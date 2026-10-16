@@ -125,7 +125,11 @@ fn qwen38_packed_q80_gemm_parity_at_production_width() {
         grim_tensor::QuantProvenance::default(),
         device.clone(),
     );
-    let got = g.forward(&x_t).expect("attn_v forward").to_vec_f32().expect("read");
+    let got = g
+        .forward(&x_t)
+        .expect("attn_v forward")
+        .to_vec_f32()
+        .expect("read");
 
     let t = cl.weight();
     let d = t.shape().dims().to_vec();

@@ -44,9 +44,7 @@ impl RocmDevice {
                                 / (2.0 * cfg.base.ln())
                         };
                         let low = corr(y.beta_fast).floor().max(0.0);
-                        let high = corr(y.beta_slow)
-                            .ceil()
-                            .min((d.saturating_sub(1)) as f32);
+                        let high = corr(y.beta_slow).ceil().min((d.saturating_sub(1)) as f32);
                         let t = (i as f32 - low) / (high - low).max(0.001);
                         let ramp = 1.0 - t.clamp(0.0, 1.0);
                         (freq / y.factor) * (1.0 - ramp) + freq * ramp
@@ -209,6 +207,7 @@ impl RocmDevice {
         let mut base_f = base;
         let mut inter_i = if cfg.interleaved { 1 } else { 0 };
         let mut heads_i = num_heads as i32;
+        let mut rotary_i = cfg.rotary_dim.min(dim) as i32;
 
         let total = (b * s * half) as usize;
         let (grid, block) = linear_launch(total);
@@ -228,6 +227,7 @@ impl RocmDevice {
                 arg(&mut base_f),
                 arg(&mut inter_i),
                 arg(&mut heads_i),
+                arg(&mut rotary_i),
             ],
         )?;
 
@@ -429,26 +429,34 @@ impl RocmDevice {
         arena_slot_stride: usize,
     ) -> Result<()> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        // M3 fail-closed (mirrors kv_append): arena dtype must match GRIM_F16_KV.
-        fn rope_kv_f16_enabled() -> bool {
-            std::env::var("GRIM_F16_KV")
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(false)
-        }
+        // Storage truth (mirrors kv_append): uniform F32 or uniform F16
+        // arenas work regardless of GRIM_F16_KV; mixed or packed fail loud.
+        let mut k_f16_opt: Option<bool> = None;
         for (arena, what) in [(k_arena, "rope_append k"), (v_arena, "rope_append v")] {
             let s = arena
                 .as_any()
                 .downcast_ref::<RocmStorage>()
                 .ok_or_else(|| Error::Backend(format!("{what}: arena must be RocmStorage")))?;
-            let want_f16 = rope_kv_f16_enabled();
-            let is_f16 = s.dtype.arith == grim_tensor::dtype::ArithType::F16;
-            if is_f16 != want_f16 {
-                return Err(Error::Backend(format!(
-                    "{what}: arena dtype {:?} does not match GRIM_F16_KV={want_f16}",
-                    s.dtype.arith,
-                )));
+            let is_f16 = match s.dtype.arith {
+                grim_tensor::dtype::ArithType::F16 => true,
+                grim_tensor::dtype::ArithType::F32 => false,
+                other => {
+                    return Err(Error::Backend(format!(
+                        "{what}: arena dtype {other:?} needs the paged quant path"
+                    )));
+                }
+            };
+            match k_f16_opt {
+                None => k_f16_opt = Some(is_f16),
+                Some(prev) if prev != is_f16 => {
+                    return Err(Error::Backend(
+                        "rope_append: K/V arenas must share one dtype (storage truth)".into(),
+                    ));
+                }
+                _ => {}
             }
         }
+        let f16_want = k_f16_opt.unwrap_or(false);
         let dim = cfg.dim;
         let base = cfg.base;
         let out_dims = out_shape.dims();
@@ -499,7 +507,7 @@ impl RocmDevice {
         let mut kv_stride_i = kv_stride as i32;
         let mut steps_i = steps as i32;
         let mut slot_stride_i = arena_slot_stride as i32;
-        let mut f16_i = rope_kv_f16_enabled() as i32;
+        let mut f16_i = f16_want as i32;
 
         let total = (b * s * half) as usize;
         let (grid, block) = linear_launch(total);
@@ -591,6 +599,7 @@ impl RocmDevice {
         let mut base_f = base;
         let mut inter_i = if cfg.interleaved { 1 } else { 0 };
         let mut heads_i = num_heads as i32;
+        let mut rotary_i = cfg.rotary_dim.min(dim) as i32;
 
         let total = (b * s * half) as usize;
         let (grid, block) = linear_launch(total);
@@ -610,6 +619,7 @@ impl RocmDevice {
                 arg(&mut base_f),
                 arg(&mut inter_i),
                 arg(&mut heads_i),
+                arg(&mut rotary_i),
             ],
         )?;
 

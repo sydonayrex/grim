@@ -623,6 +623,83 @@ pub fn fused_or_scalar_attention_i4_arena(
     )
 }
 
+/// WS-3A K2V4: mixed-width (2-bit K / 4-bit V) dense-arena attention for
+/// device-resident query. The K side packs four codes per byte, so `head_dim`
+/// must be a multiple of 4 (enforced by the launcher).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i2v4_arena_device(
+    q_st: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_i2v4(
+        q_st,
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// WS-3A K2V4: mixed-width dense-arena attention with a host-resident query.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i2v4_arena(
+    q: &[f32],
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_i2v4_arena_device(
+        q_st.as_ref(),
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
 /// Paged attention entry point (WI-X2): operates on device-resident KV pages via block tables,
 /// avoiding full-history CPU-to-GPU re-uploading on decode steps.
 #[allow(clippy::too_many_arguments)]

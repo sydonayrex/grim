@@ -947,8 +947,12 @@ impl RocmDevice {
         let res = unsafe {
             hipModuleLaunchKernel(
                 func,
-                grid.x, grid.y, grid.z,
-                block.x, block.y, block.z,
+                grid.x,
+                grid.y,
+                grid.z,
+                block.x,
+                block.y,
+                block.z,
                 0,
                 stream,
                 args.as_mut_ptr(),

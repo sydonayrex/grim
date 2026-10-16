@@ -2845,6 +2845,70 @@ mod tests {
         assert_eq!(pool.block_num_tokens(id), Some(BLOCK_SIZE));
     }
 
+    /// WS-3B × WS-5: a compressor built from a NAMED PROFILE (the table the
+    /// engine selects from `GRIM_KV_QUANT`) must close the same compress → spill
+    /// → promote loop, and the demotion must be counted in the spill telemetry.
+    ///
+    /// This is the seam the engine's profile wiring actually exercises: without
+    /// it, `named_profile` is only known to the env parser, not to the pool.
+    #[test]
+    fn named_profile_compressor_closes_spill_loop() {
+        let dir = tempdir().unwrap();
+        let block_elems = BLOCK_SIZE * 2 * 4;
+        let spill =
+            Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        pool.attach_spill(spill.clone());
+
+        let cfg = grim_kvquant::named_profile("text-shallow")
+            .expect("text-shallow must resolve");
+        assert_eq!((cfg.key_bits, cfg.value_bits, cfg.group_size), (8, 4, 64));
+        let before = pool.spill_telemetry();
+        pool.attach_compressor(Arc::new(LloydMaxCompressor::new(cfg)));
+
+        let k = vec![0.5f32; block_elems];
+        let v = vec![-0.25f32; block_elems];
+        let id = pool.alloc().unwrap();
+        pool.write_keys(id, &k, BLOCK_SIZE);
+        pool.write_values(id, &v);
+
+        pool.free(id);
+        assert!(spill.get_tier(id).is_some(), "block must have left VRAM");
+        let blob = spill
+            .retrieve_compressed(id)
+            .unwrap()
+            .expect("spill must hold the compressed blob when a compressor is attached");
+        let block = CompressedKvBlock::from_bytes(&blob).unwrap();
+        assert_eq!(block.num_tokens, BLOCK_SIZE);
+
+        // The demotion is counted, not just performed.
+        let after = pool.spill_telemetry();
+        assert!(
+            after.demoted_blocks > before.demoted_blocks,
+            "demoted_blocks must advance: {} -> {}",
+            before.demoted_blocks,
+            after.demoted_blocks
+        );
+
+        let compressor = LloydMaxCompressor::new(cfg);
+        let (k_ref, _) = compressor
+            .dequantize_for_attention(&block, &CpuDevice::new(), Device::Cpu)
+            .unwrap();
+        let promoted = pool
+            .promote_to_gpu(id)
+            .unwrap()
+            .expect("compressed promote");
+        assert_eq!(promoted.0, k_ref.to_vec_f32().unwrap());
+        // 8-bit keys + 4-bit values on constant data must be near-exact.
+        let max_err = promoted
+            .0
+            .iter()
+            .zip(&k)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 0.5, "key lossiness bounded, got {max_err}");
+    }
+
     #[test]
     fn test_dirty_block_mirror_tracking_and_flushing() {
         let mut pool = KvBlockPool::new(8, 2, 4);

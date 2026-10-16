@@ -1,0 +1,6 @@
+warning: warning: Missing auto-load script at offset 0 in section .debug_gdb_scripts
+of file /drive/bigfast/grim/target/debug/grim-cli.
+Use `info auto-load python-scripts [REGEXP]' to list them.
+Missing auto-load script at offset 0 in section .debug_gdb_scripts
+of file /drive/bigfast/grim/target/debug/grim-cli.
+Use `info auto-load python-scripts [REGEXP]' to list them.

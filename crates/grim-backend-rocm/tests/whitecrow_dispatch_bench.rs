@@ -121,7 +121,10 @@ fn whitecrow_dispatch_keeps_pace_with_q4k() -> TestResult {
         return Ok(());
     }
 
-    for (m, n, k, iters) in [(1usize, 4096usize, 4096usize, 50usize), (16, 4096, 4096, 20)] {
+    for (m, n, k, iters) in [
+        (1usize, 4096usize, 4096usize, 50usize),
+        (16, 4096, 4096, 20),
+    ] {
         let mut rng = Lcg::warmed(0xC2049 ^ (m as u64));
         let a: Vec<f32> = (0..m * k).map(|_| rng()).collect();
         let w: Vec<f32> = (0..n * k).map(|_| rng() * 0.5).collect();
@@ -236,16 +239,7 @@ fn whitecrow_dispatch_keeps_pace_with_q4k() -> TestResult {
             std::env::set_var("GRIM_DECODE_EXACT_GEMV", "0");
         }
         let (us_q4k, gb_q4k) = bench(&dev, &w_q4k, &x, m, n, k, QuantFormat::Q4K, iters)?;
-        let (us_c, gb_c) = bench(
-            &dev,
-            &w_crow,
-            &x,
-            m,
-            n,
-            k,
-            QuantFormat::W4A4OstQuant,
-            iters,
-        )?;
+        let (us_c, gb_c) = bench(&dev, &w_crow, &x, m, n, k, QuantFormat::W4A4OstQuant, iters)?;
 
         println!("[crow-bench] m={m:<4} n={n} k={k}");
         println!("  q4k dot4    : {us_q4k:>9.1} us  {gb_q4k:>7.1} GB/s");

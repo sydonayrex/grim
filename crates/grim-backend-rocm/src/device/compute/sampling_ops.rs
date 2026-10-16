@@ -7,6 +7,15 @@ use grim_tensor::{BackendStorage, ElementwiseOps, SamplingOps};
 use crate::as_rocm;
 use crate::device::roc_device::RocmDevice;
 
+fn log_device_sampler_fallback(reason: &str) {
+    use std::sync::OnceLock;
+    static LOGGED: OnceLock<bool> = OnceLock::new();
+    if LOGGED.get().is_none() {
+        eprintln!("[sampling] device sampler unavailable ({reason}); falling back to CPU");
+        LOGGED.set(true).ok();
+    }
+}
+
 impl SamplingOps for RocmDevice {
     /// B1 (PLAN-reduce-d2h-h2d): penalty-aware device sampling. Penalty
     /// pre-pass + sample stay on-device (one small H2D for history ids, 4-byte
@@ -61,7 +70,7 @@ impl SamplingOps for RocmDevice {
             return self.argmax(logits);
         }
         if let Ok(rocm_s) = as_rocm(logits) {
-            if let Ok(Some(token)) = crate::kernels::device_sampler::sample_logits_on_device(
+            match crate::kernels::device_sampler::sample_logits_on_device(
                 self,
                 rocm_s,
                 vocab,
@@ -70,7 +79,9 @@ impl SamplingOps for RocmDevice {
                 top_p,
                 seed,
             ) {
-                return Ok(token);
+                Ok(Some(token)) => return Ok(token),
+                Ok(None) => log_device_sampler_fallback("validation rejected the device path"),
+                Err(e) => log_device_sampler_fallback(&format!("kernel failed: {e}")),
             }
         }
         let cpu_logits = logits.to_cpu_vec_f32()?;

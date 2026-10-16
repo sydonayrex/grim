@@ -19,7 +19,7 @@
 //!      cargo test -p grim-backend-rocm --test scrub_jay_gpu -- --nocapture
 
 use grim_backend_rocm::RocmDevice;
-use grim_quant::scrub_jay::{quantize_block, SCRUB_JAY_BLOCK, SCRUB_JAY_CODEBOOKS};
+use grim_quant::scrub_jay::{SCRUB_JAY_BLOCK, SCRUB_JAY_CODEBOOKS, quantize_block};
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
 use std::panic;
 
@@ -35,7 +35,10 @@ fn gpu_device() -> Option<RocmDevice> {
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let unit = ((self.0 >> 40) as f32) / (1u32 << 24) as f32;
         (unit - 0.5) * 2.0
     }
@@ -44,7 +47,9 @@ impl Lcg {
 /// Parse the `GRIM_SCRUB_JAY_CB` initializer back out of the kernel source.
 fn kernel_codebook() -> Vec<i8> {
     let src = grim_backend_rocm::kernels::scrub_jay::KERNEL_SOURCE;
-    let start = src.find("GRIM_SCRUB_JAY_CB[256] = {").expect("table present in source");
+    let start = src
+        .find("GRIM_SCRUB_JAY_CB[256] = {")
+        .expect("table present in source");
     let body_start = src[start..].find('{').unwrap() + start;
     let body_end = src[body_start..].find('}').unwrap() + body_start;
     // Strip line comments BEFORE splitting on commas. Doing it the other way
@@ -56,7 +61,9 @@ fn kernel_codebook() -> Vec<i8> {
         .map(|l| l.split("//").next().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n");
-    body.split(',').filter_map(|t| t.trim().parse::<i8>().ok()).collect()
+    body.split(',')
+        .filter_map(|t| t.trim().parse::<i8>().ok())
+        .collect()
 }
 
 #[test]
@@ -122,23 +129,81 @@ fn fused_dequant_gemm_matches_cpu() -> TestResult {
         }
 
         // --- upload -------------------------------------------------------
-        let a_t = up(&dev, f32_bytes(&a), K, DType { arith: ArithType::F32, storage: Storage::Native }, "a")?;
-        let sel_t = up(&dev, u8_bytes(&sel), sel.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sel")?;
-        let idx_t = up(&dev, u8_bytes(&idx), idx.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "idx")?;
-        let sgn_t = up(&dev, u8_bytes(&sgn), sgn.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sgn")?;
-        let scl_t = up(&dev, f32_bytes(&scl), scl.len(), DType { arith: ArithType::F32, storage: Storage::Native }, "scl")?;
+        let a_t = up(
+            &dev,
+            f32_bytes(&a),
+            K,
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+            "a",
+        )?;
+        let sel_t = up(
+            &dev,
+            u8_bytes(&sel),
+            sel.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "sel",
+        )?;
+        let idx_t = up(
+            &dev,
+            u8_bytes(&idx),
+            idx.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "idx",
+        )?;
+        let sgn_t = up(
+            &dev,
+            u8_bytes(&sgn),
+            sgn.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "sgn",
+        )?;
+        let scl_t = up(
+            &dev,
+            f32_bytes(&scl),
+            scl.len(),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+            "scl",
+        )?;
         let out_t = MemoryOps::alloc_storage(
             &dev,
             &Shape::new(vec![n]),
-            DType { arith: ArithType::F32, storage: Storage::Native },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("out alloc: {e}"))?;
 
         fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
             grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
         }
-        dev.launch_scrub_jay_gemv(r(&a_t), r(&sel_t), r(&idx_t), r(&sgn_t), r(&scl_t), r(&out_t), pre_scale, n, K)
-            .map_err(|e| format!("launch: {e}"))?;
+        dev.launch_scrub_jay_gemv(
+            r(&a_t),
+            r(&sel_t),
+            r(&idx_t),
+            r(&sgn_t),
+            r(&scl_t),
+            r(&out_t),
+            pre_scale,
+            n,
+            K,
+        )
+        .map_err(|e| format!("launch: {e}"))?;
         dev.synchronize();
         let got = download_f32(&out_t)?;
 
@@ -217,23 +282,82 @@ fn fused_dequant_gemm_tiled_matches_cpu() -> TestResult {
         }
     }
 
-    let a_t = up(&dev, f32_bytes(&a), M * K, DType { arith: ArithType::F32, storage: Storage::Native }, "a")?;
-    let sel_t = up(&dev, u8_bytes(&sel), sel.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sel")?;
-    let idx_t = up(&dev, u8_bytes(&idx), idx.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "idx")?;
-    let sgn_t = up(&dev, u8_bytes(&sgn), sgn.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sgn")?;
-    let scl_t = up(&dev, f32_bytes(&scl), scl.len(), DType { arith: ArithType::F32, storage: Storage::Native }, "scl")?;
+    let a_t = up(
+        &dev,
+        f32_bytes(&a),
+        M * K,
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+        "a",
+    )?;
+    let sel_t = up(
+        &dev,
+        u8_bytes(&sel),
+        sel.len(),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "sel",
+    )?;
+    let idx_t = up(
+        &dev,
+        u8_bytes(&idx),
+        idx.len(),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "idx",
+    )?;
+    let sgn_t = up(
+        &dev,
+        u8_bytes(&sgn),
+        sgn.len(),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "sgn",
+    )?;
+    let scl_t = up(
+        &dev,
+        f32_bytes(&scl),
+        scl.len(),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+        "scl",
+    )?;
     let out_t = MemoryOps::alloc_storage(
         &dev,
         &Shape::new(vec![M * N]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
     fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
         grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
     }
-    dev.launch_scrub_jay_gemm_tiled(r(&a_t), r(&sel_t), r(&idx_t), r(&sgn_t), r(&scl_t), r(&out_t), pre_scale, M, N, K)
-        .map_err(|e| format!("launch tiled: {e}"))?;
+    dev.launch_scrub_jay_gemm_tiled(
+        r(&a_t),
+        r(&sel_t),
+        r(&idx_t),
+        r(&sgn_t),
+        r(&scl_t),
+        r(&out_t),
+        pre_scale,
+        M,
+        N,
+        K,
+    )
+    .map_err(|e| format!("launch tiled: {e}"))?;
     dev.synchronize();
     let got = download_f32(&out_t)?;
 
@@ -269,7 +393,6 @@ fn fused_dequant_gemm_tiled_matches_cpu() -> TestResult {
     Ok(())
 }
 
-
 fn up(
     d: &RocmDevice,
     bytes: &[u8],
@@ -287,8 +410,13 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 fn download_f32(t: &Box<dyn BackendStorage>) -> TestResult<Vec<f32>> {
-    let bytes = grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
-    Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    let bytes = grim_backend_rocm::as_rocm(t.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 /// The activation quantizer, against a host reference using the same frozen
@@ -314,16 +442,52 @@ fn activation_quantizer_matches_cpu() -> TestResult {
     let a: Vec<f32> = (0..ROWS * K).map(|_| rng.next_f32() * 4.0).collect();
 
     let n_blocks = K / SCRUB_JAY_BLOCK;
-    let idx_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * K]), DType { arith: ArithType::U8, storage: Storage::Native })
-        .map_err(|e| format!("idx: {e}"))?;
-    let sel_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * n_blocks]), DType { arith: ArithType::U8, storage: Storage::Native })
-        .map_err(|e| format!("sel: {e}"))?;
-    let scl_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * n_blocks]), DType { arith: ArithType::F32, storage: Storage::Native })
-        .map_err(|e| format!("scl: {e}"))?;
-    let sgn_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * n_blocks]), DType { arith: ArithType::U8, storage: Storage::Native })
-        .map_err(|e| format!("sgn: {e}"))?;
-    let a_t = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![ROWS * K]), DType { arith: ArithType::F32, storage: Storage::Native })
-        .map_err(|e| format!("a: {e}"))?;
+    let idx_t = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![ROWS * K]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("idx: {e}"))?;
+    let sel_t = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![ROWS * n_blocks]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("sel: {e}"))?;
+    let scl_t = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![ROWS * n_blocks]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("scl: {e}"))?;
+    let sgn_t = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![ROWS * n_blocks]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("sgn: {e}"))?;
+    let a_t = MemoryOps::from_cpu_bytes(
+        &dev,
+        &f32_bytes(&a),
+        &Shape::new(vec![ROWS * K]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("a: {e}"))?;
 
     fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
         grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
@@ -356,48 +520,84 @@ fn activation_quantizer_matches_cpu() -> TestResult {
                 let mut err = 0.0f32;
                 for &v in block.iter() {
                     let mag = v.abs() * inv_d;
-                    let bd = book.iter().map(|&l| (l as f32 - mag).powi(2)).fold(f32::INFINITY, f32::min);
+                    let bd = book
+                        .iter()
+                        .map(|&l| (l as f32 - mag).powi(2))
+                        .fold(f32::INFINITY, f32::min);
                     err += bd;
                 }
-                if err < best_err { best_err = err; best_c = c; }
+                if err < best_err {
+                    best_err = err;
+                    best_c = c;
+                }
             }
             let bi = row * n_blocks + blk;
             if got_sel[bi] as usize != best_c {
                 bad += 1;
-                if bad <= 3 { eprintln!("sel mismatch row={row} blk={blk}: got {} want {best_c}", got_sel[bi]); }
+                if bad <= 3 {
+                    eprintln!(
+                        "sel mismatch row={row} blk={blk}: got {} want {best_c}",
+                        got_sel[bi]
+                    );
+                }
                 continue;
             }
             if (got_scl[bi] - d).abs() > 1e-5 * d.abs().max(1e-6) {
                 bad += 1;
-                if bad <= 3 { eprintln!("scl mismatch row={row} blk={blk}: got {} want {d}", got_scl[bi]); }
+                if bad <= 3 {
+                    eprintln!(
+                        "scl mismatch row={row} blk={blk}: got {} want {d}",
+                        got_scl[bi]
+                    );
+                }
                 continue;
             }
             let mut want_sgn = 0u8;
             for i in 0..SCRUB_JAY_BLOCK {
-                if block[i] < 0.0 { want_sgn |= 1 << i; }
+                if block[i] < 0.0 {
+                    want_sgn |= 1 << i;
+                }
                 let mag = block[i].abs() * inv_d;
                 let mut bd = f32::INFINITY;
                 let mut bj = 0usize;
                 for (j, &l) in cb[best_c].iter().enumerate() {
                     let e = (l as f32 - mag).powi(2);
-                    if e < bd { bd = e; bj = j; }
+                    if e < bd {
+                        bd = e;
+                        bj = j;
+                    }
                 }
                 if got_idx[row * K + blk * SCRUB_JAY_BLOCK + i] as usize != bj {
                     bad += 1;
-                    if bad <= 3 { eprintln!("idx mismatch row={row} blk={blk} i={i}"); }
+                    if bad <= 3 {
+                        eprintln!("idx mismatch row={row} blk={blk} i={i}");
+                    }
                 }
             }
-            if got_sgn[bi] != want_sgn { bad += 1; }
+            if got_sgn[bi] != want_sgn {
+                bad += 1;
+            }
         }
     }
-    assert_eq!(bad, 0, "{bad} plane mismatches between GPU and host quantizer");
-    eprintln!("activation quantizer: all {} blocks agree with the host reference", ROWS * n_blocks);
+    assert_eq!(
+        bad, 0,
+        "{bad} plane mismatches between GPU and host quantizer"
+    );
+    eprintln!(
+        "activation quantizer: all {} blocks agree with the host reference",
+        ROWS * n_blocks
+    );
     Ok(())
 }
 
 fn bytes_of(t: &Box<dyn BackendStorage>) -> TestResult<Vec<u8>> {
-    Ok(grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?)
+    Ok(grim_backend_rocm::as_rocm(t.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?)
 }
 fn got_scl_bytes(t: &Box<dyn BackendStorage>) -> TestResult<Vec<f32>> {
-    Ok(bytes_of(t)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(bytes_of(t)?
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }

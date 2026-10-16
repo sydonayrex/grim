@@ -88,7 +88,6 @@ pub struct CharonCache {
 /// Which numeric path served a `fused_moe_dispatch_from_logits` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchKind {
-
     /// f32 expert stacks (native f32, or any quantized format dequantized
     /// to f32 at stack-build time).
     F32Dequant,
@@ -243,9 +242,18 @@ impl CharonCache {
         *self.resident.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.whitecrow.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.kq_native.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.whitecrow_refused.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        self.arm_trace.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.won_logged.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self
+            .whitecrow_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        self.arm_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.won_logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.routing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8fp8.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -374,10 +382,7 @@ pub type CharonScratchBuffers = (
 /// upload is tiny but still an H2D of host-owned data, so the capture path
 /// must call this from pool-build time (or peek via [`peek_kq_native`]),
 /// never from inside a capture bracket.
-fn pick_expert_bytes(
-    e: &MoeExpert,
-    pick: fn(&MoeExpert) -> &grim_tensor::Tensor,
-) -> u64 {
+fn pick_expert_bytes(e: &MoeExpert, pick: fn(&MoeExpert) -> &grim_tensor::Tensor) -> u64 {
     pick(e)
         .storage()
         .as_ref()
@@ -512,16 +517,15 @@ pub(crate) fn ensure_kq_native(
         down_bytes,
         down_q4k,
     };
-    *cache.kq_native.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(KqNativeResident {
-            gate_ptrs: Arc::clone(&resident.gate_ptrs),
-            up_ptrs: Arc::clone(&resident.up_ptrs),
-            down_ptrs: Arc::clone(&resident.down_ptrs),
-            num_experts: resident.num_experts,
-            gate_bytes: resident.gate_bytes,
-            down_bytes: resident.down_bytes,
-            down_q4k: resident.down_q4k,
-        });
+    *cache.kq_native.lock().unwrap_or_else(|e| e.into_inner()) = Some(KqNativeResident {
+        gate_ptrs: Arc::clone(&resident.gate_ptrs),
+        up_ptrs: Arc::clone(&resident.up_ptrs),
+        down_ptrs: Arc::clone(&resident.down_ptrs),
+        num_experts: resident.num_experts,
+        gate_bytes: resident.gate_bytes,
+        down_bytes: resident.down_bytes,
+        down_q4k: resident.down_q4k,
+    });
     Ok(resident)
 }
 
@@ -618,13 +622,11 @@ pub(crate) fn ensure_whitecrow_scratch(
     // dies produced a GPU page fault, so the total committed bytes are
     // bounded here: GRIM_MOE_WHITECROW_BUDGET_MB (default 1024 MiB process-
     // wide). A refusal is latched per cache and degrades to the arms below.
-    let per_layer_bytes =
-        ((inter * hidden / 2 + inter * (hidden / 128) * 3 + 24)
-            + (inter * hidden / 2 + inter * (hidden / 128) * 3 + 24)
-            + (hidden * inter / 2 + hidden * (inter / 128) * 3 + 24))
-            * num_experts;
-    static WC_COMMITTED: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    let per_layer_bytes = ((inter * hidden / 2 + inter * (hidden / 128) * 3 + 24)
+        + (inter * hidden / 2 + inter * (hidden / 128) * 3 + 24)
+        + (hidden * inter / 2 + hidden * (inter / 128) * 3 + 24))
+        * num_experts;
+    static WC_COMMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Default 0 = the arm stays OFF unless the operator sized the budget for
     // the WHOLE model (layers x per-layer bytes). A partial build — some
     // layers on WhiteCrow stacks, some on the fallback — strands the built
@@ -693,7 +695,10 @@ pub(crate) fn ensure_whitecrow_scratch(
     let stack = |pick: fn(&MoeExpert) -> &grim_tensor::Tensor,
                  n: usize,
                  k: usize|
-     -> Result<(std::sync::Arc<dyn grim_tensor::backend::BackendStorage>, u64)> {
+     -> Result<(
+        std::sync::Arc<dyn grim_tensor::backend::BackendStorage>,
+        u64,
+    )> {
         let mut blob: Vec<u8> = Vec::new();
         for e in experts {
             let w = pick(e);
@@ -736,10 +741,7 @@ pub(crate) fn ensure_whitecrow_scratch(
         gate_stride,
         down_stride,
     };
-    WC_COMMITTED.fetch_add(
-        per_layer_bytes as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    WC_COMMITTED.fetch_add(per_layer_bytes as u64, std::sync::atomic::Ordering::Relaxed);
     *cache.whitecrow.lock().unwrap_or_else(|e| e.into_inner()) = Some(WhiteCrowResident {
         gate: Arc::clone(&resident.gate),
         up: Arc::clone(&resident.up),
@@ -1195,24 +1197,28 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                 let out_storage = out_storage_b
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| {
-                        grim_tensor::Error::Backend("kq out not RocmStorage".into())
-                    })?;
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq out not RocmStorage".into()))?;
                 let g_ptrs = kq
                     .gate_ptrs
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::Error::Backend("kq gate ptrs not RocmStorage".into()))?;
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq gate ptrs not RocmStorage".into())
+                    })?;
                 let u_ptrs = kq
                     .up_ptrs
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::Error::Backend("kq up ptrs not RocmStorage".into()))?;
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq up ptrs not RocmStorage".into())
+                    })?;
                 let d_ptrs = kq
                     .down_ptrs
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into()))?;
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into())
+                    })?;
                 if let Err(e) = rocm.moe_dequant_gemm_prefill_into(
                     x_rocm,
                     g_ptrs,
@@ -1266,9 +1272,19 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     )?;
                     let ab = out_storage.copy_to_host().unwrap();
                     let bb = out2.copy_to_host().unwrap();
-                    let a: Vec<f32> = ab.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    let b: Vec<f32> = bb.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                    let a: Vec<f32> = ab
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let b: Vec<f32> = bb
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let md = a
+                        .iter()
+                        .zip(&b)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max);
                     let na = a.iter().fold(0.0f32, |m2, v| m2.max(v.abs()));
                     let nb = b.iter().fold(0.0f32, |m2, v| m2.max(v.abs()));
                     let sa: f32 = a.iter().map(|v| v.abs()).sum();
@@ -1280,12 +1296,23 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     let mut mism: Vec<String> = Vec::new();
                     for (i, (x, y)) in a.iter().zip(&b).enumerate() {
                         if (x - y).abs() > 1.0 {
-                            mism.push(format!("i={i} tok={} col={} a={x:.4} b={y:.4}", i / 3584, i % 3584));
+                            mism.push(format!(
+                                "i={i} tok={} col={} a={x:.4} b={y:.4}",
+                                i / 3584,
+                                i % 3584
+                            ));
                         }
-                        if mism.len() >= 6 { break; }
+                        if mism.len() >= 6 {
+                            break;
+                        }
                     }
-                    eprintln!("[moe-arm-diff] max_abs={md} amax_a={na} amax_b={nb} sum|a|={sa} sum|b|={sb} cos={cos:.4} len={}", a.len());
-                    for m in &mism { eprintln!("[moe-arm-diff]   {m}"); }
+                    eprintln!(
+                        "[moe-arm-diff] max_abs={md} amax_a={na} amax_b={nb} sum|a|={sa} sum|b|={sb} cos={cos:.4} len={}",
+                        a.len()
+                    );
+                    for m in &mism {
+                        eprintln!("[moe-arm-diff]   {m}");
+                    }
                 }
                 let out_t = Tensor::new(
                     Arc::from(out_storage_b),
@@ -1301,17 +1328,23 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     .gate_ptrs
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::Error::Backend("kq gate ptrs not RocmStorage".into()))?;
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq gate ptrs not RocmStorage".into())
+                    })?;
                 let u_ptrs = kq
                     .up_ptrs
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::Error::Backend("kq up ptrs not RocmStorage".into()))?;
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq up ptrs not RocmStorage".into())
+                    })?;
                 let d_ptrs = kq
                     .down_ptrs
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into()))?;
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into())
+                    })?;
                 rocm.moe_fused_dispatch_kq_native_into(
                     x_rocm,
                     g_ptrs,
@@ -2844,7 +2877,9 @@ mod kq_native_integration_tests {
         if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
             return;
         }
-        let Ok(path) = std::env::var("XING_GGUF") else { return };
+        let Ok(path) = std::env::var("XING_GGUF") else {
+            return;
+        };
         let hidden = 3584usize;
         let inter = 1024usize;
         let num_experts = 64usize;
@@ -2896,7 +2931,9 @@ mod kq_native_integration_tests {
         let num_pairs = tokens.len();
         let rsf = 1.0f32;
 
-        let act: Vec<f32> = (0..hidden).map(|i| ((i % 13) as f32 - 6.0) * 0.07).collect();
+        let act: Vec<f32> = (0..hidden)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.07)
+            .collect();
         let up = |v: Vec<u8>| -> grim_tensor::Tensor {
             grim_tensor::Tensor::new(
                 std::sync::Arc::from(
@@ -2916,12 +2953,8 @@ mod kq_native_integration_tests {
                 grim_tensor::Device::Rocm(0),
             )
         };
-        let u32_bytes = |v: &[u32]| -> Vec<u8> {
-            v.iter().flat_map(|x| x.to_le_bytes()).collect()
-        };
-        let f32_bytes = |v: &[f32]| -> Vec<u8> {
-            v.iter().flat_map(|x| x.to_le_bytes()).collect()
-        };
+        let u32_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let a_t = up(f32_bytes(&act));
         let t_t = up(u32_bytes(&tokens));
         let e_t = up(u32_bytes(&expert_ids));
@@ -2934,7 +2967,9 @@ mod kq_native_integration_tests {
         )
         .expect("out");
 
-        fn arc_of(a: &Arc<dyn grim_tensor::backend::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        fn arc_of(
+            a: &Arc<dyn grim_tensor::backend::BackendStorage>,
+        ) -> &grim_backend_rocm::RocmStorage {
             a.as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
                 .unwrap()
@@ -3008,14 +3043,18 @@ mod kq_native_integration_tests {
             if p == 0 {
                 let g_dot: f32 = (0..hidden).map(|i| act[i] * g_flat[i]).sum();
                 let u_dot: f32 = (0..hidden).map(|i| act[i] * u_flat[i]).sum();
-                eprintln!("[dg-host] pair0 j=0: g_dot={g_dot:.6} u_dot={u_dot:.6} expected_act0={:.6}",
-                    (g_dot / (1.0 + (-g_dot).exp())) * u_dot);
+                eprintln!(
+                    "[dg-host] pair0 j=0: g_dot={g_dot:.6} u_dot={u_dot:.6} expected_act0={:.6}",
+                    (g_dot / (1.0 + (-g_dot).exp())) * u_dot
+                );
                 {
                     // Host down dot for output h=0, computed AFTER actv exists:
                     // reuse the same expression the want-loop uses.
                     let d_flat_h = deq_q4k(&dwb, hidden, inter);
                     let d_dot: f32 = (0..inter).map(|j| actv[j] * d_flat_h[j]).sum();
-                    eprintln!("[dg-host] pair0 h=0: d_dot={d_dot:.6} (arm manual_d0 was printed by the arm)");
+                    eprintln!(
+                        "[dg-host] pair0 h=0: d_dot={d_dot:.6} (arm manual_d0 was printed by the arm)"
+                    );
                 }
                 eprintln!(
                     "[dg-host] pair0: tok={} exp={e} w={} x[0..3]={:?} g[0..3]={:?} u[0..3]={:?} act[0..3]={:?} d[0..3]={:?}",
@@ -3046,7 +3085,10 @@ mod kq_native_integration_tests {
         eprintln!(
             "[kq-model] kernel vs host on runtime storages: max_abs {max_abs:.3e} rel {rel:.3e}"
         );
-        assert!(rel < 1e-3, "model-shaped integration diverges (rel {rel:.3e})");
+        assert!(
+            rel < 1e-3,
+            "model-shaped integration diverges (rel {rel:.3e})"
+        );
 
         // ---- A/B: the dequant-once prefill arm on the SAME inputs ----------
         // MUST be zeroed: the arm's scatter is an atomicAdd accumulation.
@@ -3070,7 +3112,11 @@ mod kq_native_integration_tests {
             let _ = &tmp;
             // Copy zeros in: device-to-device from a freshly zeroed upload.
             let zeros_st = dev
-                .from_cpu(&vec![0f32; hidden], &grim_tensor::Shape::new(vec![hidden]), grim_tensor::DType::F32)
+                .from_cpu(
+                    &vec![0f32; hidden],
+                    &grim_tensor::Shape::new(vec![hidden]),
+                    grim_tensor::DType::F32,
+                )
                 .expect("zeros");
             let zs = zeros_st
                 .as_any()
@@ -3136,27 +3182,46 @@ mod kq_native_integration_tests {
         let d_wts = vec![0.25f32, 0.25f32, 0.25f32, 0.25f32];
         let d_toks_st = dev
             .from_cpu_bytes(
-                &d_toks.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                &d_toks
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
                 &grim_tensor::Shape::new(vec![4]),
-                grim_tensor::DType { arith: grim_tensor::ArithType::U32, storage: grim_tensor::Storage::Native },
+                grim_tensor::DType {
+                    arith: grim_tensor::ArithType::U32,
+                    storage: grim_tensor::Storage::Native,
+                },
             )
             .expect("d toks");
         let d_exps_st = dev
             .from_cpu_bytes(
-                &d_exps.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                &d_exps
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
                 &grim_tensor::Shape::new(vec![4]),
-                grim_tensor::DType { arith: grim_tensor::ArithType::U32, storage: grim_tensor::Storage::Native },
+                grim_tensor::DType {
+                    arith: grim_tensor::ArithType::U32,
+                    storage: grim_tensor::Storage::Native,
+                },
             )
             .expect("d exps");
         let d_wts_st = dev
             .from_cpu_bytes(
-                &d_wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                &d_wts
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
                 &grim_tensor::Shape::new(vec![4]),
                 grim_tensor::DType::F32,
             )
             .expect("d wts");
-        fn st_of2<'a>(a: &'a Arc<dyn grim_tensor::backend::BackendStorage>) -> &'a grim_backend_rocm::RocmStorage {
-            a.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap()
+        fn st_of2<'a>(
+            a: &'a Arc<dyn grim_tensor::backend::BackendStorage>,
+        ) -> &'a grim_backend_rocm::RocmStorage {
+            a.as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .unwrap()
         }
         let d_toks_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(d_toks_st);
         let d_exps_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(d_exps_st);

@@ -1153,6 +1153,165 @@ impl AttentionOps for RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
+    /// WS-3A K2V4: mixed-width (2-bit K / 4-bit V) dense-arena attention.
+    /// Same shape/window handling as `qkv_attention_i4`; the K side is packed
+    /// four codes per byte, so `head_dim` must be a multiple of 4.
+    fn qkv_attention_i2v4(
+        &self,
+        q: &dyn BackendStorage,
+        k_codes: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_codes: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        use grim_tensor::dtype::ArithType as AT;
+        let softcap: f32 = self.attn_logit_softcap();
+        let check = |s: &dyn BackendStorage, want: AT, what: &str| -> Result<()> {
+            let a = as_rocm(s)?;
+            if a.dtype.arith != want {
+                return Err(Error::Backend(format!(
+                    "launch_qkv_attention_i2v4: {what} must be {want:?}, got {:?}",
+                    a.dtype.arith
+                )));
+            }
+            if !a.device_ptr_is_valid() {
+                return Err(Error::Backend(format!(
+                    "launch_qkv_attention_i2v4: {what} lacks a valid device pointer"
+                )));
+            }
+            Ok(())
+        };
+        check(q, AT::F32, "q")?;
+        check(k_codes, AT::U8, "k_codes")?;
+        check(k_scales, AT::F32, "k_scales")?;
+        check(v_codes, AT::U8, "v_codes")?;
+        check(v_scales, AT::F32, "v_scales")?;
+
+        let dims = out_shape.dims();
+        let (seq_len, num_heads, head_dim) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else if dims.len() == 2 {
+            let k_dims = k_codes.shape().dims();
+            let head_dim = match k_dims.len() {
+                3 => k_dims[2],
+                2 if num_kv_heads > 0 => k_dims[1] / num_kv_heads,
+                _ => {
+                    return Err(Error::Shape(
+                        "qkv_attention_i2v4: cannot derive head_dim from the K codes arena".into(),
+                    ));
+                }
+            };
+            if head_dim == 0 || dims[1] % head_dim != 0 {
+                return Err(Error::Shape(format!(
+                    "qkv_attention_i2v4: out width {} is not a whole number of head_dim {head_dim}",
+                    dims[1]
+                )));
+            }
+            (dims[0], dims[1] / head_dim, head_dim)
+        } else {
+            return Err(Error::Shape(format!(
+                "qkv_attention_i2v4: out_shape must be [seq, heads, dim] or [seq, heads*dim], \
+                 got {dims:?}"
+            )));
+        };
+        if num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(Error::Backend(
+                "qkv_attention_i2v4: num_heads must be a positive multiple of num_kv_heads".into(),
+            ));
+        }
+        if head_dim == 0 || head_dim > 256 || head_dim % 4 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_qkv_attention_i2v4: head_dim {head_dim} must be a multiple of 4 and in 1..=256"
+            )));
+        }
+        let window_lo_i: i32 = match window {
+            None => 0,
+            Some(w) => {
+                let abs_first = cache_offset as usize;
+                let win_lo = abs_first.saturating_sub(w.saturating_sub(1));
+                i32::try_from(win_lo)
+                    .map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
+            }
+        };
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut qptr = dev_ptr(as_rocm(q)?)?;
+        let mut kptr = dev_ptr(as_rocm(k_codes)?)?;
+        let mut vptr = dev_ptr(as_rocm(v_codes)?)?;
+        let mut ksptr = dev_ptr(as_rocm(k_scales)?)?;
+        let mut vsptr = dev_ptr(as_rocm(v_scales)?)?;
+        let mut optr = dev_ptr(&storage)?;
+        let mut max_ptr: u64 = 0;
+        let mut sum_ptr: u64 = 0;
+        let mut nh = num_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut co = cache_offset as i32;
+        let mut isd = 1.0 / (head_dim as f32).sqrt();
+        let mut wlo = window_lo_i;
+        let mut sc = softcap;
+        let mut oproj_ptr: u64 = 0;
+        let mut odim: i32 = 0;
+        let mut fuseo: i32 = 0;
+        let mut alibi_ptr: u64 = 0;
+        let mut has_alibi: i32 = 0;
+        // WS-3A: 2-bit keys, 4-bit values. Uniform across the launch, so the
+        // kernel's width branches are not divergent.
+        let mut k_bits: i32 = 2;
+        let mut v_bits: i32 = 4;
+
+        let grid = crate::HipDim3::new(seq_len as u32, num_heads as u32, 1);
+        let block_dim_x = if matches!(
+            self.props.wavefront_size,
+            crate::device::handles::WavefrontSize::W32
+        ) {
+            128
+        } else {
+            256
+        };
+        let block = crate::HipDim3::new(block_dim_x, 1, 1);
+        let stream = self.launch_compute_kernel(
+            "grim_qkv_attention_ixkv",
+            grid,
+            block,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut ksptr),
+                arg(&mut vsptr),
+                arg(&mut optr),
+                arg(&mut max_ptr),
+                arg(&mut sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
+                arg(&mut wlo),
+                arg(&mut sc),
+                arg(&mut oproj_ptr),
+                arg(&mut odim),
+                arg(&mut fuseo),
+                arg(&mut alibi_ptr),
+                arg(&mut has_alibi),
+                arg(&mut k_bits),
+                arg(&mut v_bits),
+            ],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+
     fn qkv_attention_alibi(
         &self,
         q: &dyn BackendStorage,

@@ -26,7 +26,7 @@
 //!      cargo test -p grim-backend-rocm --test scrub_jay_journey -- --nocapture
 
 use grim_backend_rocm::RocmDevice;
-use grim_quant::scrub_jay::{quantize_block, SCRUB_JAY_BLOCK};
+use grim_quant::scrub_jay::{SCRUB_JAY_BLOCK, quantize_block};
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
 use std::panic;
 use std::time::Instant;
@@ -43,13 +43,20 @@ fn gpu_device() -> Option<RocmDevice> {
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let unit = ((self.0 >> 40) as f32) / (1u32 << 24) as f32;
         (unit - 0.5) * 2.0 * 6.0
     }
 }
 
-fn timed_ms<F: FnMut() -> TestResult>(dev: &RocmDevice, mut launch: F, iters: u32) -> TestResult<f64> {
+fn timed_ms<F: FnMut() -> TestResult>(
+    dev: &RocmDevice,
+    mut launch: F,
+    iters: u32,
+) -> TestResult<f64> {
     for _ in 0..3 {
         launch()?;
     }
@@ -75,7 +82,10 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
     let pre_scale = 1.0f32 / 14.0;
 
     println!("--- B7: ScrubJay vs Q4_K fused dequant, decode (M=1) ---");
-    println!("{:>6}  {:>11}  {:>11}  {:>13}  {:>8}  {:>9}  {:>9}", "N", "scrubjay", "q4k(dot4)", "q4k(scalar)", "ratio", "SJ GB/s", "Q4K GB/s");
+    println!(
+        "{:>6}  {:>11}  {:>11}  {:>13}  {:>8}  {:>9}  {:>9}",
+        "N", "scrubjay", "q4k(dot4)", "q4k(scalar)", "ratio", "SJ GB/s", "Q4K GB/s"
+    );
 
     let mut worst_ratio = f64::INFINITY;
     for &n in &[256usize, 1024, 4096] {
@@ -104,24 +114,80 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
             }
         }
         // Bytes actually resident in VRAM for the weights.
-        let sj_bytes =
-            (sel.len() + idx.len() + sgn.len()) as u64 + (scl.len() * 4) as u64 + 4;
+        let sj_bytes = (sel.len() + idx.len() + sgn.len()) as u64 + (scl.len() * 4) as u64 + 4;
 
         // ---- Q4_K packed --------------------------------------------------
         let q4k = quantize_q4k(&b, n, K)?;
         let q4k_bytes = q4k.len() as u64;
 
         // ---- upload -------------------------------------------------------
-        let a_t = up(&dev, f32_bytes(&a), K, DType { arith: ArithType::F32, storage: Storage::Native }, "a")?;
-        let sel_t = up(&dev, &sel, sel.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sel")?;
-        let idx_t = up(&dev, &idx, idx.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "idx")?;
-        let sgn_t = up(&dev, &sgn, sgn.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sgn")?;
-        let scl_t = up(&dev, f32_bytes(&scl), scl.len(), DType { arith: ArithType::F32, storage: Storage::Native }, "scl")?;
-        let q4k_t = up(&dev, &q4k, q4k.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "q4k")?;
+        let a_t = up(
+            &dev,
+            f32_bytes(&a),
+            K,
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+            "a",
+        )?;
+        let sel_t = up(
+            &dev,
+            &sel,
+            sel.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "sel",
+        )?;
+        let idx_t = up(
+            &dev,
+            &idx,
+            idx.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "idx",
+        )?;
+        let sgn_t = up(
+            &dev,
+            &sgn,
+            sgn.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "sgn",
+        )?;
+        let scl_t = up(
+            &dev,
+            f32_bytes(&scl),
+            scl.len(),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+            "scl",
+        )?;
+        let q4k_t = up(
+            &dev,
+            &q4k,
+            q4k.len(),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            "q4k",
+        )?;
         let out_t = MemoryOps::alloc_storage(
             &dev,
             &Shape::new(vec![n]),
-            DType { arith: ArithType::F32, storage: Storage::Native },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("out alloc: {e}"))?;
 
@@ -130,11 +196,25 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
         }
 
         // ---- time both ---------------------------------------------------
-        let sj_ms = timed_ms(&dev, || {
-            dev.launch_scrub_jay_gemv(r(&a_t), r(&sel_t), r(&idx_t), r(&sgn_t), r(&scl_t), r(&out_t), pre_scale, n, K)
+        let sj_ms = timed_ms(
+            &dev,
+            || {
+                dev.launch_scrub_jay_gemv(
+                    r(&a_t),
+                    r(&sel_t),
+                    r(&idx_t),
+                    r(&sgn_t),
+                    r(&scl_t),
+                    r(&out_t),
+                    pre_scale,
+                    n,
+                    K,
+                )
                 .map(|_| ())
                 .map_err(|e| format!("sj launch: {e}").into())
-        }, ITERS)?;
+            },
+            ITERS,
+        )?;
 
         // The Q4_K baseline is now the vector-dot GEMV the dispatch actually
         // reaches on gfx1200 (the RDNA2-only gate was lifted once
@@ -145,24 +225,35 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
         let q81_t = MemoryOps::alloc_storage(
             &dev,
             &Shape::new(vec![q81_bytes]),
-            DType { arith: ArithType::U8, storage: Storage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("q81 alloc: {e}"))?;
         dev.launch_quantize_q8_1(r(&a_t), r(&q81_t), 1, K)
             .map_err(|e| format!("q8_1 quantize: {e}"))?;
         dev.synchronize();
 
-        let q4k_dot_ms = timed_ms(&dev, || {
-            dev.launch_dot4_q4k_q81_gemv_for_ab(r(&q81_t), r(&q4k_t), r(&out_t), 1, n, K)
-                .map(|_| ())
-                .map_err(|e| format!("q4k dot launch: {e}").into())
-        }, ITERS)?;
+        let q4k_dot_ms = timed_ms(
+            &dev,
+            || {
+                dev.launch_dot4_q4k_q81_gemv_for_ab(r(&q81_t), r(&q4k_t), r(&out_t), 1, n, K)
+                    .map(|_| ())
+                    .map_err(|e| format!("q4k dot launch: {e}").into())
+            },
+            ITERS,
+        )?;
 
-        let q4k_scalar_ms = timed_ms(&dev, || {
-            dev.launch_fused_dequant_gemm_q4k_for_ab(r(&a_t), r(&q4k_t), r(&out_t), 1, n, K)
-                .map(|_| ())
-                .map_err(|e| format!("q4k scalar launch: {e}").into())
-        }, ITERS)?;
+        let q4k_scalar_ms = timed_ms(
+            &dev,
+            || {
+                dev.launch_fused_dequant_gemm_q4k_for_ab(r(&a_t), r(&q4k_t), r(&out_t), 1, n, K)
+                    .map(|_| ())
+                    .map_err(|e| format!("q4k scalar launch: {e}").into())
+            },
+            ITERS,
+        )?;
         let q4k_ms = q4k_dot_ms;
 
         // Weight-stream bandwidth: the decode GEMV is bandwidth-bound, so the
@@ -379,10 +470,14 @@ fn scrub_jay_journey_survives_end_to_end() -> TestResult {
     for (layer, e) in &traj {
         println!("  after layer {layer}: {e:.4}");
     }
-    println!("  final output: {out_err:.4}   argmax f32={aw} scrubjay={ag} (top-2 margin {margin:.4})");
+    println!(
+        "  final output: {out_err:.4}   argmax f32={aw} scrubjay={ag} (top-2 margin {margin:.4})"
+    );
     println!("  argmax preserved: {}", aw == ag);
-    println!("  error / margin = {:.2}x  (< 1.0 means the error is smaller than the decision boundary)",
-        out_err / margin.max(1e-9));
+    println!(
+        "  error / margin = {:.2}x  (< 1.0 means the error is smaller than the decision boundary)",
+        out_err / margin.max(1e-9)
+    );
 
     // GPU arm: the real kernel over real planes, so the cost figure is a launch
     // measurement and the route counter proves the path ran.
@@ -414,26 +509,88 @@ fn scrub_jay_journey_survives_end_to_end() -> TestResult {
             }
         }
     }
-    let a_t = up(&dev, f32_bytes(&x0), k, DType { arith: ArithType::F32, storage: Storage::Native }, "a")?;
-    let sel_t = up(&dev, &sel, sel.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sel")?;
-    let idx_t = up(&dev, &idx, idx.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "idx")?;
-    let sgn_t = up(&dev, &sgn, sgn.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sgn")?;
-    let scl_t = up(&dev, f32_bytes(&scl), scl.len(), DType { arith: ArithType::F32, storage: Storage::Native }, "scl")?;
+    let a_t = up(
+        &dev,
+        f32_bytes(&x0),
+        k,
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+        "a",
+    )?;
+    let sel_t = up(
+        &dev,
+        &sel,
+        sel.len(),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "sel",
+    )?;
+    let idx_t = up(
+        &dev,
+        &idx,
+        idx.len(),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "idx",
+    )?;
+    let sgn_t = up(
+        &dev,
+        &sgn,
+        sgn.len(),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "sgn",
+    )?;
+    let scl_t = up(
+        &dev,
+        f32_bytes(&scl),
+        scl.len(),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+        "scl",
+    )?;
     let out_t = MemoryOps::alloc_storage(
         &dev,
         &Shape::new(vec![n]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
     fn rr(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
         grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
     }
-    let ms = timed_ms(&dev, || {
-        dev.launch_scrub_jay_gemv(rr(&a_t), rr(&sel_t), rr(&idx_t), rr(&sgn_t), rr(&scl_t), rr(&out_t), 1.0, n, k)
+    let ms = timed_ms(
+        &dev,
+        || {
+            dev.launch_scrub_jay_gemv(
+                rr(&a_t),
+                rr(&sel_t),
+                rr(&idx_t),
+                rr(&sgn_t),
+                rr(&scl_t),
+                rr(&out_t),
+                1.0,
+                n,
+                k,
+            )
             .map(|_| ())
             .map_err(|e| format!("launch: {e}").into())
-    }, 50)?;
+        },
+        50,
+    )?;
 
     let after_count = grim_backend_rocm::kernel_route_snapshot()
         .iter()
@@ -444,7 +601,10 @@ fn scrub_jay_journey_survives_end_to_end() -> TestResult {
     println!("--- GPU arm ---");
     println!("  grim_scrub_jay_gemv launches recorded: {launched}");
     println!("  {ms:.4} ms per launch (N={n}, K={k}, M=1)");
-    assert!(launched > 0, "grim_scrub_jay_gemv route never recorded a launch");
+    assert!(
+        launched > 0,
+        "grim_scrub_jay_gemv route never recorded a launch"
+    );
 
     // Verdict. The output-error gate is the same 10% A7 used so the two formats
     // are judged on one scale; the margin ratio is printed rather than gated,
@@ -496,10 +656,16 @@ fn tree_pie_vs_scrub_jay_on_identical_fixture() -> TestResult {
 
     println!("--- identical fixture: f32 vs TreePie vs ScrubJay ---");
     println!("  top-2 logit margin (shared): {margin:.4}");
-    println!("  TreePie  output err {e_tp:.4}  argmax {atp}  err/margin {:.2}x  preserved={}",
-        e_tp / margin.max(1e-9), atp == aw);
-    println!("  ScrubJay  output err {e_sj:.4}  argmax {asj}  err/margin {:.2}x  preserved={}",
-        e_sj / margin.max(1e-9), asj == aw);
+    println!(
+        "  TreePie  output err {e_tp:.4}  argmax {atp}  err/margin {:.2}x  preserved={}",
+        e_tp / margin.max(1e-9),
+        atp == aw
+    );
+    println!(
+        "  ScrubJay  output err {e_sj:.4}  argmax {asj}  err/margin {:.2}x  preserved={}",
+        e_sj / margin.max(1e-9),
+        asj == aw
+    );
 
     // Bytes moved for the same weights, which is the other half of the trade.
     println!("  density: TreePie 5.0 bpw, ScrubJay 5.5 bpw, Q4_K 4.5 bpw");

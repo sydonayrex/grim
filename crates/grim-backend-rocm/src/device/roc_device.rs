@@ -570,7 +570,9 @@ impl RocmDevice {
         let mut warp_size = 32; // Default to W32 (RDNA) fallback
         let mut xnack_val = 0;
         let mut streams = Vec::new();
-            if std::env::var_os("GRIM_INIT_TRACE").is_some() { eprintln!("[init-trace] attrs done, streams..."); }
+        if std::env::var_os("GRIM_INIT_TRACE").is_some() {
+            eprintln!("[init-trace] attrs done, streams...");
+        }
         unsafe {
             let mut val = 0;
             let status =
@@ -692,7 +694,9 @@ impl RocmDevice {
         len: usize,
     ) -> Result<()> {
         if src_ptr.is_null() || dst_ptr.is_null() {
-            return Err(Error::Backend("copy_via_direct_if_possible: null pointer".into()));
+            return Err(Error::Backend(
+                "copy_via_direct_if_possible: null pointer".into(),
+            ));
         }
         self.copy_via_route(src_device, dst_device, src_ptr, dst_ptr, len)
     }
@@ -730,11 +734,20 @@ impl RocmDevice {
         n: usize,
         hidden_dim: usize,
     ) -> Result<()> {
-        if local_in.is_null() || peer_in.is_null() || weight.is_null() || res_out.is_null() || norm_out.is_null() {
-            return Err(Error::Backend("launch_fused_allreduce_rmsnorm_two_gpu: null buffer".into()));
+        if local_in.is_null()
+            || peer_in.is_null()
+            || weight.is_null()
+            || res_out.is_null()
+            || norm_out.is_null()
+        {
+            return Err(Error::Backend(
+                "launch_fused_allreduce_rmsnorm_two_gpu: null buffer".into(),
+            ));
         }
         if n == 0 || hidden_dim == 0 {
-            return Err(Error::Backend("launch_fused_allreduce_rmsnorm_two_gpu: empty dims".into()));
+            return Err(Error::Backend(
+                "launch_fused_allreduce_rmsnorm_two_gpu: empty dims".into(),
+            ));
         }
         let eps_val: f32 = eps;
         let n_i = n as i32;
@@ -1061,6 +1074,12 @@ impl RocmDevice {
     /// (RDNA2+). Graph decode branches on this instead of probing types.
     pub fn supports_dot4(&self) -> bool {
         self.is_dot4_arch
+    }
+
+    /// Whether a Q8_0 dot4 GEMV is exact on this GPU. `grim_sdot4` sign-extends
+    /// both packed operands on RDNA3/4, making Q8_0 dot4 exact across architectures.
+    pub fn q80_dot_ok(&self) -> bool {
+        true
     }
 
     /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver

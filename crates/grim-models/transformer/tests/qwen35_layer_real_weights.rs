@@ -27,7 +27,9 @@ use grim_tensor::{Device, Shape};
 fn model_path() -> Option<std::path::PathBuf> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
         if p.exists() {
             return Some(p);
         }
@@ -154,7 +156,11 @@ fn cmp(what: &str, got: &[f32], want: &[f32], tol: f32) {
 /// and the chain would then be testing the drift.
 fn hand_tail(blk: &Qwen35Block, x: &[f32], proj: &[f32], eps: f32) -> Vec<f32> {
     let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
-    let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+    let pan = blk
+        .post_attention_norm
+        .weight
+        .to_vec_f32()
+        .expect("post norm");
     let h2 = rms(&h1, &pan, eps);
     let (gw, gi, go) = lin_w(&blk.ffn_gate);
     let (uw, ui, uo) = lin_w(&blk.ffn_up);
@@ -169,11 +175,7 @@ fn hand_tail(blk: &Qwen35Block, x: &[f32], proj: &[f32], eps: f32) -> Vec<f32> {
 /// The recurrent (KDA) block's expected output, from llama.cpp, reading the
 /// block's own weights. MUTATES `cache` exactly as the real forward does, so a
 /// chain must hand it the same state the block will see.
-fn hand_recurrent_layer(
-    blk: &Qwen35Block,
-    x: &[f32],
-    cache: &mut Qwen35LayerCache,
-) -> Vec<f32> {
+fn hand_recurrent_layer(blk: &Qwen35Block, x: &[f32], cache: &mut Qwen35LayerCache) -> Vec<f32> {
     let eps = blk.attn_norm.eps;
     let an = blk.attn_norm.weight.to_vec_f32().expect("attn_norm");
     let xn = rms(x, &an, eps);
@@ -185,7 +187,12 @@ fn hand_recurrent_layer(
     // ssm_conv1d.weight has ggml ne0 = tap count (llama.cpp
     // `ggml_ssm_conv`: d_conv = c->ne[0], d_inner = c->ne[1]); the 9B's raw
     // dims are [4, 8192], so element (tap, ch) is at tap + 4*ch.
-    let cw = blk.ssm_conv1d.as_ref().expect("conv").to_vec_f32().expect("cw");
+    let cw = blk
+        .ssm_conv1d
+        .as_ref()
+        .expect("conv")
+        .to_vec_f32()
+        .expect("cw");
     assert_eq!(cw.len(), TAPS * conv_dim(), "conv weight size");
     let mut state = cache.conv_state.clone();
     let mut conv = vec![0.0f32; conv_dim()];
@@ -294,8 +301,20 @@ fn hand_attention_layer(blk: &Qwen35Block, x: &[f32], n_rot: usize, base: f64) -
     assert_eq!(v.len(), kvd);
 
     // Q/K RMS norm per head, BEFORE rope, then NeoX rope at pos 0.
-    let qn = blk.attn_q_norm.as_ref().expect("q_norm").weight.to_vec_f32().unwrap();
-    let kn = blk.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
+    let qn = blk
+        .attn_q_norm
+        .as_ref()
+        .expect("q_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .expect("k_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
     for h in 0..AH {
         let s = h * AHD;
         let n = rms(&q[s..s + AHD], &qn, eps);
@@ -352,7 +371,6 @@ fn seed_recurrent_cache(cache: &mut Qwen35LayerCache) {
     }
 }
 
-
 /// The checkpoint's RoPE: PARTIAL rotary over the first `n_rot` dims, with
 /// `theta_base` from the file.
 ///
@@ -381,7 +399,6 @@ fn rope_partial(v: &mut [f32], pos: f64, n_rot: usize, theta_base: f64) {
     let r = rope_via_device(v, 1, 1, hd, &[pos as u32], n_rot, theta_base);
     v.copy_from_slice(&r);
 }
-
 
 /// The RoPE, by CALLING the backend's implementation rather than modelling it.
 ///
@@ -417,7 +434,9 @@ fn rope_via_device(
     let mut cfg = grim_tensor::RopeConfig::new(head_dim, theta_base as f32);
     cfg.rotary_dim = n_rot;
     let three = Shape::new(vec![1, s_len * heads, head_dim]);
-    let st = dev.from_cpu(t, &three, DType::F32).expect("upload for rope");
+    let st = dev
+        .from_cpu(t, &three, DType::F32)
+        .expect("upload for rope");
     let (roped, _) = dev
         .rope(st.as_ref(), &pos_ext, &cfg, &three)
         .expect("dev.rope");
@@ -506,7 +525,9 @@ fn real_layer_weights_match_the_gguf() {
         ("blk.0.ssm_alpha.weight", HIDDEN * NV),
         ("blk.0.ssm_out.weight", HIDDEN * value_dim()),
     ] {
-        let m = prov.meta(name).unwrap_or_else(|e| panic!("meta {name}: {e}"));
+        let m = prov
+            .meta(name)
+            .unwrap_or_else(|e| panic!("meta {name}: {e}"));
         eprintln!("  {name}: dims {:?}", m.shape);
         assert_eq!(
             m.shape.iter().product::<usize>(),
@@ -535,12 +556,17 @@ fn real_layer_weights_match_the_gguf() {
         assert!(worst <= 1e-6, "{name} differs from the GGUF by {worst:.3e}");
         eprintln!("  {name}: {} values match the checkpoint", f.len());
     };
-    check_vec("blk.0.ssm_norm.weight", &blk.ssm_norm.clone().expect("ssm_norm"));
+    check_vec(
+        "blk.0.ssm_norm.weight",
+        &blk.ssm_norm.clone().expect("ssm_norm"),
+    );
     check_vec("blk.0.ssm_a", &blk.ssm_a.clone().expect("ssm_a"));
-    check_vec("blk.0.ssm_dt.bias", &blk.ssm_dt_bias.clone().expect("dt_bias"));
+    check_vec(
+        "blk.0.ssm_dt.bias",
+        &blk.ssm_dt_bias.clone().expect("dt_bias"),
+    );
     eprintln!("[real-weights] shapes and F32 vectors match the checkpoint");
 }
-
 
 /// The same treatment for a REAL full-attention layer. The synthetic
 /// attention test passed, but no attention layer has ever been run against
@@ -572,10 +598,15 @@ fn real_attention_layer_matches_hand_reference() {
         ("blk.3.attn_v.weight", vec![kvd, HIDDEN]),
         ("blk.3.attn_output.weight", vec![HIDDEN, qd]),
     ] {
-        let m = prov.meta(name).unwrap_or_else(|e| panic!("meta {name}: {e}"));
+        let m = prov
+            .meta(name)
+            .unwrap_or_else(|e| panic!("meta {name}: {e}"));
         assert_eq!(m.shape, want, "{name} shape");
     }
-    eprintln!("[real-attn] fused attn_q is [{} x {HIDDEN}] = [Q | gate]", 2 * qd);
+    eprintln!(
+        "[real-attn] fused attn_q is [{} x {HIDDEN}] = [Q | gate]",
+        2 * qd
+    );
     let (n_rot, base) = rope_params(&prov);
     eprintln!("[real-attn] rope from checkpoint: n_rot={n_rot} freq_base={base}");
 
@@ -683,7 +714,11 @@ fn all_32_blocks_chain_correctly() {
                 at = i;
             }
         }
-        let kind = if blk.is_full_attention { "attn" } else { "kda " };
+        let kind = if blk.is_full_attention {
+            "attn"
+        } else {
+            "kda "
+        };
         eprintln!(
             "[chain] {name} ({kind}) in|out| {:.2}  worst {:.3e} at {at}",
             h.iter().map(|v| v.abs() as f64).sum::<f64>() / HIDDEN as f64,
@@ -739,7 +774,11 @@ struct AttnCfg {
     rope_per_position: bool,
 }
 
-const ATTN_LLAMA: AttnCfg = AttnCfg { scale: true, causal: true, rope_per_position: true };
+const ATTN_LLAMA: AttnCfg = AttnCfg {
+    scale: true,
+    causal: true,
+    rope_per_position: true,
+};
 
 /// Full attention over `positions.len()` rows, from an empty KV cache.
 fn hand_attention_layer_cfg(
@@ -764,8 +803,20 @@ fn hand_attention_layer_cfg(
     let (kw, ki, ko) = lin_w(blk.wk.as_ref().expect("attn_k"));
     let (vw, vi, vo) = lin_w(blk.wv.as_ref().expect("attn_v"));
     let (ow, oi, oo) = lin_w(blk.wo.as_ref().expect("wo"));
-    let qn = blk.attn_q_norm.as_ref().expect("q_norm").weight.to_vec_f32().unwrap();
-    let kn = blk.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
+    let qn = blk
+        .attn_q_norm
+        .as_ref()
+        .expect("q_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .expect("k_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
     assert_eq!((qi, qo), (HIDDEN, 2 * qd), "attn_q geometry");
     assert_eq!((ki, ko), (HIDDEN, kvd), "attn_k geometry");
     assert_eq!((vi, vo), (HIDDEN, kvd), "attn_v geometry");
@@ -823,11 +874,16 @@ fn hand_attention_layer_cfg(
             for s in 0..n_keys {
                 let mut d = 0.0f64;
                 for i in 0..AHD {
-                    d += (q_all[t * qd + h * AHD + i] as f64) * (k_all[s * kvd + kvh * AHD + i] as f64);
+                    d += (q_all[t * qd + h * AHD + i] as f64)
+                        * (k_all[s * kvd + kvh * AHD + i] as f64);
                 }
                 // The 1/sqrt(head_dim) on the QK score. Invisible at S=1 (a
                 // one-key softmax is scale-invariant) and dominant at S>1.
-                let val = if cfg.scale { (d / (AHD as f64).sqrt()) as f32 } else { d as f32 };
+                let val = if cfg.scale {
+                    (d / (AHD as f64).sqrt()) as f32
+                } else {
+                    d as f32
+                };
                 sc[s] = val;
                 if val > mx {
                     mx = val;
@@ -858,7 +914,13 @@ fn hand_attention_layer_cfg(
     out
 }
 
-fn hand_attention_layer_multi(blk: &Qwen35Block, x: &[f32], positions: &[u32], n_rot: usize, base: f64) -> Vec<f32> {
+fn hand_attention_layer_multi(
+    blk: &Qwen35Block,
+    x: &[f32],
+    positions: &[u32],
+    n_rot: usize,
+    base: f64,
+) -> Vec<f32> {
     hand_attention_layer_cfg(blk, x, positions, ATTN_LLAMA, n_rot, base)
 }
 
@@ -875,7 +937,12 @@ fn hand_recurrent_layer_multi(
     let an = blk.attn_norm.weight.to_vec_f32().expect("attn_norm");
     let (qw, qi, qo) = lin_w(blk.attn_qkv.as_ref().expect("attn_qkv"));
     assert_eq!((qi, qo), (HIDDEN, conv_dim()), "attn_qkv geometry");
-    let cw = blk.ssm_conv1d.as_ref().expect("conv").to_vec_f32().expect("cw");
+    let cw = blk
+        .ssm_conv1d
+        .as_ref()
+        .expect("conv")
+        .to_vec_f32()
+        .expect("cw");
     assert_eq!(cw.len(), TAPS * conv_dim(), "conv weight size");
     let (aw, ai, ao) = lin_w(blk.ssm_alpha.as_ref().expect("alpha"));
     let (bw, bi, bo) = lin_w(blk.ssm_beta.as_ref().expect("beta"));
@@ -949,7 +1016,8 @@ fn hand_recurrent_layer_multi(
             let inv = 1.0 / ((ss / HD as f64 + eps as f64).sqrt());
             for i in 0..HD {
                 let idx = h * HD + i;
-                branch[idx] = (acc[i] as f64 * inv * ssm_norm[i] as f64 * silu(z[idx]) as f64) as f32;
+                branch[idx] =
+                    (acc[i] as f64 * inv * ssm_norm[i] as f64 * silu(z[idx]) as f64) as f32;
             }
         }
 
@@ -993,7 +1061,12 @@ fn multi_token_reference_agrees_with_the_single_token_one() {
     eprintln!("[rope] checkpoint: n_rot={n_rot} freq_base={base}");
     let single = hand_attention_layer(&attn, &x, n_rot, base);
     let multi = hand_attention_layer_multi(&attn, &x, &[0], n_rot, base);
-    cmp("attention S=1 (single vs multi reference)", &multi, &single, 1e-5);
+    cmp(
+        "attention S=1 (single vs multi reference)",
+        &multi,
+        &single,
+        1e-5,
+    );
 
     let ws = grim_nn::WeightSource::root(&prov, Device::Cpu).pp("blk.0");
     let rec = Qwen35Block::load_tp(&ws, &c, 0, grim_nn::TensorParallelConfig::default())
@@ -1004,7 +1077,12 @@ fn multi_token_reference_agrees_with_the_single_token_one() {
     seed_recurrent_cache(&mut cb);
     let single = hand_recurrent_layer(&rec, &x, &mut ca);
     let multi = hand_recurrent_layer_multi(&rec, &x, 1, &mut cb);
-    cmp("recurrent S=1 (single vs multi reference)", &multi, &single, 1e-5);
+    cmp(
+        "recurrent S=1 (single vs multi reference)",
+        &multi,
+        &single,
+        1e-5,
+    );
 }
 
 /// THE PREFILL CHAIN — all 32 blocks at seq_len=5, positions 0..4, each fed the
@@ -1043,7 +1121,11 @@ fn all_32_blocks_chain_correctly_at_seq_len_5() {
         let ws = grim_nn::WeightSource::root(&prov, Device::Cpu).pp(&name);
         let blk = Qwen35Block::load_tp(&ws, &c, k, grim_nn::TensorParallelConfig::default())
             .unwrap_or_else(|e| panic!("load {name}: {e}"));
-        assert_eq!(blk.is_full_attention, (k + 1) % 4 == 0, "{name} layer-type predicate");
+        assert_eq!(
+            blk.is_full_attention,
+            (k + 1) % 4 == 0,
+            "{name} layer-type predicate"
+        );
 
         let mut cache = Qwen35LayerCache::new(&c);
         seed_recurrent_cache(&mut cache);
@@ -1077,7 +1159,11 @@ fn all_32_blocks_chain_correctly_at_seq_len_5() {
                 at = i;
             }
         }
-        let kind = if blk.is_full_attention { "attn" } else { "kda " };
+        let kind = if blk.is_full_attention {
+            "attn"
+        } else {
+            "kda "
+        };
         let (row, col) = (at / HIDDEN, at % HIDDEN);
         eprintln!(
             "[chain5] {name} ({kind}) worst {worst:.3e} at row {row} col {col} \
@@ -1161,9 +1247,27 @@ fn attn_seq5_hypothesis_sweep_names_the_defect() {
 
     let hyps: Vec<(&str, AttnCfg)> = vec![
         ("llama.cpp: scaled + causal + rope-per-pos", ATTN_LLAMA),
-        ("no QK scale", AttnCfg { scale: false, ..ATTN_LLAMA }),
-        ("non-causal (row t sees all keys)", AttnCfg { causal: false, ..ATTN_LLAMA }),
-        ("rope at pos 0 for every row", AttnCfg { rope_per_position: false, ..ATTN_LLAMA }),
+        (
+            "no QK scale",
+            AttnCfg {
+                scale: false,
+                ..ATTN_LLAMA
+            },
+        ),
+        (
+            "non-causal (row t sees all keys)",
+            AttnCfg {
+                causal: false,
+                ..ATTN_LLAMA
+            },
+        ),
+        (
+            "rope at pos 0 for every row",
+            AttnCfg {
+                rope_per_position: false,
+                ..ATTN_LLAMA
+            },
+        ),
     ];
 
     let mut results: Vec<(&str, Vec<f32>)> = Vec::new();
@@ -1254,7 +1358,13 @@ fn seq5_kv_arena_contents_vs_computed() {
     let an = blk.attn_norm.weight.to_vec_f32().expect("attn_norm");
     let (kw, ki, ko) = lin_w(blk.wk.as_ref().expect("attn_k"));
     let (vw, vi, vo) = lin_w(blk.wv.as_ref().expect("attn_v"));
-    let kn = blk.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .expect("k_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
     let (n_rot, base) = rope_params(&prov);
     eprintln!("[rope] arena test: n_rot={n_rot} freq_base={base}");
     let mut want_k = vec![0.0f32; S * kvd]; // POST-rope
@@ -1370,7 +1480,11 @@ fn seq5_kv_arena_contents_vs_computed() {
              | closest other row {} at {:.3e}",
             err_vs(&want_k_pre),
             err_vs(&want_k_r0),
-            if best_other.0 == usize::MAX { -1i64 } else { best_other.0 as i64 },
+            if best_other.0 == usize::MAX {
+                -1i64
+            } else {
+                best_other.0 as i64
+            },
             best_other.1
         );
     }
@@ -1418,7 +1532,13 @@ fn seq5_solve_for_the_rope_position_used() {
     let eps = blk.attn_norm.eps;
     let an = blk.attn_norm.weight.to_vec_f32().expect("attn_norm");
     let (kw, ki, ko) = lin_w(blk.wk.as_ref().expect("attn_k"));
-    let kn = blk.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .expect("k_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
     let (n_rot, base) = rope_params(&prov);
     eprintln!("[rope] arena test: n_rot={n_rot} freq_base={base}");
     // Pre-rope, per-head-normed K for every row.
@@ -1625,8 +1745,18 @@ fn seq5_rope_kernel_vs_arena() {
         .expect("wk.forward")
         .to_vec_f32()
         .expect("read");
-    let kn = blk.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
-    let eps = blk.attn_k_norm.as_ref().map(|n| n.eps).unwrap_or(blk.attn_norm.eps);
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .expect("k_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
+    let eps = blk
+        .attn_k_norm
+        .as_ref()
+        .map(|n| n.eps)
+        .unwrap_or(blk.attn_norm.eps);
     let mut k_normed = k_proj.clone();
     for t in 0..S {
         for h in 0..AKV {
@@ -1669,7 +1799,11 @@ fn seq5_rope_kernel_vs_arena() {
         .to_cpu_vec_f32()
         .expect("read arena");
 
-    eprintln!("[split] grim_rope {} floats, arena {} floats", grim_rope.len(), arena.len());
+    eprintln!(
+        "[split] grim_rope {} floats, arena {} floats",
+        grim_rope.len(),
+        arena.len()
+    );
     for t in 0..S {
         let row_err = |cand: &[f32]| -> f32 {
             let mut w = 0.0f32;
@@ -1821,19 +1955,36 @@ fn seq5_kv_arena_on_rocm_matches_oracle() {
     }
     eprintln!(
         "[rocm] per-row worst: {:?}",
-        per_row.iter().map(|v| format!("{v:.2e}")).collect::<Vec<_>>()
+        per_row
+            .iter()
+            .map(|v| format!("{v:.2e}"))
+            .collect::<Vec<_>>()
     );
 
     // ---- 2. the K ARENA ----------------------------------------------------
     let arena = cache.k_device.as_ref().expect("block must fill a K arena");
     let k_hist = arena.to_cpu_vec_f32().expect("read K arena");
-    eprintln!("[rocm] K arena {} floats, shape {:?}", k_hist.len(), arena.shape().dims());
+    eprintln!(
+        "[rocm] K arena {} floats, shape {:?}",
+        k_hist.len(),
+        arena.shape().dims()
+    );
     for t in 0..S.min(k_hist.len() / kvd) {
         // Compare the arena row against the K this block's weights produce, using
         // the same recipe as the CPU test.
         let mut wk = 0.0f32;
-        let kn = blk_cpu.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
-        let eps = blk_cpu.attn_k_norm.as_ref().map(|n| n.eps).unwrap_or(blk_cpu.attn_norm.eps);
+        let kn = blk_cpu
+            .attn_k_norm
+            .as_ref()
+            .expect("k_norm")
+            .weight
+            .to_vec_f32()
+            .unwrap();
+        let eps = blk_cpu
+            .attn_k_norm
+            .as_ref()
+            .map(|n| n.eps)
+            .unwrap_or(blk_cpu.attn_norm.eps);
         let (kw, ki, ko) = lin_w(blk_cpu.wk.as_ref().expect("attn_k"));
         let an = blk_cpu.attn_norm.weight.to_vec_f32().expect("attn_norm");
         let xn = rms(&x[t * HIDDEN..(t + 1) * HIDDEN], &an, blk_cpu.attn_norm.eps);
@@ -1907,10 +2058,15 @@ fn seq5_identical_rows_isolate_the_rope_position() {
         "block loaded onto {:?}, not ROCm — this would be a false green",
         blk.device
     );
-    eprintln!("[iso] block rotary_dim={} (checkpoint says {ck_n_rot})", blk.rotary_dim);
+    eprintln!(
+        "[iso] block rotary_dim={} (checkpoint says {ck_n_rot})",
+        blk.rotary_dim
+    );
 
     // ONE row, replicated five times.
-    let row0: Vec<f32> = (0..HIDDEN).map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5).collect();
+    let row0: Vec<f32> = (0..HIDDEN)
+        .map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5)
+        .collect();
     let x: Vec<f32> = row0.iter().cycle().take(S * HIDDEN).copied().collect();
     assert!(
         x[..HIDDEN] == x[HIDDEN..2 * HIDDEN] && x[HIDDEN..2 * HIDDEN] == x[2 * HIDDEN..3 * HIDDEN],
@@ -1945,8 +2101,18 @@ fn seq5_identical_rows_isolate_the_rope_position() {
     let an = blk_cpu.attn_norm.weight.to_vec_f32().expect("attn_norm");
     let xn = rms(&row0, &an, blk_cpu.attn_norm.eps);
     let (kw, ki, ko) = lin_w(blk_cpu.wk.as_ref().expect("attn_k"));
-    let kn = blk_cpu.attn_k_norm.as_ref().expect("k_norm").weight.to_vec_f32().unwrap();
-    let keps = blk_cpu.attn_k_norm.as_ref().map(|n| n.eps).unwrap_or(blk_cpu.attn_norm.eps);
+    let kn = blk_cpu
+        .attn_k_norm
+        .as_ref()
+        .expect("k_norm")
+        .weight
+        .to_vec_f32()
+        .unwrap();
+    let keps = blk_cpu
+        .attn_k_norm
+        .as_ref()
+        .map(|n| n.eps)
+        .unwrap_or(blk_cpu.attn_norm.eps);
     let mut k_norm = matvec(&xn, &kw, ki, ko);
     for h in 0..AKV {
         let s0 = h * AHD;
@@ -2022,7 +2188,9 @@ fn seq5_identical_rows_isolate_the_rope_position() {
     let grim_rope2 = roped2.to_cpu_vec_f32().expect("read");
 
     // The block's own parameters — the decisive candidate.
-    let st3 = dev.from_cpu(&k_norm_5, &t3_shape, DType::F32).expect("upload");
+    let st3 = dev
+        .from_cpu(&k_norm_5, &t3_shape, DType::F32)
+        .expect("upload");
     let (rb, _) = dev
         .rope(st3.as_ref(), &pos_ext, &block_cfg, &t3_shape)
         .expect("dev.rope with the BLOCK's cfg");
@@ -2085,9 +2253,14 @@ fn seq5_what_do_arena_rows_hold() {
     let ws = grim_nn::WeightSource::root(&prov, device.clone()).pp("blk.3");
     let blk = Qwen35Block::load_tp(&ws, &c, 3, grim_nn::TensorParallelConfig::default())
         .expect("load on GPU");
-    assert!(matches!(blk.device, Device::Rocm(_)), "not ROCm — false green");
+    assert!(
+        matches!(blk.device, Device::Rocm(_)),
+        "not ROCm — false green"
+    );
 
-    let row0: Vec<f32> = (0..HIDDEN).map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5).collect();
+    let row0: Vec<f32> = (0..HIDDEN)
+        .map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5)
+        .collect();
     let x: Vec<f32> = row0.iter().cycle().take(S * HIDDEN).copied().collect();
     let x_t = grim_tensor::Tensor::new(
         std::sync::Arc::from(
@@ -2101,7 +2274,12 @@ fn seq5_what_do_arena_rows_hold() {
     );
     let mut cache = Qwen35LayerCache::new(&c);
     blk.forward(&x_t, &positions, &mut cache).expect("forward");
-    let k_hist = cache.k_device.as_ref().expect("arena").to_cpu_vec_f32().expect("read");
+    let k_hist = cache
+        .k_device
+        .as_ref()
+        .expect("arena")
+        .to_cpu_vec_f32()
+        .expect("read");
 
     let ws_cpu = grim_nn::WeightSource::root(&prov, Device::Cpu).pp("blk.3");
     let bc = Qwen35Block::load_tp(&ws_cpu, &c, 3, grim_nn::TensorParallelConfig::default())
@@ -2134,18 +2312,28 @@ fn seq5_what_do_arena_rows_hold() {
         (mx, mean, 0.0)
     };
 
-    eprintln!("[what] n_rot={} base={}", rope_params(&prov).0, rope_params(&prov).1);
-    eprintln!("[what] |k|max={:.5} |v|max={:.5} |q|max={:.5}", 
-        k.iter().fold(0.0f32,|a,b|a.max(b.abs())),
-        v.iter().fold(0.0f32,|a,b|a.max(b.abs())),
-        q.iter().fold(0.0f32,|a,b|a.max(b.abs())));
+    eprintln!(
+        "[what] n_rot={} base={}",
+        rope_params(&prov).0,
+        rope_params(&prov).1
+    );
+    eprintln!(
+        "[what] |k|max={:.5} |v|max={:.5} |q|max={:.5}",
+        k.iter().fold(0.0f32, |a, b| a.max(b.abs())),
+        v.iter().fold(0.0f32, |a, b| a.max(b.abs())),
+        q.iter().fold(0.0f32, |a, b| a.max(b.abs()))
+    );
     for t in 0..S {
         let arow = &k_hist[t * kvd..(t + 1) * kvd];
         let (mx, mean, _) = stats(arow);
         eprintln!(
             "[what] row {t}: |max|={mx:.5} mean|x|={mean:.5} | vs k {:.3e} | vs v {:.3e} \
              | vs q {:.3e} | vs gate {:.3e} | vs zeros {:.3e}",
-            err(arow, &k), err(arow, &v), err(arow, q), err(arow, gate), err(arow, &vec![0.0f32; kvd])
+            err(arow, &k),
+            err(arow, &v),
+            err(arow, q),
+            err(arow, gate),
+            err(arow, &vec![0.0f32; kvd])
         );
     }
 }
@@ -2185,10 +2373,15 @@ fn seq5_device_projection_per_row() {
     let ws = grim_nn::WeightSource::root(&prov, device.clone()).pp("blk.3");
     let blk = Qwen35Block::load_tp(&ws, &c, 3, grim_nn::TensorParallelConfig::default())
         .expect("load blk.3 on the GPU");
-    assert!(matches!(blk.device, Device::Rocm(_)), "not ROCm — false green");
+    assert!(
+        matches!(blk.device, Device::Rocm(_)),
+        "not ROCm — false green"
+    );
 
     // FIVE DISTINCT rows: a per-row defect cannot hide behind identical inputs.
-    let x: Vec<f32> = (0..S * HIDDEN).map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5).collect();
+    let x: Vec<f32> = (0..S * HIDDEN)
+        .map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5)
+        .collect();
     let x_t = grim_tensor::Tensor::new(
         std::sync::Arc::from(
             dev.from_cpu(&x, &Shape::new(vec![S, HIDDEN]), DType::F32)
@@ -2335,7 +2528,9 @@ fn seq5_reshaped_view_is_bit_exact_on_device() {
     let flat = Shape::new(vec![S, wide]);
     let t3d = Shape::new(vec![1, S * AKV, AHD]);
 
-    let st = dev.from_cpu(&src, &flat, DType::F32).expect("upload [5,1024]");
+    let st = dev
+        .from_cpu(&src, &flat, DType::F32)
+        .expect("upload [5,1024]");
     let t = grim_tensor::Tensor::new(
         std::sync::Arc::from(st),
         flat.clone(),
@@ -2348,10 +2543,14 @@ fn seq5_reshaped_view_is_bit_exact_on_device() {
     // `alloc_storage(target_shape)` then `copy_slice_into(fresh, src, 0,
     // elem_count)` — a 5120-float D2D copy into a differently-shaped buffer,
     // which is the whole content of the reshape.
-    let up = dev.alloc_storage(&t3d, DType::F32).expect("alloc the [1,20,256] destination");
+    let up = dev
+        .alloc_storage(&t3d, DType::F32)
+        .expect("alloc the [1,20,256] destination");
     dev.copy_slice_into(up.as_ref(), t.storage().as_ref(), 0, S * wide)
         .expect("5120-float D2D copy into the reshaped destination");
-    let back = dev.alloc_storage(&flat, DType::F32).expect("alloc the [5,1024] destination");
+    let back = dev
+        .alloc_storage(&flat, DType::F32)
+        .expect("alloc the [5,1024] destination");
     dev.copy_slice_into(back.as_ref(), up.as_ref(), 0, S * wide)
         .expect("5120-float D2D copy back");
     let got = back.to_cpu_vec_f32().expect("read round-tripped buffer");
@@ -2380,7 +2579,8 @@ fn seq5_reshaped_view_is_bit_exact_on_device() {
         at % wide
     );
     assert_eq!(
-        mismatched, 0,
+        mismatched,
+        0,
         "reshaped_view is NOT bit-exact on the device: {mismatched} of {} elements differ \\
          (worst {worst:.3e} at flat index {at}, row {} col {}). This is the 5120-float D2D copy \\
          inside `rope_ext`, on the same `copy_slice_range` path whose hipMemcpyAsync keeps \\
@@ -2447,26 +2647,29 @@ fn tail_output_norm_and_lm_head_match_the_reference() {
 
     // ---- the tail, through grim's own objects ------------------------------
     let ws_out = grim_nn::WeightSource::root(&prov, Device::Cpu);
-    let on = grim_nn::modules::RmsNorm::load(
-        &ws_out.pp("output_norm"),
-        HIDDEN,
-        c.rms_norm_eps,
-    )
-    .expect("load output_norm");
+    let on = grim_nn::modules::RmsNorm::load(&ws_out.pp("output_norm"), HIDDEN, c.rms_norm_eps)
+        .expect("load output_norm");
     eprintln!(
         "[tail] output_norm weight len={} eps={}",
         on.weight.to_vec_f32().map(|v| v.len()).unwrap_or(0),
         on.eps
     );
     let oh = grim_backend_cpu::cpu_tensor(h.clone(), Shape::new(vec![S, HIDDEN]));
-    let normed = on.forward(&oh).expect("output_norm.forward").to_vec_f32().expect("read");
+    let normed = on
+        .forward(&oh)
+        .expect("output_norm.forward")
+        .to_vec_f32()
+        .expect("read");
 
     // ---- the reference ------------------------------------------------------
     let onw = on.weight.to_vec_f32().expect("output_norm weight");
     let mut want_normed = vec![0.0f32; S * HIDDEN];
     for t in 0..S {
-        want_normed[t * HIDDEN..(t + 1) * HIDDEN]
-            .copy_from_slice(&rms(&h[t * HIDDEN..(t + 1) * HIDDEN], &onw, on.eps));
+        want_normed[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&rms(
+            &h[t * HIDDEN..(t + 1) * HIDDEN],
+            &onw,
+            on.eps,
+        ));
     }
     let mut worst = 0.0f32;
     let mut at = 0usize;
@@ -2478,7 +2681,11 @@ fn tail_output_norm_and_lm_head_match_the_reference() {
             at = i;
         }
     }
-    eprintln!("[tail] output_norm: worst {worst:.3e} at row {} col {}", at / HIDDEN, at % HIDDEN);
+    eprintln!(
+        "[tail] output_norm: worst {worst:.3e} at row {} col {}",
+        at / HIDDEN,
+        at % HIDDEN
+    );
     assert!(
         worst <= 1e-4,
         "output_norm does not match the RMS reference (worst {worst:.3e} at row {} col {}). \
@@ -2669,7 +2876,9 @@ fn kda_branch_multi_row_projections_on_device() {
         .expect("load blk.0 on the CPU");
 
     // Distinct rows, so a per-row defect cannot hide behind symmetric inputs.
-    let x: Vec<f32> = (0..S * HIDDEN).map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5).collect();
+    let x: Vec<f32> = (0..S * HIDDEN)
+        .map(|i| ((i * 13 % 31) as f32) / 31.0 - 0.5)
+        .collect();
     let x_t = grim_tensor::Tensor::new(
         std::sync::Arc::from(
             dev.from_cpu(&x, &Shape::new(vec![S, HIDDEN]), DType::F32)
@@ -2721,7 +2930,11 @@ fn kda_branch_multi_row_projections_on_device() {
             "{tag}: block weight reports in={w_in}, expected {HIDDEN} — the reference below \
              indexes with in={HIDDEN} and would be measuring a transposed weight"
         );
-        assert!(got.len() >= S * width, "{tag} returned {} floats", got.len());
+        assert!(
+            got.len() >= S * width,
+            "{tag} returned {} floats",
+            got.len()
+        );
         let mut worst = 0.0f32;
         let mut at = 0usize;
         for t in 0..S {
@@ -2786,7 +2999,10 @@ fn ssm_alpha_linear_forward_depends_on_m() {
     let ws = grim_nn::WeightSource::root(&prov, device.clone()).pp("blk.0");
     let bg = Qwen35Block::load_tp(&ws, &c, 0, grim_nn::TensorParallelConfig::default())
         .expect("load blk.0 on the GPU");
-    assert!(matches!(bg.device, Device::Rocm(_)), "not ROCm — false green");
+    assert!(
+        matches!(bg.device, Device::Rocm(_)),
+        "not ROCm — false green"
+    );
     let gl = bg.ssm_alpha.as_ref().expect("ssm_alpha");
     // The reference weight comes from a CPU copy: `to_vec_f32` on a
     // DEVICE-resident K-quant tensor is broken (it asks for 4 B/elem against a

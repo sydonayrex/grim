@@ -1,8 +1,8 @@
 //! `grim train` — SFT training loop: dataset loading, streaming forward, cross-entropy loss, autograd backward, AdamW step, sidecar persistence. F4: real model loading via GrimProvider.
 
 use grim_autograd::{
-    backward, cross_entropy_loss, AutogradRegistry, AutogradScope, InjectionConfig,
-    LoRAInjectionRegistry, Tape,
+    AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape, backward,
+    cross_entropy_loss,
 };
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
@@ -1856,8 +1856,8 @@ mod tests {
         let seq_len = input_ids.len();
 
         use grim_autograd::{
-            apply_and_record_lora, AdamW, AdamWConfig, AutogradRegistry, InjectionConfig,
-            LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
+            AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
+            LoRAInjectionRegistry, Tape, apply_and_record_lora,
         };
 
         let inj_cfg = InjectionConfig {
@@ -1935,8 +1935,8 @@ mod tests {
         use grim_backend_cpu::cpu_tensor;
         use grim_engine::streaming_forward::StreamingBlockForward;
         use grim_models_transformer::LlamaConfig;
-        use grim_nn::modules::Embedding;
         use grim_nn::WeightSource;
+        use grim_nn::modules::Embedding;
         use grim_tensor::Shape;
 
         let vocab = 16usize;

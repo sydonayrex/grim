@@ -337,7 +337,11 @@ fn raw_hip_ffi_outside_the_backend_crate_is_guarded() {
         .parent()
         .expect("crates/grim-backend-rocm -> crates/")
         .to_path_buf();
-    assert!(workspace.is_dir(), "expected crates dir at {}", workspace.display());
+    assert!(
+        workspace.is_dir(),
+        "expected crates dir at {}",
+        workspace.display()
+    );
 
     const RISKY: &[&str] = &[
         "hipMemcpyAsync(",

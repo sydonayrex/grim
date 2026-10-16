@@ -5,13 +5,13 @@
 
 use std::ffi::c_void;
 
+use grim_tensor::BackendStorage;
 use grim_tensor::dtype::{ArithType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::BackendStorage;
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, HipDim3};
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Returns `true` when the activation storage holds native FP16 data
@@ -448,7 +448,9 @@ impl grim_format::convert::GpuDequant for RocmDevice {
         bytes: &[u8],
         elem_count: usize,
     ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
-        let _serial = dequant_serial_lock(self.ordinal).lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = dequant_serial_lock(self.ordinal)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
         match storage {
             Storage::KQuant(KQuantScheme::Q80) => {

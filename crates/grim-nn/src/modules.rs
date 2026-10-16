@@ -2844,7 +2844,17 @@ pub fn short_conv1d(
                 }
             }
             let dev = pick_device_for_tensor(state);
-            let new_shape = Shape::new(vec![b, d, k_size - 1]);
+            // Preserve the caller's shape label: the flat order above is
+            // channel-major regardless, and no reader here is dim-aware
+            // (sizing derives from `len / (b*d)`), so flipping the label
+            // ([B,K-1,D] -> [B,D,K-1]) only breaks dim-aware callers across
+            // calls while changing no numerics. Keep what arrived.
+            let in_shape = state.shape().clone();
+            let new_shape = if in_shape.elem_count() == new_state.len() {
+                in_shape
+            } else {
+                Shape::new(vec![b, k_size - 1, d])
+            };
             let storage = dev.from_cpu(&new_state, &new_shape, DType::F32)?;
             *state = Tensor::new(
                 Arc::from(storage),

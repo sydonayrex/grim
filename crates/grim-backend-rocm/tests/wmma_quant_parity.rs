@@ -126,9 +126,7 @@ fn run_case(
             nonfinite += 1;
         }
     }
-    eprintln!(
-        "[{format:?}] m={m} n={n} k={k} max_diff={max_diff} nonfinite={nonfinite}"
-    );
+    eprintln!("[{format:?}] m={m} n={n} k={k} max_diff={max_diff} nonfinite={nonfinite}");
     assert_eq!(
         nonfinite, 0,
         "{format:?}: WMMA kernel produced {nonfinite} non-finite outputs (NaN/Inf)"
@@ -311,8 +309,7 @@ fn wmma_quant_partial_m_parity_and_route() {
             &quant_q4k,
             &|blk, n| grim_quant::dequant_q4k(blk, n).unwrap(),
         );
-        let wmma =
-            grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
+        let wmma = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
         let tiled =
             grim_backend_rocm::rocm_kernel_route_counter("grim_fused_dequant_gemm_q4k_tiled");
         let ksplit =
@@ -362,10 +359,11 @@ fn wmma_big_q4k_large_m_parity_and_route() {
         );
         let big = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big_q4k");
         let big128 = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big128_q4k");
-        let big64x128 =
-            grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big64x128_q4k");
+        let big64x128 = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big64x128_q4k");
         let small = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
-        eprintln!("[big-q4k] m={m} big={big} big128={big128} big64x128={big64x128} small16={small}");
+        eprintln!(
+            "[big-q4k] m={m} big={big} big128={big128} big64x128={big64x128} small16={small}"
+        );
         // The 64x128 tile (12.89 ms vs 128x64's 19.88 at m=4056 n=4096 k=4096)
         // owns every m >= 64 whose n is a multiple of 128 — the test's n=1024
         // qualifies — because halving the A-side passes beats everything else
@@ -375,7 +373,8 @@ fn wmma_big_q4k_large_m_parity_and_route() {
             "m={m}: the 64x128 tile must serve large-M prefill at n%128==0"
         );
         assert_eq!(
-            big + big128 + big64x128 + small, 1,
+            big + big128 + big64x128 + small,
+            1,
             "m={m}: exactly one WMMA tile kernel must serve this shape"
         );
     }

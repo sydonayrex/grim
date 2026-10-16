@@ -254,6 +254,14 @@ extern "C" __global__ void grim_sigmoid(const float* x, float* out, int n) {
     out[i] = 1.0f / (1.0f + expf(-v));
 }
 
+extern "C" __global__ void grim_sigmoid_mul(const float* gate, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = gate[i];
+    float s = 1.0f / (1.0f + expf(-v));
+    out[i] *= s;
+}
+
 // GeLU (tanh approximation): out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 extern "C" __global__ void grim_gelu(const float* x, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -665,12 +673,20 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
 extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int* pos_base,
                                                float* out,
                                                int b, int s, int d, int half, float base,
-                                               int interleaved, int num_heads) {
+                                               int interleaved, int num_heads, int rotary_dim) {
     // One thread per (batch, step, dim-half-pair) element. `s` is the flattened
     // query length = num_heads * steps. All heads within the same step share one
     // position, so the step index is `si / num_heads` and the position is
     // `base + step_idx` — exactly mirroring the host-position `grim_rope` with
     // positions[] = [base+t repeated num_heads times per step].
+    //
+    // Partial rotary: only the first `rotary_dim` dims rotate (pairs
+    // (i, i+rhalf) NeoX / (2i, 2i+1) interleaved, frequencies use the FULL d
+    // exactly like `grim_rope_yarn`); dims [rotary_dim, d) pass through.
+    // rotary_dim >= d reproduces the old full-width behavior exactly.
+    int rhalf = rotary_dim / 2;
+    if (rhalf > half) rhalf = half;
+    if (rhalf < 0) rhalf = 0;
     int total = b * s * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -678,19 +694,26 @@ extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int
     int rem = idx - bi * (s * half);
     int si = rem / half;
     int i = rem - si * half;
-    int step_idx = (num_heads > 0) ? (si / num_heads) : si;
-    float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
-    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
-    float val = pos * freq;
-    float sin_val = sinf(val);
-    float cos_val = cosf(val);
     int base_idx = (bi * s + si) * d;
-    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
-    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
-    float x1 = x[a_idx];
-    float x2 = x[b_idx];
-    out[a_idx] = x1 * cos_val - x2 * sin_val;
-    out[b_idx] = x2 * cos_val + x1 * sin_val;
+    if (i < rhalf) {
+        int step_idx = (num_heads > 0) ? (si / num_heads) : si;
+        float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
+        float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+        float val = pos * freq;
+        float sin_val = sinf(val);
+        float cos_val = cosf(val);
+        int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+        int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + rhalf + i);
+        float x1 = x[a_idx];
+        float x2 = x[b_idx];
+        out[a_idx] = x1 * cos_val - x2 * sin_val;
+        out[b_idx] = x2 * cos_val + x1 * sin_val;
+    } else {
+        // Passthrough tail: 2 elements per thread covers [2*rhalf, d) exactly.
+        int e0 = 2 * rhalf + 2 * (i - rhalf);
+        out[base_idx + e0] = x[base_idx + e0];
+        out[base_idx + e0 + 1] = x[base_idx + e0 + 1];
+    }
 }
 
 // PLAN-decode-throughput-restore: fused QK-norm + device-base RoPE. Same math
@@ -2761,4 +2784,3 @@ mod tests {
         assert!(OTHER_KERNEL_SOURCE.contains("grim_argmax_stage2"));
     }
 }
-

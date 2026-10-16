@@ -11,8 +11,8 @@ use grim_backend_rocm::{
 use grim_format::GgufProvider;
 use grim_format::fusion::build_transformer_ir;
 use grim_format::gguf::{
-    GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp, GrimMetadata,
-    GrimRocmlProfile, GrimTrainQuantMode, read_gguf, read_tensor_bytes,
+    GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp, GrimMetadata, GrimRocmlProfile,
+    GrimTrainQuantMode, read_gguf, read_tensor_bytes,
 };
 use grim_quant::{
     FisherCalibrationSample, ImportanceScores, QuantFormat, RcoConfig, RewrittenTensorData,
@@ -146,7 +146,9 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
         println!(
             "grim.rco.allocation: {} entries (provenance: {})",
             alloc.len(),
-            grim.rco_allocation_provenance.as_deref().unwrap_or("unknown")
+            grim.rco_allocation_provenance
+                .as_deref()
+                .unwrap_or("unknown")
         );
     }
     if let Some(scores) = &grim.calibration_scores {
@@ -162,7 +164,11 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
                         "{} ({} bytes, sha256:{})",
                         a.kind,
                         a.size,
-                        a.sha256.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+                        a.sha256
+                            .iter()
+                            .take(8)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
                     ))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -300,13 +306,28 @@ pub fn cmd_oxidizer_search(
             // restrict the ladder (diagnostic for serving defects).
             available_bpws: std::env::var("GRIM_RCO_MENU")
                 .ok()
-                .map(|v| v.split(',').filter_map(|x| x.trim().parse::<u32>().ok()).collect())
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|x| x.trim().parse::<u32>().ok())
+                        .collect()
+                })
                 .unwrap_or_else(|| vec![2, 7, 3, 4, 5, 6]),
             costs: {
-                let all = [(2u32, 2.25f64), (7, 2.625), (3, 3.4375), (4, 4.5), (5, 5.5), (6, 6.5)];
+                let all = [
+                    (2u32, 2.25f64),
+                    (7, 2.625),
+                    (3, 3.4375),
+                    (4, 4.5),
+                    (5, 5.5),
+                    (6, 6.5),
+                ];
                 let menu = std::env::var("GRIM_RCO_MENU")
                     .ok()
-                    .map(|v| v.split(',').filter_map(|x| x.trim().parse::<u32>().ok()).collect::<Vec<u32>>())
+                    .map(|v| {
+                        v.split(',')
+                            .filter_map(|x| x.trim().parse::<u32>().ok())
+                            .collect::<Vec<u32>>()
+                    })
                     .unwrap_or_else(|| vec![2, 7, 3, 4, 5, 6]);
                 Some(
                     menu.iter()
@@ -358,11 +379,20 @@ fn sibling_candidates(kind: &str, model_path: &str) -> Vec<String> {
             "mmproj.gguf",
         ],
         "imatrix" => &["{s}-imatrix.gguf", "{s}.imatrix.gguf", "imatrix-{s}.gguf"],
-        "mtp" => &["{s}-mtp.gguf", "{s}.mtp.gguf", "{s}-mtp-draft.gguf", "{s}-draft.gguf"],
+        "mtp" => &[
+            "{s}-mtp.gguf",
+            "{s}.mtp.gguf",
+            "{s}-mtp-draft.gguf",
+            "{s}-draft.gguf",
+        ],
         _ => &[],
     };
     pats.iter()
-        .map(|pat| dir.join(pat.replace("{s}", stem)).to_string_lossy().into_owned())
+        .map(|pat| {
+            dir.join(pat.replace("{s}", stem))
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect()
 }
 
@@ -422,9 +452,7 @@ impl EmbedSidecars {
             let path: String = match explicit {
                 Some(p) => {
                     if !Path::new(p).exists() {
-                        return Err(format!(
-                            "--embed-{kind}: file not found: {p}"
-                        ));
+                        return Err(format!("--embed-{kind}: file not found: {p}"));
                     }
                     p.clone()
                 }
@@ -436,8 +464,8 @@ impl EmbedSidecars {
                     None => continue,
                 },
             };
-            let bytes = fs::read(&path)
-                .map_err(|e| format!("--embed-{kind}: cannot read {path}: {e}"))?;
+            let bytes =
+                fs::read(&path).map_err(|e| format!("--embed-{kind}: cannot read {path}: {e}"))?;
             eprintln!(
                 "[grim convert] embedding {kind} sidecar: {} ({} bytes)",
                 path,
@@ -506,13 +534,10 @@ pub fn cmd_oxidizer_convert(
                 let (names, scores): (Vec<String>, Vec<f32>) = im.scores.into_iter().unzip();
                 ImportanceScores::new(names, scores)
             }
-            Err(e) => {
-                return Err(format!("imatrix '{imatrix_path}' failed to parse: {e}"))
-            }
+            Err(e) => return Err(format!("imatrix '{imatrix_path}' failed to parse: {e}")),
         }
     } else if let Some(scores) = grim_meta.calibration_scores.clone() {
-        let (embedded_names, embedded_scores): (Vec<String>, Vec<f32>) =
-            scores.into_iter().unzip();
+        let (embedded_names, embedded_scores): (Vec<String>, Vec<f32>) = scores.into_iter().unzip();
         eprintln!(
             "[grim convert] using embedded calibration sidecar ({} tensors)",
             embedded_names.len()
@@ -672,12 +697,7 @@ pub fn cmd_oxidizer_convert(
                     override_dtype: dtype,
                     importance_score: importance_scores
                         .layer_scores
-                        .get(
-                            imp_name_to_idx
-                                .get(name.as_str())
-                                .copied()
-                                .unwrap_or(i),
-                        )
+                        .get(imp_name_to_idx.get(name.as_str()).copied().unwrap_or(i))
                         .copied()
                         .unwrap_or(0.0),
                     layout_hint: None,
@@ -873,7 +893,6 @@ fn load_importance_scores(path: &str) -> Result<ImportanceScores, String> {
         .collect();
     Ok(ImportanceScores::new(names, scores))
 }
-
 
 pub fn build_rewritten_tensors(
     provider: &GgufProvider,

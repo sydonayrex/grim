@@ -43,7 +43,7 @@ impl Lcg {
             .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((self.0 >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0  // [-1, 1): the *2.0 is load-bearing (one-sided draws make u4/int8 gates vacuous)
+        ((self.0 >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0 // [-1, 1): the *2.0 is load-bearing (one-sided draws make u4/int8 gates vacuous)
     }
 }
 
@@ -80,7 +80,10 @@ fn grey_dispatch_beats_dense_fp8_at_prefill() -> TestResult {
         return Ok(());
     }
 
-    for (m, n, k, iters) in [(1usize, 4096usize, 4096usize, 30usize), (16, 4096, 4096, 10)] {
+    for (m, n, k, iters) in [
+        (1usize, 4096usize, 4096usize, 30usize),
+        (16, 4096, 4096, 10),
+    ] {
         let mut rng = Lcg(0x6E67 ^ (m as u64));
         let a: Vec<f32> = (0..m * k).map(|_| rng.f32()).collect();
         let w: Vec<f32> = (0..n * k).map(|_| rng.f32()).collect();

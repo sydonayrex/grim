@@ -110,9 +110,9 @@ pub mod gla_launchers;
 pub mod gla_mega_launchers;
 pub mod kernel_infra;
 pub mod layer_elementwise;
-pub mod xing_graph_ops;
 pub mod optimizer_ops;
 pub mod sampling_ops;
+pub mod xing_graph_ops;
 
 #[allow(unused_imports)] // flat public API: `device::compute::<method>`
 pub use autograd_ops::*;

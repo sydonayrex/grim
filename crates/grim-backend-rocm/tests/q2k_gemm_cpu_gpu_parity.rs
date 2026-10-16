@@ -53,10 +53,16 @@ fn build_block(seed: u32) -> [u8; 84] {
     let mut b = [0u8; 84];
     for (i, v) in b[0..16].iter_mut().enumerate() {
         // Ensure every nibble position varies: lo = sc (0..15), hi = m (0..15).
-        *v = (i.wrapping_mul(19).wrapping_add(seed as usize).wrapping_mul(3)) as u8;
+        *v = (i
+            .wrapping_mul(19)
+            .wrapping_add(seed as usize)
+            .wrapping_mul(3)) as u8;
     }
     for (i, v) in b[16..80].iter_mut().enumerate() {
-        *v = (i.wrapping_mul(11).wrapping_add(seed as usize).wrapping_mul(5)) as u8;
+        *v = (i
+            .wrapping_mul(11)
+            .wrapping_add(seed as usize)
+            .wrapping_mul(5)) as u8;
     }
     b[80] = 0x00; // d = 1.0 fp16
     b[81] = 0x3C;
@@ -133,7 +139,9 @@ fn test_q2k_gpu_gemm_matches_cpu_dequant_reference() {
         .collect();
 
     let a_shape = Shape::from_slice(&[m, k]);
-    let a_rocm = dev.from_cpu(&a_host, &a_shape, DType::F32).expect("A upload");
+    let a_rocm = dev
+        .from_cpu(&a_host, &a_shape, DType::F32)
+        .expect("A upload");
     let b_shape = Shape::from_slice(&[n * row_bytes]);
     let b_rocm = dev
         .from_cpu_bytes(

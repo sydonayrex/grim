@@ -182,16 +182,24 @@ fn journey_case(m: usize, n: usize, k: usize, name: &str) -> TestResult {
     )
     .map_err(|e| format!("convert: {e}"))?;
 
-    let provider = GrimProvider::open(grim_path.to_str().expect("path"))
-        .map_err(|e| format!("open: {e}"))?;
-    let meta = provider.meta("blk.weight").map_err(|e| format!("meta: {e}"))?;
+    let provider =
+        GrimProvider::open(grim_path.to_str().expect("path")).map_err(|e| format!("open: {e}"))?;
+    let meta = provider
+        .meta("blk.weight")
+        .map_err(|e| format!("meta: {e}"))?;
     assert_eq!(
         meta.dtype.storage,
         Storage::Block(grim_tensor::BlockDtype::Fp8Sparse24Hw),
         "{name}: tag 673 must load as HW-tiled"
     );
-    assert_eq!(meta.shape, vec![n, k], "{name}: loader must preserve [n, k]");
-    let raw = provider.get("blk.weight").map_err(|e| format!("get: {e}"))?;
+    assert_eq!(
+        meta.shape,
+        vec![n, k],
+        "{name}: loader must preserve [n, k]"
+    );
+    let raw = provider
+        .get("blk.weight")
+        .map_err(|e| format!("get: {e}"))?;
 
     // Host reference from the SAME file-loaded bytes.
     let wq = grim_quant::grey_raven::dequant_grey_raven_hw(&raw.bytes, n, k)
@@ -209,7 +217,9 @@ fn journey_case(m: usize, n: usize, k: usize, name: &str) -> TestResult {
 
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
         DType {
             arith: ArithType::F32,
@@ -217,13 +227,8 @@ fn journey_case(m: usize, n: usize, k: usize, name: &str) -> TestResult {
         },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
-    let b_t = MemoryOps::from_cpu_bytes(
-        &dev,
-        &raw.bytes,
-        &Shape::new(vec![n, k]),
-        meta.dtype,
-    )
-    .map_err(|e| format!("b h2d: {e}"))?;
+    let b_t = MemoryOps::from_cpu_bytes(&dev, &raw.bytes, &Shape::new(vec![n, k]), meta.dtype)
+        .map_err(|e| format!("b h2d: {e}"))?;
 
     let (c_t, _handle) = dev.quantized_matmul(
         &*a_t,

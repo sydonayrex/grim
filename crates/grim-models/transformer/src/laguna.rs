@@ -133,7 +133,7 @@ impl Laguna {
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
 
         // The MoE router is a token-level sigmoid gate (one score per expert per token).
@@ -285,7 +285,7 @@ mod tests {
                 beta_fast: 32.0,
                 beta_slow: 1.0,
                 attention_factor: 1.485_203,
-            rope_mscale: None,
+                rope_mscale: None,
             }),
             ..Default::default()
         };

@@ -452,7 +452,8 @@ impl CoreTensorOps for RocmDevice {
                 let base = w_ptr as usize;
                 let mut codes_ptr = (base + 8) as *mut c_void;
                 let mut scales_ptr = (base + 8 + elem + 8) as *mut c_void;
-                let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+                let storage =
+                    RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
                 let mut out_ptr = dev_ptr(&storage)?;
                 let mut row_len_i = row_len as i32;
                 let mut eps_f = eps;
@@ -678,7 +679,7 @@ impl CoreTensorOps for RocmDevice {
             other => {
                 return Err(Error::Backend(format!(
                     "embedding_packed: weight storage is {other:?}, expected a K-quant scheme"
-                )))
+                )));
             }
         };
         // (elements per super-block, bytes per super-block, entry point)
@@ -689,7 +690,7 @@ impl CoreTensorOps for RocmDevice {
             other => {
                 return Err(Error::Unimplemented(format!(
                     "embedding_packed: no on-device gather for {other:?}"
-                )))
+                )));
             }
         };
         let what = entry;
@@ -704,7 +705,9 @@ impl CoreTensorOps for RocmDevice {
         }
         let out_dims = out.dims();
         if out_dims.len() != 2 {
-            return Err(Error::Shape("embedding_packed: out must be [n, dim]".into()));
+            return Err(Error::Shape(
+                "embedding_packed: out must be [n, dim]".into(),
+            ));
         }
         if out_dims[1] != dim {
             return Err(Error::Shape(format!(

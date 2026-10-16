@@ -243,7 +243,7 @@ mod tests {
     fn test_swa_bounded_replay_mechanics() {
         let n_win = 512;
         let matched = 3584; // Radix match length
-        let total = 4096;   // Prefill length
+        let total = 4096; // Prefill length
 
         let range = AttentionDispatcher::compute_swa_replay_range(matched, total, n_win);
         assert_eq!(range.start, 3584 - 512); // exactly matched - n_win

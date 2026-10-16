@@ -259,18 +259,18 @@ impl RocmDevice {
         h_idx: usize,
         d_idx: usize,
     ) -> Result<*mut c_void> {
-        let q_ptr = q_idx.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: q_idx has no device ptr".into())
-        })?;
-        let w_ptr = w_idx.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: w_idx has no device ptr".into())
-        })?;
-        let k_ptr = k_idx.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: k_idx has no device ptr".into())
-        })?;
-        let s_ptr = scores.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: scores has no device ptr".into())
-        })?;
+        let q_ptr = q_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: q_idx has no device ptr".into()))?;
+        let w_ptr = w_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: w_idx has no device ptr".into()))?;
+        let k_ptr = k_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: k_idx has no device ptr".into()))?;
+        let s_ptr = scores
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: scores has no device ptr".into()))?;
 
         let block_threads = 256u32;
         let grid_blocks = ((seq_len as u32) + block_threads - 1) / block_threads;

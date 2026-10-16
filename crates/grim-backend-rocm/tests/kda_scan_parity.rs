@@ -627,13 +627,25 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
     for t in 0..total {
         let (out, h) = dev
             .kda_gated_delta_rule_batched(
-                upload(&dev, &conv[t * conv_dim..(t + 1) * conv_dim], Shape::new(vec![conv_dim])).as_ref(),
+                upload(
+                    &dev,
+                    &conv[t * conv_dim..(t + 1) * conv_dim],
+                    Shape::new(vec![conv_dim]),
+                )
+                .as_ref(),
                 upload(&dev, &alpha[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
                 upload(&dev, &beta[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
                 dt_b.as_ref(),
                 a_b.as_ref(),
                 nw_b.as_ref(),
-                Some(upload(&dev, &z[t * nv * d..(t + 1) * nv * d], Shape::new(vec![nv * d])).as_ref()),
+                Some(
+                    upload(
+                        &dev,
+                        &z[t * nv * d..(t + 1) * nv * d],
+                        Shape::new(vec![nv * d]),
+                    )
+                    .as_ref(),
+                ),
                 state_b.as_ref(),
                 nv,
                 nk,
@@ -651,13 +663,25 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
     let out_shape_scan = Shape::new(vec![t_scan, nv * d]);
     let (scan_out, h) = dev
         .kda_gated_delta_rule_scan(
-            upload(&dev, &conv[..t_scan * conv_dim], Shape::new(vec![t_scan, conv_dim])).as_ref(),
+            upload(
+                &dev,
+                &conv[..t_scan * conv_dim],
+                Shape::new(vec![t_scan, conv_dim]),
+            )
+            .as_ref(),
             upload(&dev, &alpha[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
             upload(&dev, &beta[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
             upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
             upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
             upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
-            Some(upload(&dev, &z[..t_scan * nv * d], Shape::new(vec![t_scan, nv * d])).as_ref()),
+            Some(
+                upload(
+                    &dev,
+                    &z[..t_scan * nv * d],
+                    Shape::new(vec![t_scan, nv * d]),
+                )
+                .as_ref(),
+            ),
             state_a.as_ref(),
             t_scan,
             nv,
@@ -697,7 +721,9 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
     };
     let a_err = rel(&a);
     let b_err = rel(&b);
-    eprintln!("[kda-chain] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}");
+    eprintln!(
+        "[kda-chain] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}"
+    );
     assert!(
         b_err < 1e-3,
         "batched-only chain diverges from the oracle ({b_err:.3e}) — the chain test's own baseline is broken"
@@ -793,13 +819,25 @@ fn scan_then_batched_chain_matches_oracle_at_27b_geometry() {
     for t in 0..total {
         let (out, h) = dev
             .kda_gated_delta_rule_batched(
-                upload(&dev, &conv[t * conv_dim..(t + 1) * conv_dim], Shape::new(vec![conv_dim])).as_ref(),
+                upload(
+                    &dev,
+                    &conv[t * conv_dim..(t + 1) * conv_dim],
+                    Shape::new(vec![conv_dim]),
+                )
+                .as_ref(),
                 upload(&dev, &alpha[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
                 upload(&dev, &beta[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
                 dt_b.as_ref(),
                 a_b.as_ref(),
                 nw_b.as_ref(),
-                Some(upload(&dev, &z[t * nv * d..(t + 1) * nv * d], Shape::new(vec![nv * d])).as_ref()),
+                Some(
+                    upload(
+                        &dev,
+                        &z[t * nv * d..(t + 1) * nv * d],
+                        Shape::new(vec![nv * d]),
+                    )
+                    .as_ref(),
+                ),
                 state_b.as_ref(),
                 nv,
                 nk,
@@ -817,13 +855,25 @@ fn scan_then_batched_chain_matches_oracle_at_27b_geometry() {
     let out_shape_scan = Shape::new(vec![t_scan, nv * d]);
     let (scan_out, h) = dev
         .kda_gated_delta_rule_scan(
-            upload(&dev, &conv[..t_scan * conv_dim], Shape::new(vec![t_scan, conv_dim])).as_ref(),
+            upload(
+                &dev,
+                &conv[..t_scan * conv_dim],
+                Shape::new(vec![t_scan, conv_dim]),
+            )
+            .as_ref(),
             upload(&dev, &alpha[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
             upload(&dev, &beta[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
             upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
             upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
             upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
-            Some(upload(&dev, &z[..t_scan * nv * d], Shape::new(vec![t_scan, nv * d])).as_ref()),
+            Some(
+                upload(
+                    &dev,
+                    &z[..t_scan * nv * d],
+                    Shape::new(vec![t_scan, nv * d]),
+                )
+                .as_ref(),
+            ),
             state_a.as_ref(),
             t_scan,
             nv,
@@ -863,7 +913,9 @@ fn scan_then_batched_chain_matches_oracle_at_27b_geometry() {
     };
     let a_err = rel(&a);
     let b_err = rel(&b);
-    eprintln!("[kda-chain-27b] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}");
+    eprintln!(
+        "[kda-chain-27b] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}"
+    );
     assert!(
         b_err < 1e-3,
         "batched-only chain diverges from the oracle ({b_err:.3e}) — the chain test's own baseline is broken"

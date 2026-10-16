@@ -51,12 +51,7 @@ fn up(dev: &RocmDevice, bytes: &[u8]) -> TestResult<Box<dyn grim_tensor::Backend
     .map_err(|e| format!("h2d: {e}").into())
 }
 
-fn run_mma(
-    dev: &RocmDevice,
-    a_bytes: &[u8],
-    b_bytes: &[u8],
-    sidx: u32,
-) -> TestResult<Vec<f32>> {
+fn run_mma(dev: &RocmDevice, a_bytes: &[u8], b_bytes: &[u8], sidx: u32) -> TestResult<Vec<f32>> {
     let a_t = up(dev, a_bytes)?;
     let b_t = up(dev, b_bytes)?;
     let c_t = MemoryOps::alloc_storage(
@@ -109,7 +104,8 @@ fn grey_raven_layout_verification() -> TestResult {
             let pat = PATS[g % 4];
             for &slot in &pat {
                 let k = 4 * g + slot;
-                let v = (((r * 7 + k * 13) % 5) + 1) as f32 * if (r + k) % 2 == 0 { 1.0 } else { -1.0 };
+                let v =
+                    (((r * 7 + k * 13) % 5) + 1) as f32 * if (r + k) % 2 == 0 { 1.0 } else { -1.0 };
                 w[r * 32 + k] = v;
                 mask[r * 32 + k] = true;
             }
@@ -121,7 +117,8 @@ fn grey_raven_layout_verification() -> TestResult {
     let mut x = vec![0.0f32; 16 * 32];
     for m in 0..16 {
         for k in 0..32 {
-            x[m * 32 + k] = (((m * 3 + k * 5) % 7) + 1) as f32 * 0.25
+            x[m * 32 + k] = (((m * 3 + k * 5) % 7) + 1) as f32
+                * 0.25
                 * if (m * k) % 2 == 0 { 1.0 } else { -1.0 };
         }
     }

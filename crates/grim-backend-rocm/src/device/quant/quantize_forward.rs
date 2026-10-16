@@ -11,7 +11,7 @@ use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, HipDim3, RocmHandle};
+use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
 
 impl RocmDevice {
     /// Launch standalone Q8_0 quantization HIP kernel.

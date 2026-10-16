@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv, ConvDeviceSeed,
-    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
+    ConvDeviceSeed, ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
+    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
 };
 use grim_core::error::Result;
 use grim_nn::NormKind;
@@ -18,8 +18,8 @@ use grim_tensor::{BackendStorage, CoreTensorOps, Device, MemoryOps, RopeConfig, 
 use crate::block::LlamaBlock;
 use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
-use crate::deepseek32::DeepSeek32;
 use crate::deepseek4::DeepSeek4;
+use crate::deepseek32::DeepSeek32;
 use crate::gemma2::{Gemma2, Gemma2Block};
 use crate::glm4_moe_lite::Glm4MoeLite;
 use crate::granite_moe_hybrid::GraniteMoeHybrid;
@@ -155,7 +155,6 @@ fn linear_into_named(
         );
     }
 
-
     // WhiteRaven blocked FP8 (16x16-blocked E4M3) cannot use
     // `linear_decode_into` here: its act path does a D2H readback plus an
     // allocation, and inside a capture the allocation is CAPTURE_POISON while
@@ -178,10 +177,10 @@ fn linear_into_named(
         let pad = grim_backend_rocm::decode_graph_buffers::capture_fp8_pad_scratch().ok_or_else(
             || {
                 grim_core::error::Error::Backend(format!(
-                "linear_decode[{what} @ layer {layer}]: WhiteRaven blocked weight found but no \
+                    "linear_decode[{what} @ layer {layer}]: WhiteRaven blocked weight found but no \
                  padded-fp8 act scratch is installed for capture (act {:?}, weight {:?}, out {:?})",
-                a_dims, w_dims, o_dims
-            ))
+                    a_dims, w_dims, o_dims
+                ))
             },
         )?;
         let k = a_s.shape().dims().last().copied().unwrap_or(0);
@@ -213,6 +212,13 @@ fn linear_into_named(
         ))
     })?;
     Ok(())
+}
+
+fn is_q80(t: &grim_tensor::Tensor) -> bool {
+    matches!(
+        t.dtype().storage,
+        grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+    )
 }
 
 fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
@@ -273,45 +279,57 @@ impl LlamaBlock {
         // `device_weight` supplies a ones vector when the checkpoint has no
         // norm weight, which `olmo.cpp:65-67` does.
         let attn_in = &buffers.layer_input[layer_idx];
+        let hidden = attn_in.shape().dims().last().copied().unwrap_or(0);
         let attn_w = self
             .attn_norm
             .device_weight(self._cfg.hidden_size)
             .map_err(grim_core::error::Error::Tensor)?;
-        match self.attn_norm.kind {
-            NormKind::Rms => {
-                dev.rms_norm_into(
-                    attn_in,
-                    &**attn_w.storage(),
-                    self.attn_norm.eps,
-                    &buffers.norm_buf[layer_idx],
-                    &attn_in.shape().clone(),
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-            }
-            NormKind::LayerNorm => {
-                let b = self.attn_norm.bias.as_ref().map(|t| t.storage());
-                dev.layer_norm_into(
-                    attn_in,
-                    &**attn_w.storage(),
-                    b.as_deref().map(|s| s.as_ref()),
-                    self.attn_norm.eps,
-                    &buffers.norm_buf[layer_idx],
-                    &attn_in.shape().clone(),
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-            }
-        }
-        let normed: &Storage = &buffers.norm_buf[layer_idx];
-        let act = &buffers.act_q81_buf[layer_idx];
-        let hidden = normed.shape().dims().last().copied().unwrap_or(0);
-        let batch = buffers.batch.max(1);
 
-        // 2. QKV projection
         let fused_qkv = self
             .wqkv_q80_fused
             .as_ref()
             .filter(|_| dot_fused_ok(dev, hidden));
 
+        let norm_fused_qkv = fused_qkv.is_none()
+            && self.attn_norm.kind == NormKind::Rms
+            && dot_fused_ok(dev, hidden)
+            && is_q80(&self.wq.weight())
+            && is_q80(&self.wk.weight())
+            && is_q80(&self.wv.weight())
+            && (self._cfg.local_num_heads * self._cfg.head_dim) % 4 == 0
+            && (self._cfg.local_num_kv_heads * self._cfg.head_dim) % 4 == 0;
+
+        if !norm_fused_qkv {
+            match self.attn_norm.kind {
+                NormKind::Rms => {
+                    dev.rms_norm_into(
+                        attn_in,
+                        &**attn_w.storage(),
+                        self.attn_norm.eps,
+                        &buffers.norm_buf[layer_idx],
+                        &attn_in.shape().clone(),
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                }
+                NormKind::LayerNorm => {
+                    let b = self.attn_norm.bias.as_ref().map(|t| t.storage());
+                    dev.layer_norm_into(
+                        attn_in,
+                        &**attn_w.storage(),
+                        b.as_deref().map(|s| s.as_ref()),
+                        self.attn_norm.eps,
+                        &buffers.norm_buf[layer_idx],
+                        &attn_in.shape().clone(),
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                }
+            }
+        }
+        let normed: &Storage = &buffers.norm_buf[layer_idx];
+        let act = &buffers.act_q81_buf[layer_idx];
+        let batch = buffers.batch.max(1);
+
+        // 2. QKV projection
         if let Some(fused) = fused_qkv {
             let norm_rocm = dst_downcast(normed)?;
             let m = buffers.batch.max(1);
@@ -339,6 +357,24 @@ impl LlamaBlock {
                 fused.n_v,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+        } else if norm_fused_qkv {
+            let n_q = self._cfg.local_num_heads * self._cfg.head_dim;
+            let n_kv = self._cfg.local_num_kv_heads * self._cfg.head_dim;
+            dev.fused_qkv_dot4_norm_into(
+                &buffers.layer_input[layer_idx],
+                rocm_storage(&attn_w)?,
+                self.attn_norm.eps,
+                rocm_storage(self.wq.weight())?,
+                rocm_storage(self.wk.weight())?,
+                rocm_storage(self.wv.weight())?,
+                &buffers.q_buf[layer_idx],
+                &buffers.k_buf[layer_idx],
+                &buffers.v_buf[layer_idx],
+                n_q,
+                n_kv,
+                hidden,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused norm qkv dot4: {e}")))?;
         } else {
             linear_into(
                 dev,
@@ -422,10 +458,24 @@ impl LlamaBlock {
         let kv_stride = nkv * hd;
         let arena_slot_stride = buffers.max_ctx * kv_stride;
         let max_ctx = buffers.max_ctx;
-        launch_qkv_gemv(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        // Phase 3: bounds-check the RING row, not the absolute pos. With a
+        // capped arena `current_pos` outgrows `max_ctx` by design once the
+        // ring wraps; rejecting it would drop capture to eager exactly when
+        // eviction is carrying the load.
+        grim_backend_rocm::launch_qkv_gemv_ring(
+            &buffers.k_arena[layer_idx],
+            buffers.current_pos,
+            max_ctx,
+            buffers.kv_ring,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        grim_backend_rocm::launch_attention_ring(
+            &buffers.k_arena[layer_idx],
+            buffers.current_pos,
+            max_ctx,
+            buffers.kv_ring,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
         grim_backend_rocm::launch_kv_append_batch(
             dev,
@@ -436,6 +486,7 @@ impl LlamaBlock {
             steps,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -448,6 +499,7 @@ impl LlamaBlock {
             steps,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -476,6 +528,7 @@ impl LlamaBlock {
             0,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -497,17 +550,14 @@ impl LlamaBlock {
         //
         // `q_head_buf` is dead after the RoPE, so the sigmoid lands there and no
         // third buffer is needed.
-        dev.sigmoid_into(
+        // Fused sigmoid*attn output gate epilogue (Plan Phase 2)
+        dev.sigmoid_mul_into(
             &buffers.q_gate_buf[layer_idx],
-            &buffers.q_head_buf[layer_idx],
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid: {e}")))?;
-        dev.mul_into(
-            &buffers.attn_out_buf[layer_idx],
-            &buffers.q_head_buf[layer_idx],
             &buffers.attn_out_buf[layer_idx],
         )
-        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 attn gate mul: {e}")))?;
+        .map_err(|e| {
+            grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid_mul: {e}"))
+        })?;
 
         // 7. Output projection (wo) + residual add
         linear_into_named(
@@ -520,142 +570,222 @@ impl LlamaBlock {
             layer_idx,
         )?;
 
-        add_graph(
-            &buffers.layer_input[layer_idx],
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_output[layer_idx],
-            dev,
-        )?;
+        // Publish destination for block output (Fix 3: residual add writes directly into next layer or head_input)
+        let n_layers = buffers.layer_input.len();
+        let residual_dst: &Storage = if layer_idx + 1 < n_layers {
+            &buffers.layer_input[layer_idx + 1]
+        } else {
+            &buffers.head_input
+        };
 
         // 8. FFN sublayer
         if !self.ffn_disabled {
             let ffn_shape = buffers.layer_output[layer_idx].shape().clone();
-            // Same kind dispatch as the attention norm above.
             let ffn_w = self
                 .ffn_norm
                 .device_weight(self._cfg.hidden_size)
                 .map_err(grim_core::error::Error::Tensor)?;
-            match self.ffn_norm.kind {
-                NormKind::Rms => {
-                    dev.rms_norm_into(
-                        &buffers.layer_output[layer_idx],
-                        &**ffn_w.storage(),
-                        self.ffn_norm.eps,
-                        &buffers.norm_buf[layer_idx],
-                        &ffn_shape,
-                    )
-                    .map_err(grim_core::error::Error::Tensor)?;
-                }
-                NormKind::LayerNorm => {
-                    let b = self.ffn_norm.bias.as_ref().map(|t| t.storage());
-                    dev.layer_norm_into(
-                        &buffers.layer_output[layer_idx],
-                        &**ffn_w.storage(),
-                        b.as_deref().map(|s| s.as_ref()),
-                        self.ffn_norm.eps,
-                        &buffers.norm_buf[layer_idx],
-                        &ffn_shape,
-                    )
-                    .map_err(grim_core::error::Error::Tensor)?;
-                }
-            }
 
-            let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
+            let wg_opt = self.w_gate.as_ref();
+            let wu_opt = self.w_up.as_ref();
+            let fused_residual_ffn = self.ffn_norm.kind == NormKind::Rms
+                && dot_fused_ok(dev, hidden)
+                && wg_opt.map(|w| is_q80(w.weight())).unwrap_or(false)
+                && wu_opt.map(|w| is_q80(w.weight())).unwrap_or(false);
 
-            if let Some(fused_gu) = self
-                .w_gate_up_q80_fused
-                .as_ref()
-                .filter(|_| dot_fused_ok(dev, hidden))
-            {
-                let norm_rocm = dst_downcast(normed_ffn)?;
-                dev.launch_quantize_q8_1(norm_rocm, act, batch, hidden)
-                    .map_err(|e| grim_core::error::Error::Backend(format!("gateup quant: {e}")))?;
-                dev.launch_fused_gate_up_dot4_into(
-                    act,
-                    &fused_gu.storage,
-                    &buffers.gate_up_buf[layer_idx],
-                    fused_gu.n_gate,
-                    fused_gu.n_up,
+            if fused_residual_ffn {
+                let wg = wg_opt.unwrap();
+                let wu = wu_opt.unwrap();
+                dev.fused_add_rms_norm_gate_up_silu_dot4_into(
+                    &buffers.layer_input[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    rocm_storage(&ffn_w)?,
+                    self.ffn_norm.eps,
+                    rocm_storage(wg.weight())?,
+                    rocm_storage(wu.weight())?,
+                    &buffers.layer_output[layer_idx],
+                    &buffers.activated_buf[layer_idx],
+                    batch.max(1),
+                    wg.weight().shape().dim(0).unwrap_or(0),
                     hidden,
                 )
-                .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup: {e}")))?;
-                let staged: &Storage = &buffers.gate_up_buf[layer_idx];
-                dev.copy_slice_into(&buffers.gate_buf[layer_idx], staged, 0, fused_gu.n_gate)
-                    .map_err(grim_core::error::Error::Tensor)?;
-                dev.copy_slice_range(
-                    &buffers.up_buf[layer_idx],
-                    0,
-                    staged,
-                    fused_gu.n_gate,
-                    fused_gu.n_up,
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("fused residual+gateup: {e}"))
+                })?;
             } else {
-                let wg = self
-                    .w_gate
-                    .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("missing w_gate".into()))?;
-                let wu = self
-                    .w_up
-                    .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("missing w_up".into()))?;
-                linear_into_named(
+                add_graph(
+                    &buffers.layer_input[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    &buffers.layer_output[layer_idx],
                     dev,
-                    normed_ffn,
-                    wg.weight(),
-                    &buffers.gate_buf[layer_idx],
-                    act,
-                    "ffn.gate",
-                    layer_idx,
                 )?;
-                linear_into_named(
-                    dev,
-                    normed_ffn,
-                    wu.weight(),
-                    &buffers.up_buf[layer_idx],
-                    act,
-                    "ffn.up",
-                    layer_idx,
-                )?;
-            }
 
-            dev.silu_mul_into(
-                &buffers.gate_buf[layer_idx],
-                &buffers.up_buf[layer_idx],
-                &buffers.activated_buf[layer_idx],
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+                match self.ffn_norm.kind {
+                    NormKind::Rms => {
+                        dev.rms_norm_into(
+                            &buffers.layer_output[layer_idx],
+                            &**ffn_w.storage(),
+                            self.ffn_norm.eps,
+                            &buffers.norm_buf[layer_idx],
+                            &ffn_shape,
+                        )
+                        .map_err(grim_core::error::Error::Tensor)?;
+                    }
+                    NormKind::LayerNorm => {
+                        let b = self.ffn_norm.bias.as_ref().map(|t| t.storage());
+                        dev.layer_norm_into(
+                            &buffers.layer_output[layer_idx],
+                            &**ffn_w.storage(),
+                            b.as_deref().map(|s| s.as_ref()),
+                            self.ffn_norm.eps,
+                            &buffers.norm_buf[layer_idx],
+                            &ffn_shape,
+                        )
+                        .map_err(grim_core::error::Error::Tensor)?;
+                    }
+                }
+
+                let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
+
+                let use_fused_silu = dot_fused_ok(dev, hidden)
+                    && wg_opt.map(|w| is_q80(w.weight())).unwrap_or(false)
+                    && wu_opt.map(|w| is_q80(w.weight())).unwrap_or(false);
+
+                if use_fused_silu {
+                    let wg = wg_opt.unwrap();
+                    let wu = wu_opt.unwrap();
+                    dev.fused_gate_up_silu_dot4_into(
+                        normed_ffn,
+                        rocm_storage(wg.weight())?,
+                        rocm_storage(wu.weight())?,
+                        &buffers.activated_buf[layer_idx],
+                        wg.weight().shape().dim(0).unwrap_or(0),
+                        hidden,
+                        act,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("fused gateup silu: {e}"))
+                    })?;
+                } else if let Some(fused_gu) = self
+                    .w_gate_up_q80_fused
+                    .as_ref()
+                    .filter(|_| dot_fused_ok(dev, hidden))
+                {
+                    let norm_rocm = dst_downcast(normed_ffn)?;
+                    dev.launch_quantize_q8_1(norm_rocm, act, batch, hidden)
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("gateup quant: {e}"))
+                        })?;
+                    dev.launch_fused_gate_up_dot4_into(
+                        act,
+                        &fused_gu.storage,
+                        &buffers.gate_up_buf[layer_idx],
+                        fused_gu.n_gate,
+                        fused_gu.n_up,
+                        hidden,
+                    )
+                    .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup: {e}")))?;
+                    let staged: &Storage = &buffers.gate_up_buf[layer_idx];
+                    dev.copy_slice_into(&buffers.gate_buf[layer_idx], staged, 0, fused_gu.n_gate)
+                        .map_err(grim_core::error::Error::Tensor)?;
+                    dev.copy_slice_range(
+                        &buffers.up_buf[layer_idx],
+                        0,
+                        staged,
+                        fused_gu.n_gate,
+                        fused_gu.n_up,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                    dev.silu_mul_into(
+                        &buffers.gate_buf[layer_idx],
+                        &buffers.up_buf[layer_idx],
+                        &buffers.activated_buf[layer_idx],
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                } else {
+                    let wg = self
+                        .w_gate
+                        .as_ref()
+                        .ok_or_else(|| grim_core::error::Error::Backend("missing w_gate".into()))?;
+                    let wu = self
+                        .w_up
+                        .as_ref()
+                        .ok_or_else(|| grim_core::error::Error::Backend("missing w_up".into()))?;
+                    linear_into_named(
+                        dev,
+                        normed_ffn,
+                        wg.weight(),
+                        &buffers.gate_buf[layer_idx],
+                        act,
+                        "ffn.gate",
+                        layer_idx,
+                    )?;
+                    linear_into_named(
+                        dev,
+                        normed_ffn,
+                        wu.weight(),
+                        &buffers.up_buf[layer_idx],
+                        act,
+                        "ffn.up",
+                        layer_idx,
+                    )?;
+                    dev.silu_mul_into(
+                        &buffers.gate_buf[layer_idx],
+                        &buffers.up_buf[layer_idx],
+                        &buffers.activated_buf[layer_idx],
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                }
+            }
 
             let wd = self
                 .w_down
                 .as_ref()
                 .ok_or_else(|| grim_core::error::Error::Backend("missing w_down".into()))?;
-            linear_into_named(
-                dev,
-                &buffers.activated_buf[layer_idx],
-                wd.weight(),
-                &buffers.norm_buf[layer_idx],
-                act,
-                "ffn.down",
-                layer_idx,
-            )?;
+            let ffn_k = buffers.activated_buf[layer_idx]
+                .shape()
+                .dims()
+                .last()
+                .copied()
+                .unwrap_or(0);
+            let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
+            if use_fused_down {
+                dev.launch_dot4_q80_f32act_add_gemv(
+                    &buffers.activated_buf[layer_idx],
+                    rocm_storage(wd.weight())?,
+                    Some(&buffers.layer_output[layer_idx]),
+                    dst_downcast(residual_dst)?,
+                    batch.max(1),
+                    wd.weight().shape().dim(0).unwrap_or(0),
+                    ffn_k,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+            } else {
+                linear_into_named(
+                    dev,
+                    &buffers.activated_buf[layer_idx],
+                    wd.weight(),
+                    &buffers.norm_buf[layer_idx],
+                    act,
+                    "ffn.down",
+                    layer_idx,
+                )?;
 
+                add_graph(
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    dst_downcast(residual_dst)?,
+                    dev,
+                )?;
+            }
+        } else {
             add_graph(
-                &buffers.layer_output[layer_idx],
+                &buffers.layer_input[layer_idx],
                 &buffers.norm_buf[layer_idx],
-                &buffers.layer_output[layer_idx],
+                dst_downcast(residual_dst)?,
                 dev,
             )?;
         }
-
-        // Publish to next layer or head_input
-        let n_layers = buffers.layer_input.len();
-        let dst: &Storage = if layer_idx + 1 < n_layers {
-            &buffers.layer_input[layer_idx + 1]
-        } else {
-            &buffers.head_input
-        };
-        publish_into(dev, dst, &buffers.layer_output[layer_idx])?;
         Ok(())
     }
 }
@@ -713,7 +843,10 @@ pub(crate) fn prewarm_lane_weights_for(
         .iter()
         .filter(|w| prewarm_one_kquant_linear(dev, w))
         .count();
-    eprintln!("[prewarm] u4 lane weights: {done} ready, {} skipped", total - done);
+    eprintln!(
+        "[prewarm] u4 lane weights: {done} ready, {} skipped",
+        total - done
+    );
     Ok(())
 }
 
@@ -724,8 +857,12 @@ impl DecodeGraphModel for Llama {
         let mut weights: Vec<&grim_tensor::Tensor> = Vec::new();
         for b in &self.layers {
             for l in [
-                Some(&b.wq), Some(&b.wk), Some(&b.wv),
-                b.g_proj.as_ref(), b.w_gate.as_ref(), b.w_up.as_ref(),
+                Some(&b.wq),
+                Some(&b.wk),
+                Some(&b.wv),
+                b.g_proj.as_ref(),
+                b.w_gate.as_ref(),
+                b.w_up.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -741,14 +878,20 @@ impl DecodeGraphModel for Llama {
         prewarm_lane_weights_for(&dev, weights)
     }
 
-
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        // int4 dense KV arenas historically miss a graph-safe i4 kernel pair; refuse
+        // capture (run.rs then uses the eager path, which is correct).
+        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4" | "int8" | "i8" | "q8")) {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: quantized KV (int8/int4) graph path disabled (eager fallback)".into(),
+            ));
+        }
+        let dev = dev_for_llama(self)?;
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
             ));
         }
-        let dev = dev_for_llama(self)?;
         let stream = dev
             .get_stream_from_pool(0)
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
@@ -1117,6 +1260,13 @@ impl DecodeGraphModel for Llama {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                src_elem_bytes: if k_rocm.dtype().arith == grim_tensor::ArithType::F16 {
+                    2
+                } else {
+                    4
+                },
+                k_scales_dev: None,
+                v_scales_dev: None,
                 gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
@@ -1141,9 +1291,15 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
         let mut weights: Vec<&grim_tensor::Tensor> = Vec::new();
         for b in &self.layers {
             for l in [
-                b.wq.as_ref(), b.wk.as_ref(), b.wv.as_ref(), b.wo.as_ref(),
-                b.shortconv_in_proj.as_ref(), b.shortconv_out_proj.as_ref(),
-                b.gdl_b_proj.as_ref(), b.gdl_w_proj.as_ref(), b.gdl_f_proj.as_ref(),
+                b.wq.as_ref(),
+                b.wk.as_ref(),
+                b.wv.as_ref(),
+                b.wo.as_ref(),
+                b.shortconv_in_proj.as_ref(),
+                b.shortconv_out_proj.as_ref(),
+                b.gdl_b_proj.as_ref(),
+                b.gdl_w_proj.as_ref(),
+                b.gdl_f_proj.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -1409,9 +1565,14 @@ impl Qwen35Block {
                 .map_err(grim_core::error::Error::Tensor)?;
             }
 
-            // 4. RoPE
+            // 4. RoPE. Partial rotary + NeoX half-split pairing, matching
+            // the eager path exactly (qwen35.rs builds the same RopeConfig):
+            // the base kernel rotates only the first `rotary_dim` dims and
+            // passes the rest through.
             let steps = 1usize;
-            let rope_cfg = RopeConfig::new(hd, self.rope_theta);
+            let mut rope_cfg = RopeConfig::new(hd, self.rope_theta);
+            rope_cfg.rotary_dim = self.rotary_dim;
+            rope_cfg.interleaved = false;
             let q3 = Shape::new(vec![batch, nh * steps, hd]);
             dev.rope_dev_base_into(
                 &buffers.q_head_buf[layer_idx],
@@ -1440,66 +1601,185 @@ impl Qwen35Block {
             let kv_stride = nkv * hd;
             let arena_slot_stride = buffers.max_ctx * kv_stride;
             let max_ctx = buffers.max_ctx;
-            launch_qkv_gemv(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-            launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-
-            grim_backend_rocm::launch_kv_append_batch(
-                dev,
+            // Phase 3: bounds-check the RING row, not the absolute pos. With a
+            // capped arena `current_pos` outgrows `max_ctx` by design once the
+            // ring wraps; rejecting it would drop capture to eager exactly when
+            // eviction is carrying the load.
+            grim_backend_rocm::launch_qkv_gemv_ring(
                 &buffers.k_arena[layer_idx],
-                &buffers.k_buf[layer_idx],
-                &buffers.pos_dev,
-                kv_stride,
-                steps,
-                batch,
-                arena_slot_stride,
+                buffers.current_pos,
+                max_ctx,
+                buffers.kv_ring,
             )
-            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            grim_backend_rocm::launch_attention_ring(
+                &buffers.k_arena[layer_idx],
+                buffers.current_pos,
+                max_ctx,
+                buffers.kv_ring,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
-            grim_backend_rocm::launch_kv_append_batch(
-                dev,
-                &buffers.v_arena[layer_idx],
-                &buffers.v_buf[layer_idx],
-                &buffers.pos_dev,
-                kv_stride,
-                steps,
-                batch,
-                arena_slot_stride,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+            // Phase-2 int8 arenas take the quantizing append (u8 codes + one
+            // f32 scale per (row, kv_head)); f32/f16 take the plain copy. The
+            // decision comes from STORAGE, so the captured graph always
+            // matches what the arenas actually hold.
+            let arena_i8 = buffers.kv_arena_is_int8();
+            if arena_i8 {
+                let scale_slot_stride = buffers.max_ctx * nkv;
+                for (src, dst, scales, tag) in [
+                    (
+                        &buffers.k_buf[layer_idx],
+                        &buffers.k_arena[layer_idx],
+                        &buffers.k_scale_arena,
+                        "k",
+                    ),
+                    (
+                        &buffers.v_buf[layer_idx],
+                        &buffers.v_arena[layer_idx],
+                        &buffers.v_scale_arena,
+                        "v",
+                    ),
+                ] {
+                    let sc = scales.get(layer_idx).ok_or_else(|| {
+                        grim_core::error::Error::Backend(format!(
+                            "graph kv_append_i8 {tag}: no scale sidecar for layer {layer_idx}"
+                        ))
+                    })?;
+                    grim_backend_rocm::launch_kv_append_i8(
+                        dev,
+                        src,
+                        &buffers.pos_dev,
+                        dst,
+                        sc,
+                        kv_stride,
+                        nkv,
+                        hd,
+                        steps,
+                        batch,
+                        arena_slot_stride,
+                        scale_slot_stride,
+                        buffers.kv_ring,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("kv_append_i8 {tag}: {e}"))
+                    })?;
+                }
+            } else {
+                grim_backend_rocm::launch_kv_append_batch(
+                    dev,
+                    &buffers.k_arena[layer_idx],
+                    &buffers.k_buf[layer_idx],
+                    &buffers.pos_dev,
+                    kv_stride,
+                    steps,
+                    batch,
+                    arena_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+
+                grim_backend_rocm::launch_kv_append_batch(
+                    dev,
+                    &buffers.v_arena[layer_idx],
+                    &buffers.v_buf[layer_idx],
+                    &buffers.pos_dev,
+                    kv_stride,
+                    steps,
+                    batch,
+                    arena_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+            }
 
             // 6. Attention kernel
-            grim_backend_rocm::launch_qkv_attention_dev_batch(
-                dev,
-                &buffers.q_buf[layer_idx],
-                &buffers.k_arena[layer_idx],
-                &buffers.v_arena[layer_idx],
-                &buffers.attn_out_buf[layer_idx],
-                &buffers.attn_max_buf[layer_idx],
-                &buffers.attn_sum_buf[layer_idx],
-                &buffers.pos_dev,
-                nh as u32,
-                nkv as u32,
-                hd as u32,
-                steps as u32,
-                steps as u32,
-                1.0 / (hd as f32).sqrt(),
-                0,
-                0.0,
-                &buffers.attn_dummy,
-                0,
-                0,
-                &buffers.attn_dummy,
-                0,
-                batch,
-                arena_slot_stride,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
+            if arena_i8 {
+                let scale_slot_stride = buffers.max_ctx * nkv;
+                let k_scales = buffers.k_scale_arena.get(layer_idx).ok_or_else(|| {
+                    grim_core::error::Error::Backend(format!(
+                        "graph attention_i8: no k scale sidecar for layer {layer_idx}"
+                    ))
+                })?;
+                let v_scales = buffers.v_scale_arena.get(layer_idx).ok_or_else(|| {
+                    grim_core::error::Error::Backend(format!(
+                        "graph attention_i8: no v scale sidecar for layer {layer_idx}"
+                    ))
+                })?;
+                grim_backend_rocm::launch_qkv_attention_dev_batch_i8(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    k_scales,
+                    &buffers.v_arena[layer_idx],
+                    v_scales,
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.pos_dev,
+                    nh as u32,
+                    nkv as u32,
+                    hd as u32,
+                    steps as u32,
+                    steps as u32,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    0.0,
+                    &buffers.attn_dummy,
+                    0,
+                    0,
+                    &buffers.attn_dummy,
+                    0,
+                    batch,
+                    arena_slot_stride,
+                    scale_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("qkv_attention_dev_i8: {e}"))
+                })?;
+            } else {
+                grim_backend_rocm::launch_qkv_attention_dev_batch(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    &buffers.v_arena[layer_idx],
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.pos_dev,
+                    nh as u32,
+                    nkv as u32,
+                    hd as u32,
+                    steps as u32,
+                    steps as u32,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    0.0,
+                    &buffers.attn_dummy,
+                    0,
+                    0,
+                    &buffers.attn_dummy,
+                    0,
+                    batch,
+                    arena_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
+            }
 
             // Bump pos_dev
             grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+
+            // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
+            dev.sigmoid_mul_into(
+                &buffers.q_gate_buf[layer_idx],
+                &buffers.attn_out_buf[layer_idx],
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid_mul: {e}"))
+            })?;
 
             // 7. Output projection (wo)
             let wo = self.wo.as_ref().ok_or_else(|| {
@@ -1643,72 +1923,133 @@ impl Qwen35Block {
             )?;
         }
 
-        // Residual 1 add: layer_input + branch_proj -> layer_output
-        add_graph(
-            &buffers.layer_input[layer_idx],
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_output[layer_idx],
-            dev,
-        )?;
-
-        // 8. FFN sublayer
-        let ffn_shape = buffers.layer_output[layer_idx].shape().clone();
-        dev.rms_norm_into(
-            &buffers.layer_output[layer_idx],
-            &**self.post_attention_norm.weight.storage(),
-            self.post_attention_norm.eps,
-            &buffers.norm_buf[layer_idx],
-            &ffn_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
-        let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
-
-        linear_into(
-            dev,
-            normed_ffn,
-            self.ffn_gate.weight(),
-            &buffers.gate_buf[layer_idx],
-            act,
-        )?;
-        linear_into(
-            dev,
-            normed_ffn,
-            self.ffn_up.weight(),
-            &buffers.up_buf[layer_idx],
-            act,
-        )?;
-
-        dev.silu_mul_into(
-            &buffers.gate_buf[layer_idx],
-            &buffers.up_buf[layer_idx],
-            &buffers.activated_buf[layer_idx],
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
-
-        linear_into(
-            dev,
-            &buffers.activated_buf[layer_idx],
-            self.ffn_down.weight(),
-            &buffers.norm_buf[layer_idx],
-            act,
-        )?;
-
-        // Residual 2 add: layer_output + ffn_out -> layer_output
-        add_graph(
-            &buffers.layer_output[layer_idx],
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_output[layer_idx],
-            dev,
-        )?;
-
-        // Publish to next layer or head_input
+        // Destination for final block output (residual add writes directly into next layer or head_input)
         let n_layers = buffers.layer_input.len();
-        let dst: &Storage = if layer_idx + 1 < n_layers {
+        let residual_dst: &Storage = if layer_idx + 1 < n_layers {
             &buffers.layer_input[layer_idx + 1]
         } else {
             &buffers.head_input
         };
-        publish_into(dev, dst, &buffers.layer_output[layer_idx])?;
+
+        let ffn_shape = buffers.layer_output[layer_idx].shape().clone();
+        let ffn_w = &self.post_attention_norm.weight;
+
+        let wg = &self.ffn_gate;
+        let wu = &self.ffn_up;
+        let fused_residual_ffn =
+            dot_fused_ok(dev, self.hidden_size) && is_q80(wg.weight()) && is_q80(wu.weight());
+
+        if fused_residual_ffn {
+            dev.fused_add_rms_norm_gate_up_silu_dot4_into(
+                &buffers.layer_input[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                rocm_storage(&ffn_w)?,
+                self.post_attention_norm.eps,
+                rocm_storage(wg.weight())?,
+                rocm_storage(wu.weight())?,
+                &buffers.layer_output[layer_idx],
+                &buffers.activated_buf[layer_idx],
+                batch.max(1),
+                wg.weight().shape().dim(0).unwrap_or(0),
+                self.hidden_size,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused residual+gateup: {e}")))?;
+        } else {
+            // Residual 1 add: layer_input + branch_proj -> layer_output
+            add_graph(
+                &buffers.layer_input[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                &buffers.layer_output[layer_idx],
+                dev,
+            )?;
+
+            // 8. FFN sublayer
+            dev.rms_norm_into(
+                &buffers.layer_output[layer_idx],
+                &**ffn_w.storage(),
+                self.post_attention_norm.eps,
+                &buffers.norm_buf[layer_idx],
+                &ffn_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
+
+            let use_fused_silu =
+                dot_fused_ok(dev, self.hidden_size) && is_q80(wg.weight()) && is_q80(wu.weight());
+
+            if use_fused_silu {
+                dev.fused_gate_up_silu_dot4_into(
+                    normed_ffn,
+                    rocm_storage(wg.weight())?,
+                    rocm_storage(wu.weight())?,
+                    &buffers.activated_buf[layer_idx],
+                    wg.weight().shape().dim(0).unwrap_or(0),
+                    self.hidden_size,
+                    act,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup silu: {e}")))?;
+            } else {
+                linear_into(
+                    dev,
+                    normed_ffn,
+                    self.ffn_gate.weight(),
+                    &buffers.gate_buf[layer_idx],
+                    act,
+                )?;
+                linear_into(
+                    dev,
+                    normed_ffn,
+                    self.ffn_up.weight(),
+                    &buffers.up_buf[layer_idx],
+                    act,
+                )?;
+
+                dev.silu_mul_into(
+                    &buffers.gate_buf[layer_idx],
+                    &buffers.up_buf[layer_idx],
+                    &buffers.activated_buf[layer_idx],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+        }
+
+        let wd = &self.ffn_down;
+        let ffn_k = buffers.activated_buf[layer_idx]
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
+
+        if use_fused_down {
+            dev.launch_dot4_q80_f32act_add_gemv(
+                &buffers.activated_buf[layer_idx],
+                rocm_storage(wd.weight())?,
+                Some(&buffers.layer_output[layer_idx]),
+                dst_downcast(residual_dst)?,
+                batch.max(1),
+                wd.weight().shape().dim(0).unwrap_or(0),
+                ffn_k,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+        } else {
+            linear_into(
+                dev,
+                &buffers.activated_buf[layer_idx],
+                self.ffn_down.weight(),
+                &buffers.norm_buf[layer_idx],
+                act,
+            )?;
+
+            // Residual 2 add: layer_output + ffn_out -> residual_dst
+            add_graph(
+                &buffers.layer_output[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                dst_downcast(residual_dst)?,
+                dev,
+            )?;
+        }
         Ok(())
     }
 }
@@ -1729,9 +2070,15 @@ impl DecodeGraphModel for Qwen35 {
         let mut linears: Vec<&Linear> = Vec::new();
         for b in &self.blocks {
             for l in [
-                b.wq.as_ref(), b.wk.as_ref(), b.wv.as_ref(), b.wo.as_ref(),
-                b.attn_qkv.as_ref(), b.attn_gate.as_ref(), b.ssm_out.as_ref(),
-                b.ssm_alpha.as_ref(), b.ssm_beta.as_ref(),
+                b.wq.as_ref(),
+                b.wk.as_ref(),
+                b.wv.as_ref(),
+                b.wo.as_ref(),
+                b.attn_qkv.as_ref(),
+                b.attn_gate.as_ref(),
+                b.ssm_out.as_ref(),
+                b.ssm_alpha.as_ref(),
+                b.ssm_beta.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -1790,6 +2137,45 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        // int4 dense KV arenas still have no graph-safe i4 kernel pair; refuse
+        // capture (run.rs then uses the eager path, which is correct).
+        //
+        // int8 IS allowed: `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8`
+        // are the captured pair, and they are gated by
+        // `graph_i8_append_and_attend_match_eager_f32` in
+        // grim-backend-rocm/tests/qkv_attention.rs. That test is what caught the
+        // launcher's argument-order defect (it wrote attention output into the
+        // scale sidecar and faulted) before capture was enabled.
+        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4")) {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: int4 KV has no dedicated graph kernel pair (eager fallback)".into(),
+            ));
+        }
+        // A per-layer KV budget table (`GRIM_KV_ARENA_ROWS=4096,2048,...`) cannot
+        // be honored by the graph, which captures ONE ring for every layer:
+        // replay would clamp every layer to a single cap. Refuse so the caller
+        // uses the eager path, which applies the table per layer.
+        if let Some(b) = crate::qwen35::KvLayerBudgets::from_env() {
+            if !b.is_uniform() {
+                return Err(grim_core::error::Error::Backend(
+                    "decode graph: per-layer GRIM_KV_ARENA_ROWS is not graph-safe (eager fallback)"
+                        .into(),
+                ));
+            }
+        }
+        // CurDKV survivor selection runs a host compaction pass that rewrites
+        // `current_pos`; the captured graph bakes `total_dev` as a device
+        // scalar it bumps itself, so it cannot observe the reset. Refuse.
+        if crate::qwen35::parse_evict_mode_env(
+            std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref(),
+        ) == crate::qwen35::EvictionMode::Curdkv
+        {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: GRIM_KV_EVICT_MODE=curdkv needs the host compaction pass (eager \
+                 fallback)"
+                    .into(),
+            ));
+        }
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
@@ -1855,7 +2241,11 @@ impl DecodeGraphModel for Qwen35 {
         let n_v = n_k;
         let inter = self.cfg.intermediate_size;
         let vocab = self.cfg.vocab_size.max(1);
-        let ctx = max_ctx.max(1);
+        // Phase 3: with a fixed KV capacity the arena no longer scales with the
+        // advertised context — `ctx` is clamped so the footprint is the cap,
+        // and the ring policy rides on the buffers for capture AND replay.
+        let evict = crate::qwen35::kv_eviction_policy(&self.device);
+        let ctx = evict.effective_ctx(max_ctx.max(1));
         let nh = self.cfg.num_heads;
         // Short-conv hidden width == the KDA conv width, NOT the attention
         // query width. The allocator stages `3 * sc_h_dim` for it, so taking
@@ -1892,6 +2282,57 @@ impl DecodeGraphModel for Qwen35 {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
+        // Qwen35 owns its KV arena representation: f16 by default (validated
+        // eager + graph), int8 when `GRIM_KV_ARENA=int8`, f32 on explicit
+        // opt-out. The shared allocator follows the global GRIM_F16_KV flag
+        // (default off), so the empty arenas are swapped here for the right
+        // dtype. Launchers derive the representation from STORAGE (never env),
+        // and the seeder copies codes + int8 scales bit-exact when both arenas
+        // share one format — which they do, because both sides ask the same
+        // resolver.
+        {
+            use grim_backend_rocm::RocmStorage;
+            let kv_dt = crate::qwen35::kv_arena_dtype(&self.device);
+            if kv_dt.arith != grim_tensor::ArithType::F32 {
+                for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
+                    let shape = arena.shape().clone();
+                    let narrowed = RocmStorage::alloc_gpu(
+                        &shape,
+                        kv_dt.clone(),
+                        &dev.allocator_handle(),
+                        dev.ordinal(),
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!(
+                            "graph KV arena alloc ({:?}): {e}",
+                            kv_dt.arith
+                        ))
+                    })?;
+                    *arena = narrowed;
+                }
+            }
+            // int8 codes need their f32 scale sidecars before capture.
+            if kv_dt.arith == grim_tensor::ArithType::U8 {
+                let n_kv = self.cfg.num_kv_heads;
+                buffers.allocate_int8_kv_scales(&dev, n_kv).map_err(|e| {
+                    grim_core::error::Error::Backend(format!("graph int8 scales: {e}"))
+                })?;
+            }
+            // Phase 3: publish the ring so the Qwen35 capture sites bake the
+            // right cap/sinks into kv_append and attention.
+            buffers.kv_ring = evict.ring();
+            if evict.cap_rows.is_some() {
+                eprintln!(
+                    "[qwen35] KV eviction ring: capacity {} token rows, {} sinks \
+                     (arena ctx clamped {} -> {})",
+                    evict.cap_rows.unwrap_or(0),
+                    evict.sinks,
+                    max_ctx,
+                    ctx
+                );
+            }
+        }
+
         // Size each layer's `q_buf` to ITS OWN projection width. The pool
         // allocates one width for every layer, but a recurrent layer projects
         // `attn_qkv` at the conv width while a full-attention layer projects
@@ -1911,7 +2352,12 @@ impl DecodeGraphModel for Qwen35 {
                     .wq
                     .as_ref()
                     .map(|l| l.weight().shape().dims()[0])
-                    .or_else(|| block.attn_qkv.as_ref().map(|l| l.weight().shape().dims()[0]))
+                    .or_else(|| {
+                        block
+                            .attn_qkv
+                            .as_ref()
+                            .map(|l| l.weight().shape().dims()[0])
+                    })
                     .unwrap_or(2 * q_dim)
             } else {
                 block
@@ -2110,11 +2556,47 @@ impl DecodeGraphModel for Qwen35 {
                 }
             };
 
+            // int8 eager arenas hand the seeder their scale sidecars so the
+            // graph's codes AND scales are copied bit-exact.
+            let eager_is_i8 = k_rocm.dtype().arith == grim_tensor::ArithType::U8;
+            let (ksc_ptr, vsc_ptr) = if eager_is_i8 {
+                let ks = cache
+                    .k_scales_device
+                    .as_ref()
+                    .and_then(|b| as_rocm(b.as_ref()).ok())
+                    .and_then(|s| s.device_ptr_u64())
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: int8 KV arena without a k scale sidecar".into(),
+                        )
+                    })?;
+                let vs = cache
+                    .v_scales_device
+                    .as_ref()
+                    .and_then(|b| as_rocm(b.as_ref()).ok())
+                    .and_then(|s| s.device_ptr_u64())
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: int8 KV arena without a v scale sidecar".into(),
+                        )
+                    })?;
+                (Some(ks as *const f32), Some(vs as *const f32))
+            } else {
+                (None, None)
+            };
+
             out.push(Some(EagerKvSource {
                 k_dev: k_ptr,
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                src_elem_bytes: match k_rocm.dtype().arith {
+                    grim_tensor::ArithType::U8 => 1,
+                    grim_tensor::ArithType::F16 => 2,
+                    _ => 4,
+                },
+                k_scales_dev: ksc_ptr,
+                v_scales_dev: vsc_ptr,
                 gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
@@ -2343,10 +2825,24 @@ impl Gemma2Block {
         let kv_stride = nkv * hd;
         let arena_slot_stride = buffers.max_ctx * kv_stride;
         let max_ctx = buffers.max_ctx;
-        launch_qkv_gemv(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        // Phase 3: bounds-check the RING row, not the absolute pos. With a
+        // capped arena `current_pos` outgrows `max_ctx` by design once the
+        // ring wraps; rejecting it would drop capture to eager exactly when
+        // eviction is carrying the load.
+        grim_backend_rocm::launch_qkv_gemv_ring(
+            &buffers.k_arena[layer_idx],
+            buffers.current_pos,
+            max_ctx,
+            buffers.kv_ring,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        grim_backend_rocm::launch_attention_ring(
+            &buffers.k_arena[layer_idx],
+            buffers.current_pos,
+            max_ctx,
+            buffers.kv_ring,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
         grim_backend_rocm::launch_kv_append_batch(
             dev,
@@ -2357,6 +2853,7 @@ impl Gemma2Block {
             steps,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -2369,37 +2866,9 @@ impl Gemma2Block {
             steps,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
-
-        // 5. Attention kernel with optional softcapping
-        let softcap = self.attn_logit_softcapping.unwrap_or(0.0);
-        grim_backend_rocm::launch_qkv_attention_dev_batch(
-            dev,
-            &buffers.q_buf[layer_idx],
-            &buffers.k_arena[layer_idx],
-            &buffers.v_arena[layer_idx],
-            &buffers.attn_out_buf[layer_idx],
-            &buffers.attn_max_buf[layer_idx],
-            &buffers.attn_sum_buf[layer_idx],
-            &buffers.pos_dev,
-            nh as u32,
-            nkv as u32,
-            hd as u32,
-            steps as u32,
-            steps as u32,
-            1.0 / (hd as f32).sqrt(),
-            0,
-            softcap,
-            &buffers.attn_dummy,
-            0,
-            0,
-            &buffers.attn_dummy,
-            0,
-            batch,
-            arena_slot_stride,
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
         // Bump pos_dev
         grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
@@ -2797,10 +3266,24 @@ impl ChameleonBlock {
         let kv_stride = nkv * hd;
         let arena_slot_stride = buffers.max_ctx * kv_stride;
         let max_ctx = buffers.max_ctx;
-        launch_qkv_gemv(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        // Phase 3: bounds-check the RING row, not the absolute pos. With a
+        // capped arena `current_pos` outgrows `max_ctx` by design once the
+        // ring wraps; rejecting it would drop capture to eager exactly when
+        // eviction is carrying the load.
+        grim_backend_rocm::launch_qkv_gemv_ring(
+            &buffers.k_arena[layer_idx],
+            buffers.current_pos,
+            max_ctx,
+            buffers.kv_ring,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        grim_backend_rocm::launch_attention_ring(
+            &buffers.k_arena[layer_idx],
+            buffers.current_pos,
+            max_ctx,
+            buffers.kv_ring,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
         grim_backend_rocm::launch_kv_append_batch(
             dev,
@@ -2811,6 +3294,7 @@ impl ChameleonBlock {
             steps,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -2823,6 +3307,7 @@ impl ChameleonBlock {
             steps,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -2851,6 +3336,7 @@ impl ChameleonBlock {
             0,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -3319,6 +3805,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -3331,6 +3818,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -3358,6 +3846,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 0,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -3450,21 +3939,19 @@ impl DecodeGraphModel for MiniMaxM3 {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
 
-            add_graph(
-                &graph.buffers.layer_output[i],
-                &graph.buffers.moe_out[i],
-                &graph.buffers.layer_output[i],
-                &dev,
-            )?;
-
             let n_layers = graph.buffers.layer_input.len();
-            let dst: &Storage = if i + 1 < n_layers {
+            let residual_dst: &Storage = if i + 1 < n_layers {
                 &graph.buffers.layer_input[i + 1]
             } else {
                 &graph.buffers.head_input
             };
-            dev.copy_slice_into(dst, &graph.buffers.layer_output[i], 0, batch * hidden)
-                .map_err(grim_core::error::Error::Tensor)?;
+
+            add_graph(
+                &graph.buffers.layer_output[i],
+                &graph.buffers.moe_out[i],
+                dst_downcast(residual_dst)?,
+                &dev,
+            )?;
         }
 
         // Final RMSNorm + LM head
@@ -3595,6 +4082,13 @@ impl DecodeGraphModel for MiniMaxM3 {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                src_elem_bytes: if k_rocm.dtype().arith == grim_tensor::ArithType::F16 {
+                    2
+                } else {
+                    4
+                },
+                k_scales_dev: None,
+                v_scales_dev: None,
                 gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
@@ -3781,6 +4275,7 @@ impl DecodeGraphModel for Glm4MoeLite {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -3793,6 +4288,7 @@ impl DecodeGraphModel for Glm4MoeLite {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -3820,6 +4316,7 @@ impl DecodeGraphModel for Glm4MoeLite {
                 0,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -3949,21 +4446,19 @@ impl DecodeGraphModel for Glm4MoeLite {
                 )?;
             }
 
-            add_graph(
-                &graph.buffers.layer_output[i],
-                &graph.buffers.moe_out[i],
-                &graph.buffers.layer_output[i],
-                &dev,
-            )?;
-
             let n_layers = graph.buffers.layer_input.len();
-            let dst: &Storage = if i + 1 < n_layers {
+            let residual_dst: &Storage = if i + 1 < n_layers {
                 &graph.buffers.layer_input[i + 1]
             } else {
                 &graph.buffers.head_input
             };
-            dev.copy_slice_into(dst, &graph.buffers.layer_output[i], 0, batch * hidden)
-                .map_err(grim_core::error::Error::Tensor)?;
+
+            add_graph(
+                &graph.buffers.layer_output[i],
+                &graph.buffers.moe_out[i],
+                dst_downcast(residual_dst)?,
+                &dev,
+            )?;
         }
 
         // Final RMSNorm + LM head
@@ -4196,6 +4691,7 @@ impl DecodeGraphModel for GraniteMoeHybrid {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -4208,6 +4704,7 @@ impl DecodeGraphModel for GraniteMoeHybrid {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -4235,6 +4732,7 @@ impl DecodeGraphModel for GraniteMoeHybrid {
                 0,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -4636,6 +5134,7 @@ impl DecodeGraphModel for HyV3 {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -4648,6 +5147,7 @@ impl DecodeGraphModel for HyV3 {
                 steps,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -4675,6 +5175,7 @@ impl DecodeGraphModel for HyV3 {
                 0,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -5092,6 +5593,13 @@ impl DecodeGraphModel for Chameleon {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                src_elem_bytes: if k_rocm.dtype().arith == grim_tensor::ArithType::F16 {
+                    2
+                } else {
+                    4
+                },
+                k_scales_dev: None,
+                v_scales_dev: None,
                 gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
@@ -5257,6 +5765,7 @@ impl DecodeGraphModel for DeepSeek4 {
                 1,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
 
@@ -5548,6 +6057,7 @@ impl DecodeGraphModel for DeepSeek2 {
                 1,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
 
@@ -5856,6 +6366,7 @@ impl DecodeGraphModel for DeepSeek32 {
                 1,
                 batch,
                 arena_slot_stride,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
 
@@ -7313,8 +7824,7 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
         // eager path computes this table per call; the graph path cannot.
         rope_inv_freq: {
             let rope_cfg = &model.layers[0].self_attn.rope.config;
-            let (inv_freq, _) =
-                grim_backend_rocm::RocmDevice::yarn_inv_freq_and_mscale(rope_cfg);
+            let (inv_freq, _) = grim_backend_rocm::RocmDevice::yarn_inv_freq_and_mscale(rope_cfg);
             let boxed = dev.from_cpu(
                 &inv_freq,
                 &Shape::new(vec![inv_freq.len()]),
@@ -7494,8 +8004,14 @@ impl DecodeGraphModel for Xing40 {
                     let k = if l.mlp.is_some() {
                         "dense"
                     } else if l.moe.is_some() {
-                        if l.moe.as_ref().unwrap().shared_experts.is_some() { "moe+shared" } else { "moe" }
-                    } else { "none" };
+                        if l.moe.as_ref().unwrap().shared_experts.is_some() {
+                            "moe+shared"
+                        } else {
+                            "moe"
+                        }
+                    } else {
+                        "none"
+                    };
                     format!("{i}:{k}")
                 })
                 .collect();
@@ -7515,11 +8031,9 @@ impl DecodeGraphModel for Xing40 {
                         down: e.w2.clone(),
                     })
                     .collect();
-                if let Err(e) = crate::shared_moe::ensure_kq_native(
-                    dev.ordinal(),
-                    &experts,
-                    &moe.charon_cache,
-                ) {
+                if let Err(e) =
+                    crate::shared_moe::ensure_kq_native(dev.ordinal(), &experts, &moe.charon_cache)
+                {
                     eprintln!("[xing40-graph] kq-native prewarm failed: {e}");
                 }
             }
@@ -7556,11 +8070,14 @@ impl DecodeGraphModel for Xing40 {
                         // Per-layer resident bytes: (gate + up + down) blobs,
                         // each (stride x n_routed_experts); gate and up share
                         // a stride.
-                        let per_layer = (first_stacks.gate_stride * 2
-                            + first_stacks.down_stride)
+                        let per_layer = (first_stacks.gate_stride * 2 + first_stacks.down_stride)
                             * self.cfg.n_routed_experts as u64;
                         let projected = per_layer * n_moe as u64;
-                        let free = grim_backend_rocm::device::capability_profiler::free_device_memory(dev.ordinal()).unwrap_or(0);
+                        let free =
+                            grim_backend_rocm::device::capability_profiler::free_device_memory(
+                                dev.ordinal(),
+                            )
+                            .unwrap_or(0);
                         if projected > free {
                             eprintln!(
                                 "[xing40-graph] whitecrow stacks need {projected:.0} B across {n_moe} MoE layers, {free} B free; skipping prewarm (fail closed)"
@@ -7679,11 +8196,17 @@ impl DecodeGraphModel for Xing40 {
                     let (a0, a1, an) = &spans[i];
                     let (b0, b1, bn) = &spans[j];
                     if a0 < b1 && b0 < a1 {
-                        overlaps.push(format!("{an} [{a0:#x},{a1:#x}) OVERLAPS {bn} [{b0:#x},{b1:#x})"));
+                        overlaps.push(format!(
+                            "{an} [{a0:#x},{a1:#x}) OVERLAPS {bn} [{b0:#x},{b1:#x})"
+                        ));
                     }
                 }
             }
-            eprintln!("[xing-graph] span count {}; OVERLAPS: {}", spans.len(), overlaps.len());
+            eprintln!(
+                "[xing-graph] span count {}; OVERLAPS: {}",
+                spans.len(),
+                overlaps.len()
+            );
             for o in overlaps.iter().take(12) {
                 eprintln!("[xing-graph]   {o}");
             }
@@ -7781,7 +8304,7 @@ impl DecodeGraphModel for Xing40 {
                 let cdst = as_rocm(scratch.attn_comb_snap[i].as_ref())?;
                 dev.copy_slice_into(cdst, scratch.comb[i].as_ref(), 0, hc * hc * batch)?;
             }
-                        // CAVEAT: this is a WARMUP pass. run.rs runs warmups on UNSEEDED
+            // CAVEAT: this is a WARMUP pass. run.rs runs warmups on UNSEEDED
             // buffers and then re-seeds, so only values UPSTREAM of the
             // attention (embedding, collapse, attn gates, q path) are
             // comparable to an eager run. Anything downstream of the KV
@@ -7789,7 +8312,10 @@ impl DecodeGraphModel for Xing40 {
             // rounds of chasing that were wasted before this was written down.
             if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
                 let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                for (lbl, b) in [("post", scratch.post.first()), ("comb", scratch.comb.first())] {
+                for (lbl, b) in [
+                    ("post", scratch.post.first()),
+                    ("comb", scratch.comb.first()),
+                ] {
                     if let Some(b) = b {
                         if let Ok(st) = as_rocm(b.as_ref()) {
                             if let Ok(v) = st.to_cpu_vec_f32() {
@@ -7806,7 +8332,7 @@ impl DecodeGraphModel for Xing40 {
                     }
                 }
             }
-dev.launch_hc_collapse_step(
+            dev.launch_hc_collapse_step(
                 // The attention branch reads the layer INPUT. `sout[i]` is the
                 // staging buffer the attention write-back fills further down,
                 // so it is still zeros at this point.
@@ -7822,7 +8348,7 @@ dev.launch_hc_collapse_step(
                 layer.attn_norm.eps,
                 as_rocm(scratch.col[i].as_ref())?,
                 &h_shape,
-           )?;
+            )?;
             // The FFN branch overwrites `col` later in this layer, so the
             // attention-branch value is only observable here. Dump during the
             // WARMUP pass (capturing=false => syncing is legal and the values
@@ -7831,8 +8357,8 @@ dev.launch_hc_collapse_step(
                 let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
                 if let Ok(st) = as_rocm(scratch.col[0].as_ref()) {
                     if let Ok(v) = st.to_cpu_vec_f32() {
-                        let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
-                            .sqrt();
+                        let r =
+                            (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
                         eprintln!(
                             "[xing-graph] WARM attn_in L{i}: n {} rms {r:.4e} head {:?}",
                             v.len(),
@@ -7926,7 +8452,9 @@ dev.launch_hc_collapse_step(
             // Warmup only: allocation is capture-poison.
             if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
                 let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                let Ok(got) = as_rocm(scratch.qp[i].as_ref())?.to_cpu_vec_f32() else { return Ok(()) };
+                let Ok(got) = as_rocm(scratch.qp[i].as_ref())?.to_cpu_vec_f32() else {
+                    return Ok(());
+                };
                 let pre_shape = Shape::new(vec![1, nh * rope_d]);
                 let nope_shape = Shape::new(vec![1, nh * nope]);
                 let t_pre = dev.zeros(&pre_shape, grim_tensor::DType::F32);
@@ -7960,32 +8488,64 @@ dev.launch_hc_collapse_step(
                                         grim_tensor::DType::F32,
                                     ) {
                                         Ok(v) => v,
-                                        Err(_) => { ok = false; break; }
-                                    };
-                                    let mut ho = match dev.zeros(&head_shape, grim_tensor::DType::F32) {
-                                        Ok(v) => v,
-                                        Err(_) => { ok = false; break; }
-                                    };
-                                    match grim_tensor::AttentionOps::rope(dev.as_ref(), head_src.as_ref(), &pos, &scratch.rope_cfg, &head_shape) {
-                                        Ok((t, _)) => {
-                                            if dev.write_cols(
-                                                refbuf.as_mut(), nh * rope_d, h * rope_d,
-                                                t.as_ref(), 1, rope_d,
-                                            ).is_err() { ok = false; break; }
+                                        Err(_) => {
+                                            ok = false;
+                                            break;
                                         }
-                                        _ => { ok = false; break; }
+                                    };
+                                    let mut ho =
+                                        match dev.zeros(&head_shape, grim_tensor::DType::F32) {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                ok = false;
+                                                break;
+                                            }
+                                        };
+                                    match grim_tensor::AttentionOps::rope(
+                                        dev.as_ref(),
+                                        head_src.as_ref(),
+                                        &pos,
+                                        &scratch.rope_cfg,
+                                        &head_shape,
+                                    ) {
+                                        Ok((t, _)) => {
+                                            if dev
+                                                .write_cols(
+                                                    refbuf.as_mut(),
+                                                    nh * rope_d,
+                                                    h * rope_d,
+                                                    t.as_ref(),
+                                                    1,
+                                                    rope_d,
+                                                )
+                                                .is_err()
+                                            {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        _ => {
+                                            ok = false;
+                                            break;
+                                        }
                                     }
                                     let _ = &mut ho;
                                 }
                                 if ok {
                                     dev.synchronize();
                                     if let Ok(b) = refbuf.to_cpu_vec_f32() {
-                                        let md = got.iter().zip(b.iter())
+                                        let md = got
+                                            .iter()
+                                            .zip(b.iter())
                                             .map(|(x, y)| (x - y).abs())
                                             .fold(0.0f32, f32::max);
                                         let rg = (got.iter().map(|x| x * x).sum::<f32>()
-                                            / got.len().max(1) as f32).sqrt();
-                                        eprintln!("[xing-graph] QROPE in_place_vs_perhead: max_abs {md:.4e} rel {:.4e} rms {rg:.4e}", md as f64 / (rg as f64).max(1e-12));
+                                            / got.len().max(1) as f32)
+                                            .sqrt();
+                                        eprintln!(
+                                            "[xing-graph] QROPE in_place_vs_perhead: max_abs {md:.4e} rel {:.4e} rms {rg:.4e}",
+                                            md as f64 / (rg as f64).max(1e-12)
+                                        );
                                     }
                                 }
                             }
@@ -8065,6 +8625,7 @@ dev.launch_hc_collapse_step(
                 1,
                 batch,
                 buffers.max_ctx * (rank + rope_d),
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
             // Latent-space attention over the LIVE length (pos_dev + 1); the
@@ -8116,7 +8677,8 @@ dev.launch_hc_collapse_step(
             // Warmup only: allocating is capture-poison.
             if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
                 if let Some(w_vc) = sa.w_vc_device(0)? {
-                    let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                    let _ =
+                        grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
                     let lat = as_rocm(scratch.qattn_latent[i].as_ref())?;
                     let w_r = as_rocm(w_vc)?;
                     let attn_shape = Shape::new(vec![1, nh * vd]);
@@ -8137,16 +8699,26 @@ dev.launch_hc_collapse_step(
                             for h in 0..nh {
                                 let tmp = match dev.zeros(&head_shape, grim_tensor::DType::F32) {
                                     Ok(t) => t,
-                                    Err(_) => { ok = false; break; }
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
                                 };
                                 let tmp_r: &grim_backend_rocm::RocmStorage =
                                     tmp.as_any().downcast_ref().expect("rocm");
                                 let lat_h = dev.narrow_cols(
-                                    lat, nh * rank, h * rank, 1, rank,
+                                    lat,
+                                    nh * rank,
+                                    h * rank,
+                                    1,
+                                    rank,
                                     &Shape::new(vec![1, rank]),
                                 );
                                 let w_h = dev.narrow_rows(
-                                    w_r, h * vd, vd, rank,
+                                    w_r,
+                                    h * vd,
+                                    vd,
+                                    rank,
                                     &Shape::new(vec![vd, rank]),
                                 );
                                 if let (Ok((l, _)), Ok((w, _))) = (lat_h, w_h) {
@@ -8154,7 +8726,8 @@ dev.launch_hc_collapse_step(
                                         ok = false;
                                         break;
                                     }
-                                    if dev.write_cols(mm_m, nh * vd, h * vd, tmp_r, 1, vd).is_err() {
+                                    if dev.write_cols(mm_m, nh * vd, h * vd, tmp_r, 1, vd).is_err()
+                                    {
                                         ok = false;
                                         break;
                                     }
@@ -8167,21 +8740,27 @@ dev.launch_hc_collapse_step(
                         if ok {
                             dev.synchronize();
                             if let (Ok(a), Ok(b)) = (xg.to_cpu_vec_f32(), mm.to_cpu_vec_f32()) {
-                                let md = a.iter().zip(b.iter())
+                                let md = a
+                                    .iter()
+                                    .zip(b.iter())
                                     .map(|(x, y)| (x - y).abs())
                                     .fold(0.0f32, f32::max);
                                 let ra = (a.iter().map(|x| x * x).sum::<f32>()
-                                    / a.len().max(1) as f32).sqrt();
-                                eprintln!("[xing-graph] ABSORB xing_vs_matmul: max_abs {md:.4e} rel {:.4e} rms {ra:.4e}", md / ra.max(1e-12));
+                                    / a.len().max(1) as f32)
+                                    .sqrt();
+                                eprintln!(
+                                    "[xing-graph] ABSORB xing_vs_matmul: max_abs {md:.4e} rel {:.4e} rms {ra:.4e}",
+                                    md / ra.max(1e-12)
+                                );
                             }
                         }
                     }
                 }
             }
             if let Some(w_vc) = sa.w_vc_device(0)? {
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mla") {
-                return Ok(());
-            }
+                if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mla") {
+                    return Ok(());
+                }
                 dev.launch_xing_q_absorb(
                     as_rocm(scratch.qattn_latent[i].as_ref())?,
                     w_vc,
@@ -8253,11 +8832,20 @@ dev.launch_hc_collapse_step(
                         as_rocm(scratch.attn[i].as_ref()),
                         as_rocm(sa.o_proj.weight().storage().as_ref()),
                     ) {
-                        if let Ok(fb) = dev.zeros(&Shape::new(vec![1, hidden]), grim_tensor::DType::F32) {
+                        if let Ok(fb) =
+                            dev.zeros(&Shape::new(vec![1, hidden]), grim_tensor::DType::F32)
+                        {
                             let fb_r: &grim_backend_rocm::RocmStorage =
                                 fb.as_any().downcast_ref().expect("rocm");
                             if dev
-                                .launch_fused_dequant_gemm_q4k_for_ab(attn_r, o_ws2, fb_r, 1, hidden, nh * vd)
+                                .launch_fused_dequant_gemm_q4k_for_ab(
+                                    attn_r,
+                                    o_ws2,
+                                    fb_r,
+                                    1,
+                                    hidden,
+                                    nh * vd,
+                                )
                                 .is_ok()
                             {
                                 dev.synchronize();
@@ -8333,15 +8921,18 @@ dev.launch_hc_collapse_step(
                         }
                     }
                     rr = (rr / (hc * hidden) as f64).sqrt();
-                    let rg = (soutv.iter().map(|x| x * x).sum::<f32>()
-                        / soutv.len().max(1) as f32)
+                    let rg = (soutv.iter().map(|x| x * x).sum::<f32>() / soutv.len().max(1) as f32)
                         .sqrt();
                     let rms = |v: &Vec<f32>| {
                         (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
                     };
                     eprintln!(
                         "[xing-graph] WB inputs rms: sin {:.4e} nb {:.4e} post {:?} comb {:.4e} sout {:.4e}",
-                        rms(&sinv), rms(&nb), &postv[..hc.min(postv.len())], rms(&combv), rg
+                        rms(&sinv),
+                        rms(&nb),
+                        &postv[..hc.min(postv.len())],
+                        rms(&combv),
+                        rg
                     );
                     eprintln!(
                         "[xing-graph] ATTN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
@@ -8383,22 +8974,28 @@ dev.launch_hc_collapse_step(
                 cmin,
                 cmax,
             )?;
-                        if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
                 let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
                 // Same warmup caveat as above: the FFN proj reads a stream
                 // built on a stale KV arena.
                 if let Some(b) = scratch.proj.first() {
                     if let Ok(st) = as_rocm(b.as_ref()) {
                         if let Ok(v) = st.to_cpu_vec_f32() {
-                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                            eprintln!("[xing-graph] WARMFFN proj rms {r:.4e} head {:?}", &v[..6.min(v.len())]);
+                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] WARMFFN proj rms {r:.4e} head {:?}",
+                                &v[..6.min(v.len())]
+                            );
                         }
                     }
                 }
                 if let Some(b) = scratch.comb.first() {
                     if let Ok(st) = as_rocm(b.as_ref()) {
                         if let Ok(v) = st.to_cpu_vec_f32() {
-                            let rows: Vec<f32> = (0..hc).map(|h| (0..hc).map(|i| v[h * hc + i]).sum()).collect();
+                            let rows: Vec<f32> = (0..hc)
+                                .map(|h| (0..hc).map(|i| v[h * hc + i]).sum())
+                                .collect();
                             eprintln!("[xing-graph] WARMFFN comb rowsums {rows:?}");
                         }
                     }
@@ -8413,13 +9010,18 @@ dev.launch_hc_collapse_step(
                 if let Some(b) = scratch.col.first() {
                     if let Ok(st) = as_rocm(b.as_ref()) {
                         if let Ok(v) = st.to_cpu_vec_f32() {
-                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                            eprintln!("[xing-graph] WARMFFN ffn_in n {} rms {r:.4e} head {:?}", v.len(), &v[..4.min(v.len())]);
+                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] WARMFFN ffn_in n {} rms {r:.4e} head {:?}",
+                                v.len(),
+                                &v[..4.min(v.len())]
+                            );
                         }
                     }
                 }
             }
-// The FFN branch reads the stream the ATTENTION write-back just
+            // The FFN branch reads the stream the ATTENTION write-back just
             // produced (`sout[i]`), not the layer input (`sin[i]`) — a replace-all
             // had flattened both collapses onto `sin`, which the near-zero `post`
             // gate of layer 0 hid until layer 1's larger gate exposed it.
@@ -8512,20 +9114,26 @@ dev.launch_hc_collapse_step(
                 // agree - and layers 2..39 are all moe+shared, so this is the
                 // first thing to check once layer 0 is oracle-verified.
                 if i == 2 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                    let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                    let _ =
+                        grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
                     let gl = as_rocm(&buffers.moe_gate_logits[i]).and_then(|s| s.to_cpu_vec_f32());
                     let bs = match bias {
-                        Some(b) => match as_rocm(b) { Ok(r) => r.to_cpu_vec_f32().ok(), Err(_) => None },
+                        Some(b) => match as_rocm(b) {
+                            Ok(r) => r.to_cpu_vec_f32().ok(),
+                            Err(_) => None,
+                        },
                         None => None,
                     };
                     // u32, NOT f32: reading it with to_cpu_vec_f32 reports
                     // zeros and looks exactly like a routing bug.
-                    let de = as_rocm(&buffers.moe_route_experts)
-                        .and_then(|s| s.to_cpu_vec_u32());
+                    let de = as_rocm(&buffers.moe_route_experts).and_then(|s| s.to_cpu_vec_u32());
                     let dw = as_rocm(&buffers.moe_route_weights).and_then(|s| s.to_cpu_vec_f32());
                     eprintln!(
                         "[xing-graph] ROUTING probe L2: logits_ok {} bias_ok {} experts_ok {:?} w_ok {}",
-                        gl.is_ok(), bs.is_some(), de.as_ref().map(|v| &v[..4.min(v.len())]), dw.is_ok()
+                        gl.is_ok(),
+                        bs.is_some(),
+                        de.as_ref().map(|v| &v[..4.min(v.len())]),
+                        dw.is_ok()
                     );
                     if let (Ok(gl), Some(bs), Ok(de), Ok(dw)) = (gl, bs, de, dw) {
                         let ne = gl.len();
@@ -8536,7 +9144,11 @@ dev.launch_hc_collapse_step(
                                 .partial_cmp(&(sig[*a] + bs[*a]))
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         });
-                        let sel: Vec<usize> = order.iter().take(moe.num_experts_per_tok).copied().collect();
+                        let sel: Vec<usize> = order
+                            .iter()
+                            .take(moe.num_experts_per_tok)
+                            .copied()
+                            .collect();
                         let sum: f32 = sel.iter().map(|j| sig[*j]).sum();
                         let dev_sel: Vec<usize> = de
                             .iter()
@@ -8550,7 +9162,9 @@ dev.launch_hc_collapse_step(
                         eprintln!(
                             "[xing-graph] ROUTING oracle: dev_experts {dev_sel:?} dev_w {:?} | host_experts {sel:?} host_w {:?} | overlap {same_set}/{}",
                             devs.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>(),
-                            sel.iter().map(|j| format!("{:.4}", sig[*j] / sum)).collect::<Vec<_>>(),
+                            sel.iter()
+                                .map(|j| format!("{:.4}", sig[*j] / sum))
+                                .collect::<Vec<_>>(),
                             moe.num_experts_per_tok
                         );
                     }
@@ -8729,7 +9343,8 @@ dev.launch_hc_collapse_step(
             //   out[j] = sum_c activated[c] * w2[j, c]
             if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
                 if let Some(mlp) = &layer.mlp {
-                    let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                    let _ =
+                        grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
                     let act = as_rocm(&buffers.activated_buf[i]).and_then(|s| s.to_cpu_vec_f32());
                     let w = mlp.w2.weight().to_vec_f32();
                     let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
@@ -8749,9 +9364,8 @@ dev.launch_hc_collapse_step(
                             rr += (acc as f64) * (acc as f64);
                         }
                         rr = (rr / n_out as f64).sqrt();
-                        let rg = (nb[..n_out].iter().map(|x| x * x).sum::<f32>()
-                            / n_out as f32)
-                            .sqrt();
+                        let rg =
+                            (nb[..n_out].iter().map(|x| x * x).sum::<f32>() / n_out as f32).sqrt();
                         eprintln!(
                             "[xing-graph] DENSE W2 vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
                             md as f64 / rr.max(1e-12)
@@ -8808,7 +9422,11 @@ dev.launch_hc_collapse_step(
                     };
                     eprintln!(
                         "[xing-graph] FFNWB inputs rms: sout {:.4e} nb {:.4e} post {:?} comb {:.4e} sin1 {:.4e}",
-                        rms(&sinv), rms(&nb), &postv[..hc.min(postv.len())], rms(&combv), rg
+                        rms(&sinv),
+                        rms(&nb),
+                        &postv[..hc.min(postv.len())],
+                        rms(&combv),
+                        rg
                     );
                     eprintln!(
                         "[xing-graph] FFN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
@@ -8868,7 +9486,7 @@ dev.launch_hc_collapse_step(
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
-            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;        // Diagnostics: join BOTH streams before any readback.
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?; // Diagnostics: join BOTH streams before any readback.
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
             dev.synchronize();
             if let Some(scratch) = self.graph_scratch.get() {
@@ -8922,8 +9540,13 @@ dev.launch_hc_collapse_step(
                     if let Some(nb) = graph.buffers.norm_buf.first() {
                         if let Ok(v) = nb.to_cpu_vec_f32() {
                             let nan = v.iter().filter(|x| x.is_nan()).count();
-                            let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                            eprintln!("[xing-graph] norm_buf0: len {} nan {nan} rms {rms:.4e}", v.len());
+                            let rms = (v.iter().map(|x| x * x).sum::<f32>()
+                                / v.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] norm_buf0: len {} nan {nan} rms {rms:.4e}",
+                                v.len()
+                            );
                         }
                     }
                     // The gathered embedding row: the graph uses
@@ -8931,8 +9554,13 @@ dev.launch_hc_collapse_step(
                     // eager uses grim_nn::embedding_gather_on_device.
                     if let Some(li) = graph.buffers.layer_input.first() {
                         if let Ok(v) = li.to_cpu_vec_f32() {
-                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                            eprintln!("[xing-graph] embedding row: n {} rms {r:.4e} head {:?}", v.len(), &v[..v.len().min(4)]);
+                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] embedding row: n {} rms {r:.4e} head {:?}",
+                                v.len(),
+                                &v[..v.len().min(4)]
+                            );
                         }
                     }
                     // Per-layer attn-branch input rms (post attn_norm), the
@@ -8970,7 +9598,9 @@ dev.launch_hc_collapse_step(
                         }
                         if let Some(nb) = graph.buffers.norm_buf.get(li) {
                             if let Ok(v) = nb.to_cpu_vec_f32() {
-                                let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                                let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                    / v.len().max(1) as f32)
+                                    .sqrt();
                                 eprintln!("[xing-graph] L{li} norm_buf rms {r:.4e}");
                             }
                         }
@@ -8994,467 +9624,51 @@ dev.launch_hc_collapse_step(
                             })
                             .collect();
                         eprintln!("[xing-graph] sin rms {}", parts.join(" "));
-                    // ATTENTION WRITE-BACK oracle at the real prefix. Every
-                    // input is now individually verified (absorb exact, attn
-                    // gates exact, o_proj exact) and all three survive the
-                    // replay via the snapshots, so this checks the write-back
-                    // itself: sout[h*hidden+d] = post[h]*y[d] +
-                    // sum_k comb[h*hc+k]*sin[k*hidden+d].
-                    {
-                        let sv = g.sin0_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let nb = g.attn_out_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let pv = g.attn_post_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let cv = g.attn_comb_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let ov = g.sout
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        if let (Some(sinv), Some(nbv), Some(pv), Some(cv), Some(ov)) =
-                            (sv, nb, pv, cv, ov)
+                        // ATTENTION WRITE-BACK oracle at the real prefix. Every
+                        // input is now individually verified (absorb exact, attn
+                        // gates exact, o_proj exact) and all three survive the
+                        // replay via the snapshots, so this checks the write-back
+                        // itself: sout[h*hidden+d] = post[h]*y[d] +
+                        // sum_k comb[h*hc+k]*sin[k*hidden+d].
                         {
-                            let hid = self.cfg.hidden_size;
-                            let hc4 = self.cfg.hc_mult;
-                            let (mut md, mut rr) = (0.0f32, 0.0f64);
-                            for d in 0..hid {
-                                for h in 0..hc4 {
-                                    let mut acc = pv[h] * nbv[d];
-                                    for k in 0..hc4 {
-                                        acc += cv[h * hc4 + k] * sinv[k * hid + d];
-                                    }
-                                    let diff = (acc - ov[h * hid + d]).abs();
-                                    if diff > md {
-                                        md = diff;
-                                    }
-                                    rr += (acc as f64) * (acc as f64);
-                                }
-                            }
-                            rr = (rr / (hc4 * hid) as f64).sqrt();
-                            let rg = (ov.iter().map(|x| x * x).sum::<f32>()
-                                / ov.len().max(1) as f32)
-                                .sqrt();
-                            eprintln!(
-                                "[xing-graph] ATTNWB post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                                md as f64 / rr.max(1e-12)
-                            );
-                        }
-                    }
-
-                    // The PRE-scale query, held unscaled here (the ratio is folded into
-                    // `inv_sqrt_d`). This is the quantity eager dumps as QABS/QROPE
-                    // and the comparison that locates the divergence upstream of
-                    // the W_UV, which the fused/absorb alignment ruled out.
-                    for (nm, buf) in [("QABS", &g.qabs), ("QROPE", &g.qp)] {
-                        if let Some(b) = buf.first() {
-                            if let Ok(st) = as_rocm(b.as_ref()) {
-                                if let Ok(v) = st.to_cpu_vec_f32() {
-                                    let r = (v.iter().map(|x| x * x).sum::<f32>()
-                                        / v.len().max(1) as f32)
-                                        .sqrt();
-                                    eprintln!(
-                                        "[xing-graph] {nm} pos {} rms {r:.6e} head {:?}",
-                                        graph.buffers.current_pos,
-                                        &v[..4.min(v.len())]
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // The o_proj output the graph fed to the attention
-                    // write-back, snapshotted in-graph at the real prefix.
-                    if let Some(nb) = g.attn_out_snap
-                        .first()
-                        .and_then(|b| as_rocm(b.as_ref()).ok())
-                        .and_then(|b| b.to_cpu_vec_f32().ok())
-                    {
-                        let r =
-                            (nb.iter().map(|x| x * x).sum::<f32>() / nb.len().max(1) as f32).sqrt();
-                        eprintln!(
-                            "[xing-graph] ATTNOUT pos {} rms {r:.6e} head {:?}",
-                            graph.buffers.current_pos,
-                            &nb[..4.min(nb.len())]
-                        );
-                    }
-
-                    // OPROJ oracle against the SNAPSHOT taken in-graph at the
-                    // real prefix: attn[0] x o_proj^T. attn[0] is exact, the
-                    // attention gates are exact, so if this fails the whole
-                    // attention write-back is explained.
-                    {
-                        let a = g.attn
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let nb = g.attn_out_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let w = self.layers[0]
-                            .self_attn
-                            .o_proj
-                            .weight()
-                            .to_vec_f32()
-                            .ok();
-                        if let (Some(a), Some(nb), Some(w)) = (a, nb, w) {
-                            let k = a.len();
-                            let n_out = 512.min(nb.len());
-                            let (mut md, mut rr) = (0.0f32, 0.0f64);
-                            for j in 0..n_out {
-                                let mut acc = 0.0f32;
-                                for c in 0..k {
-                                    acc += a[c] * w[j * k + c];
-                                }
-                                let d = (acc - nb[j]).abs();
-                                if d > md {
-                                    md = d;
-                                }
-                                rr += (acc as f64) * (acc as f64);
-                            }
-                            rr = (rr / n_out as f64).sqrt();
-                            let rg = (nb[..n_out].iter().map(|x| x * x).sum::<f32>()
-                                / n_out as f32)
-                                .sqrt();
-                            eprintln!(
-                                "[xing-graph] OPROJ post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                                md as f64 / rr.max(1e-12)
-                            );
-                        }
-                    }
-
-                    // The ATTENTION branch's gates, snapshotted in-graph at a
-                    // real prefix. Directly comparable with eager's
-                    // position-tagged ATTNGATES line.
-                    {
-                        let hc4 = self.cfg.hc_mult;
-                        let pv = g.attn_post_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let cv = g.attn_comb_snap
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        if let (Some(pv), Some(cv)) = (pv, cv) {
-                            let rows: Vec<f32> = (0..hc4)
-                                .map(|h| (0..hc4).map(|k| cv[h * hc4 + k]).sum())
-                                .collect();
-                            eprintln!(
-                                "[xing-graph] ATTNGATES pos {} comb_rowsums {:?} post {:?}",
-                                graph.buffers.current_pos,
-                                rows,
-                                &pv[..hc4.min(pv.len())]
-                            );
-                        }
-                    }
-
-                    // MLA latent-attention ORACLE, post-replay, over the real
-                    // arena prefix. qattn_latent feeds the absorb, which feeds
-                    // o_proj, which feeds the write-back — and attn_out has just
-                    // been measured DIFFERING between the paths while every
-                    // stage below it is host-exact, so this is the last link.
-                    {
-                        let rank = self.cfg.kv_lora_rank;
-                        let rope_d = self.cfg.qk_rope_head_dim;
-                        let nh = self.cfg.num_heads;
-                        let mscale =
-                            self.cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0);
-                        let inv = mscale * mscale
-                            / ((self.cfg.qk_nope_head_dim + rope_d) as f32).sqrt();
-                        let qa = g.qabs
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let qr = g.qp
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let kv = graph.buffers.k_arena
-                            .first()
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let got = g.qattn_latent
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        if let (Some(qa), Some(qr), Some(kv), Some(got)) = (qa, qr, kv, got) {
-                            let row = rank + rope_d;
-                            let slen = ((graph.buffers.current_pos as usize) + 1)
-                                .min(kv.len() / row.max(1));
-                            let mut scores = vec![0.0f32; slen];
-                            let (mut md, mut rr) = (0.0f32, 0.0f64);
-                            for h in 0..nh {
-                                for t in 0..slen {
-                                    let mut sc = 0.0f32;
-                                    for c in 0..rank {
-                                        sc += qa[h * rank + c] * kv[t * row + c];
-                                    }
-                                    for r in 0..rope_d {
-                                        sc += qr[h * rope_d + r] * kv[t * row + rank + r];
-                                    }
-                                    scores[t] = sc * inv;
-                                }
-                                let mx =
-                                    scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                let mut ex = vec![0.0f32; slen];
-                                let mut sum = 0.0f32;
-                                for t in 0..slen {
-                                    ex[t] = (scores[t] - mx).exp();
-                                    sum += ex[t];
-                                }
-                                let iv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-                                for c in 0..rank {
-                                    let mut acc = 0.0f32;
-                                    for t in 0..slen {
-                                        acc += ex[t] * iv * kv[t * row + c];
-                                    }
-                                    let d = (acc - got[h * rank + c]).abs();
-                                    if d > md {
-                                        md = d;
-                                    }
-                                    rr += (acc as f64) * (acc as f64);
-                                }
-                            }
-                            rr = (rr / (nh * rank) as f64).sqrt();
-                            let n = nh * rank;
-                            let rg =
-                                (got[..n].iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
-                            eprintln!(
-                                "[xing-graph] QATTN post-replay vs HOST (slen {slen}): max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                                md as f64 / rr.max(1e-12)
-                            );
-                        }
-                    }
-
-                    // Value-absorb ORACLE, post-replay: attn[h,v] =
-                    // sum_c qattn_latent[h,c] * w_vc[h,v,c]. Both inputs
-                    // survive the replay, so this checks the absorb at the
-                    // real prefix rather than the warmup's slen=1.
-                    {
-                        let w = self.layers[0]
-                            .self_attn
-                            .w_vc_device(0)
-                            .ok()
-                            .flatten()
-                            .and_then(|w| as_rocm(w).ok())
-                            .and_then(|w| w.to_cpu_vec_f32().ok());
-                        let q = g.qattn_latent
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        let a = g.attn
-                            .first()
-                            .and_then(|b| as_rocm(b.as_ref()).ok())
-                            .and_then(|b| b.to_cpu_vec_f32().ok());
-                        if let (Some(w), Some(q), Some(a)) = (w, q, a) {
-                            let nh = self.cfg.num_heads;
-                            let vd = self.cfg.v_head_dim;
-                            let rank = self.cfg.kv_lora_rank;
-                            let (mut md, mut rr) = (0.0f32, 0.0f64);
-                            for h in 0..nh {
-                                for v in 0..vd {
-                                    let mut acc = 0.0f32;
-                                    for c in 0..rank {
-                                        acc += q[h * rank + c] * w[(h * vd + v) * rank + c];
-                                    }
-                                    let d = (acc - a[h * vd + v]).abs();
-                                    if d > md {
-                                        md = d;
-                                    }
-                                    rr += (acc as f64) * (acc as f64);
-                                }
-                            }
-                            rr = (rr / (nh * vd) as f64).sqrt();
-                            let rg =
-                                (a.iter().map(|x| x * x).sum::<f32>() / a.len().max(1) as f32).sqrt();
-                            eprintln!(
-                                "[xing-graph] ABSORB post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                                md as f64 / rr.max(1e-12)
-                            );
-                        }
-                    }
-
-                    // Post-attention stream (sout[0]) - the other input to the
-                    // FFN write-back, and the product of the attention branch.
-                    if let Some(sb) = g.sout.first() {
-                        if let Ok(st) = as_rocm(sb.as_ref()) {
-                            if let Ok(v) = st.to_cpu_vec_f32() {
-                                let r = (v.iter().map(|x| x * x).sum::<f32>()
-                                    / v.len().max(1) as f32)
-                                    .sqrt();
-                                eprintln!(
-                                    "[xing-graph] STREAMATTN pos {} rms {r:.6e} head {:?}",
-                                    graph.buffers.current_pos,
-                                    &v[..4]
-                                );
-                            }
-                        }
-                    }
-                    // IN-SITU MoE ORACLE for layer 2 (the first moe+shared
-                    // layer). The dispatch has a bit-identical UNIT test but has
-                    // never been checked on the real routing: norm_buf[i] is
-                    // only ever an INPUT to the write-back oracle, which passes
-                    // regardless of whether the dispatch itself was right.
-                    // Routing comes from the PER-LAYER snapshot - the shared
-                    // buffers hold the last layer's routing post-replay.
-                    if std::env::var_os("GRIM_XING_TRACE").is_some() {
-                        const ML: usize = 2;
-                        const NOUT: usize = 256;
-                        if let Some(moe) = &self.layers.get(ML).and_then(|l| l.moe.as_ref()) {
-                            let col = g
-                                .col
-                                .get(ML)
+                            let sv = g
+                                .sin0_snap
+                                .first()
                                 .and_then(|b| as_rocm(b.as_ref()).ok())
-                                .and_then(|s| s.to_cpu_vec_f32().ok());
-                            let nb = graph
-                                .buffers
-                                .norm_buf
-                                .get(ML)
-                                .and_then(|s| s.to_cpu_vec_f32().ok());
-                            let sel = g
-                                .route_experts_snap
-                                .get(ML)
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let nb = g
+                                .attn_out_snap
+                                .first()
                                 .and_then(|b| as_rocm(b.as_ref()).ok())
-                                .and_then(|s| s.to_cpu_vec_u32().ok());
-                            let wts = g
-                                .route_weights_snap
-                                .get(ML)
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let pv = g
+                                .attn_post_snap
+                                .first()
                                 .and_then(|b| as_rocm(b.as_ref()).ok())
-                                .and_then(|s| s.to_cpu_vec_f32().ok());
-                            if let (Some(col), Some(nb), Some(sel), Some(wts)) = (col, nb, sel, wts)
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let cv = g
+                                .attn_comb_snap
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let ov = g
+                                .sout
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            if let (Some(sinv), Some(nbv), Some(pv), Some(cv), Some(ov)) =
+                                (sv, nb, pv, cv, ov)
                             {
-                                let hidden = col.len();
-                                let topk = sel.len().min(wts.len());
-                                let mut acc = vec![0.0f32; NOUT.min(hidden)];
-                                let mut ok = true;
-                                for t in 0..topk {
-                                    let e = sel[t] as usize;
-                                    let w = wts[t] * moe.routed_scaling_factor;
-                                    let Some(x) = moe.experts.get(e) else { ok = false; break };
-                                    let (Ok(g1), Ok(u1), Ok(d1)) = (
-                                        x.w1.weight().to_vec_f32(),
-                                        x.w3.weight().to_vec_f32(),
-                                        x.w2.weight().to_vec_f32(),
-                                    ) else { ok = false; break };
-                                    let inter = g1.len() / hidden.max(1);
-                                    let mut act = vec![0.0f32; inter];
-                                    for j in 0..inter {
-                                        let (mut ga, mut ua) = (0.0f32, 0.0f32);
-                                        for c in 0..hidden.min(g1.len() / inter.max(1)) {
-                                            ga += col[c] * g1[j * hidden + c];
-                                            ua += col[c] * u1[j * hidden + c];
-                                        }
-                                        act[j] = (ga / (1.0 + (-ga).exp())) * ua;
-                                    }
-                                    for (j, o) in acc.iter_mut().enumerate().take(NOUT.min(hidden)) {
-                                        let mut v = 0.0f32;
-                                        for c in 0..inter.min(act.len()) {
-                                            v += act[c] * d1[j * inter + c];
-                                        }
-                                        *o += w * v;
-                                    }
-                                }
-                                if ok {
-                                    if let Some(sh) = &moe.shared_experts {
-                                        if let (Ok(s1), Ok(s3), Ok(s2)) = (
-                                            sh.w1.weight().to_vec_f32(),
-                                            sh.w3.weight().to_vec_f32(),
-                                            sh.w2.weight().to_vec_f32(),
-                                        ) {
-                                            let sinter = s1.len() / hidden.max(1);
-                                            let mut act = vec![0.0f32; sinter];
-                                            for j in 0..sinter {
-                                                let (mut ga, mut ua) = (0.0f32, 0.0f32);
-                                                for c in 0..hidden.min(s1.len() / sinter.max(1)) {
-                                                    ga += col[c] * s1[j * hidden + c];
-                                                    ua += col[c] * s3[j * hidden + c];
-                                                }
-                                                act[j] = (ga / (1.0 + (-ga).exp())) * ua;
-                                            }
-                                            for (j, o) in
-                                                acc.iter_mut().enumerate().take(NOUT.min(hidden))
-                                            {
-                                                let mut v = 0.0f32;
-                                                for c in 0..sinter.min(act.len()) {
-                                                    v += act[c] * s2[j * sinter + c];
-                                                }
-                                                *o += v;
-                                            }
-                                        }
-                                    }
-                                    let n = acc.len().min(nb.len());
-                                    let md = acc[..n]
-                                        .iter()
-                                        .zip(nb[..n].iter())
-                                        .map(|(x, y)| (x - y).abs())
-                                        .fold(0.0f32, f32::max);
-                                    let rr =
-                                        (acc[..n].iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32)
-                                            .sqrt();
-                                    let rg =
-                                        (nb[..n].iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32)
-                                            .sqrt();
-                                    eprintln!(
-                                        "[xing-graph] MOE-ORACLE L{ML} (first {n} outs, top{topk}): max_abs {md:.4e} rel {:.4e} host_rms {rr:.4e} dev_rms {rg:.4e}",
-                                        md as f64 / (rr as f64).max(1e-12)
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // FFN WRITE-BACK ORACLE ACROSS DEPTH, post-replay. Every
-                    // input survives the replay for EVERY layer (sout[i] is
-                    // written once by the attention branch, norm_buf[i] by the
-                    // FFN, post[i]/comb[i] by the FFN's gate call, and the
-                    // result lands in sin[i+1]). Running it per layer turns it
-                    // into a depth scan: the first layer whose oracles fail
-                    // localises the residual, which layer 0 alone cannot do.
-                    {
-                        let hid = self.cfg.hidden_size;
-                        let hc4 = self.cfg.hc_mult;
-                        let n_l = self.layers.len();
-                        let mut bad: Vec<String> = Vec::new();
-                        for li in 0..n_l {
-                            let dst = if li + 1 < n_l { g.sin.get(li + 1) } else { g.sin.first() };
-                            let (Some(sv), Some(nv), Some(pv), Some(cv), Some(ov)) = (
-                                g.sout.get(li),
-                                graph.buffers.norm_buf.get(li),
-                                g.post.get(li),
-                                g.comb.get(li),
-                                dst,
-                            ) else {
-                                continue;
-                            };
-                            fn rd<E>(r: std::result::Result<&grim_backend_rocm::RocmStorage, E>) -> Option<Vec<f32>> {
-                                r.ok().and_then(|x| x.to_cpu_vec_f32().ok())
-                            }
-                            let got = (
-                                rd(as_rocm(sv.as_ref())),
-                                rd(as_rocm(nv)),
-                                rd(as_rocm(pv.as_ref())),
-                                rd(as_rocm(cv.as_ref())),
-                                rd(as_rocm(ov.as_ref())),
-                            );
-                            if let (Some(sinv), Some(nbv), Some(postv), Some(combv), Some(outv)) = got {
+                                let hid = self.cfg.hidden_size;
+                                let hc4 = self.cfg.hc_mult;
                                 let (mut md, mut rr) = (0.0f32, 0.0f64);
                                 for d in 0..hid {
                                     for h in 0..hc4 {
-                                        let mut acc = postv[h] * nbv[d];
+                                        let mut acc = pv[h] * nbv[d];
                                         for k in 0..hc4 {
-                                            acc += combv[h * hc4 + k] * sinv[k * hid + d];
+                                            acc += cv[h * hc4 + k] * sinv[k * hid + d];
                                         }
-                                        let diff = (acc - outv[h * hid + d]).abs();
+                                        let diff = (acc - ov[h * hid + d]).abs();
                                         if diff > md {
                                             md = diff;
                                         }
@@ -9462,82 +9676,536 @@ dev.launch_hc_collapse_step(
                                     }
                                 }
                                 rr = (rr / (hc4 * hid) as f64).sqrt();
-                                let rg = (outv.iter().map(|x| x * x).sum::<f32>()
-                                    / outv.len().max(1) as f32)
+                                let rg = (ov.iter().map(|x| x * x).sum::<f32>()
+                                    / ov.len().max(1) as f32)
                                     .sqrt();
-                                let rel = md as f64 / rr.max(1e-12);
-                                if rel > 1e-5 {
-                                    bad.push(format!(
-                                        "L{li} rel {rel:.3e} (max_abs {md:.3e}, rms {rg:.3e})"
-                                    ));
+                                eprintln!(
+                                    "[xing-graph] ATTNWB post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                    md as f64 / rr.max(1e-12)
+                                );
+                            }
+                        }
+
+                        // The PRE-scale query, held unscaled here (the ratio is folded into
+                        // `inv_sqrt_d`). This is the quantity eager dumps as QABS/QROPE
+                        // and the comparison that locates the divergence upstream of
+                        // the W_UV, which the fused/absorb alignment ruled out.
+                        for (nm, buf) in [("QABS", &g.qabs), ("QROPE", &g.qp)] {
+                            if let Some(b) = buf.first() {
+                                if let Ok(st) = as_rocm(b.as_ref()) {
+                                    if let Ok(v) = st.to_cpu_vec_f32() {
+                                        let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                            / v.len().max(1) as f32)
+                                            .sqrt();
+                                        eprintln!(
+                                            "[xing-graph] {nm} pos {} rms {r:.6e} head {:?}",
+                                            graph.buffers.current_pos,
+                                            &v[..4.min(v.len())]
+                                        );
+                                    }
                                 }
                             }
                         }
-                        if bad.is_empty() {
+
+                        // The o_proj output the graph fed to the attention
+                        // write-back, snapshotted in-graph at the real prefix.
+                        if let Some(nb) = g
+                            .attn_out_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok())
+                        {
+                            let r = (nb.iter().map(|x| x * x).sum::<f32>()
+                                / nb.len().max(1) as f32)
+                                .sqrt();
                             eprintln!(
-                                "[xing-graph] FFWB-DEPTH: all {n_l} layers pass (<1e-5)"
-                            );
-                        } else {
-                            eprintln!(
-                                "[xing-graph] FFWB-DEPTH: {} of {n_l} layers FAIL: {}",
-                                bad.len(),
-                                bad.iter().take(6).cloned().collect::<Vec<_>>().join(" | ")
+                                "[xing-graph] ATTNOUT pos {} rms {r:.6e} head {:?}",
+                                graph.buffers.current_pos,
+                                &nb[..4.min(nb.len())]
                             );
                         }
-                    }
 
-                    // Layer 0's FFN hc gates, post-replay: the FFN gate call
-                    // is the last writer of comb[0]/post[0], so these survive
-                    // and are directly comparable with eager's FFNGATES line.
-                    if let Some(c) = g.comb.first() {
-                        if let Ok(st) = as_rocm(c.as_ref()) {
-                            if let Ok(v) = st.to_cpu_vec_f32() {
-                                let hc4 = self.cfg.hc_mult;
+                        // OPROJ oracle against the SNAPSHOT taken in-graph at the
+                        // real prefix: attn[0] x o_proj^T. attn[0] is exact, the
+                        // attention gates are exact, so if this fails the whole
+                        // attention write-back is explained.
+                        {
+                            let a = g
+                                .attn
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let nb = g
+                                .attn_out_snap
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let w = self.layers[0].self_attn.o_proj.weight().to_vec_f32().ok();
+                            if let (Some(a), Some(nb), Some(w)) = (a, nb, w) {
+                                let k = a.len();
+                                let n_out = 512.min(nb.len());
+                                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                                for j in 0..n_out {
+                                    let mut acc = 0.0f32;
+                                    for c in 0..k {
+                                        acc += a[c] * w[j * k + c];
+                                    }
+                                    let d = (acc - nb[j]).abs();
+                                    if d > md {
+                                        md = d;
+                                    }
+                                    rr += (acc as f64) * (acc as f64);
+                                }
+                                rr = (rr / n_out as f64).sqrt();
+                                let rg = (nb[..n_out].iter().map(|x| x * x).sum::<f32>()
+                                    / n_out as f32)
+                                    .sqrt();
+                                eprintln!(
+                                    "[xing-graph] OPROJ post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                    md as f64 / rr.max(1e-12)
+                                );
+                            }
+                        }
+
+                        // The ATTENTION branch's gates, snapshotted in-graph at a
+                        // real prefix. Directly comparable with eager's
+                        // position-tagged ATTNGATES line.
+                        {
+                            let hc4 = self.cfg.hc_mult;
+                            let pv = g
+                                .attn_post_snap
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let cv = g
+                                .attn_comb_snap
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            if let (Some(pv), Some(cv)) = (pv, cv) {
                                 let rows: Vec<f32> = (0..hc4)
-                                    .map(|h| (0..hc4).map(|k| v[h * hc4 + k]).sum())
+                                    .map(|h| (0..hc4).map(|k| cv[h * hc4 + k]).sum())
                                     .collect();
                                 eprintln!(
-                                    "[xing-graph] FFNGATES pos {} comb_rowsums {:?}",
+                                    "[xing-graph] ATTNGATES pos {} comb_rowsums {:?} post {:?}",
                                     graph.buffers.current_pos,
-                                    rows
+                                    rows,
+                                    &pv[..hc4.min(pv.len())]
                                 );
                             }
                         }
-                    }
-                    // Layer 0's INPUT streams at this replay: the step-start
-                    // state. Comparable with eager's "[xing-trace] block_in"
-                    // for the same position — if these differ, the divergence
-                    // is in the replay's step-start state, not in any layer.
-                    if let Some(b) = g.sin.first() {
-                        if let Ok(st) = as_rocm(b.as_ref()) {
-                            if let Ok(v) = st.to_cpu_vec_f32() {
-                                let r = (v.iter().map(|x| x * x).sum::<f32>()
-                                    / v.len().max(1) as f32)
+
+                        // MLA latent-attention ORACLE, post-replay, over the real
+                        // arena prefix. qattn_latent feeds the absorb, which feeds
+                        // o_proj, which feeds the write-back — and attn_out has just
+                        // been measured DIFFERING between the paths while every
+                        // stage below it is host-exact, so this is the last link.
+                        {
+                            let rank = self.cfg.kv_lora_rank;
+                            let rope_d = self.cfg.qk_rope_head_dim;
+                            let nh = self.cfg.num_heads;
+                            let mscale = self
+                                .cfg
+                                .rope_yarn
+                                .map(|y| y.attention_factor)
+                                .unwrap_or(1.0);
+                            let inv = mscale * mscale
+                                / ((self.cfg.qk_nope_head_dim + rope_d) as f32).sqrt();
+                            let qa = g
+                                .qabs
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let qr =
+                                g.qp.first()
+                                    .and_then(|b| as_rocm(b.as_ref()).ok())
+                                    .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let kv = graph
+                                .buffers
+                                .k_arena
+                                .first()
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let got = g
+                                .qattn_latent
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            if let (Some(qa), Some(qr), Some(kv), Some(got)) = (qa, qr, kv, got) {
+                                let row = rank + rope_d;
+                                let slen = ((graph.buffers.current_pos as usize) + 1)
+                                    .min(kv.len() / row.max(1));
+                                let mut scores = vec![0.0f32; slen];
+                                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                                for h in 0..nh {
+                                    for t in 0..slen {
+                                        let mut sc = 0.0f32;
+                                        for c in 0..rank {
+                                            sc += qa[h * rank + c] * kv[t * row + c];
+                                        }
+                                        for r in 0..rope_d {
+                                            sc += qr[h * rope_d + r] * kv[t * row + rank + r];
+                                        }
+                                        scores[t] = sc * inv;
+                                    }
+                                    let mx =
+                                        scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                    let mut ex = vec![0.0f32; slen];
+                                    let mut sum = 0.0f32;
+                                    for t in 0..slen {
+                                        ex[t] = (scores[t] - mx).exp();
+                                        sum += ex[t];
+                                    }
+                                    let iv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                                    for c in 0..rank {
+                                        let mut acc = 0.0f32;
+                                        for t in 0..slen {
+                                            acc += ex[t] * iv * kv[t * row + c];
+                                        }
+                                        let d = (acc - got[h * rank + c]).abs();
+                                        if d > md {
+                                            md = d;
+                                        }
+                                        rr += (acc as f64) * (acc as f64);
+                                    }
+                                }
+                                rr = (rr / (nh * rank) as f64).sqrt();
+                                let n = nh * rank;
+                                let rg =
+                                    (got[..n].iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+                                eprintln!(
+                                    "[xing-graph] QATTN post-replay vs HOST (slen {slen}): max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                    md as f64 / rr.max(1e-12)
+                                );
+                            }
+                        }
+
+                        // Value-absorb ORACLE, post-replay: attn[h,v] =
+                        // sum_c qattn_latent[h,c] * w_vc[h,v,c]. Both inputs
+                        // survive the replay, so this checks the absorb at the
+                        // real prefix rather than the warmup's slen=1.
+                        {
+                            let w = self.layers[0]
+                                .self_attn
+                                .w_vc_device(0)
+                                .ok()
+                                .flatten()
+                                .and_then(|w| as_rocm(w).ok())
+                                .and_then(|w| w.to_cpu_vec_f32().ok());
+                            let q = g
+                                .qattn_latent
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            let a = g
+                                .attn
+                                .first()
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|b| b.to_cpu_vec_f32().ok());
+                            if let (Some(w), Some(q), Some(a)) = (w, q, a) {
+                                let nh = self.cfg.num_heads;
+                                let vd = self.cfg.v_head_dim;
+                                let rank = self.cfg.kv_lora_rank;
+                                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                                for h in 0..nh {
+                                    for v in 0..vd {
+                                        let mut acc = 0.0f32;
+                                        for c in 0..rank {
+                                            acc += q[h * rank + c] * w[(h * vd + v) * rank + c];
+                                        }
+                                        let d = (acc - a[h * vd + v]).abs();
+                                        if d > md {
+                                            md = d;
+                                        }
+                                        rr += (acc as f64) * (acc as f64);
+                                    }
+                                }
+                                rr = (rr / (nh * vd) as f64).sqrt();
+                                let rg = (a.iter().map(|x| x * x).sum::<f32>()
+                                    / a.len().max(1) as f32)
                                     .sqrt();
                                 eprintln!(
-                                    "[xing-graph] SIN0 pos {} rms {r:.6e} head {:?}",
-                                    graph.buffers.current_pos,
-                                    &v[..v.len().min(4)]
+                                    "[xing-graph] ABSORB post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                    md as f64 / rr.max(1e-12)
                                 );
                             }
                         }
-                    }
-                    // Layer 0's OUTPUT stream at this replay, tagged with the
-                    // position so it can be matched against eager's "L1 in".
-                    if let Some(b) = g.sin.get(1) {
-                        if let Ok(st) = as_rocm(b.as_ref()) {
-                            if let Ok(v) = st.to_cpu_vec_f32() {
-                                let r = (v.iter().map(|x| x * x).sum::<f32>()
-                                    / v.len().max(1) as f32)
-                                    .sqrt();
+
+                        // Post-attention stream (sout[0]) - the other input to the
+                        // FFN write-back, and the product of the attention branch.
+                        if let Some(sb) = g.sout.first() {
+                            if let Ok(st) = as_rocm(sb.as_ref()) {
+                                if let Ok(v) = st.to_cpu_vec_f32() {
+                                    let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                        / v.len().max(1) as f32)
+                                        .sqrt();
+                                    eprintln!(
+                                        "[xing-graph] STREAMATTN pos {} rms {r:.6e} head {:?}",
+                                        graph.buffers.current_pos,
+                                        &v[..4]
+                                    );
+                                }
+                            }
+                        }
+                        // IN-SITU MoE ORACLE for layer 2 (the first moe+shared
+                        // layer). The dispatch has a bit-identical UNIT test but has
+                        // never been checked on the real routing: norm_buf[i] is
+                        // only ever an INPUT to the write-back oracle, which passes
+                        // regardless of whether the dispatch itself was right.
+                        // Routing comes from the PER-LAYER snapshot - the shared
+                        // buffers hold the last layer's routing post-replay.
+                        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                            const ML: usize = 2;
+                            const NOUT: usize = 256;
+                            if let Some(moe) = &self.layers.get(ML).and_then(|l| l.moe.as_ref()) {
+                                let col = g
+                                    .col
+                                    .get(ML)
+                                    .and_then(|b| as_rocm(b.as_ref()).ok())
+                                    .and_then(|s| s.to_cpu_vec_f32().ok());
+                                let nb = graph
+                                    .buffers
+                                    .norm_buf
+                                    .get(ML)
+                                    .and_then(|s| s.to_cpu_vec_f32().ok());
+                                let sel = g
+                                    .route_experts_snap
+                                    .get(ML)
+                                    .and_then(|b| as_rocm(b.as_ref()).ok())
+                                    .and_then(|s| s.to_cpu_vec_u32().ok());
+                                let wts = g
+                                    .route_weights_snap
+                                    .get(ML)
+                                    .and_then(|b| as_rocm(b.as_ref()).ok())
+                                    .and_then(|s| s.to_cpu_vec_f32().ok());
+                                if let (Some(col), Some(nb), Some(sel), Some(wts)) =
+                                    (col, nb, sel, wts)
+                                {
+                                    let hidden = col.len();
+                                    let topk = sel.len().min(wts.len());
+                                    let mut acc = vec![0.0f32; NOUT.min(hidden)];
+                                    let mut ok = true;
+                                    for t in 0..topk {
+                                        let e = sel[t] as usize;
+                                        let w = wts[t] * moe.routed_scaling_factor;
+                                        let Some(x) = moe.experts.get(e) else {
+                                            ok = false;
+                                            break;
+                                        };
+                                        let (Ok(g1), Ok(u1), Ok(d1)) = (
+                                            x.w1.weight().to_vec_f32(),
+                                            x.w3.weight().to_vec_f32(),
+                                            x.w2.weight().to_vec_f32(),
+                                        ) else {
+                                            ok = false;
+                                            break;
+                                        };
+                                        let inter = g1.len() / hidden.max(1);
+                                        let mut act = vec![0.0f32; inter];
+                                        for j in 0..inter {
+                                            let (mut ga, mut ua) = (0.0f32, 0.0f32);
+                                            for c in 0..hidden.min(g1.len() / inter.max(1)) {
+                                                ga += col[c] * g1[j * hidden + c];
+                                                ua += col[c] * u1[j * hidden + c];
+                                            }
+                                            act[j] = (ga / (1.0 + (-ga).exp())) * ua;
+                                        }
+                                        for (j, o) in
+                                            acc.iter_mut().enumerate().take(NOUT.min(hidden))
+                                        {
+                                            let mut v = 0.0f32;
+                                            for c in 0..inter.min(act.len()) {
+                                                v += act[c] * d1[j * inter + c];
+                                            }
+                                            *o += w * v;
+                                        }
+                                    }
+                                    if ok {
+                                        if let Some(sh) = &moe.shared_experts {
+                                            if let (Ok(s1), Ok(s3), Ok(s2)) = (
+                                                sh.w1.weight().to_vec_f32(),
+                                                sh.w3.weight().to_vec_f32(),
+                                                sh.w2.weight().to_vec_f32(),
+                                            ) {
+                                                let sinter = s1.len() / hidden.max(1);
+                                                let mut act = vec![0.0f32; sinter];
+                                                for j in 0..sinter {
+                                                    let (mut ga, mut ua) = (0.0f32, 0.0f32);
+                                                    for c in 0..hidden.min(s1.len() / sinter.max(1))
+                                                    {
+                                                        ga += col[c] * s1[j * hidden + c];
+                                                        ua += col[c] * s3[j * hidden + c];
+                                                    }
+                                                    act[j] = (ga / (1.0 + (-ga).exp())) * ua;
+                                                }
+                                                for (j, o) in acc
+                                                    .iter_mut()
+                                                    .enumerate()
+                                                    .take(NOUT.min(hidden))
+                                                {
+                                                    let mut v = 0.0f32;
+                                                    for c in 0..sinter.min(act.len()) {
+                                                        v += act[c] * s2[j * sinter + c];
+                                                    }
+                                                    *o += v;
+                                                }
+                                            }
+                                        }
+                                        let n = acc.len().min(nb.len());
+                                        let md = acc[..n]
+                                            .iter()
+                                            .zip(nb[..n].iter())
+                                            .map(|(x, y)| (x - y).abs())
+                                            .fold(0.0f32, f32::max);
+                                        let rr = (acc[..n].iter().map(|x| x * x).sum::<f32>()
+                                            / n.max(1) as f32)
+                                            .sqrt();
+                                        let rg = (nb[..n].iter().map(|x| x * x).sum::<f32>()
+                                            / n.max(1) as f32)
+                                            .sqrt();
+                                        eprintln!(
+                                            "[xing-graph] MOE-ORACLE L{ML} (first {n} outs, top{topk}): max_abs {md:.4e} rel {:.4e} host_rms {rr:.4e} dev_rms {rg:.4e}",
+                                            md as f64 / (rr as f64).max(1e-12)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // FFN WRITE-BACK ORACLE ACROSS DEPTH, post-replay. Every
+                        // input survives the replay for EVERY layer (sout[i] is
+                        // written once by the attention branch, norm_buf[i] by the
+                        // FFN, post[i]/comb[i] by the FFN's gate call, and the
+                        // result lands in sin[i+1]). Running it per layer turns it
+                        // into a depth scan: the first layer whose oracles fail
+                        // localises the residual, which layer 0 alone cannot do.
+                        {
+                            let hid = self.cfg.hidden_size;
+                            let hc4 = self.cfg.hc_mult;
+                            let n_l = self.layers.len();
+                            let mut bad: Vec<String> = Vec::new();
+                            for li in 0..n_l {
+                                let dst = if li + 1 < n_l {
+                                    g.sin.get(li + 1)
+                                } else {
+                                    g.sin.first()
+                                };
+                                let (Some(sv), Some(nv), Some(pv), Some(cv), Some(ov)) = (
+                                    g.sout.get(li),
+                                    graph.buffers.norm_buf.get(li),
+                                    g.post.get(li),
+                                    g.comb.get(li),
+                                    dst,
+                                ) else {
+                                    continue;
+                                };
+                                fn rd<E>(
+                                    r: std::result::Result<&grim_backend_rocm::RocmStorage, E>,
+                                ) -> Option<Vec<f32>> {
+                                    r.ok().and_then(|x| x.to_cpu_vec_f32().ok())
+                                }
+                                let got = (
+                                    rd(as_rocm(sv.as_ref())),
+                                    rd(as_rocm(nv)),
+                                    rd(as_rocm(pv.as_ref())),
+                                    rd(as_rocm(cv.as_ref())),
+                                    rd(as_rocm(ov.as_ref())),
+                                );
+                                if let (
+                                    Some(sinv),
+                                    Some(nbv),
+                                    Some(postv),
+                                    Some(combv),
+                                    Some(outv),
+                                ) = got
+                                {
+                                    let (mut md, mut rr) = (0.0f32, 0.0f64);
+                                    for d in 0..hid {
+                                        for h in 0..hc4 {
+                                            let mut acc = postv[h] * nbv[d];
+                                            for k in 0..hc4 {
+                                                acc += combv[h * hc4 + k] * sinv[k * hid + d];
+                                            }
+                                            let diff = (acc - outv[h * hid + d]).abs();
+                                            if diff > md {
+                                                md = diff;
+                                            }
+                                            rr += (acc as f64) * (acc as f64);
+                                        }
+                                    }
+                                    rr = (rr / (hc4 * hid) as f64).sqrt();
+                                    let rg = (outv.iter().map(|x| x * x).sum::<f32>()
+                                        / outv.len().max(1) as f32)
+                                        .sqrt();
+                                    let rel = md as f64 / rr.max(1e-12);
+                                    if rel > 1e-5 {
+                                        bad.push(format!(
+                                            "L{li} rel {rel:.3e} (max_abs {md:.3e}, rms {rg:.3e})"
+                                        ));
+                                    }
+                                }
+                            }
+                            if bad.is_empty() {
+                                eprintln!("[xing-graph] FFWB-DEPTH: all {n_l} layers pass (<1e-5)");
+                            } else {
                                 eprintln!(
-                                    "[xing-graph] SIN1 pos {} rms {r:.6e} head {:?}",
-                                    graph.buffers.current_pos,
-                                    &v[..v.len().min(4)]
+                                    "[xing-graph] FFWB-DEPTH: {} of {n_l} layers FAIL: {}",
+                                    bad.len(),
+                                    bad.iter().take(6).cloned().collect::<Vec<_>>().join(" | ")
                                 );
                             }
                         }
-                    }
+
+                        // Layer 0's FFN hc gates, post-replay: the FFN gate call
+                        // is the last writer of comb[0]/post[0], so these survive
+                        // and are directly comparable with eager's FFNGATES line.
+                        if let Some(c) = g.comb.first() {
+                            if let Ok(st) = as_rocm(c.as_ref()) {
+                                if let Ok(v) = st.to_cpu_vec_f32() {
+                                    let hc4 = self.cfg.hc_mult;
+                                    let rows: Vec<f32> = (0..hc4)
+                                        .map(|h| (0..hc4).map(|k| v[h * hc4 + k]).sum())
+                                        .collect();
+                                    eprintln!(
+                                        "[xing-graph] FFNGATES pos {} comb_rowsums {:?}",
+                                        graph.buffers.current_pos, rows
+                                    );
+                                }
+                            }
+                        }
+                        // Layer 0's INPUT streams at this replay: the step-start
+                        // state. Comparable with eager's "[xing-trace] block_in"
+                        // for the same position — if these differ, the divergence
+                        // is in the replay's step-start state, not in any layer.
+                        if let Some(b) = g.sin.first() {
+                            if let Ok(st) = as_rocm(b.as_ref()) {
+                                if let Ok(v) = st.to_cpu_vec_f32() {
+                                    let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                        / v.len().max(1) as f32)
+                                        .sqrt();
+                                    eprintln!(
+                                        "[xing-graph] SIN0 pos {} rms {r:.6e} head {:?}",
+                                        graph.buffers.current_pos,
+                                        &v[..v.len().min(4)]
+                                    );
+                                }
+                            }
+                        }
+                        // Layer 0's OUTPUT stream at this replay, tagged with the
+                        // position so it can be matched against eager's "L1 in".
+                        if let Some(b) = g.sin.get(1) {
+                            if let Ok(st) = as_rocm(b.as_ref()) {
+                                if let Ok(v) = st.to_cpu_vec_f32() {
+                                    let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                        / v.len().max(1) as f32)
+                                        .sqrt();
+                                    eprintln!(
+                                        "[xing-graph] SIN1 pos {} rms {r:.6e} head {:?}",
+                                        graph.buffers.current_pos,
+                                        &v[..v.len().min(4)]
+                                    );
+                                }
+                            }
+                        }
                     }
                     // GRIM_XING_DUMP=<prefix>: full per-layer attention
                     // inputs/outputs at pos 41, matching eager's dumps —
@@ -9554,11 +10222,17 @@ dev.launch_hc_collapse_step(
                                         v.iter().flat_map(|f| f.to_le_bytes()).collect();
                                     let _ = std::fs::write(name, bytes);
                                 };
-                                for li in 0..3.min(gx.qabs.len().min(gx.qp.len()).min(gx.qattn_latent.len())) {
-                                    if let Ok(v) = as_rocm(gx.qabs[li].as_ref()).and_then(|s| s.to_cpu_vec_f32()) {
+                                for li in 0..3
+                                    .min(gx.qabs.len().min(gx.qp.len()).min(gx.qattn_latent.len()))
+                                {
+                                    if let Ok(v) = as_rocm(gx.qabs[li].as_ref())
+                                        .and_then(|s| s.to_cpu_vec_f32())
+                                    {
                                         save(format!("{prefix}_graph_qabs_L{li}.f32"), &v);
                                     }
-                                    if let Ok(v) = as_rocm(gx.qp[li].as_ref()).and_then(|s| s.to_cpu_vec_f32()) {
+                                    if let Ok(v) =
+                                        as_rocm(gx.qp[li].as_ref()).and_then(|s| s.to_cpu_vec_f32())
+                                    {
                                         save(format!("{prefix}_graph_qrope_L{li}.f32"), &v);
                                     }
                                     if let Some(ka) = graph.buffers.k_arena.get(li) {
@@ -9567,7 +10241,9 @@ dev.launch_hc_collapse_step(
                                         // rows match, so skip the kv dump.
                                         let _ = ka;
                                     }
-                                    if let Ok(v) = as_rocm(gx.qattn_latent[li].as_ref()).and_then(|s| s.to_cpu_vec_f32()) {
+                                    if let Ok(v) = as_rocm(gx.qattn_latent[li].as_ref())
+                                        .and_then(|s| s.to_cpu_vec_f32())
+                                    {
                                         save(format!("{prefix}_graph_qattn_L{li}.f32"), &v);
                                     }
                                 }
@@ -9581,20 +10257,32 @@ dev.launch_hc_collapse_step(
                             let last = &v[v.len().saturating_sub(self.cfg.vocab_size)..];
                             let mx = last.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                             let lse = mx as f64
-                                + last.iter().map(|x| ((x - mx) as f64).exp()).sum::<f64>().ln();
+                                + last
+                                    .iter()
+                                    .map(|x| ((x - mx) as f64).exp())
+                                    .sum::<f64>()
+                                    .ln();
                             let mut idx: Vec<u32> = (0..last.len() as u32).collect();
                             idx.sort_by(|a, b| last[*b as usize].total_cmp(&last[*a as usize]));
                             idx.truncate(5);
-                            let parts: Vec<String> = idx.iter().map(|i| {
-                                format!("{}:{:.4}", i, last[*i as usize] as f64 - lse)
-                            }).collect();
+                            let parts: Vec<String> = idx
+                                .iter()
+                                .map(|i| format!("{}:{:.4}", i, last[*i as usize] as f64 - lse))
+                                .collect();
                             let nonzero = last.iter().filter(|x| **x != 0.0).count();
                             let within = last.iter().filter(|x| (**x - mx).abs() < 1e-3).count();
-                            eprintln!("[xing-graph] head stats: n {} nonzero {nonzero} within1e-3-of-max {within} max {mx:.4} min {:.4}", last.len(), last.iter().copied().fold(f32::INFINITY, f32::min));
+                            eprintln!(
+                                "[xing-graph] head stats: n {} nonzero {nonzero} within1e-3-of-max {within} max {mx:.4} min {:.4}",
+                                last.len(),
+                                last.iter().copied().fold(f32::INFINITY, f32::min)
+                            );
                             // KV arena rows around the replay position: the seed
                             // is the one input the graph does not recompute, so
                             // an off-by-one there is invisible everywhere else.
-                            let kvr = match graph.buffers.k_arena.first() { Some(k) => k.to_cpu_vec_f32(), None => return Ok(()) };
+                            let kvr = match graph.buffers.k_arena.first() {
+                                Some(k) => k.to_cpu_vec_f32(),
+                                None => return Ok(()),
+                            };
                             let row = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
                             let p = graph.buffers.current_pos as usize;
                             for (li, ka) in graph.buffers.k_arena.iter().enumerate().take(3) {
@@ -9603,7 +10291,8 @@ dev.launch_hc_collapse_step(
                                         let seg = &kv[p * row..p * row + row];
                                         eprintln!(
                                             "[xing-graph] ARENAROW L{li} pos {p} rms {:.6e} head {:?}",
-                                            (seg.iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                                            (seg.iter().map(|x| x * x).sum::<f32>() / row as f32)
+                                                .sqrt(),
                                             &seg[..4]
                                         );
                                     }
@@ -9613,15 +10302,16 @@ dev.launch_hc_collapse_step(
                                 let row = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
                                 let p = graph.buffers.current_pos as usize;
                                 // Include a SEEDED row (not one this replay
-                            // appended): rows 0..p-1 come from the eager
-                            // session, and a single stale one out of ~36 is
-                            // exactly the magnitude of the residual.
-                            for r in [10usize, p.saturating_sub(2), p - 1, p] {
+                                // appended): rows 0..p-1 come from the eager
+                                // session, and a single stale one out of ~36 is
+                                // exactly the magnitude of the residual.
+                                for r in [10usize, p.saturating_sub(2), p - 1, p] {
                                     if r * row + row <= kv.len() {
                                         let seg = &kv[r * row..r * row + row];
                                         eprintln!(
                                             "[xing-graph] ARENA row {r}: rms {:.4e} head {:?}",
-                                            (seg.iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                                            (seg.iter().map(|x| x * x).sum::<f32>() / row as f32)
+                                                .sqrt(),
                                             &seg[..4]
                                         );
                                     }
@@ -9636,8 +10326,14 @@ dev.launch_hc_collapse_step(
                     }
                     if let Ok(b) = as_rocm(g.meaned.as_ref()) {
                         if let Ok(v) = b.to_cpu_vec_f32() {
-                            let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                            eprintln!("[xing-graph] HEADINPUT pos {} rms {rms:.6e} head {:?}", graph.buffers.current_pos, &v[..v.len().min(4)]);
+                            let rms = (v.iter().map(|x| x * x).sum::<f32>()
+                                / v.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] HEADINPUT pos {} rms {rms:.6e} head {:?}",
+                                graph.buffers.current_pos,
+                                &v[..v.len().min(4)]
+                            );
                         }
                     }
                 }
@@ -9699,6 +10395,14 @@ dev.launch_hc_collapse_step(
                         v_dev: k_dev,
                         prefill_len: rows,
                         kv_stride: latent_dim,
+                        src_elem_bytes: if storage.dtype().arith == grim_tensor::ArithType::F16 {
+                            2
+                        } else {
+                            4
+                        },
+                        // MLA latent cache: no int8 scale sidecar.
+                        k_scales_dev: None,
+                        v_scales_dev: None,
                         gdl_state: None,
                         _anchor: std::marker::PhantomData,
                     }));

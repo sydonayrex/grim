@@ -10,7 +10,8 @@ use grim_core::session::{Inner, SessionT};
 use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_tensor::{
-    ArithType, CoreTensorOps, DType, Device, QuantProvenance, RecurrentOps, Shape, Storage, Tensor,
+    ArithType, CoreTensorOps, DType, Device, MemoryOps, QuantProvenance, RecurrentOps, Shape,
+    Storage, Tensor,
 };
 
 // Config
@@ -1212,8 +1213,9 @@ impl Qwen35Block {
                 // Append to the device arena (device-side). f32 rows convert to
                 // the arena dtype via arena_append_from_f32 — never a raw copy
                 // into an f16 arena. K/V history stays on the GPU.
+                ensure_arena_format_supported(&device)?;
                 let k_new_rows = seq_len * self.num_kv_heads;
-                let evict = kv_eviction_policy(&device);
+                let evict = kv_eviction_policy_for_layer(&device, self.layer_idx);
                 let k_cap_rows = cache
                     .k_device
                     .as_ref()
@@ -1333,6 +1335,14 @@ impl Qwen35Block {
                     )?;
                 }
 
+                // WS-4.3: CurDKV compaction at the eviction boundary. Survivors
+                // are chosen by leverage score (sinks + residual + top-k) and
+                // gathered to the front; `current_pos` is reset to the retained
+                // count so the attention below reads exactly that prefix.
+                if evict.mode == EvictionMode::Curdkv {
+                    curdkv_compact_arena(&dev, &mut *cache, &evict, self.num_kv_heads, self.head_dim)?;
+                }
+
                 // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
                 let total_kv = evict.live_rows(cache.current_pos + seq_len);
                 let k_dev = cache.k_device.as_ref().ok_or_else(|| {
@@ -1347,6 +1357,22 @@ impl Qwen35Block {
                     cache.k_scales_device.as_ref(),
                     cache.v_scales_device.as_ref(),
                 ) {
+                    (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int2V4 => {
+                        crate::shared_attention::fused_or_scalar_attention_i2v4_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            ks.as_ref(),
+                            v_dev.as_ref(),
+                            vs.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
                     (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int4 => {
                         crate::shared_attention::fused_or_scalar_attention_i4_arena(
                             &q_all,
@@ -3800,7 +3826,8 @@ fn attention_layer_d2d(
     stage!("rope");
     // --- append K/V to the device arena, then attend -----------------------
     let k_new_rows = seq_len * blk.num_kv_heads;
-    let evict = kv_eviction_policy(&device);
+    ensure_arena_format_supported(&device)?;
+    let evict = kv_eviction_policy_for_layer(&device, blk.layer_idx);
     let k_cap_rows = cache
         .k_device
         .as_ref()
@@ -3901,6 +3928,10 @@ fn attention_layer_d2d(
     }
 
     stage!("arena_append");
+    // WS-4.3: CurDKV compaction at the eviction boundary (see the host-q path).
+    if evict.mode == EvictionMode::Curdkv {
+        curdkv_compact_arena(&dev, &mut *cache, &evict, blk.num_kv_heads, blk.head_dim)?;
+    }
     // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
     let total_kv = evict.live_rows(cache.current_pos + seq_len);
     let k_arena = cache
@@ -3944,6 +3975,22 @@ fn attention_layer_d2d(
         cache.k_scales_device.as_ref(),
         cache.v_scales_device.as_ref(),
     ) {
+        (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int2V4 => {
+            crate::shared_attention::fused_or_scalar_attention_i2v4_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                ks.as_ref(),
+                v_arena.as_ref(),
+                vs.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
         (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int4 => {
             crate::shared_attention::fused_or_scalar_attention_i4_arena_device(
                 q_rope.storage().as_ref(),
@@ -4171,6 +4218,19 @@ const NUT_SUB_BLOCK_BYTES: usize = 9;
 /// (always explicit, never default); otherwise the Qwen35 f16 default
 /// applies (f16 unless `GRIM_F16_KV` explicitly disables). Other backends
 /// stay F32.
+/// CurDKV variants the Phase-3 eviction can select survivors by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EvictionMode {
+    /// Default: keep first `sinks`, then the most recent `cap_rows - sinks` tokens.
+    #[default]
+    Positional,
+    /// Keep first `sinks`, then the highest-leverage `cap_rows - sinks` tokens
+    /// chosen by [`KvEvictionPolicy::curdkv_indices`]. Requires a gather pass
+    /// at the eviction boundary; falls back to Positional where the pass is
+    /// not yet wired.
+    Curdkv,
+}
+
 /// Phase-3 KV-eviction policy for the dense ROCm arenas.
 ///
 /// `cap_rows` is a FIXED capacity in TOKEN rows (one arena row is one token,
@@ -4183,6 +4243,15 @@ const NUT_SUB_BLOCK_BYTES: usize = 9;
 pub struct KvEvictionPolicy {
     pub cap_rows: Option<usize>,
     pub sinks: usize,
+    /// Which survivor-selection strategy the policy uses (default Positional).
+    pub mode: EvictionMode,
+    /// WS-4.3: newest token rows the CurDKV pass NEVER evicts. The residual
+    /// window is what makes the selection decode-safe: the newest row is the
+    /// context the current query was just computed against, so dropping it
+    /// would make the model attend to a history that excludes its own prefix.
+    /// Unused by the positional ring (which keeps the newest rows by
+    /// construction).
+    pub residual: usize,
 }
 
 impl KvEvictionPolicy {
@@ -4190,6 +4259,8 @@ impl KvEvictionPolicy {
         Self {
             cap_rows: None,
             sinks: 0,
+            mode: EvictionMode::Positional,
+            residual: 0,
         }
     }
 
@@ -4228,10 +4299,28 @@ impl KvEvictionPolicy {
     pub fn arena_row(&self, abs_row: usize) -> usize {
         self.ring().row(abs_row)
     }
+
+    /// Compute the retained arena-row order for `n_tokens` tokens using the
+    /// policy's survivor-selection strategy.
+    ///
+    /// Returns `None` for `Positional` mode (the existing contiguous ring
+    /// layout already provides its ordering) and `Some(indices)` for `Curdkv`
+    /// mode. CurDKV itself lives in [`Self::curdkv_indices`].
+    pub fn compute_retained(&self, n_tokens: usize, d: usize, k: &[f32], v: &[f32]) -> Option<Vec<usize>> {
+        match self.mode {
+            EvictionMode::Positional => None,
+            EvictionMode::Curdkv => Some(Self::curdkv_indices(k, v, n_tokens, d, self.cap_rows.unwrap_or(n_tokens), self.sinks)),
+        }
+    }
+
+    /// Wire-in shim around [`select_curdkv_indices`] used by the CuRD-KV
+    /// eviction path. Exists so the policy carries its own call site.
+    pub fn curdkv_indices(k_group: &[f32], v_group: &[f32], n_tokens: usize, d: usize, budget: usize, sinks: usize) -> Vec<usize> {
+        Self::select_curdkv_indices(k_group, v_group, n_tokens, d, budget, sinks)
+    }
 }
 
 /// CurDKV Gaussian projection dimension for low-rank leverage score estimation.
-#[allow(dead_code)]
 pub const CURDKV_R: usize = 20;
 
 /// Deterministic Gaussian projection matrix G [d, r] generated via pseudo-random normal.
@@ -4243,7 +4332,9 @@ pub fn curdkv_projection_matrix(d: usize, r: usize) -> Vec<f32> {
     // Standard linear congruential / Box-Muller generator for deterministic zero-overhead matrix
     let mut state = 0x123456789abcdef0u64;
     let mut next_u01 = || -> f32 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 33) as f32 + 1.0) / (2147483648.0)
     };
     for _ in 0..(d * r / 2) {
@@ -4274,7 +4365,6 @@ impl KvEvictionPolicy {
     /// 3. l^(K)_j = ||K_proj[j]||_2^2, l^(V)_j = ||V_proj[j]||_2^2
     /// 4. l^(KV)_j = l^(K)_j * l^(V)_j
     /// 5. Top-k selection preserving initial `sinks` tokens.
-    #[allow(dead_code)]
     pub fn select_curdkv_indices(
         k_group: &[f32],
         v_group: &[f32],
@@ -4332,57 +4422,361 @@ impl KvEvictionPolicy {
 
         selected
     }
+
+    /// WS-4.3: CurDKV survivor selection WITH a residual window.
+    ///
+    /// Retains, up to `budget` rows: the leading `sinks`, the newest `residual`
+    /// tokens, and the highest-leverage tokens from what is left. The residual
+    /// window is the decode-safety property — the newest token is the prefix the
+    /// current query was just computed against, so evicting it would make the
+    /// model attend to a history that excludes its own context.
+    ///
+    /// Returns indices in ascending order, which is what makes the in-place
+    /// gather in [`curdkv_compact_arena`] safe.
+    pub fn select_curdkv_indices_residual(
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+        budget: usize,
+        sinks: usize,
+        residual: usize,
+    ) -> Vec<usize> {
+        if n_tokens <= budget {
+            return (0..n_tokens).collect();
+        }
+        let r = CURDKV_R;
+        let g = curdkv_projection_matrix(d, r);
+        let mut scores = vec![0.0f32; n_tokens];
+        for j in 0..n_tokens {
+            let k_row = &k_group[j * d..(j + 1) * d];
+            let v_row = &v_group[j * d..(j + 1) * d];
+            let mut l_k = 0.0f32;
+            let mut l_v = 0.0f32;
+            for col in 0..r {
+                let mut kp = 0.0f32;
+                let mut vp = 0.0f32;
+                for i in 0..d {
+                    let g_val = g[i * r + col];
+                    kp += k_row[i] * g_val;
+                    vp += v_row[i] * g_val;
+                }
+                l_k += kp * kp;
+                l_v += vp * vp;
+            }
+            scores[j] = l_k * l_v;
+        }
+
+        // Pinned: the leading sinks.
+        let s = sinks.min(n_tokens).min(budget);
+        let mut selected: Vec<usize> = (0..s).collect();
+        // Pinned: the newest `residual` tokens.
+        let res = residual
+            .min(n_tokens.saturating_sub(s))
+            .min(budget.saturating_sub(s));
+        let res_start = n_tokens - res;
+        // Everything else competes on leverage score.
+        let rem_budget = budget.saturating_sub(s).saturating_sub(res);
+        if rem_budget > 0 && res_start > s {
+            let mut mid: Vec<usize> = (s..res_start).collect();
+            mid.sort_by(|&a, &b| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            selected.extend(mid.into_iter().take(rem_budget));
+        }
+        selected.extend(res_start..n_tokens);
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
+
+    /// The policy's own survivor selection: budget = `cap_rows`, sinks and
+    /// residual taken from the policy.
+    pub fn select_curdkv_with_residual(
+        &self,
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+    ) -> Vec<usize> {
+        let budget = self.cap_rows.unwrap_or(n_tokens).min(n_tokens);
+        Self::select_curdkv_indices_residual(
+            k_group,
+            v_group,
+            n_tokens,
+            d,
+            budget,
+            self.sinks,
+            self.residual,
+        )
+    }
 }
 
-/// Read the Phase-4 CurDKV eviction policy from the environment.
+/// WS-4.3: compact a layer's dense K/V arenas to the CurDKV survivor set.
 ///
-/// `GRIM_KV_ARENA_ROWS` = fixed capacity in token rows (unset/0 = unlimited).
-/// `GRIM_KV_SINKS` = pinned leading tokens (default 4), clamped below the
-/// capacity so sinks can never consume the whole ring.
-/// `GRIM_CURDKV` = 1 enables CurDKV value-guided leverage score selection.
+/// Runs at the eviction boundary: the live row count has reached the cap and
+/// the mode is [`EvictionMode::Curdkv`]. Survivors are chosen on the host by
+/// leverage score (always keeping the pinned sinks and the newest `residual`
+/// tokens), then gathered into the FRONT of the arena with
+/// [`grim_tensor::MemoryOps::gather_rows_into`].
+///
+/// The gather is in place and safe: the survivor list is strictly increasing,
+/// so destination row `i` is never a row a later copy still has to read.
+///
+/// `cache.current_pos` is reset to the retained count. The attention kernels
+/// read the contiguous prefix `[0, live)`, so this is what makes a
+/// non-contiguous survivor set readable without touching the kernels.
+///
+/// Only F32/F16 arenas are supported. The int8/int4 scale sidecars would each
+/// need their own gather, and a half-compaction would pair a row's codes with
+/// another row's scale — the exact drift the append path already guards.
+pub(crate) fn curdkv_compact_arena(
+    dev: &Arc<dyn grim_tensor::BackendDevice>,
+    cache: &mut Qwen35LayerCache,
+    policy: &KvEvictionPolicy,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<usize> {
+    let abs = cache.current_pos;
+    let Some(cap) = policy.cap_rows else {
+        return Ok(abs);
+    };
+    if abs <= cap {
+        return Ok(abs);
+    }
+    // `current_pos` is the ABSOLUTE token count; the arena itself holds exactly
+    // `cap` rows (the ring wraps). The rows to compact are the RESIDENT ones.
+    let live = abs.min(cap);
+    if cache.k_scales_device.is_some() || cache.v_scales_device.is_some() {
+        return Err(grim_core::error::Error::Backend(
+            "curdkv compaction: quantized (int8/int4) arenas need a sidecar gather and are not \
+             supported yet"
+                .into(),
+        ));
+    }
+    let stride = num_kv_heads * head_dim;
+    let (Some(k_dev), Some(v_dev)) = (cache.k_device.as_ref(), cache.v_device.as_ref()) else {
+        return Ok(abs);
+    };
+    // The one D2H on the eviction path, once per boundary: leverage scores are
+    // a host computation over the live rows.
+    let k_host = k_dev.to_cpu_vec_f32()?;
+    let v_host = v_dev.to_cpu_vec_f32()?;
+    if k_host.len() < live * stride || v_host.len() < live * stride {
+        return Err(grim_core::error::Error::Shape(format!(
+            "curdkv compaction: arena holds {} / {} f32 but {live} live rows need {}",
+            k_host.len(),
+            v_host.len(),
+            live * stride
+        )));
+    }
+    let survivors = policy.select_curdkv_with_residual(&k_host, &v_host, live, stride);
+    let rows: Vec<u32> = survivors.iter().map(|&r| r as u32).collect();
+    dev.gather_rows_into(k_dev.as_ref(), 0, k_dev.as_ref(), &rows, stride)?;
+    dev.gather_rows_into(v_dev.as_ref(), 0, v_dev.as_ref(), &rows, stride)?;
+    let retained = survivors.len();
+    cache.current_pos = retained;
+    Ok(retained)
+}
+
+/// Per-layer KV-arena capacity table parsed from `GRIM_KV_ARENA_ROWS`.
+///
+/// Accepted forms:
+///   - `N`             — every layer gets N (uniform)
+///   - `N0,N1,...,Nk`  — layer i gets N_i; layers past the list reuse the LAST
+///                       entry, so a short list degrades gracefully
+///   - a `0` entry     — that layer is UNLIMITED (no cap)
+///
+/// An absent/empty spec, or any non-numeric entry, disables eviction (`None`);
+/// an unparseable entry is rejected loudly rather than silently zeroed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvLayerBudgets {
+    per_layer: Vec<usize>,
+}
+
+impl KvLayerBudgets {
+    pub fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return None;
+        }
+        let mut per_layer = Vec::new();
+        for part in spec.split(',') {
+            let part = part.trim();
+            match part.parse::<usize>() {
+                Ok(v) if !part.is_empty() => per_layer.push(v),
+                _ => {
+                    eprintln!(
+                        "[qwen35] GRIM_KV_ARENA_ROWS entry {part:?} is not a number; eviction disabled"
+                    );
+                    return None;
+                }
+            }
+        }
+        if per_layer.is_empty() {
+            return None;
+        }
+        Some(Self { per_layer })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let spec = std::env::var("GRIM_KV_ARENA_ROWS").ok()?;
+        Self::parse(&spec)
+    }
+
+    /// Capacity for `layer`; `None` = unlimited. Layers past the table reuse
+    /// the last entry.
+    pub fn cap_for(&self, layer: usize) -> Option<usize> {
+        let idx = layer.min(self.per_layer.len() - 1);
+        match self.per_layer[idx] {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// True when every layer resolves to the same capacity. The decode graph
+    /// captures ONE ring for all layers, so it can only honor a uniform table.
+    pub fn is_uniform(&self) -> bool {
+        self.per_layer.iter().all(|v| *v == self.per_layer[0])
+    }
+
+    /// Worst-case capacity across layers for reservation planning: `None`
+    /// (unlimited) if ANY layer is uncapped, else the largest cap.
+    pub fn max_cap(&self) -> Option<usize> {
+        if self.per_layer.iter().any(|v| *v == 0) {
+            return None;
+        }
+        self.per_layer.iter().copied().max()
+    }
+
+    /// Number of explicit entries (a short table is padded with its last).
+    pub fn entries(&self) -> usize {
+        self.per_layer.len()
+    }
+}
+
+/// Pure parser for `GRIM_KV_SINKS`: default 4, clamped into `[0, cap-1]` so a
+/// bad value can never consume the whole ring.
+pub(crate) fn parse_sinks_env(v: Option<&str>, cap: usize) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .min(cap.saturating_sub(1))
+}
+
+/// Pure parser for `GRIM_KV_EVICT_MODE`.
+pub(crate) fn parse_evict_mode_env(v: Option<&str>) -> EvictionMode {
+    match v {
+        Some("curdkv" | "cur_dkv" | "leverage") => EvictionMode::Curdkv,
+        _ => EvictionMode::Positional,
+    }
+}
+
+/// Pure parser for `GRIM_KV_RESIDUAL`: the newest token rows the CurDKV pass
+/// never evicts. Defaults to `cap/8` (at least 1), clamped below the cap.
+pub(crate) fn parse_residual_env(v: Option<&str>, cap: usize) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| (cap / 8).max(1))
+        .min(cap.saturating_sub(1))
+}
+
+/// Eviction policy for ONE attention layer.
+///
+/// `GRIM_KV_ARENA_ROWS` = per-layer capacity in token rows (see
+/// [`KvLayerBudgets`]; unset/0 = unlimited for that layer).
+/// `GRIM_KV_SINKS` = pinned leading tokens (default 4), clamped below the cap.
+/// `GRIM_KV_EVICT_MODE` = `curdkv` enables leverage-score survivor selection.
+pub(crate) fn kv_eviction_policy_for_layer(device: &Device, layer_idx: usize) -> KvEvictionPolicy {
+    if !matches!(device, Device::Rocm(_)) {
+        return KvEvictionPolicy::disabled();
+    }
+    let Some(budgets) = KvLayerBudgets::from_env() else {
+        return KvEvictionPolicy::disabled();
+    };
+    let Some(cap) = budgets.cap_for(layer_idx) else {
+        return KvEvictionPolicy::disabled();
+    };
+    let sinks = parse_sinks_env(std::env::var("GRIM_KV_SINKS").ok().as_deref(), cap);
+    let mode = parse_evict_mode_env(std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref());
+    let residual = parse_residual_env(std::env::var("GRIM_KV_RESIDUAL").ok().as_deref(), cap);
+    KvEvictionPolicy {
+        cap_rows: Some(cap),
+        sinks,
+        mode,
+        residual,
+    }
+}
+
+/// Model-wide (worst-case) eviction policy: the largest per-layer cap, or
+/// disabled. Used for KV reservation planning, where the reservation must
+/// cover the layer that needs the most rows. NOT for per-layer append — use
+/// [`kv_eviction_policy_for_layer`] there.
 pub(crate) fn kv_eviction_policy(device: &Device) -> KvEvictionPolicy {
     if !matches!(device, Device::Rocm(_)) {
         return KvEvictionPolicy::disabled();
     }
-    let cap = std::env::var("GRIM_KV_ARENA_ROWS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|c| *c > 0);
-    let Some(cap) = cap else {
+    let Some(budgets) = KvLayerBudgets::from_env() else {
         return KvEvictionPolicy::disabled();
     };
-    let sinks = std::env::var("GRIM_KV_SINKS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(4)
-        .min(cap - 1);
+    let Some(cap) = budgets.max_cap() else {
+        return KvEvictionPolicy::disabled();
+    };
+    let sinks = parse_sinks_env(std::env::var("GRIM_KV_SINKS").ok().as_deref(), cap);
+    let mode = parse_evict_mode_env(std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref());
+    let residual = parse_residual_env(std::env::var("GRIM_KV_RESIDUAL").ok().as_deref(), cap);
     KvEvictionPolicy {
         cap_rows: Some(cap),
         sinks,
+        mode,
+        residual,
     }
 }
 
-fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvArenaFormat {
+/// Pure core of [`kv_arena_format_qwen`]: resolve from already-read env
+/// strings, with the Qwen35-specific DEFAULT (f16) applied only when
+/// `GRIM_KV_ARENA` is unset. Explicit values go through the backend's ONE
+/// spelling table ([`grim_backend_rocm::parse_kv_arena_env`]) so an explicit
+/// `GRIM_KV_ARENA` can never mean different things to the model and to the
+/// graph allocator.
+pub(crate) fn resolve_kv_arena_format_qwen(
+    arena: Option<&str>,
+    f16_kv: Option<&str>,
+) -> grim_backend_rocm::KvArenaFormat {
     use grim_backend_rocm::KvArenaFormat as F;
-    if !matches!(device, Device::Rocm(_)) {
-        return F::F32;
-    }
-    match std::env::var("GRIM_KV_ARENA").as_deref() {
-        Ok("int8" | "i8" | "q8") => F::Int8,
-        Ok("int4" | "i4" | "q4") => F::Int4,
-        Ok("f32") => F::F32,
-        Ok("f16") => F::F16,
-        Ok(other) => {
-            eprintln!(
-                "[qwen35] GRIM_KV_ARENA={other:?} unrecognized (f32|f16|int8|int4); using f16 default"
-            );
-            F::F16
-        }
-        Err(_) => match std::env::var("GRIM_F16_KV").as_deref() {
-            Ok("0" | "false" | "off" | "no") => F::F32,
-            _ => F::F16,
+    match arena {
+        Some(v) => match grim_backend_rocm::parse_kv_arena_env(v) {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "[qwen35] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using f16 default"
+                );
+                F::F16
+            }
         },
+        None => {
+            // The model's default is f16, so the flag is read in the
+            // DISABLED sense: only an explicit off spelling opts out. (The
+            // backend's f32 default reads the same flag in the ENABLED
+            // sense; `f16_kv_explicitly_disabled` is the complement of
+            // `parse_f16_kv_env`, pinned by the backend's own test.)
+            if grim_backend_rocm::f16_kv_explicitly_disabled(f16_kv) {
+                F::F32
+            } else {
+                F::F16
+            }
+        }
     }
+}
+
+pub(crate) fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvArenaFormat {
+    if !matches!(device, Device::Rocm(_)) {
+        return grim_backend_rocm::KvArenaFormat::F32;
+    }
+    resolve_kv_arena_format_qwen(
+        std::env::var("GRIM_KV_ARENA").ok().as_deref(),
+        std::env::var("GRIM_F16_KV").ok().as_deref(),
+    )
 }
 
 /// Codes-element dtype for the dense ROCm KV arenas. F32/F16/U8 per
@@ -4400,7 +4794,32 @@ pub(crate) fn kv_arena_dtype(device: &Device) -> DType {
             arith: ArithType::U8,
             storage: Storage::Native,
         },
+        // WS-3A: byte-addressed like int8/int4 so the arena allocates, but
+        // `ensure_arena_format_supported` refuses it before any use — the
+        // 2-bit-K kernels do not exist.
+        F::Int2V4 => DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
     }
+}
+
+/// Fail closed on an arena format whose device kernels do not exist yet.
+///
+/// `GRIM_KV_ARENA=int2v4` (WS-3A) resolves to a first-class format so it cannot
+/// be mistaken for another, but its 2-bit-K quantizer and mixed-width attention
+/// dequant are not written. `int2v4` and `int8` are BOTH byte-addressed, so a
+/// silent fallthrough would serve 2-bit codes as 8-bit and corrupt the cache —
+/// this refusal is the difference between a loud failure and a wrong answer.
+pub(crate) fn ensure_arena_format_supported(device: &Device) -> Result<()> {
+    let fmt = kv_arena_format_qwen(device);
+    if !fmt.has_device_kernels() {
+        return Err(grim_core::error::Error::Backend(format!(
+            "GRIM_KV_ARENA={fmt:?}: the native K2V4 arena kernels (2-bit K quantizer + \
+             mixed-width attention dequant) are not implemented; use int4, int8, f16 or f32"
+        )));
+    }
+    Ok(())
 }
 
 /// Per-(row, kv-head) f32 scales sidecar dtype for int8/int4 formats.
@@ -4408,7 +4827,7 @@ pub(crate) fn kv_arena_dtype(device: &Device) -> DType {
 fn kv_arena_scale_dtype(device: &Device) -> Option<DType> {
     use grim_backend_rocm::KvArenaFormat as F;
     match kv_arena_format_qwen(device) {
-        F::Int8 | F::Int4 => Some(DType::F32),
+        F::Int8 | F::Int4 | F::Int2V4 => Some(DType::F32),
         _ => None,
     }
 }
@@ -4452,7 +4871,7 @@ fn arena_append_kv_rows<'a>(
     let stride = nkv * head_dim;
     let kv_elems = n_tok_rows * stride;
     let format = kv_arena_format_qwen(device);
-    if format != F::Int8 && format != F::Int4 {
+    if !matches!(format, F::Int8 | F::Int4 | F::Int2V4) {
         let dst_off = row_off * stride;
         arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, 0, kv_elems)?;
         arena_append_from_f32(dev.as_ref(), v_dst, dst_off, v_src, 0, kv_elems)?;
@@ -4476,29 +4895,52 @@ fn arena_append_kv_rows<'a>(
     // `qwen35_i8_kv_arena_rows_match_f32_within_code_step` pins this call site.
     let scale_off = row_off * nkv;
 
-    if format == F::Int4 {
-        // In packed int4, each byte stores 2 elements, so byte stride is stride / 2.
-        let dst_off_bytes = row_off * (stride / 2);
-        grim_backend_rocm::launch_kv_quantize_rows_i4(
-            rocm.as_ref(),
-            k_src,
-            0,
-            k_dst,
-            dst_off_bytes,
-            ksc,
-            scale_off,
-            n_tok_rows,
-            stride,
-            nkv,
-            head_dim,
-        )
-        .map(|_| ())?;
+    if format == F::Int4 || format == F::Int2V4 {
+        // Packed byte stride differs per side: 2-bit K holds 4 codes/byte
+        // (stride/4), 4-bit V holds 2 codes/byte (stride/2).
+        let k_off_bytes = if format == F::Int2V4 {
+            row_off * (stride / 4)
+        } else {
+            row_off * (stride / 2)
+        };
+        let v_off_bytes = row_off * (stride / 2);
+        if format == F::Int2V4 {
+            grim_backend_rocm::launch_kv_quantize_rows_i2(
+                rocm.as_ref(),
+                k_src,
+                0,
+                k_dst,
+                k_off_bytes,
+                ksc,
+                scale_off,
+                n_tok_rows,
+                stride,
+                nkv,
+                head_dim,
+            )
+            .map(|_| ())?;
+        } else {
+            grim_backend_rocm::launch_kv_quantize_rows_i4(
+                rocm.as_ref(),
+                k_src,
+                0,
+                k_dst,
+                k_off_bytes,
+                ksc,
+                scale_off,
+                n_tok_rows,
+                stride,
+                nkv,
+                head_dim,
+            )
+            .map(|_| ())?;
+        }
         grim_backend_rocm::launch_kv_quantize_rows_i4(
             rocm.as_ref(),
             v_src,
             0,
             v_dst,
-            dst_off_bytes,
+            v_off_bytes,
             vsc,
             scale_off,
             n_tok_rows,
@@ -4555,7 +4997,7 @@ fn ensure_int8_scales(
 ) -> grim_tensor::error::Result<()> {
     use grim_backend_rocm::KvArenaFormat as F;
     let fmt = kv_arena_format_qwen(device);
-    if fmt != F::Int8 && fmt != F::Int4 {
+    if !matches!(fmt, F::Int8 | F::Int4 | F::Int2V4) {
         return Ok(());
     }
     // f32 by construction (the int8 reader multiplies codes by an f32 scale);
@@ -5270,6 +5712,82 @@ fn bound_kv_arena(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WS-3A: every declared arena format passes the support guard now that
+    /// the K2V4 kernels exist. The guard remains the single place a future
+    /// format would be refused from, so it must accept exactly the formats
+    /// whose kernels are implemented.
+    #[test]
+    fn all_arena_formats_pass_the_support_guard() {
+        for spec in ["f32", "f16", "int8", "int4", "int2v4"] {
+            temp_env::with_var("GRIM_KV_ARENA", Some(spec), || {
+                assert!(
+                    ensure_arena_format_supported(&Device::Rocm(0)).is_ok(),
+                    "{spec} must pass the guard now that its kernels exist"
+                );
+            });
+        }
+    }
+
+    /// WS-0: an explicit `GRIM_KV_ARENA` must parse identically in the model
+    /// resolver and the backend allocator. Before WS-0 the two carried their
+    /// own spelling tables; this pins them to one.
+    #[test]
+    fn qwen35_arena_format_agrees_with_backend_for_explicit_values() {
+        use grim_backend_rocm::KvArenaFormat as F;
+        for (s, want) in [
+            ("f32", F::F32),
+            ("f16", F::F16),
+            ("int8", F::Int8),
+            ("i8", F::Int8),
+            ("q8", F::Int8),
+            ("int4", F::Int4),
+            ("i4", F::Int4),
+            ("q4", F::Int4),
+        ] {
+            assert_eq!(
+                resolve_kv_arena_format_qwen(Some(s), None),
+                want,
+                "model resolver GRIM_KV_ARENA={s}"
+            );
+            assert_eq!(
+                grim_backend_rocm::parse_kv_arena_env(s),
+                Some(want),
+                "backend parser GRIM_KV_ARENA={s}"
+            );
+        }
+    }
+
+    /// WS-0: the ONE intended difference between the model and backend
+    /// resolvers is the unset default (Qwen35 opts into f16; the backend
+    /// default is f32, pinned by that crate's own test). The f16 flag is
+    /// honored identically in both layers.
+    #[test]
+    fn qwen35_arena_format_default_and_f16_flag() {
+        use grim_backend_rocm::KvArenaFormat as F;
+        // Unset arena -> the Qwen35 f16 default.
+        assert_eq!(resolve_kv_arena_format_qwen(None, None), F::F16);
+        // The legacy flag is shared with the backend, so its disabled
+        // spellings mean f32 here too (this is the drift WS-0 closed).
+        for s in ["0", "false", "off", "no"] {
+            assert_eq!(
+                resolve_kv_arena_format_qwen(None, Some(s)),
+                F::F32,
+                "GRIM_F16_KV={s} should disable f16"
+            );
+        }
+        for s in ["1", "true", "yes"] {
+            assert_eq!(
+                resolve_kv_arena_format_qwen(None, Some(s)),
+                F::F16,
+                "GRIM_F16_KV={s} should enable f16"
+            );
+        }
+        // An unrecognized explicit value uses the model's f16 default (the
+        // backend warns and uses f32); the divergence is documented and only
+        // reachable on a typo.
+        assert_eq!(resolve_kv_arena_format_qwen(Some("q7"), None), F::F16);
+    }
 
     /// Uniform capability rows: every device measures identically, so placement
     /// must fall back to the headroom-only split it used before capability was
@@ -6515,7 +7033,7 @@ mod rope_tests {
 
 #[cfg(test)]
 mod kv_eviction_tests {
-    use super::{KvEvictionPolicy, kv_eviction_policy};
+    use super::{EvictionMode, KvEvictionPolicy, kv_eviction_policy, parse_residual_env};
     use grim_tensor::Device;
 
     /// Phase 3: the host `arena_row` must equal the device `grim_kv_ring_row`
@@ -6546,6 +7064,8 @@ mod kv_eviction_tests {
                 let pol = KvEvictionPolicy {
                     cap_rows: Some(cap),
                     sinks: eff_sinks,
+                    mode: EvictionMode::Positional,
+                    residual: 0,
                 };
                 for t in 0..(cap * 3 + 17) {
                     assert_eq!(
@@ -6567,6 +7087,8 @@ mod kv_eviction_tests {
         let pol = KvEvictionPolicy {
             cap_rows: Some(cap),
             sinks,
+            mode: EvictionMode::Positional,
+            residual: 0,
         };
         for t in 0..sinks {
             assert_eq!(pol.arena_row(t), t, "sink token {t} was evicted");
@@ -6618,6 +7140,111 @@ mod kv_eviction_tests {
         temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("64"), || {
             assert_eq!(kv_eviction_policy(&Device::Cpu).cap_rows, None);
         });
+    }
+
+    /// WS-4.1: the per-layer budget table. A single value is uniform; a list
+    /// gives each layer its own cap; layers past the list reuse the last; a 0
+    /// entry means unlimited; garbage disables eviction.
+    #[test]
+    fn kv_layer_budgets_parse_and_resolve() {
+        use super::KvLayerBudgets;
+        // Uniform.
+        let b = KvLayerBudgets::parse("4096").unwrap();
+        assert!(b.is_uniform());
+        for l in 0..8 {
+            assert_eq!(b.cap_for(l), Some(4096));
+        }
+        assert_eq!(b.max_cap(), Some(4096));
+        // Per-layer, short list pads with the last entry.
+        let b = KvLayerBudgets::parse("8192,4096,2048").unwrap();
+        assert!(!b.is_uniform());
+        assert_eq!(b.cap_for(0), Some(8192));
+        assert_eq!(b.cap_for(1), Some(4096));
+        assert_eq!(b.cap_for(2), Some(2048));
+        assert_eq!(b.cap_for(7), Some(2048), "past the table reuses the last entry");
+        assert_eq!(b.max_cap(), Some(8192));
+        // A 0 entry is unlimited for that layer, and makes the model-wide
+        // planning cap unlimited too (the worst case).
+        let b = KvLayerBudgets::parse("4096,0").unwrap();
+        assert_eq!(b.cap_for(0), Some(4096));
+        assert_eq!(b.cap_for(1), None);
+        assert_eq!(b.max_cap(), None);
+        assert!(!b.is_uniform());
+        // Absent / empty / garbage -> disabled, loudly for garbage.
+        assert_eq!(KvLayerBudgets::parse(""), None);
+        assert_eq!(KvLayerBudgets::parse("   "), None);
+        assert_eq!(KvLayerBudgets::parse("4096,abc"), None);
+        assert_eq!(KvLayerBudgets::parse("4096,-1"), None);
+        // Whitespace tolerated.
+        let b = KvLayerBudgets::parse(" 4096 , 2048 ").unwrap();
+        assert_eq!(b.cap_for(0), Some(4096));
+        assert_eq!(b.cap_for(1), Some(2048));
+        assert_eq!(b.entries(), 2);
+    }
+
+    /// The sinks and eviction-mode parsers are pure, so they are testable
+    /// without touching the process environment.
+    #[test]
+    fn kv_eviction_parsers_are_pure() {
+        use super::{EvictionMode, parse_evict_mode_env, parse_sinks_env};
+        assert_eq!(parse_sinks_env(None, 64), 4, "default sinks");
+        assert_eq!(parse_sinks_env(Some("8"), 64), 8);
+        assert_eq!(parse_sinks_env(Some("1000"), 8), 7, "clamped below cap");
+        assert_eq!(parse_sinks_env(Some("junk"), 64), 4, "junk -> default");
+        assert_eq!(parse_sinks_env(Some("4"), 0), 0, "cap 0 -> 0 sinks");
+        assert_eq!(parse_evict_mode_env(None), EvictionMode::Positional);
+        assert_eq!(parse_evict_mode_env(Some("curdkv")), EvictionMode::Curdkv);
+        assert_eq!(parse_evict_mode_env(Some("leverage")), EvictionMode::Curdkv);
+        assert_eq!(
+            parse_evict_mode_env(Some("nonsense")),
+            EvictionMode::Positional
+        );
+    }
+
+    /// WS-4.3: the CurDKV residual window is never evicted and the sinks stay
+    /// pinned, and the survivor list is STRICTLY INCREASING — which is the
+    /// precondition that makes the in-place `gather_rows_into` compaction safe
+    /// (destination row i is never a row a later copy still has to read).
+    #[test]
+    fn curdkv_residual_window_keeps_sinks_and_newest() {
+        let (n, d) = (12usize, 4);
+        // Distinguishable rows: row j is all-j.
+        let k: Vec<f32> = (0..n * d).map(|i| (i / d) as f32).collect();
+        let v = k.clone();
+        let sel = KvEvictionPolicy::select_curdkv_indices_residual(&k, &v, n, d, 6, 2, 2);
+        assert_eq!(sel.len(), 6, "budget must be honored exactly: {sel:?}");
+        assert_eq!(&sel[..2], &[0, 1], "sinks must be the first survivors: {sel:?}");
+        assert!(
+            sel.contains(&10) && sel.contains(&11),
+            "the newest `residual` rows must survive: {sel:?}"
+        );
+        assert!(
+            sel.windows(2).all(|w| w[0] < w[1]),
+            "survivors must be strictly increasing (gather precondition): {sel:?}"
+        );
+    }
+
+    /// The residual window is clamped so it can never overshoot the budget, and
+    /// a budget at least as large as the live set retains everything.
+    #[test]
+    fn curdkv_residual_is_clamped_and_identity_when_budget_covers_all() {
+        let (n, d) = (8usize, 2);
+        let k: Vec<f32> = (0..n * d).map(|i| i as f32).collect();
+        let sel = KvEvictionPolicy::select_curdkv_indices_residual(&k, &k, n, d, 3, 1, 99);
+        assert_eq!(sel.len(), 3, "residual must not overshoot the budget: {sel:?}");
+        assert!(sel.windows(2).all(|w| w[0] < w[1]));
+        let all = KvEvictionPolicy::select_curdkv_indices_residual(&k, &k, n, d, 8, 2, 2);
+        assert_eq!(all, (0..8).collect::<Vec<_>>());
+    }
+
+    /// `GRIM_KV_RESIDUAL` defaults to `cap/8` (floor 1) and clamps below the cap.
+    #[test]
+    fn residual_env_parses_and_clamps() {
+        assert_eq!(parse_residual_env(None, 64), 8);
+        assert_eq!(parse_residual_env(None, 4), 1, "small cap floors at 1");
+        assert_eq!(parse_residual_env(Some("3"), 64), 3);
+        assert_eq!(parse_residual_env(Some("9999"), 8), 7, "clamped below cap");
+        assert_eq!(parse_residual_env(Some("junk"), 64), 8, "junk -> default");
     }
 
     #[test]

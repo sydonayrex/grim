@@ -10,41 +10,57 @@ impl Engine {
             config.head_dim,
         );
 
-        // KV-cache quantization (§kv-int8). `EngineConfig.kv_compressor` takes precedence; otherwise honor `GRIM_KV_QUANT=int8` which attaches a
-        // Lloyd-Max int4/int8 compressor so the paged KV pool compresses admitted blocks before spill.
+        // KV-cache quantization. `EngineConfig.kv_compressor` takes precedence;
+        // otherwise `GRIM_KV_QUANT` attaches a Lloyd-Max compressor that the
+        // paged KV pool uses when it compresses an admitted block BEFORE spill.
+        //
+        // Scope: this is the SPILL/DEMOTE compressor, not the decode-time KV
+        // representation. The dense decode arena is chosen by `GRIM_KV_ARENA`
+        // in the backend; this knob only decides how a block is packed when it
+        // leaves VRAM. Accepted values: `int8`, `int4`, the KV-OMNI modality
+        // profiles (`text-shallow`/`k8v4`, `text-deep`/`k4v2`, `audio`/`k2v2`,
+        // `visual`/`k8v16`), or `off`.
         let mut compressor: Option<Arc<dyn grim_kvquant::KvCompressor>> =
             config.kv_compressor.clone();
         if compressor.is_none() {
             if let Ok(mode) = std::env::var("GRIM_KV_QUANT") {
                 match mode.trim().to_ascii_lowercase().as_str() {
-                    "int8" => {
-                        let cfg = grim_kvquant::KvQuantConfig {
-                            key_bits: 3,
-                            value_bits: 8,
-                            group_size: 64,
-                            qk_compute_bits: 8,
-                        };
-                        compressor = Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
-                        log::info!(
-                            "[grim-engine] kv-int8: attached LloydMaxCompressor (key_bits=3, value_bits=8, group=64)"
-                        );
-                    }
-                    "int4" => {
-                        let cfg = grim_kvquant::KvQuantConfig {
-                            key_bits: 2,
-                            value_bits: 4,
-                            group_size: 64,
-                            qk_compute_bits: 8,
-                        };
-                        compressor = Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
-                        log::info!(
-                            "[grim-engine] kv-int8: attached LloydMaxCompressor (key_bits=2, value_bits=4, group=64)"
-                        );
-                    }
                     "off" | "" => {}
-                    other => eprintln!(
-                        "[grim-engine] GRIM_KV_QUANT='{other}' not recognized (expected int8|int4|off)"
-                    ),
+                    spec => {
+                        let cfg = match spec {
+                            "int8" => Some(grim_kvquant::KvQuantConfig {
+                                key_bits: 3,
+                                value_bits: 8,
+                                group_size: 64,
+                                qk_compute_bits: 8,
+                            }),
+                            "int4" => Some(grim_kvquant::KvQuantConfig {
+                                key_bits: 2,
+                                value_bits: 4,
+                                group_size: 64,
+                                qk_compute_bits: 8,
+                            }),
+                            // KV-OMNI modality profiles, one shared table with
+                            // the omni compressor (grim_kvquant::named_profile).
+                            other => grim_kvquant::named_profile(other),
+                        };
+                        match cfg {
+                            Some(cfg) => {
+                                compressor =
+                                    Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
+                                log::info!(
+                                    "[grim-engine] kv-quant '{spec}': LloydMaxCompressor (key_bits={}, value_bits={}, group={})",
+                                    cfg.key_bits,
+                                    cfg.value_bits,
+                                    cfg.group_size
+                                );
+                            }
+                            None => eprintln!(
+                                "[grim-engine] GRIM_KV_QUANT='{spec}' not recognized (expected int8|int4|off|{})",
+                                grim_kvquant::NAMED_PROFILES.join("|")
+                            ),
+                        }
+                    }
                 }
             }
         }

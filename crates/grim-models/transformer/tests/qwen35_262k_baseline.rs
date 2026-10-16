@@ -96,44 +96,74 @@ fn qwen35_9b_262k_kv_arena_baseline_accounting() {
     assert_eq!(k_elems_per_token_per_layer, 1024);
     assert_eq!(v_elems_per_token_per_layer, 1024);
 
-    let kv_elems_per_token_total = num_attn_layers * (k_elems_per_token_per_layer + v_elems_per_token_per_layer);
+    let kv_elems_per_token_total =
+        num_attn_layers * (k_elems_per_token_per_layer + v_elems_per_token_per_layer);
     assert_eq!(kv_elems_per_token_total, 16384);
 
     // FP32 Baseline
     let fp32_bytes_per_token = kv_elems_per_token_total * 4;
     assert_eq!(fp32_bytes_per_token, 65536, "Baseline must be 64KB/token");
     let fp32_total_bytes_262k = fp32_bytes_per_token as u64 * CONTEXT_262K as u64;
-    assert_eq!(fp32_total_bytes_262k, 17_179_869_184, "Baseline must be exactly 17.18 GB (16.00 GiB)");
+    assert_eq!(
+        fp32_total_bytes_262k, 17_179_869_184,
+        "Baseline must be exactly 17.18 GB (16.00 GiB)"
+    );
 
     // FP16 (Phase 1)
     let fp16_bytes_per_token = kv_elems_per_token_total * 2;
     assert_eq!(fp16_bytes_per_token, 32768, "Phase 1 must be 32KB/token");
     let fp16_total_bytes_262k = fp16_bytes_per_token as u64 * CONTEXT_262K as u64;
-    assert_eq!(fp16_total_bytes_262k, 8_589_934_592, "Phase 1 must be exactly 8.59 GB (8.00 GiB)");
+    assert_eq!(
+        fp16_total_bytes_262k, 8_589_934_592,
+        "Phase 1 must be exactly 8.59 GB (8.00 GiB)"
+    );
 
     // INT8 (Phase 2)
     let int8_bytes_per_token = kv_elems_per_token_total * 1;
     assert_eq!(int8_bytes_per_token, 16384, "Phase 2 must be 16KB/token");
     let int8_total_bytes_262k = int8_bytes_per_token as u64 * CONTEXT_262K as u64;
-    assert_eq!(int8_total_bytes_262k, 4_294_967_296, "Phase 2 must be exactly 4.29 GB (4.00 GiB)");
+    assert_eq!(
+        int8_total_bytes_262k, 4_294_967_296,
+        "Phase 2 must be exactly 4.29 GB (4.00 GiB)"
+    );
 
     // INT4 (Phase 3)
     let int4_bytes_per_token = kv_elems_per_token_total / 2;
     assert_eq!(int4_bytes_per_token, 8192, "Phase 3 must be 8KB/token");
     let int4_total_bytes_262k = int4_bytes_per_token as u64 * CONTEXT_262K as u64;
-    assert_eq!(int4_total_bytes_262k, 2_147_483_648, "Phase 3 must be exactly 2.15 GB (2.00 GiB)");
+    assert_eq!(
+        int4_total_bytes_262k, 2_147_483_648,
+        "Phase 3 must be exactly 2.15 GB (2.00 GiB)"
+    );
 
     eprintln!("\n================ KV Arena Baseline Table (Qwen3.5-9B @ 262,144) ================");
     eprintln!("Layer breakdown: {num_attn_layers} Attention layers, {num_kda_layers} KDA layers");
-    eprintln!("Per-layer KV width: {} elems (K: {}, V: {})", k_elems_per_token_per_layer + v_elems_per_token_per_layer, k_elems_per_token_per_layer, v_elems_per_token_per_layer);
+    eprintln!(
+        "Per-layer KV width: {} elems (K: {}, V: {})",
+        k_elems_per_token_per_layer + v_elems_per_token_per_layer,
+        k_elems_per_token_per_layer,
+        v_elems_per_token_per_layer
+    );
     eprintln!("Total KV elems / token across model: {kv_elems_per_token_total} elems");
     eprintln!("--------------------------------------------------------------------------------");
-    eprintln!("Phase               Bytes/token    Total @ 262K (GiB)    Total @ 262K (GB)    Ratio");
-    eprintln!("Baseline (FP32)     64 KB          16.00 GiB             17.18 GB             1.00x");
-    eprintln!("Phase 1 (FP16)      32 KB           8.00 GiB              8.59 GB             2.00x");
-    eprintln!("Phase 2 (INT8)      16 KB           4.00 GiB              4.29 GB             4.00x");
-    eprintln!("Phase 3 (INT4)       8 KB           2.00 GiB              2.15 GB             8.00x");
-    eprintln!("Phase 4 (CurDKV)    ~0.8 KB        ~0.20 GiB             ~0.22 GB            ~78.0x");
+    eprintln!(
+        "Phase               Bytes/token    Total @ 262K (GiB)    Total @ 262K (GB)    Ratio"
+    );
+    eprintln!(
+        "Baseline (FP32)     64 KB          16.00 GiB             17.18 GB             1.00x"
+    );
+    eprintln!(
+        "Phase 1 (FP16)      32 KB           8.00 GiB              8.59 GB             2.00x"
+    );
+    eprintln!(
+        "Phase 2 (INT8)      16 KB           4.00 GiB              4.29 GB             4.00x"
+    );
+    eprintln!(
+        "Phase 3 (INT4)       8 KB           2.00 GiB              2.15 GB             8.00x"
+    );
+    eprintln!(
+        "Phase 4 (CurDKV)    ~0.8 KB        ~0.20 GiB             ~0.22 GB            ~78.0x"
+    );
     eprintln!("================================================================================\n");
 }
 
@@ -150,17 +180,20 @@ fn qwen35_9b_real_weights_baseline_parity_snapshot() {
     let c = cfg_9b();
 
     // Verify metadata matches architecture assumptions
-    let full_attn_interval = prov.metadata("qwen35.full_attention_interval")
+    let full_attn_interval = prov
+        .metadata("qwen35.full_attention_interval")
         .and_then(|v| v.as_u32())
         .unwrap_or(4) as usize;
     assert_eq!(full_attn_interval, 4);
 
-    let num_layers = prov.metadata("qwen35.block_count")
+    let num_layers = prov
+        .metadata("qwen35.block_count")
         .and_then(|v| v.as_u32())
         .unwrap_or(32) as usize;
     assert_eq!(num_layers, 32);
 
-    let context_len = prov.metadata("qwen35.context_length")
+    let context_len = prov
+        .metadata("qwen35.context_length")
         .and_then(|v| v.as_u32())
         .unwrap_or(262144) as usize;
     assert_eq!(context_len, 262144);
@@ -175,21 +208,44 @@ fn qwen35_9b_real_weights_baseline_parity_snapshot() {
     let x = vec![0.05f32; c.hidden_size];
     let in_tensor = grim_backend_cpu::cpu_tensor(x, Shape::new(vec![1, c.hidden_size]));
 
-    let out = blk.forward(&in_tensor, &[0], &mut cache).expect("forward step 0");
+    let out = blk
+        .forward(&in_tensor, &[0], &mut cache)
+        .expect("forward step 0");
     let out_vec = out.to_vec_f32().expect("read out");
     assert_eq!(out_vec.len(), c.hidden_size);
-    assert!(out_vec.iter().all(|v| v.is_finite()), "Step-0 baseline decode output must be finite");
+    assert!(
+        out_vec.iter().all(|v| v.is_finite()),
+        "Step-0 baseline decode output must be finite"
+    );
 
     // Verify cache allocated expected KV elements in the arena (step 0 -> 1 token of kv_dim)
     let kvd = c.num_kv_heads * c.head_dim;
-    let k_arena = cache.k_device.as_ref().expect("k_device arena must be allocated");
-    let v_arena = cache.v_device.as_ref().expect("v_device arena must be allocated");
+    let k_arena = cache
+        .k_device
+        .as_ref()
+        .expect("k_device arena must be allocated");
+    let v_arena = cache
+        .v_device
+        .as_ref()
+        .expect("v_device arena must be allocated");
     let k_vec = k_arena.to_cpu_vec_f32().expect("read K arena");
     let v_vec = v_arena.to_cpu_vec_f32().expect("read V arena");
-    assert!(k_vec.len() >= kvd, "k_arena should hold at least 1 token of kvd floats");
-    assert!(v_vec.len() >= kvd, "v_arena should hold at least 1 token of kvd floats");
-    assert!(k_vec[..kvd].iter().all(|v| v.is_finite()), "K arena row 0 must be finite");
-    assert!(v_vec[..kvd].iter().all(|v| v.is_finite()), "V arena row 0 must be finite");
+    assert!(
+        k_vec.len() >= kvd,
+        "k_arena should hold at least 1 token of kvd floats"
+    );
+    assert!(
+        v_vec.len() >= kvd,
+        "v_arena should hold at least 1 token of kvd floats"
+    );
+    assert!(
+        k_vec[..kvd].iter().all(|v| v.is_finite()),
+        "K arena row 0 must be finite"
+    );
+    assert!(
+        v_vec[..kvd].iter().all(|v| v.is_finite()),
+        "V arena row 0 must be finite"
+    );
     cache.current_pos += 1;
     assert_eq!(cache.current_pos, 1);
 }

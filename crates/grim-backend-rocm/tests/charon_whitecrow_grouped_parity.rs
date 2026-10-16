@@ -12,9 +12,9 @@
 //!   --test charon_whitecrow_grouped_parity
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::dtype::{ArithType, DType, Storage};
-use grim_tensor::Shape;
 use grim_tensor::MemoryOps;
+use grim_tensor::Shape;
+use grim_tensor::dtype::{ArithType, DType, Storage};
 use std::sync::Arc;
 
 const HIDDEN: usize = 256; // group-128: hidden % 128 == 0
@@ -75,7 +75,14 @@ fn blob_from(qw: &[u8], sc: &[u8], zr: &[u8]) -> Vec<u8> {
 /// fused gate|up -> silu -> down math with f32 activations.
 fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([
-        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        b[o],
+        b[o + 1],
+        b[o + 2],
+        b[o + 3],
+        b[o + 4],
+        b[o + 5],
+        b[o + 6],
+        b[o + 7],
     ])
 }
 
@@ -109,10 +116,13 @@ fn host_reference(
     }
     let mut act = vec![0f32; INTER];
     for proj in 0..2 {
-        let blob = &gate_blob[exp as usize * gate_stride as usize
-            ..(exp as usize + 1) * gate_stride as usize];
-        let src = if proj == 1 { &up_blob[exp as usize * gate_stride as usize
-            ..(exp as usize + 1) * gate_stride as usize] } else { blob };
+        let blob = &gate_blob
+            [exp as usize * gate_stride as usize..(exp as usize + 1) * gate_stride as usize];
+        let src = if proj == 1 {
+            &up_blob[exp as usize * gate_stride as usize..(exp as usize + 1) * gate_stride as usize]
+        } else {
+            blob
+        };
         let (qw, sc, zr, n_groups) = seg(src, INTER, HIDDEN);
         let _ = (sc, zr, qw, n_groups);
         for j in 0..INTER {
@@ -124,7 +134,9 @@ fn host_reference(
                 let mut sa = 0f32;
                 for wi in 0..16 {
                     let word = u32::from_le_bytes(
-                        qw[j * (HIDDEN / 8) + gg * 16 + wi ..][..4].try_into().unwrap(),
+                        qw[j * (HIDDEN / 8) + gg * 16 + wi..][..4]
+                            .try_into()
+                            .unwrap(),
                     );
                     for t in 0..8 {
                         let av = a[tok * HIDDEN + gg * 128 + wi * 8 + t];
@@ -143,8 +155,8 @@ fn host_reference(
             }
         }
     }
-    let dblob = &down_blob[exp as usize * down_stride as usize
-        ..(exp as usize + 1) * down_stride as usize];
+    let dblob =
+        &down_blob[exp as usize * down_stride as usize..(exp as usize + 1) * down_stride as usize];
     let (qw, sc, zr, n_groups) = seg(dblob, HIDDEN, INTER);
     for h in 0..HIDDEN {
         let mut acc = 0f32;
@@ -155,7 +167,9 @@ fn host_reference(
             let mut sa = 0f32;
             for wi in 0..16 {
                 let word = u32::from_le_bytes(
-                    qw[h * (INTER / 8) + gg * 16 + wi ..][..4].try_into().unwrap(),
+                    qw[h * (INTER / 8) + gg * 16 + wi..][..4]
+                        .try_into()
+                        .unwrap(),
                 );
                 for t in 0..8 {
                     let av = act[gg * 128 + wi * 8 + t];
@@ -199,11 +213,23 @@ fn whitecrow_grouped_matches_host_reference() {
     let mut up_blob = Vec::new();
     let mut down_blob = Vec::new();
     for e in 0..NUM_EXPERTS {
-        let (q, s, z) = wc_encode(&gw[e * HIDDEN * INTER..(e + 1) * HIDDEN * INTER], INTER, HIDDEN);
+        let (q, s, z) = wc_encode(
+            &gw[e * HIDDEN * INTER..(e + 1) * HIDDEN * INTER],
+            INTER,
+            HIDDEN,
+        );
         gate_blob.extend_from_slice(&blob_from(&q, &s, &z));
-        let (q, s, z) = wc_encode(&uw[e * HIDDEN * INTER..(e + 1) * HIDDEN * INTER], INTER, HIDDEN);
+        let (q, s, z) = wc_encode(
+            &uw[e * HIDDEN * INTER..(e + 1) * HIDDEN * INTER],
+            INTER,
+            HIDDEN,
+        );
         up_blob.extend_from_slice(&blob_from(&q, &s, &z));
-        let (q, s, z) = wc_encode(&dw[e * INTER * HIDDEN..(e + 1) * INTER * HIDDEN], HIDDEN, INTER);
+        let (q, s, z) = wc_encode(
+            &dw[e * INTER * HIDDEN..(e + 1) * INTER * HIDDEN],
+            HIDDEN,
+            INTER,
+        );
         down_blob.extend_from_slice(&blob_from(&q, &s, &z));
     }
     let gate_stride = (gate_blob.len() / NUM_EXPERTS) as u64;
@@ -313,9 +339,7 @@ fn whitecrow_grouped_matches_host_reference() {
         scale = scale.max(g.abs()).max(wv.abs());
     }
     let rel = max_abs / scale;
-    eprintln!(
-        "[whitecrow-parity] kernel vs host-over-blobs: max_abs {max_abs:.3e} rel {rel:.3e}"
-    );
+    eprintln!("[whitecrow-parity] kernel vs host-over-blobs: max_abs {max_abs:.3e} rel {rel:.3e}");
     assert!(
         rel < 1e-4,
         "grouped WhiteCrow kernel diverges from the host blob reference (rel {rel:.3e})"

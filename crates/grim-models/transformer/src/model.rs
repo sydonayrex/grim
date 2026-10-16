@@ -779,7 +779,7 @@ mod tests {
             max_seq_len: 512,
             partial_rotary_factor: prf,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         }
     }
 
@@ -825,7 +825,7 @@ mod tests {
             max_seq_len: 512,
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
         let model = Llama::random(Device::Cpu, cfg.clone());
         let seq = 3usize;

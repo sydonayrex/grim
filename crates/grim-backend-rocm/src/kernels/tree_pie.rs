@@ -205,7 +205,11 @@ mod tests {
             let sign = (code >> 4) & 1;
             let (exp, mant) = (nib >> 2, nib & 3);
             let (exp_field, mant_10) = if exp == 0 {
-                if mant == 0 { (0u16, 0u16) } else { (14 + (mant >> 1), ((mant + 1) >> 2) << 9) }
+                if mant == 0 {
+                    (0u16, 0u16)
+                } else {
+                    (14 + (mant >> 1), ((mant + 1) >> 2) << 9)
+                }
             } else {
                 (exp + 15, mant << 8)
             };

@@ -2976,17 +2976,19 @@ mod tests {
         // `#if`, which ends long before this kernel.
         let mut depth = 0usize;
         let mut end = None;
-        for (i, line) in KERNEL_SOURCE[start..].lines().enumerate() {
+        let mut byte_offset = 0usize;
+        for line in KERNEL_SOURCE[start..].lines() {
             let t = line.trim_start();
             if t.starts_with("#if") {
                 depth += 1;
             } else if t.starts_with("#endif") {
                 depth -= 1;
                 if depth == 0 {
-                    end = Some(start + i);
+                    end = Some(start + byte_offset + line.len());
                     break;
                 }
             }
+            byte_offset += line.len() + 1; // +1 for newline
         }
         let end = end.expect("wave32 guard footer");
         assert!(

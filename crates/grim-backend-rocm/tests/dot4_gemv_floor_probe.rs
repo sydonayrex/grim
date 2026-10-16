@@ -19,12 +19,10 @@
 //! RUN: GRIM_RUN_GPU_TEST=1 HIP_VISIBLE_DEVICES=1 cargo test -p grim-backend-rocm \
 //!      --test dot4_gemv_floor_probe -- --ignored --nocapture
 
-use grim_backend_rocm::memory::allocator::RocmCachingAllocator;
-use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{
-    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage,
-};
+use grim_backend_rocm::RocmStorage;
+use grim_backend_rocm::memory::allocator::RocmCachingAllocator;
+use grim_tensor::{ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage};
 use std::sync::Arc;
 
 fn gpu_device() -> Option<RocmDevice> {
@@ -101,8 +99,8 @@ fn bench(dev: &RocmDevice, c: &Case, iters: usize, seed: u64) -> (f64, f64) {
         .expect("rocm weight storage");
 
     let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
-    let a_st = CoreTensorOps::from_cpu(dev, &a, &Shape::new(vec![1, k]), DType::F32)
-        .expect("upload act");
+    let a_st =
+        CoreTensorOps::from_cpu(dev, &a, &Shape::new(vec![1, k]), DType::F32).expect("upload act");
 
     let q81_bytes = (k / 32) * 36;
     let act_q81 = RocmStorage::alloc_gpu(
@@ -115,13 +113,8 @@ fn bench(dev: &RocmDevice, c: &Case, iters: usize, seed: u64) -> (f64, f64) {
         0,
     )
     .expect("alloc q81 scratch");
-    let out = RocmStorage::alloc_gpu(
-        &Shape::new(vec![n]),
-        DType::F32,
-        &alloc,
-        0,
-    )
-    .expect("alloc out");
+    let out =
+        RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).expect("alloc out");
 
     // Warmup: JIT compile + allocator priming, untimed.
     for _ in 0..3 {
@@ -146,11 +139,7 @@ fn bench(dev: &RocmDevice, c: &Case, iters: usize, seed: u64) -> (f64, f64) {
 fn report(c: &Case, per_launch_us: f64, gbps: f64) {
     eprintln!(
         "[floor-probe] {:<26} scheme={:?} n={:<7} per_launch={:>8.1} us  weight_GBps={:>7.1}",
-        c.label,
-        c.scheme,
-        c.n,
-        per_launch_us,
-        gbps
+        c.label, c.scheme, c.n, per_launch_us, gbps
     );
 }
 
@@ -163,7 +152,12 @@ fn dot4_gemv_floor_small_vs_big_launch() {
     let k = 4096usize;
 
     // (a) small launch, sparsely issued.
-    let small = Case { label: "a_small_q4k", scheme: KQuantScheme::Q4K, n: 16384, k };
+    let small = Case {
+        label: "a_small_q4k",
+        scheme: KQuantScheme::Q4K,
+        n: 16384,
+        k,
+    };
     let (us, gbps) = bench(&dev, &small, 20, 41);
     report(&small, us, gbps);
 
@@ -175,13 +169,23 @@ fn dot4_gemv_floor_small_vs_big_launch() {
     );
 
     // (c) lm_head-scale launch of the SAME kernel — the bandwidth ceiling.
-    let big = Case { label: "c_big_q4k_lmhead_scale", scheme: KQuantScheme::Q4K, n: 248320, k };
+    let big = Case {
+        label: "c_big_q4k_lmhead_scale",
+        scheme: KQuantScheme::Q4K,
+        n: 248320,
+        k,
+    };
     let (us_big, gbps_big) = bench(&dev, &big, 5, 43);
     report(&big, us_big, gbps_big);
 
     // (d) other formats at the small shape.
     for scheme in [KQuantScheme::Q5K, KQuantScheme::Q6K] {
-        let c = Case { label: "d_small", scheme, n: 16384, k };
+        let c = Case {
+            label: "d_small",
+            scheme,
+            n: 16384,
+            k,
+        };
         let (us, gbps) = bench(&dev, &c, 20, 47);
         report(&c, us, gbps);
     }
@@ -202,7 +206,9 @@ fn dot4_gemv_floor_small_vs_big_launch() {
             sseed ^= sseed << 5;
             sseed
         };
-        let vals: Vec<f32> = (0..n * k).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+        let vals: Vec<f32> = (0..n * k)
+            .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+            .collect();
         let w_bytes = grim_quant::quant_q80(&vals).expect("quant_q80");
         let alloc = dev.allocator_handle();
         let w = MemoryOps::from_cpu_bytes(&dev, &w_bytes, &Shape::new(vec![n, k]), q80_dtype)
@@ -211,31 +217,53 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
         let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, k]), DType::F32).unwrap();
         let q81_bytes = (k / 32) * 36;
-        let act_q81 = RocmStorage::alloc_gpu(&Shape::new(vec![q81_bytes]), DType { arith: ArithType::U8, storage: Storage::Native }, &alloc, 0).unwrap();
+        let act_q81 = RocmStorage::alloc_gpu(
+            &Shape::new(vec![q81_bytes]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            &alloc,
+            0,
+        )
+        .unwrap();
         let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
         for _ in 0..3 {
-            dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &act_q81).unwrap();
+            dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &act_q81)
+                .unwrap();
         }
         dev.synchronize();
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &act_q81).unwrap();
+            dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &act_q81)
+                .unwrap();
         }
         dev.synchronize();
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
         let gbps = (n as f64) * (k as f64 / 32.0) * 34.0 / 1e9 / (us * 1e-6);
-        eprintln!("[floor-probe] e_small_q80_no_unpack        scheme=Q80 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+        eprintln!(
+            "[floor-probe] e_small_q80_no_unpack        scheme=Q80 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}"
+        );
     }
 
     // (f) q4k with GRIM_DOT4_FAST=1 — the word-wide-mask unpack variant.
     // Expected: multiple-x the stock 23 GB/s if the unpack chain was the
     // bottleneck; identical output mapping is gated by dot_gemv_parity.
     {
-        unsafe { std::env::set_var("GRIM_DOT4_FAST", "1"); }
-        let fast = Case { label: "f_small_q4k_FAST", scheme: KQuantScheme::Q4K, n: 16384, k };
+        unsafe {
+            std::env::set_var("GRIM_DOT4_FAST", "1");
+        }
+        let fast = Case {
+            label: "f_small_q4k_FAST",
+            scheme: KQuantScheme::Q4K,
+            n: 16384,
+            k,
+        };
         let (us, gbps) = bench(&dev, &fast, 20, 41);
         report(&fast, us, gbps);
-        unsafe { std::env::set_var("GRIM_DOT4_FAST", "0"); }
+        unsafe {
+            std::env::set_var("GRIM_DOT4_FAST", "0");
+        }
     }
 
     // (g) WhiteCrow W4A4 (OSTQuant u4 x u4, native v_dot8) at the small
@@ -256,16 +284,42 @@ fn dot4_gemv_floor_small_vs_big_launch() {
             sseed
         };
         let b_qw: Vec<u32> = (0..n * words_per_col).map(|_| nxt() as u32).collect();
-        let b_sc: Vec<u16> = (0..n * n_groups).map(|_| (nxt() & 0x3fff) as u16 | 0x3800).collect(); // bf16 ~[0.5,1.0)
+        let b_sc: Vec<u16> = (0..n * n_groups)
+            .map(|_| (nxt() & 0x3fff) as u16 | 0x3800)
+            .collect(); // bf16 ~[0.5,1.0)
         let b_zr: Vec<u8> = (0..n * n_groups).map(|_| (nxt() & 0x0f) as u8).collect();
         let qw_bytes: Vec<u8> = b_qw.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sc_bytes: Vec<u8> = b_sc.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &qw_bytes, &Shape::new(vec![n, words_per_col]),
-            DType { arith: ArithType::U32, storage: Storage::Native }).unwrap();
-        let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &sc_bytes, &Shape::new(vec![n, n_groups]),
-            DType { arith: ArithType::BF16, storage: Storage::Native }).unwrap();
-        let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_zr, &Shape::new(vec![n, n_groups]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &qw_bytes,
+            &Shape::new(vec![n, words_per_col]),
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+        let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &sc_bytes,
+            &Shape::new(vec![n, n_groups]),
+            DType {
+                arith: ArithType::BF16,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+        let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_zr,
+            &Shape::new(vec![n, n_groups]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
         let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
         let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, k]), DType::F32).unwrap();
         let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
@@ -275,18 +329,22 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         let zr_rocm = b_zr_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         // Warmup (JIT + u4 scratch alloc).
         for _ in 0..3 {
-            dev.launch_w4a4_ostquant_gemv(a_rocm, qw_rocm, sc_rocm, zr_rocm, &out, 1, n, k).unwrap();
+            dev.launch_w4a4_ostquant_gemv(a_rocm, qw_rocm, sc_rocm, zr_rocm, &out, 1, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            dev.launch_w4a4_ostquant_gemv(a_rocm, qw_rocm, sc_rocm, zr_rocm, &out, 1, n, k).unwrap();
+            dev.launch_w4a4_ostquant_gemv(a_rocm, qw_rocm, sc_rocm, zr_rocm, &out, 1, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
-        let gb = n as f64 * k as f64 * (0.5 + 2.0/128.0 + 1.0/128.0) / 1e9;
+        let gb = n as f64 * k as f64 * (0.5 + 2.0 / 128.0 + 1.0 / 128.0) / 1e9;
         let gbps = gb / (us * 1e-6);
-        eprintln!("[floor-probe] g_small_W4A4_whitecrow       scheme=U4  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+        eprintln!(
+            "[floor-probe] g_small_W4A4_whitecrow       scheme=U4  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}"
+        );
     }
 
     // (h) TreePie GEMV (5.0 bpw, V_DOT2_F32_F16) — packed in-register decode,
@@ -301,35 +359,57 @@ fn dot4_gemv_floor_small_vs_big_launch() {
             sseed ^= sseed << 5;
             sseed
         };
-        let vals: Vec<f32> = (0..n * k).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+        let vals: Vec<f32> = (0..n * k)
+            .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+            .collect();
         let packed_u32 = grim_quant::tree_pie::pack_tree_pie(&vals);
         let packed_bytes: Vec<u8> = packed_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &packed_bytes,
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &packed_bytes,
             &Shape::new(vec![packed_bytes.len()]),
-            DType { arith: ArithType::U32, storage: Storage::Native }).unwrap();
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
         let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
-        let a_f16_bytes: Vec<u8> = a.iter()
+        let a_f16_bytes: Vec<u8> = a
+            .iter()
             .map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
-            .flatten().collect();
-        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_f16_bytes,
+            .flatten()
+            .collect();
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &a_f16_bytes,
             &Shape::new(vec![a_f16_bytes.len()]),
-            DType { arith: ArithType::F16, storage: Storage::Native }).unwrap();
+            DType {
+                arith: ArithType::F16,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
         let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
         let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         for _ in 0..3 {
-            dev.launch_tree_pie_gemv(a_rocm, b_rocm, &out, n, k).unwrap();
+            dev.launch_tree_pie_gemv(a_rocm, b_rocm, &out, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            dev.launch_tree_pie_gemv(a_rocm, b_rocm, &out, n, k).unwrap();
+            dev.launch_tree_pie_gemv(a_rocm, b_rocm, &out, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
         let gb = n as f64 * k as f64 * 0.625 / 1e9;
         let gbps = gb / (us * 1e-6);
-        eprintln!("[floor-probe] h_small_TREAPIE_dot2         scheme=TP  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+        eprintln!(
+            "[floor-probe] h_small_TREAPIE_dot2         scheme=TP  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}"
+        );
     }
 
     // (i) WhiteRaven FP8 E4M3 WMMA GEMM (RDNA4 V_WMMA_FP8) — 1.0 B/elem.
@@ -351,26 +431,46 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         for (i, &v) in a_row.iter().enumerate() {
             a_fp8[i] = grim_quant::quant_fp8(&[v]).unwrap()[0];
         }
-        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![16, k]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
-        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![n, k]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &a_fp8,
+            &Shape::new(vec![16, k]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_fp8,
+            &Shape::new(vec![n, k]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
         let out = RocmStorage::alloc_gpu(&Shape::new(vec![1, n]), DType::F32, &alloc, 0).unwrap();
         let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         for _ in 0..3 {
-            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, 1, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, 1, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
         let gb = n as f64 * k as f64 * 1.0 / 1e9;
         let gbps = gb / (us * 1e-6);
-        eprintln!("[floor-probe] i_small_WHITERAVEN_fp8_wmma  scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+        eprintln!(
+            "[floor-probe] i_small_WHITERAVEN_fp8_wmma  scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}"
+        );
     }
 
     // (j) WhiteRaven at M=16 — its native tile. Prefill-relevant: how many
@@ -388,26 +488,46 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         };
         let b_fp8: Vec<u8> = (0..n * k).map(|_| (nxt() & 0xff) as u8).collect();
         let a_fp8: Vec<u8> = (0..m * k).map(|_| (nxt() & 0xff) as u8).collect();
-        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![m, k]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
-        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![n, k]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &a_fp8,
+            &Shape::new(vec![m, k]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_fp8,
+            &Shape::new(vec![n, k]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
         let out = RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &alloc, 0).unwrap();
         let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         for _ in 0..3 {
-            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, m, n, k).unwrap();
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, m, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, m, n, k).unwrap();
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, m, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
         let gb = n as f64 * k as f64 * 1.0 / 1e9;
         let gbps = gb / (us * 1e-6);
-        eprintln!("[floor-probe] j_m16_WHITERAVEN_fp8_wmma    scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+        eprintln!(
+            "[floor-probe] j_m16_WHITERAVEN_fp8_wmma    scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}"
+        );
     }
 
     // (k) WhiteRaven-BLOCKED FP8 E4M3 WMMA (16x16-blocked B, ldm=16): same
@@ -432,30 +552,51 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         for (i, &v) in a_row.iter().enumerate() {
             a_fp8[i] = grim_quant::quant_fp8(&[v]).unwrap()[0];
         }
-        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![16, k]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
-        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_blocked, &Shape::new(vec![n * k]),
-            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &a_fp8,
+            &Shape::new(vec![16, k]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_blocked,
+            &Shape::new(vec![n * k]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
         let out = RocmStorage::alloc_gpu(&Shape::new(vec![1, n]), DType::F32, &alloc, 0).unwrap();
         let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
         for _ in 0..3 {
-            dev.launch_wmma_gemm_fp8_e4m3_blocked(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+            dev.launch_wmma_gemm_fp8_e4m3_blocked(a_rocm, b_rocm, &out, 1, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            dev.launch_wmma_gemm_fp8_e4m3_blocked(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+            dev.launch_wmma_gemm_fp8_e4m3_blocked(a_rocm, b_rocm, &out, 1, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
         let gb = n as f64 * k as f64 * 1.0 / 1e9;
         let gbps = gb / (us * 1e-6);
-        eprintln!("[floor-probe] k_blocked_WHITERAVEN_fp8    scheme=FP8b n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+        eprintln!(
+            "[floor-probe] k_blocked_WHITERAVEN_fp8    scheme=FP8b n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}"
+        );
     }
 
     // Verdict inputs, not a hard gate: this probe is evidence.
-    let small_gb = 16384.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;    let big_gb = 248320.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
+    let small_gb = 16384.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
+    let big_gb = 248320.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
     eprintln!(
         "[floor-probe] verdict inputs: small moves {small_gb:.3} GB in {us:.0} us; \
          big moves {big_gb:.3} GB in {us_big:.0} us; big is {:.1}x the bytes for {:.1}x the time",

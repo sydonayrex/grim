@@ -467,14 +467,17 @@ impl RocmStorage {
         // runs on the decode path where those bytes live only on the device.
         // Uploading is the one moment they are in host memory, so take the
         // hash here: it removes a full D2H plus the hashing (measured 2.5 s
-        // across 201 weights) from the first decode step.
+        // across 201 weights) from the first decode step. It is ALSO the
+        // identity the in-memory memo verifies on every hit (recycled device
+        // pointers), so every lane-served weight registers regardless of
+        // size — hashing kilobytes is negligible next to the upload itself.
         if let grim_tensor::Storage::KQuant(scheme) = dtype.storage {
             use grim_tensor::KQuantScheme as S;
             let lane_served = matches!(
                 scheme,
                 S::Q4K | S::Q5K | S::Q6K | S::Q3K | S::IQ3S | S::Q2K | S::IQ4NL | S::GsqRco3p5
             );
-            if lane_served && bytes >= 1024 * 1024 {
+            if lane_served {
                 crate::device::compute::gemm_launchers::register_weight_source_hash(
                     dev_ptr_void as u64,
                     bytes,
@@ -537,14 +540,12 @@ impl Drop for RocmStorage {
             if std::env::var("GRIM_ALLOC_AUDIT").as_deref() == Ok("1")
                 && RocmCachingAllocator::size_class_of(self.bytes) >= 16384
             {
-                static N: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 400 {
                     eprintln!(
                         "[drop-trace] #{n} ptr={ptr_val:#x} bytes={} managed={}",
-                        self.bytes,
-                        self.managed
+                        self.bytes, self.managed
                     );
                     eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
                 }
@@ -604,17 +605,14 @@ impl BackendStorage for RocmStorage {
         }
         let mut raw = vec![0u8; need as usize];
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        crate::check_hip(
-            "hipMemcpyDtoH (u32)",
-            unsafe {
-                hipMemcpy(
-                    raw.as_mut_ptr() as *mut c_void,
-                    dev_ptr_void,
-                    need as usize,
-                    crate::HipMemcpyKind::DeviceToHost,
-                )
-            },
-        )?;
+        crate::check_hip("hipMemcpyDtoH (u32)", unsafe {
+            hipMemcpy(
+                raw.as_mut_ptr() as *mut c_void,
+                dev_ptr_void,
+                need as usize,
+                crate::HipMemcpyKind::DeviceToHost,
+            )
+        })?;
         Ok(raw
             .chunks_exact(4)
             .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))

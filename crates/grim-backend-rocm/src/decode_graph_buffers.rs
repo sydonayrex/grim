@@ -14,14 +14,15 @@ use std::sync::Arc;
 
 use grim_tensor::BackendStorage;
 
-use crate::device::roc_device::RocmDevice;
-use crate::device::util::dtype_f32;
-use crate::memory::storage::RocmStorage;
 use crate::DTypeStorage;
 use crate::HipMemcpyKind;
+use crate::device::roc_device::RocmDevice;
+use crate::device::util::dtype_f32;
+use crate::kernels::qkv_attention::KvRingPolicy;
+use crate::memory::storage::RocmStorage;
 use crate::{
-    check_hip, hipGraphDestroy, hipGraphExecDestroy, hipGraphExecKernelNodeSetParams,
-    hipGraphInstantiate, hipMemcpyAsync, hipStreamBeginCapture, hipStreamEndCapture, Shape,
+    Shape, arg, check_hip, hipGraphDestroy, hipGraphExecDestroy, hipGraphExecKernelNodeSetParams,
+    hipGraphInstantiate, hipMemcpyAsync, hipStreamBeginCapture, hipStreamEndCapture, linear_launch,
 };
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, DType};
@@ -125,6 +126,18 @@ pub struct DecodeGraphBuffers {
     /// KV cache arenas (pre-allocated to max context)
     pub k_arena: Vec<RocmStorage>, // [max_ctx, n_k]
     pub v_arena: Vec<RocmStorage>,       // [max_ctx, n_v]
+    /// Phase-2 int8 KV scale sidecars: one f32 per (row, kv_head), laid out
+    /// `[batch * max_ctx, n_kv_heads]` to mirror the arena slotting. Empty
+    /// unless the arenas hold u8 codes; every int8 launcher reads these, so
+    /// a codes arena without its sidecar is a loud failure, not a reinterpret.
+    pub k_scale_arena: Vec<RocmStorage>,
+    pub v_scale_arena: Vec<RocmStorage>,
+    /// Phase-3 eviction ring. `cap_rows <= 0` (the default) means the arena
+    /// grows with the context and every ring kernel is an identity; otherwise
+    /// the arena is a fixed capacity with `sink_rows` pinned attention sinks
+    /// and the newest tokens in a ring. Owned here so capture and replay read
+    /// the same policy the capture baked into the kernels.
+    pub kv_ring: KvRingPolicy,
     /// Latent KV cache arena for MLA models (DeepSeek, Kimi): [batch * max_ctx, latent_kv_dim]
     pub latent_kv_arena: Vec<RocmStorage>,
     /// Output projection
@@ -266,14 +279,24 @@ pub struct GdlLayerBuffers {
 /// PLAN-reduce-d2h-h2d (prefill seeding): one layer's eager device K/V source.
 /// Raw device pointers — caller guarantees they outlive the seed copy.
 pub struct EagerKvSource<'a> {
-    /// Device pointer to eager K rows (f32, `prefill_len × kv_stride`).
+    /// Device pointer to eager K rows (`prefill_len × kv_stride` elements).
     pub k_dev: *const f32,
-    /// Device pointer to eager V rows (f32, `prefill_len × kv_stride`).
+    /// Device pointer to eager V rows (`prefill_len × kv_stride` elements).
     pub v_dev: *const f32,
     /// Valid rows in each buffer.
     pub prefill_len: u32,
     /// Elements per row (`num_kv_heads × head_dim`).
     pub kv_stride: usize,
+    /// Bytes per source element (1 for int8 codes, 2 for f16, 4 for f32).
+    /// The seeder copies raw bytes when this matches the arena, converts
+    /// f32->f16 when the graph runs f16 over f32 eager rows, and fails loud
+    /// otherwise — never truncates.
+    pub src_elem_bytes: usize,
+    /// Phase-2 int8: f32 scale sidecar pointers, one per (row, kv_head).
+    /// Set iff the eager arenas hold u8 codes; the seeder copies these into
+    /// the graph's sidecars alongside the codes.
+    pub k_scales_dev: Option<*const f32>,
+    pub v_scales_dev: Option<*const f32>,
     /// GDL recurrent state pointer (set for GDL layers, None for dense).
     /// Points to `[batch*heads*dk*dv]` f32 device buffer.
     pub gdl_state: Option<*const f32>,
@@ -418,6 +441,10 @@ impl DecodeGraphBuffers {
         let mut fused_qkv_out = Vec::with_capacity(num_layers);
         let mut k_arena = Vec::with_capacity(num_layers);
         let mut v_arena = Vec::with_capacity(num_layers);
+        // Filled on demand by `set_int8_kv_scales` (an empty vec means the
+        // arenas are f32/f16 and no sidecar exists).
+        let k_scale_arena: Vec<RocmStorage> = Vec::new();
+        let v_scale_arena: Vec<RocmStorage> = Vec::new();
         let mut latent_kv_arena =
             Vec::with_capacity(if latent_kv_dim > 0 { num_layers } else { 0 });
         // Q8_1 staging must cover the widest activation row (hidden vs inter),
@@ -775,6 +802,9 @@ impl DecodeGraphBuffers {
             attn_sum_buf,
             k_arena,
             v_arena,
+            k_scale_arena,
+            v_scale_arena,
+            kv_ring: KvRingPolicy::UNLIMITED,
             latent_kv_arena,
             head_input,
             head_output,
@@ -804,6 +834,53 @@ impl DecodeGraphBuffers {
             max_ctx,
             batch,
         })
+    }
+
+    /// True when the KV arenas hold u8 codes (Phase-2 int8 format). Derived
+    /// from STORAGE, never from env — the same storage-truth rule the
+    /// append/attend launchers follow.
+    pub fn kv_arena_is_int8(&self) -> bool {
+        self.k_arena
+            .first()
+            .map(|a| a.dtype.arith == grim_tensor::dtype::ArithType::U8)
+            .unwrap_or(false)
+    }
+
+    /// Allocate the per-layer f32 scale sidecars for the int8 KV format, one
+    /// f32 per (row, kv_head) laid out `[batch * max_ctx, nkv_heads]`.
+    /// MUST run outside capture. Idempotent: a second call is a no-op.
+    pub fn allocate_int8_kv_scales(&mut self, dev: &RocmDevice, num_kv_heads: usize) -> Result<()> {
+        if !self.k_scale_arena.is_empty() {
+            return Ok(());
+        }
+        if num_kv_heads == 0 {
+            return Err(Error::Backend(
+                "allocate_int8_kv_scales: num_kv_heads is zero".into(),
+            ));
+        }
+        let rows = self.batch.max(1) * self.max_ctx;
+        let shape = Shape::new(vec![rows, num_kv_heads]);
+        for _ in 0..self.k_arena.len() {
+            self.k_scale_arena.push(RocmStorage::alloc_gpu(
+                &shape,
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::Native,
+                },
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            self.v_scale_arena.push(RocmStorage::alloc_gpu(
+                &shape,
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::Native,
+                },
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+        }
+        Ok(())
     }
 
     /// Allocate one layer's KDA recurrent device buffers (state + projections).
@@ -1086,7 +1163,15 @@ impl DecodeGraphBuffers {
                     self.k_arena.len()
                 )));
             }
-            let n_rows = src.prefill_len;
+            // Phase 3: with a fixed-capacity ring, `prefill_len` is the ABSOLUTE
+            // token count while the eager arena only holds the live prefix
+            // [0, min(prefill_len, cap)). Both arenas use the same ring policy,
+            // so the layouts already agree and seeding stays a single
+            // contiguous copy — no gather, and the sinks stay at rows [0, sinks).
+            let n_rows = match self.kv_ring.cap_rows {
+                cap if cap > 0 => src.prefill_len.min(cap as u32),
+                _ => src.prefill_len,
+            };
             let n_elem: usize = (n_rows as usize) * src.kv_stride;
             // K arena row width must match the eager cache stride.
             let arena_k_cols = self.k_arena[layer_idx]
@@ -1116,14 +1201,26 @@ impl DecodeGraphBuffers {
             // SAFETY: src.k_dev/src.v_dev are device mem owned by the session
             // caches (valid for the generation); dst is the graph arena. D2D
             // copy on the active stream, ordered vs later launches.
-            // GRAVE Phase 1: element size follows the arena dtype (f16 KV
-            // arena halves the bytes; the old hardcode read past the source).
-            let elem_size = if crate::kernels::qkv_attention::kv_f16_enabled() {
-                2usize
-            } else {
-                4usize
+            // Element widths follow the SOURCE (src_elem_bytes) and the ARENA
+            // (live flag) independently: equal widths take the raw copy; an
+            // f32 eager source seeding an f16 arena converts elementwise
+            // (grim_f32_to_f16); anything else (e.g. f16 rows into an f32
+            // arena after a mid-run flag downgrade) fails loud. The old code
+            // trusted the live flag for both sides and silently copied half
+            // the bytes when they disagreed.
+            let arena_elem_bytes = match self.k_arena[layer_idx].dtype.arith {
+                grim_tensor::ArithType::U8 => 1usize,
+                grim_tensor::ArithType::F16 => 2usize,
+                grim_tensor::ArithType::F32 => 4usize,
+                // Storage truth, like the launchers: only dense u8/f16/f32
+                // arenas seed here; packed formats use their own path.
+                other => {
+                    return Err(Error::Backend(format!(
+                        "seed_kv_arena: layer {layer_idx} arena dtype {other:?} unsupported"
+                    )));
+                }
             };
-            let bytes = n_elem * elem_size;
+            let n_bytes = n_elem * arena_elem_bytes;
             let dst_k = self.k_arena[layer_idx]
                 .device_ptr_u64()
                 .ok_or_else(|| Error::Backend("seed: k_arena has no ptr".into()))?
@@ -1134,21 +1231,145 @@ impl DecodeGraphBuffers {
                 as *mut c_void;
             let src_k = src.k_dev as *const c_void;
             let src_v = src.v_dev as *const c_void;
-            let res: crate::HipErrorT = unsafe {
-                crate::hipMemcpyAsync(dst_k, src_k, bytes, HipMemcpyKind::DeviceToDevice, stream)
-            };
-            if res != crate::hipSuccess {
+            // int8 codes arenas: byte-copy the codes, then copy the f32
+            // scale sidecars. Requires int8 eager sources — the graph and
+            // eager arenas come from the same format resolver, so a mismatch
+            // means something reassigned the flag mid-run; fail loud rather
+            // than quantize the prompt silently.
+            if arena_elem_bytes == 1 {
+                if src.src_elem_bytes != 1 {
+                    return Err(Error::Backend(format!(
+                        "seed_kv_arena: layer {layer_idx} int8 graph arena but eager source is \
+                         {}B/elem — both arenas must share one KV format",
+                        src.src_elem_bytes
+                    )));
+                }
+                let n_kv = self
+                    .k_scale_arena
+                    .get(layer_idx)
+                    .map(|s| s.shape.dims().get(1).copied().unwrap_or(0))
+                    .unwrap_or(0);
+                let scale_n = (n_rows as usize) * n_kv;
+                for (s_ptr, d_ptr, sc_src, dst_sc, tag) in [
+                    (
+                        src.k_dev as *const c_void,
+                        dst_k,
+                        src.k_scales_dev,
+                        &self.k_scale_arena,
+                        "K",
+                    ),
+                    (
+                        src.v_dev as *const c_void,
+                        dst_v,
+                        src.v_scales_dev,
+                        &self.v_scale_arena,
+                        "V",
+                    ),
+                ] {
+                    let sc = sc_src.filter(|p| !p.is_null()).ok_or_else(|| {
+                        Error::Backend(format!(
+                            "seed_kv_arena: layer {layer_idx} int8 arena but eager {tag} \
+                                 scale sidecar is missing"
+                        ))
+                    })?;
+                    let dst_sidecar = dst_sc
+                        .get(layer_idx)
+                        .filter(|s| s.shape.elem_count() >= scale_n)
+                        .and_then(|s| s.device_ptr_u64())
+                        .ok_or_else(|| {
+                            Error::Backend(format!(
+                                "seed_kv_arena: layer {layer_idx} graph {tag} scale sidecar \
+                                 missing or too small ({scale_n} scales needed)"
+                            ))
+                        })?;
+                    for (dst, bytes, what) in [
+                        (d_ptr as *mut c_void, n_bytes, format!("codes {tag}")),
+                        (
+                            dst_sidecar as *mut c_void,
+                            scale_n * 4,
+                            format!("scales {tag}"),
+                        ),
+                    ] {
+                        let res: crate::HipErrorT = unsafe {
+                            crate::hipMemcpyAsync(
+                                dst,
+                                if what.starts_with("codes") {
+                                    s_ptr
+                                } else {
+                                    sc as *const c_void
+                                },
+                                bytes,
+                                HipMemcpyKind::DeviceToDevice,
+                                stream,
+                            )
+                        };
+                        if res != crate::hipSuccess {
+                            return Err(Error::Backend(format!(
+                                "seed_kv_arena: memcpy {what} failed: {res}"
+                            )));
+                        }
+                    }
+                }
+                continue;
+            }
+            if src.src_elem_bytes == arena_elem_bytes {
+                let res: crate::HipErrorT = unsafe {
+                    crate::hipMemcpyAsync(
+                        dst_k,
+                        src_k,
+                        n_bytes,
+                        HipMemcpyKind::DeviceToDevice,
+                        stream,
+                    )
+                };
+                if res != crate::hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "seed_kv_arena: hipMemcpyAsync K failed: {res}"
+                    )));
+                }
+                let res: crate::HipErrorT = unsafe {
+                    crate::hipMemcpyAsync(
+                        dst_v,
+                        src_v,
+                        n_bytes,
+                        HipMemcpyKind::DeviceToDevice,
+                        stream,
+                    )
+                };
+                if res != crate::hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "seed_kv_arena: hipMemcpyAsync V failed: {res}"
+                    )));
+                }
+                continue;
+            }
+            if !(src.src_elem_bytes == 4 && arena_elem_bytes == 2) {
                 return Err(Error::Backend(format!(
-                    "seed_kv_arena: hipMemcpyAsync K failed: {res}"
+                    "seed_kv_arena: layer {layer_idx} source width {}B vs arena {}B — \
+                     only f32->f16 seeding is supported (downgrades fail loud)",
+                    src.src_elem_bytes, arena_elem_bytes
                 )));
             }
-            let res: crate::HipErrorT = unsafe {
-                crate::hipMemcpyAsync(dst_v, src_v, bytes, HipMemcpyKind::DeviceToDevice, stream)
-            };
-            if res != crate::hipSuccess {
-                return Err(Error::Backend(format!(
-                    "seed_kv_arena: hipMemcpyAsync V failed: {res}"
-                )));
+            // f32 eager rows -> f16 arena: elementwise convert, K then V.
+            let (grid, block) = linear_launch(n_elem);
+            for (s_ptr, d_ptr) in [(src_k, dst_k), (src_v, dst_v)] {
+                let mut s = s_ptr as u64;
+                let mut d = d_ptr as u64;
+                let mut src_off = 0i32;
+                let mut dst_off = 0i32;
+                let mut n = n_elem as i32;
+                dev.launch_compute_kernel(
+                    "grim_f32_to_f16",
+                    grid,
+                    block,
+                    &mut [
+                        arg(&mut s),
+                        arg(&mut d),
+                        arg(&mut src_off),
+                        arg(&mut dst_off),
+                        arg(&mut n),
+                    ],
+                )?;
             }
         }
         // Set the append position to the end of the seeded prefill so the first
@@ -1571,8 +1792,7 @@ impl DecodeGraph {
         // beyond cleanup: the partial graph is always discarded.
         let _ = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
         self.capturing = false;
-        crate::device::roc_device::RocmDevice::shared(self.ordinal)
-            .set_capture_gate(false, None);
+        crate::device::roc_device::RocmDevice::shared(self.ordinal).set_capture_gate(false, None);
         install_capture_fp8_pad(None);
         if !graph.is_null() {
             unsafe {
@@ -1754,15 +1974,36 @@ pub fn decode_graph_enabled() -> bool {
 /// stable-address topology for capture. Real KV/attention launches live in
 /// `kernels::qkv_attention` (`launch_kv_append`, `launch_qkv_attention_dev`).
 pub fn launch_qkv_gemv(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Result<()> {
+    launch_qkv_gemv_ring(k_arena, pos, max_ctx, KvRingPolicy::UNLIMITED)
+}
+
+/// Ring-aware [`launch_qkv_gemv`].
+///
+/// `pos` is the ABSOLUTE token index, which under the Phase-3 eviction ring may
+/// legitimately exceed `max_ctx` (the arena's capacity): the token lands at
+/// `ring.row(pos)`. Validating the raw `pos` against `max_ctx` would reject
+/// every capture taken once the ring wraps, silently forcing the eager path —
+/// exactly when eviction is supposed to be carrying the load. So bounds-check
+/// the row that will actually be written. With `UNLIMITED` this is exactly the
+/// old `pos < max_ctx` check.
+pub fn launch_qkv_gemv_ring(
+    k_arena: &RocmStorage,
+    pos: u32,
+    max_ctx: usize,
+    ring: KvRingPolicy,
+) -> Result<()> {
     let ptr = k_arena
         .device_ptr_u64()
         .ok_or_else(|| Error::Backend("launch_qkv_gemv: k_arena has no device ptr".into()))?;
     if ptr == 0 {
         return Err(Error::Backend("launch_qkv_gemv: null arena ptr".into()));
     }
-    if (pos as usize) >= max_ctx {
+    let row = ring.row(pos as usize);
+    if row >= max_ctx {
         return Err(Error::Backend(format!(
-            "launch_qkv_gemv: pos {pos} >= max_ctx {max_ctx}"
+            "launch_qkv_gemv: pos {pos} maps to arena row {row} >= max_ctx {max_ctx} \
+             (ring cap {} sinks {})",
+            ring.cap_rows, ring.sink_rows
         )));
     }
     Ok(())
@@ -1770,7 +2011,17 @@ pub fn launch_qkv_gemv(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Resul
 
 /// Validate attention replay topology (stable pointers, in-range pos).
 pub fn launch_attention(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Result<()> {
-    launch_qkv_gemv(k_arena, pos, max_ctx)
+    launch_qkv_gemv_ring(k_arena, pos, max_ctx, KvRingPolicy::UNLIMITED)
+}
+
+/// Ring-aware [`launch_attention`].
+pub fn launch_attention_ring(
+    k_arena: &RocmStorage,
+    pos: u32,
+    max_ctx: usize,
+    ring: KvRingPolicy,
+) -> Result<()> {
+    launch_qkv_gemv_ring(k_arena, pos, max_ctx, ring)
 }
 
 /// Async H2D of token embedding id into fixed input buffer (4 bytes).
@@ -1874,27 +2125,29 @@ mod tests {
     #[test]
     fn decode_graph_buffers_allocate_rejects_zero_batch() {
         // Zero-dim guard fires before any HIP alloc; no GPU needed.
-        assert!(DecodeGraphBuffers::allocate(
-            &crate::device::roc_device::RocmDevice::shared(0),
-            // num_layers, hidden, n_q, n_attn_out, n_k, n_v, inter,
-            // max_ctx, vocab, then the zero the guard is meant to catch.
-            1,
-            64,
-            64,
-            64,
-            64,
-            256,
-            8,
-            100,
-            8,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
-        )
-        .is_err());
+        assert!(
+            DecodeGraphBuffers::allocate(
+                &crate::device::roc_device::RocmDevice::shared(0),
+                // num_layers, hidden, n_q, n_attn_out, n_k, n_v, inter,
+                // max_ctx, vocab, then the zero the guard is meant to catch.
+                1,
+                64,
+                64,
+                64,
+                64,
+                256,
+                8,
+                100,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]

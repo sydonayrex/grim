@@ -1064,6 +1064,29 @@ pub trait AttentionOps {
         ))
     }
 
+    /// WS-3A K2V4: dense-arena attention over a MIXED-WIDTH packed row — 2-bit
+    /// keys (4 codes/byte) with 4-bit values (2 codes/byte), each side carrying
+    /// its own per-(row, kv_head) scale. `qkv_attention_i4` is the `4/4` case;
+    /// this exists because the two sides need different packing strides.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_i2v4(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_codes: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_codes: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_i2v4 not implemented for this backend".into(),
+        ))
+    }
+
     /// Paged (block-table) attention over a QUANTIZED KV cache.
     ///
     /// Distinct from [`Self::qkv_attention_paged`], whose kernel reads page rows
@@ -2068,6 +2091,65 @@ pub trait MemoryOps {
         Err(crate::error::Error::Unimplemented(
             "copy_slice_range not implemented for this backend".into(),
         ))
+    }
+
+    /// Gather selected rows of a 2-D (row-major) buffer into a contiguous
+    /// destination region.
+    ///
+    /// `src` and `dst` are row-major with `row_elems` elements per row. `rows`
+    /// lists the SOURCE row indices to keep, in output order; output row `i`
+    /// lands at destination row `dst_row_off + i`. This is the compaction step
+    /// of value-guided KV eviction: the survivors are chosen on the host (a
+    /// non-contiguous set) and must be laid down contiguously so the attention
+    /// kernels' contiguous-window assumption holds.
+    ///
+    /// Every index must be `< src` rows; an out-of-range index is a bug in the
+    /// selection pass and is an error, never a clamp — a clamp would silently
+    /// duplicate a row and corrupt the cache.
+    ///
+    /// The default implementation is one `copy_slice_range` per row: correct on
+    /// every backend that implements that, and used as the reference oracle for
+    /// a device kernel override (which collapses the N copies into one launch).
+    fn gather_rows_into(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_row_off: usize,
+        src: &dyn BackendStorage,
+        rows: &[u32],
+        row_elems: usize,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if row_elems == 0 {
+            return Err(crate::error::Error::Shape(
+                "gather_rows_into: row_elems must be non-zero".into(),
+            ));
+        }
+        let src_rows = src.shape().dims().first().copied().unwrap_or(0);
+        let dst_rows = dst.shape().dims().first().copied().unwrap_or(0);
+        if dst_row_off + rows.len() > dst_rows {
+            return Err(crate::error::Error::Shape(format!(
+                "gather_rows_into: {} rows at offset {dst_row_off} overflow dst ({dst_rows} rows)",
+                rows.len()
+            )));
+        }
+        for (i, &r) in rows.iter().enumerate() {
+            let r = r as usize;
+            if r >= src_rows {
+                return Err(crate::error::Error::Shape(format!(
+                    "gather_rows_into: source row {r} out of range (src has {src_rows} rows)"
+                )));
+            }
+            self.copy_slice_range(
+                dst,
+                (dst_row_off + i) * row_elems,
+                src,
+                r * row_elems,
+                row_elems,
+            )?;
+        }
+        Ok(())
     }
 }
 

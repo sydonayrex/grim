@@ -367,6 +367,16 @@ extern "C" __global__ void BIG_NAME(
         }
     }
 }
+#undef BIG_BM
+#undef BIG_BN
+#undef BIG_BK
+#undef BIG_LD
+#undef BIG_THREADS
+#undef BIG_WAVES
+#undef BIG_WN
+#undef BIG_NAME
+#undef BIG_FILL
+#undef BIG_BBLK
 "#;
 
 pub fn kernel_source(
@@ -400,7 +410,6 @@ pub fn big64_source(fill: &str) -> String {
     let (f, blk) = fmt_params(fill);
     kernel_source(&format!("grim_wmma_big_{fill}"), 64, 64, 128, f, blk)
 }
-
 
 /// The 128x64 tile (dispatched at m >= 128).
 pub fn big128_source(fill: &str) -> String {
