@@ -432,3 +432,60 @@ characteristic to watch, not a gate failure (margin 2.0 nats).
 `GRIM_PPL_GATE_ARENA=int4` on Qwen3.5-9B-Q4_K_M passes: rel_delta 0.0136 against
 the f32 arena at ctx 4096, within the `grim_quant::accuracy_gate` budget. The
 eager path is undisturbed.
+
+## Multi-GPU decode layout (2026-10-16)
+
+### The graph cannot span GPUs
+
+`dc75229d` removed the single-device guard from the Qwen35 decode graph and
+captured a layer-split model (16 layers on `rocm:0`, 16 + head on `rocm:1`)
+into ONE HIP graph, relying on `enable_peer_access`. Every arena format then
+faulted on the first replay:
+
+```
+Memory access fault by GPU node-1 ... Reason: Page not present or supervisor privilege.
+```
+
+f16 included, and f16 uses no packed KV kernel — so this was never the KV
+representation.
+
+**Root cause:** a HIP graph is recorded on ONE device's stream, and ROCm cannot
+capture a kernel launched on a DIFFERENT device into it. The launch is accepted
+during capture; the node faults on replay. Isolated reproducer (no model
+needed):
+
+```
+cargo run -p grim-backend-rocm --example p2p_graph_probe
+# one add_into on device 1 captured while device 0's stream captures
+# => Memory access fault by GPU node-1 ... Page not present
+```
+
+Peer access does NOT help: `enable_peer_access(0,1)` and `(1,0)` both succeed on
+this box (Pcie class, verified with the peer probe) and the fault still occurs.
+The failure is the capture/replay DEVICE MISMATCH, not pointer reachability.
+
+**Fix (`75cb675e`):** restore the single-device guard in
+`Qwen35::get_or_create_decode_graph`. A layer-split model uses eager, which
+moves the hidden state per block explicitly. Qwen35 is the only model that can
+be layer-split (sole caller of `plan_layer_devices`).
+
+### The split is a net LOSS for a model that fits on one card
+
+f16, 339-token prefill, 23 decode tokens, ctx 4096, same prompt, quiet box:
+
+| layout | path | ms/token |
+|---|---|---|
+| single GPU | graph | **89.02** |
+| single GPU | eager | 145.22 |
+| 2 GPUs (16+16) | eager (graph refused) | 198.42 |
+
+Splitting across two cards is **2.2x slower** than leaving the model on one card
+with the graph. `resolve_discrete_rocm_devices` hands the planner EVERY discrete
+GPU, and `plan_layer_devices` splits whenever more than one is present — so a
+9B that fits in one 17 GB card is split anyway and loses the graph. The split is
+only worth its per-token cross-device handoff (`move_to_device` = D2H + H2D +
+device drain) when the model does not fit on one device.
+
+Recommendation: split only when the weights + KV arenas do not fit in the
+largest single device's budget. Making the graph work on a split model needs ONE
+GRAPH PER DEVICE with the boundary hidden state handed off between replays.

@@ -89,7 +89,7 @@ impl TensorProvider for SynthProvider {
     }
 }
 
-fn synth_weights() -> SynthProvider {
+fn synth_weights_layers(n: usize) -> SynthProvider {
     let q_dim = HEADS * HEAD_DIM;
     let kv_dim = KV_HEADS * HEAD_DIM;
     let mut m = HashMap::new();
@@ -99,19 +99,26 @@ fn synth_weights() -> SynthProvider {
         m.insert(name.to_string(), raw_f32(seed, shape));
     };
     put(&mut m, "token_embd.weight", vec![VOCAB, HIDDEN]);
-    put(&mut m, "blk.0.attn_norm.weight", vec![HIDDEN]);
-    put(&mut m, "blk.0.attn_q.weight", vec![2 * q_dim, HIDDEN]);
-    put(&mut m, "blk.0.attn_k.weight", vec![kv_dim, HIDDEN]);
-    put(&mut m, "blk.0.attn_v.weight", vec![kv_dim, HIDDEN]);
-    put(&mut m, "blk.0.attn_output.weight", vec![HIDDEN, q_dim]);
-    put(&mut m, "blk.0.post_attention_norm.weight", vec![HIDDEN]);
-    put(&mut m, "blk.0.ffn_norm.weight", vec![HIDDEN]);
-    put(&mut m, "blk.0.ffn_gate.weight", vec![INTER, HIDDEN]);
-    put(&mut m, "blk.0.ffn_up.weight", vec![INTER, HIDDEN]);
-    put(&mut m, "blk.0.ffn_down.weight", vec![HIDDEN, INTER]);
+    for i in 0..n {
+        let p = format!("blk.{i}");
+        put(&mut m, &format!("{p}.attn_norm.weight"), vec![HIDDEN]);
+        put(&mut m, &format!("{p}.attn_q.weight"), vec![2 * q_dim, HIDDEN]);
+        put(&mut m, &format!("{p}.attn_k.weight"), vec![kv_dim, HIDDEN]);
+        put(&mut m, &format!("{p}.attn_v.weight"), vec![kv_dim, HIDDEN]);
+        put(&mut m, &format!("{p}.attn_output.weight"), vec![HIDDEN, q_dim]);
+        put(&mut m, &format!("{p}.post_attention_norm.weight"), vec![HIDDEN]);
+        put(&mut m, &format!("{p}.ffn_norm.weight"), vec![HIDDEN]);
+        put(&mut m, &format!("{p}.ffn_gate.weight"), vec![INTER, HIDDEN]);
+        put(&mut m, &format!("{p}.ffn_up.weight"), vec![INTER, HIDDEN]);
+        put(&mut m, &format!("{p}.ffn_down.weight"), vec![HIDDEN, INTER]);
+    }
     put(&mut m, "output_norm.weight", vec![HIDDEN]);
     put(&mut m, "output.weight", vec![VOCAB, HIDDEN]);
     SynthProvider { tensors: m }
+}
+
+fn synth_weights() -> SynthProvider {
+    synth_weights_layers(1)
 }
 
 /// One full-attention layer (`interval = 1`): no KDA/recurrent machinery, so
@@ -315,4 +322,57 @@ fn qwen35_packed_graph_refusal_int2v4() {
     unsafe {
         std::env::set_var("GRIM_KV_ARENA", "f32");
     }
+}
+
+/// GATE / NEGATIVE CONTROL: a layer-split model must NOT be capturable.
+///
+/// A HIP graph is recorded on ONE device's stream, and ROCm cannot capture a
+/// kernel launched on a DIFFERENT device into it — the launch is accepted during
+/// capture and the node faults on replay (`Memory access fault ... GPU node-1`).
+/// That crashed multi-GPU decode for every arena format, f16 included; the
+/// isolated reproducer is
+/// `crates/grim-backend-rocm/examples/p2p_graph_probe.rs`. This pins the
+/// refusal so cross-device capture cannot be re-enabled without a red test.
+#[test]
+fn qwen35_layer_split_model_refuses_the_graph() {
+    let Some((device, _dev)) = gpu_device() else {
+        return;
+    };
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices to build a layer-split model");
+        return;
+    }
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 2;
+    cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
+    let provider = synth_weights_layers(2);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load tiny split qwen35");
+
+    // The model must actually be split, or this gate tests nothing.
+    let ords: Vec<usize> = model
+        .blocks
+        .iter()
+        .map(|b| match b.device {
+            Device::Rocm(o) => o,
+            _ => usize::MAX,
+        })
+        .collect();
+    assert!(
+        ords.iter().any(|&o| o != ords[0]),
+        "model did not layer-split; this gate would be vacuous: {ords:?}"
+    );
+
+    let err = model
+        .get_or_create_decode_graph(16, 1)
+        .expect_err("a layer-split model must refuse the decode graph");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("single-device"),
+        "refusal must name the reason (single-device), got: {msg}"
+    );
+    eprintln!("[split-refusal] {msg}");
 }
