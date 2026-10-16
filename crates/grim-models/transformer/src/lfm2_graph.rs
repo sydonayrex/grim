@@ -266,6 +266,7 @@ impl Lfm2 {
                         k_scales_dev: None,
                         v_scales_dev: None,
                         gdl_state: state_ptr,
+                        device_ordinal: 0,
                         _anchor: std::marker::PhantomData,
                     }));
                 }
@@ -343,6 +344,7 @@ impl Lfm2 {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }

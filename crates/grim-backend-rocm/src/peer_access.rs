@@ -21,6 +21,38 @@ unsafe extern "C" {
     ) -> HipErrorT;
     fn hipDeviceEnablePeerAccess(peer_device: i32, flags: u32) -> HipErrorT;
     fn hipDeviceDisablePeerAccess(peer_device: i32) -> HipErrorT;
+    fn hipMemcpyPeerAsync(
+        dst: *mut c_void,
+        dst_device: i32,
+        src: *const c_void,
+        src_device: i32,
+        count: usize,
+        stream: *mut c_void,
+    ) -> HipErrorT;
+}
+
+/// Asynchronous Peer-to-Peer copy wrapping hipMemcpyPeerAsync directly (no RCCL feature dependency).
+pub fn p2p_memcpy_async(
+    dst: *mut c_void,
+    dst_device: i32,
+    src: *const c_void,
+    src_device: i32,
+    count: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    if dst.is_null() || src.is_null() {
+        return Err(Error::Backend("p2p_memcpy_async: null buffer".into()));
+    }
+    let res = unsafe {
+        hipMemcpyPeerAsync(dst, dst_device, src, src_device, count, stream)
+    };
+    if res == hipSuccess {
+        Ok(())
+    } else {
+        Err(Error::Backend(format!(
+            "hipMemcpyPeerAsync failed with status {res}"
+        )))
+    }
 }
 
 /// Runtime verdict for a `(src, dst)` GPU pair. `Copy + PartialEq` so

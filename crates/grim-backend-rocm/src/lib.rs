@@ -156,7 +156,7 @@ pub use crate::device::util::{
     dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch,
     prefill_in_flight, raw_set_device, set_prefill_in_flight, warp_rows_launch,
 };
-pub use crate::peer_access::enumerate_devices;
+pub use crate::peer_access::{enable_peer_access, enumerate_devices, p2p_memcpy_async};
 
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.

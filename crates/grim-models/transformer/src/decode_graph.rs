@@ -1288,6 +1288,7 @@ impl DecodeGraphModel for Llama {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -1664,6 +1665,12 @@ impl Qwen35Block {
             }
             let arena_i8 = packed_bits == Some(8);
             let arena_i4 = packed_bits == Some(4);
+            // The i4 kernels' per-row and per-head code terms are PACKED BYTES
+            // (`kv_stride/2`, `head_dim/2`), so the slot stride they receive
+            // must be the arena's BYTE extent, not the element count — passing
+            // the element stride doubles every slot's base offset and, with
+            // the now-packed arena, walks off the allocation.
+            let arena_slot_stride_packed = arena_slot_stride / 2;
             if arena_i8 {
                 let scale_slot_stride = buffers.max_ctx * nkv;
                 for (src, dst, scales, tag) in [
@@ -1711,7 +1718,7 @@ impl Qwen35Block {
                     (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], &buffers.v_scale_arena, "v"),
                 ] {
                     let sc = scales.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph kv_append_i4 {tag}: no scale sidecar for layer {layer_idx}")))?;
-                    grim_backend_rocm::launch_kv_append_i4(dev, src, &buffers.pos_dev, dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride, scale_slot_stride, buffers.kv_ring)
+                    grim_backend_rocm::launch_kv_append_i4(dev, src, &buffers.pos_dev, dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring)
                         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_i4 {tag}: {e}")))?;
                 }
             } else {
@@ -1805,7 +1812,7 @@ impl Qwen35Block {
                     nh as u32, nkv as u32, hd as u32, steps as u32, steps as u32,
                     1.0 / (hd as f32).sqrt(), 0, 0.0,
                     &buffers.attn_dummy, 0, 0, &buffers.attn_dummy, 0,
-                    batch, arena_slot_stride, scale_slot_stride, buffers.kv_ring,
+                    batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring,
                 ).map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention_dev_i4: {e}")))?;
             } else {
                 grim_backend_rocm::launch_qkv_attention_dev_batch(
@@ -2251,21 +2258,21 @@ impl DecodeGraphModel for Qwen35 {
         // and eager KV arenas live on another GPU; recording their kernels into
         // this device's graph — and seeding the graph arenas from cross-device
         // eager arenas — dereferences foreign memory. That is the `Page not
-        // present` fault at the first decode step: `seed_kv_arena_from_eager`
-        // issues `hipMemcpyAsync(dst=graph_arena_on_dev0, src=eager_arena_on_dev1)`
-        // on dev0's stream for every layer on dev1. Refuse here so the caller
-        // stays on the eager path, which moves the hidden state per block
-        // explicitly and is correct across devices.
-        let multi_device = match self.blocks.first() {
-            Some(first) => self.blocks.iter().any(|b| b.device != first.device),
-            None => false,
-        };
-        if multi_device {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph is single-device; this model is layer-split across \
-                 multiple GPUs — using eager"
-                    .into(),
-            ));
+        // Multi-device P2P: ensure bidirectional peer access is enabled between all model devices
+        let mut dev_ords: Vec<usize> = Vec::new();
+        for b in &self.blocks {
+            if let grim_tensor::Device::Rocm(ord) = b.device {
+                if !dev_ords.contains(&ord) {
+                    dev_ords.push(ord);
+                }
+            }
+        }
+        for &src_ord in &dev_ords {
+            for &dst_ord in &dev_ords {
+                if src_ord != dst_ord {
+                    let _ = grim_backend_rocm::enable_peer_access(src_ord as i32, dst_ord as i32);
+                }
+            }
         }
         let dev = dev_for_qwen35(self)?;
         let stream = dev
@@ -2327,8 +2334,17 @@ impl DecodeGraphModel for Qwen35 {
         // their branch to `KdaLayerBuffers::branch` at value_dim — so it gets
         // the true `q_dim`. See `attn_out_buf`'s doc for the two references.
         let n_attn_out = self.cfg.num_heads * self.cfg.head_dim;
-        let mut buffers = DecodeGraphBuffers::allocate(
+        let layer_devices: Vec<usize> = self
+            .blocks
+            .iter()
+            .map(|b| match b.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            })
+            .collect();
+        let mut buffers = DecodeGraphBuffers::allocate_with_layer_devices(
             &dev,
+            Some(&layer_devices),
             self.blocks.len(),
             hidden,
             n_q,
@@ -2344,6 +2360,7 @@ impl DecodeGraphModel for Qwen35 {
             0,
             sc_h_dim,
             sc_l_cache,
+            0,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
@@ -2370,13 +2387,32 @@ impl DecodeGraphModel for Qwen35 {
                 _ => None,
             };
             if kv_dt.arith != grim_tensor::ArithType::F32 {
+                // Packed formats store MULTIPLE codes per byte, so the arena's
+                // trailing dim is the PACKED row extent in bytes, not the f32
+                // element extent. The seeder asserts graph-arena last dim ==
+                // the eager arena's packed kv_stride; a full-width graph arena
+                // fails the seed loud (good) but also doubles every row a
+                // byte-extent kernel indexes (silent). int8 is 1 byte/elem
+                // (no-op); int4 packs 2 codes/byte; int2v4's allocation takes
+                // its wider side (V, 2 codes/byte) per the format's row_bytes.
+                let packed_factor: f64 = match fmt {
+                    grim_backend_rocm::KvArenaFormat::Int4
+                    | grim_backend_rocm::KvArenaFormat::Int2V4 => 0.5,
+                    _ => 1.0,
+                };
                 for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
-                    let shape = arena.shape().clone();
+                    let mut dims = arena.shape().dims().to_vec();
+                    if let Some(last) = dims.last_mut() {
+                        *last = ((*last as f64) * packed_factor) as usize;
+                    }
+                    let shape = grim_tensor::Shape::from_slice(&dims);
+                    let arena_ord = arena.device_ordinal();
+                    let arena_dev = grim_backend_rocm::RocmDevice::shared(arena_ord);
                     let narrowed = RocmStorage::alloc_gpu(
                         &shape,
                         kv_dt.clone(),
-                        &dev.allocator_handle(),
-                        dev.ordinal(),
+                        &arena_dev.allocator_handle(),
+                        arena_ord,
                     )
                     .map_err(|e| {
                         grim_core::error::Error::Backend(format!(
@@ -2384,9 +2420,7 @@ impl DecodeGraphModel for Qwen35 {
                             kv_dt.arith
                         ))
                     })?;
-                    // ZERO-FILL HYPOTHESIS TEST: clear dirty recycled memory in graph arena
-                    let dev_rocm = grim_backend_rocm::RocmDevice::shared(dev.ordinal());
-                    let _ = dev_rocm.launch_memset_u8(&narrowed, 0, narrowed.bytes());
+                    let _ = arena_dev.launch_memset_u8(&narrowed, 0, narrowed.bytes());
                     *arena = narrowed;
                 }
             }
@@ -2447,11 +2481,16 @@ impl DecodeGraphModel for Qwen35 {
                     .unwrap_or(kda_conv)
             };
             if width != n_q && width > 0 {
+                let blk_ord = match block.device {
+                    grim_tensor::Device::Rocm(ord) => ord,
+                    _ => dev.ordinal(),
+                };
+                let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
                 buffers.q_buf[layer_idx] = grim_backend_rocm::RocmStorage::alloc_gpu(
                     &Shape::new(vec![batch, width]),
                     dt.clone(),
-                    &dev.allocator_handle(),
-                    dev.ordinal(),
+                    &blk_dev.allocator_handle(),
+                    blk_ord,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("q_buf layer alloc: {e}")))?;
             }
@@ -2463,8 +2502,13 @@ impl DecodeGraphModel for Qwen35 {
             let d_state = self.cfg.ssm_d_state;
             for (layer_idx, block) in self.blocks.iter().enumerate() {
                 if !block.is_full_attention {
+                    let blk_ord = match block.device {
+                        grim_tensor::Device::Rocm(ord) => ord,
+                        _ => dev.ordinal(),
+                    };
+                    let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
                     buffers.allocate_kda_layer(
-                        &dev, layer_idx, batch, n_val, n_key, d_state, kda_conv,
+                        &blk_dev, layer_idx, batch, n_val, n_key, d_state, kda_conv,
                     )?;
                 }
             }
@@ -2503,12 +2547,24 @@ impl DecodeGraphModel for Qwen35 {
 
         // Forward all layers
         for (i, block) in self.blocks.iter().enumerate() {
-            block.forward_graph(i, &graph.buffers, &dev)?;
+            let blk_ord = match block.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
+            let _guard = grim_backend_rocm::DeviceGuard::set(blk_ord as i32);
+            block.forward_graph(i, &graph.buffers, &blk_dev)?;
         }
 
         // Final norm + output head
+        let last_ord = match self.device {
+            grim_tensor::Device::Rocm(ord) => ord,
+            _ => dev.ordinal(),
+        };
+        let last_dev = grim_backend_rocm::RocmDevice::shared(last_ord);
+        let _guard = grim_backend_rocm::DeviceGuard::set(last_ord as i32);
         let h_shape = graph.buffers.head_input.shape().clone();
-        dev.rms_norm_into(
+        last_dev.rms_norm_into(
             &graph.buffers.head_input,
             &**self.output_norm.weight.storage(),
             self.output_norm.eps,
@@ -2518,11 +2574,11 @@ impl DecodeGraphModel for Qwen35 {
         .map_err(grim_core::error::Error::Tensor)?;
 
         linear_into(
-            &dev,
+            &last_dev,
             &graph.buffers.head_input,
             self.output.weight(),
             &graph.buffers.head_output,
-            &graph.buffers.act_q81_buf[0],
+            &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
         )?;
 
         Ok(())
@@ -2665,24 +2721,29 @@ impl DecodeGraphModel for Qwen35 {
                 (None, None)
             };
 
-            out.push(Some(EagerKvSource {
-                k_dev: k_ptr,
-                v_dev: v_ptr,
-                prefill_len: valid_rows,
-                kv_stride,
-                src_elem_bytes: match k_rocm.dtype().arith {
-                    grim_tensor::ArithType::U8 => 1,
-                    grim_tensor::ArithType::F16 => 2,
-                    _ => 4,
-                },
-                k_scales_dev: ksc_ptr,
-                v_scales_dev: vsc_ptr,
-                gdl_state: None,
-                _anchor: std::marker::PhantomData,
-            }));
-        }
+                let dev_ord = match self.blocks[i].device {
+                    grim_tensor::Device::Rocm(ord) => ord as i32,
+                    _ => 0,
+                };
+                out.push(Some(EagerKvSource {
+                    k_dev: k_ptr,
+                    v_dev: v_ptr,
+                    prefill_len: valid_rows,
+                    kv_stride,
+                    src_elem_bytes: match k_rocm.dtype().arith {
+                        grim_tensor::ArithType::U8 => 1,
+                        grim_tensor::ArithType::F16 => 2,
+                        _ => 4,
+                    },
+                    k_scales_dev: ksc_ptr,
+                    v_scales_dev: vsc_ptr,
+                    gdl_state: None,
+                    device_ordinal: dev_ord,
+                    _anchor: std::marker::PhantomData,
+                }));
+            }
 
-        Ok(out)
+            Ok(out)
     }
 
     fn eager_kda_seed_sources<'a>(
@@ -4170,6 +4231,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -5681,6 +5743,7 @@ impl DecodeGraphModel for Chameleon {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -10484,6 +10547,7 @@ impl DecodeGraphModel for Xing40 {
                         k_scales_dev: None,
                         v_scales_dev: None,
                         gdl_state: None,
+                        device_ordinal: 0,
                         _anchor: std::marker::PhantomData,
                     }));
                 }
