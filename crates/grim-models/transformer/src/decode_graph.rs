@@ -1667,10 +1667,11 @@ impl Qwen35Block {
             let arena_i4 = packed_bits == Some(4);
             // The i4 kernels' per-row and per-head code terms are PACKED BYTES
             // (`kv_stride/2`, `head_dim/2`), so the slot stride they receive
-            // must be the arena's BYTE extent, not the element count — passing
-            // the element stride doubles every slot's base offset and, with
-            // the now-packed arena, walks off the allocation.
-            let arena_slot_stride_packed = arena_slot_stride / 2;
+            // must be the arena's BYTE extent. `arena_slot_stride` is ALREADY
+            // that byte extent for int4 (see the `Some(4)` arm above), so it is
+            // passed through unchanged — dividing by 2 here would halve it a
+            // second time and mis-place every non-zero batch slot.
+            let arena_slot_stride_packed = arena_slot_stride;
             if arena_i8 {
                 let scale_slot_stride = buffers.max_ctx * nkv;
                 for (src, dst, scales, tag) in [
@@ -2098,12 +2099,22 @@ impl Qwen35Block {
             .unwrap_or(0);
         let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
 
+        let dst_storage = dst_downcast(residual_dst)?;
+        let dst_dev_ord = dst_storage.device_ordinal();
+        let is_cross_dev = dst_dev_ord != dev.ordinal();
+
+        let local_dst: &Storage = if is_cross_dev {
+            &buffers.layer_output[layer_idx]
+        } else {
+            residual_dst
+        };
+
         if use_fused_down {
             dev.launch_dot4_q80_f32act_add_gemv(
                 &buffers.activated_buf[layer_idx],
                 rocm_storage(wd.weight())?,
                 Some(&buffers.layer_output[layer_idx]),
-                dst_downcast(residual_dst)?,
+                dst_downcast(local_dst)?,
                 batch.max(1),
                 wd.weight().shape().dim(0).unwrap_or(0),
                 ffn_k,
@@ -2118,14 +2129,38 @@ impl Qwen35Block {
                 act,
             )?;
 
-            // Residual 2 add: layer_output + ffn_out -> residual_dst
+            // Residual 2 add: layer_output + ffn_out -> local_dst
             add_graph(
                 &buffers.layer_output[layer_idx],
                 &buffers.norm_buf[layer_idx],
-                dst_downcast(residual_dst)?,
+                dst_downcast(local_dst)?,
                 dev,
             )?;
         }
+
+        if is_cross_dev {
+            let stream = dev.active_stream();
+            let src_storage = dst_downcast(local_dst)?;
+            let src_ptr = src_storage.device_ptr().ok_or_else(|| {
+                grim_core::error::Error::Backend("p2p residual handoff: null src ptr".into())
+            })?;
+            let dst_ptr = dst_storage.device_ptr().ok_or_else(|| {
+                grim_core::error::Error::Backend("p2p residual handoff: null dst ptr".into())
+            })?;
+            let count = src_storage.bytes();
+            grim_backend_rocm::p2p_memcpy_async(
+                dst_ptr as *mut std::ffi::c_void,
+                dst_dev_ord as i32,
+                src_ptr as *const std::ffi::c_void,
+                dev.ordinal() as i32,
+                count,
+                stream,
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("p2p residual handoff failed: {e}"))
+            })?;
+        }
+
         Ok(())
     }
 }
