@@ -2288,26 +2288,35 @@ impl DecodeGraphModel for Qwen35 {
                 "decode graph disabled by env".into(),
             ));
         }
-        // The decode graph is recorded on ONE device (`dev_for_qwen35` = the
-        // model's nominal device). A layer-split model has blocks whose weights
-        // and eager KV arenas live on another GPU; recording their kernels into
-        // this device's graph — and seeding the graph arenas from cross-device
-        // eager arenas — dereferences foreign memory. That is the `Page not
-        // Multi-device P2P: ensure bidirectional peer access is enabled between all model devices
-        let mut dev_ords: Vec<usize> = Vec::new();
-        for b in &self.blocks {
-            if let grim_tensor::Device::Rocm(ord) = b.device {
-                if !dev_ords.contains(&ord) {
-                    dev_ords.push(ord);
-                }
-            }
-        }
-        for &src_ord in &dev_ords {
-            for &dst_ord in &dev_ords {
-                if src_ord != dst_ord {
-                    let _ = grim_backend_rocm::enable_peer_access(src_ord as i32, dst_ord as i32);
-                }
-            }
+        // SINGLE-DEVICE ONLY. A HIP graph is recorded on ONE device's stream,
+        // and ROCm cannot capture a kernel launched on a DIFFERENT device into
+        // it: the launch is accepted during capture but the node faults on
+        // replay. That is the `Page not present` on the first decode step of a
+        // layer-split model, and it is reproducible in ~30 lines — see
+        // `crates/grim-backend-rocm/examples/p2p_graph_probe.rs` (one `add_into`
+        // on device 1 captured while device 0's stream captures → fault on
+        // GPU node-1). Peer access does NOT help: `enable_peer_access` succeeds
+        // both ways on this box (Pcie class) and the fault still occurs, because
+        // the failure is the capture/replay device mismatch, not pointer
+        // reachability. Enabling P2P and hoping is what produced a crash for
+        // every arena format (f16 included, which uses no packed KV kernel).
+        //
+        // Refuse here so the caller stays on the eager path, which moves the
+        // hidden state per block explicitly and IS correct across devices. On a
+        // two-GPU split eager is also FASTER than a single-GPU graph (two cards
+        // share the weight GEMV), so this costs no throughput. Making the graph
+        // work on a split model needs ONE GRAPH PER DEVICE with the boundary
+        // hidden state handed off between replays — a feature, not a flag.
+        let multi_device = match self.blocks.first() {
+            Some(first) => self.blocks.iter().any(|b| b.device != first.device),
+            None => false,
+        };
+        if multi_device {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph is single-device and this model is layer-split across multiple \
+                 GPUs (ROCm cannot capture cross-device kernels) — using eager"
+                    .into(),
+            ));
         }
         let dev = dev_for_qwen35(self)?;
         let stream = dev
