@@ -377,3 +377,58 @@ keeps KQuant/FloatPack bytes packed and device-resident on ROCm, and
 `Linear::forward` dispatches them through `quantized_matmul`. The Qwen failure
 is specific to the layer-split/Q4 scalar-kernel path, not a general LFM upload
 regression.
+
+## int4 KV graph kernel pair (2026-10-15)
+
+The int4 dense KV arena is now served by a capturable kernel pair
+(`grim_kv_append_i4` + `grim_qkv_attention_dev_i4`), so int4 runs the decode
+GRAPH instead of falling back to eager. Before this, int4 reached capture and
+silently ran the int8 kernels (the live hazard the format-derived
+`KvArenaFormat::graph_kernel_pair()` predicate now closes).
+
+### Decode throughput — int4 vs int8 vs f16 (T4.1)
+
+Command (release build, single GPU so the shared multi-GPU P2P path is not in
+the measurement; 339-token prefill, 47 decode tokens, ctx 4096):
+
+```
+HIP_VISIBLE_DEVICES=0 GRIM_CONTEXT=4096 GRIM_KV_ARENA=<arm> \
+  target/release/grim-cli run models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf "<wikitext prompt>" \
+  --max-tokens 48 --raw
+```
+
+| arena | KV arena | ms/token | tokens/sec |
+|---|---|---|---|
+| f16  | 134 MB | 81.72 | 12 |
+| int8 |  68 MB | 80.25 | 12 |
+| int4 |  35 MB | 80.70 | 12 |
+
+**Finding: int4 is NOT faster than int8 (or f16) at decode here.** All three
+arms land within ~2%, so batch-1 decode at this scale is not KV-read-bound —
+the per-step weight GEMV dominates and the KV bytes are a small fraction of the
+traffic. int4's justification is KV MEMORY (35 MB vs 68 MB vs 134 MB, a 2x/4x
+reduction that buys context length), not decode speed. Reported rather than
+shipped as a speed win.
+
+### Long-context retrieval (T4.2)
+
+`crates/grim-cli/tests/kv_int4_retrieval.rs` plants a unique passphrase at 10%,
+50% and 90% depth of a ~1200-token haystack and compares the LOGPROB of the
+correct answer token under f16 and int4 (a single-bit answer difference is a
+coin flip at 4 bits, so the logprob margin is the signal).
+
+| depth | f16 logp | int4 logp | delta | int4 rank of correct token |
+|---|---|---|---|---|
+| 0.10 | -0.446 | -0.429 | +0.016 | 0 (argmax) |
+| 0.50 | -0.565 | -0.630 | -0.066 | 0 (argmax) |
+| 0.90 | -0.791 | -1.335 | -0.543 | 0 (argmax) |
+
+int4 retains every needle (correct token is the argmax at all depths). The
+logprob penalty grows with depth (up to 0.54 nats at 90%), which is a known
+characteristic to watch, not a gate failure (margin 2.0 nats).
+
+### PPL gate (T4.3)
+
+`GRIM_PPL_GATE_ARENA=int4` on Qwen3.5-9B-Q4_K_M passes: rel_delta 0.0136 against
+the f32 arena at ctx 4096, within the `grim_quant::accuracy_gate` budget. The
+eager path is undisturbed.

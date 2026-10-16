@@ -968,7 +968,7 @@ impl DecodeGraphBuffers {
     /// the same for every packed width: int8, int4 and int2v4 each store one
     /// scale per (row, kv head) per side. MUST run outside capture. Idempotent:
     /// a second call is a no-op.
-    pub fn allocate_packed_kv_scales(&mut self, dev: &RocmDevice, num_kv_heads: usize) -> Result<()> {
+    pub fn allocate_packed_kv_scales(&mut self, _dev: &RocmDevice, num_kv_heads: usize) -> Result<()> {
         if !self.k_scale_arena.is_empty() {
             return Ok(());
         }
@@ -979,15 +979,17 @@ impl DecodeGraphBuffers {
         }
         let rows = self.batch.max(1) * self.max_ctx;
         let shape = Shape::new(vec![rows, num_kv_heads]);
-        for _ in 0..self.k_arena.len() {
+        for (i, arena) in self.k_arena.iter().enumerate() {
+            let ord = self.layer_devices.get(i).copied().unwrap_or(arena.device_ordinal());
+            let l_dev = RocmDevice::shared(ord);
             self.k_scale_arena.push(RocmStorage::alloc_gpu(
                 &shape,
                 DType {
                     arith: ArithType::F32,
                     storage: DTypeStorage::Native,
                 },
-                &dev.allocator,
-                dev.ordinal,
+                &l_dev.allocator,
+                l_dev.ordinal,
             )?);
             self.v_scale_arena.push(RocmStorage::alloc_gpu(
                 &shape,
@@ -995,8 +997,8 @@ impl DecodeGraphBuffers {
                     arith: ArithType::F32,
                     storage: DTypeStorage::Native,
                 },
-                &dev.allocator,
-                dev.ordinal,
+                &l_dev.allocator,
+                l_dev.ordinal,
             )?);
         }
         Ok(())
@@ -1420,6 +1422,8 @@ impl DecodeGraphBuffers {
                                  missing or too small ({scale_n} scales needed)"
                             ))
                         })?;
+                    let src_ord = src.device_ordinal;
+                    let dst_ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal) as i32;
                     for (dst, bytes, what) in [
                         (d_ptr as *mut c_void, n_bytes, format!("codes {tag}")),
                         (
@@ -1428,23 +1432,36 @@ impl DecodeGraphBuffers {
                             format!("scales {tag}"),
                         ),
                     ] {
-                        let res: crate::HipErrorT = unsafe {
-                            crate::hipMemcpyAsync(
+                        let src_p = if what.starts_with("codes") {
+                            s_ptr
+                        } else {
+                            sc as *const c_void
+                        };
+                        if src_ord != dst_ord {
+                            crate::peer_access::p2p_memcpy_async(
                                 dst,
-                                if what.starts_with("codes") {
-                                    s_ptr
-                                } else {
-                                    sc as *const c_void
-                                },
+                                dst_ord,
+                                src_p,
+                                src_ord,
                                 bytes,
-                                HipMemcpyKind::DeviceToDevice,
                                 stream,
                             )
-                        };
-                        if res != crate::hipSuccess {
-                            return Err(Error::Backend(format!(
-                                "seed_kv_arena: memcpy {what} failed: {res}"
-                            )));
+                            .map_err(|e| Error::Backend(format!("seed_kv_arena: P2P copy {what} failed: {e}")))?;
+                        } else {
+                            let res: crate::HipErrorT = unsafe {
+                                crate::hipMemcpyAsync(
+                                    dst,
+                                    src_p,
+                                    bytes,
+                                    HipMemcpyKind::DeviceToDevice,
+                                    stream,
+                                )
+                            };
+                            if res != crate::hipSuccess {
+                                return Err(Error::Backend(format!(
+                                    "seed_kv_arena: memcpy {what} failed: {res}"
+                                )));
+                            }
                         }
                     }
                 }

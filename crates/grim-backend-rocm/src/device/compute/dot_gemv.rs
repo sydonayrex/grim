@@ -56,14 +56,13 @@ impl RocmDevice {
         // stream waits on it before its own launch. Correct under eager AND
         // capture (the wait becomes a DAG edge), on every arch, and removes
         // the host-side stall entirely.
-        let ev = self.q81_quant_event();
+        let ev = if self.active_capture_stream().is_some() {
+            std::ptr::null_mut()
+        } else {
+            self.q81_quant_event()
+        };
         if !ev.is_null() {
-            // `launch_compute_kernel` restores the caller's context on the way
-            // out, so the thread is back on whatever it was parked on here.
-            // `hipEventRecord` acts on the CURRENT device, and both the event
-            // and the stream belong to `self`.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            // SAFETY: ev created via hipEventCreate; handle is a live stream.
             unsafe { crate::hipEventRecord(ev, handle) };
         }
         Ok(handle)
@@ -101,13 +100,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // P1-1: wait for the quantize producer's event (no-op once complete).
-        let ev = self.q81_quant_event();
+        let ev = if self.active_capture_stream().is_some() {
+            std::ptr::null_mut()
+        } else {
+            self.q81_quant_event()
+        };
         if !ev.is_null() {
-            // The wait orders `self`'s stream against `self`'s event, so it must
-            // run with this device current — see the note in q81_quant_event.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            // SAFETY: ev is a live event; active_stream is the device's stream.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
         if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
@@ -227,11 +226,13 @@ impl RocmDevice {
                 "dot4_q80_q81_add_gemv: K must be 32-aligned (k={k})"
             )));
         }
-        let ev = self.q81_quant_event();
+        let ev = if self.active_capture_stream().is_some() {
+            std::ptr::null_mut()
+        } else {
+            self.q81_quant_event()
+        };
         if !ev.is_null() {
-            // See the note in q81_quant_event: both operands belong to `self`.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            // SAFETY: ev is a live event; the active stream is graph-capture safe.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
         let a_ptr = act_q81.device_ptr.ok_or_else(|| {

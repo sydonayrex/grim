@@ -1273,7 +1273,7 @@ impl RocmDevice {
         &self.gpu_target
     }
 
-    pub(crate) fn active_stream(&self) -> *mut c_void {
+    pub fn active_stream(&self) -> *mut c_void {
         let stream = if self.capture_active.load(Ordering::SeqCst) {
             self.capture_stream
                 .read()

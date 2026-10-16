@@ -2588,16 +2588,25 @@ impl DecodeGraphModel for Qwen35 {
             };
             let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
             let _guard = grim_backend_rocm::DeviceGuard::set(blk_ord as i32);
+            if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+                eprintln!("[graph-trace] layer {i}/{} on rocm:{blk_ord} (capturing={})", self.blocks.len(), graph.capturing);
+            }
             block.forward_graph(i, &graph.buffers, &blk_dev)?;
         }
 
-        // Final norm + output head
-        let last_ord = match self.device {
-            grim_tensor::Device::Rocm(ord) => ord,
-            _ => dev.ordinal(),
+        // Final norm + output head on output device
+        let last_ord = match self.output.weight().device() {
+            grim_tensor::Device::Rocm(ord) => *ord,
+            _ => match self.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            },
         };
         let last_dev = grim_backend_rocm::RocmDevice::shared(last_ord);
         let _guard = grim_backend_rocm::DeviceGuard::set(last_ord as i32);
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] final norm + head on rocm:{last_ord} (capturing={})", graph.capturing);
+        }
         let h_shape = graph.buffers.head_input.shape().clone();
         last_dev.rms_norm_into(
             &graph.buffers.head_input,
@@ -2615,6 +2624,18 @@ impl DecodeGraphModel for Qwen35 {
             &graph.buffers.head_output,
             &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
         )?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!(
+                "[graph-trace] head finished (capturing={}): head_in={:#x} (dev={}), head_out={:#x} (dev={}), act_q81={:#x} (dev={})",
+                graph.capturing,
+                graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                graph.buffers.head_input.device_ordinal(),
+                graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                graph.buffers.head_output.device_ordinal(),
+                graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)].device_ptr_u64().unwrap_or(0),
+                graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)].device_ordinal(),
+            );
+        }
 
         Ok(())
     }
@@ -2636,9 +2657,25 @@ impl DecodeGraphModel for Qwen35 {
             .buffers
             .write_pos_async(&dev, pos, graph.stream)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] executing graph.replay() pos={pos}");
+        }
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] graph.replay() returned ok; syncing devices");
+        }
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] devices synchronized");
+        }
         Ok(())
     }
 

@@ -627,9 +627,10 @@ fn try_graph_decode_step(
         // coincidence — a future split of graph/sampler streams would
         // silently race. On miss (kernel not yet pre-resolved), sync the
         // graph stream once and take the ambient path (one-time cost).
-        if let Device::Rocm(ordinal) = device {
-            let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
-            let stream = g.stream;
+        if let Device::Rocm(_) = device {
+            let logits_ord = g.logits_device_storage().device_ordinal();
+            let dev = grim_backend_rocm::RocmDevice::shared(logits_ord);
+            let stream = dev.active_stream();
             let gate = sampling_params;
             match grim_backend_rocm::sample_logits_on_device_with_penalty_at_stream(
                 &dev,
@@ -658,8 +659,9 @@ fn try_graph_decode_step(
                 }
             }
         }
+        let logits_device = Device::Rocm(g.logits_device_storage().device_ordinal());
         if let Ok(tok) = sample_storage_on_rocm(
-            device,
+            &logits_device,
             g.logits_device_storage(),
             sampling_params,
             seed,
