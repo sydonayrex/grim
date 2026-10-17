@@ -476,6 +476,14 @@ impl RocmDevice {
         if m >= tiled_m_min && k % 256 == 0 {
             return self.launch_fused_dequant_gemm_iq1s_tiled(a, b, out, m, n, k);
         }
+        // MEASURED NEGATIVE — a bit-identical vec4 variant (float4 activation
+        // loads, same accumulation order) was tried and REMOVED: 52.0 vs 27.9 ms
+        // at m=110 (1.9x SLOWER) and slower at m=1 too, because the eight grid
+        // byte extractions cost more than the load issue they saved. Recorded
+        // here so it is not re-tried blind. The remaining levers are structural
+        // (matrix cores with a vectorized dequant, or a q8_1-act integer dot),
+        // both of which change the accumulation order and need a tolerance/PPL
+        // gate rather than the 0.0 parity this kernel holds.
         self.launch_fused_deq_gemm_simple(
             "grim_fused_dequant_gemm_iq1s_grouped",
             a,
