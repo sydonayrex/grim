@@ -512,3 +512,27 @@ graph defect. To make the graph capturable at all, the graph decode dispatch
 gained: IQ2S embedding gather + IQ1S/IQ1M/IQ2S/IQ2XS/IQ2XXS/IQ3XXS fused-dequant
 arms in `linear_decode_into` (outer or-pattern + inner match; the aliased
 IQ1S-on-Q2S layout was the historic 27B page fault and must never return).
+
+## D2-2: group-hoisted IQ fused-dequant GEMMs (2026-10-17)
+
+The scalar fused-dequant GEMM called the per-weight dequant for every (output,
+weight) pair — block header, scale/index math and grid-table load EVERY weight.
+rocprofv3 on the shape-exact probe: grid 17408x256, no LDS, ~5 ms for 17.4 MB =
+~1% of card peak, i.e. ALU/latency bound. Within an 8-weight group all of it is
+constant, so the grouped kernels hoist it to the group.
+
+Swift-1.5-Qwen3.8-27B GSQ-RCO, layer split (29/35), `GRIM_CONTEXT=4096
+GRIM_KV_ARENA=int8`, prompt "Paris, and the", 32 tokens, both cards:
+
+| stage | ms/token | GEMV GB/s |
+|---|---|---|
+| eager (pre-Phase-A baseline) | 14688.6 | 0.7 |
+| per-device graph, scalar IQ kernels | 4395.7 | 2.4 |
+| + IQ1S/IQ3XXS/IQ3S/IQ2S/IQ2XS/IQ2XXS grouped | 626.3 | 16.7 |
+| + IQ4_XS/IQ1_M grouped (all eight) | **606.3** | 17.2 |
+
+**24.2x vs the eager baseline**; the IQ1_S probe alone went 4.07 -> 113.1 GB/s
+(27.8x). All eight formats are BIT-IDENTICAL to their retained scalar oracles
+(worst abs 0.000e0 at n=256/k=5120) — same values, same ascending accumulation
+order, so no PPL revalidation is needed for the format change. Regression: qwen
+6/6, lfm2 11/11, backend lib 594/594.
