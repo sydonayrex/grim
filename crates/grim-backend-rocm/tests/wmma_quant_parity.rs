@@ -661,10 +661,30 @@ fn q8_1_pack(a: &[f32]) -> (Vec<u8>, Vec<f32>) {
 /// Reports every scheme rather than stopping at the first failure, so a single
 /// execution gives the whole picture.
 ///
+/// After the IQ2_XXS / IQ2_XS / IQ4_XS fixes, on real checkpoint bytes at
+/// m=1 n=256 k=512, gfx1200:
+///
+///   ok  IQ1_S      4 tensors   2.2e-7
+///   ok  IQ2_XXS   30 tensors   1.5e-7   (was 1.0e+0 — entirely wrong values)
+///   ok  IQ2_XS    32 tensors   2.5e-7   (was 1.0e+0 — entirely wrong values)
+///   ok  IQ2_S     72 tensors   1.3e-7
+///   ok  IQ3_XXS   83 tensors   2.3e-7
+///   ok  IQ3_S     97 tensors   2.2e-7
+///   ok  IQ4_XS    33 tensors   2.4e-7   (was 8/256 non-finite, max_diff 1.3e8)
+///   ??  Q2_K      28 tensors   7.5e-3   UNINVESTIGATED
+///   ??  Q4_K      19 tensors   2.2e-1   UNINVESTIGATED
+///   ??  Q6_K       8 tensors   1.0e-1   UNINVESTIGATED
+///
+/// The whole IQ family is now clean at fp32 epsilon. The Q*_K trio is a
+/// separate open question: they ride the dot4/q81 legs and may be a reference
+/// or accumulation convention rather than a kernel defect. That has NOT been
+/// established in either direction, which is why they are labelled `??` rather
+/// than FAIL. Left #[ignore]d for the same reason.
+///
 ///   cargo test -p grim-backend-rocm --test wmma_quant_parity \
 ///     kquant_scheme_sweep -- --ignored --nocapture --test-threads=1
 #[test]
-#[ignore = "diagnostic sweep: names every failing scheme; not yet all green"]
+#[ignore = "IQ family clean; Q2_K/Q4_K/Q6_K still uninvestigated (see doc comment)"]
 fn kquant_scheme_sweep() {
     use grim_format::gguf::GgufDType;
     let Some(dev) = gpu_device() else {
@@ -685,9 +705,13 @@ fn kquant_scheme_sweep() {
         ("IQ2_S", GgufDType::IQ2_S, KQuantScheme::IQ2S, 82, false),
         ("IQ3_XXS", GgufDType::IQ3_XXS, KQuantScheme::IQ3XXS, 98, false),
         ("IQ3_S", GgufDType::IQ3_S, KQuantScheme::IQ3S, 110, false),
-        // No f32-act leg exists for IQ4_XS: it falls through to the
-        // `act_q81` dot4 catch-all, so it needs the Q8_1 reference below.
-        ("IQ4_XS", GgufDType::IQ4_XS, KQuantScheme::IQ4XS, 136, true),
+        // IQ4_XS used to be the `uses_q81 = true` case here (no f32-act leg, so
+        // it fell to the dot4 catch-all and returned non-finite). It now has its
+        // own fused-dequant leg, which reads A as raw f32 and ignores the
+        // act_q81 scratch — so the reference must use raw `a_host` too. Leaving
+        // this `true` charges the kernel for Q8_1 quantization it does not
+        // perform, which showed up as a stubborn ~7.9e-3.
+        ("IQ4_XS", GgufDType::IQ4_XS, KQuantScheme::IQ4XS, 136, false),
         ("Q2_K", GgufDType::Q2K, KQuantScheme::Q2K, 84, true),
         ("Q4_K", GgufDType::Q4K, KQuantScheme::Q4K, 144, true),
         ("Q6_K", GgufDType::Q6K, KQuantScheme::Q6K, 210, true),

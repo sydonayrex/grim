@@ -1550,30 +1550,69 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
 
     // block_q2_XXS: 66 bytes per 256 weights.
     // Layout: d(f16,2) + qs(32) + signs(32) = 66.
+    // block_iq2_xxs: **66** bytes per 256 weights (ggml-common.h; matches
+    // grim-format's gguf.rs type-id-16 byte size and wmma_routing's row).
+    //   d(f16,2) @0 | qs[64] @2
+    //
+    // There is no separate signs field: the whole 64-byte qs is eight 8-byte
+    // groups, each an `aux8[0..4]` of grid indices plus an `aux32_1` whose top
+    // 4 bits carry the scale and whose low 28 bits carry four 7-bit sign
+    // patterns. The previous version invented a grid as
+    // `(grid_idx + in_sb%8) % 4 - 1.5f`, read signs one bit per weight out of a
+    // `blk + 34` field that does not exist in this layout, and ignored the
+    // per-32 sub-scale entirely — so all 30 IQ2_XXS tensors in the 27B decoded
+    // to finite, entirely wrong weights (~1.0 relative error), which is what
+    // left the model finite but incoherent after IQ3_XXS was fixed.
+    //
+    // Now mirrors `grim_quant::dequant_iq2xxs` and charon.rs's iq2xxs arm.
     __device__ inline float dequant_iq2xxs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 34;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * val * sign_val;
+        int ib32 = in_sb / 32;              // 0..7
+        int l = (in_sb % 32) / 8;           // 0..3
+        int j = in_sb % 8;                   // 0..7
+        const unsigned char* aux8 = qs + 8 * ib32;
+        unsigned int aux32 = (unsigned int)aux8[4]
+                           | ((unsigned int)aux8[5] << 8)
+                           | ((unsigned int)aux8[6] << 16)
+                           | ((unsigned int)aux8[7] << 24);
+        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.25f;
+        unsigned long long gv = IQ2XXS_GRID[aux8[l]];
+        unsigned int signs = KSIGNS_IQ2XS[(aux32 >> (7 * l)) & 127];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
-    // block_q2_XS: 74 bytes per 256 weights.
-    // Layout: d(f16,2) + qs(32) + scales(8) + signs(32) = 74.
+    // block_iq2_xs: **74** bytes per 256 weights (ggml-common.h; matches
+    // grim-format's gguf.rs type-id-17 byte size).
+    //   d(f16,2) @0 | qs[64] @2 | scales[8] @66
+    //
+    // qs is 32 little-endian uint16_t, each `grid_idx = q & 511` plus a 7-bit
+    // sign-pattern index in `q >> 9`. scales is ONE BYTE PER 32 WEIGHTS (not
+    // the old `*0.125 + 0.5` per-16 sub-scale, and not at offset 34): the low
+    // nibble scales l 0/1, the high nibble l 2/3, as `d * (0.5 + nib) * 0.25`.
+    // The old body also read a `signs` field at blk+42 that this layout does
+    // not have and invented the same `(idx + i%8) % 4 - 1.5` grid as IQ2_XXS,
+    // so all 32 IQ2_XS tensors decoded to finite, entirely wrong weights.
+    //
+    // Now mirrors `grim_quant::dequant_iq2xs` and charon.rs's iq2xs arm.
     __device__ inline float dequant_iq2xs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 34;
-        const unsigned char* signs = blk + 42;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        const unsigned char* scales = blk + 66;
+        int ib32 = in_sb / 32;              // 0..7
+        int l = (in_sb % 32) / 8;           // 0..3
+        int j = in_sb % 8;                   // 0..7
+        unsigned char sc_byte = scales[ib32];
+        float db = d * (0.5f + (float)((l < 2) ? (sc_byte & 0x0F) : (sc_byte >> 4))) * 0.25f;
+        int q_off = (ib32 * 4 + l) * 2;
+        unsigned int q_val = (unsigned int)qs[q_off] | ((unsigned int)qs[q_off + 1] << 8);
+        unsigned long long gv = IQ2XS_GRID[q_val & 511];
+        unsigned int signs = KSIGNS_IQ2XS[q_val >> 9];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
 // block_q2_S: 82 bytes per 256 weights.
@@ -1929,18 +1968,18 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
             const unsigned char* blk = row_b_ptr + sb_idx * 66;
             const int k0 = sb_idx * 256;
-            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-            const unsigned char* qs = blk + 2;
-            const unsigned char* signs = blk + 34;
+            // The per-block loop and the hoisted `a_row`/`blk` are what this
+            // kernel exists for; the DECODE delegates to the helper, which is
+            // the single source of truth. This body used to inline its own copy
+            // with a fabricated `(grid_idx + j) % 4 - 1.5f` grid and a
+            // `blk + 34` signs field the IQ2_XXS layout does not have — which
+            // is why fixing `dequant_iq2xxs` alone changed nothing here: this
+            // is the leg `launch_fused_dequant_gemm_iq2xxs` actually launches.
             for (int g = 0; g < 32; ++g) {
-                const int grid_idx = qs[g];
-                const unsigned char sg = signs[g];
                 const int base = k0 + g * 8;
                 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const float val = (float)((grid_idx + j) % 4) - 1.5f;
-                    const float sign_val = (sg >> j) & 1 ? -1.0f : 1.0f;
-                    acc += a_row[base + j] * (d * val * sign_val);
+                    acc += a_row[base + j] * dequant_iq2xxs(blk, g * 8 + j);
                 }
             }
         }
@@ -2019,26 +2058,15 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
             const unsigned char* blk = row_b_ptr + sb_idx * 74;
             const int k0 = sb_idx * 256;
-            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-            const unsigned char* qs = blk + 2;
-            const unsigned char* scales = blk + 34;
-            const unsigned char* signs = blk + 42;
-            for (int sb16 = 0; sb16 < 16; ++sb16) {
-                const float sc =
-                    ((float)((scales[sb16 / 2] >> ((sb16 % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-                const float scale = d * sc;
+            // Same story as the IQ2_XXS grouped leg above: the inlined decode
+            // was a stub (fabricated grid, per-16 `*0.125+0.5` sub-scale at the
+            // wrong offset 34, and a `blk + 42` signs field this layout lacks),
+            // so `dequant_iq2xs` is now the only decode in the file.
+            for (int g = 0; g < 32; ++g) {
+                const int base = k0 + g * 8;
                 #pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int g = sb16 * 2 + half;
-                    const int grid_idx = qs[g];
-                    const unsigned char sg = signs[g];
-                    const int base = k0 + g * 8;
-                    #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const float val = (float)((grid_idx + j) % 4) - 1.5f;
-                        const float sign_val = (sg >> j) & 1 ? -1.0f : 1.0f;
-                        acc += a_row[base + j] * (scale * val * sign_val);
-                    }
+                for (int j = 0; j < 8; ++j) {
+                    acc += a_row[base + j] * dequant_iq2xs(blk, g * 8 + j);
                 }
             }
         }

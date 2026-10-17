@@ -2966,6 +2966,19 @@ impl RocmDevice {
                     KQuantScheme::IQ3XXS => {
                         self.launch_fused_dequant_gemm_iq3xxs(a_s, w, out, m, n, k)?
                     }
+                    // IQ4_XS must never reach the Q3_K catch-all below, for
+                    // exactly the reason IQ3_S is called out above — the
+                    // aliased layouts walk different offsets and read past the
+                    // block. IQ4_XS is 136 B/256 and its fused-dequant helper
+                    // (`dequant_iq4xs`, 6-bit scales_h/scales_l + the
+                    // kvalues_iq4nl codebook) was already correct; only the
+                    // dispatch was missing, so the 27B's 33 IQ4_XS tensors —
+                    // including `output.weight`, the LM head — were being
+                    // decoded by the Q3_K kernel and came back non-finite
+                    // (measured: 8/256 outputs non-finite, max_diff 1.3e8).
+                    KQuantScheme::IQ4XS => {
+                        self.launch_fused_dequant_gemm_iq4xs(a_s, w, out, m, n, k)?
+                    }
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
