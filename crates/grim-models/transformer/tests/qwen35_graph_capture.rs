@@ -376,3 +376,81 @@ fn qwen35_layer_split_model_refuses_the_graph() {
     );
     eprintln!("[split-refusal] {msg}");
 }
+
+/// A0 BASELINE (external review 2026-10-16, item 1). The captured pos scalar is
+/// bumped by EVERY attention layer (decode_graph.rs:1849, per-layer, no reset),
+/// so a step with TWO OR MORE attention layers makes layer 2 read pos + steps.
+/// Every existing graph gate here uses num_layers = 1 / interval = 1 — exactly
+/// one attention layer per step — so this has never been observed. Single
+/// device, f32 arena, hybrid 4-layer model, NO seed: pure graph-vs-eager.
+/// If this goes red, the single-device graph has latent pos drift and A5b's
+/// per-device replica design inherits the same defect.
+#[test]
+fn qwen35_graph_matches_eager_with_two_attention_layers_per_step() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f32") };
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2; // attention layers 1 and 3: two bumps per step
+    let provider = synth_weights_layers(4);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load 4-layer hybrid");
+
+    let is_attn = |i: usize| (i + 1) % 2 == 0;
+    let n_attn: usize = (0..4).filter(|&i| is_attn(i)).count();
+    assert_eq!(n_attn, 2, "gate model must hold exactly two attention layers");
+
+    // Eager reference.
+    let mut session = model.new_session();
+    let mut eager_logits = Vec::new();
+    for (step, tok) in TOKENS.iter().enumerate() {
+        let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
+        let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
+        let out = CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
+            .expect("eager forward")
+            .to_vec_f32()
+            .expect("eager readback");
+        eager_logits.push(out);
+    }
+
+    // Graph side: warmup, capture, replay — no seed, both sides from empty arena.
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("graph pool alloc");
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured);
+
+    let mut graph_logits = Vec::new();
+    for tok in TOKENS {
+        model
+            .forward_replay(&mut graph, tok)
+            .expect("graph replay");
+        graph_logits.push(graph.read_logits_f32().expect("graph logit readback"));
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+
+    for (step, (a, b)) in eager_logits.iter().zip(graph_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!(
+            "[a0-two-attn-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})"
+        );
+        assert!(
+            e <= 1e-1,
+            "A0 step {step}: graph replay diverges from eager with two attention \
+             layers per step: worst {e:.3e} at {at} (eager {}, graph {})",
+            a[at],
+            b[at]
+        );
+    }
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f32") };
+}
