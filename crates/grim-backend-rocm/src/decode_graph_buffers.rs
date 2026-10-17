@@ -162,6 +162,16 @@ pub struct DecodeGraphBuffers {
     /// Single-u32 device buffer holding KV position. Updated before each
     /// replay via one 4-byte async H2D (spec §Scalar second approach).
     pub pos_dev: RocmStorage,
+    /// A5b: one pos replica per FOREIGN device in the placement (empty for a
+    /// single-device model — `pos_dev_for` falls back to `pos_dev`). Each
+    /// replica is zeroed at alloc like `pos_dev`.
+    pub pos_replicas: Vec<RocmStorage>,
+    /// Device ordinal for each entry in `pos_replicas`.
+    pub pos_replica_ords: Vec<usize>,
+    /// A5b: read-only attn_dummy replica per foreign device (empty = fallback
+    /// to `attn_dummy`).
+    pub attn_dummy_replicas: Vec<RocmStorage>,
+    pub attn_dummy_replica_ords: Vec<usize>,
     /// M2 (PLAN-kernel-fusion): MoE routing + output staging. Empty vecs when
     /// the model has no MoE layers. Routing triple is shared across layers —
     /// each layer writes then consumes it in stream order within its bracket.
@@ -757,6 +767,53 @@ impl DecodeGraphBuffers {
             &dev.allocator,
             dev.ordinal,
         )?;
+        // A5b: one zeroed pos replica + attn_dummy replica per FOREIGN device
+        // in the placement, so no graph kernel reads another device's memory.
+        // Single-device placements produce empty vecs (fallback to the
+        // originals — byte-identical behavior).
+        let mut pos_replicas = Vec::new();
+        let mut pos_replica_ords = Vec::new();
+        let mut attn_dummy_replicas = Vec::new();
+        let mut attn_dummy_replica_ords = Vec::new();
+        if let Some(ds) = layer_devices {
+            for &ord in ds.iter().collect::<std::collections::BTreeSet<_>>() {
+                if ord == dev.ordinal {
+                    continue;
+                }
+                let r_dev = crate::RocmDevice::shared(ord);
+                let pr = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch]),
+                    dt.clone(),
+                    &r_dev.allocator,
+                    r_dev.ordinal,
+                )?;
+                {
+                    let _g = crate::device::util::DeviceGuard::set(r_dev.ordinal as i32);
+                    let p = pr
+                        .device_ptr
+                        .ok_or_else(|| Error::Backend("pos replica has no device ptr".into()))?;
+                    let res: crate::HipErrorT = unsafe {
+                        crate::device::handles::hipMemset(
+                            p as *mut std::ffi::c_void,
+                            0,
+                            batch.max(1) * std::mem::size_of::<f32>(),
+                        )
+                    };
+                    if res != crate::hipSuccess {
+                        return Err(Error::Backend(format!("zero pos replica: {res}")));
+                    }
+                }
+                pos_replicas.push(pr);
+                pos_replica_ords.push(r_dev.ordinal);
+                attn_dummy_replicas.push(RocmStorage::alloc_gpu(
+                    &Shape::new(vec![1]),
+                    dt.clone(),
+                    &r_dev.allocator,
+                    r_dev.ordinal,
+                )?);
+                attn_dummy_replica_ords.push(r_dev.ordinal);
+            }
+        }
         let push_all = |dev: &RocmDevice,
                         dt: &DType,
                         moe_gate_logits: &mut Vec<RocmStorage>,
@@ -924,6 +981,10 @@ impl DecodeGraphBuffers {
             head_output,
             current_pos: 0,
             pos_dev,
+            pos_replicas,
+            pos_replica_ords,
+            attn_dummy_replicas,
+            attn_dummy_replica_ords,
             token_ids_dev,
             attn_dummy,
             act_q81_buf,
@@ -1963,8 +2024,9 @@ impl DecodeGraphBuffers {
         stream: *mut c_void,
     ) -> Result<()> {
         let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        // A5b: the replica of THIS device (== pos_dev itself on the primary).
         let dst = self
-            .pos_dev
+            .pos_dev_for(dev.ordinal)
             .device_ptr_u64()
             .ok_or_else(|| Error::Backend("pos_dev has no device ptr".into()))?
             as *mut c_void;
@@ -1992,6 +2054,40 @@ impl DecodeGraphBuffers {
             return Err(Error::Backend(format!(
                 "write_pos_async hipMemcpyAsync failed: {res}"
             )));
+        }
+        Ok(())
+    }
+
+    /// A5b: the pos scalar of device `ord` — the original `pos_dev` on the
+    /// allocating device, the matching replica elsewhere.
+    pub fn pos_dev_for(&self, ord: usize) -> &RocmStorage {
+        self.pos_replica_ords
+            .iter()
+            .position(|&o| o == ord)
+            .map(|i| &self.pos_replicas[i])
+            .unwrap_or(&self.pos_dev)
+    }
+
+    /// A5b: the attn_dummy of device `ord` (read-only dummy).
+    pub fn attn_dummy_for(&self, ord: usize) -> &RocmStorage {
+        self.attn_dummy_replica_ords
+            .iter()
+            .position(|&o| o == ord)
+            .map(|i| &self.attn_dummy_replicas[i])
+            .unwrap_or(&self.attn_dummy)
+    }
+
+    /// A5b: write `pos` into EVERY device's pos scalar, each on its own
+    /// device's stream, so every segment's replay starts at the same value
+    /// (the A0-green pre-write design). Must run OUTSIDE any capture bracket.
+    pub fn write_pos_all_segments(&mut self, pos: u32) -> Result<()> {
+        let primary = self.pos_dev.device_ordinal();
+        let mut ords: Vec<usize> = vec![primary];
+        ords.extend(self.pos_replica_ords.iter().copied());
+        for ord in ords {
+            let dev = crate::RocmDevice::shared(ord);
+            let stream = dev.active_stream();
+            self.write_pos_async(&dev, pos, stream)?;
         }
         Ok(())
     }

@@ -454,7 +454,7 @@ impl LlamaBlock {
         let q3 = Shape::new(vec![batch, nh * steps, hd]);
         dev.rope_dev_base_into(
             &buffers.q_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             &buffers.q_buf[layer_idx],
             &rope_cfg,
             &q3,
@@ -466,7 +466,7 @@ impl LlamaBlock {
         let k3 = Shape::new(vec![batch, nkv * steps, hd]);
         dev.rope_dev_base_into(
             &buffers.k_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             &buffers.k_buf[layer_idx],
             &rope_cfg,
             &k3,
@@ -502,7 +502,7 @@ impl LlamaBlock {
             dev,
             &buffers.k_arena[layer_idx],
             &buffers.k_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             kv_stride,
             steps,
             batch,
@@ -515,7 +515,7 @@ impl LlamaBlock {
             dev,
             &buffers.v_arena[layer_idx],
             &buffers.v_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             kv_stride,
             steps,
             batch,
@@ -533,7 +533,7 @@ impl LlamaBlock {
             &buffers.attn_out_buf[layer_idx],
             &buffers.attn_max_buf[layer_idx],
             &buffers.attn_sum_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             nh as u32,
             nkv as u32,
             hd as u32,
@@ -542,10 +542,10 @@ impl LlamaBlock {
             1.0 / (hd as f32).sqrt(),
             0,
             0.0,
-            &buffers.attn_dummy,
+            buffers.attn_dummy_for(dev.ordinal()),
             0,
             0,
-            &buffers.attn_dummy,
+            buffers.attn_dummy_for(dev.ordinal()),
             0,
             batch,
             arena_slot_stride,
@@ -554,7 +554,7 @@ impl LlamaBlock {
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
         // Bump pos_dev
-        grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
+        grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
             .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
         // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
@@ -1178,9 +1178,12 @@ impl DecodeGraphModel for Llama {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -1597,7 +1600,7 @@ impl Qwen35Block {
             let q3 = Shape::new(vec![batch, nh * steps, hd]);
             dev.rope_dev_base_into(
                 &buffers.q_head_buf[layer_idx],
-                &buffers.pos_dev,
+                buffers.pos_dev_for(dev.ordinal()),
                 &buffers.q_head_buf[layer_idx],
                 &rope_cfg,
                 &q3,
@@ -1609,7 +1612,7 @@ impl Qwen35Block {
             let k3 = Shape::new(vec![batch, nkv * steps, hd]);
             dev.rope_dev_base_into(
                 &buffers.k_buf[layer_idx],
-                &buffers.pos_dev,
+                buffers.pos_dev_for(dev.ordinal()),
                 &buffers.k_buf[layer_idx],
                 &rope_cfg,
                 &k3,
@@ -1696,7 +1699,7 @@ impl Qwen35Block {
                     grim_backend_rocm::launch_kv_append_i8(
                         dev,
                         src,
-                        &buffers.pos_dev,
+                        buffers.pos_dev_for(dev.ordinal()),
                         dst,
                         sc,
                         kv_stride,
@@ -1719,7 +1722,7 @@ impl Qwen35Block {
                     (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], &buffers.v_scale_arena, "v"),
                 ] {
                     let sc = scales.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph kv_append_i4 {tag}: no scale sidecar for layer {layer_idx}")))?;
-                    grim_backend_rocm::launch_kv_append_i4(dev, src, &buffers.pos_dev, dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring)
+                    grim_backend_rocm::launch_kv_append_i4(dev, src, buffers.pos_dev_for(dev.ordinal()), dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring)
                         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_i4 {tag}: {e}")))?;
                 }
             } else {
@@ -1727,7 +1730,7 @@ impl Qwen35Block {
                     dev,
                     &buffers.k_arena[layer_idx],
                     &buffers.k_buf[layer_idx],
-                    &buffers.pos_dev,
+                    buffers.pos_dev_for(dev.ordinal()),
                     kv_stride,
                     steps,
                     batch,
@@ -1740,7 +1743,7 @@ impl Qwen35Block {
                     dev,
                     &buffers.v_arena[layer_idx],
                     &buffers.v_buf[layer_idx],
-                    &buffers.pos_dev,
+                    buffers.pos_dev_for(dev.ordinal()),
                     kv_stride,
                     steps,
                     batch,
@@ -1773,7 +1776,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    &buffers.pos_dev,
+                    buffers.pos_dev_for(dev.ordinal()),
                     nh as u32,
                     nkv as u32,
                     hd as u32,
@@ -1782,10 +1785,10 @@ impl Qwen35Block {
                     1.0 / (hd as f32).sqrt(),
                     0,
                     0.0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     batch,
                     arena_slot_stride,
@@ -1809,10 +1812,10 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    &buffers.pos_dev,
+                    buffers.pos_dev_for(dev.ordinal()),
                     nh as u32, nkv as u32, hd as u32, steps as u32, steps as u32,
                     1.0 / (hd as f32).sqrt(), 0, 0.0,
-                    &buffers.attn_dummy, 0, 0, &buffers.attn_dummy, 0,
+                    buffers.attn_dummy_for(dev.ordinal()), 0, 0, buffers.attn_dummy_for(dev.ordinal()), 0,
                     batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring,
                 ).map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention_dev_i4: {e}")))?;
             } else {
@@ -1824,7 +1827,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    &buffers.pos_dev,
+                    buffers.pos_dev_for(dev.ordinal()),
                     nh as u32,
                     nkv as u32,
                     hd as u32,
@@ -1833,10 +1836,10 @@ impl Qwen35Block {
                     1.0 / (hd as f32).sqrt(),
                     0,
                     0.0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     batch,
                     arena_slot_stride,
@@ -1846,7 +1849,7 @@ impl Qwen35Block {
             }
 
             // Bump pos_dev
-            grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
+            grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
             // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
@@ -2662,9 +2665,12 @@ impl DecodeGraphModel for Qwen35 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
             eprintln!("[graph-trace] executing graph.replay() pos={pos}");
@@ -3317,9 +3323,12 @@ impl DecodeGraphModel for Gemma2 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -4210,9 +4219,12 @@ impl DecodeGraphModel for MiniMaxM3 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -4718,9 +4730,12 @@ impl DecodeGraphModel for Glm4MoeLite {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -5140,9 +5155,12 @@ impl DecodeGraphModel for GraniteMoeHybrid {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -5579,9 +5597,12 @@ impl DecodeGraphModel for HyV3 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -5721,9 +5742,12 @@ impl DecodeGraphModel for Chameleon {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -6123,9 +6147,12 @@ impl DecodeGraphModel for DeepSeek4 {
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
         let pos = graph.buffers.current_pos;
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -6415,9 +6442,12 @@ impl DecodeGraphModel for DeepSeek2 {
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
         let pos = graph.buffers.current_pos;
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -6724,9 +6754,12 @@ impl DecodeGraphModel for DeepSeek32 {
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
         let pos = graph.buffers.current_pos;
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -9704,9 +9737,12 @@ impl DecodeGraphModel for Xing40 {
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
             eprintln!("[xing-graph] GRAPHFEED pos {pos} token {token_id}");
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
