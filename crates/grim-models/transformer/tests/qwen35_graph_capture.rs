@@ -624,3 +624,97 @@ fn qwen35_split_model_seed_families_run_on_their_own_devices() {
         .seed_kda_state_from_eager(&seed_dev, &kda)
         .expect("seed kda (split placement)");
 }
+
+/// D1 GATE: the decode graph must SERVE `GRIM_KV_EVICT_MODE=curdkv` instead of
+/// refusing. Today the refusal fires because the host compaction pass rewrites
+/// `current_pos`; the device-side replacement keeps `total_dev` on-device.
+/// Fixture: 4-layer hybrid (interval 2), f32 arena, cap 8 rows (sinks 2,
+/// residual 2), 12 tokens so the run crosses the eviction boundary twice.
+/// Both arms run under the SAME env; the eager arm exercises the host
+/// compaction, the graph arm the device-side one — replay must track eager.
+#[test]
+fn qwen35_graph_serves_curdvk_eviction_like_eager() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+        std::env::set_var("GRIM_KV_ARENA_ROWS", "8");
+        std::env::set_var("GRIM_KV_SINKS", "2");
+        std::env::set_var("GRIM_KV_RESIDUAL", "2");
+        std::env::set_var("GRIM_KV_EVICT_MODE", "curdkv");
+    }
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
+    let provider = synth_weights_hybrid(4, 2);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load curdkv model");
+
+    // 12 tokens: cap 8 with sinks 2 / residual 2 means the boundary is crossed
+    // at pos 9 (compaction) and again later — the gate needs both arms to
+    // survive at least two compactions.
+    let tokens: Vec<u32> = (0..12).map(|i| (3 + 7 * i) % VOCAB as u32).collect();
+
+    // Eager arm: host compaction at the boundary.
+    let mut session = model.new_session();
+    let mut eager = Vec::new();
+    for (step, tok) in tokens.iter().enumerate() {
+        let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
+        let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
+        eager.push(
+            CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
+                .expect("eager curdkv forward")
+                .to_vec_f32()
+                .expect("eager readback"),
+        );
+    }
+
+    // Graph arm: warmup 2, capture 1, replay the rest. The FIRST capture must
+    // succeed — that is the red part of this gate while the refusal stands.
+    let mut graph = match model.get_or_create_decode_graph(16, 1) {
+        Ok(g) => g,
+        Err(e) => panic!(
+            "D1: the graph must not refuse CurDKV eviction anymore: {e}"
+        ),
+    };
+    let _ = model.forward_capture(&mut graph, tokens[0]);
+    let _ = model.forward_capture(&mut graph, tokens[1]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, tokens[2])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured, "curdkv capture must succeed");
+
+    let mut got = Vec::new();
+    for (step, tok) in tokens.iter().enumerate().skip(2) {
+        model
+            .forward_replay(&mut graph, *tok)
+            .unwrap_or_else(|e| panic!("D1 replay step {step}: {e}"));
+        got.push(graph.read_logits_f32().expect("graph logit readback"));
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+
+    for (gi, (a, b)) in eager.iter().skip(2).zip(got.iter()).enumerate() {
+        let step = gi + 2;
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[d1-curdvk-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 1e-1,
+            "D1 curdkv step {step}: graph diverges from eager host compaction: \\
+             worst {e:.3e} at {at} (eager {}, graph {})",
+            a[at],
+            b[at]
+        );
+    }
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+        std::env::remove_var("GRIM_KV_ARENA_ROWS");
+        std::env::remove_var("GRIM_KV_SINKS");
+        std::env::remove_var("GRIM_KV_RESIDUAL");
+        std::env::remove_var("GRIM_KV_EVICT_MODE");
+    }
+}
