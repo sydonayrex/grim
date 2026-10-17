@@ -536,3 +536,20 @@ GRIM_KV_ARENA=int8`, prompt "Paris, and the", 32 tokens, both cards:
 (worst abs 0.000e0 at n=256/k=5120) — same values, same ascending accumulation
 order, so no PPL revalidation is needed for the format change. Regression: qwen
 6/6, lfm2 11/11, backend lib 594/594.
+
+## Single-device fit: do not split what fits (2026-10-17)
+
+`assign_by_headroom` splits proportionally to headroom by design and never asks
+whether one device suffices. At ctx 4096 / int8 KV both target models fit the
+primary card, so the split was pure loss — a cross-device hop per forward:
+
+| model | split (2 seg) | single device | delta |
+|---|---|---|---|
+| Qwen3.5-9B-Q4_K_M | 117.63 ms/token | **83.23** | -29% |
+| 27B GSQ-RCO IQ3_XXS | 606.3 | **430.2** | -29% |
+
+Fit is checked against the PRIMARY device's remaining budget after its KV arena
+share (9B 4.26/14.03 GB; 27B 9.05/9.63 GB). `GRIM_FORCE_SPLIT=1` opts out so the
+multi-GPU path stays testable — the split gates set it. The split remains the
+fallback for models that do not fit; its per-device graph path is green
+(parity 2.4e-5) and 3.34x over eager when it is used.
