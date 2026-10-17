@@ -10611,9 +10611,16 @@ pub fn dequant_iq1s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     for i in 0..nb {
         let base = i * 50;
         let d = f16_to_f32(data[base], data[base + 1]);
+        // block_iq1_s is 50 B = fp16 d(2) + qs[QK_K/8](32) + qh[QK_K/32](16)
+        // (ggml-common.h:429). `qh` is a SEPARATE field that follows `qs`; it
+        // is not a tail of it. Slicing only the 32 qs bytes and then reading
+        // `qs[32 + ib*2]` indexed one past the end and panicked on every block
+        // ("the len is 32 but the index is 32"), so IQ1_S could not be decoded
+        // on the host at all.
         let qs = &data[base + 2..base + 34];
+        let qh_bytes = &data[base + 34..base + 50];
         for ib in 0..8 {
-            let qh = u16::from_le_bytes([qs[32 + ib * 2], qs[32 + ib * 2 + 1]]);
+            let qh = u16::from_le_bytes([qh_bytes[ib * 2], qh_bytes[ib * 2 + 1]]);
             let dl = d * (2.0 * (((qh >> 12) & 7) as f32) + 1.0);
             let delta = if qh & 0x8000 != 0 {
                 -IQ1S_DELTA
