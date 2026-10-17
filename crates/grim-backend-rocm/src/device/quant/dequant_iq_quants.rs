@@ -449,11 +449,33 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // D2-2: the GROUP-HOISTED kernel (grid-index math + IQ1S_GRID load
-        // hoisted out of each 8-weight group). Bit-identical to the scalar
-        // kernel — same values, same ascending accumulation order — and
-        // measured much faster; the scalar entry stays reachable for the
-        // parity gate via `..._iq1s_scalar`.
+        // Prompt tiling when it can pay (see the tiled launcher), else the
+        // GROUP-HOISTED kernel (D2-2: grid-index math + IQ1S_GRID load hoisted
+        // out of each 8-weight group). Both are bit-identical to the scalar
+        // kernel — same values, same ascending accumulation order — which stays
+        // reachable for the parity gates via `..._iq1s_scalar`.
+        // PROMPT TILING IS MEASURED-NEUTRAL — DEFAULT OFF.
+        //
+        // `grim_fused_dequant_gemm_iq1s_tiled` stages a dequantized weight tile
+        // in LDS and reuses it across TILE_M=16 prompt rows, cutting weight
+        // traffic and dequant work 16x. Measured at the production shape
+        // (n=17408, k=5120), grouped vs tiled: **m=110 21.7 vs 21.7 ms, m=339
+        // 58.5 vs 60.0 ms** — i.e. 0.97-1.00x, no win. The reason: the kernel
+        // is COMPUTE-bound (scalar dequant + FMA at ~500 GFLOP/s), not
+        // weight-traffic-bound, and tiling does not reduce the FLOP count. The
+        // linear growth of prompt cost with m is simply m*n*k FLOPs, not the
+        // re-read. The tiled kernel and its bit-exact parity gate are kept as
+        // the record of that measurement (and as a base for real vectorization,
+        // which must change the accumulation order and therefore needs a
+        // tolerance/PPL gate, not the 0.0 parity this one holds).
+        // `GRIM_IQ_TILED_M_MIN=<m>` opts in for experiments.
+        let tiled_m_min: usize = std::env::var("GRIM_IQ_TILED_M_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        if m >= tiled_m_min && k % 256 == 0 {
+            return self.launch_fused_dequant_gemm_iq1s_tiled(a, b, out, m, n, k);
+        }
         self.launch_fused_deq_gemm_simple(
             "grim_fused_dequant_gemm_iq1s_grouped",
             a,
@@ -463,6 +485,56 @@ impl RocmDevice {
             n,
             k,
             1,
+        )
+    }
+
+    /// Prompt-tiled IQ1_S GEMM: TILE_M prompt rows share one LDS-staged
+    /// dequantized weight tile, so weight traffic and dequant work drop by
+    /// TILE_M. Grid (ceil(N/16), ceil(M/16)), block 256 (8 waves of 32).
+    ///
+    /// Only used when it can pay: `m >= TILE_M` (a partial tile wastes
+    /// (TILE_M - m) rows of work) and `k % 256 == 0` (super-block layout).
+    pub(crate) fn launch_fused_dequant_gemm_iq1s_tiled(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 16;
+        const TILE_N: usize = 16;
+        let mut aptr = a
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("iq1s_tiled: a has no ptr".into()))?;
+        let mut bptr = b
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("iq1s_tiled: b has no ptr".into()))?;
+        let mut optr = out
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("iq1s_tiled: out has no ptr".into()))?;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let grid = crate::HipDim3::new(
+            n.div_ceil(TILE_N) as u32,
+            m.div_ceil(TILE_M) as u32,
+            1,
+        );
+        let block = crate::HipDim3::new((TILE_M * TILE_N) as u32, 1, 1);
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_iq1s_tiled",
+            grid,
+            block,
+            &mut [
+                crate::arg(&mut aptr),
+                crate::arg(&mut bptr),
+                crate::arg(&mut optr),
+                crate::arg(&mut mm),
+                crate::arg(&mut nn),
+                crate::arg(&mut kk),
+            ],
         )
     }
 
@@ -910,6 +982,91 @@ mod iq1s_grouped_parity {
                 g[worst_i]
             );
         }
+        }
+    }
+
+    /// D3-B gate: the PROMPT-TILED IQ1_S kernel (LDS-staged dequant reused
+    /// across TILE_M rows) must be bit-identical to the grouped kernel at
+    /// prompt shapes, including a PARTIAL final tile (m=40 with TILE_M=16) and
+    /// a non-multiple n (the store guard).
+    #[test]
+    fn tiled_iq1s_gemm_matches_the_grouped_kernel_at_prompt_shapes() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] device 0 unavailable");
+            return;
+        };
+        let dt = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ1S),
+        };
+        // (m, n, k): full tiles, a partial tile row block (40 = 2x16 + 8), a
+        // non-multiple n, and the production k.
+        for (m, n, k) in [
+            (16usize, 64usize, 512usize),
+            (40, 48, 512),
+            (16, 256, 5120),
+            (33, 80, 1024),
+        ] {
+            let bytes = packed_iq1s(n, k);
+            let w_box = dev
+                .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), dt.clone())
+                .expect("packed weight");
+            let w = w_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            let act: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.01)
+                .collect();
+            let a_box = dev
+                .from_cpu(&act, &Shape::new(vec![m, k]), DType::F32)
+                .expect("act");
+            let a = a_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            let out_g_box = dev
+                .zeros(&Shape::new(vec![m, n]), DType::F32)
+                .expect("out alloc");
+            let out_t_box = dev
+                .zeros(&Shape::new(vec![m, n]), DType::F32)
+                .expect("out alloc");
+            let out_g = out_g_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            let out_t = out_t_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            dev.launch_fused_dequant_gemm_iq1s_scalar(&a, &w, &out_g, m, n, k)
+                .expect("grouped launch");
+            dev.launch_fused_dequant_gemm_iq1s_tiled(&a, &w, &out_t, m, n, k)
+                .expect("tiled launch");
+            dev.synchronize();
+            let g = out_g.to_cpu_vec_f32().expect("grouped readback");
+            let t = out_t.to_cpu_vec_f32().expect("tiled readback");
+            let mut worst = 0.0f32;
+            let mut at = 0usize;
+            for (i, (x, y)) in g.iter().zip(t.iter()).enumerate() {
+                let d = (x - y).abs();
+                if d > worst {
+                    worst = d;
+                    at = i;
+                }
+            }
+            eprintln!("[iq1s-tiled-parity] m={m} n={n} k={k}: worst abs {worst:.3e} at {at}");
+            assert!(
+                worst <= 1e-6,
+                "tiled IQ1_S GEMM diverges from the grouped kernel at m={m} n={n} k={k}: \
+                 worst {worst:.3e} at {at} (grouped {}, tiled {})",
+                g[at],
+                t[at]
+            );
         }
     }
 }

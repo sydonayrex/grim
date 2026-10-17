@@ -33,6 +33,14 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(17408);
     let k = 5120usize;
+    // Optional m (arg 4): the prompt case. Compares the grouped kernel against
+    // the prompt-tiled one at the same shape (both are exported through
+    // `quantized_matmul`'s routing, so the tiled one is what a real prompt uses
+    // when m >= 16).
+    let m: usize = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let dev = RocmDevice::try_new(ordinal).expect("try_new");
 
     const BLK_ELEMS: usize = 256;
@@ -60,11 +68,11 @@ fn main() {
         .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), packed_dt)
         .expect("upload packed weights");
 
-    let act: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let act: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
     let a = dev
-        .from_cpu(&act, &Shape::new(vec![1, k]), DType::F32)
+        .from_cpu(&act, &Shape::new(vec![m, k]), DType::F32)
         .expect("upload act");
-    let out_shape = Shape::new(vec![1, n]);
+    let out_shape = Shape::new(vec![m, n]);
 
     // Warmup (JIT + residency).
     for _ in 0..2 {
@@ -101,9 +109,31 @@ fn main() {
          ({:.1} MB weight bytes)",
         weight_bytes as f64 / 1e6
     );
+    if m >= 16 {
+        // Same shape through the PROMPT-TILED kernel, via the public routing.
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let (_o, _h) = dev
+                .quantized_matmul(
+                    a.as_ref(),
+                    w.as_ref(),
+                    &[],
+                    grim_tensor::QuantFormat::Iq1S,
+                    &out_shape,
+                )
+                .expect("tiled gemv");
+        }
+        dev.synchronize();
+        let tiled_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!(
+            "[iq1s-gemv] m={m}: grouped {ms:.3} ms vs tiled {tiled_ms:.3} ms              ({:.2}x, {:.2} GB/s effective)",
+            ms / tiled_ms,
+            (n * row_bytes) as f64 / (tiled_ms / 1000.0) / 1e9 * m as f64 / m as f64
+        );
+    }
     println!(
-        "[iq1s-gemv] 64 layers x 1 such weight per token => {:.0} ms/token if this is the \
-         whole cost (27B graph arm measured 4395 ms/token)",
+        "[iq1s-gemv] m={m}: {:.0} ms/weight; 64 such weights => {:.0} ms per prompt row-batch",
+        ms,
         ms * 64.0
     );
 }

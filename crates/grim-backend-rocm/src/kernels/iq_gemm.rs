@@ -2521,6 +2521,70 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // PROMPT TILING (D3-B follow-up): the grouped kernel has no reuse across
+    // prompt rows — every output element re-reads (and re-dequantizes) its
+    // weight row, so prompt processing is LINEAR in prompt length at ~63
+    // ms/token while one pass over the weight set would be ~30 ms for the WHOLE
+    // prompt. This kernel stages a dequantized weight tile in LDS once per
+    // 256-weight super-block and reuses it across TILE_M prompt rows: weight
+    // traffic and dequant work drop by TILE_M.
+    //
+    // Layout: grid (ceil(N/TILE_N), ceil(M/TILE_M)), block TILE_M*TILE_N = 256
+    // threads (8 waves of 32 — RDNA wave32 discipline). Thread t owns exactly
+    // one output (row = t/TILE_N, col = t%TILE_N).
+    //
+    // Bit-identical to the grouped/scalar kernels: identical dequant values and
+    // the same ascending accumulation order (sb, then kk = k ascending), so the
+    // parity gate can demand worst abs 0.0.
+    #define GRIM_IQ1S_TILE_M 16
+    #define GRIM_IQ1S_TILE_N 16
+    __global__ void grim_fused_dequant_gemm_iq1s_tiled(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq1s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        __shared__ float ws[GRIM_IQ1S_TILE_N][256];
+        const int TILE_M = GRIM_IQ1S_TILE_M;
+        const int TILE_N = GRIM_IQ1S_TILE_N;
+        const int m0 = blockIdx.y * TILE_M;
+        const int n0 = blockIdx.x * TILE_N;
+        const int tid = threadIdx.x;
+        const int row = tid / TILE_N;
+        const int col = tid % TILE_N;
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 50;
+        const int gm = m0 + row;
+        const bool row_live = gm < M;
+        float acc = 0.0f;
+        for (int sb = 0; sb < blocks_per_row; ++sb) {
+            // Cooperative dequant of TILE_N columns x 256 weights into LDS.
+            for (int i = tid; i < TILE_N * 256; i += TILE_M * TILE_N) {
+                const int c = i >> 8;
+                const int kk = i & 255;
+                const int gn = n0 + c;
+                if (gn < N) {
+                    ws[c][kk] = dequant_iq1s(B_iq1s + gn * row_bytes + sb * 50, kk);
+                } else {
+                    ws[c][kk] = 0.0f;
+                }
+            }
+            __syncthreads();
+            if (row_live) {
+                const float* a_row = A + (unsigned long long)gm * K + sb * 256;
+                #pragma unroll 8
+                for (int kk = 0; kk < 256; ++kk) {
+                    acc += a_row[kk] * ws[col][kk];
+                }
+            }
+            __syncthreads();
+        }
+        const int gn = n0 + col;
+        if (row_live && gn < N) {
+            C[(unsigned long long)gm * N + gn] = acc;
+        }
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq1s(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq1s,
