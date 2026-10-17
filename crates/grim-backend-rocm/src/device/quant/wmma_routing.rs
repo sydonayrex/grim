@@ -63,7 +63,22 @@ impl RocmDevice {
             std::env::var("GRIM_WMMA").as_deref(),
             Ok("0") | Ok("false") | Ok("off")
         );
-        if allow_wmma && is_rdna34 && m <= 4 && !wmma_off {
+        // Small-M threshold, env-tunable, default 0 = never prefer WMMA.
+        //
+        // It used to be hardcoded `m <= 4`, which routed exactly the SHORT
+        // PROMPT through WMMA — the case it is worst at. Measured on the 27B
+        // (4-token prompt, single device): the WMMA fused-dequant kernels cost
+        // 19.6 s of the run's 21.6 s of kernel time at ~40 ms PER TENSOR
+        // (~2.5 GFLOP/s), while the group-hoisted scalar kernels run the same
+        // shapes at ~0.5 ms. The scalar path is also the one with the bit-exact
+        // parity gate (the WMMA IQ3_S kernel measured rel 0.76 on real
+        // Xing4.0 weights), so preferring it at small m is both faster and
+        // safer. `GRIM_WMMA_M_MAX=<n>` restores a WMMA preference for m <= n.
+        let wmma_m_max: usize = std::env::var("GRIM_WMMA_M_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if allow_wmma && is_rdna34 && m <= wmma_m_max && !wmma_off {
             wmma_method(self, a, b, out, m, n, k)?;
         } else {
             scalar_method(self, a, b, out, m, n, k)?;
