@@ -2009,7 +2009,18 @@ impl Qwen35 {
             blocks.push(Qwen35Block::load_tp(&layer_ws, &cfg, i, tp)?);
         }
 
-        let last_device = available_devices.last().unwrap_or(&device).clone();
+        // The head must live where the LAST LAYER lives, not on the last
+        // VISIBLE device: the two coincide only while the placement's tail
+        // lands on the last ordinal. When the planner puts every layer on one
+        // device (single-device fit) and the head stayed on the other, its
+        // kernels launched on device 1 while the capture ran on device 0 —
+        // the cross-device capture fault, reproduced as `Memory access fault by
+        // GPU node-1` on the 9B. A6's gate asserts this invariant for the graph;
+        // this makes the loader honour it.
+        let last_device = layer_devices
+            .last()
+            .cloned()
+            .unwrap_or_else(|| available_devices.last().unwrap_or(&device).clone());
         let output_norm = RmsNorm::load(
             &ws.with_device(last_device.clone()).pp("output_norm"),
             cfg.hidden_size,
@@ -5508,6 +5519,22 @@ fn plan_layer_devices(
         } else {
             vec![Default::default(); devices.len()]
         };
+    // Single-device preference FIRST: a model that fits one card must not be
+    // split (see `single_device_fit` for the measurement).
+    if let Some(best) = single_device_fit(&layer_bytes, &remaining) {
+        eprintln!(
+            "[qwen35] single-device fit: rocm:{} holds all {} layers ({:.2} GB of {:.2} GB \
+             budget) — not splitting (a split would add a cross-device hop per forward)",
+            match devices[best] {
+                Device::Rocm(o) => o,
+                _ => usize::MAX,
+            },
+            num_layers,
+            layer_bytes.iter().sum::<u64>() as f64 / 1e9,
+            remaining[best] as f64 / 1e9,
+        );
+        return vec![devices[best].clone(); num_layers];
+    }
     let (targets, unplaced) = assign_by_headroom(&layer_bytes, &mut remaining, &caps);
     for t in targets {
         assignment.push(devices[t].clone());
@@ -5562,6 +5589,45 @@ fn plan_layer_devices(
 /// Returns the chosen device index per layer plus the count of layers that did
 /// not fit anywhere (those are placed on device 0 and will fall back to managed
 /// memory). Pure function so placement can be unit-tested without a GPU.
+/// Single-device preference: if ONE device's remaining budget (after its KV
+/// arena share is reserved) can hold every layer, that device should take the
+/// whole model.
+///
+/// `assign_by_headroom` splits proportionally to headroom by design, so a model
+/// that fits one card is split anyway and pays a cross-device hop per forward
+/// for no memory benefit. Measured on the 9B at ctx 4096 / int8 KV, same
+/// prompt, 32 tokens: **single segment 83.23 ms/token vs the 2-segment split
+/// 117.63** — the split cost 34.4 ms/token (+41%) with nothing gained. (The
+/// 27B does not fit and is unaffected.)
+///
+/// Returns the device index to use, or `None` when the model genuinely needs
+/// more than one device.
+///
+/// **Only device 0 (the model's primary) is eligible.** The rest of the model
+/// — embedding table, output head, `pos_dev`, the graph's non-layer buffers —
+/// is placed on the primary, and the capture gate is raised there; moving every
+/// LAYER to another device while those stay put is exactly the cross-device
+/// capture that faults (`Memory access fault by GPU node-1`, reproduced when
+/// this helper first preferred the roomier card). A single-device layout is only
+/// safe when it is the primary's.
+fn single_device_fit(layer_bytes: &[u64], remaining: &[u64]) -> Option<usize> {
+    // `GRIM_FORCE_SPLIT=1` opts out: the split path must stay exercisable (and
+    // tested) even when a model fits one card, and the multi-GPU gates need a
+    // guaranteed 2-segment layout.
+    if matches!(
+        std::env::var("GRIM_FORCE_SPLIT").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        return None;
+    }
+    let total: u64 = layer_bytes.iter().sum();
+    if remaining.first().copied().unwrap_or(0) >= total {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn assign_by_headroom(
     layer_bytes: &[u64],
     remaining: &mut [u64],

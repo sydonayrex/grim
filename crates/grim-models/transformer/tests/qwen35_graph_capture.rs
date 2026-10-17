@@ -402,10 +402,14 @@ fn qwen35_layer_split_model_replays_like_eager() {
     let mut cfg = tiny_cfg();
     cfg.num_layers = 4;
     cfg.full_attention_interval = 2;
+    // The planner prefers ONE device when the model fits it, and this tiny model
+    // fits anywhere — force the split so this gate tests the split path.
+    unsafe { std::env::set_var("GRIM_FORCE_SPLIT", "1") };
     cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
     let provider = synth_weights_hybrid(4, 2);
     let ws = WeightSource::root(&provider, device.clone());
     let model = Qwen35::load(device.clone(), &ws, cfg).expect("load split hybrid qwen35");
+    unsafe { std::env::remove_var("GRIM_FORCE_SPLIT") };
 
     let ords: Vec<usize> = model
         .blocks
@@ -587,10 +591,14 @@ fn qwen35_split_model_seed_families_run_on_their_own_devices() {
     let mut cfg = tiny_cfg();
     cfg.num_layers = 4;
     cfg.full_attention_interval = 2;
+    // The planner prefers ONE device when the model fits it, and this tiny model
+    // fits anywhere — force the split so this gate tests the split path.
+    unsafe { std::env::set_var("GRIM_FORCE_SPLIT", "1") };
     cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
     let provider = synth_weights_hybrid(4, 2);
     let ws = WeightSource::root(&provider, device.clone());
     let model = Qwen35::load(device.clone(), &ws, cfg).expect("load split hybrid");
+    unsafe { std::env::remove_var("GRIM_FORCE_SPLIT") };
 
     // Eager prefill to produce seed sources.
     let mut session = model.new_session();
