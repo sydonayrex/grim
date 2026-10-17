@@ -172,7 +172,7 @@ impl RocmDevice {
 
     /// Dequantize IQ3_XXS packed bytes via the ROCm kernel. 96 bytes / 256-elem super-block.
     pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 96, 256, "grim_dequant_iq3xxs")
+        self.dequantize_iq_host(bytes, elem_count, 98, 256, "grim_dequant_iq3xxs")
     }
 
     /// Dequantize IQ3_S packed bytes via the ROCm kernel. 110 bytes / 256-elem super-block.

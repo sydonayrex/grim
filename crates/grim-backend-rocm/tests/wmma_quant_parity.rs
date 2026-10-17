@@ -227,21 +227,19 @@ fn wmma_quant_decode_parity() {
 /// `wmma_quant_decode_parity`) and is not the 27B's decode entry.
 ///
 /// Set `GRIM_DOT_GEMV=0` to force the WMMA branch and reach
-/// `launch_wmma_fused_dequant_iq3xxs` instead; both arms should be finite.
+/// `launch_wmma_fused_dequant_iq3xxs` instead.
 ///
-/// CURRENTLY RED — both arms produce non-finite output (measured 2026-10-16 on
-/// gfx1200, real `blk.61.ffn_gate.weight` bytes):
-///   * default (fused-dequant GEMM): 14/256 non-finite, max_diff ~1.0e6,
-///     first bad at output index 4
-///   * `GRIM_DOT_GEMV=0` (WMMA):      256/256 non-finite, every output NaN
-/// The host `dequant_iq3xxs` of the identical bytes is finite, so the defect is
-/// on the device dequant, not in the artifact. Marked `#[ignore]` to match this
-/// file's convention (every sibling here is ignored) so CI stays green while
-/// the gate stays runnable:
-///   cargo test -p grim-backend-rocm --test wmma_quant_parity \
-///     wmma_iq3xxs_decode_path_parity -- --ignored --nocapture
+/// GREEN on the default arm after the device-dequant fix (measured 2026-10-16
+/// on gfx1200, real `blk.61.ffn_gate.weight` bytes): max_diff 1.8e-7,
+/// nonfinite 0. It was 14/256 non-finite with max_diff ~1.0e6 before.
+///
+/// STILL RED on the `GRIM_DOT_GEMV=0` arm: 256/256 non-finite. That arm
+/// (`grim_wmma_fused_dequant_iq3xxs`, wmma_iq_gemm.rs) shares the corrected
+/// `dequant_iq3xxs` and the 98-byte stride, so the residual NaN is in that
+/// kernel's own tile/writeback logic, not in the dequant. It is not the default
+/// dispatch, so it is left tracked rather than silently masked: run it with
+/// `GRIM_DOT_GEMV=0` and this test to reproduce.
 #[test]
-#[ignore = "RED: IQ3_XXS device dequant emits NaN; tracked, not yet fixed"]
 fn wmma_iq3xxs_decode_path_parity() {
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");

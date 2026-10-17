@@ -1607,19 +1607,44 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
 
     // ===================== IQ3 variants =====================
 
-    // block_q3_XXS: 96 bytes per 256 weights.
-    // Layout: d(f16,2) + qs(64) + signs(30) = 96.
+    // block_iq3_xxs: **98** bytes per 256 weights (ggml-common.h; mirrored by
+    // `grim-format`'s byte-size table and by `wmma_routing`'s dispatch row).
+    //   d(f16,2) @0 | qs[64] @2 | scales+signs[32] @66
+    //
+    // This was a STUB. It read a 96-byte block (so every row after the first
+    // and every super-block past the first started 2 bytes early), took the
+    // scale from the right offset but then ignored it (`* 0.25f`), invented a
+    // value grid as `(grid_idx + sub_idx*17) % 7 - 3.0f` — arithmetic on a byte
+    // index, not an IQ codebook — and read signs one bit per weight instead of
+    // the 7-bit-per-sub-block KMASK pattern. The 27B Qwen3.8 checkpoint carries
+    // 83 IQ3_XXS tensors, and this kernel served every one of them, so its
+    // logits were non-finite from step 0 (`!!!!`, token 0 is `!`). No parity
+    // gate covered IQ3_XXS, which is how that survived.
+    //
+    // Now mirrors `grim_quant::dequant_iq3xxs` and the charon.rs fmt==2 arm
+    // exactly: per 32-weight sub-block, `db = d * (0.5 + aux>>28) * 0.5`, a
+    // 7-bit sign-pattern index into KSIGNS_IQ2XS, and a grid byte from
+    // IQ3XXS_GRID whose four little-endian bytes are the first four weights
+    // (or the second four, for j >= 4).
     __device__ inline float dequant_iq3xxs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 66;
-        int grid_idx = qs[in_sb / 8];
-        int sub_idx = in_sb % 8;
-        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
-        int sign_byte_idx = (in_sb / 8);
-        if (sign_byte_idx >= 30) sign_byte_idx = 29;
-        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * base_val * 0.25f * sign_val;
+        const unsigned char* ss = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned int aux = (unsigned int)ss[4 * ib32]
+                         | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                         | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                         | ((unsigned int)ss[4 * ib32 + 3] << 24);
+        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+        unsigned int gv = (j < 4) ? IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]]
+                                  : IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+        int jj = (j < 4) ? j : j - 4;
+        float g = (float)((gv >> (8 * jj)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
     // block_q3_S layout, mirroring grim_quant::dequant_iq3s exactly:
@@ -2020,14 +2045,14 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         const int row = (int)(idx / N);
         const int col = (int)(idx % N);
         const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 96;
+        const int row_bytes = blocks_per_row * 98;  // IQ3_XXS is 98 B/256, not 96
         const unsigned char* row_b_ptr = B_iq3xxs + col * row_bytes;
         float acc = 0.0f;
         for (int k = 0; k < K; ++k) {
             float a_val = A[row * K + k];
             int sb_idx = k / 256;
             int in_sb = k % 256;
-            float w_val = dequant_iq3xxs(row_b_ptr + sb_idx * 96, in_sb);
+            float w_val = dequant_iq3xxs(row_b_ptr + sb_idx * 98, in_sb);
             acc += a_val * w_val;
         }
         C[row * N + col] = acc;
@@ -2045,13 +2070,13 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
         const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 96;
+        const int row_bytes = blocks_per_row * 98;  // IQ3_XXS is 98 B/256, not 96
         int sb_idx = k_idx / 256;
         int in_sb = k_idx % 256;
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
-            float w_val = dequant_iq3xxs(B_iq3xxs + n * row_bytes + sb_idx * 96, in_sb);
+            float w_val = dequant_iq3xxs(B_iq3xxs + n * row_bytes + sb_idx * 98, in_sb);
             acc += dy_val * w_val;
         }
         dX[row * K + k_idx] = acc;

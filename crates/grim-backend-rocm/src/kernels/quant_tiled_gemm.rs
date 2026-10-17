@@ -119,7 +119,7 @@ GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq2s_tiled,
                          dequant_iq2s, 256, 82)
 GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq3xxs_tiled,
                          grim_fused_dequant_gemm_iq3xxs_backward_tiled,
-                         dequant_iq3xxs, 256, 96)
+                         dequant_iq3xxs, 256, 98)
 GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq3s_tiled,
                          grim_fused_dequant_gemm_iq3s_backward_tiled,
                          dequant_iq3s, 256, 110)

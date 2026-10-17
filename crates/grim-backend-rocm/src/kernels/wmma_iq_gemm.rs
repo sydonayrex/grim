@@ -199,7 +199,7 @@ extern "C" __global__ void grim_wmma_fused_dequant_iq2s(
     }
 }
 
-// --- IQ3_XXS (96 bytes / 256 weights) ---
+// --- IQ3_XXS (98 bytes / 256 weights: d f16 + qs[64] + scales/signs[32]) ---
 __device__ __forceinline__ void dequant_iq_iq3xxs_chunk_fp16(
     const unsigned char* block, int k_start, _Float16* out) {
     for (int i = 0; i < 16; ++i) {
@@ -236,10 +236,10 @@ extern "C" __global__ void grim_wmma_fused_dequant_iq3xxs(
         for (int j = 0; j < 16; ++j) {
             int col = col_base + j;
             if (col < N) {
-                const unsigned char* row_ptr = B_iq + (long long)col * n_blocks_per_row * 96;
+                const unsigned char* row_ptr = B_iq + (long long)col * n_blocks_per_row * 98;
                 int block_idx = k0 / QK_K;
                 int k_in_block = k0 % QK_K;
-                dequant_iq_iq3xxs_chunk_fp16(row_ptr + (long long)block_idx * 96, k_in_block, &b_tile[j * 16]);
+                dequant_iq_iq3xxs_chunk_fp16(row_ptr + (long long)block_idx * 98, k_in_block, &b_tile[j * 16]);
             } else {
                 for (int k = 0; k < 16; ++k) b_tile[j * 16 + k] = (_Float16)0;
             }

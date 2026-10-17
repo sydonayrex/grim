@@ -31,6 +31,7 @@ extern "C" {
         return scale * val * sign_val;
     }
 
+
     __device__ inline float dequant_iq2s_device(const unsigned char* blk, int in_sb) {
         return dequant_iq2s(blk, in_sb);
     }
@@ -38,14 +39,22 @@ extern "C" {
     __device__ inline float dequant_iq3xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 66;
-        int grid_idx = qs[in_sb / 8];
-        int sub_idx = in_sb % 8;
-        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
-        int sign_byte_idx = (in_sb / 8);
-        if (sign_byte_idx >= 30) sign_byte_idx = 29;
-        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * base_val * 0.25f * sign_val;
+        const unsigned char* ss = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned int aux = (unsigned int)ss[4 * ib32]
+                         | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                         | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                         | ((unsigned int)ss[4 * ib32 + 3] << 24);
+        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+        unsigned int gv = (j < 4) ? IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]]
+                                  : IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+        int jj = (j < 4) ? j : j - 4;
+        float g = (float)((gv >> (8 * jj)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
     // block_q3_S layout, mirroring grim_quant::dequant_iq3s exactly:
@@ -200,7 +209,7 @@ extern "C" {
     {
         const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + (size_t)b * 96;
+        const unsigned char* blk = packed + (size_t)b * 98;  /* IQ3_XXS: 98 B per 256 */;
         float* dst = out + (size_t)b * 256;
         const int base = threadIdx.x * 4;
         float4 v;
