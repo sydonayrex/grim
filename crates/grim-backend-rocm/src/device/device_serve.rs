@@ -380,6 +380,31 @@ impl MemoryOps for RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
+        // GSQ-RCO convert-on-load: encode the 2.25 bpw packed weight into the
+        // W4A4OstQuant blob on the HOST and upload only the lanes, so the packed
+        // copy never lands in VRAM. Holding both is ~29 GB for the 27B (10.4
+        // packed + ~18.5 lanes) — it fits neither one card nor two — while the
+        // lanes alone (~18.5 GB) split cleanly. The repack is LOSSLESS (same
+        // codes, same dequant; citycrow's round-trip tests pin it), so this is a
+        // layout change, not a requant: outputs are bit-identical to the memo
+        // path. Anything that fails the gate falls back to the packed upload and
+        // the existing lazy memo below.
+        if let Some(blob) = self.try_convert_gsq_rco_to_ostquant_blob(data, shape, &dtype) {
+            let blob_dtype = DType {
+                arith: ArithType::U8,
+                storage: crate::DTypeStorage::W4A4OstQuant(grim_tensor::dtype::OstQuantConfig {
+                    group_size: grim_quant::citycrow::CITYCROW_GROUP,
+                }),
+            };
+            return RocmStorage::copy_from_host_raw_bytes(
+                &blob,
+                shape,
+                blob_dtype,
+                &self.allocator,
+                self.ordinal,
+            )
+            .map(|s| Box::new(s) as Box<dyn BackendStorage>);
+        }
         RocmStorage::copy_from_host_raw_bytes(data, shape, dtype, &self.allocator, self.ordinal)
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
@@ -793,5 +818,55 @@ impl RocmDevice {
                 arg(&mut vs),
             ],
         )
+    }
+}
+impl RocmDevice {
+    /// Host-side GSQ-RCO → W4A4OstQuant blob for convert-on-load.
+    ///
+    /// Returns `None` whenever conversion is not applicable — wrong scheme,
+    /// non-2-D shape, or the arch/K gate fails — and the caller uploads the
+    /// packed bytes exactly as before. `Err` from the encoder is also a
+    /// fallback (None), never a load failure: the lazy memo path remains the
+    /// reference and must keep working.
+    fn try_convert_gsq_rco_to_ostquant_blob(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: &DType,
+    ) -> Option<Vec<u8>> {
+        if !matches!(
+            dtype.storage,
+            crate::DTypeStorage::KQuant(grim_tensor::KQuantScheme::GsqRco3p5)
+        ) {
+            return None;
+        }
+        let dims = shape.dims();
+        if dims.len() != 2 {
+            return None;
+        }
+        let (n, k) = (dims[0], dims[1]);
+        // Same gate the W4A4OstQuant dispatch arm enforces at serve time —
+        // converting a weight the arm would refuse would strand it.
+        if crate::quantization::w4a4_ostquant_supported(
+            crate::quantization::gcn_arch(&self.gpu_target),
+            k,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let (qw, sc, zr) = self
+            .encode_u4_lanes(data, n, k, grim_tensor::KQuantScheme::GsqRco3p5)
+            .ok()?;
+        // The blob layout launch_w4a4_ostquant_gemv_blob parses:
+        // [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros].
+        let mut blob = Vec::with_capacity(24 + qw.len() + sc.len() + zr.len());
+        blob.extend_from_slice(&(qw.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&qw);
+        blob.extend_from_slice(&(sc.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&sc);
+        blob.extend_from_slice(&(zr.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&zr);
+        Some(blob)
     }
 }

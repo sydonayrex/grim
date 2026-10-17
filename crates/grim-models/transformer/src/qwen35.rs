@@ -5462,8 +5462,28 @@ fn plan_layer_devices(
 
     let mut assignment = Vec::with_capacity(num_layers);
     // Size each block from checkpoint metadata before committing it.
+    // Convert-on-load swaps every GSQ-RCO weight's resident bytes for its
+    // W4A4OstQuant blob (~1.8x the packed size), so the split must be budgeted
+    // at the RESIDENT size. Budgeting packed is how a 10.4 GB checkpoint
+    // "fit" and then spilled 18.5 GB of lanes to managed memory mid-load.
+    // Conversion fires per tensor only when every target device passes the
+    // W4A4OstQuant arch gate (the loader's own per-tensor K%128 test is applied
+    // inside `prefix_bytes_resident`).
+    let convert_gsq_rco = !devices.is_empty()
+        && devices.iter().all(|d| match d {
+            Device::Rocm(ord) => {
+                let shared = grim_backend_rocm::RocmDevice::shared(*ord);
+                let target = shared.gpu_target_str();
+                grim_backend_rocm::quantization::w4a4_ostquant_supported(
+                    grim_backend_rocm::quantization::gcn_arch(target),
+                    128,
+                )
+                .is_ok()
+            }
+            _ => false,
+        });
     let layer_bytes: Vec<u64> = (0..num_layers)
-        .map(|i| ws.pp("blk").pp(&i.to_string()).prefix_bytes())
+        .map(|i| ws.pp("blk").pp(&i.to_string()).prefix_bytes_resident(convert_gsq_rco))
         .collect();
 
     // Measured per-device capability, in `devices` order.

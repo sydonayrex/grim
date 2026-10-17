@@ -32,17 +32,7 @@ extern "C" {
     }
 
     __device__ inline float dequant_iq2s_device(const unsigned char* blk, int in_sb) {
-        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 50;
-        const unsigned char* signs = blk + 58;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        return dequant_iq2s(blk, in_sb);
     }
 
     __device__ inline float dequant_iq3xxs_device(const unsigned char* blk, int in_sb) {

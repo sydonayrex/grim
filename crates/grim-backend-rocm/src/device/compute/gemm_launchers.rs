@@ -3519,7 +3519,7 @@ impl RocmDevice {
     /// Split out of [`Self::requant_kquant_to_whitecrow`] so cache read, encode,
     /// and cache write are three separable steps, and so the encode is reachable
     /// without a device allocation.
-    fn encode_u4_lanes(
+    pub(crate) fn encode_u4_lanes(
         &self,
         packed: &[u8],
         n: usize,

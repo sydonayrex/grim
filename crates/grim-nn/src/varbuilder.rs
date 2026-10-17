@@ -288,6 +288,43 @@ impl<'a> WeightSource<'a> {
     /// device owns it: layer placement has to fit the destination's free VRAM,
     /// and counting bytes from the checkpoint metadata is cheaper (and safer)
     /// than loading the layer and discovering it did not fit.
+    /// VRAM the prefix will occupy AFTER load, i.e. charging GSQ-RCO weights
+    /// their resident W4A4OstQuant blob instead of the packed 2.25 bpw bytes,
+    /// when convert-on-load will fire for them (`convert_gsq_rco`).
+    ///
+    /// The capacity-aware placement planner must budget THIS, not
+    /// [`Self::prefix_bytes`]: convert-on-load swaps the resident bytes for the
+    /// blob, so a packed-size budget under-reserves by ~1.8x on a GSQ-RCO
+    /// checkpoint and the loader spills to managed memory mid-load.
+    pub fn prefix_bytes_resident(&self, convert_gsq_rco: bool) -> u64 {
+        let prefix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}.", self.prefix.join("."))
+        };
+        self.tensors
+            .tensor_names()
+            .iter()
+            .filter(|n| n.starts_with(&prefix))
+            .filter_map(|n| self.tensors.meta(n).ok())
+            .map(|m| {
+                let elems: usize = m.shape.iter().product();
+                let converts = convert_gsq_rco
+                    && m.shape.len() == 2
+                    && matches!(
+                        m.dtype.storage,
+                        grim_tensor::Storage::KQuant(KQuantScheme::GsqRco3p5)
+                    )
+                    && m.shape[1] % 128 == 0;
+                if converts {
+                    grim_quant::citycrow::resident_blob_bytes(elems)
+                } else {
+                    m.dtype.expected_bytes(elems) as u64
+                }
+            })
+            .sum()
+    }
+
     pub fn prefix_bytes(&self) -> u64 {
         let prefix = if self.prefix.is_empty() {
             String::new()

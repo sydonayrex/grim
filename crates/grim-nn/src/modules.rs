@@ -1675,12 +1675,13 @@ fn embedding_has_packed_gather(storage: &Storage, device: &grim_tensor::Device) 
     // a host packed gather (`CpuDevice::embedding_packed`, A2) that dequants
     // one row at a time -- so K-quant tables in a verified scheme stay packed
     // everywhere instead of deflating to f32 at load.
-    // Verified schemes only: Q4K + IQ3S. IQ2_S stays excluded (see above).
+    // Verified schemes: Q4K + IQ3S + IQ2S.
     let _ = device;
     matches!(
         storage,
         Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
             | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S)
+            | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ2S)
     )
 }
 
