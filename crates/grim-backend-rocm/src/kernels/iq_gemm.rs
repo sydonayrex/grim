@@ -1908,6 +1908,45 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ2_XXS forward GEMM (bit-identical; the qs/signs
+    // byte loads and the `d` load move out of the 8-weight group).
+    __global__ void grim_fused_dequant_gemm_iq2xxs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2xxs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 66;
+        const unsigned char* row_b_ptr = B_iq2xxs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 66;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* signs = blk + 34;
+            for (int g = 0; g < 32; ++g) {
+                const int grid_idx = qs[g];
+                const unsigned char sg = signs[g];
+                const int base = k0 + g * 8;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float val = (float)((grid_idx + j) % 4) - 1.5f;
+                    const float sign_val = (sg >> j) & 1 ? -1.0f : 1.0f;
+                    acc += a_row[base + j] * (d * val * sign_val);
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq2xxs(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq2xxs,
@@ -1954,6 +1993,54 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq2xs(row_b_ptr + sb_idx * 74, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ2_XS forward GEMM (bit-identical). The 16-weight
+    // scale is hoisted to the outer loop; the qs/signs bytes and `d` to the
+    // 8-weight group.
+    __global__ void grim_fused_dequant_gemm_iq2xs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2xs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 74;
+        const unsigned char* row_b_ptr = B_iq2xs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 74;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* scales = blk + 34;
+            const unsigned char* signs = blk + 42;
+            for (int sb16 = 0; sb16 < 16; ++sb16) {
+                const float sc =
+                    ((float)((scales[sb16 / 2] >> ((sb16 % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+                const float scale = d * sc;
+                #pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int g = sb16 * 2 + half;
+                    const int grid_idx = qs[g];
+                    const unsigned char sg = signs[g];
+                    const int base = k0 + g * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float val = (float)((grid_idx + j) % 4) - 1.5f;
+                        const float sign_val = (sg >> j) & 1 ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (scale * val * sign_val);
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }
@@ -2008,6 +2095,57 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ2_S forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq2s` (same values, same ascending order:
+    // ib32, l, j IS in_sb ascending), with the scale nibble, the 10-bit grid
+    // index math and the 8-byte grid entry hoisted out of each 8-weight group.
+    __global__ void grim_fused_dequant_gemm_iq2s_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 82;
+        const unsigned char* row_b_ptr = B_iq2s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 82;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* signs = blk + 34;
+            const unsigned char* qh = blk + 66;
+            const unsigned char* scales = blk + 74;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const unsigned char sc_byte = scales[ib32];
+                const int qh_val = (int)qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const float nib = (float)((l >= 2) ? (sc_byte >> 4) : (sc_byte & 0x0F));
+                    const float db = d * (0.5f + nib) * 0.25f;
+                    const int grid_idx = (int)qs[ib32 * 4 + l]
+                        | (((qh_val << (8 - 2 * l))) & 0x300);
+                    const unsigned long long packed = IQ2S_GRID[grid_idx];
+                    const unsigned char sg = signs[ib32 * 4 + l];
+                    const int base = k0 + ib32 * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float g = (float)((packed >> (8 * j)) & 0xFFULL);
+                        const float sign_val = (sg & (1 << j)) ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (db * g * sign_val);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq2s(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq2s,
@@ -2054,6 +2192,58 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq3xxs(row_b_ptr + sb_idx * 98, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ3_XXS forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq3xxs` (same values, same ascending
+    // accumulation order: ib32, l, j IS in_sb ascending), with the block
+    // header, the aux/db math, the sign-table load and the two grid loads
+    // hoisted out of each 8-weight group where they are constant.
+    __global__ void grim_fused_dequant_gemm_iq3xxs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq3xxs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 98;
+        const unsigned char* row_b_ptr = B_iq3xxs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 98;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* ss = blk + 66;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const unsigned int aux = (unsigned int)ss[4 * ib32]
+                                       | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                                       | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                                       | ((unsigned int)ss[4 * ib32 + 3] << 24);
+                const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                for (int l = 0; l < 4; ++l) {
+                    const unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+                    const unsigned int g_lo = IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]];
+                    const unsigned int g_hi = IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+                    const int base = k0 + ib32 * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const unsigned int gv = (j < 4) ? g_lo : g_hi;
+                        const int jj = (j < 4) ? j : j - 4;
+                        const float g = (float)((gv >> (8 * jj)) & 0xFF);
+                        const float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (db * g * sign);
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }
@@ -2174,6 +2364,62 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ3_S forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq3s` (same values, same ascending order:
+    // t, l, m IS in_sb ascending), with d, the scale nibble, the grid-row
+    // index math and the two grid byte loads hoisted out of each 8-weight
+    // group. IQ3_S is the most common format in the 27B manifest (98 tensors).
+    __global__ void grim_fused_dequant_gemm_iq3s_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq3s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 110;
+        const unsigned char* row_b_ptr = B_iq3s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 110;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* qh = blk + 66;
+            const unsigned char* signs = blk + 74;
+            const unsigned char* scales = blk + 106;
+            for (int t = 0; t < 8; ++t) {
+                const int kk = t / 2; // 64-weight group -> scale byte
+                const unsigned char sc = scales[kk];
+                const float db = d * (1.0f + 2.0f * (float)((t % 2 == 0) ? (sc & 0xF) : (sc >> 4)));
+                for (int l = 0; l < 4; ++l) {
+                    // Grid rows are [512][4] bytes: hoist the two ROW POINTERS
+                    // (their 9-bit indices are constant across the 8 group
+                    // members) and index the row inside the unrolled loop.
+                    const unsigned char* g_lo = IQ3S_GRID_B[qs[t * 8 + 2 * l]
+                        | ((((int)qh[t] >> (2 * l)) & 1) << 8)];
+                    const unsigned char* g_hi = IQ3S_GRID_B[qs[t * 8 + 2 * l + 1]
+                        | ((((int)qh[t] >> (2 * l + 1)) & 1) << 8)];
+                    const unsigned char sg = signs[t * 4 + l];
+                    const int base = k0 + t * 32 + l * 8;
+                    #pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        const unsigned char g = (m < 4) ? g_lo[m] : g_hi[m - 4];
+                        const float gv = (float)(signed char)g;
+                        const float sign = ((sg >> m) & 1) ? -1.0f : 1.0f;
+                        acc += a_row[base + m] * (db * gv * sign);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq3s(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq3s,
@@ -2219,6 +2465,58 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq1s(row_b_ptr + sb_idx * 50, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ1_S forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq1s` (same per-weight values, same ascending
+    // accumulation order: ib, l, j IS in_sb ascending), but the grid-index
+    // math and the 2048-entry IQ1S_GRID load are hoisted out of the inner
+    // 8-weight group, where idx/dl/delta are CONSTANT: within one group only
+    // `j` (which byte of the grid entry) and the delta bit vary. The scalar
+    // kernel paid ~1 dependent global load + ~15 ALU ops PER WEIGHT (measured:
+    // grid 17408x256, no LDS, ~5 ms for 17.4 MB = ~1% of card peak, so it was
+    // ALU/latency bound, not bandwidth bound); this pays them once per 8.
+    __global__ void grim_fused_dequant_gemm_iq1s_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq1s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 50;
+        const unsigned char* row_b_ptr = B_iq1s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 50;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned short* qh = (const unsigned short*)(blk + 34);
+            for (int ib = 0; ib < 8; ++ib) {
+                const unsigned short qh_ib = qh[ib];
+                const float dl = d * (2.0f * (float)((qh_ib >> 12) & 7) + 1.0f);
+                const float delta = (qh_ib & 0x8000) ? -0.125f : 0.125f;
+                for (int l = 0; l < 4; ++l) {
+                    const int grid_idx =
+                        qs[ib * 4 + l] | ((((int)(qh_ib >> (3 * l)) & 7)) << 8);
+                    const unsigned long long g = IQ1S_GRID[grid_idx];
+                    const int base = k0 + ib * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const signed char grid_j = (signed char)((g >> (8 * j)) & 0xff);
+                        const float w = dl * ((float)grid_j + delta);
+                        acc += a_row[base + j] * w;
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }
