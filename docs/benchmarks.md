@@ -607,3 +607,18 @@ The linear growth in m is m*n*k FLOPs, not the re-read. Tiling is default OFF
 of the measurement and as the base for real vectorization, which changes the
 accumulation order and therefore needs a tolerance/PPL gate rather than 0.0
 parity. **The remaining prompt lever is the per-FLOP rate, not reuse.**
+
+### Follow-up: the per-FLOP lever, measured (2026-10-17, a5647d43)
+
+After tiling measured neutral, the next hypothesis was load issue: the grouped
+kernel's inner loop is one FMA per activation load. A bit-identical vec4 variant
+(float4 activation loads, unchanged accumulation order, so the 0.0 parity gate
+covered it) measured **52.0 vs 27.9 ms at m=110 (1.9x SLOWER)** and slower at
+m=1 — the eight grid byte extractions cost more than the load issue they saved.
+Removed rather than shipped.
+
+Two measured negatives on this front (tiling 1.00x, vec4 0.52x) are the evidence
+that the IQ GEMV is near its practical limit in this kernel structure. Further
+gains are structural — matrix cores with a vectorized dequant, or a q8_1-act
+integer dot — and both change the accumulation order, so they need a
+tolerance/PPL gate rather than bit-parity.
