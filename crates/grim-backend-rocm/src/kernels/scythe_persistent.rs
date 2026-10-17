@@ -6,7 +6,7 @@
 /// HIP source for the ScytheRing persistent dispatch kernel.
 /// The kernel is launched ONCE per persistent wave (one wave per CU typically) and runs.
 pub const KERNEL_SOURCE: &str = r#"
-// Device-side mirrors of the Rust ScytheTaskDescriptor / MoETaskDescriptor (grim_engine::scythe2).
+// Device-side mirrors of the Rust ScytheTaskDescriptor / MoETaskDescriptor (crate::scythe_task_descriptors).
 // #[repr(C, align(32))] on the Rust side; the device matches that layout exactly so the host-written.
 struct __align__(32) scythe_task_descriptor_t {
     unsigned int opcode;     // 0=nop,1=col-GEMM,2=row-GEMM,3=attn,4=norm,5=CommFuse,6=MoE,7=add
