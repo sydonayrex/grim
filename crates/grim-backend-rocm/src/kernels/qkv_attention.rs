@@ -3009,6 +3009,20 @@ extern "C" __global__ void grim_qkv_attention_dev_i4(
     }
 }
 
+// D1: clamp a per-layer KV total to the eviction ring's capacity. The eager
+// path resets `current_pos` to the retained count at the boundary (the host
+// CurDKV pass), which keeps the ring's absolute row sequence at
+// 0,1,..,cap-1,cap,cap,.. — the graph reproduces that with this node right
+// after the bump. `cap <= 0` (no ring) is the identity.
+extern "C" __global__ void grim_kv_clamp_total(
+    int* __restrict__ total_dev,
+    int cap
+) {
+    if (cap <= 0) return;
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (total_dev[slot] > cap) total_dev[slot] = cap;
+}
+
 // P3: per-slot position bump. Grid (batch,1,1)/(1,1,1) — thread b bumps
 // `past_dev[b] += steps`. batch=1 callers launch grid (1,1,1): slot 0.
 extern "C" __global__ void grim_bump_i32(
@@ -5328,6 +5342,37 @@ pub fn launch_bump_i32_slots(
         crate::HipDim3::new(b, 1, 1),
         crate::HipDim3::new(1, 1, 1),
         &mut [arg(&mut past_ptr), arg(&mut steps_i)],
+    )
+}
+
+/// D1: clamp a layer's KV total to the ring capacity (identity when
+/// `cap_rows <= 0`). Captured node — launched right after the per-layer bump
+/// so the absolute row sequence matches the eager path's post-compaction
+/// `current_pos`.
+pub fn launch_clamp_layer_total(
+    dev: &crate::RocmDevice,
+    total_dev: &dyn BackendStorage,
+    cap_rows: i32,
+    batch: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    if cap_rows <= 0 {
+        return Ok(std::ptr::null_mut());
+    }
+    let tot_s = total_dev
+        .as_any()
+        .downcast_ref::<crate::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("clamp_total: not RocmStorage".into()))?;
+    let mut tp = tot_s
+        .device_ptr_u64()
+        .ok_or_else(|| crate::Error::Backend("clamp_total: no ptr".into()))?;
+    let mut cap = cap_rows;
+    let grid = crate::HipDim3::new(batch.max(1) as u32, 1, 1);
+    let block = crate::HipDim3::new(1, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_clamp_total",
+        grid,
+        block,
+        &mut [crate::arg(&mut tp), crate::arg(&mut cap)],
     )
 }
 

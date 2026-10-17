@@ -193,7 +193,7 @@ pub use fusion::{
 
 pub use kernels::qkv_attention::{
     BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, KvRingPolicy, launch_bump_i32,
-    launch_bump_i32_slots, launch_kv_append, launch_kv_append_batch, launch_kv_append_i4,
+    launch_bump_i32_slots, launch_clamp_layer_total, launch_kv_append, launch_kv_append_batch, launch_kv_append_i4,
     launch_kv_append_i8,
     launch_kv_quantize_rows_i2, launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8,
     launch_paged_attention,

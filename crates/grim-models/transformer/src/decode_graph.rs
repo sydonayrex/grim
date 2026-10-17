@@ -561,6 +561,16 @@ impl LlamaBlock {
         // compaction can reset it without touching the shared rope position.
         grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.layer_totals[layer_idx], steps, batch)
             .map_err(|e| grim_core::error::Error::Backend(format!("bump layer total: {e}")))?;
+        // D1: clamp the layer total to the ring capacity, reproducing the
+        // eager path reset of current_pos at the eviction boundary (no-op
+        // when the ring is unlimited).
+        grim_backend_rocm::launch_clamp_layer_total(
+            dev,
+            &buffers.layer_totals[layer_idx],
+            buffers.kv_ring.cap_rows,
+            batch,
+        )
+            .map_err(|e| grim_core::error::Error::Backend(format!("clamp total: {e}")))?;
 
         // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
         //
@@ -1867,6 +1877,16 @@ impl Qwen35Block {
             // compaction can reset it without touching the shared rope position.
             grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.layer_totals[layer_idx], steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump layer total: {e}")))?;
+            // D1: clamp the layer total to the ring capacity, reproducing the
+            // eager path reset of current_pos at the eviction boundary (no-op
+            // when the ring is unlimited).
+            grim_backend_rocm::launch_clamp_layer_total(
+                dev,
+                &buffers.layer_totals[layer_idx],
+                buffers.kv_ring.cap_rows,
+                batch,
+            )
+                .map_err(|e| grim_core::error::Error::Backend(format!("clamp total: {e}")))?;
 
             // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
             dev.sigmoid_mul_into(
@@ -2289,19 +2309,14 @@ impl DecodeGraphModel for Qwen35 {
                 ));
             }
         }
-        // CurDKV survivor selection runs a host compaction pass that rewrites
-        // `current_pos`; the captured graph bakes `total_dev` as a device
-        // scalar it bumps itself, so it cannot observe the reset. Refuse.
-        if crate::qwen35::parse_evict_mode_env(
-            std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref(),
-        ) == crate::qwen35::EvictionMode::Curdkv
-        {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph: GRIM_KV_EVICT_MODE=curdkv needs the host compaction pass (eager \
-                 fallback)"
-                    .into(),
-            ));
-        }
+        // D1: the CurDKV refusal is GONE. The host pass at the eviction
+        // boundary resets `current_pos` to the retained count; the graph
+        // reproduces that with a captured per-layer clamp node
+        // (`grim_kv_clamp_total`) launched right after each layer's total bump,
+        // so the ring's absolute row sequence matches eager exactly. The host
+        // pass's leverage selection is a no-op at these budgets (n_tokens ==
+        // live == cap == budget -> "keep everything"), so there is no survivor
+        // gather to reproduce; the ring's clamped prefix IS the live set.
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
