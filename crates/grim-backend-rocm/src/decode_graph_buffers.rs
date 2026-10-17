@@ -1947,7 +1947,29 @@ pub struct DecodeGraph {
     /// Kernel node whose scalar args change per step (KV append). Null ->
     /// use `pos_dev` + async memcpy path instead.
     pub kv_append_node: *mut c_void,
+    /// One captured graph per contiguous device run. EMPTY = the legacy
+    /// single-graph path (graph/exec/stream above); only `set_layer_devices`
+    /// populates it, and a split placement yields one segment per run.
+    /// Capture contract: `begin_capture` does today's arm work on segment 0
+    /// (fp8-pad publish, open + gate); the model's `forward_capture` advances
+    /// each interior boundary (`end_capture_segment(k)` ->
+    /// `begin_capture_segment(k+1)`); `end_capture` closes the last open
+    /// segment; `abort_capture` ends whichever segment is open;
+    /// `replay()` delegates to `replay_chain()`.
+    pub segments: Vec<GraphSegment>,
     ordinal: usize,
+}
+
+/// One device's slice of a split capture: its own graph, exec, and — the part
+/// that matters — its own stream, because a graph must be recorded and
+/// launched on the device whose kernels it holds.
+#[derive(Debug)]
+pub struct GraphSegment {
+    pub device: usize,
+    pub layers: std::ops::Range<usize>,
+    pub graph: *mut c_void,
+    pub exec: *mut c_void,
+    pub stream: *mut c_void,
 }
 
 // SAFETY: raw HIP handles owned by self, only touched on owning device.
@@ -1964,8 +1986,136 @@ impl DecodeGraph {
             is_captured: false,
             capturing: false,
             kv_append_node: std::ptr::null_mut(),
+            segments: Vec::new(),
             ordinal: dev.ordinal,
         }
+    }
+
+    /// Recompute the per-device segments from the layer placement. Every
+    /// segment gets its OWN device's pooled stream — a graph must be captured
+    /// and launched on its device's stream, and mixing them is the fault this
+    /// whole feature exists to avoid. Call BEFORE `begin_capture`; until this
+    /// runs the graph stays on the legacy single-graph path.
+    pub fn set_layer_devices(&mut self, ords: &[usize]) {
+        self.segments = device_segments(ords)
+            .into_iter()
+            .map(|(device, layers)| {
+                let d = crate::device::roc_device::RocmDevice::shared(device);
+                let stream = d
+                    .get_stream_from_pool(0)
+                    .unwrap_or_else(|| d.active_stream());
+                GraphSegment {
+                    device,
+                    layers,
+                    graph: std::ptr::null_mut(),
+                    exec: std::ptr::null_mut(),
+                    stream,
+                }
+            })
+            .collect();
+    }
+
+    fn split_capture(&self) -> bool {
+        self.segments.len() > 1
+    }
+
+    /// Open segment `seg`'s capture bracket: begin capture on ITS stream under
+    /// ITS device's guard, and raise THIS segment device's capture gate
+    /// pointing at THIS segment's stream — `active_stream()` on that device
+    /// then returns the capturing stream, so plain launches route into the
+    /// graph. Raising it on a foreign device is what routed foreign kernels
+    /// into a graph and faulted on replay.
+    pub fn begin_capture_segment(&mut self, seg: usize) -> Result<()> {
+        let s = &self.segments[seg];
+        let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+        // SAFETY: stream owned by that device's pool, valid for capture duration.
+        let res: crate::HipErrorT = unsafe { hipStreamBeginCapture(s.stream, 2) };
+        if res != crate::hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipStreamBeginCapture(seg {seg}) failed: {res}"
+            )));
+        }
+        self.capturing = true;
+        crate::device::roc_device::RocmDevice::shared(s.device)
+            .set_capture_gate(true, Some(s.stream));
+        Ok(())
+    }
+
+    /// Close segment `seg`'s bracket: end capture, lower its gate, instantiate
+    /// and upload ITS graph on ITS stream.
+    pub fn end_capture_segment(&mut self, seg: usize) -> Result<()> {
+        {
+            let s = &self.segments[seg];
+            let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+            let mut graph: *mut c_void = std::ptr::null_mut();
+            // SAFETY: stream is under capture; graph out-ptr valid.
+            let res: crate::HipErrorT =
+                unsafe { hipStreamEndCapture(s.stream, &mut graph) };
+            crate::device::roc_device::RocmDevice::shared(s.device)
+                .set_capture_gate(false, None);
+            if res != crate::hipSuccess {
+                self.capturing = false;
+                return Err(Error::Backend(format!(
+                    "hipStreamEndCapture(seg {seg}) failed: {res}"
+                )));
+            }
+            let mut exec: *mut c_void = std::ptr::null_mut();
+            // SAFETY: graph just captured, exec out-ptr valid.
+            let inst: crate::HipErrorT = unsafe {
+                hipGraphInstantiate(
+                    &mut exec,
+                    graph,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if inst != crate::hipSuccess {
+                self.capturing = false;
+                unsafe {
+                    let _ = hipGraphDestroy(graph);
+                }
+                return Err(Error::Backend(format!(
+                    "hipGraphInstantiate(seg {seg}) failed: {inst}"
+                )));
+            }
+            let up = unsafe { crate::hipGraphUpload(exec, s.stream) };
+            if up != crate::hipSuccess {
+                self.capturing = false;
+                unsafe {
+                    let _ = hipGraphExecDestroy(exec);
+                    let _ = hipGraphDestroy(graph);
+                }
+                return Err(Error::Backend(format!(
+                    "hipGraphUpload(seg {seg}) failed: {up}"
+                )));
+            }
+            let s = &mut self.segments[seg];
+            s.graph = graph;
+            s.exec = exec;
+        }
+        // Only the LAST segment's close ends the global capturing window;
+        // interior boundaries immediately open the next bracket.
+        if seg + 1 >= self.segments.len() {
+            self.capturing = false;
+        }
+        Ok(())
+    }
+
+    /// Launch segment `seg`'s graph on its own device + stream.
+    pub fn replay_segment(&self, seg: usize) -> Result<()> {
+        let s = &self.segments[seg];
+        if s.exec.is_null() {
+            return Err(Error::Backend(format!(
+                "replay_segment({seg}): not captured"
+            )));
+        }
+        let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+        // SAFETY: exec/stream owned by the segment's device, valid post-capture.
+        check_hip("hipGraphLaunch", unsafe {
+            crate::hipGraphLaunch(s.exec, s.stream)
+        })?;
+        Ok(())
     }
 
     /// Allocate buffers + wrap. Single entry used by `get_or_create_decode_graph`.
@@ -2014,6 +2164,16 @@ impl DecodeGraph {
         if self.is_captured {
             return Err(Error::Backend("begin_capture: already captured".into()));
         }
+        // Split path: publish the fp8 pad, then open segment 0's bracket. The
+        // interior boundaries are advanced by the model's forward_capture;
+        // end_capture closes the last open segment.
+        if self.split_capture() {
+            // Publish the padded-fp8 act scratch for the duration of the
+            // capture (WhiteRaven blocked leg needs it and cannot allocate
+            // inside a capture).
+            install_capture_fp8_pad(self.buffers.act_fp8_pad_buf.first());
+            return self.begin_capture_segment(0);
+        }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // SAFETY: stream owned by device pool, valid for capture duration.
         let res: crate::HipErrorT = unsafe { hipStreamBeginCapture(self.stream, 2) };
@@ -2047,6 +2207,48 @@ impl DecodeGraph {
     /// graph, leaves `is_captured=false`. Without this the stream stays in
     /// capture mode and later D2H/H2D calls fail (hipMemcpyDtoH 906).
     pub fn abort_capture(&mut self) -> Result<()> {
+        if self.split_capture() {
+            // Per open segment: close under ITS device's guard, destroy the
+            // partial graph directly — NO instantiate/upload of a graph we are
+            // about to destroy. Then tear down any already-finalized segment.
+            for seg in 0..self.segments.len() {
+                if self.segments[seg].exec.is_null() && self.capturing {
+                    let s = &self.segments[seg];
+                    let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+                    let mut graph: *mut c_void = std::ptr::null_mut();
+                    // SAFETY: stream is under capture; result ignored beyond
+                    // cleanup: the partial graph is always discarded.
+                    let _ = unsafe { hipStreamEndCapture(s.stream, &mut graph) };
+                    crate::device::roc_device::RocmDevice::shared(s.device)
+                        .set_capture_gate(false, None);
+                    if !graph.is_null() {
+                        unsafe {
+                            let _ = hipGraphDestroy(graph);
+                        }
+                    }
+                }
+                let (graph, exec) = (self.segments[seg].graph, self.segments[seg].exec);
+                if !graph.is_null() || !exec.is_null() {
+                    let _guard =
+                        crate::device::util::DeviceGuard::set(self.segments[seg].device as i32);
+                    unsafe {
+                        if !exec.is_null() {
+                            let _ = hipGraphExecDestroy(exec);
+                        }
+                        if !graph.is_null() {
+                            let _ = hipGraphDestroy(graph);
+                        }
+                    }
+                    self.segments[seg].graph = std::ptr::null_mut();
+                    self.segments[seg].exec = std::ptr::null_mut();
+                }
+            }
+            self.is_captured = false;
+            self.capturing = false;
+            // Clear the thread-local fp8 pad, exactly like the legacy path.
+            install_capture_fp8_pad(None);
+            return Ok(());
+        }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut graph: *mut c_void = std::ptr::null_mut();
         // SAFETY: stream is under capture; graph out-ptr valid. Result ignored
@@ -2070,6 +2272,27 @@ impl DecodeGraph {
     }
 
     pub fn end_capture(&mut self) -> Result<()> {
+        // Split path: close the last open segment (forward boundaries were
+        // closed by forward_capture itself), validate every segment captured,
+        // then clear the fp8 pad.
+        if self.split_capture() {
+            if !self.capturing {
+                return Err(Error::Backend("end_capture without begin_capture".into()));
+            }
+            let last = self.segments.len() - 1;
+            if self.segments[last].exec.is_null() {
+                self.end_capture_segment(last)?;
+            }
+            if let Some(missing) = self.segments.iter().position(|s| s.exec.is_null()) {
+                return Err(Error::Backend(format!(
+                    "end_capture: segment {missing} was never captured"
+                )));
+            }
+            self.is_captured = true;
+            self.capturing = false;
+            install_capture_fp8_pad(None);
+            return Ok(());
+        }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut graph: *mut c_void = std::ptr::null_mut();
         // SAFETY: stream is under capture; graph out-ptr valid.
@@ -2133,7 +2356,15 @@ impl DecodeGraph {
 
     /// Replay entire graph in one launch. Caller must `write_pos_async`
     /// + H2D input first, D2H logits after.
+    ///
+    /// Split path: delegates to `replay_chain` (task A4) — a bare segment
+    /// loop would read the previous segment's stale boundary state, so until
+    /// A4 lands a split graph refuses to replay rather than silently
+    /// producing wrong output.
     pub fn replay(&self) -> Result<()> {
+        if self.split_capture() {
+            return self.replay_chain();
+        }
         if !self.is_captured || self.exec.is_null() {
             return Err(Error::Backend("replay: graph not captured".into()));
         }
@@ -2143,6 +2374,19 @@ impl DecodeGraph {
             crate::hipGraphLaunch(self.exec, self.stream)
         })?;
         Ok(())
+    }
+
+    /// Replay every segment in order with the ordered boundary handoff
+    /// between them (task A4). Placeholder until A4: refuses rather than
+    /// producing silently-wrong split output.
+    pub fn replay_chain(&self) -> Result<()> {
+        if !self.split_capture() {
+            return self.replay();
+        }
+        let _ = self.segments.len();
+        Err(Error::Unimplemented(
+            "replay_chain: ordered boundary handoff lands in task A4".into(),
+        ))
     }
 
     /// Spec §Scalar: update KV-position kernel args before replay.
@@ -2409,6 +2653,47 @@ mod tests {
         }
         assert_eq!(segs.first().unwrap().1.start, 0);
         assert_eq!(segs.last().unwrap().1.end, 5);
+    }
+
+    /// A2: one captured graph per contiguous device run, each on ITS device's
+    /// pooled stream. Needs two live ROCm devices; skips otherwise.
+    #[test]
+    fn decode_graph_builds_one_segment_per_device_run() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] device 0 unavailable");
+            return;
+        };
+        if crate::RocmDevice::try_new(1).is_err() {
+            eprintln!("[SKIP] needs 2 ROCm devices");
+            return;
+        }
+        // 2 layers on device 0, 1 on device 1 -> 2 segments.
+        let mut g = DecodeGraph::allocate(
+            &dev,
+            dev.active_stream(),
+            3, 64, 32, 8, 8, 128, 16, 64, 4, 1,
+        )
+        .expect("allocate");
+        assert!(g.segments.is_empty(), "no set_layer_devices call yet -> legacy path");
+        g.set_layer_devices(&[0, 0, 1]);
+        assert_eq!(g.segments.len(), 2, "two device runs must yield two graphs");
+        assert_eq!(g.segments[0].layers, 0..2);
+        assert_eq!(g.segments[1].layers, 2..3);
+        assert_eq!(g.segments[0].device, 0);
+        assert_eq!(g.segments[1].device, 1);
+        // Each segment's stream must belong to ITS device.
+        assert_eq!(
+            g.segments[0].stream,
+            crate::device::roc_device::RocmDevice::shared(0).active_stream()
+        );
+        assert_eq!(
+            g.segments[1].stream,
+            crate::device::roc_device::RocmDevice::shared(1).active_stream()
+        );
     }
 
     #[test]
