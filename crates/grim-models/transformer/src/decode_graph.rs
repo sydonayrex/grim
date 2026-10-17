@@ -2001,8 +2001,27 @@ impl Qwen35Block {
         }
 
         // Destination for final block output (residual add writes directly into next layer or head_input)
+        // Crossing a device boundary: write DEVICE-LOCAL into `boundary_out`
+        // (task A3). The old behaviour copied straight into the next layer's
+        // buffer via p2p_memcpy_async INSIDE the capture — a cross-device op
+        // in one graph, which faults on replay. The replay driver (A4)
+        // performs the ordered copy OUTSIDE the graphs.
         let n_layers = buffers.layer_input.len();
-        let residual_dst: &Storage = if layer_idx + 1 < n_layers {
+        let crossing = layer_idx + 1 < n_layers
+            && buffers.layer_devices.get(layer_idx).copied()
+                != buffers.layer_devices.get(layer_idx + 1).copied();
+        let boundary_slot = if crossing {
+            Some(
+                buffers
+                    .boundary_index(layer_idx)
+                    .expect("device differs, so a boundary must exist"),
+            )
+        } else {
+            None
+        };
+        let residual_dst: &Storage = if crossing {
+            &buffers.boundary_out[boundary_slot.unwrap()]
+        } else if layer_idx + 1 < n_layers {
             &buffers.layer_input[layer_idx + 1]
         } else {
             &buffers.head_input
@@ -2100,14 +2119,11 @@ impl Qwen35Block {
         let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
 
         let dst_storage = dst_downcast(residual_dst)?;
-        let dst_dev_ord = dst_storage.device_ordinal();
-        let is_cross_dev = dst_dev_ord != dev.ordinal();
-
-        let local_dst: &Storage = if is_cross_dev {
-            &buffers.layer_output[layer_idx]
-        } else {
-            residual_dst
-        };
+        let _ = dst_storage.device_ordinal();
+        // A3: residual_dst is always device-local now (boundary writes land in
+        // `boundary_out` on THIS block's device), so the fused-down/add path
+        // can target it directly — no local staging detour.
+        let local_dst: &Storage = residual_dst;
 
         if use_fused_down {
             dev.launch_dot4_q80_f32act_add_gemv(
@@ -2138,28 +2154,12 @@ impl Qwen35Block {
             )?;
         }
 
-        if is_cross_dev {
-            let stream = dev.active_stream();
-            let src_storage = dst_downcast(local_dst)?;
-            let src_ptr = src_storage.device_ptr().ok_or_else(|| {
-                grim_core::error::Error::Backend("p2p residual handoff: null src ptr".into())
-            })?;
-            let dst_ptr = dst_storage.device_ptr().ok_or_else(|| {
-                grim_core::error::Error::Backend("p2p residual handoff: null dst ptr".into())
-            })?;
-            let count = src_storage.bytes();
-            grim_backend_rocm::p2p_memcpy_async(
-                dst_ptr as *mut std::ffi::c_void,
-                dst_dev_ord as i32,
-                src_ptr as *const std::ffi::c_void,
-                dev.ordinal() as i32,
-                count,
-                stream,
-            )
-            .map_err(|e| {
-                grim_core::error::Error::Backend(format!("p2p residual handoff failed: {e}"))
-            })?;
-        }
+        // A3: on a device boundary the residual already went into
+        // `boundary_out` (device-local, same device as this block's kernels)
+        // via `residual_dst`, so the write is single-device and the graph
+        // stays clean. The ordered peer copy into the next segment's
+        // `layer_input` happens OUTSIDE the graphs in the replay driver (A4).
+        // The old in-capture `p2p_memcpy_async` handoff is gone.
 
         Ok(())
     }

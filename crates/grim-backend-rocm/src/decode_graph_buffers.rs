@@ -66,6 +66,9 @@ pub fn capture_fp8_pad_scratch() -> Option<&'static RocmStorage> {
 pub struct DecodeGraphBuffers {
     /// Per-layer buffers (indexed by layer_idx)
     pub layer_input: Vec<RocmStorage>, // [batch, hidden_size]
+    /// One handoff buffer per device transition, on the PRODUCING device
+    /// (empty for a single-device placement). Task A3.
+    pub boundary_out: Vec<RocmStorage>,
     pub layer_output: Vec<RocmStorage>, // [batch, hidden_size]
     /// Attention-specific
     pub q_buf: Vec<RocmStorage>, // [batch, n_q]
@@ -948,7 +951,61 @@ impl DecodeGraphBuffers {
                 Some(ds) => ds.to_vec(),
                 None => vec![dev.ordinal; num_layers],
             },
+            boundary_out: Self::build_boundary_out(layer_devices, batch, hid, &dt)?,
         })
+    }
+
+    /// One handoff buffer per device transition, on the PRODUCING device: the
+    /// last layer of segment k writes here (so segment k's graph stays
+    /// single-device), and the replay driver copies it into the next segment's
+    /// `layer_input` before launching segment k+1.
+    fn build_boundary_out(
+        layer_devices: Option<&[usize]>,
+        batch: usize,
+        hid: usize,
+        dt: &DType,
+    ) -> Result<Vec<RocmStorage>> {
+        let Some(ds) = layer_devices else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for w in ds.windows(2) {
+            if w[0] == w[1] {
+                continue;
+            }
+            let l_dev = crate::RocmDevice::shared(w[0]);
+            out.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, hid]),
+                dt.clone(),
+                &l_dev.allocator,
+                l_dev.ordinal,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// The `boundary_out` slot for the transition AFTER `layer_idx`, or `None`
+    /// when layer `layer_idx + 1` is on the same device. Boundaries are
+    /// numbered in layer order, matching `boundary_out`'s construction order.
+    pub fn boundary_index(&self, layer_idx: usize) -> Option<usize> {
+        if layer_idx + 1 >= self.layer_input.len() {
+            return None;
+        }
+        if self.layer_input[layer_idx].device_ordinal()
+            == self.layer_input[layer_idx + 1].device_ordinal()
+        {
+            return None;
+        }
+        Some(
+            (0..=layer_idx)
+                .filter(|&i| {
+                    i + 1 < self.layer_input.len()
+                        && self.layer_input[i].device_ordinal()
+                            != self.layer_input[i + 1].device_ordinal()
+                })
+                .count()
+                - 1,
+        )
     }
 
     /// Packed KV codes per element width, from STORAGE (never env): `None` when
@@ -2694,6 +2751,48 @@ mod tests {
             g.segments[1].stream,
             crate::device::roc_device::RocmDevice::shared(1).active_stream()
         );
+    }
+
+    /// A3: one handoff buffer per device transition, allocated on the
+    /// PRODUCING device, so each segment's graph stays single-device.
+    #[test]
+    fn boundary_residual_targets_the_producing_device() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] device 0 unavailable");
+            return;
+        };
+        let buffers = DecodeGraphBuffers::allocate_with_layer_devices(
+            // (dev, layer_devices, num_layers, hidden, n_q, n_attn_out, n_k, n_v,
+            //  inter, max_ctx, vocab, num_heads, batch, n_expert, top_k, sc_h_dim,
+            //  sc_l_cache, latent_kv_dim) -- 18 params.
+            &dev, Some(&[0, 0, 1]), 3, 64, 32, 32, 8, 8, 128, 16, 64, 4, 1, 0, 0, 0, 0, 0,
+        )
+        .expect("allocate");
+        // Exactly one boundary (between layer 1 and layer 2).
+        assert_eq!(buffers.boundary_out.len(), 1);
+        // The producer is segment 0's device, NOT the consumer's (layer 2's device).
+        assert_eq!(
+            buffers.boundary_out[0].device_ordinal(),
+            0,
+            "the boundary buffer must live on the device whose graph writes it"
+        );
+        // The consumer buffer is still on the next layer's device.
+        assert_eq!(buffers.layer_input[2].device_ordinal(), 1);
+        // Same-device placement must produce no boundary buffers.
+        let same = DecodeGraphBuffers::allocate_with_layer_devices(
+            &dev, Some(&[0, 0, 0]), 3, 64, 32, 32, 8, 8, 128, 16, 64, 4, 1, 0, 0, 0, 0, 0,
+        )
+        .expect("allocate same-device");
+        assert!(same.boundary_out.is_empty());
+        assert_eq!(same.boundary_index(1), None);
+        assert_eq!(same.boundary_index(2), None);
+        // Split: layer 1 is the producer of the only boundary.
+        assert_eq!(buffers.boundary_index(1), Some(0));
+        assert_eq!(buffers.boundary_index(0), None);
     }
 
     #[test]
