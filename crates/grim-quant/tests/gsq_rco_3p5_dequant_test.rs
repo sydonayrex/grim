@@ -211,11 +211,15 @@ fn short_buffer_is_rejected() {
 }
 
 #[test]
-fn all_zero_block_has_no_representable_scale_on_encode() {
+fn all_zero_block_encodes_as_flushed_zeros() {
+    // All-zero blocks carry no representable scale: the encoder now flushes them
+    // to d=0/codes=0 (a counted, non-erroring path) instead of returning Err,
+    // because released GSQ-RCO artifacts carry ~50% zero-scale blocks. See
+    // quantize_gsq_rco_3p5_block_counted for the rationale.
     let vals = vec![0.0f32; BLOCK_SIZE_GSQ_RCO_3P5];
-    let mut packed = vec![0u8; BLOCK_BYTES_GSQ_RCO_3P5];
-    let err = quantize_gsq_rco_3p5_block(&vals, &mut packed).expect_err("all-zero block");
-    assert!(format!("{err}").contains("all zeros"));
+    let mut packed = vec![1u8; BLOCK_BYTES_GSQ_RCO_3P5];
+    quantize_gsq_rco_3p5_block(&vals, &mut packed).expect("all-zero block encodes");
+    assert!(packed.iter().all(|&b| b == 0), "flushed block must be all zeros");
 }
 
 /// Hand-constructed golden vector in the style of `golden_dequant.rs`: the packed
