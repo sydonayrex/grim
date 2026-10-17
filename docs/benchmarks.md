@@ -582,3 +582,28 @@ that stages a dequantized weight tile in LDS and reuses it across TILE_M prompt
 rows — the same structure the K-quant tiled kernels already use, extended to the
 IQ grid formats (iq1s/iq1m have no tiled stamps at all). Not implemented; this
 is the measured target.
+
+## Prompt tiling: implemented, gated, measured NEUTRAL (2026-10-17, 51536ccd)
+
+Prompt processing is linear in prompt length at ~63 ms/token, which looked like
+weight re-reads (the grouped kernel dequantizes each weight row once per output
+element). `grim_fused_dequant_gemm_iq1s_tiled` stages the dequantized weights in
+LDS once per super-block and reuses them across TILE_M=16 prompt rows — 16x less
+weight traffic and dequant work. Bit-identical to the grouped kernel (parity
+gate: worst abs 0.000e0 at m=16/33/40 including a partial final tile and a
+non-multiple n).
+
+Measured at the production shape (n=17408, k=5120), grouped vs tiled:
+
+| m | grouped | tiled | ratio |
+|---|---|---|---|
+| 110 | 21.7 ms | 21.7 ms | 1.00x |
+| 339 | 58.5 ms | 60.0 ms | 0.97x |
+
+**No win.** The kernel is COMPUTE-bound — scalar dequant + FMA at ~500 GFLOP/s —
+not weight-traffic-bound, so removing 16x of the weight traffic buys nothing.
+The linear growth in m is m*n*k FLOPs, not the re-read. Tiling is default OFF
+(`GRIM_IQ_TILED_M_MIN=<m>` opts in); the kernel and its gate stay as the record
+of the measurement and as the base for real vectorization, which changes the
+accumulation order and therefore needs a tolerance/PPL gate rather than 0.0
+parity. **The remaining prompt lever is the per-FLOP rate, not reuse.**
