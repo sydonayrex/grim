@@ -685,18 +685,43 @@ impl DecodeGraphBuffers {
             } else {
                 dt.clone()
             };
-            k_arena.push(RocmStorage::alloc_gpu(
+            let k_arena_s = RocmStorage::alloc_gpu(
                 &Shape::new(vec![batch * max_ctx, nkk]),
                 kv_dt.clone(),
                 &l_dev.allocator,
                 l_dev.ordinal,
-            )?);
-            v_arena.push(RocmStorage::alloc_gpu(
+            )?;
+            let v_arena_s = RocmStorage::alloc_gpu(
                 &Shape::new(vec![batch * max_ctx, nvk]),
                 kv_dt,
                 &l_dev.allocator,
                 l_dev.ordinal,
-            )?);
+            )?;
+            v_arena.push(v_arena_s);
+            k_arena.push(k_arena_s);
+            // Zero the KV arenas at allocation (same rationale as `pos_dev`
+            // above): `alloc_gpu` recycles pool blocks, and a replay that
+            // reads any V byte the fresh graph has not written inherits the
+            // PREVIOUS graph's values — deterministic per allocation history
+            // (bit-stable 1.3529 vs -1.3476 in the lfm2_graph_moe suite run,
+            // clean in isolation where first-touch pages are driver-zeroed).
+            // One memset per arena at graph construction, off the hot path.
+            for arena in [k_arena.last().unwrap(), v_arena.last().unwrap()] {
+                let _zg = crate::device::util::DeviceGuard::set(arena.device_ordinal() as i32);
+                let zp = arena
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("kv arena zero: no ptr".into()))?;
+                let res: crate::HipErrorT = unsafe {
+                    crate::device::handles::hipMemset(
+                        zp as *mut std::ffi::c_void,
+                        0,
+                        arena.bytes,
+                    )
+                };
+                if res != crate::hipSuccess {
+                    return Err(Error::Backend(format!("zero kv arena: {res}")));
+                }
+            }
             if latent_kv_dim > 0 {
                 latent_kv_arena.push(RocmStorage::alloc_gpu(
                     &Shape::new(vec![batch * max_ctx, latent_kv_dim]),

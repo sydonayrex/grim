@@ -725,8 +725,19 @@ fn lfm2_graph_moe_layer_captures_and_replays() {
     // the replays differ per token but are finite — covered above — and that
     // replaying is stable by re-running the same sequence.
     let replay2 = capture_replay_logits(&model, &tokens).expect("moe capture/replay 2");
-    for (a_seq, b_seq) in replay.iter().zip(&replay2) {
-        for (a, b) in a_seq.iter().zip(b_seq) {
+    for (ti, (a_seq, b_seq)) in replay.iter().zip(&replay2).enumerate() {
+        let worst = a_seq
+            .iter()
+            .zip(b_seq.iter())
+            .enumerate()
+            .max_by(|x, y| {
+                let dx = (*x.1.0 - *x.1.1).abs();
+                let dy = (*y.1.0 - *y.1.1).abs();
+                dx.partial_cmp(&dy).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some((i, (a, b))) = worst {
+            let (a, b) = (*a, *b);
+            eprintln!("[moe-determinism] token {ti}: worst idx {i}: {a} vs {b}");
             assert!((a - b).abs() < 1e-2, "replay nondeterminism: {a} vs {b}");
         }
     }
