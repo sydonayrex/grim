@@ -1708,13 +1708,19 @@ impl DecodeGraphBuffers {
         dev: &RocmDevice,
         per_layer: &[Option<EagerKvSource<'_>>],
     ) -> Result<()> {
-        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
-        let stream = dev.active_stream();
         for (layer_idx, src) in per_layer.iter().enumerate() {
             let Some(src) = src else { continue };
             let Some(state_ptr) = src.gdl_state else {
                 continue;
             };
+            // A5: guard + stream on the LAYER's device, not the graph's
+            // primary — a split model's layer-i buffers live on
+            // layer_devices[i], and issuing the copy from the primary
+            // device's context is the seeder fault class this task exists
+            // for (hipMemcpyAsync on foreign-device pointers).
+            let ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal);
+            let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+            let stream = crate::RocmDevice::shared(ord).active_stream();
             let Some(gdl) = self.gdl.get(layer_idx).and_then(|o| o.as_ref()) else {
                 return Err(Error::Backend(format!(
                     "seed_gdl_state: layer {layer_idx} has no GDL buffers"
@@ -1755,10 +1761,12 @@ impl DecodeGraphBuffers {
         dev: &RocmDevice,
         per_layer: &[Option<ConvDeviceSeed<'_>>],
     ) -> Result<()> {
-        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
-        let stream = dev.active_stream();
         for (layer_idx, seed) in per_layer.iter().enumerate() {
             let Some(sd) = seed else { continue };
+            // A5: per-layer device context (see seed_gdl_state_from_eager).
+            let ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal);
+            let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+            let stream = crate::RocmDevice::shared(ord).active_stream();
             if layer_idx >= self.sc_state.len() {
                 return Err(Error::Backend(format!(
                     "seed_conv_rings_from_device: layer {layer_idx} >= {} sc rings",
@@ -1799,11 +1807,13 @@ impl DecodeGraphBuffers {
         dev: &RocmDevice,
         per_layer: &[Option<EagerKdaSource<'_>>],
     ) -> Result<()> {
-        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
-        let stream = dev.active_stream();
         for (layer_idx, src) in per_layer.iter().enumerate() {
             let Some(src) = src else { continue };
             let state_ptr = src.kda_state;
+            // A5: per-layer device context (see seed_gdl_state_from_eager).
+            let ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal);
+            let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+            let stream = crate::RocmDevice::shared(ord).active_stream();
             let Some(kda) = self.kda.get(layer_idx).and_then(|o| o.as_ref()) else {
                 continue;
             };

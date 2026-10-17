@@ -485,3 +485,60 @@ fn qwen35_graph_matches_eager_with_two_attention_layers_per_step() {
     }
     unsafe { std::env::set_var("GRIM_KV_ARENA", "f32") };
 }
+
+/// A5 gate: a split model's graph buffers must be seeded per segment — each
+/// family (KV, GDL, conv, KDA) copies on the LAYER's device context. Needs
+/// two live devices; the seeder code paths themselves are covered per-layer
+/// by construction (layer_devices[i] == the eager layer's device).
+#[test]
+fn qwen35_split_model_seed_families_run_on_their_own_devices() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices");
+        return;
+    }
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f32") };
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
+    cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
+    let provider = synth_weights_hybrid(4, 2);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load split hybrid");
+
+    // Eager prefill to produce seed sources.
+    let mut session = model.new_session();
+    let ids = dev_tensor(dev.as_ref(), &device, &[TOKENS[0] as f32]);
+    let pos = dev_tensor(dev.as_ref(), &device, &[0.0f32]);
+    let _ = CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
+        .expect("eager prefill");
+
+    let srcs = model.eager_kv_seed_sources(session.as_ref(), 1).expect("kv seeds");
+    let conv = model.eager_conv_device_seed_sources(session.as_ref()).expect("conv seeds");
+    let kda = model.eager_kda_seed_sources(session.as_ref()).expect("kda seeds");
+
+    // The production seed path (run.rs macros) must succeed against a split
+    // placement: every family copies on the right device context now.
+    let mut graph = model.get_or_create_decode_graph(16, 1).expect("graph");
+    let seed_dev = grim_backend_rocm::RocmDevice::shared(0);
+    graph
+        .buffers
+        .seed_kv_arena_from_eager(&seed_dev, &srcs)
+        .expect("seed kv (split placement)");
+    graph
+        .buffers
+        .seed_gdl_state_from_eager(&seed_dev, &srcs)
+        .expect("seed gdl (split placement)");
+    graph
+        .buffers
+        .seed_conv_rings_from_device(&seed_dev, &conv)
+        .expect("seed conv (split placement)");
+    graph
+        .buffers
+        .seed_kda_state_from_eager(&seed_dev, &kda)
+        .expect("seed kda (split placement)");
+}
