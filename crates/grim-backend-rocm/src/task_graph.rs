@@ -92,6 +92,7 @@ pub struct TaskGraph {
 }
 
 #[derive(Default)]
+#[derive(Debug)]
 pub struct TaskGraphBuilder {
     nodes: Vec<TaskNode>,
     arg_table: Vec<ArgEntry>,
