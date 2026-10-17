@@ -502,7 +502,7 @@ impl LlamaBlock {
             dev,
             &buffers.k_arena[layer_idx],
             &buffers.k_buf[layer_idx],
-            buffers.pos_dev_for(dev.ordinal()),
+            &buffers.layer_totals[layer_idx],
             kv_stride,
             steps,
             batch,
@@ -515,7 +515,7 @@ impl LlamaBlock {
             dev,
             &buffers.v_arena[layer_idx],
             &buffers.v_buf[layer_idx],
-            buffers.pos_dev_for(dev.ordinal()),
+            &buffers.layer_totals[layer_idx],
             kv_stride,
             steps,
             batch,
@@ -533,7 +533,7 @@ impl LlamaBlock {
             &buffers.attn_out_buf[layer_idx],
             &buffers.attn_max_buf[layer_idx],
             &buffers.attn_sum_buf[layer_idx],
-            buffers.pos_dev_for(dev.ordinal()),
+            &buffers.layer_totals[layer_idx],
             nh as u32,
             nkv as u32,
             hd as u32,
@@ -556,6 +556,11 @@ impl LlamaBlock {
         // Bump pos_dev
         grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
             .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+        // D1-2a: the layer OWN total -- the append row index and the
+        // attention live-row count come from here, so a per-layer CurDKV
+        // compaction can reset it without touching the shared rope position.
+        grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.layer_totals[layer_idx], steps, batch)
+            .map_err(|e| grim_core::error::Error::Backend(format!("bump layer total: {e}")))?;
 
         // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
         //
@@ -1705,7 +1710,7 @@ impl Qwen35Block {
                     grim_backend_rocm::launch_kv_append_i8(
                         dev,
                         src,
-                        buffers.pos_dev_for(dev.ordinal()),
+                        &buffers.layer_totals[layer_idx],
                         dst,
                         sc,
                         kv_stride,
@@ -1728,7 +1733,7 @@ impl Qwen35Block {
                     (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], &buffers.v_scale_arena, "v"),
                 ] {
                     let sc = scales.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph kv_append_i4 {tag}: no scale sidecar for layer {layer_idx}")))?;
-                    grim_backend_rocm::launch_kv_append_i4(dev, src, buffers.pos_dev_for(dev.ordinal()), dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring)
+                    grim_backend_rocm::launch_kv_append_i4(dev, src, &buffers.layer_totals[layer_idx], dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring)
                         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_i4 {tag}: {e}")))?;
                 }
             } else {
@@ -1736,7 +1741,7 @@ impl Qwen35Block {
                     dev,
                     &buffers.k_arena[layer_idx],
                     &buffers.k_buf[layer_idx],
-                    buffers.pos_dev_for(dev.ordinal()),
+                    &buffers.layer_totals[layer_idx],
                     kv_stride,
                     steps,
                     batch,
@@ -1749,7 +1754,7 @@ impl Qwen35Block {
                     dev,
                     &buffers.v_arena[layer_idx],
                     &buffers.v_buf[layer_idx],
-                    buffers.pos_dev_for(dev.ordinal()),
+                    &buffers.layer_totals[layer_idx],
                     kv_stride,
                     steps,
                     batch,
@@ -1782,7 +1787,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    buffers.pos_dev_for(dev.ordinal()),
+                    &buffers.layer_totals[layer_idx],
                     nh as u32,
                     nkv as u32,
                     hd as u32,
@@ -1818,7 +1823,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    buffers.pos_dev_for(dev.ordinal()),
+                    &buffers.layer_totals[layer_idx],
                     nh as u32, nkv as u32, hd as u32, steps as u32, steps as u32,
                     1.0 / (hd as f32).sqrt(), 0, 0.0,
                     buffers.attn_dummy_for(dev.ordinal()), 0, 0, buffers.attn_dummy_for(dev.ordinal()), 0,
@@ -1833,7 +1838,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    buffers.pos_dev_for(dev.ordinal()),
+                    &buffers.layer_totals[layer_idx],
                     nh as u32,
                     nkv as u32,
                     hd as u32,
@@ -1857,6 +1862,11 @@ impl Qwen35Block {
             // Bump pos_dev
             grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+            // D1-2a: the layer OWN total -- the append row index and the
+            // attention live-row count come from here, so a per-layer CurDKV
+            // compaction can reset it without touching the shared rope position.
+            grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.layer_totals[layer_idx], steps, batch)
+                .map_err(|e| grim_core::error::Error::Backend(format!("bump layer total: {e}")))?;
 
             // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
             dev.sigmoid_mul_into(

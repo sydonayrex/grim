@@ -674,11 +674,20 @@ fn qwen35_graph_serves_curdvk_eviction_like_eager() {
 
     // Graph arm: warmup 2, capture 1, replay the rest. The FIRST capture must
     // succeed — that is the red part of this gate while the refusal stands.
-    let mut graph = match model.get_or_create_decode_graph(16, 1) {
+    // Env hygiene: this gate OWNS the curdkv env, and a panic must not leak it
+    // into the rest of the test process (it poisoned every later gate once).
+    let graph_res = model.get_or_create_decode_graph(16, 1);
+    let mut graph = match graph_res {
         Ok(g) => g,
-        Err(e) => panic!(
-            "D1: the graph must not refuse CurDKV eviction anymore: {e}"
-        ),
+        Err(e) => {
+            unsafe {
+                std::env::remove_var("GRIM_KV_ARENA_ROWS");
+                std::env::remove_var("GRIM_KV_SINKS");
+                std::env::remove_var("GRIM_KV_RESIDUAL");
+                std::env::remove_var("GRIM_KV_EVICT_MODE");
+            }
+            panic!("D1: the graph must not refuse CurDKV eviction anymore: {e}");
+        }
     };
     let _ = model.forward_capture(&mut graph, tokens[0]);
     let _ = model.forward_capture(&mut graph, tokens[1]);

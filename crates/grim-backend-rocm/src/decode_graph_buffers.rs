@@ -172,6 +172,14 @@ pub struct DecodeGraphBuffers {
     /// to `attn_dummy`).
     pub attn_dummy_replicas: Vec<RocmStorage>,
     pub attn_dummy_replica_ords: Vec<usize>,
+    /// D1-2a: per-layer KV total (live row count), i32-in-f32-slot like
+    /// `pos_dev`. `pos_dev` keeps serving RoPE position and accumulates its
+    /// per-layer bumps (A0-pinned); `layer_totals[i]` counts only layer i's
+    /// appends, so the append row index and the attention live-row count are
+    /// EXACT (today the shared scalar over-reads zeroed rows on models with
+    /// >1 attention layer — masked by arena zeroing). Zeroed at alloc; the
+    /// seeder writes the prefill count per layer (write_layer_totals).
+    pub layer_totals: Vec<RocmStorage>,
     /// M2 (PLAN-kernel-fusion): MoE routing + output staging. Empty vecs when
     /// the model has no MoE layers. Routing triple is shared across layers —
     /// each layer writes then consumes it in stream order within its bracket.
@@ -839,6 +847,37 @@ impl DecodeGraphBuffers {
                 attn_dummy_replica_ords.push(r_dev.ordinal);
             }
         }
+        // D1-2a: one zeroed total per layer, on the layer's device.
+        let mut layer_totals = Vec::with_capacity(num_layers);
+        for layer_i in 0..num_layers {
+            let l_dev = match layer_devices.and_then(|ds| ds.get(layer_i)) {
+                Some(&ord) if ord != dev.ordinal => crate::RocmDevice::shared(ord),
+                _ => crate::RocmDevice::shared(dev.ordinal),
+            };
+            let t = RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch.max(1)]),
+                dt.clone(),
+                &l_dev.allocator,
+                l_dev.ordinal,
+            )?;
+            {
+                let _g = crate::device::util::DeviceGuard::set(l_dev.ordinal as i32);
+                let p = t
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("layer_total has no ptr".into()))?;
+                let res: crate::HipErrorT = unsafe {
+                    crate::device::handles::hipMemset(
+                        p as *mut std::ffi::c_void,
+                        0,
+                        batch.max(1) * std::mem::size_of::<f32>(),
+                    )
+                };
+                if res != crate::hipSuccess {
+                    return Err(Error::Backend(format!("zero layer_total: {res}")));
+                }
+            }
+            layer_totals.push(t);
+        }
         let push_all = |dev: &RocmDevice,
                         dt: &DType,
                         moe_gate_logits: &mut Vec<RocmStorage>,
@@ -1010,6 +1049,7 @@ impl DecodeGraphBuffers {
             pos_replica_ords,
             attn_dummy_replicas,
             attn_dummy_replica_ords,
+            layer_totals,
             token_ids_dev,
             attn_dummy,
             act_q81_buf,
@@ -1395,6 +1435,43 @@ impl DecodeGraphBuffers {
         let vals = vec![pos; self.batch.max(1)];
         self.write_pos_slots_raw(dev, &vals, stream)?;
         self.current_pos = pos;
+        Ok(())
+    }
+
+    /// D1-2a: seed EVERY layer's KV total to `rows` (the prefill length),
+    /// each on its layer's device. Call after arena seeding and BEFORE the
+    /// first replay; in-graph bumps then maintain them per step, and a
+    /// per-layer CurDKV compaction resets the ones it compacted.
+    pub fn write_layer_totals(&self, rows: u32) -> Result<()> {
+        for (i, t) in self.layer_totals.iter().enumerate() {
+            let ord = t.device_ordinal();
+            let dev = crate::RocmDevice::shared(ord);
+            let _g = crate::device::util::DeviceGuard::set(ord as i32);
+            let dst = t
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("write_layer_totals: no ptr".into()))?
+                as *mut c_void;
+            let vals = vec![rows; self.batch.max(1)];
+            let bytes = 4 * self.batch.max(1);
+            let host_bytes =
+                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, bytes) };
+            let (src_ptr, _pinned) =
+                crate::memory::pinned::stage_h2d_pinned(ord, host_bytes);
+            let res: crate::HipErrorT = unsafe {
+                hipMemcpyAsync(
+                    dst,
+                    src_ptr as *const c_void,
+                    bytes,
+                    HipMemcpyKind::HostToDevice,
+                    dev.active_stream(),
+                )
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!(
+                    "write_layer_totals layer {i}: hipMemcpyAsync {res}"
+                )));
+            }
+        }
         Ok(())
     }
 
