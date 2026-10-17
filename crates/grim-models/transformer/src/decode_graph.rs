@@ -956,11 +956,11 @@ impl DecodeGraphModel for Llama {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
+        let ords: Vec<usize> = buffers.layer_devices.clone();
         let mut graph = DecodeGraph::new(&dev, buffers, stream);
         // A6: derive the per-device capture segments from the placement the
         // buffers were allocated with. Single-device models get one segment
         // and stay on the legacy single-graph path (split_capture() == false).
-        let ords = graph.buffers.layer_devices.clone();
         graph.set_layer_devices(&ords);
         Ok(graph)
     }
@@ -2565,7 +2565,13 @@ impl DecodeGraphModel for Qwen35 {
             }
         }
 
-        Ok(DecodeGraph::new(&dev, buffers, stream))
+        let ords: Vec<usize> = buffers.layer_devices.clone();
+        let mut graph = DecodeGraph::new(&dev, buffers, stream);
+        // A6: derive the per-device capture segments from the placement the
+        // buffers were allocated with. Single-device models get one segment
+        // and stay on the legacy single-graph path (split_capture() == false).
+        graph.set_layer_devices(&ords);
+        Ok(graph)
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
