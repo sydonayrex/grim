@@ -212,6 +212,26 @@ pub struct DecodeGraphBuffers {
     pub layer_devices: Vec<usize>,
 }
 
+/// The maximal contiguous runs of equal device ordinal in `layer_devices`,
+/// in layer order. Each run becomes one captured graph, because a HIP graph
+/// can only hold kernels from one device (see
+/// `examples/p2p_graph_probe.rs`).
+///
+/// The runs tile the layer range exactly (no gaps, no overlap): segment k+1
+/// starts where segment k ended. That is what lets the replay driver hand the
+/// hidden state straight from one segment's last layer to the next segment's
+/// first layer.
+pub fn device_segments(layer_devices: &[usize]) -> Vec<(usize, std::ops::Range<usize>)> {
+    let mut out: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+    for (i, &ord) in layer_devices.iter().enumerate() {
+        match out.last_mut() {
+            Some((last_ord, range)) if *last_ord == ord => range.end = i + 1,
+            _ => out.push((ord, i..i + 1)),
+        }
+    }
+    out
+}
+
 /// KDA per-layer device state + projection buffers for HIP graph capture.
 #[derive(Debug)]
 pub struct KdaLayerBuffers {
@@ -2361,6 +2381,35 @@ pub fn check_layer_topology(buffers: &DecodeGraphBuffers, layer_idx: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_segments_are_maximal_contiguous_runs() {
+        assert_eq!(
+            device_segments(&[0, 0, 1, 1]),
+            vec![(0, 0..2), (1, 2..4)]
+        );
+        // Single device: one segment covering everything.
+        assert_eq!(device_segments(&[0, 0, 0]), vec![(0, 0..3)]);
+        // Non-contiguous placement must NOT be silently merged — it yields more
+        // segments, which is exactly what the caller must know about.
+        assert_eq!(
+            device_segments(&[0, 1, 0]),
+            vec![(0, 0..1), (1, 1..2), (0, 2..3)]
+        );
+        assert!(device_segments(&[]).is_empty());
+    }
+
+    #[test]
+    fn device_segments_rejects_a_two_segment_split_at_layer_zero() {
+        // A run that starts at 0 is well-formed; the invariant the caller relies on
+        // is that segment k+1 starts where segment k ended (no gaps, no overlap).
+        let segs = device_segments(&[0, 0, 1, 1, 1]);
+        for w in segs.windows(2) {
+            assert_eq!(w[0].1.end, w[1].1.start, "segments must tile the layer range");
+        }
+        assert_eq!(segs.first().unwrap().1.start, 0);
+        assert_eq!(segs.last().unwrap().1.end, 5);
+    }
 
     #[test]
     fn decode_graph_disabled_by_either_flag() {
