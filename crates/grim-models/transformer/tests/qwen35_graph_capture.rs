@@ -194,10 +194,31 @@ fn dev_tensor(dev: &RocmDevice, device: &Device, data: &[f32]) -> Tensor {
 /// Worst normalized elementwise difference (mirrors the d2d gates' metric,
 /// which does not explode on near-zero outputs).
 fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
-    let scale = a.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+    // Both halves of this had to be made non-finite-aware, because a gate that
+    // cannot fail on NaN is not a gate. When the 27B's graph replay returned
+    // all-NaN logits, this function reported `worst = 0.0` and
+    // `split_graph_replay_matches_eager` passed, which is how a NaN-producing
+    // replay shipped behind a "2.4e-5" parity number.
+    //
+    // 1. `f32::max` returns the non-NaN operand, so a NaN in the reference
+    //    used to drop out of `scale` entirely and shrink the denominator.
+    let scale = a
+        .iter()
+        .fold(0.0f32, |m, x| {
+            if x.is_finite() {
+                m.max(x.abs())
+            } else {
+                m
+            }
+        })
+        .max(1e-6);
     let mut worst = (0.0f32, 0usize, 0.0f32);
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         let d = (x - y).abs() / scale;
+        // 2. `NaN > worst.0` is false, so any non-finite pair was skipped and
+        //    the divergence it represented was never recorded. Treat it as the
+        //    worst possible outcome instead of a pass.
+        let d = if d.is_finite() { d } else { f32::INFINITY };
         if d > worst.0 {
             worst = (d, i, (x - y).abs());
         }
