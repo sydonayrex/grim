@@ -25,7 +25,13 @@ fn main() {
         .unwrap_or(20);
 
     // The 27B's recurrent-layer attn_qkv shape (IQ1_S in the GSQ-RCO build).
-    let n = 17408usize;
+    // Optional n override (arg 3) for the A-read scaling test: if the cost is
+    // dominated by A re-reads (every output thread walks the whole activation
+    // row), time stays ~flat as n shrinks at fixed k.
+    let n: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(17408);
     let k = 5120usize;
     let dev = RocmDevice::try_new(ordinal).expect("try_new");
 
