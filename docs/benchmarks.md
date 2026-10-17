@@ -553,3 +553,32 @@ share (9B 4.26/14.03 GB; 27B 9.05/9.63 GB). `GRIM_FORCE_SPLIT=1` opts out so the
 multi-GPU path stays testable — the split gates set it. The split remains the
 fallback for models that do not fit; its per-device graph path is green
 (parity 2.4e-5) and 3.34x over eager when it is used.
+
+## Prompt processing: WMMA removed, and the reuse gap (2026-10-17)
+
+`launch_iq_wmma_fallback` routed `m <= 4` to the fused WMMA kernel — the SHORT
+PROMPT through the path it is worst at. Measured on the 27B (single device, ctx
+4096, int8 KV): the WMMA fused-dequant kernels were 19.6 s of a run's 21.6 s of
+kernel time at ~40 ms per tensor (~2.5 GFLOP/s). The group-hoisted scalar
+kernels do the same shapes in ~0.5 ms, and a 110-token prompt confirms it is not
+a small-m artifact: scalar 13.7 s wall vs WMMA 86.8 s (6.3x). WMMA is now
+never preferred for the IQ formats (`GRIM_WMMA_M_MAX` restores it for A/B).
+
+| 27B, 4-token prompt, 32 tokens | wall | decode |
+|---|---|---|
+| WMMA at m<=4 (old) | 28.3 s | 424.2 ms/token |
+| scalar (now) | **9.0 s** | **136.0 ms/token** |
+
+Token sweep after: n=8 5.9 s, n=32 8.4 s, n=64 11.9 s → startup 18.5 → **~4.9 s**,
+steady decode 172 → **109 ms/token** (135x the 14688.6 ms/token eager baseline).
+Output tokens unchanged.
+
+**Remaining prefill gap, measured.** Prompt processing is LINEAR in prompt
+length at ~63 ms/token (40 tok 2.5 s, 120 tok 8.2 s, 360 tok 21.8 s) because the
+grouped kernel has no reuse across prompt rows: every output element re-reads
+its weight row. Reading the 9 GB weight set ONCE at ~300 GB/s would cost ~30 ms
+for the whole prompt regardless of length. Closing that needs a tiled IQ kernel
+that stages a dequantized weight tile in LDS and reuses it across TILE_M prompt
+rows — the same structure the K-quant tiled kernels already use, extended to the
+IQ grid formats (iq1s/iq1m have no tiled stamps at all). Not implemented; this
+is the measured target.
