@@ -355,35 +355,37 @@ fn qwen35_packed_graph_refusal_int2v4() {
     }
 }
 
-/// GATE / NEGATIVE CONTROL: a layer-split model must NOT be capturable.
+/// A6 GATE: a layer-split model must now CAPTURE and REPLAY, one graph per
+/// device, with the boundary hidden state handed across by the ordered peer
+/// copy (A4). This replaces the old refusal gate: the refusal existed because
+/// a cross-device capture faults on replay (`p2p_graph_probe.rs` isolates
+/// that); the per-segment capture removes the cross-device capture, not the
+/// symptom.
 ///
-/// A HIP graph is recorded on ONE device's stream, and ROCm cannot capture a
-/// kernel launched on a DIFFERENT device into it — the launch is accepted during
-/// capture and the node faults on replay (`Memory access fault ... GPU node-1`).
-/// That crashed multi-GPU decode for every arena format, f16 included; the
-/// isolated reproducer is
-/// `crates/grim-backend-rocm/examples/p2p_graph_probe.rs`. This pins the
-/// refusal so cross-device capture cannot be re-enabled without a red test.
+/// Fixture: 4 layers at interval = 2 (see GATE FIXTURE NOTE in the plan) —
+/// recurrent {0,2}, attention {1,3}, both segments hold both kinds. NO
+/// seeding: both sides start from an empty arena exactly like the
+/// single-device gate (seeding coverage is A5's split gate).
 #[test]
-fn qwen35_layer_split_model_refuses_the_graph() {
-    let Some((device, _dev)) = gpu_device() else {
+fn qwen35_layer_split_model_replays_like_eager() {
+    let Some((device, dev)) = gpu_device() else {
         return;
     };
     if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
-        eprintln!("[SKIP] needs 2 ROCm devices to build a layer-split model");
+        eprintln!("[SKIP] needs 2 ROCm devices");
         return;
     }
     let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
 
     let mut cfg = tiny_cfg();
-    cfg.num_layers = 2;
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
     cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
-    let provider = synth_weights_layers(2);
+    let provider = synth_weights_hybrid(4, 2);
     let ws = WeightSource::root(&provider, device.clone());
-    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load tiny split qwen35");
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load split hybrid qwen35");
 
-    // The model must actually be split, or this gate tests nothing.
     let ords: Vec<usize> = model
         .blocks
         .iter()
@@ -396,16 +398,75 @@ fn qwen35_layer_split_model_refuses_the_graph() {
         ords.iter().any(|&o| o != ords[0]),
         "model did not layer-split; this gate would be vacuous: {ords:?}"
     );
-
-    let err = model
-        .get_or_create_decode_graph(16, 1)
-        .expect_err("a layer-split model must refuse the decode graph");
-    let msg = format!("{err}");
+    // Both layer kinds must be present, or the gate is not testing a hybrid.
+    let is_attn = |i: usize| (i + 1) % 2 == 0;
     assert!(
-        msg.contains("single-device"),
-        "refusal must name the reason (single-device), got: {msg}"
+        (0..4).any(is_attn) && (0..4).any(|i| !is_attn(i)),
+        "the gate model must contain BOTH attention and recurrent layers"
     );
-    eprintln!("[split-refusal] {msg}");
+
+    // Eager reference, one token per step, absolute positions.
+    let mut session = model.new_session();
+    let mut eager = Vec::new();
+    for (step, tok) in TOKENS.iter().enumerate() {
+        let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
+        let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
+        eager.push(
+            CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
+                .expect("eager forward")
+                .to_vec_f32()
+                .expect("readback"),
+        );
+    }
+
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("a layer-split model must now be capturable");
+    assert_eq!(graph.segments.len(), 2, "one graph per device");
+    assert_eq!(graph.segments[0].layers, 0..2);
+    assert_eq!(graph.segments[1].layers, 2..4);
+    // The head must land in the LAST segment, or its kernels are in no graph.
+    let head_ord = match model.output.weight().device() {
+        Device::Rocm(o) => *o,
+        _ => usize::MAX,
+    };
+    assert_eq!(
+        head_ord,
+        graph.segments.last().unwrap().device,
+        "the output head must live on the last segment's device"
+    );
+
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured, "split capture must succeed");
+
+    let mut got = Vec::new();
+    for tok in TOKENS {
+        model
+            .forward_replay(&mut graph, tok)
+            .expect("replay");
+        got.push(graph.read_logits_f32().expect("readback"));
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+    for (step, (a, b)) in eager.iter().zip(got.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[split-graph-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 1e-1,
+            "split step {step}: replay diverges from eager: worst {e:.3e} at {at} \
+             (eager {}, graph {})",
+            a[at],
+            b[at]
+        );
+    }
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f16");
+    }
 }
 
 /// A0 BASELINE (external review 2026-10-16, item 1). The captured pos scalar is

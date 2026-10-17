@@ -956,7 +956,13 @@ impl DecodeGraphModel for Llama {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
-        Ok(DecodeGraph::new(&dev, buffers, stream))
+        let mut graph = DecodeGraph::new(&dev, buffers, stream);
+        // A6: derive the per-device capture segments from the placement the
+        // buffers were allocated with. Single-device models get one segment
+        // and stay on the legacy single-graph path (split_capture() == false).
+        let ords = graph.buffers.layer_devices.clone();
+        graph.set_layer_devices(&ords);
+        Ok(graph)
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
@@ -2310,17 +2316,15 @@ impl DecodeGraphModel for Qwen35 {
         // share the weight GEMV), so this costs no throughput. Making the graph
         // work on a split model needs ONE GRAPH PER DEVICE with the boundary
         // hidden state handed off between replays — a feature, not a flag.
-        let multi_device = match self.blocks.first() {
-            Some(first) => self.blocks.iter().any(|b| b.device != first.device),
-            None => false,
-        };
-        if multi_device {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph is single-device and this model is layer-split across multiple \
-                 GPUs (ROCm cannot capture cross-device kernels) — using eager"
-                    .into(),
-            ));
-        }
+        // A6: the single-device refusal is GONE. A layer-split model now
+        // captures ONE GRAPH PER DEVICE (task A2): `set_layer_devices` below
+        // derives the per-device segments, `begin_capture` opens segment 0,
+        // `forward_capture` advances each interior boundary, `end_capture`
+        // closes the last, and `replay_chain` hands the hidden state across
+        // with an ordered peer copy (A4). Legacy single-device graphs never
+        // see any of it (segments stay on the legacy path).
+        // (A6: the placement the buffers were allocated with drives
+        // set_layer_devices below — see the DecodeGraph::new call site.)
         let dev = dev_for_qwen35(self)?;
         let stream = dev
             .get_stream_from_pool(0)
@@ -2604,6 +2608,19 @@ impl DecodeGraphModel for Qwen35 {
                 eprintln!("[graph-trace] layer {i}/{} on rocm:{blk_ord} (capturing={})", self.blocks.len(), graph.capturing);
             }
             block.forward_graph(i, &graph.buffers, &blk_dev)?;
+            // A6: advance an interior device boundary per the A2 capture
+            // contract — close segment k (whose last layer is i) and open
+            // segment k+1. Legacy single-graph graphs have no segments.
+            if graph.segments.len() > 1 {
+                if let Some(si) = graph.segments.iter().position(|s| s.layers.contains(&i)) {
+                    if i + 1 == graph.segments[si].layers.end
+                        && si + 1 < graph.segments.len()
+                    {
+                        graph.end_capture_segment(si)?;
+                        graph.begin_capture_segment(si + 1)?;
+                    }
+                }
+            }
         }
 
         // Final norm + output head on output device
@@ -2614,6 +2631,18 @@ impl DecodeGraphModel for Qwen35 {
                 _ => dev.ordinal(),
             },
         };
+        // A6: the head MUST run inside the last segment's bracket, i.e. on the
+        // last segment's device — assert, don't assume.
+        if graph.segments.len() > 1 {
+            let last_seg = graph.segments.last().expect("segments non-empty");
+            if last_ord != last_seg.device {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "forward_capture: head runs on rocm:{last_ord} but the last capture \
+                     segment is rocm:{} — the head would land in no graph",
+                    last_seg.device
+                )));
+            }
+        }
         let last_dev = grim_backend_rocm::RocmDevice::shared(last_ord);
         let _guard = grim_backend_rocm::DeviceGuard::set(last_ord as i32);
         if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
