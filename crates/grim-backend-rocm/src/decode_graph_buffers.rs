@@ -10,6 +10,7 @@
 //! rocBLAS per Rule 0 — this module owns buffers + graph, not math.
 
 use std::ffi::c_void;
+use crate::task_graph::TaskGraph as GrimTaskGraph;
 use std::sync::Arc;
 
 use grim_tensor::BackendStorage;
@@ -172,6 +173,11 @@ pub struct DecodeGraphBuffers {
     /// to `attn_dummy`).
     pub attn_dummy_replicas: Vec<RocmStorage>,
     pub attn_dummy_replica_ords: Vec<usize>,
+    /// M1: the emitted task-graph IR, set by `end_capture` when the emitter is
+    /// enabled (`GRIM_EMIT_TASK_GRAPH=1`). `None` before capture — which is
+    /// what makes a missing emission a loud failure in M2 rather than an empty
+    /// graph that compares equal.
+    pub emitted_task_graph: Option<GrimTaskGraph>,
     /// D1-2a: per-layer KV total (live row count), i32-in-f32-slot like
     /// `pos_dev`. `pos_dev` keeps serving RoPE position and accumulates its
     /// per-layer bumps (A0-pinned); `layer_totals[i]` counts only layer i's
@@ -1050,6 +1056,7 @@ impl DecodeGraphBuffers {
             attn_dummy_replicas,
             attn_dummy_replica_ords,
             layer_totals,
+            emitted_task_graph: None,
             token_ids_dev,
             attn_dummy,
             act_q81_buf,
@@ -2225,6 +2232,11 @@ pub struct DecodeGraph {
     /// One event PER BOUNDARY (index = producing segment ordinal), each
     /// created under a DeviceGuard on the producing device. Task A4.
     pub boundary_evs: Vec<*mut std::ffi::c_void>,
+    /// M1/M2: the task-graph emitter, Some only when
+    /// `GRIM_EMIT_TASK_GRAPH=1`. `forward_capture` pushes nodes into it; the
+    /// finished IR is published to `buffers.emitted_task_graph` at
+    /// `end_capture`.
+    pub emitter: Option<crate::task_graph::TaskGraphBuilder>,
     ordinal: usize,
 }
 
@@ -2256,6 +2268,11 @@ impl DecodeGraph {
             kv_append_node: std::ptr::null_mut(),
             segments: Vec::new(),
             boundary_evs: Vec::new(),
+            emitter: if std::env::var("GRIM_EMIT_TASK_GRAPH").is_ok() {
+                Some(crate::task_graph::TaskGraphBuilder::new())
+            } else {
+                None
+            },
             ordinal: dev.ordinal,
         }
     }
@@ -2302,6 +2319,34 @@ impl DecodeGraph {
 
     fn split_capture(&self) -> bool {
         self.segments.len() > 1
+    }
+
+    /// M1/M2: push one node into the emitter when emission is enabled.
+    /// No-op otherwise — production paths pay an `Option` check, nothing more.
+    /// `dev` is the ordinal the node's kernels run on.
+    pub fn emit_node(
+        &mut self,
+        opcode: crate::task_graph::OpCode,
+        params: [u32; 16],
+        args: &[(u64, u64, u8)],
+        deps: &[u32],
+        dev_ord: u8,
+    ) -> u32 {
+        let Some(b) = self.emitter.as_mut() else {
+            return u32::MAX;
+        };
+        let handles: Vec<crate::task_graph::ArgId> = args
+            .iter()
+            .map(|&(ptr, bytes, role)| b.push_arg(ptr, bytes, role))
+            .collect();
+        b.push(opcode, params, &handles, deps, dev_ord, 0)
+    }
+
+    /// Publish the finished IR (called from `end_capture`).
+    fn publish_task_graph(&mut self) {
+        if let Some(b) = self.emitter.take() {
+            self.buffers.emitted_task_graph = Some(b.finish());
+        }
     }
 
     /// Open segment `seg`'s capture bracket: begin capture on ITS stream under
@@ -2576,6 +2621,7 @@ impl DecodeGraph {
             self.is_captured = true;
             self.capturing = false;
             install_capture_fp8_pad(None);
+            self.publish_task_graph();
             return Ok(());
         }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
@@ -2636,6 +2682,7 @@ impl DecodeGraph {
         for &ord in &ords {
             crate::device::roc_device::RocmDevice::shared(ord).set_capture_gate(false, None);
         }
+        self.publish_task_graph();
         Ok(())
     }
 

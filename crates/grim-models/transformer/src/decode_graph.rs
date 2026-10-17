@@ -2627,6 +2627,28 @@ impl DecodeGraphModel for Qwen35 {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
 
+        // M1/M2 emitter: one node per model-level launch, only during the
+        // capture bracket (warmups run the same code with capturing=false and
+        // must not push duplicate nodes). Each layer emits a block node
+        // (ATTENTION or RECURRENT) plus a GEMM node for its dense FFN; the
+        // per-launch refinement inside forward_graph is follow-on work.
+        let mut emit_last: u32 = u32::MAX;
+        if graph.emitter.is_some() && graph.capturing {
+            let seg0 = graph.segments.first().map(|s| s.device).unwrap_or(dev.ordinal());
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.token_ids_dev.bytes() as u64, 1),
+                    (graph.buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_input[0].bytes() as u64, 2),
+                ],
+                &[],
+                seg0 as u8,
+            );
+        }
+
         // Forward all layers
         for (i, block) in self.blocks.iter().enumerate() {
             let blk_ord = match block.device {
@@ -2639,6 +2661,35 @@ impl DecodeGraphModel for Qwen35 {
                 eprintln!("[graph-trace] layer {i}/{} on rocm:{blk_ord} (capturing={})", self.blocks.len(), graph.capturing);
             }
             block.forward_graph(i, &graph.buffers, &blk_dev)?;
+            if graph.emitter.is_some() && graph.capturing {
+                let is_attn = (i + 1) % self.cfg.full_attention_interval.max(1) == 0;
+                let kind = if is_attn {
+                    grim_backend_rocm::task_graph::op::ATTENTION
+                } else {
+                    grim_backend_rocm::task_graph::op::RECURRENT
+                };
+                let args = [
+                    (graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_input[i].bytes() as u64, 1u8),
+                    (graph.buffers.k_arena[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.k_arena[i].bytes() as u64, 0u8),
+                    (graph.buffers.v_arena[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.v_arena[i].bytes() as u64, 0u8),
+                    (graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_output[i].bytes() as u64, 2u8),
+                ];
+                let blk = graph.emit_node(kind,
+                    [self.cfg.head_dim as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &args, &[emit_last], blk_ord as u8);
+                let ffn_args = [
+                    (graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_output[i].bytes() as u64, 1u8),
+                ];
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::GEMM,
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &ffn_args, &[blk], blk_ord as u8);
+            }
             // A6: advance an interior device boundary per the A2 capture
             // contract — close segment k (whose last layer is i) and open
             // segment k+1. Legacy single-graph graphs have no segments.
@@ -2689,6 +2740,18 @@ impl DecodeGraphModel for Qwen35 {
         )
         .map_err(grim_core::error::Error::Tensor)?;
 
+        if graph.emitter.is_some() && graph.capturing {
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::NORM,
+                [self.cfg.hidden_size as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.head_input.bytes() as u64, 1u8),
+                ],
+                &[emit_last],
+                last_ord as u8,
+            );
+        }
         linear_into(
             &last_dev,
             &graph.buffers.head_input,
@@ -2696,6 +2759,18 @@ impl DecodeGraphModel for Qwen35 {
             &graph.buffers.head_output,
             &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
         )?;
+        if graph.emitter.is_some() && graph.capturing {
+            let _ = graph.emit_node(
+                grim_backend_rocm::task_graph::op::GEMM,
+                [self.cfg.vocab_size as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.head_output.bytes() as u64, 2u8),
+                ],
+                &[emit_last],
+                last_ord as u8,
+            );
+        }
         if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
             eprintln!(
                 "[graph-trace] head finished (capturing={}): head_in={:#x} (dev={}), head_out={:#x} (dev={}), act_q81={:#x} (dev={})",

@@ -735,3 +735,83 @@ fn qwen35_graph_serves_curdvk_eviction_like_eager() {
         std::env::remove_var("GRIM_KV_EVICT_MODE");
     }
 }
+
+/// PM-2 gate: with `GRIM_EMIT_TASK_GRAPH=1`, capturing the 4-layer hybrid must
+/// publish a task-graph IR whose structure mirrors the real walk — embedding
+/// node, per-layer (RECURRENT-or-ATTENTION, FFN GEMM) pairs, final NORM, head
+/// GEMM — with a derived capability set and a single sink. This is the M2
+/// interpreter's input contract.
+#[test]
+fn qwen35_capture_emits_a_structurally_true_task_graph() {
+    let Some((device, _dev)) = gpu_device() else {
+        return;
+    };
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+        std::env::set_var("GRIM_EMIT_TASK_GRAPH", "1");
+    }
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
+    let provider = synth_weights_hybrid(4, 2);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load emit model");
+
+    let mut graph = model.get_or_create_decode_graph(16, 1).expect("graph");
+    assert!(graph.buffers.emitted_task_graph.is_none(), "no IR before capture");
+
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+
+    let ir = graph
+        .buffers
+        .emitted_task_graph
+        .as_ref()
+        .expect("the capture must publish the emitted task graph");
+
+    // Structure: 1 embed + 4 layers x (block + FFN GEMM) + 1 NORM + 1 head GEMM.
+    assert_eq!(ir.nodes.len(), 1 + 4 * 2 + 2, "node count: {:#?}", {
+        let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
+        ops
+    });
+    use grim_backend_rocm::task_graph::op;
+    let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
+    assert_eq!(ops[0], op::ELEMENTWISE, "first node is the embedding gather");
+    for (li, i) in (0..4).enumerate() {
+        let block = ops[1 + li * 2];
+        let want = if (i + 1) % 2 == 0 { op::ATTENTION } else { op::RECURRENT };
+        assert_eq!(block, want, "layer {i} block op");
+        assert_eq!(ops[2 + li * 2], op::GEMM, "layer {i} FFN op");
+    }
+    assert_eq!(ops[9], op::NORM, "final norm");
+    assert_eq!(ops[10], op::GEMM, "head");
+
+    // The chain is total: every node except the first depends on its
+    // predecessor, so the single sink is the head.
+    assert_eq!(ir.sinks, vec![(ir.nodes.len() - 1) as u32]);
+
+    // Derived caps, single device.
+    assert!(!ir.caps.needs_peer, "single-device gate model");
+    assert!(ir.caps.opcodes.contains(&op::ATTENTION));
+    assert!(ir.caps.opcodes.contains(&op::RECURRENT));
+    assert!(ir.caps.opcodes.contains(&op::GEMM));
+    assert_eq!(ir.caps.devices.len(), 1);
+    // The argument table is the model's: every arg handle resolves.
+    for n in &ir.nodes {
+        for &a in &n.args[..n.n_args as usize] {
+            assert!((a as usize) < ir.arg_table.len(), "dangling arg handle {a}");
+        }
+    }
+
+    unsafe {
+        std::env::remove_var("GRIM_EMIT_TASK_GRAPH");
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+    }
+}
