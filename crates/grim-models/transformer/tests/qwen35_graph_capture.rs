@@ -90,8 +90,26 @@ impl TensorProvider for SynthProvider {
 }
 
 fn synth_weights_layers(n: usize) -> SynthProvider {
+    synth_weights_hybrid(n, 1)
+}
+
+/// Hybrid synthesizer: with `interval = 1` every layer is full attention
+/// (as before); with `interval = k`, layer i is full attention iff
+/// (i+1) % k == 0, and the other layers are KDA/recurrent and get the
+/// recurrent tensor set the loader requires (qwen35.rs:470-586):
+/// `attn_qkv` [kda_qkv_dim, hidden], `attn_gate` [max(q_dim, value_dim), hidden],
+/// `ssm_out` [hidden, value_dim], `ssm_conv1d` [conv_dim, d_conv], plus the
+/// scalar/vector KDA gates. Dims derive from `Qwen35Config::default()`'s
+/// ssm fields (d_state 128, d_conv 4, dt_rank 48, n_group 16), NOT literals.
+fn synth_weights_hybrid(n: usize, interval: usize) -> SynthProvider {
     let q_dim = HEADS * HEAD_DIM;
     let kv_dim = KV_HEADS * HEAD_DIM;
+    let d_state = 128usize;
+    let d_conv = 4usize;
+    let dt_rank = 48usize;
+    let n_group = 16usize;
+    let kda_qkv_dim = (dt_rank + 2 * n_group) * d_state; // == conv_dim
+    let value_dim = dt_rank * d_state;
     let mut m = HashMap::new();
     let mut seed = 1u32;
     let mut put = |m: &mut HashMap<String, RawTensor>, name: &str, shape: Vec<usize>| {
@@ -101,16 +119,29 @@ fn synth_weights_layers(n: usize) -> SynthProvider {
     put(&mut m, "token_embd.weight", vec![VOCAB, HIDDEN]);
     for i in 0..n {
         let p = format!("blk.{i}");
+        let is_attn = (i + 1) % interval.max(1) == 0;
         put(&mut m, &format!("{p}.attn_norm.weight"), vec![HIDDEN]);
-        put(&mut m, &format!("{p}.attn_q.weight"), vec![2 * q_dim, HIDDEN]);
-        put(&mut m, &format!("{p}.attn_k.weight"), vec![kv_dim, HIDDEN]);
-        put(&mut m, &format!("{p}.attn_v.weight"), vec![kv_dim, HIDDEN]);
-        put(&mut m, &format!("{p}.attn_output.weight"), vec![HIDDEN, q_dim]);
         put(&mut m, &format!("{p}.post_attention_norm.weight"), vec![HIDDEN]);
         put(&mut m, &format!("{p}.ffn_norm.weight"), vec![HIDDEN]);
         put(&mut m, &format!("{p}.ffn_gate.weight"), vec![INTER, HIDDEN]);
         put(&mut m, &format!("{p}.ffn_up.weight"), vec![INTER, HIDDEN]);
         put(&mut m, &format!("{p}.ffn_down.weight"), vec![HIDDEN, INTER]);
+        if is_attn {
+            put(&mut m, &format!("{p}.attn_q.weight"), vec![2 * q_dim, HIDDEN]);
+            put(&mut m, &format!("{p}.attn_k.weight"), vec![kv_dim, HIDDEN]);
+            put(&mut m, &format!("{p}.attn_v.weight"), vec![kv_dim, HIDDEN]);
+            put(&mut m, &format!("{p}.attn_output.weight"), vec![HIDDEN, q_dim]);
+        } else {
+            put(&mut m, &format!("{p}.attn_qkv.weight"), vec![kda_qkv_dim, HIDDEN]);
+            put(&mut m, &format!("{p}.attn_gate.weight"), vec![q_dim.max(value_dim), HIDDEN]);
+            put(&mut m, &format!("{p}.ssm_out.weight"), vec![HIDDEN, value_dim]);
+            put(&mut m, &format!("{p}.ssm_conv1d.weight"), vec![kda_qkv_dim, d_conv]);
+            put(&mut m, &format!("{p}.ssm_a"), vec![value_dim]);
+            put(&mut m, &format!("{p}.ssm_alpha.weight"), vec![dt_rank, HIDDEN]);
+            put(&mut m, &format!("{p}.ssm_beta.weight"), vec![dt_rank, HIDDEN]);
+            put(&mut m, &format!("{p}.ssm_dt.bias"), vec![dt_rank]);
+            put(&mut m, &format!("{p}.ssm_norm.weight"), vec![value_dim]);
+        }
     }
     put(&mut m, "output_norm.weight", vec![HIDDEN]);
     put(&mut m, "output.weight", vec![VOCAB, HIDDEN]);
@@ -396,7 +427,7 @@ fn qwen35_graph_matches_eager_with_two_attention_layers_per_step() {
     let mut cfg = tiny_cfg();
     cfg.num_layers = 4;
     cfg.full_attention_interval = 2; // attention layers 1 and 3: two bumps per step
-    let provider = synth_weights_layers(4);
+    let provider = synth_weights_hybrid(4, 2);
     let ws = WeightSource::root(&provider, device.clone());
     let model = Qwen35::load(device.clone(), &ws, cfg).expect("load 4-layer hybrid");
 
