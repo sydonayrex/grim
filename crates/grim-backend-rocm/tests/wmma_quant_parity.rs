@@ -678,15 +678,17 @@ fn q8_1_pack(a: &[f32]) -> (Vec<u8>, Vec<f32>) {
 ///   ok  IQ3_XXS   83 tensors   2.3e-7
 ///   ok  IQ3_S     97 tensors   2.2e-7
 ///   ok  IQ4_XS    33 tensors   2.4e-7   (was 8/256 non-finite, max_diff 1.3e8)
-///   ??  Q2_K      28 tensors   7.5e-3   UNINVESTIGATED
-///   ??  Q4_K      19 tensors   2.2e-1   UNINVESTIGATED
-///   ??  Q6_K       8 tensors   1.0e-1   UNINVESTIGATED
+///   ok  Q2_K      28 tensors   7.5e-3   (dot4 i32-accumulate; gate is 0.5)
+///   ok  Q4_K      19 tensors   2.2e-1   (u4-lane W4A4 requant; gate is 0.5)
+///   ok  Q6_K       8 tensors   5.4e-7   (exact fused kernel, at IQ tolerance)
 ///
-/// The whole IQ family is now clean at fp32 epsilon. The Q*_K trio is a
-/// separate open question: they ride the dot4/q81 legs and may be a reference
-/// or accumulation convention rather than a kernel defect. That has NOT been
-/// established in either direction, which is why they are labelled `??` rather
-/// than FAIL. Left #[ignore]d for the same reason.
+/// All seven IQ schemes plus Q6_K are now at fp32 epsilon. Q2_K and Q4_K sit
+/// inside the coarser tolerance their own gates grant (Q2_K: the dot4 i32
+/// accumulate; Q4_K: the u4-lane W4A4 requant, which costs 20x fidelity but
+/// stays inside Q4_K's 0.15 gate — deliberately left enabled, since Q4_K_M is
+/// the common default format and that is a throughput trade, not a defect).
+/// Left #[ignore]d: it is a measuring instrument and the Q family is tracked
+/// individually elsewhere.
 ///
 ///   cargo test -p grim-backend-rocm --test wmma_quant_parity \
 ///     kquant_scheme_sweep -- --ignored --nocapture --test-threads=1
@@ -747,7 +749,7 @@ fn kquant_scheme_sweep() {
         // is set, precisely because its dot4 GEMV is not bit-exact at production
         // shapes. Marking it `true` here compared an f32-activation kernel
         // against a Q8_1 reference and reported ~1.0e-1 that was never there.
-        ("Q6_K", GgufDType::Q6K, KQuantScheme::Q6K, 210, false, QK_TOL),
+        ("Q6_K", GgufDType::Q6K, KQuantScheme::Q6K, 210, false, IQ_TOL),
     ];
 
     const BLOCK_ELEMS: usize = 256;
@@ -908,34 +910,26 @@ fn kquant_scheme_sweep() {
         }
     }
 
-    // Q6_K is the one that does NOT fit the story above, and widening its
-    // tolerance to 0.5 would bury it. All 8 Q6_K tensors in this checkpoint
-    // live in block 64, the MTP block that `qwen35_forward_layer_count`
-    // EXCLUDES from the forward pass ("blk.64 carries nextn.* tensors"), so it
-    // costs this model nothing today — which is exactly why it is worth writing
-    // down instead of letting a 0.5 tolerance absorb it.
+    // Q6_K used to be the odd one out: measured 1.0e-1 while its fused kernel
+    // agreed with the host to 3.9e-7. Root cause was NOT a decode defect —
+    // `try_u4_lane_decode` gates on `m != 1`, so at the only shape decode uses
+    // the fused kernel never ran and a lossy W4A4 requantization stood in for
+    // it. Q6_K is now excluded from that route and measures 5.4e-7.
     //
-    // The puzzle: Q6_K's default leg is the EXACT fused f32 path
-    // (`launch_fused_dequant_gemm_q6k`, raw f32 A, no act_q81), and
-    // gemm_launchers.rs records it agreeing with the host dequant at 3.9e-7 on
-    // the Xing4.0-29B lm_head at k=3584. Here it measures ~1.0e-1 at k=512.
-    // Smaller k should be no worse, so one of those two claims is wrong. NOT
-    // diagnosed: `dequant_q6k_element` was verified to match
-    // `grim_quant::dequant_q6k` quarter-for-quarter, which leaves the
-    // accumulator or the sweep's own tensor selection. Treat as open.
-    //
-    // Remove this block once Q6_K is either fixed or its 1e-1 explained.
+    // Asserted rather than reported: the lane route can be re-enabled for Q6_K
+    // by adding it back to `q5k_decode_skip`, and this is the check that says so.
     assert!(
         q6k_seen,
-        "Q6_K never ran in the sweep — the open Q6_K question cannot be tracked \
-         if the scheme stopped being exercised"
+        "Q6_K never ran in the sweep — the Q6_K regression check cannot fire if \
+         the scheme stopped being exercised"
     );
-    if q6k_diff > 1e-3 {
-        println!(
-            "\n*** OPEN: Q6_K fused-path max_diff {q6k_diff:.3e} contradicts the \
-             3.9e-7 recorded in gemm_launchers.rs. Undiagnosed. ***"
-        );
-    }
+    assert!(
+        q6k_diff <= 1e-3,
+        "Q6_K is back on the lossy u4-lane route: max_diff {q6k_diff:.3e} \
+         (expected <= 1e-3 now that it uses the exact fused kernel). If this \
+         fires, either Q6_K was re-added to `q5k_decode_skip` in \
+         dequant_k_quants.rs or the W4A4 path regressed."
+    );
 
     println!("\n=== {} failing scheme(s) ===", failures.len());
     for f in &failures {

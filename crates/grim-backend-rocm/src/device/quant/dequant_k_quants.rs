@@ -668,7 +668,36 @@ impl RocmDevice {
         // correction are all sound. Q5K M=1 therefore falls through to the
         // exact dot4/WMMA legs (fidelity over throughput); the M>1 u4-GEMM
         // route is unaffected and stays.
-        let q5k_decode_skip = matches!(scheme, grim_tensor::dtype::KQuantScheme::Q5K);
+        // Q6_K joins Q5_K here, for the same reason and with the same evidence
+        // class. Measured 2026-10-17 on the Swift-1.5 27B, real `blk.64.ffn_up`
+        // // Q6_K bytes, gfx1200, m=1 n=256 k=512:
+        //
+        //   u4-lane route (default):  max_diff 1.019e-1
+        //   GRIM_DECODE_W4A4=0:       max_diff 5.420e-7   <- fp32 epsilon
+        //
+        // and by shape sweep, holding n and k fixed:
+        //
+        //   m=1  -> FAIL (4.3e-3 .. 1.0e-1)
+        //   m=2  -> ok 2.4e-7   m=4 -> 5.6e-7   m=256 -> 5.5e-7
+        //
+        // `try_u4_lane_decode` gates on `m != 1`, so at the only shape that
+        // matters for decode the fused kernel `grim_fused_dequant_gemm_q6k`
+        // NEVER RAN. It is not broken — it agrees with the host dequant to
+        // 5.4e-7 once it is actually reached. The defect was entirely in the
+        // W4A4 requantization route standing in for it, which is a lossy
+        // format conversion rather than a decode.
+        //
+        // Q4_K was measured on the same axis and left alone deliberately: its
+        // lane route costs 20x fidelity (2.16e-1 -> 1.02e-2 with
+        // GRIM_DECODE_W4A4=0), but 1.02e-2 sits inside Q4_K's existing 0.15
+        // parity gate and Q4_K_M is the common default format, so opting it out
+        // would trade real throughput for accuracy nobody is currently losing.
+        // Q6_K has no such trade to protect: its 8 tensors are all in the MTP
+        // block, and it was 100x outside tolerance.
+        let q5k_decode_skip = matches!(
+            scheme,
+            grim_tensor::dtype::KQuantScheme::Q5K | grim_tensor::dtype::KQuantScheme::Q6K
+        );
         if m != 1
             || !w4a4_decode
             || q5k_decode_skip
