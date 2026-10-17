@@ -2014,6 +2014,9 @@ pub struct DecodeGraph {
     /// segment; `abort_capture` ends whichever segment is open;
     /// `replay()` delegates to `replay_chain()`.
     pub segments: Vec<GraphSegment>,
+    /// One event PER BOUNDARY (index = producing segment ordinal), each
+    /// created under a DeviceGuard on the producing device. Task A4.
+    pub boundary_evs: Vec<*mut std::ffi::c_void>,
     ordinal: usize,
 }
 
@@ -2044,6 +2047,7 @@ impl DecodeGraph {
             capturing: false,
             kv_append_node: std::ptr::null_mut(),
             segments: Vec::new(),
+            boundary_evs: Vec::new(),
             ordinal: dev.ordinal,
         }
     }
@@ -2068,6 +2072,22 @@ impl DecodeGraph {
                     exec: std::ptr::null_mut(),
                     stream,
                 }
+            })
+            .collect();
+        // One event per boundary, created under a DeviceGuard on the PRODUCING
+        // device (an event is a device-side object; hipStreamWaitEvent from
+        // another device's stream must reference one from the producing side).
+        self.boundary_evs = self.segments[..self.segments.len().saturating_sub(1)]
+            .iter()
+            .map(|s| {
+                let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+                let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
+                let res: crate::HipErrorT = unsafe { crate::hipEventCreate(&mut ev) };
+                if res != crate::hipSuccess {
+                    eprintln!("[decode-graph] hipEventCreate failed: {res}");
+                    return std::ptr::null_mut();
+                }
+                ev
             })
             .collect();
     }
@@ -2433,17 +2453,39 @@ impl DecodeGraph {
         Ok(())
     }
 
-    /// Replay every segment in order with the ordered boundary handoff
-    /// between them (task A4). Placeholder until A4: refuses rather than
-    /// producing silently-wrong split output.
+    /// Replay every segment in order, handing the hidden state across each
+    /// device boundary. The handoff is the only per-token cross-device
+    /// traffic: segment k's graph writes `boundary_out[k]`, the ordered peer
+    /// copy moves it into segment k+1's first `layer_input`, and segment k+1's
+    /// launch waits on the event before starting.
     pub fn replay_chain(&self) -> Result<()> {
         if !self.split_capture() {
             return self.replay();
         }
-        let _ = self.segments.len();
-        Err(Error::Unimplemented(
-            "replay_chain: ordered boundary handoff lands in task A4".into(),
-        ))
+        if self.segments.iter().any(|s| s.exec.is_null()) {
+            return Err(Error::Backend("replay_chain: a segment is not captured".into()));
+        }
+        for seg in 0..self.segments.len() {
+            self.replay_segment(seg)?;
+            if seg + 1 < self.segments.len() {
+                let s = &self.segments[seg];
+                let n = &self.segments[seg + 1];
+                let ev = self
+                    .boundary_evs
+                    .get(seg)
+                    .copied()
+                    .unwrap_or(std::ptr::null_mut());
+                if ev.is_null() {
+                    return Err(Error::Backend(format!(
+                        "replay_chain: no boundary event for segment {seg}"
+                    )));
+                }
+                let src = &self.buffers.boundary_out[seg];
+                let dst = &self.buffers.layer_input[n.layers.start];
+                crate::peer_access::copy_boundary_ordered(src, dst, s.stream, n.stream, ev)?;
+            }
+        }
+        Ok(())
     }
 
     /// Spec §Scalar: update KV-position kernel args before replay.
@@ -2531,6 +2573,22 @@ impl Drop for DecodeGraph {
             if !self.graph.is_null() {
                 let _ = hipGraphDestroy(self.graph);
                 self.graph = std::ptr::null_mut();
+            }
+            // Per-segment graphs + the boundary events (tasks A2/A4).
+            for s in self.segments.iter_mut() {
+                if !s.exec.is_null() {
+                    let _ = hipGraphExecDestroy(s.exec);
+                    s.exec = std::ptr::null_mut();
+                }
+                if !s.graph.is_null() {
+                    let _ = hipGraphDestroy(s.graph);
+                    s.graph = std::ptr::null_mut();
+                }
+            }
+            for ev in self.boundary_evs.drain(..) {
+                if !ev.is_null() {
+                    let _ = crate::hipEventDestroy(ev);
+                }
             }
         }
     }
@@ -2793,6 +2851,58 @@ mod tests {
         // Split: layer 1 is the producer of the only boundary.
         assert_eq!(buffers.boundary_index(1), Some(0));
         assert_eq!(buffers.boundary_index(0), None);
+    }
+
+    /// A4: the boundary handoff is ordered (producer graph -> peer copy ->
+    /// consumer graph) and byte-exact. Needs a P2P-capable pair.
+    #[test]
+    fn boundary_copy_is_ordered_and_byte_exact() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let Ok(d0) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] device 0 unavailable");
+            return;
+        };
+        if crate::RocmDevice::try_new(1).is_err() {
+            eprintln!("[SKIP] needs 2 ROCm devices");
+            return;
+        }
+        use grim_tensor::{CoreTensorOps, MemoryOps};
+        let _ = crate::peer_access::enable_peer_access(0, 1);
+        let n = 4096usize;
+        let dt = dtype_f32();
+        let src =
+            RocmStorage::alloc_gpu(&Shape::new(vec![n]), dt.clone(), &d0.allocator, 0).unwrap();
+        let d1 = crate::device::roc_device::RocmDevice::shared(1);
+        let dst =
+            RocmStorage::alloc_gpu(&Shape::new(vec![n]), dt.clone(), &d1.allocator, 1).unwrap();
+        let want: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+        let host = d0.from_cpu(&want, &Shape::new(vec![n]), dt.clone()).expect("from_cpu");
+        d0.copy_slice_into(&src, host.as_ref(), 0, n).unwrap();
+        // `hipEventCreate` is the only event constructor grim declares.
+        let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { crate::hipEventCreate(&mut ev) },
+            crate::hipSuccess,
+            "hipEventCreate"
+        );
+        crate::peer_access::copy_boundary_ordered(
+            &src,
+            &dst,
+            d0.active_stream(),
+            d1.active_stream(),
+            ev,
+        )
+        .expect("copy");
+        d0.synchronize();
+        d1.synchronize();
+        let got = dst.to_cpu_vec_f32().expect("readback");
+        assert_eq!(got, want, "boundary copy must be byte-exact");
+        unsafe {
+            let _ = crate::hipEventDestroy(ev);
+        }
     }
 
     #[test]

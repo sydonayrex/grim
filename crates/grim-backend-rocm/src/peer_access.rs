@@ -55,6 +55,46 @@ pub fn p2p_memcpy_async(
     }
 }
 
+/// Enqueue a peer copy `src (on src_stream's device) -> dst`, then order
+/// `dst_stream` after it. The copy must NOT be captured (it runs between two
+/// graph launches in the replay driver), and `dst_stream` must not start the
+/// consumer graph until the copy lands — hence the event rather than a device
+/// sync, which would drain both queues every token.
+pub fn copy_boundary_ordered(
+    src: &crate::RocmStorage,
+    dst: &crate::RocmStorage,
+    src_stream: *mut c_void,
+    dst_stream: *mut c_void,
+    ev: *mut c_void,
+) -> Result<()> {
+    use crate::device::util::DeviceGuard;
+    let (src_dev, dst_dev) = (src.device_ordinal() as i32, dst.device_ordinal() as i32);
+    let bytes = src.bytes().min(dst.bytes());
+    let s = src
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("boundary src has no ptr".into()))?;
+    let d = dst
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("boundary dst has no ptr".into()))?;
+    let _guard = DeviceGuard::set(src_dev);
+    p2p_memcpy_async(
+        d as *mut c_void,
+        dst_dev,
+        s as *const c_void,
+        src_dev,
+        bytes,
+        src_stream,
+    )?;
+    // SAFETY: ev created via hipEventCreate; src_stream valid.
+    check_hip("hipEventRecord", unsafe { crate::hipEventRecord(ev, src_stream) })?;
+    let _guard = DeviceGuard::set(dst_dev);
+    // SAFETY: ev/dst_stream valid.
+    check_hip("hipStreamWaitEvent", unsafe {
+        crate::hipStreamWaitEvent(dst_stream, ev, 0)
+    })?;
+    Ok(())
+}
+
 /// Runtime verdict for a `(src, dst)` GPU pair. `Copy + PartialEq` so
 /// it can move across thread boundaries without ceremony.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
