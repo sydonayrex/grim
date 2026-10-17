@@ -489,3 +489,26 @@ device drain) when the model does not fit on one device.
 Recommendation: split only when the weights + KV arenas do not fit in the
 largest single device's budget. Making the graph work on a split model needs ONE
 GRAPH PER DEVICE with the boundary hidden state handed off between replays.
+
+## Per-device graphs on the 27B layer split (2026-10-16)
+
+Phase A of `plans/PLAN-multigpu-per-device-graphs.md` landed: the single-device
+refusal is gone and a layer-split model captures ONE GRAPH PER DEVICE with an
+ordered peer handoff (A2–A6). Split parity gate: worst 2.4e-5 vs eager over 3
+steps (bar 1e-1). First production evidence, Swift-1.5-Qwen3.8-27B GSQ-RCO
+(IQ3_XXS + IQ1_S banks), both cards, `capacity-aware placement: rocm:0=29
+rocm:1=35`, `GRIM_CONTEXT=4096 GRIM_KV_ARENA=int8`, prompt "Paris, and the":
+
+| path | ms/token | tokens | note |
+|---|---|---|---|
+| **graph (per-device)** | **4395.7** | 31 | `decode-graph: active` |
+| eager (graph disabled) | 14688.6 | 16 | `GRIM_DECODE_GRAPH=0` |
+
+**3.34x** — the launch-overhead win compounds across 64 layers x ~10 ops on a
+split where every layer boundary previously paid full eager dispatch. The
+absolute number is dominated by the IQ1_S scalar fused-dequant GEMV (2.4 GB/s
+achieved, weight-bound), which is the next optimization target (D-phase), not a
+graph defect. To make the graph capturable at all, the graph decode dispatch
+gained: IQ2S embedding gather + IQ1S/IQ1M/IQ2S/IQ2XS/IQ2XXS/IQ3XXS fused-dequant
+arms in `linear_decode_into` (outer or-pattern + inner match; the aliased
+IQ1S-on-Q2S layout was the historic 27B page fault and must never return).

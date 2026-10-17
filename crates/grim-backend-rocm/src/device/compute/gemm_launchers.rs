@@ -2768,7 +2768,13 @@ impl RocmDevice {
                 | KQuantScheme::IQ2S
                 | KQuantScheme::IQ2XS
                 | KQuantScheme::IQ2XXS
-                | KQuantScheme::IQ3XXS),
+                | KQuantScheme::IQ3XXS
+                // Swift-1.5 27B GSQ-RCO banks: IQ1_S/IQ1_M ride the same
+                // fused-dequant legs (the f32-act inner arms below); without
+                // them here the graph path refused mid-capture and every step
+                // fell back to eager.
+                | KQuantScheme::IQ1S
+                | KQuantScheme::IQ1M),
             ) => {
                 if act_q81.bytes < need_q81 {
                     return Err(Error::Backend(format!(
@@ -2934,6 +2940,31 @@ impl RocmDevice {
                     // dequantizes inline, so it needs no act_q81 either.
                     KQuantScheme::IQ3S => {
                         self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?
+                    }
+                    // IQ1_S/IQ1_M/IQ2 family: the scalar fused-dequant GEMMs
+                    // (ported from llama.cpp dequantize_row_iq1_s/iq1_m,
+                    // ggml-quants.c:2650/2675; IQ1S/M must NEVER ride the
+                    // Q3_K/Q2S catch-all — the aliased layouts read past the
+                    // allocation). Same f32-act leg as IQ3_S: no act_q81, no
+                    // allocation, capture-safe. The Swift-1.5 27B's GSQ-RCO
+                    // banks decode through these on the graph path.
+                    KQuantScheme::IQ1S => {
+                        self.launch_fused_dequant_gemm_iq1s(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ1M => {
+                        self.launch_fused_dequant_gemm_iq1m(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ2S => {
+                        self.launch_fused_dequant_gemm_iq2s(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ2XS => {
+                        self.launch_fused_dequant_gemm_iq2xs(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ2XXS => {
+                        self.launch_fused_dequant_gemm_iq2xxs(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ3XXS => {
+                        self.launch_fused_dequant_gemm_iq3xxs(a_s, w, out, m, n, k)?
                     }
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };
