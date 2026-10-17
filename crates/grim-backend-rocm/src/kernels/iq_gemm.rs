@@ -2570,6 +2570,73 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ1_M forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq1m`: the 4-short scale unpack, d/dl1/dl2, the
+    // four grid indices, the four deltas and the grid ENTRY are all constant
+    // within one 8-weight group (fixed ib, l), so they are hoisted there.
+    __global__ void grim_fused_dequant_gemm_iq1m_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq1m,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 56;
+        const unsigned char* row_b_ptr = B_iq1m + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 56;
+            const int k0 = sb_idx * 256;
+            const unsigned char* qs = blk;
+            const unsigned char* qh = blk + 32;
+            const unsigned char* sc = blk + 48;
+            const unsigned short sc0 = ((const unsigned short*)sc)[0];
+            const unsigned short sc1 = ((const unsigned short*)sc)[1];
+            const unsigned short sc2 = ((const unsigned short*)sc)[2];
+            const unsigned short sc3 = ((const unsigned short*)sc)[3];
+            const unsigned short scale_bits = (unsigned short)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0)
+                | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+            const float d = fp16_to_float_device(scale_bits);
+            for (int ib = 0; ib < 8; ++ib) {
+                const int half = ib % 2;
+                const unsigned short scv = ((const unsigned short*)sc)[ib / 2];
+                const float dl1 = d * (2.0f * (float)((scv >> (6 * half)) & 7) + 1.0f);
+                const float dl2 = d * (2.0f * (float)((scv >> (6 * half + 3)) & 7) + 1.0f);
+                const unsigned char qh0 = qh[ib * 2];
+                const unsigned char qh1 = qh[ib * 2 + 1];
+                const int idxs[4] = {
+                    qs[ib * 4 + 0] | (((int)qh0 << 8) & 0x700),
+                    qs[ib * 4 + 1] | (((int)qh0 << 4) & 0x700),
+                    qs[ib * 4 + 2] | (((int)qh1 << 8) & 0x700),
+                    qs[ib * 4 + 3] | (((int)qh1 << 4) & 0x700),
+                };
+                const float delta[4] = {
+                    (qh0 & 0x08) ? -0.125f : 0.125f,
+                    (qh0 & 0x80) ? -0.125f : 0.125f,
+                    (qh1 & 0x08) ? -0.125f : 0.125f,
+                    (qh1 & 0x80) ? -0.125f : 0.125f,
+                };
+                for (int l = 0; l < 4; ++l) {
+                    const float dl = (l < 2) ? dl1 : dl2;
+                    const unsigned long long g = IQ1S_GRID[idxs[l]];
+                    const int base = k0 + ib * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const signed char grid_j = (signed char)((g >> (8 * j)) & 0xff);
+                        acc += a_row[base + j] * (dl * ((float)grid_j + delta[l]));
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq1m(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq1m,
@@ -2668,6 +2735,63 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq4xs(row_b_ptr + sb_idx * 136, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ4_XS forward GEMM (bit-identical; the scales_h/ls
+    // math and `dl` move out of the 32-weight group, the quant byte out of the
+    // 16-weight half).
+    __global__ void grim_fused_dequant_gemm_iq4xs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq4xs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 136;
+        const unsigned char* row_b_ptr = B_iq4xs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+        };
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 136;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* sc_h = blk + 2;
+            const unsigned char* sc_l = blk + 4;
+            const unsigned char* qs = blk + 8;
+            const unsigned int scales_h =
+                (unsigned int)sc_h[0] | ((unsigned int)sc_h[1] << 8);
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = (int)((sc_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                             | (((int)((scales_h >> (2 * ib)) & 3)) << 4);
+                const float dl = d * (float)(ls - 32);
+                // The scalar path reads qb = qs[ib*16 + (j & 15)] and selects
+                // the nibble by (j < 16): the first 16 weights take the LOW
+                // nibble of bytes 0..15, the second 16 the HIGH nibble of the
+                // SAME bytes. Reproduce exactly — the byte index varies per j,
+                // only the nibble selector is fixed per half.
+                #pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int base = k0 + ib * 32 + half * 16;
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const unsigned char qb = qs[ib * 16 + j];
+                        const unsigned char nib =
+                            (half == 0) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+                        acc += a_row[base + j] * (dl * kvalues_iq4nl[nib]);
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }

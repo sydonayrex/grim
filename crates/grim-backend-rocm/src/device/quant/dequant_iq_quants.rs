@@ -491,6 +491,30 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq1m_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ1_M oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq1m_scalar(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1m", a, b, out, m, n, k, 1)
     }
 
@@ -587,6 +611,30 @@ impl RocmDevice {
     }
 
     pub(crate) fn launch_fused_dequant_gemm_iq4xs(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq4xs_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ4_XS oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq4xs_scalar(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -700,6 +748,14 @@ mod iq1s_grouped_parity {
         packed_fixed(n, k, 66, 43)
     }
 
+    fn packed_iq4xs(n: usize, k: usize) -> Vec<u8> {
+        packed_fixed(n, k, 136, 29)
+    }
+
+    fn packed_iq1m(n: usize, k: usize) -> Vec<u8> {
+        packed_fixed(n, k, 56, 37)
+    }
+
     fn packed_iq1s(n: usize, k: usize) -> Vec<u8> {
         // Deterministic fabricated bytes in the real IQ1_S layout
         // (block_iq1_s = 2 + 32 + 16 = 50 B / 256 weights). Values are
@@ -741,6 +797,8 @@ mod iq1s_grouped_parity {
             (KQuantScheme::IQ2S, 82usize, packed_iq2s),
             (KQuantScheme::IQ2XS, 74usize, packed_iq2xs),
             (KQuantScheme::IQ2XXS, 66usize, packed_iq2xxs),
+            (KQuantScheme::IQ4XS, 136usize, packed_iq4xs),
+            (KQuantScheme::IQ1M, 56usize, packed_iq1m),
         ] {
         let _ = blk_bytes;
         let dt = DType {
@@ -809,10 +867,22 @@ mod iq1s_grouped_parity {
                     dev.launch_fused_dequant_gemm_iq2xs(&a, &w, &out_grouped, 1, n, k)
                         .expect("grouped launch");
                 }
-                _ => {
+                KQuantScheme::IQ2XXS => {
                     dev.launch_fused_dequant_gemm_iq2xxs_scalar(&a, &w, &out_scalar, 1, n, k)
                         .expect("scalar launch");
                     dev.launch_fused_dequant_gemm_iq2xxs(&a, &w, &out_grouped, 1, n, k)
+                        .expect("grouped launch");
+                }
+                KQuantScheme::IQ4XS => {
+                    dev.launch_fused_dequant_gemm_iq4xs_scalar(&a, &w, &out_scalar, 1, n, k)
+                        .expect("scalar launch");
+                    dev.launch_fused_dequant_gemm_iq4xs(&a, &w, &out_grouped, 1, n, k)
+                        .expect("grouped launch");
+                }
+                _ => {
+                    dev.launch_fused_dequant_gemm_iq1m_scalar(&a, &w, &out_scalar, 1, n, k)
+                        .expect("scalar launch");
+                    dev.launch_fused_dequant_gemm_iq1m(&a, &w, &out_grouped, 1, n, k)
                         .expect("grouped launch");
                 }
             }
