@@ -46,6 +46,7 @@ pub mod quantization;
 pub mod rccl;
 pub mod rocm_detect;
 pub mod scythe2_placement;
+pub mod task_graph;
 pub mod scythe_task_descriptors;
 pub use crate::scythe_task_descriptors::{
     MoETaskDescriptor, MoeQuantMode, ScytheTaskDescriptor, moe_quant_mode,
