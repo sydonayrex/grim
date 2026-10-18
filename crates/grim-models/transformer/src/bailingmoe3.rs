@@ -336,13 +336,24 @@ impl Ling3Tiny {
 
             let gate_w = ws.get_unconstrained(&format!("{prefix}.moe.gate.weight"))?;
             let gate_linear = grim_nn::Linear::from_tensor(gate_w, None);
+            // Gate on the checkpoint's own declaration rather than assuming
+            // softmax. `scoring_func` / `norm_topk_prob` are the HF-config
+            // spellings of llama.cpp's `<arch>.expert_gating_func` (2 = sigmoid)
+            // and `<arch>.expert_weights_norm`; both are already parsed by
+            // `from_hf`. Bailing-MoE3 ships `expert_gating_func = 2`, so
+            // assuming softmax routed every token through the wrong gate.
+            let router_kind = match cfg.scoring_func.as_str() {
+                "sigmoid" => grim_nn::moe::RouterKind::SigmoidTopKWithBias,
+                _ => grim_nn::moe::RouterKind::SoftmaxTopK,
+            };
             let router = grim_nn::moe::MoeRouter::new(
                 gate_linear,
-                grim_nn::moe::RouterKind::SoftmaxTopK,
+                router_kind,
                 cfg.num_experts_per_tok,
                 cfg.num_experts,
                 None,
-            );
+            )
+            .with_renorm(cfg.norm_topk_prob);
             let experts = grim_nn::moe::ExpertBank::load(
                 ws,
                 cfg.num_experts,

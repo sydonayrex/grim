@@ -28,6 +28,22 @@ use crate::varbuilder::WeightSource;
 
 // Router
 
+/// Map llama.cpp's `llama_expert_gating_func_type`, read from the GGUF key
+/// `<arch>.expert_gating_func`, onto a router kind.
+///
+/// Upstream values: 0 `NONE`, 1 `SOFTMAX`, 2 `SIGMOID`, 3 `SOFTMAX_WEIGHT`
+/// (softmax applied to the router *weights*, not the logits), 4 `SQRT_SOFTPLUS`.
+/// Mapped explicitly rather than cast — upstream's enum numbering is *not*
+/// grim's `route_mode` numbering, so the two must never be conflated.
+/// `SQRT_SOFTPLUS` has no host-side equivalent and falls back to `SOFTMAX`.
+pub fn router_kind_from_gating_func(v: u32) -> RouterKind {
+    match v {
+        2 => RouterKind::SigmoidTopKWithBias,
+        3 => RouterKind::SoftmaxTopKRenorm,
+        _ => RouterKind::SoftmaxTopK,
+    }
+}
+
 /// Router gating strategy. `SoftmaxTopK` covers Qwen2/3-MoE, GLM4-MoE, Granite-MoE, etc.
 #[derive(Debug, Clone)]
 pub enum RouterKind {
@@ -173,7 +189,16 @@ impl MoeRouter {
                     }
                 }
                 RouterKind::SigmoidTopKWithBias => {
-                    chosen.iter().map(|&i| sigmoid(row[i])).collect()
+                    // Upstream gathers the *unbiased* sigmoids at the selected
+                    // experts and only then applies `norm_w` as a division by
+                    // their sum, so the bias stays selection-only.
+                    let w: Vec<f32> = chosen.iter().map(|&i| sigmoid(row[i])).collect();
+                    let sum: f32 = w.iter().sum();
+                    if self.renorm && sum > 0.0 {
+                        w.iter().map(|p| p / sum).collect()
+                    } else {
+                        w
+                    }
                 }
             };
             indices.push(chosen.to_vec());
@@ -2624,7 +2649,10 @@ impl MoeFfn {
             num_experts,
             top_k,
             route_mode,
-            false, // norm_weights: softmax mode already normalizes
+            // Upstream applies `norm_w` as a division by the selected weight
+            // sum. It is a no-op for the renormalized softmax mode (route_mode 3,
+            // which already sums to 1) but required for sigmoid gating.
+            self.router.renorm,
         )?;
 
         // 2. Fully device-resident dispatch (no routing-table upload).
@@ -3377,7 +3405,10 @@ mod tests {
         // Without bias: softmax([3,0.1,2,-1]) top2 = {0,2}.
         // With bias pushing expert 1 up by a lot, selection should prefer 1.
         let bias = cpu_tensor(vec![0.0, 10.0, 0.0, 0.0], Shape::new(vec![4]));
-        let m = build_synthetic(RouterKind::SigmoidTopKWithBias, None, Some(bias));
+        let mut m = build_synthetic(RouterKind::SigmoidTopKWithBias, None, Some(bias));
+        // renorm=false keeps the combine weights raw so this test isolates
+        // "bias affects selection only" from the norm_w division.
+        m.router.renorm = false;
         let (idx, w) = m.router.route(&token()).unwrap();
         assert_eq!(idx[0][0], 1, "bias must move expert 1 to rank 1");
         // Combine weight for selected expert 1 is the unbiased sigmoid of its
@@ -3387,6 +3418,69 @@ mod tests {
             (w[0][0] - unbiased).abs() < 1e-5,
             "combine weight must be unbiased"
         );
+    }
+
+    /// Upstream gathers the selected sigmoids and then divides by their sum when
+    /// `norm_w` is set. Without it the weights are the raw sigmoids and sum to > 1.
+    #[test]
+    fn sigmoid_renorm_controls_weight_normalization() {
+        let mut m = build_synthetic(RouterKind::SigmoidTopKWithBias, None, None);
+        m.router.renorm = true;
+        let (idx, w) = m.router.route(&token()).unwrap();
+        assert_eq!(idx[0], vec![0, 2], "top-2 by sigmoid");
+        let sum: f32 = w[0].iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "renorm must sum to 1, got {sum}");
+
+        m.router.renorm = false;
+        let (_, w2) = m.router.route(&token()).unwrap();
+        let raw: f32 = w2[0].iter().sum();
+        assert!(
+            (raw - (sigmoid(3.0) + sigmoid(2.0))).abs() < 1e-5,
+            "unnormalized weights are the raw sigmoids, got {raw}"
+        );
+        assert!(raw > 1.0, "raw sigmoid top-k mass exceeds 1, got {raw}");
+    }
+
+    /// `<arch>.expert_gating_func` is llama.cpp's own enum; mapped explicitly so
+    /// its numbering is never confused with grim's `route_mode` numbering.
+    #[test]
+    fn gating_func_enum_maps_explicitly() {
+        // 0 NONE, 1 SOFTMAX, 2 SIGMOID, 3 SOFTMAX_WEIGHT, 4 SQRT_SOFTPLUS.
+        assert!(matches!(
+            router_kind_from_gating_func(1),
+            RouterKind::SoftmaxTopK
+        ));
+        assert!(matches!(
+            router_kind_from_gating_func(2),
+            RouterKind::SigmoidTopKWithBias
+        ));
+        assert!(matches!(
+            router_kind_from_gating_func(3),
+            RouterKind::SoftmaxTopKRenorm
+        ));
+        // NONE and the unmapped SQRT_SOFTPLUS both fall back to softmax.
+        assert!(matches!(
+            router_kind_from_gating_func(0),
+            RouterKind::SoftmaxTopK
+        ));
+        assert!(matches!(
+            router_kind_from_gating_func(4),
+            RouterKind::SoftmaxTopK
+        ));
+    }
+
+    /// llama.cpp's `expert_weights_norm` hparam defaults to `false`, and real
+    /// checkpoints omit the key (e.g. lfm2moe). Absent must mean unnormalized.
+    #[test]
+    fn default_renorm_matches_upstream_hparam_default() {
+        let m = build_synthetic(RouterKind::SoftmaxTopK, None, None);
+        assert!(m.router.renorm, "MoE weight normalization defaults to true");
+        // A checkpoint that omits the key must read as false:
+        let mut m2 = build_synthetic(RouterKind::SoftmaxTopK, None, None);
+        m2.router.renorm = false;
+        let (_, w) = m2.router.route(&token()).unwrap();
+        let sum: f32 = w[0].iter().sum();
+        assert!(sum < 1.0, "an absent expert_weights_norm leaves weights unnormalized");
     }
 
     #[test]

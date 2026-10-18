@@ -1065,7 +1065,10 @@ impl DecodeGraphModel for Llama {
                     num_experts,
                     top_k,
                     route_mode,
-                    false, // softmax mode already normalizes
+                    // Mirrors the eager-GPU path: upstream's `norm_w`. A no-op for the
+                    // renormalized softmax mode (route_mode 3 already sums to 1), but
+                    // required for sigmoid gating.
+                    moe_block.moe.router.renorm,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
