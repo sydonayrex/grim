@@ -198,6 +198,8 @@ impl SolarOpen2Block {
             ..Default::default()
         };
         let spec = crate::moe_block::MoESpec {
+
+    renorm: true,
             num_experts: cfg.num_routed_experts,
             top_k: cfg.top_k,
             router_kind: grim_nn::moe::RouterKind::SoftmaxTopK,

@@ -1040,8 +1040,10 @@ impl DecodeGraphModel for Llama {
                 let num_experts = moe_block.moe.router.num_experts;
                 let top_k = moe_block.moe.router.top_k.min(num_experts).max(1);
                 let (route_mode, bias_rocm) = match moe_block.moe.router.kind {
-                    grim_nn::moe::RouterKind::SoftmaxTopK => (0, None),
-                    grim_nn::moe::RouterKind::SoftmaxTopKRenorm => (3, None),
+                    grim_nn::moe::RouterKind::SoftmaxTopK
+                    | grim_nn::moe::RouterKind::SoftmaxTopKRenorm => {
+                        (moe_block.moe.router.softmax_route_mode(), None)
+                    }
                     grim_nn::moe::RouterKind::SigmoidTopKWithBias => {
                         let b_rocm = moe_block.moe.router.correction_bias.as_ref().and_then(|b| {
                             b.storage()

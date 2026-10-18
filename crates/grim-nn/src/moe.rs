@@ -47,6 +47,18 @@ pub struct MoeRouter {
     pub top_k: usize,
     pub num_experts: usize,
     pub correction_bias: Option<Tensor>,
+    /// Whether the top-k combine weights are renormalized to sum to 1.
+    ///
+    /// llama.cpp `build_moe_ffn` gathers the *global* softmax probabilities at the
+    /// selected experts, so raw combine weights sum to `< 1` whenever
+    /// `top_k < num_experts`. It renormalizes them only when the architecture asks
+    /// for it — either `gating_op == SOFTMAX_WEIGHT` (GPT-OSS) or the per-arch
+    /// `norm_w` flag (`*.expert_weights_norm`). This field carries `norm_w`.
+    ///
+    /// `true` matches the majority of architectures and the pre-split host
+    /// behavior; `false` only for those upstream leaves unnormalized (Qwen2-MoE,
+    /// OLMoE). See `MoESpec::renorm`.
+    pub renorm: bool,
 }
 
 impl MoeRouter {
@@ -63,6 +75,31 @@ impl MoeRouter {
             top_k,
             num_experts,
             correction_bias,
+            renorm: true,
+        }
+    }
+
+    /// Override the top-k weight-renormalization policy (llama.cpp `norm_w`).
+    #[must_use]
+    pub fn with_renorm(mut self, renorm: bool) -> Self {
+        self.renorm = renorm;
+        self
+    }
+
+    /// Device `route_mode` implied by this router: 3 renormalizes over the
+    /// top-k, 0 uses the global softmax denominator. Both the eager-GPU and the
+    /// captured-graph paths must agree on this.
+    pub fn softmax_route_mode(&self) -> i32 {
+        match self.kind {
+            RouterKind::SoftmaxTopKRenorm => 3,
+            RouterKind::SoftmaxTopK => {
+                if self.renorm {
+                    3
+                } else {
+                    0
+                }
+            }
+            RouterKind::SigmoidTopKWithBias => 2,
         }
     }
 
@@ -122,11 +159,18 @@ impl MoeRouter {
             order.sort_by(|&a, &b| sel_scores[b].partial_cmp(&sel_scores[a]).unwrap());
             let chosen = &order[..k];
 
-            // Combine weights.
+            // Combine weights. For the softmax kinds `sel_scores` is already
+            // `softmax(row)` — the *global* softmax that llama.cpp gathers from —
+            // so the unnormalized path is just a gather. Renormalizing re-softmaxes
+            // over the chosen logits, matching upstream's `norm_w` division.
             let raw: Vec<f32> = match &self.kind {
                 RouterKind::SoftmaxTopK | RouterKind::SoftmaxTopKRenorm => {
-                    let logits: Vec<f32> = chosen.iter().map(|&i| row[i]).collect();
-                    softmax(&logits)
+                    if self.renorm {
+                        let logits: Vec<f32> = chosen.iter().map(|&i| row[i]).collect();
+                        softmax(&logits)
+                    } else {
+                        chosen.iter().map(|&i| sel_scores[i]).collect()
+                    }
                 }
                 RouterKind::SigmoidTopKWithBias => {
                     chosen.iter().map(|&i| sigmoid(row[i])).collect()
@@ -2489,8 +2533,9 @@ impl MoeFfn {
 
         // Route mode + optional per-expert bias (sigmoid+bias gating).
         let (route_mode, bias_rocm) = match self.router.kind {
-            RouterKind::SoftmaxTopK => (0, None),
-            RouterKind::SoftmaxTopKRenorm => (3, None),
+            RouterKind::SoftmaxTopK | RouterKind::SoftmaxTopKRenorm => {
+                (self.router.softmax_route_mode(), None)
+            }
             RouterKind::SigmoidTopKWithBias => {
                 let bias_rocm = self.router.correction_bias.as_ref().and_then(|b| {
                     let bs: &dyn BackendStorage = &**b.storage();
@@ -3280,12 +3325,13 @@ mod tests {
         assert!((w[0][1] - (1.0 - expected0)).abs() < 1e-5);
     }
 
-    /// C4 split: host `route()` treats `SoftmaxTopK` and `SoftmaxTopKRenorm`
-    /// identically (shared match arm) — the global-softmax vs renorm-over-
-    /// top-k distinction (device route_mode 0 vs 3) lives ONLY in device
-    /// dispatch, proven by `moe_all_models_parity_gpu`. Pin the host
-    /// conflation here so a future divergence fails loudly instead of
-    /// silently changing which arm the host reference describes.
+    /// With the default `renorm = true`, the host `route()` treats `SoftmaxTopK`
+    /// and `SoftmaxTopKRenorm` identically, and that matches the device. The
+    /// global-softmax vs renorm-over-top-k distinction is *not* device-only: it is
+    /// llama.cpp's per-arch `norm_w` flag, carried by `MoeRouter::renorm` so host
+    /// and device agree per architecture. See
+    /// `unnormalized_topk_gathers_global_softmax_probs` for the `renorm = false`
+    /// half (Qwen2-MoE, OLMoE).
     #[test]
     fn renorm_kind_routes_identically_to_softmax_on_host() {
         let a = build_synthetic(RouterKind::SoftmaxTopK, None, None);
@@ -3294,6 +3340,29 @@ mod tests {
         let (idx_b, w_b) = b.router.route(&token()).unwrap();
         assert_eq!(idx_a, idx_b, "host selection identical across kinds");
         assert_eq!(w_a, w_b, "host weights identical across kinds");
+    }
+
+    /// llama.cpp `build_moe_ffn` gathers the *global* softmax probabilities at the
+    /// selected experts, so with `norm_w = false` (Qwen2-MoE, OLMoE) the combine
+    /// weights must NOT be renormalized to sum to 1.
+    #[test]
+    fn unnormalized_topk_gathers_global_softmax_probs() {
+        let mut m = build_synthetic(RouterKind::SoftmaxTopK, None, None);
+        m.router.renorm = false;
+        let (idx, w) = m.router.route(&token()).unwrap();
+        assert_eq!(idx[0], vec![0, 2], "selection is independent of the renorm policy");
+
+        let z = m.router.gate_logits(&token()).unwrap().to_vec_f32().unwrap();
+        let probs = softmax(&z);
+        assert!((w[0][0] - probs[0]).abs() < 1e-5, "weight is the gathered global prob");
+        assert!((w[0][1] - probs[2]).abs() < 1e-5, "weight is the gathered global prob");
+
+        let sum: f32 = w[0].iter().sum();
+        assert!(
+            (sum - (probs[0] + probs[2])).abs() < 1e-5,
+            "unnormalized sum must equal the gathered top-k mass, got {sum}"
+        );
+        assert!(sum < 1.0, "unnormalized top-k must not sum to 1, got {sum}");
     }
 
     #[test]

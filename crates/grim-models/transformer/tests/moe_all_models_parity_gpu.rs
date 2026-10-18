@@ -199,13 +199,19 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
             ),
             None,
         );
+        // The oracle below is a *global*-softmax oracle (combine weights are the
+        // gathered global probs, summing to < 1), so this router must opt out of
+        // renormalization. Upstream llama.cpp picks this per architecture via
+        // `build_moe_ffn`'s `norm_w` — `false` for Qwen2-MoE and OLMoE, `true` for
+        // Qwen3/Qwen3.5-MoE, Granite, Mellum and Llama.
         let router_gpu = MoeRouter::new(
             gate_linear_gpu,
             RouterKind::SoftmaxTopK,
             top_k,
             num_experts,
             None,
-        );
+        )
+        .with_renorm(false);
 
         let mut gate_gpu = Vec::new();
         let mut up_gpu = Vec::new();

@@ -11,6 +11,7 @@ use crate::model::LlamaConfig;
 /// Per-architecture routing configuration that distinguishes MoE families.
 #[derive(Debug, Clone)]
 pub struct MoESpec {
+
     /// Total number of experts (`expert_count`).
     pub num_experts: usize,
     /// Experts activated per token (`expert_used_count` / top-k).
@@ -18,6 +19,17 @@ pub struct MoESpec {
     /// Router scoring convention: softmax (Qwen/GLM/Granite/Phi/...) or
     /// sigmoid+bias (Laguna, DeepSeek-V2/V3 dedup gating).
     pub router_kind: RouterKind,
+    /// Whether the top-k combine weights are renormalized to sum to 1
+    /// (llama.cpp `build_moe_ffn`'s per-arch `norm_w` / `*.expert_weights_norm`).
+    ///
+    /// Upstream gathers the *global* softmax probabilities at the selected experts,
+    /// so weights sum to `< 1` whenever `top_k < num_experts`, and renormalizes only
+    /// where the architecture asks for it. Verified against
+    /// `old/repo/llama.cpp-master` `src/llama-graph.cpp`: `true` for Qwen3/Qwen3.5-
+    /// MoE, Granite (incl. hybrid/swa), Mellum, Maple, Llama; `false` for
+    /// Qwen2-MoE and OLMoE. Architectures whose upstream value comes from a
+    /// checkpoint key (Bailing-MoE3, Laguna) are not statically resolvable.
+    pub renorm: bool,
     /// Scaling applied to the (routed) expert output before adding the
     /// shared-expert contribution (`routed_scaling_factor`).
     pub routed_scaling_factor: f32,
@@ -76,7 +88,8 @@ impl MoeBlock {
             spec.top_k,
             spec.num_experts,
             correction_bias,
-        );
+        )
+        .with_renorm(spec.renorm);
 
         let moe_inter = spec.moe_intermediate_size.unwrap_or(cfg.intermediate_size);
         let shared_inter = spec
@@ -273,6 +286,8 @@ mod tests {
             world_size: 1,
         };
         let spec = MoESpec {
+
+     renorm: true,
             num_experts,
             top_k,
             router_kind: RouterKind::SoftmaxTopK,
