@@ -430,6 +430,18 @@ impl Lfm2 {
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        // Same seam Qwen35 and now Llama close: the replay runs on the graph's
+        // pool stream and the caller's first D2H (`hipMemcpy`) is NULL-stream
+        // ordered, so without this a logits readback can race kernels still in
+        // flight. (`forward_replay_batch` still returns unsynced — its callers
+        // own the ordering; do not copy this there blindly.)
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 

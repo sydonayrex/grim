@@ -91,6 +91,55 @@ pub struct TaskGraph {
     pub caps: CapabilitySet,
 }
 
+/// How much of a model's task graph the persistent ring (M4) can run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingReadiness {
+    /// Every opcode in the graph has ring support.
+    pub full: bool,
+    /// Opcodes present in the graph that the ring cannot execute; each such
+    /// node falls back to its ordinary launcher (the fallback contract), so
+    /// this is a coverage report, not an error.
+    pub missing: Vec<OpCode>,
+    /// Human-readable reason, always non-empty when `full` is false.
+    pub reason: String,
+}
+
+/// Derived compatibility predicate (plan task M3, condition 3).
+///
+/// Ask the emitted graph what it needs; never maintain a list of models. The
+/// only input is the capability set DERIVED from the nodes (`finish()` fills
+/// it), so a model that gains an op is automatically re-classified and a
+/// partially-supported model still reports `full: false` with the missing set
+/// rather than failing. `RING_OPCODES` — the one hand-maintained input, the
+/// opcodes the ring implements — lives in [`crate::task_graph_exec`].
+pub fn ring_ready(caps: &CapabilitySet) -> RingReadiness {
+    let ring: std::collections::BTreeSet<OpCode> =
+        crate::task_graph_exec::RING_OPCODES.iter().copied().collect();
+    let missing: Vec<OpCode> = caps
+        .opcodes
+        .iter()
+        .filter(|op| !ring.contains(op) && **op != op::FALLBACK)
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        RingReadiness {
+            full: true,
+            missing: Vec::new(),
+            reason: "every opcode in the graph has ring support".into(),
+        }
+    } else {
+        RingReadiness {
+            full: false,
+            reason: format!(
+                "ring implements {:?}; graph also needs {missing:?}, which falls back \
+                 to its ordinary launcher per node",
+                ring.iter().collect::<Vec<_>>()
+            ),
+            missing,
+        }
+    }
+}
+
 #[derive(Default)]
 #[derive(Debug)]
 pub struct TaskGraphBuilder {
@@ -138,6 +187,17 @@ impl TaskGraphBuilder {
             scope,
         });
         idx
+    }
+
+    /// Number of nodes pushed so far. The emitter walks are strictly
+    /// sequential, so "the previously emitted node" is `len() - 1` — that is
+    /// the dependency every mid-chain node carries.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
     }
 
     pub fn finish(self) -> TaskGraph {

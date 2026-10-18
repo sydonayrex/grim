@@ -91,6 +91,72 @@ pub trait DecodeGraphModel: Send + Sync {
     ) -> Result<Vec<Option<ConvDeviceSeed<'a>>>> {
         Ok(Vec::new())
     }
+
+    /// M2: interpret the PUBLISHED task graph for one decode step.
+    ///
+    /// Walks `graph.buffers.emitted_task_graph` in dependency order
+    /// (`task_graph_exec::execute`) and dispatches each node through this
+    /// model's EXISTING launchers — the compatibility oracle of plan task M2:
+    /// "IR execution == graph replay, for any model", available before any new
+    /// kernel exists. The FALLBACK contract lives here: a node whose opcode
+    /// this model cannot dispatch individually runs through the model's
+    /// ordinary launcher path for that stage rather than erroring, so one
+    /// exotic op costs a model its megakernel only on that node.
+    ///
+    /// Default: `Unimplemented` — a model without an interpreter still
+    /// captures and replays; only the IR-execution oracle is unavailable.
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        let _ = (graph, token_id);
+        Err(grim_core::error::Error::Unimplemented(
+            "model has no task-graph interpreter (forward_interpret_ir)".into(),
+        ))
+    }
+
+    /// M4: interpret the published IR with its GEMM nodes routed to the
+    /// persistent task ring instead of their launchers.
+    ///
+    /// `ring` is the caller's REUSABLE context ([`TaskRingContext`]): the
+    /// descriptors are staged once, so the context outlives a single step and the
+    /// steady-state step performs no upload. Every node that is NOT an
+    /// executable GEMM goes through its ordinary launcher exactly as
+    /// [`Self::forward_interpret_ir`] does, which is the fallback contract the
+    /// conversion relies on.
+    ///
+    /// Default: `Unimplemented` — M4 converts one opcode at a time, so a model
+    /// without this method is simply not ring-converted yet.
+    fn forward_interpret_ir_ring(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: &mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    ) -> Result<()> {
+        let _ = (graph, token_id, ring);
+        Err(grim_core::error::Error::Unimplemented(
+            "model has no task-graph ring interpreter (forward_interpret_ir_ring)".into(),
+        ))
+    }
+
+    /// The shared IR walk behind the two entry points above.
+    ///
+    /// `ring = None` is the M2 route: GEMM nodes are served by the block
+    /// launchers (ATTENTION's dispatch) and the head stage. `Some` routes each
+    /// GEMM node to the persistent wave instead — ONE launch for the whole set.
+    ///
+    /// Declared on the trait (default `Unimplemented`) rather than as an
+    /// inherent method so every model's interpreter shares ONE walk: the two
+    /// entry points cannot drift apart, and a model that has not converted to
+    /// the ring still gets the M2 walk for free.
+    fn interpret_ir(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: Option<&mut grim_backend_rocm::kernels::task_ring::TaskRingContext>,
+    ) -> Result<()> {
+        let _ = (graph, token_id, ring);
+        Err(grim_core::error::Error::Unimplemented(
+            "model has no task-graph IR walk (interpret_ir)".into(),
+        ))
+    }
 }
 
 // ─── Helpers for Graph Recording ──────────────────────────────────────────
@@ -1008,9 +1074,82 @@ impl DecodeGraphModel for Llama {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
 
+        // M1/M2 emitter: one node per model-level launch during capture.
+        let mut emit_last: u32 = u32::MAX;
+        if graph.emitter.is_some() && graph.capturing {
+            let seg0 = graph.segments.first().map(|s| s.device).unwrap_or(dev.ordinal());
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.token_ids_dev.bytes() as u64, 1),
+                    (graph.buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_input[0].bytes() as u64, 2),
+                ],
+                &[],
+                seg0 as u8,
+            );
+        }
+
         // Forward all layers
         for (i, layer) in self.layers.iter().enumerate() {
             layer.forward_graph(i, &graph.buffers, &dev)?;
+
+            // M1/M2 emitter: one block node (ATTENTION) plus one FFN GEMM node
+            // per layer; dense FFN and MoE share the same FFN GEMM slot.
+            if graph.emitter.is_some() && graph.capturing {
+                // Llama-3.2-1B is all-attention; every block is an ATTENTION node.
+                let kind = grim_backend_rocm::task_graph::op::ATTENTION;
+                let blk_args = [
+                    (
+                        graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_input[i].bytes() as u64,
+                        1u8,
+                    ),
+                    (
+                        graph.buffers.k_arena[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.k_arena[i].bytes() as u64,
+                        0u8,
+                    ),
+                    (
+                        graph.buffers.v_arena[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.v_arena[i].bytes() as u64,
+                        0u8,
+                    ),
+                    (
+                        graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_output[i].bytes() as u64,
+                        2u8,
+                    ),
+                ];
+                let blk = graph.emit_node(
+                    kind,
+                    [self.cfg.head_dim as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &blk_args,
+                    &[emit_last],
+                    dev.ordinal() as u8,
+                );
+                let ffn_args = [
+                    (
+                        graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_output[i].bytes() as u64,
+                        1u8,
+                    ),
+                ];
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::GEMM,
+                    [
+                        graph.buffers.layer_output[i].shape().dims().last().copied().unwrap_or(0) as u32,
+                        graph.buffers.layer_output[i].shape().dims().last().copied().unwrap_or(0) as u32,
+                        graph.buffers.layer_output[i].shape().dims().last().copied().unwrap_or(0) as u32,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
+                    &ffn_args,
+                    &[blk],
+                    dev.ordinal() as u8,
+                );
+            }
 
             if let Some(Some(moe_block)) = self.moe_blocks.get(i) {
                 let act = &graph.buffers.act_q81_buf[i];
@@ -1187,6 +1326,39 @@ impl DecodeGraphModel for Llama {
             &graph.buffers.head_output,
             &graph.buffers.act_q81_buf[0],
         )?;
+
+        // M1/M2 emitter: final norm + head GEMM.
+        if graph.emitter.is_some() && graph.capturing {
+            let last_ord = match self.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::NORM,
+                [self.cfg.hidden_size as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[(
+                    graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                    graph.buffers.head_input.bytes() as u64,
+                    1u8,
+                )],
+                &[emit_last],
+                last_ord as u8,
+            );
+            let _ = graph.emit_node(
+                grim_backend_rocm::task_graph::op::GEMM,
+                [
+                    self.cfg.vocab_size as u32,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+                &[(
+                    graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                    graph.buffers.head_output.bytes() as u64,
+                    2u8,
+                )],
+                &[emit_last],
+                last_ord as u8,
+            );
+        }
 
         Ok(())
     }
@@ -8532,12 +8704,32 @@ impl DecodeGraphModel for Xing40 {
                 grim_core::error::Error::Backend("xing40 graph scratch poisoned".into())
             })?;
         let scratch = &mut *scratch_guard;
-        let buffers = &mut graph.buffers;
-        let batch = buffers.batch.max(1);
+        let batch = graph.buffers.batch.max(1);
         let hidden = self.cfg.hidden_size;
         let hc = scratch.hc;
         let flat = scratch.flat;
         let cfg = &self.cfg;
+
+        // M1/M2 emitter: embedding gather ELEMENTWISE node.
+        if graph.emitter.is_some() && graph.capturing {
+            let _ = graph.emit_node(
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[(
+                    graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                    graph.buffers.token_ids_dev.bytes() as u64,
+                    1u8,
+                ), (
+                    graph.buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                    graph.buffers.layer_input[0].bytes() as u64,
+                    2u8,
+                )],
+                &[],
+                dev.ordinal() as u8,
+            );
+        }
+
+        let buffers = &mut graph.buffers;
 
         // Aliasing probe (env-gated): the graph writes NaN over sin[0] on every
         // replay, and sin is read-only in this body. A pool buffer that OVERLAPS
@@ -8619,6 +8811,7 @@ impl DecodeGraphModel for Xing40 {
             batch * hidden,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
         // Broadcast the gathered row across the hc streams (the same column
         // writes seed_streams_device performs; write_cols is a pure kernel).
         for h in 0..hc {
