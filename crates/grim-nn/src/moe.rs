@@ -2918,7 +2918,14 @@ impl LookaheadPredictor {
     }
 
     /// Softmax over `logits`, then take `top_k` by probability and renormalize the
-    /// selected probabilities over the chosen set (mirrors `MoeRouter::route`'s SoftmaxTopK combine-weight convention).
+    /// selected probabilities over the chosen set.
+    ///
+    /// This is deliberately *not* `MoeRouter::route`'s combine-weight convention.
+    /// Those weights are architecture-dependent (`MoeRouter::renorm`) and are
+    /// derived from real gate logits, whereas this runs on *predicted* logits to
+    /// describe a forecast hot set. The result feeds only `routing_consistency`
+    /// and the SRP/SCH gate — never expert dispatch — so a distribution summing to
+    /// 1 is the right shape here regardless of the architecture's `renorm`.
     fn top_k_from_logits(&self, logits: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let probs = softmax(logits);
         let mut order: Vec<usize> = (0..self.num_experts).collect();
