@@ -1,0 +1,530 @@
+//! Plan Phase M, task M4: the persistent task ring — ONE launch executes a step's
+//! `op::GEMM` nodes.
+//!
+//! The ring is not a new device kernel. It is a host-side plan/enqueue layer
+//! over the wave that already exists (`grim_scythe_persistent_dispatch`,
+//! `scythe_persistent.rs`), which polls a VRAM slot array and switches on the
+//! descriptor opcode. What this task adds:
+//!
+//! 1. **A plan.** `TaskRingPlan::from_graph` reads the emitted task graph and
+//!    binds the subset of `op::GEMM` nodes a ring could actually run — nodes that
+//!    name all three operands by role AND carry geometry AND whose weight is
+//!    native f32. The wave's GEMM arm computes in f32, so a quantized weight is
+//!    not executable by it: that node stays on its ordinary launcher, which is
+//!    the fallback contract (partial conversion is always usable) and is why the
+//!    ring never dequantizes.
+//!
+//! 2. **Staged descriptors.** The plan is serialized to a device-side array ONCE
+//!    (the geometry of a decode step does not change between steps), so the
+//!    steady-state step performs no descriptor upload at all.
+//!
+//! 3. **One launch.** `launch_task_ring` launches the wave with `staged_count != 0`;
+//!    the wave's prologue uploads the descriptors and repoints tail/head, then the
+//!    existing poll loop consumes them. Enqueue + dispatch = ONE launch for the
+//!    whole step's GEMM set, where the launcher path spends one launch per node.
+//!
+//! The task-graph `op` numbering and the scythe descriptor numbering are DIFFERENT
+//! conventions (task-graph `op::GEMM` is 1; the wave's row-GEMM is 2). The ring
+//! translates at this boundary and nowhere else — the IR keeps its own ids.
+//!
+//! `wave_launch_count` is the launch-count assertion's subject: it must advance
+//! by exactly one per step regardless of how many GEMM nodes the step has.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
+use grim_tensor::{BackendStorage, MemoryOps, Shape};
+
+use crate::device::util::{arg, as_rocm, dev_ptr};
+use crate::scythe_task_descriptors::ScytheTaskDescriptor;
+use crate::task_graph::{arg_role, op, ArgEntry, TaskGraph};
+
+/// Wave-side opcode for a row-major-B GEMM: B is `[N, K]`, `C = A @ B^T`.
+/// This is the `matmul_op` convention, which is what grim's dense linears use.
+const OP_ROW_GEMM: u32 = 2;
+/// Wave-side opcode for an RMS norm over the last axis (`eps` is fixed in the
+/// kernel). Matches the arm in `scythe_persistent::KERNEL_SOURCE`.
+const OP_NORM: u32 = 4;
+
+/// The task-graph `op` → wave opcode translation (M5: opcode generalization).
+///
+/// Two numbering systems meet here: the task graph's (`op::GEMM` = 1, `op::NORM`
+/// = 10, …) and the scythe descriptor's (row-GEMM = 2, norm = 4, …). The ring
+/// translates at this table and nowhere else, so the IR keeps its own ids and a
+/// wave never sees one.
+///
+/// This is a CONVERTIBILITY list, not a capability list: an entry means the wave
+/// has an arm for that opcode AND the ring can bind the node's operands to it.
+/// `op::NORM` is the M5 first entry (the arm exists; the Llama emitter's head
+/// node gains the weight/geometry it needs). `op::ATTENTION` is deliberately
+/// absent — the wave's arm wants `q`/`k`/`v`/`out` and `seq_len`/`num_heads`/
+/// `head_dim`, and today's ATTENTION nodes carry neither the operands nor that
+/// param layout, so binding it would be a guess.
+const OP_Q8_0_DOT4: u32 = 8; // V_DOT4_I32_IU8 integer-dot arm (Q8_0 quantized GEMM)
+
+pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
+    (crate::task_graph::op::GEMM, OP_ROW_GEMM),
+    (crate::task_graph::op::NORM, OP_NORM),
+    (crate::task_graph::op::Q8_0_DOT4, OP_Q8_0_DOT4),
+];
+
+/// Translate a task-graph opcode to its wave opcode.
+///
+/// `None` means the ring cannot execute this opcode — the caller leaves the node
+/// on its ordinary launcher (the fallback contract). Never a silent default: a
+/// node run by the wrong arm is a wrong result, not an error.
+pub fn wave_opcode(op: crate::task_graph::OpCode) -> Option<u32> {
+    WAVE_OPCODES.iter().find(|&&(o, _)| o == op).map(|&(_, w)| w)
+}
+
+/// How many descriptors one staged array holds. 64 covers the largest in-tree
+/// emitter (40 layers x FFN + head) with headroom; a plan larger than this
+/// stages the first `STAGED_CAPACITY` and leaves the rest on their launchers.
+pub const STAGED_CAPACITY: u32 = 64;
+
+/// One ring-executable GEMM. All pointers are device addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingGemm {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub input: u64,
+    pub weight: u64,
+    pub output: u64,
+    pub quant: u32,
+    /// The IR node index this entry was derived from. The interpreter matches
+    /// on this rather than on a bare counter: a model whose GEMMs are
+    /// interleaved with other nodes has unbindable GEMMs too (a quantized
+    /// weight, a missing operand), and those occupy no plan slot — so counting
+    /// GEMM nodes and indexing the plan by that count desyncs the moment one is
+    /// skipped.
+    pub ir_node: u32,
+}
+
+/// The executable subset of a task graph, in dependency order (the order the
+/// wave will consume it — the slots are a FIFO, so a mis-ordered plan is a wrong
+/// result, not an error).
+/// One ring-executable RMS norm: `out[m,k] = a[m,k] * rsqrt(mean(a^2)) * w[k]`.
+/// Geometry is `m` (rows) and `k` (the normalized axis).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingNorm {
+    pub m: u32,
+    pub k: u32,
+    pub input: u64,
+    pub weight: u64,
+    pub output: u64,
+    pub ir_node: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskRingPlan {
+    pub gemms: Vec<TaskRingGemm>,
+    pub norms: Vec<TaskRingNorm>,
+}
+
+impl TaskRingPlan {
+    /// Bind the ring-executable GEMM subset of an emitted task graph.
+    ///
+    /// A node is bound only when it is `op::GEMM`, names all three operands by
+    /// role, has real geometry, and its weight is native (`params[0] == 0`).
+    /// Anything else — a quantized weight, a missing operand, a node with no
+    /// down projection — is simply absent from the plan and keeps running on
+    /// its ordinary launcher. The ring reports what it took rather than guessing.
+    pub fn from_graph(ir: &TaskGraph) -> Self {
+        let mut gemms = Vec::new();
+        let mut norms = Vec::new();
+        // Indexed, not searched: `execute` walks in dependency order rather than
+        // node order, so the emitter's own index is the only thing that links a
+        // plan entry back to the node it came from.
+        for (idx, node) in ir.nodes.iter().enumerate() {
+            // Both converted opcodes bind the same way: resolve the operands by
+            // ROLE first, then apply each opcode's own geometry and capability
+            // check. A node that fails its check is absent from the plan and keeps
+            // running on its ordinary launcher.
+            if node.opcode != op::GEMM && node.opcode != op::NORM {
+                continue;
+            }
+            let (mut input, mut weight, mut output) = (None, None, None);
+            for &h in &node.args[..node.n_args as usize] {
+                let entry: &ArgEntry = match ir.arg_table.get(h as usize) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                match entry.role {
+                    r if r == arg_role::ACT_IN => input = Some(entry.ptr),
+                    r if r == arg_role::WEIGHT => weight = Some(entry.ptr),
+                    r if r == arg_role::ACT_OUT => output = Some(entry.ptr),
+                    _ => {}
+                }
+            }
+            match (input, weight, output) {
+                (Some(i), Some(w), Some(o)) => {
+                    if node.opcode == op::NORM {
+                        // `m`/`k` in params[2..4]. The wave's arm fixes `eps` at
+                        // 1e-5, the Llama-family value: a model with a different
+                        // epsilon is NOT bound here, because normalizing with the
+                        // wrong constant is a silent wrong answer.
+                        let m = node.params[2];
+                        let k = node.params[1];
+                        if m == 0 || k == 0 {
+                            continue;
+                        }
+                        norms.push(TaskRingNorm {
+                            m,
+                            k,
+                            input: i,
+                            weight: w,
+                            output: o,
+                            ir_node: idx as u32,
+                        });
+                        continue;
+                    }
+                    // GEMM: `n`/`k`/`m` in params[1..4], and a native weight
+                    // (`params[0] == 0`) because the f32 arm cannot dequantize.
+                    let n = node.params[1];
+                    let k = node.params[2];
+                    let m = node.params[3];
+                    if m == 0 || n == 0 || k == 0 || node.params[0] != 0 {
+                        continue;
+                    }
+                    gemms.push(TaskRingGemm {
+                        m,
+                        n,
+                        k,
+                        input: i,
+                        weight: w,
+                        output: o,
+                        quant: node.params[0],
+                        ir_node: idx as u32,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Self { gemms, norms }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.gemms.is_empty() && self.norms.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.gemms.len()
+    }
+
+    pub fn norms(&self) -> &[TaskRingNorm] {
+        &self.norms
+    }
+
+    /// The ring's whole dispatch set for one step — what the launch-count
+    /// assertion measures.
+    pub fn step_len(&self) -> usize {
+        self.gemms.len() + self.norms.len()
+    }
+
+    /// Serialize the plan into the device-side staged array.
+    ///
+    /// `ScytheTaskDescriptor`'s own layout is the ABI here (that is the contract
+    /// `upload()` and the scythe path already honour), so the bytes are produced
+    /// from the struct rather than by hand.
+    ///
+    /// Returns the storage plus the number of descriptors actually staged (the
+    /// first `STAGED_CAPACITY` of the plan).
+    ///
+    /// The returned storage must outlive every wave that reads it: the staged
+    /// array holds the descriptors the wave dereferences on each step, so it is
+    /// uploaded ONCE and kept. Callers that do not want to track it can
+    /// `mem::forget` it — a few KB against the weights it schedules.
+    pub fn stage_on_device(
+        &self,
+        dev: &crate::RocmDevice,
+    ) -> crate::Result<(Box<dyn BackendStorage>, u32)> {
+        let count = self.gemms.len().min(STAGED_CAPACITY as usize);
+        let mut bytes = vec![0u8; count * std::mem::size_of::<ScytheTaskDescriptor>()];
+        for (i, g) in self.gemms.iter().take(count).enumerate() {
+            let desc = ScytheTaskDescriptor {
+                opcode: OP_ROW_GEMM,
+                m: g.m,
+                n: g.n,
+                k: g.k,
+                input_ptr: g.input,
+                weight_ptr: g.weight,
+                output_ptr: g.output,
+                peer_ptr: 0,
+                status: 0,
+            };
+            let off = i * std::mem::size_of::<ScytheTaskDescriptor>();
+            let cell = unsafe {
+                std::slice::from_raw_parts(
+                    &desc as *const ScytheTaskDescriptor as *const u8,
+                    std::mem::size_of::<ScytheTaskDescriptor>(),
+                )
+            };
+            bytes[off..off + cell.len()].copy_from_slice(cell);
+        }
+        let storage = dev.from_cpu_bytes(
+            &bytes,
+            &Shape::new(vec![bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+        Ok((storage, count as u32))
+    }
+}
+
+/// A caller-owned, REUSABLE ring context for one task graph.
+///
+/// The descriptors are uploaded ONCE (`stage_on_device`), because the geometry
+/// of a decode step does not change between steps; re-staging per step would
+/// put the very launch back this task removes. `launch` then spends ONE wave per
+/// step for the whole GEMM set.
+pub struct TaskRingContext {
+    plan: TaskRingPlan,
+    staged: Option<Box<dyn BackendStorage>>,
+    count: u32,
+    /// The ring itself, owned by the context and reused across steps: the wave
+    /// repoints tail/head every step, so the same buffers serve all of them.
+    slots: Box<dyn BackendStorage>,
+    tail: Box<dyn BackendStorage>,
+    head: Box<dyn BackendStorage>,
+    stop: Box<dyn BackendStorage>,
+    capacity: u32,
+}
+
+impl TaskRingContext {
+    /// Derive and stage the ring-executable subset of an emitted task graph, and
+    /// allocate the ring it will run on.
+    ///
+    /// `None` when the graph contains no executable GEMM — nothing to convert,
+    /// and the caller keeps every node on its launchers.
+    pub fn from_graph(dev: &crate::RocmDevice, ir: &TaskGraph) -> crate::Result<Option<Self>> {
+        let plan = TaskRingPlan::from_graph(ir);
+        if plan.is_empty() && plan.norms.is_empty() {
+            return Ok(None);
+        }
+        let capacity = 32u32;
+        let slots = dev.alloc_scythe_ring_bytes((capacity as usize) * 64)?;
+        let u32_scalar = |v: u32| {
+            dev.from_cpu_bytes(
+                &v.to_ne_bytes(),
+                &Shape::new(vec![1]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+            )
+        };
+        let mut ctx = Self {
+            plan,
+            staged: None,
+            count: 0,
+            slots: Box::new(slots),
+            tail: u32_scalar(0)?,
+            head: u32_scalar(0)?,
+            stop: u32_scalar(0)?,
+            capacity,
+        };
+        // Stage AFTER the ring exists so the caller gets a fully formed context
+        // back; the plan is known non-empty here, so count lands non-zero.
+        let (staged, count) = ctx.plan.stage_on_device(dev)?;
+        ctx.staged = Some(staged);
+        ctx.count = count;
+        Ok(Some(ctx))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The number of GEMMs this context runs per step.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    /// The plan itself — for a caller that wants to assert what was converted.
+    pub fn plan(&self) -> &TaskRingPlan {
+        &self.plan
+    }
+
+    /// Enqueue ONE GEMM and drain it with a one-task wave.
+    ///
+    /// This is the granularity an INTERLEAVED model forces: a non-resident wave
+    /// launched on the caller's stream SERIALIZES with every host kernel queued
+    /// behind it, so a wave launched at the start of the step would run all of
+    /// the GEMMs before layer 1's attention exists. Descriptors therefore go in
+    /// one at a time, at the point in the step where each runs.
+    ///
+    /// The launches per node are the ones `scythe_route::route_gemm` already
+    /// spends (slot write, head publish, wave) — all on-device and
+    /// graph-capturable, none a host round-trip. What this task adds over that
+    /// path is that the descriptor comes from the EMITTED TASK GRAPH rather than
+    /// a hand-written call site, which is what lets a model convert without its
+    /// launcher knowing a ring exists.
+    ///
+    /// The ONE-launch-per-step property is therefore NOT claimed for an
+    /// interleaved model here; it is what a resident wave on its own stream
+    /// (task M6) buys. [`Self::launch`] is the whole-set form, used where the
+    /// GEMM set is contiguous.
+    pub fn enqueue_gemm(&self, dev: &crate::RocmDevice, g: &TaskRingGemm) -> crate::Result<()> {
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_ROW_GEMM,
+            g.m,
+            g.n,
+            g.k,
+            g.input,
+            g.weight,
+            g.output,
+            0,
+        )?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Enqueue one RMS norm and drain it with a one-task wave.
+    ///
+    /// The wave's arm fixes `eps` at 1e-5 — the Llama-family value. A model
+    /// whose norm uses a different epsilon is NOT bound (see `from_graph`),
+    /// because normalizing with the wrong constant is a silent wrong answer.
+    pub fn enqueue_norm(&self, dev: &crate::RocmDevice, n: &TaskRingNorm) -> crate::Result<()> {
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_NORM,
+            n.m,
+            n.k,
+            0,
+            n.input,
+            n.weight,
+            n.output,
+            0,
+        )?;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// ONE launch for the WHOLE staged set (a contiguous GEMM run).
+    pub fn launch(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        let staged = self.staged.as_deref().ok_or_else(|| {
+            crate::Error::Backend("task ring context has no staged array".into())
+        })?;
+        launch_task_ring(
+            dev,
+            &*self.slots,
+            self.capacity,
+            &*self.tail,
+            &*self.head,
+            &*self.stop,
+            Some(staged),
+            self.count,
+        )?
+        .synchronize()?;
+        Ok(())
+    }
+}
+
+/// Wave launches since process start. The M4 gate asserts this advances by
+/// exactly one per step, which is the property the phase exists to buy: a
+/// launcher path spends one launch per GEMM node, the ring spends one per step.
+static WAVE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Host-side monotonic head counter for the per-node enqueue path. The device
+/// `head` scalar is published from this; monotonic across steps, which is what
+/// lets the wave tell "queue empty" from "nothing enqueued yet".
+static NEXT_HEAD: AtomicU64 = AtomicU64::new(0);
+
+pub fn wave_launch_count() -> u64 {
+    WAVE_LAUNCHES.load(Ordering::Relaxed)
+}
+
+/// ONE launch for the whole step's GEMM set.
+///
+/// `staged` is the device array from [`TaskRingPlan::stage_on_device`]; the
+/// wave's prologue uploads `staged_count` descriptors into the slots and repoints
+/// tail/head, then the existing poll loop consumes them. The caller must not
+/// also call `launch_scythe_publish_head` — the wave publishes head itself, and
+/// a host publish on top of that would double-advance the counter.
+///
+/// `staged_count` must be `> 0` with `staged` present (a null array with a
+/// non-zero count would have the wave read nothing), and must be `<= capacity`
+/// (the prologue masks with `capacity - 1`).
+pub fn launch_task_ring(
+    dev: &crate::RocmDevice,
+    slots: &dyn BackendStorage,
+    capacity: u32,
+    tail: &dyn BackendStorage,
+    head: &dyn BackendStorage,
+    stop: &dyn BackendStorage,
+    staged: Option<&dyn BackendStorage>,
+    staged_count: u32,
+) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
+    // `None, 0` is the pre-existing contract (the host published `head`; the
+    // prologue is a no-op). A count with a null array is the bug: the wave would
+    // read nothing while believing it has work.
+    let staged = match staged {
+        Some(s) if staged_count > 0 => Some(s),
+        None if staged_count == 0 => None,
+        _ => {
+            return Err(crate::Error::Backend(
+                "launch_task_ring: staged_count > 0 requires the staged descriptor array"
+                    .into(),
+            ))
+        }
+    };
+    if staged_count > capacity {
+        return Err(crate::Error::Backend(format!(
+            "launch_task_ring: staged_count {staged_count} exceeds ring capacity {capacity}"
+        )));
+    }
+    let mut slots_ptr = dev_ptr(as_rocm(slots)?)?;
+    let mut tail_ptr = dev_ptr(as_rocm(tail)?)?;
+    let mut head_ptr = dev_ptr(as_rocm(head)?)?;
+    let mut stop_ptr = dev_ptr(as_rocm(stop)?)?;
+    // The staged pointer is only meaningful when the prologue runs
+    // (staged_count > 0); pass null otherwise — the kernel never reads it.
+    let mut staged_ptr: *mut std::ffi::c_void = match staged {
+        Some(s) => crate::device::util::dev_ptr_dyn(s)?,
+        None => std::ptr::null_mut(),
+    };
+    let mut cap = capacity;
+    let mut limit = staged_count;
+    let mut count = staged_count;
+    let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+    dev.launch_compute_kernel(
+        "grim_scythe_persistent_dispatch",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut slots_ptr),
+            arg(&mut cap),
+            arg(&mut tail_ptr),
+            arg(&mut head_ptr),
+            arg(&mut stop_ptr),
+            arg(&mut limit),
+            arg(&mut 0u32), // resident = 0: the staged prologue resets tail
+            arg(&mut staged_ptr),
+            arg(&mut count),
+        ],
+    )?;
+    WAVE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    Ok(Box::new(crate::RocmHandle::new(Some(
+        dev.active_stream(),
+    ))))
+}

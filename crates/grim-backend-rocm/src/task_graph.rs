@@ -25,6 +25,11 @@ pub mod op {
     pub const ELEMENTWISE: super::OpCode = 12;
     pub const SAMPLE: super::OpCode = 13;
     pub const PEER_COPY: super::OpCode = 14;
+    /// Q8_0 dot4 GEMM (plan PM-6 / condition 4): a quantized GEMM whose weight
+    /// is Q8_0 and whose wave arm is the integer-dot (`V_DOT4_I32_IU8`) arm,
+    /// *not* the f32 GEMM arm. Distinct from `op::GEMM` because a Q8_0 weight
+    /// cannot run on the f32 arm and the ring never dequantizes.
+    pub const Q8_0_DOT4: super::OpCode = 15;
     /// Extension point: an op with no opcode yet runs through its existing
     /// launcher (Phase M fallback contract). It still participates in the DAG,
     /// so its dependents stay correctly ordered.

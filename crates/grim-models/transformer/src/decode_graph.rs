@@ -8,7 +8,8 @@ use std::sync::Arc;
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
     ConvDeviceSeed, ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
-    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
+    check_layer_topology, decode_graph_enabled, emit_node_into, launch_attention,
+    launch_qkv_gemv,
 };
 use grim_core::error::Result;
 use grim_nn::NormKind;
@@ -8812,6 +8813,9 @@ impl DecodeGraphModel for Xing40 {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
 
+        // M1/M2 emitter chain cursor, updated by per-layer nodes below.
+        let mut emit_last: u32 = u32::MAX;
+
         // Broadcast the gathered row across the hc streams (the same column
         // writes seed_streams_device performs; write_cols is a pure kernel).
         for h in 0..hc {
@@ -9978,6 +9982,79 @@ impl DecodeGraphModel for Xing40 {
                 hc,
                 hidden,
             )?;
+
+            // M1/M2 emitter: per-layer block node (ATTENTION) plus FFN node
+            // (MOE_DISPATCH for routed layers, GEMM for the dense lead).
+            // Uses the free fn emit_node_into so only graph.emitter is borrowed,
+            // which is disjoint from the `buffers` borrow held across this function.
+            let blk_ord = dev.ordinal();
+            if graph.emitter.is_some() && graph.capturing {
+                let sin = as_rocm(scratch.sin[i].as_ref())?;
+                let sout = as_rocm(scratch.sout[i].as_ref())?;
+                let norm_buf = buffers.norm_buf[i].device_ptr_u64().unwrap_or(0);
+                let norm_bytes = buffers.norm_buf[i].bytes() as u64;
+                let moe_out = buffers.moe_out[i].device_ptr_u64().unwrap_or(0);
+                let moe_bytes = buffers.moe_out[i].bytes() as u64;
+                let attn_args = [
+                    (sin.device_ptr_u64().unwrap_or(0), sin.bytes() as u64, 1u8),
+                    (sout.device_ptr_u64().unwrap_or(0), sout.bytes() as u64, 2u8),
+                ];
+                let attn = emit_node_into(
+                    &mut graph.emitter,
+                    grim_backend_rocm::task_graph::op::ATTENTION,
+                    [hidden as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &attn_args,
+                    &[],
+                    blk_ord as u8,
+                );
+                if attn == u32::MAX {
+                    // emitter was disabled between the is_some check and now; skip.
+                } else if layer.moe.is_some() {
+                    let moe_args = [
+                        (norm_buf, norm_bytes, 1u8),
+                        (moe_out, moe_bytes, 2u8),
+                    ];
+                    emit_last = emit_node_into(
+                        &mut graph.emitter,
+                        grim_backend_rocm::task_graph::op::MOE_DISPATCH,
+                        [hidden as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        &moe_args,
+                        &[attn],
+                        blk_ord as u8,
+                    );
+                } else if layer.mlp.is_some() {
+                    let ffn_args = [(norm_buf, norm_bytes, 1u8), (norm_buf, norm_bytes, 2u8)];
+                    emit_last = emit_node_into(
+                        &mut graph.emitter,
+                        grim_backend_rocm::task_graph::op::GEMM,
+                        [
+                            hidden as u32,
+                            hidden as u32,
+                            hidden as u32,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                        &ffn_args,
+                        &[attn],
+                        blk_ord as u8,
+                    );
+                } else {
+                    // No FFN on this layer: chain straight through.
+                    emit_last = attn;
+                }
+            }
+
             // HOST ORACLE for the FFN write-back, i.e. sin[1] — the value the
             // per-layer ratio table has tracked since the first session (graph
             // 3.9997e-3 vs eager 4.03218e-3). Same formula as the attention
@@ -10051,6 +10128,65 @@ impl DecodeGraphModel for Xing40 {
             &buffers.head_output,
             &buffers.act_q81_buf[0],
         )?;
+
+        // M1/M2 emitter: final norm + head GEMM.
+        let blk_ord = dev.ordinal();
+        if graph.emitter.is_some() && graph.capturing {
+            let meaned = as_rocm(scratch.meaned.as_ref())?;
+            let norm_args = [
+                (meaned.device_ptr_u64().unwrap_or(0), meaned.bytes() as u64, 1u8),
+                (meaned.device_ptr_u64().unwrap_or(0), meaned.bytes() as u64, 2u8),
+            ];
+            let norm_node = emit_node_into(
+                &mut graph.emitter,
+                grim_backend_rocm::task_graph::op::NORM,
+                [hidden as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &norm_args,
+                &[emit_last],
+                blk_ord as u8,
+            );
+            let meaned_dev = meaned.device_ptr_u64().unwrap_or(0);
+            let meaned_bytes = meaned.bytes() as u64;
+            let head_w = as_rocm(self.output.weight().storage().as_ref())?;
+            let head_args = [
+                (meaned_dev, meaned_bytes, 1u8),
+                (head_w.device_ptr_u64().unwrap_or(0), head_w.bytes() as u64, 0u8),
+                (
+                    buffers.head_output.device_ptr_u64().unwrap_or(0),
+                    buffers.head_output.bytes() as u64,
+                    2u8,
+                ),
+            ];
+            // Xing40's forward_capture ends here: emit_last is the terminal head
+            // node (nothing downstream consumes it), so the head GEMM is a
+            // statement, not a chain update.
+            let _ = emit_node_into(
+                &mut graph.emitter,
+                grim_backend_rocm::task_graph::op::GEMM,
+                [
+                    hidden as u32,
+                    hidden as u32,
+                    self.cfg.vocab_size as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                &head_args,
+                &[norm_node],
+                blk_ord as u8,
+            );
+        }
+
         Ok(())
     }
 
