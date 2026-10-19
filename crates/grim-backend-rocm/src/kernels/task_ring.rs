@@ -45,6 +45,16 @@ const OP_ROW_GEMM: u32 = 2;
 /// Wave-side opcode for an RMS norm over the last axis (`eps` is fixed in the
 /// kernel). Matches the arm in `scythe_persistent::KERNEL_SOURCE`.
 const OP_NORM: u32 = 4;
+/// Wave-side opcode for element-wise add: `out[i] = a[i] + b[i]` over `m*n`
+/// elements. The ELEMENTWISE task-graph opcode maps here; the emitter must
+/// ensure the node is actually a binary add (the arm cannot do anything else).
+const OP_ADD: u32 = 7;
+/// Wave-side opcode for attention: flash-attention with q/k/v/out and
+/// seq_len/num_heads/head_dim. The arm has a hard 256 head_dim limit.
+const OP_ATTN: u32 = 3;
+/// Wave-side opcode for MoE dispatch: casts `weight_ptr` to
+/// `moe_task_descriptor_t*` and calls the fused MoE kernel inline.
+const OP_MOE: u32 = 6;
 
 /// The task-graph `op` → wave opcode translation (M5: opcode generalization).
 ///
@@ -55,16 +65,17 @@ const OP_NORM: u32 = 4;
 ///
 /// This is a CONVERTIBILITY list, not a capability list: an entry means the wave
 /// has an arm for that opcode AND the ring can bind the node's operands to it.
-/// `op::NORM` is the M5 first entry (the arm exists; the Llama emitter's head
-/// node gains the weight/geometry it needs). `op::ATTENTION` is deliberately
-/// absent — the wave's arm wants `q`/`k`/`v`/`out` and `seq_len`/`num_heads`/
-/// `head_dim`, and today's ATTENTION nodes carry neither the operands nor that
-/// param layout, so binding it would be a guess.
+/// M5 adds NORM (already bound, was missing from RING_OPCODES), ELEMENTWISE
+/// (OP_ADD — a binary add), ATTENTION (OP_ATTN — flash attention), and
+/// MOE_DISPATCH (OP_MOE — fused MoE with data-dependent routing schedule).
 const OP_Q8_0_DOT4: u32 = 8; // V_DOT4_I32_IU8 integer-dot arm (Q8_0 quantized GEMM)
 
 pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::GEMM, OP_ROW_GEMM),
     (crate::task_graph::op::NORM, OP_NORM),
+    (crate::task_graph::op::ELEMENTWISE, OP_ADD),
+    (crate::task_graph::op::ATTENTION, OP_ATTN),
+    (crate::task_graph::op::MOE_DISPATCH, OP_MOE),
     (crate::task_graph::op::Q8_0_DOT4, OP_Q8_0_DOT4),
 ];
 
@@ -116,10 +127,66 @@ pub struct TaskRingNorm {
     pub ir_node: u32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// One ring-executable element-wise add: `out[i] = a[i] + b[i]` over `m*n` elements.
+/// The wave's OP_ADD arm is a binary add; the emitter must ensure the node is
+/// actually an add (the arm cannot do anything else).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingAdd {
+    pub m: u32,
+    pub n: u32,
+    pub input_a: u64,
+    pub input_b: u64,
+    pub output: u64,
+    pub ir_node: u32,
+}
+
+/// One ring-executable attention: flash-attention with q/k/v/out.
+/// Geometry is `seq_len` (m), `num_heads` (n), `head_dim` (k).
+/// The wave's OP_ATTN arm has a hard 256 head_dim limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingAttn {
+    pub seq_len: u32,
+    pub num_heads: u32,
+    pub head_dim: u32,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub output: u64,
+    pub ir_node: u32,
+}
+
+/// One ring-executable MoE dispatch. The wave's OP_MOE arm casts `weight_ptr`
+/// to `moe_task_descriptor_t*`, so the descriptor must be staged on device and
+/// its address passed as the weight pointer. The routing schedule
+/// (token_ids, expert_ids, weights) is data-dependent — it changes per step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TaskRingMoe {
+    pub hidden: u32,
+    pub inter: u32,
+    pub num_tokens: u32,
+    pub block_size: u32,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub quant_mode: u32,
+    pub routed_scaling_factor: f32,
+    pub gate_w: u64,
+    pub up_w: u64,
+    pub down_w: u64,
+    pub token_ids: u64,
+    pub expert_ids: u64,
+    pub weights: u64,
+    pub input: u64,
+    pub output: u64,
+    pub ir_node: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TaskRingPlan {
     pub gemms: Vec<TaskRingGemm>,
     pub norms: Vec<TaskRingNorm>,
+    pub adds: Vec<TaskRingAdd>,
+    pub attns: Vec<TaskRingAttn>,
+    pub moes: Vec<TaskRingMoe>,
 }
 
 impl TaskRingPlan {
@@ -133,52 +200,150 @@ impl TaskRingPlan {
     pub fn from_graph(ir: &TaskGraph) -> Self {
         let mut gemms = Vec::new();
         let mut norms = Vec::new();
+        let mut adds = Vec::new();
+        let mut attns = Vec::new();
+        let mut moes = Vec::new();
         // Indexed, not searched: `execute` walks in dependency order rather than
         // node order, so the emitter's own index is the only thing that links a
         // plan entry back to the node it came from.
         for (idx, node) in ir.nodes.iter().enumerate() {
-            // Both converted opcodes bind the same way: resolve the operands by
-            // ROLE first, then apply each opcode's own geometry and capability
-            // check. A node that fails its check is absent from the plan and keeps
-            // running on its ordinary launcher.
-            if node.opcode != op::GEMM && node.opcode != op::NORM {
-                continue;
+            // Resolve operands by ROLE first, then apply each opcode's own
+            // geometry and capability check. A node that fails its check is
+            // absent from the plan and keeps running on its ordinary launcher.
+            match node.opcode {
+                op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH => {}
+                _ => continue,
             }
             let (mut input, mut weight, mut output) = (None, None, None);
+            let mut second_input = None;
             for &h in &node.args[..node.n_args as usize] {
                 let entry: &ArgEntry = match ir.arg_table.get(h as usize) {
                     Some(e) => e,
                     None => continue,
                 };
                 match entry.role {
-                    r if r == arg_role::ACT_IN => input = Some(entry.ptr),
+                    r if r == arg_role::ACT_IN => {
+                        if input.is_none() {
+                            input = Some(entry.ptr);
+                        } else {
+                            second_input = Some(entry.ptr);
+                        }
+                    }
                     r if r == arg_role::WEIGHT => weight = Some(entry.ptr),
                     r if r == arg_role::ACT_OUT => output = Some(entry.ptr),
                     _ => {}
                 }
             }
-            match (input, weight, output) {
-                (Some(i), Some(w), Some(o)) => {
-                    if node.opcode == op::NORM {
-                        // `m`/`k` in params[2..4]. The wave's arm fixes `eps` at
-                        // 1e-5, the Llama-family value: a model with a different
-                        // epsilon is NOT bound here, because normalizing with the
-                        // wrong constant is a silent wrong answer.
-                        let m = node.params[2];
-                        let k = node.params[1];
-                        if m == 0 || k == 0 {
-                            continue;
-                        }
-                        norms.push(TaskRingNorm {
-                            m,
-                            k,
-                            input: i,
-                            weight: w,
-                            output: o,
-                            ir_node: idx as u32,
-                        });
+            match node.opcode {
+                op::NORM => {
+                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
+                    // `m`/`k` in params[2..4]. The wave's arm fixes `eps` at
+                    // 1e-5, the Llama-family value: a model with a different
+                    // epsilon is NOT bound here, because normalizing with the
+                    // wrong constant is a silent wrong answer.
+                    let m = node.params[2];
+                    let k = node.params[1];
+                    if m == 0 || k == 0 {
                         continue;
                     }
+                    norms.push(TaskRingNorm { m, k, input: i, weight: w, output: o, ir_node: idx as u32 });
+                }
+                op::ELEMENTWISE => {
+                    let (Some(a), Some(b), Some(o)) = (input, second_input, output) else { continue };
+                    // OP_ADD: `out[i] = a[i] + b[i]` over `m*n` elements.
+                    // params[0] = m, params[1] = n.
+                    let m = node.params[0];
+                    let n = node.params[1];
+                    if m == 0 || n == 0 {
+                        continue;
+                    }
+                    adds.push(TaskRingAdd { m, n, input_a: a, input_b: b, output: o, ir_node: idx as u32 });
+                }
+                op::ATTENTION => {
+                    let (Some(q), Some(k), Some(o)) = (input, weight, output) else { continue };
+                    // OP_ATTN: input=q, weight=k, peer=v, output=out.
+                    // The wave's arm has a hard 256 head_dim limit.
+                    let seq_len = node.params[0];
+                    let num_heads = node.params[1];
+                    let head_dim = node.params[2];
+                    if seq_len == 0 || num_heads == 0 || head_dim == 0 || head_dim > 256 {
+                        continue;
+                    }
+                    // V is the peer operand — the third ACT_IN or a SCRATCH role.
+                    let v = second_input.or_else(|| {
+                        node.args[..node.n_args as usize].iter().find_map(|&h| {
+                            ir.arg_table.get(h as usize).and_then(|e| {
+                                if e.role == arg_role::SCRATCH { Some(e.ptr) } else { None }
+                            })
+                        })
+                    });
+                    let Some(v) = v else { continue };
+                    attns.push(TaskRingAttn { seq_len, num_heads, head_dim, q, k, v, output: o, ir_node: idx as u32 });
+                }
+                op::MOE_DISPATCH => {
+                    let (Some(input), Some(output)) = (input, output) else { continue };
+                    // OP_MOE: the wave casts weight_ptr to moe_task_descriptor_t*.
+                    // The descriptor must be staged on device. The routing
+                    // schedule (token_ids, expert_ids, weights) is data-dependent.
+                    // params layout: [quant_mode, hidden, inter, num_tokens,
+                    //   block_size, num_experts, top_k]
+                    let quant_mode = node.params[0];
+                    let hidden = node.params[1];
+                    let inter = node.params[2];
+                    let num_tokens = node.params[3];
+                    let block_size = node.params[4];
+                    let num_experts = node.params[5];
+                    let top_k = node.params[6];
+                    if hidden == 0 || inter == 0 || num_experts == 0 || top_k == 0 {
+                        continue;
+                    }
+                    // The wave's OP_MOE arm only supports MOE_QUANT_FP32.
+                    if quant_mode != 0 {
+                        continue;
+                    }
+                    // Resolve the weight and schedule pointers from the arg table.
+                    let mut gate_w = None;
+                    let mut up_w = None;
+                    let mut down_w = None;
+                    let mut token_ids = None;
+                    let mut expert_ids = None;
+                    let mut weights = None;
+                    for &h in &node.args[..node.n_args as usize] {
+                        let Some(e) = ir.arg_table.get(h as usize) else { continue };
+                        match e.role {
+                            r if r == arg_role::WEIGHT => {
+                                if gate_w.is_none() {
+                                    gate_w = Some(e.ptr);
+                                } else if up_w.is_none() {
+                                    up_w = Some(e.ptr);
+                                } else if down_w.is_none() {
+                                    down_w = Some(e.ptr);
+                                }
+                            }
+                            r if r == arg_role::SCRATCH => {
+                                if token_ids.is_none() {
+                                    token_ids = Some(e.ptr);
+                                } else if expert_ids.is_none() {
+                                    expert_ids = Some(e.ptr);
+                                } else if weights.is_none() {
+                                    weights = Some(e.ptr);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let (Some(gw), Some(uw), Some(dw), Some(ti), Some(ei), Some(w)) =
+                        (gate_w, up_w, down_w, token_ids, expert_ids, weights) else { continue };
+                    moes.push(TaskRingMoe {
+                        hidden, inter, num_tokens, block_size, num_experts, top_k,
+                        quant_mode, routed_scaling_factor: 1.0,
+                        gate_w: gw, up_w: uw, down_w: dw,
+                        token_ids: ti, expert_ids: ei, weights: w,
+                        input, output, ir_node: idx as u32,
+                    });
+                }
+                op::GEMM => {
+                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
                     // GEMM: `n`/`k`/`m` in params[1..4], and a native weight
                     // (`params[0] == 0`) because the f32 arm cannot dequantize.
                     let n = node.params[1];
@@ -187,25 +352,17 @@ impl TaskRingPlan {
                     if m == 0 || n == 0 || k == 0 || node.params[0] != 0 {
                         continue;
                     }
-                    gemms.push(TaskRingGemm {
-                        m,
-                        n,
-                        k,
-                        input: i,
-                        weight: w,
-                        output: o,
-                        quant: node.params[0],
-                        ir_node: idx as u32,
-                    });
+                    gemms.push(TaskRingGemm { m, n, k, input: i, weight: w, output: o, quant: node.params[0], ir_node: idx as u32 });
                 }
                 _ => {}
             }
         }
-        Self { gemms, norms }
+        Self { gemms, norms, adds, attns, moes }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.gemms.is_empty() && self.norms.is_empty()
+        self.gemms.is_empty() && self.norms.is_empty() && self.adds.is_empty()
+            && self.attns.is_empty() && self.moes.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -216,10 +373,22 @@ impl TaskRingPlan {
         &self.norms
     }
 
+    pub fn adds(&self) -> &[TaskRingAdd] {
+        &self.adds
+    }
+
+    pub fn attns(&self) -> &[TaskRingAttn] {
+        &self.attns
+    }
+
+    pub fn moes(&self) -> &[TaskRingMoe] {
+        &self.moes
+    }
+
     /// The ring's whole dispatch set for one step — what the launch-count
     /// assertion measures.
     pub fn step_len(&self) -> usize {
-        self.gemms.len() + self.norms.len()
+        self.gemms.len() + self.norms.len() + self.adds.len() + self.attns.len() + self.moes.len()
     }
 
     /// Serialize the plan into the device-side staged array.
@@ -301,7 +470,7 @@ impl TaskRingContext {
     /// and the caller keeps every node on its launchers.
     pub fn from_graph(dev: &crate::RocmDevice, ir: &TaskGraph) -> crate::Result<Option<Self>> {
         let plan = TaskRingPlan::from_graph(ir);
-        if plan.is_empty() && plan.norms.is_empty() {
+        if plan.is_empty() {
             return Ok(None);
         }
         let capacity = 32u32;
@@ -346,6 +515,12 @@ impl TaskRingContext {
     /// The plan itself — for a caller that wants to assert what was converted.
     pub fn plan(&self) -> &TaskRingPlan {
         &self.plan
+    }
+
+    /// The NORM entries of the plan. Kept on the context (not the plan) because
+    /// the interpreter holds the context; the plan is a value.
+    pub fn norms(&self) -> &[TaskRingNorm] {
+        &self.plan.norms
     }
 
     /// Enqueue ONE GEMM and drain it with a one-task wave.
@@ -410,6 +585,115 @@ impl TaskRingContext {
             n.input,
             n.weight,
             n.output,
+            0,
+        )?;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Enqueue one element-wise add and drain it with a one-task wave.
+    ///
+    /// The wave's OP_ADD arm computes `out[i] = a[i] + b[i]` over `m*n`
+    /// elements. The emitter must ensure the node is actually a binary add.
+    pub fn enqueue_add(&self, dev: &crate::RocmDevice, a: &TaskRingAdd) -> crate::Result<()> {
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_ADD,
+            a.m,
+            a.n,
+            0,
+            a.input_a,
+            a.input_b,
+            a.output,
+            0,
+        )?;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Enqueue one attention and drain it with a one-task wave.
+    ///
+    /// The wave's OP_ATTN arm computes flash-attention with q/k/v/out.
+    /// The arm has a hard 256 head_dim limit (enforced at bind time).
+    pub fn enqueue_attn(&self, dev: &crate::RocmDevice, a: &TaskRingAttn) -> crate::Result<()> {
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_ATTN,
+            a.seq_len,
+            a.num_heads,
+            a.head_dim,
+            a.q,
+            a.k,
+            a.output,
+            a.v,
+        )?;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Enqueue one MoE dispatch and drain it with a one-task wave.
+    ///
+    /// The wave's OP_MOE arm casts `weight_ptr` to `moe_task_descriptor_t*`,
+    /// so the descriptor is staged on device and its address passed as the
+    /// weight pointer. The routing schedule (token_ids, expert_ids, weights)
+    /// is data-dependent — it changes per step as routing decisions change.
+    ///
+    /// The wave's arm only supports MOE_QUANT_FP32; a quantized MoE is NOT
+    /// bound (see `from_graph`).
+    pub fn enqueue_moe(&self, dev: &crate::RocmDevice, m: &TaskRingMoe) -> crate::Result<()> {
+        use crate::scythe_task_descriptors::{moe_quant_mode, MoETaskDescriptor};
+        // Stage the MoETaskDescriptor on device. The wave casts weight_ptr to
+        // moe_task_descriptor_t*, so the descriptor must be in device memory.
+        let desc = MoETaskDescriptor {
+            hidden: m.hidden,
+            inter: m.inter,
+            num_tokens: m.num_tokens,
+            block_size: m.block_size,
+            num_experts: m.num_experts,
+            top_k: m.top_k,
+            quant_mode: moe_quant_mode::FP32,
+            routed_scaling_factor: m.routed_scaling_factor,
+            gate_w_ptr: m.gate_w,
+            up_w_ptr: m.up_w,
+            down_w_ptr: m.down_w,
+            token_ids_ptr: m.token_ids,
+            expert_ids_ptr: m.expert_ids,
+            weights_ptr: m.weights,
+        };
+        let desc_ptr = desc.upload(dev)?;
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_MOE,
+            m.num_tokens,
+            m.num_experts,
+            m.top_k,
+            m.input,
+            desc_ptr,
+            m.output,
             0,
         )?;
         let head_ptr = as_rocm(self.head.as_ref())?

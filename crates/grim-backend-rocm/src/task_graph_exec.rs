@@ -108,5 +108,9 @@ pub fn execute(
 /// `missing` rather than being silently assumed.
 pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     crate::task_graph::op::GEMM,
+    crate::task_graph::op::NORM,
+    crate::task_graph::op::ELEMENTWISE,
+    crate::task_graph::op::ATTENTION,
+    crate::task_graph::op::MOE_DISPATCH,
     crate::task_graph::op::Q8_0_DOT4,
 ];

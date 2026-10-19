@@ -1445,6 +1445,30 @@ impl DecodeGraphBuffers {
         Ok(())
     }
 
+    /// Reset the replay position state to "empty arena": `current_pos` and
+    /// every layer's live-row total go back to 0.
+    ///
+    /// THREE fields drive a replay and they must move together: the host-side
+    /// `current_pos` mirror (which `forward_replay` publishes to each device's
+    /// `pos_dev`), and `layer_totals[i]` (the append row index AND the
+    /// attention live-row count). `begin_capture` touches none of them, and
+    /// every caller warms the pool up by EXECUTING `forward_capture` with
+    /// `capturing == false` first — the warmups are what memoize the weight
+    /// caches a capture cannot allocate — so without this the first replay
+    /// inherits the warmups' bumps and its attention reads rows the warmups
+    /// wrote. `write_layer_totals` covers one of the three and had no caller;
+    /// a hand-rolled reset re-derives the list at each call site, which is how
+    /// a reset that misses one field stays invisible. This is the one place
+    /// that knows all of them.
+    ///
+    /// A caller that HAS a prefill should seed instead: `write_layer_totals`
+    /// with the prefill length, plus the KV rows themselves.
+    pub fn reset_for_replay(&mut self) -> Result<()> {
+        self.write_layer_totals(0)?;
+        // `write_pos_async` also updates the `current_pos` host mirror.
+        self.write_pos_all_segments(0)
+    }
+
     /// D1-2a: seed EVERY layer's KV total to `rows` (the prefill length),
     /// each on its layer's device. Call after arena seeding and BEFORE the
     /// first replay; in-graph bumps then maintain them per step, and a
@@ -1772,41 +1796,52 @@ impl DecodeGraphBuffers {
                 let total_k_bytes = self.k_arena[layer_idx].bytes;
                 if total_k_bytes > n_bytes {
                     let tail_bytes = total_k_bytes - n_bytes;
-                    unsafe {
+                    crate::check_hip("seed_kv_arena hipMemsetAsync K tail", unsafe {
                         crate::device::handles::hipMemsetAsync(
                             (dst_k as *mut u8).add(n_bytes) as *mut std::ffi::c_void,
                             0,
                             tail_bytes,
                             stream,
-                        );
+                        )
+                    })?;
+                    crate::check_hip("seed_kv_arena hipMemsetAsync V tail", unsafe {
                         crate::device::handles::hipMemsetAsync(
                             (dst_v as *mut u8).add(n_bytes) as *mut std::ffi::c_void,
                             0,
                             tail_bytes,
                             stream,
-                        );
-                    }
+                        )
+                    })?;
                 }
                 eprintln!(
                     "[seed-debug] layer {layer_idx}: copied {n_bytes} bytes ({n_rows} rows), tail {} bytes zeroed. total_arena={total_k_bytes}",
                     total_k_bytes.saturating_sub(n_bytes)
                 );
                 // BYTE-COMPARE CHECK: Verify graph arena matches eager arena bit-for-bit on rows 0..n_rows
-                unsafe {
-                    crate::device::handles::hipStreamSynchronize(stream);
-                    let mut host_eager_k = vec![0u8; n_bytes];
-                    let mut host_graph_k = vec![0u8; n_bytes];
-                    let mut host_eager_v = vec![0u8; n_bytes];
-                    let mut host_graph_v = vec![0u8; n_bytes];
-                    crate::hipMemcpy(host_eager_k.as_mut_ptr() as *mut std::ffi::c_void, src_k, n_bytes, HipMemcpyKind::DeviceToHost);
-                    crate::hipMemcpy(host_graph_k.as_mut_ptr() as *mut std::ffi::c_void, dst_k, n_bytes, HipMemcpyKind::DeviceToHost);
-                    crate::hipMemcpy(host_eager_v.as_mut_ptr() as *mut std::ffi::c_void, src_v, n_bytes, HipMemcpyKind::DeviceToHost);
-                    crate::hipMemcpy(host_graph_v.as_mut_ptr() as *mut std::ffi::c_void, dst_v, n_bytes, HipMemcpyKind::DeviceToHost);
+                crate::check_hip("seed_kv_arena hipStreamSynchronize", unsafe {
+                    crate::device::handles::hipStreamSynchronize(stream)
+                })?;
+                let mut host_eager_k = vec![0u8; n_bytes];
+                let mut host_graph_k = vec![0u8; n_bytes];
+                let mut host_eager_v = vec![0u8; n_bytes];
+                let mut host_graph_v = vec![0u8; n_bytes];
+                check_hip("seed_kv_arena D2H eager_k", unsafe {
+                    crate::hipMemcpy(host_eager_k.as_mut_ptr() as *mut std::ffi::c_void, src_k, n_bytes, HipMemcpyKind::DeviceToHost)
+                })?;
+                check_hip("seed_kv_arena D2H graph_k", unsafe {
+                    crate::hipMemcpy(host_graph_k.as_mut_ptr() as *mut std::ffi::c_void, dst_k, n_bytes, HipMemcpyKind::DeviceToHost)
+                })?;
+                check_hip("seed_kv_arena D2H eager_v", unsafe {
+                    crate::hipMemcpy(host_eager_v.as_mut_ptr() as *mut std::ffi::c_void, src_v, n_bytes, HipMemcpyKind::DeviceToHost)
+                })?;
+                check_hip("seed_kv_arena D2H graph_v", unsafe {
+                    crate::hipMemcpy(host_graph_v.as_mut_ptr() as *mut std::ffi::c_void, dst_v, n_bytes, HipMemcpyKind::DeviceToHost)
+                })?;
                     let k_diff = host_eager_k.iter().zip(host_graph_k.iter()).filter(|(a, b)| a != b).count();
                     let v_diff = host_eager_v.iter().zip(host_graph_v.iter()).filter(|(a, b)| a != b).count();
                     // Check for NaNs in rows 0..n_rows
-                    let k_u16: &[u16] = std::slice::from_raw_parts(host_graph_k.as_ptr() as *const u16, n_bytes / 2);
-                    let v_u16: &[u16] = std::slice::from_raw_parts(host_graph_v.as_ptr() as *const u16, n_bytes / 2);
+                    let k_u16: &[u16] = unsafe { std::slice::from_raw_parts(host_graph_k.as_ptr() as *const u16, n_bytes / 2) };
+                    let v_u16: &[u16] = unsafe { std::slice::from_raw_parts(host_graph_v.as_ptr() as *const u16, n_bytes / 2) };
                     let k_nans = k_u16.iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
                     let v_nans = v_u16.iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
                     eprintln!(
@@ -1822,7 +1857,6 @@ impl DecodeGraphBuffers {
                             }
                         }
                     }
-                }
                 continue;
             }
             if !(src.src_elem_bytes == 4 && arena_elem_bytes == 2) {
@@ -2256,6 +2290,28 @@ pub struct GraphSegment {
 unsafe impl Send for DecodeGraph {}
 unsafe impl Sync for DecodeGraph {}
 
+/// Push one node into a caller-held emitter (free fn so a model that holds a
+/// `&mut graph.buffers` reborrow across its capture walk can still emit: the
+/// emitter and the buffers are DISJOINT fields of `DecodeGraph`, and only a
+/// free fn can borrow them separately).
+pub fn emit_node_into(
+    emitter: &mut Option<crate::task_graph::TaskGraphBuilder>,
+    opcode: crate::task_graph::OpCode,
+    params: [u32; 16],
+    args: &[(u64, u64, u8)],
+    deps: &[u32],
+    dev_ord: u8,
+) -> u32 {
+    let Some(b) = emitter.as_mut() else {
+        return u32::MAX;
+    };
+    let handles: Vec<crate::task_graph::ArgId> = args
+        .iter()
+        .map(|&(ptr, bytes, role)| b.push_arg(ptr, bytes, role))
+        .collect();
+    b.push(opcode, params, &handles, deps, dev_ord, 0)
+}
+
 impl DecodeGraph {
     pub fn new(dev: &RocmDevice, buffers: DecodeGraphBuffers, stream: *mut c_void) -> Self {
         Self {
@@ -2332,14 +2388,7 @@ impl DecodeGraph {
         deps: &[u32],
         dev_ord: u8,
     ) -> u32 {
-        let Some(b) = self.emitter.as_mut() else {
-            return u32::MAX;
-        };
-        let handles: Vec<crate::task_graph::ArgId> = args
-            .iter()
-            .map(|&(ptr, bytes, role)| b.push_arg(ptr, bytes, role))
-            .collect();
-        b.push(opcode, params, &handles, deps, dev_ord, 0)
+        emit_node_into(&mut self.emitter, opcode, params, args, deps, dev_ord)
     }
 
     /// Publish the finished IR (called from `end_capture`).
@@ -2347,9 +2396,7 @@ impl DecodeGraph {
         if let Some(b) = self.emitter.take() {
             self.buffers.emitted_task_graph = Some(b.finish());
         }
-    }
-
-    /// Open segment `seg`'s capture bracket: begin capture on ITS stream under
+    }    /// Open segment `seg`'s capture bracket: begin capture on ITS stream under
     /// ITS device's guard, and raise THIS segment device's capture gate
     /// pointing at THIS segment's stream — `active_stream()` on that device
     /// then returns the capturing stream, so plain launches route into the
@@ -2820,6 +2867,10 @@ impl DecodeGraph {
 
 impl Drop for DecodeGraph {
     fn drop(&mut self) {
+        // HIP seam: graph-object destruction is device-context-sensitive, and
+        // a dropped graph at teardown runs on whatever ordinal the thread
+        // last touched. Pin the graph's own device for every destroy call.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             if !self.exec.is_null() {
                 let _ = hipGraphExecDestroy(self.exec);

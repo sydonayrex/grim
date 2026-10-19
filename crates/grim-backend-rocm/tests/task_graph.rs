@@ -73,3 +73,87 @@ fn unused_arg_slots_are_the_documented_sentinel() {
     assert_eq!(g.nodes[n as usize].args[0], only);
     assert_eq!(g.nodes[n as usize].args[1], u32::MAX);
 }
+
+/// M2: the walk dispatches every node exactly once, after its dependencies.
+/// The order assertion is the point — a scheduler that reorders silently is
+/// the failure the deterministic ready-set exists to prevent.
+#[test]
+fn execute_walks_in_dependency_order_and_detects_cycles() {
+    use grim_backend_rocm::task_graph_exec::execute;
+
+    // chain: 0 -> 1 -> 2, plus 3 depending on 0.
+    let mut b = TaskGraphBuilder::new();
+    let a = b.push(op::ELEMENTWISE, [0; 16], &[], &[], 0, 0);
+    let c = b.push(op::ATTENTION, [0; 16], &[], &[a], 0, 0);
+    let d = b.push(op::NORM, [0; 16], &[], &[c], 0, 0);
+    let _e = b.push(op::GEMM, [0; 16], &[], &[a], 0, 0);
+    let g = b.finish();
+
+    let mut fired = Vec::new();
+    execute(&g, |_idx, n| {
+        fired.push(n.opcode);
+        Ok(())
+    })
+    .expect("walk");
+    assert_eq!(fired.len(), 4, "every node dispatched exactly once");
+    assert_eq!(fired[0], op::ELEMENTWISE, "the root goes first");
+    assert!(
+        fired.iter().position(|&x| x == op::ATTENTION).unwrap()
+            < fired.iter().position(|&x| x == op::NORM).unwrap(),
+        "a node must run after its dependency"
+    );
+    let _ = d;
+
+    // Cycle: 0 -> 1 -> 0. `finish` does not validate, so build by hand.
+    let mut b = TaskGraphBuilder::new();
+    let x = b.push(op::GEMM, [0; 16], &[], &[], 0, 0);
+    let y = b.push(op::NORM, [0; 16], &[], &[x], 0, 0);
+    let mut g = b.finish();
+    g.nodes[x as usize].deps[0] = y;
+    g.nodes[x as usize].n_deps = 1;
+    let err = execute(&g, |_idx, _n| Ok(())).expect_err("cycle must be detected");
+    let msg = format!("{err}");
+    assert!(msg.contains("cycle"), "error must name the cycle: {msg}");
+}
+
+/// M3 / condition 3: readiness is a FUNCTION of the caps, not a constant.
+/// Empty ring: nothing is full, and every unsupported op shows up in
+/// `missing` with a reason.
+#[test]
+fn ring_ready_is_derived_from_the_capability_set() {
+    use grim_backend_rocm::task_graph::ring_ready;
+
+    // The expectation is DERIVED from RING_OPCODES, not hard-coded: M4 converted
+    // op::GEMM, so a GEMM-only graph is now full and the old "empty ring cannot
+    // be full" premise no longer holds for it. Pick an opcode the ring has NOT
+    // converted so the predicate still has something to report.
+    let unconverted = grim_backend_rocm::task_graph::op::RECURRENT;
+    assert!(
+        !grim_backend_rocm::task_graph_exec::RING_OPCODES.contains(&unconverted),
+        "pick an opcode RING_OPCODES has not converted"
+    );
+    let mut caps = grim_backend_rocm::task_graph::CapabilitySet::default();
+    caps.opcodes.insert(unconverted);
+    let r = ring_ready(&caps);
+    assert!(!r.full, "a ring that does not implement this opcode cannot be full");
+    assert_eq!(r.missing, vec![unconverted]);
+    assert!(!r.reason.is_empty());
+
+    // Adding another unsupported opcode must add to missing:
+    let mut caps2 = caps.clone();
+    caps2.opcodes.insert(op::ROPE);
+    let r2 = ring_ready(&caps2);
+    assert_eq!(r2.missing.len(), r.missing.len() + 1);
+
+    // A graph with only ring-supported opcodes is full:
+    let mut caps_supported = grim_backend_rocm::task_graph::CapabilitySet::default();
+    caps_supported.opcodes.insert(op::GEMM);
+    let r_supp = ring_ready(&caps_supported);
+    assert!(r_supp.full);
+    assert!(r_supp.missing.is_empty());
+
+    // A graph with no opcodes at all is trivially full.
+    let r3 = ring_ready(&grim_backend_rocm::task_graph::CapabilitySet::default());
+    assert!(r3.full);
+    assert!(r3.missing.is_empty());
+}
