@@ -703,6 +703,31 @@ fn qwen35_split_model_seed_families_run_on_their_own_devices() {
         .buffers
         .seed_kda_state_from_eager(&seed_dev, &kda)
         .expect("seed kda (split placement)");
+
+    // The trap the plan names (ai-arch-expert §5): a seed that lands NOTHING is
+    // SILENT — a zeroed recurrent state produces fluent-looking garbage with no
+    // error. So assert the recurrent state actually ARRIVED, not merely that the
+    // seed call returned Ok. `kda[i].is_some()` is the recurrent-layer predicate
+    // (attention layers allocate no KDA state), and every recurrent layer here
+    // must carry signal after the eager prefill seeded it.
+    RocmDevice::shared(0).synchronize();
+    RocmDevice::shared(1).synchronize();
+    let mut checked = 0usize;
+    for (i, kda) in graph.buffers.kda.iter().enumerate() {
+        let Some(k) = kda else { continue };
+        let v = k.state.to_cpu_vec_f32().expect("kda state readback");
+        assert!(
+            v.iter().any(|x| *x != 0.0),
+            "layer {i} KDA recurrent state is all zeros after seeding — the seed was dropped \
+             (this is the fluent-garbage failure mode, not an error)"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no recurrent layer exposed a KDA state — the split model is all-attention and this \
+         gate would be vacuous"
+    );
 }
 
 /// D1 GATE: the decode graph must SERVE `GRIM_KV_EVICT_MODE=curdkv` instead of
