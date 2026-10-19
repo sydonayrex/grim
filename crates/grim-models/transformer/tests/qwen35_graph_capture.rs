@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::{BackendStorage, RocmDevice};
 use grim_core::model::{AdapterHandle, CausalLm};
 use grim_models_transformer::decode_graph::DecodeGraphModel;
 use grim_models_transformer::qwen35::{Qwen35, Qwen35Config};
@@ -492,6 +492,78 @@ fn qwen35_layer_split_model_replays_like_eager() {
     unsafe {
         std::env::set_var("GRIM_KV_ARENA", "f16");
     }
+}
+
+/// A5b GATE: each segment's `pos` replica must LIVE on that segment's device and
+/// must receive the replay's start position.
+///
+/// A6's split-parity gate catches a wrong VALUE; this catches the wrong DEVICE.
+/// `pos_dev` is bumped INSIDE the graph (`launch_bump_i32_slots`), so on a split
+/// placement a device-1 layer would mutate device-0 memory — peer access covers
+/// the seed pairs only, not this path. The replica design puts one pos scalar on
+/// each segment's device and writes the replay start to all of them before the
+/// launches; this test asserts both halves of that contract directly, so a
+/// replica that silently stayed on device 0 fails HERE rather than as a fault
+/// (or a silent peer-read) on replay.
+#[test]
+fn pos_replicas_exist_per_segment_device_and_start_aligned() {
+    let Some((device, _dev)) = gpu_device() else {
+        return;
+    };
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices");
+        return;
+    }
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
+    // The planner prefers ONE device when the model fits, and this tiny model
+    // fits anywhere — force the split so replicas are actually built.
+    unsafe { std::env::set_var("GRIM_FORCE_SPLIT", "1") };
+    cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
+    let provider = synth_weights_hybrid(4, 2);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load split hybrid qwen35");
+    unsafe { std::env::remove_var("GRIM_FORCE_SPLIT") };
+
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("a layer-split model must be capturable");
+    assert_eq!(graph.segments.len(), 2, "one graph per device");
+
+    // 1. Every segment's replica must live on that segment's device. A replica
+    //    still on device 0 while segment 1's graph reads it is the A5b defect.
+    for (seg, s) in graph.segments.iter().enumerate() {
+        let p = graph.buffers.pos_dev_for(s.device);
+        assert_eq!(
+            p.device_ordinal(),
+            s.device,
+            "pos replica {seg} must live on its segment's device {}",
+            s.device
+        );
+    }
+
+    // 2. Writing the replay start position must land on EVERY segment's replica,
+    //    each on its own device's stream.
+    graph
+        .buffers
+        .write_pos_all_segments(7)
+        .expect("write pos to all segments");
+    for (seg, s) in graph.segments.iter().enumerate() {
+        RocmDevice::shared(s.device).synchronize();
+        let p = graph.buffers.pos_dev_for(s.device);
+        assert_eq!(
+            p.to_cpu_vec_u32().expect("read pos")[0],
+            7,
+            "replica {seg} (device {}) did not receive the replay start position",
+            s.device
+        );
+    }
+
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
 }
 
 /// A0 BASELINE (external review 2026-10-16, item 1). The captured pos scalar is
