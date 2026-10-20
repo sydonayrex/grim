@@ -54,6 +54,11 @@ const OP_ATTN: u32 = 3;
 /// Wave-side opcode for MoE dispatch: casts `weight_ptr` to
 /// `moe_task_descriptor_t*` and calls the fused MoE kernel inline.
 const OP_MOE: u32 = 6;
+/// Wave-side opcode for a peer broadcast: write the local source into the PEER
+/// device's buffer (`desc->peer_ptr`). This is M6's handoff primitive — segment
+/// *k* copies its boundary residual straight into segment *k+1*'s input, so the
+/// handoff never leaves the GPU and the host-side event disappears.
+const OP_PEER_BROADCAST: u32 = 9;
 
 /// The task-graph `op` → wave opcode translation (M5: opcode generalization).
 ///
@@ -81,6 +86,7 @@ pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::ELEMENTWISE, OP_ADD),
     (crate::task_graph::op::ATTENTION, OP_ATTN),
     (crate::task_graph::op::MOE_DISPATCH, OP_MOE),
+    (crate::task_graph::op::PEER_COPY, OP_PEER_BROADCAST),
 ];
 
 /// Translate a task-graph opcode to its wave opcode.
@@ -184,6 +190,17 @@ pub struct TaskRingMoe {
     pub ir_node: u32,
 }
 
+/// One ring-executable cross-device copy (M6): `dst[0..elems] = src[0..elems]`,
+/// where `dst` lives on the PEER device. `src` is this device's `ACT_IN` and
+/// `dst` is the node's `arg_role::PEER` operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingPeer {
+    pub elems: u32,
+    pub src: u64,
+    pub dst: u64,
+    pub ir_node: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TaskRingPlan {
     pub gemms: Vec<TaskRingGemm>,
@@ -191,6 +208,7 @@ pub struct TaskRingPlan {
     pub adds: Vec<TaskRingAdd>,
     pub attns: Vec<TaskRingAttn>,
     pub moes: Vec<TaskRingMoe>,
+    pub peers: Vec<TaskRingPeer>,
 }
 
 impl TaskRingPlan {
@@ -207,6 +225,7 @@ impl TaskRingPlan {
         let mut adds = Vec::new();
         let mut attns = Vec::new();
         let mut moes = Vec::new();
+        let mut peers = Vec::new();
         // Indexed, not searched: `execute` walks in dependency order rather than
         // node order, so the emitter's own index is the only thing that links a
         // plan entry back to the node it came from.
@@ -215,11 +234,13 @@ impl TaskRingPlan {
             // geometry and capability check. A node that fails its check is
             // absent from the plan and keeps running on its ordinary launcher.
             match node.opcode {
-                op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH => {}
+                op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH
+                | op::PEER_COPY => {}
                 _ => continue,
             }
             let (mut input, mut weight, mut output) = (None, None, None);
             let mut second_input = None;
+            let mut peer = None;
             for &h in &node.args[..node.n_args as usize] {
                 let entry: &ArgEntry = match ir.arg_table.get(h as usize) {
                     Some(e) => e,
@@ -235,10 +256,27 @@ impl TaskRingPlan {
                     }
                     r if r == arg_role::WEIGHT => weight = Some(entry.ptr),
                     r if r == arg_role::ACT_OUT => output = Some(entry.ptr),
+                    // M6: the destination lives on the OTHER device. It gets its
+                    // own role precisely so a handoff cannot be mistaken for a
+                    // local output.
+                    r if r == arg_role::PEER => peer = Some(entry.ptr),
                     _ => {}
                 }
             }
             match node.opcode {
+                op::PEER_COPY => {
+                    // `dst[0..elems] = src[0..elems]`, dst on the peer device.
+                    // The wave's OP_PEER_BROADCAST arm takes the element count in
+                    // `desc->m`; `params[0]` carries it. A copy with no peer
+                    // destination is NOT bound — it would be a local memcpy
+                    // wearing a handoff's name.
+                    let (Some(src), Some(dst)) = (input, peer) else { continue };
+                    let elems = node.params[0];
+                    if elems == 0 {
+                        continue;
+                    }
+                    peers.push(TaskRingPeer { elems, src, dst, ir_node: idx as u32 });
+                }
                 op::NORM => {
                     let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
                     // `m`/`k` in params[2..4]. The wave's arm fixes `eps` at
@@ -361,12 +399,12 @@ impl TaskRingPlan {
                 _ => {}
             }
         }
-        Self { gemms, norms, adds, attns, moes }
+        Self { gemms, norms, adds, attns, moes, peers }
     }
 
     pub fn is_empty(&self) -> bool {
         self.gemms.is_empty() && self.norms.is_empty() && self.adds.is_empty()
-            && self.attns.is_empty() && self.moes.is_empty()
+            && self.attns.is_empty() && self.moes.is_empty() && self.peers.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -389,10 +427,15 @@ impl TaskRingPlan {
         &self.moes
     }
 
+    pub fn peers(&self) -> &[TaskRingPeer] {
+        &self.peers
+    }
+
     /// The ring's whole dispatch set for one step — what the launch-count
     /// assertion measures.
     pub fn step_len(&self) -> usize {
-        self.gemms.len() + self.norms.len() + self.adds.len() + self.attns.len() + self.moes.len()
+        self.gemms.len() + self.norms.len() + self.adds.len() + self.attns.len()
+            + self.moes.len() + self.peers.len()
     }
 
     /// Serialize the plan into the device-side staged array.
@@ -724,6 +767,37 @@ impl TaskRingContext {
             desc_ptr,
             m.output,
             0,
+        )?;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Enqueue one cross-device copy and drain it with a one-task wave (M6).
+    ///
+    /// The wave's `OP_PEER_BROADCAST` arm writes `desc->input_ptr` into
+    /// `desc->peer_ptr` — the PEER device's buffer — over peer access, so the
+    /// handoff between segment *k* and segment *k+1* never leaves the GPU and the
+    /// host-side event between their graph launches is not needed. `desc->m`
+    /// carries the element count.
+    pub fn enqueue_peer_copy(&self, dev: &crate::RocmDevice, p: &TaskRingPeer) -> crate::Result<()> {
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_PEER_BROADCAST,
+            p.elems,
+            0,
+            0,
+            p.src,
+            0,
+            0,
+            p.dst,
         )?;
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()

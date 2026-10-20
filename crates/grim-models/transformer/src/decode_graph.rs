@@ -1641,6 +1641,8 @@ impl DecodeGraphModel for Llama {
         // a GEMM node the plan did not take simply has no plan slot.
         let mut ring_idx = 0usize;
         let mut ring_norm_idx = 0usize;
+        // M6: the cross-device handoff counter, same identity-match discipline.
+        let mut ring_peer_idx = 0usize;
         let trace = std::env::var_os("GRIM_IR_TRACE").is_some();
         grim_backend_rocm::task_graph_exec::execute(&ir, |idx, node| {
             match node.opcode {
@@ -1751,6 +1753,33 @@ impl DecodeGraphModel for Llama {
                     Ok(())
                 }
                 grim_backend_rocm::task_graph::op::MOE_DISPATCH => Ok(()),
+                // M6: the cross-device handoff. Identity-matched against the
+                // plan's `peers` exactly like the GEMM and NORM arms, so a node
+                // the plan could not bind (no PEER operand) stays on its
+                // launcher instead of being silently counted.
+                grim_backend_rocm::task_graph::op::PEER_COPY => {
+                    if let Some(ring) = ring.as_mut() {
+                        match ring.plan().peers().get(ring_peer_idx).copied() {
+                            Some(p) if p.ir_node == idx => {
+                                ring_peer_idx += 1;
+                                ring.enqueue_peer_copy(&dev, &p).map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "interpret ring peer copy: {e}"
+                                    ))
+                                })?;
+                            }
+                            Some(p) => {
+                                return Err(grim_core::error::Error::Backend(format!(
+                                    "interpret ring: PEER_COPY node {idx} is not the plan's next \
+                                     entry ({}) — the IR and the ring plan disagree",
+                                    p.ir_node
+                                )));
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(())
+                }
                 other => Err(grim_core::error::Error::Backend(format!(
                     "interpret: Llama cannot dispatch opcode {other} per node"
                 ))),
@@ -1784,6 +1813,13 @@ impl DecodeGraphModel for Llama {
                 return Err(grim_core::error::Error::Backend(format!(
                     "interpret ring: the walk claimed {ring_norm_idx} of {want_n} NORM plan \
                      entries — the IR and the ring plan disagree"
+                )));
+            }
+            let want_p = ring.plan().peers().len();
+            if ring_peer_idx != want_p {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "interpret ring: the walk claimed {ring_peer_idx} of {want_p} PEER_COPY \
+                     plan entries — the IR and the ring plan disagree"
                 )));
             }
         }

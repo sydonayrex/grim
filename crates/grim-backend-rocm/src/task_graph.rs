@@ -44,6 +44,12 @@ pub mod arg_role {
     pub const ACT_OUT: u8 = 2;
     pub const SCRATCH: u8 = 3;
     pub const SCALES: u8 = 4;
+    /// The PEER side of a cross-device transfer (M6). A `PEER_COPY` node's
+    /// destination lives on the OTHER device of a split placement, so it is not
+    /// an `ACT_OUT` — that role means "this device's output", and conflating the
+    /// two is how a handoff silently writes local memory instead of the peer's.
+    /// The wave's `OP_PEER_BROADCAST` arm reads it as `desc->peer_ptr`.
+    pub const PEER: u8 = 5;
 }
 
 /// One entry in the model-owned argument table.

@@ -117,4 +117,8 @@ pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     crate::task_graph::op::ELEMENTWISE,
     crate::task_graph::op::ATTENTION,
     crate::task_graph::op::MOE_DISPATCH,
+    // M6: the cross-device handoff. Bound to the wave's `OP_PEER_BROADCAST` arm
+    // and to `TaskRingPlan::peers`, so advertising it is honest — unlike
+    // Q8_0_DOT4, which was listed with no arm at all.
+    crate::task_graph::op::PEER_COPY,
 ];

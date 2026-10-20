@@ -30,7 +30,9 @@ fn capability_set_is_derived_from_the_nodes() {
 fn a_peer_node_marks_the_step_as_needing_peer_access() {
     let mut b = TaskGraphBuilder::new();
     let s = b.push_arg(1, 64, arg_role::ACT_IN);
-    let d = b.push_arg(2, 64, arg_role::ACT_OUT);
+    // The destination is the PEER's buffer, so it takes the PEER role — an
+    // ACT_OUT would mean "this device's output", which is a different thing.
+    let d = b.push_arg(2, 64, arg_role::PEER);
     b.push(op::PEER_COPY, [0; 16], &[s, d], &[], 0, 0);
     let w = b.push_arg(3, 128, arg_role::WEIGHT);
     b.push(op::GEMM, [0; 16], &[w], &[0], 1, 0);

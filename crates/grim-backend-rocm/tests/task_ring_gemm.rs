@@ -593,6 +593,57 @@ fn every_advertised_ring_opcode_maps_to_an_implemented_wave_arm() {
     );
 }
 
+/// M6 Step 1: `op::PEER_COPY` must BIND (it names an `ACT_IN` source and an
+/// `arg_role::PEER` destination) and EXECUTE. The wave's `OP_PEER_BROADCAST` arm
+/// writes `desc->input_ptr` into `desc->peer_ptr`, so pointing `peer_ptr` at a
+/// local buffer makes this a plain copy — testable on ONE device, and it is
+/// exactly the operation the cross-device handoff performs over peer access.
+///
+/// This is the gate that keeps `PEER_COPY` honest the way `Q8_0_DOT4` was not: it
+/// is in `RING_OPCODES` only because it binds AND runs.
+#[test]
+fn peer_copy_binds_and_executes() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let src: Vec<f32> = (0..16).map(|i| (i as f32 + 1.0) * 0.25).collect();
+    let (_s_s, s_ptr) = f32_dev(&dev, &src);
+    let (d_s, d_ptr) = f32_dev(&dev, &[0.0f32; 16]);
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_s = gb.push_arg(s_ptr, 64, arg_role::ACT_IN);
+    let h_d = gb.push_arg(d_ptr, 64, arg_role::PEER);
+    // params[0] = element count.
+    gb.push(
+        op::PEER_COPY,
+        [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_s, h_d],
+        &[],
+        0,
+        0,
+    );
+    let graph = gb.finish();
+    assert!(graph.caps.needs_peer, "a PEER_COPY node must set needs_peer");
+
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the peer copy");
+    assert_eq!(ctx.plan().peers().len(), 1, "the PEER_COPY node must bind");
+
+    ctx.enqueue_peer_copy(&dev, &ctx.plan().peers()[0])
+        .expect("enqueue peer copy");
+    dev.synchronize();
+
+    let got: Vec<f32> = d_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap()
+        .to_cpu_vec_f32()
+        .unwrap();
+    assert_eq!(got, src, "the peer copy must reproduce the source exactly");
+}
+
 /// Gate 1: the plan builder's binding rules.
 #[test]
 fn the_plan_binds_only_what_a_ring_can_run() {
@@ -797,6 +848,7 @@ fn one_wave_launch_runs_the_steps_gemms() {
         adds: Vec::new(),
         attns: Vec::new(),
         moes: Vec::new(),
+        peers: Vec::new(),
         gemms: vec![
             TaskRingGemm {
                 m: 1,
