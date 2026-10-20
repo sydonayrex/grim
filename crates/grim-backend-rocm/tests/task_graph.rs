@@ -129,11 +129,30 @@ fn ring_ready_is_derived_from_the_capability_set() {
     // op::GEMM, so a GEMM-only graph is now full and the old "empty ring cannot
     // be full" premise no longer holds for it. Pick an opcode the ring has NOT
     // converted so the predicate still has something to report.
-    let unconverted = grim_backend_rocm::task_graph::op::RECURRENT;
-    assert!(
-        !grim_backend_rocm::task_graph_exec::RING_OPCODES.contains(&unconverted),
-        "pick an opcode RING_OPCODES has not converted"
-    );
+    //
+    // DERIVED from the opcode list, not named: this test used to name
+    // op::RECURRENT, and M5 converted it — so it failed on a CORRECT predicate.
+    // A hardcoded "unconverted" opcode goes stale the moment the ring converts
+    // it, which is the same hand-maintained-list failure as the one it guards.
+    const ALL: [u32; 11] = [
+        op::GEMM,
+        op::MOE_DISPATCH,
+        op::MOE_COMBINE,
+        op::ATTENTION,
+        op::RECURRENT,
+        op::NORM,
+        op::ROPE,
+        op::ELEMENTWISE,
+        op::SAMPLE,
+        op::PEER_COPY,
+        op::Q8_0_DOT4,
+    ];
+    let ring = grim_backend_rocm::task_graph_exec::RING_OPCODES;
+    let unconverted = ALL
+        .iter()
+        .copied()
+        .find(|o| !ring.contains(o))
+        .expect("every opcode is converted — this test needs one the ring lacks");
     let mut caps = grim_backend_rocm::task_graph::CapabilitySet::default();
     caps.opcodes.insert(unconverted);
     let r = ring_ready(&caps);
