@@ -547,6 +547,11 @@ pub struct TaskRingContext {
     /// wave is launched once and drains every node the ring is given, so the
     /// per-node enqueue does not launch a wave of its own.
     pub resident: bool,
+    /// M6 step 3: the ring's OWN stream. A parked wave must not live on the
+    /// caller's stream — it would occupy it, and the enqueues (and the stop
+    /// kernel) would queue behind it instead of being seen. Null when the
+    /// device's stream pool had nothing to give.
+    pub stream: *mut std::ffi::c_void,
 }
 
 impl std::fmt::Debug for TaskRingContext {
@@ -602,6 +607,7 @@ impl TaskRingContext {
             desc_staging,
             capacity,
             resident: false,
+            stream: dev.get_stream_from_pool(1).unwrap_or(std::ptr::null_mut()),
         };
         // Stage AFTER the ring exists so the caller gets a fully formed context
         // back; the plan is known non-empty here, so count lands non-zero.
@@ -874,7 +880,15 @@ impl TaskRingContext {
     /// ring is given afterwards is drained without another launch. It leaves
     /// through [`Self::stop_wave`] or its own poll budget.
     pub fn launch_resident(&mut self, dev: &crate::RocmDevice) -> crate::Result<()> {
-        launch_task_ring_resident(
+        if self.stream.is_null() {
+            return Err(crate::Error::Backend(
+                "task ring has no stream of its own".into(),
+            ));
+        }
+        // Resolve the kernel first: the on-stream launch path only launches, it
+        // does not resolve. The eager launch resolves it and runs a wave that
+        // exits at once, because the queue is empty when the ring is set up.
+        launch_task_ring(
             dev,
             &*self.slots,
             self.capacity,
@@ -884,8 +898,29 @@ impl TaskRingContext {
             None,
             0,
         )?;
+        launch_task_ring_resident_on_stream(
+            dev,
+            &*self.slots,
+            self.capacity,
+            &*self.tail,
+            &*self.head,
+            &*self.stop,
+            None,
+            0,
+            self.stream,
+        )?;
         self.resident = true;
         Ok(())
+    }
+
+    /// The ring's tail counter — how many tasks the wave has consumed.
+    ///
+    /// Exposed so a caller can wait for a PARKED wave to drain: the wave runs on
+    /// the ring's own stream, so the host cannot observe the drain through the
+    /// stream and reads the counter instead.
+    pub fn tail_value(&self) -> crate::Result<u32> {
+        let v = as_rocm(self.tail.as_ref())?.to_cpu_vec_u32()?;
+        Ok(v.first().copied().unwrap_or(0))
     }
 
     /// Stop a resident wave: set the stop flag so the parked wave exits.
@@ -1034,7 +1069,7 @@ pub fn launch_task_ring(
     staged: Option<&dyn BackendStorage>,
     staged_count: u32,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
-    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, false)
+    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, false, None)
 }
 
 /// M6 step 3: launch the wave in RESIDENT mode.
@@ -1054,7 +1089,29 @@ pub fn launch_task_ring_resident(
     staged: Option<&dyn BackendStorage>,
     staged_count: u32,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
-    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, true)
+    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, true, None)
+}
+
+/// M6 step 3: launch a RESIDENT wave on an EXPLICIT stream.
+///
+/// A resident wave parks on the empty queue, so it must not run on the caller's
+/// stream: it would occupy that stream and the enqueues (and the stop kernel)
+/// would queue BEHIND it instead of being seen. The ring therefore owns a
+/// stream, and the wave lives there while the caller keeps enqueueing on its own.
+pub fn launch_task_ring_resident_on_stream(
+    dev: &crate::RocmDevice,
+    slots: &dyn BackendStorage,
+    capacity: u32,
+    tail: &dyn BackendStorage,
+    head: &dyn BackendStorage,
+    stop: &dyn BackendStorage,
+    staged: Option<&dyn BackendStorage>,
+    staged_count: u32,
+    stream: *mut std::ffi::c_void,
+) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
+    launch_task_ring_inner(
+        dev, slots, capacity, tail, head, stop, staged, staged_count, true, Some(stream),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1068,6 +1125,7 @@ fn launch_task_ring_inner(
     staged: Option<&dyn BackendStorage>,
     staged_count: u32,
     resident: bool,
+    stream: Option<*mut std::ffi::c_void>,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
     // `None, 0` is the pre-existing contract (the host published `head`; the
     // prologue is a no-op). A count with a null array is the bug: the wave would
@@ -1121,24 +1179,42 @@ fn launch_task_ring_inner(
     let mut resident_flag: u32 = if resident { 1 } else { 0 };
     let mut count = staged_count;
     let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
-    dev.launch_compute_kernel(
-        "grim_scythe_persistent_dispatch",
-        crate::HipDim3::new(1, 1, 1),
-        crate::HipDim3::new(128, 1, 1),
-        &mut [
-            arg(&mut slots_ptr),
-            arg(&mut cap),
-            arg(&mut tail_ptr),
-            arg(&mut head_ptr),
-            arg(&mut stop_ptr),
-            arg(&mut limit),
-            arg(&mut resident_flag), // 1 = park on an empty queue instead of exiting
-            arg(&mut staged_ptr),
-            arg(&mut count),
-        ],
-    )?;
+    let mut args = [
+        arg(&mut slots_ptr),
+        arg(&mut cap),
+        arg(&mut tail_ptr),
+        arg(&mut head_ptr),
+        arg(&mut stop_ptr),
+        arg(&mut limit),
+        arg(&mut resident_flag), // 1 = park on an empty queue instead of exiting
+        arg(&mut staged_ptr),
+        arg(&mut count),
+    ];
+    match stream {
+        Some(st) => {
+            // The on-stream path only LAUNCHES: the kernel must already be
+            // resolved (the eager launch resolves it). It is launched with the
+            // same grid/block, so the cache key matches.
+            dev.launch_compute_kernel_on_stream(
+                "grim_scythe_persistent_dispatch",
+                crate::HipDim3::new(1, 1, 1),
+                crate::HipDim3::new(128, 1, 1),
+                &mut args,
+                st,
+                0,
+            )?;
+        }
+        None => {
+            dev.launch_compute_kernel(
+                "grim_scythe_persistent_dispatch",
+                crate::HipDim3::new(1, 1, 1),
+                crate::HipDim3::new(128, 1, 1),
+                &mut args,
+            )?;
+        }
+    }
     WAVE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
     Ok(Box::new(crate::RocmHandle::new(Some(
-        dev.active_stream(),
+        stream.unwrap_or(dev.active_stream()),
     ))))
 }

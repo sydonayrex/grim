@@ -1287,4 +1287,109 @@ fn resident_wave_drains_a_staged_set_in_one_launch() {
             "c[{i}]: ring {g} vs reference {r}"
         );
     }
+
+    // Stop the parked wave. It lives on the ring's stream, which the device's
+    // stream pool SHARES across contexts — so a wave left parked here would
+    // block the next test's wave behind it.
+    let stop_ptr = stop_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("stop is RocmStorage")
+        .device_ptr_u64()
+        .expect("stop ptr");
+    grim_backend_rocm::kernels::qkv_attention::launch_scythe_publish_head(&dev, stop_ptr, 1)
+        .expect("set stop");
+    dev.synchronize();
+}
+
+/// M6 step 3: a node enqueued AFTER the wave parked must still be drained.
+///
+/// This is the capability a resident wave exists for, and it is impossible on
+/// ONE stream: a wave parked on the caller's stream occupies it, so the enqueue
+/// queues behind it and the wave never sees the node. The ring therefore owns a
+/// stream — the wave lives there, the enqueue stays on the caller's, and the
+/// parked wave picks the node up.
+#[test]
+fn resident_wave_drains_a_node_enqueued_after_it_parked() {
+    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the resident-wave gate");
+        return;
+    }
+    let _guard = DeviceGuard::set(0);
+    let dev = grim_backend_rocm::RocmDevice::shared(0);
+
+    // C = A @ B^T (m=1, n=2, k=2).
+    let a = [1.0f32, 2.0];
+    let b = [1.0f32, 0.0, 0.0, 1.0]; // [N=2, K=2] row-major
+    let c_ref: Vec<f32> = (0..2)
+        .map(|n| (0..2).map(|k| a[k] * b[n * 2 + k]).sum())
+        .collect();
+
+    let (_a_s, a_p) = f32_dev(&dev, &a);
+    let (_b_s, b_p) = f32_dev(&dev, &b);
+    let (c_s, c_p) = f32_dev(&dev, &[0.0f32; 2]);
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_i = gb.push_arg(a_p, 8, arg_role::ACT_IN);
+    let h_w = gb.push_arg(b_p, 32, arg_role::WEIGHT);
+    let h_o = gb.push_arg(c_p, 8, arg_role::ACT_OUT);
+    // params: [quant=0, n=2, k=2, m=1, ...]
+    gb.push(
+        op::GEMM,
+        [0, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_i, h_w, h_o],
+        &[],
+        0,
+        0,
+    );
+    let graph = gb.finish();
+
+    let mut ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the gemm");
+    assert_eq!(ctx.plan().gemms.len(), 1, "the GEMM must bind");
+
+    // The wave parks on the RING's stream.
+    ctx.launch_resident(&dev).expect("launch resident wave");
+
+    // The enqueue goes on the CALLER's stream; the parked wave on the ring's
+    // stream must pick it up. On one stream this could not happen at all.
+    ctx.enqueue_gemm(&dev, &ctx.plan().gemms[0])
+        .expect("enqueue gemm");
+
+    // Wait for the parked wave to drain it.
+    let mut tail_val = 0u32;
+    for _ in 0..4000 {
+        tail_val = ctx.tail_value().expect("tail readback");
+        if tail_val >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // The tail counts every slot the wave claimed, and the ring's slots start
+    // zeroed — status PENDING — so the wave also claims those (their opcode is
+    // 0, which has no arm: they are no-ops) before it reaches the written one.
+    // What matters is that the tail ADVANCED past the node and the node's VALUE
+    // is right, which is asserted below.
+    assert!(
+        tail_val >= 1,
+        "the parked wave must drain the node enqueued AFTER it parked (tail {tail_val})"
+    );
+
+    let got: Vec<f32> = c_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("c is RocmStorage")
+        .to_cpu_vec_f32()
+        .expect("c readback");
+    for (i, (g, r)) in got.iter().zip(c_ref.iter()).enumerate() {
+        assert!(
+            (g - r).abs() <= 1e-5 * r.abs().max(1.0),
+            "c[{i}]: ring {g} vs reference {r}"
+        );
+    }
+
+    // Stop the parked wave.
+    ctx.stop_wave(&dev).expect("stop wave");
+    dev.synchronize();
 }
