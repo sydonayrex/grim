@@ -910,6 +910,22 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
     assert!(ir.caps.opcodes.contains(&op::RECURRENT));
     assert!(ir.caps.opcodes.contains(&op::GEMM));
     assert_eq!(ir.caps.devices.len(), 1);
+
+    // RECURRENT is emitted but is NOT ring-bound — the wave has no recurrent arm
+    // (the KDA conv/scan/gate chain is several kernels). So the hybrid model must
+    // report `full: false` and NAME it. This keeps the gap visible instead of
+    // letting a future change quietly claim coverage, which is the Q8_0_DOT4
+    // failure mode: an advertised opcode with no arm behind it.
+    let ready = grim_backend_rocm::task_graph::ring_ready(&ir.caps);
+    assert!(
+        !ready.full,
+        "RECURRENT has no ring arm, so the hybrid model cannot be ring-ready"
+    );
+    assert!(
+        ready.missing.contains(&op::RECURRENT),
+        "the missing set must name RECURRENT: {:?}",
+        ready.missing
+    );
     // The argument table is the model's: every arg handle resolves.
     for n in &ir.nodes {
         for &a in &n.args[..n.n_args as usize] {
