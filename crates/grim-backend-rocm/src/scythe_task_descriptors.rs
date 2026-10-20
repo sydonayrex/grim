@@ -207,3 +207,95 @@ impl MoETaskDescriptor {
     }
 }
 
+
+// ── KDA / recurrent task descriptor + opcode OP_RECURRENT (M5) ───────────────
+// The generic `ScytheTaskDescriptor` (m/n/k + 4 pointers) cannot express the
+// qwen35 recurrent step: it is THREE kernels (short-conv causal step, batched
+// gated delta rule, gated head norm) over ~14 device buffers. The wave's
+// `OP_RECURRENT` arm casts `desc->weight_ptr` to this struct and calls the three
+// device-callable functions inline — the same pattern `MoETaskDescriptor` gives
+// `OP_MOE`.
+
+/// Device-resident descriptor for one qwen35 KDA/recurrent step.
+///
+/// The pointers are all DEVICE addresses and the state buffers are written in
+/// place, so the descriptor itself is immutable for the life of a graph and can
+/// be staged once at capture.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KdaTaskDescriptor {
+    /// Conv input: the fused QKV projection output (`q_buf`).
+    pub conv_in: u64,
+    /// Short-conv weight.
+    pub conv_w: u64,
+    /// Short-conv bias (0 = none).
+    pub conv_bias: u64,
+    /// Conv state ring, updated in place.
+    pub conv_state: u64,
+    /// Conv output (`conv_out`), [q | k | v] layout.
+    pub conv_out: u64,
+    /// Per-head `alpha` (decay gate input).
+    pub alpha: u64,
+    /// Per-head `beta` (write gate input).
+    pub beta: u64,
+    /// Per-head `dt.bias`.
+    pub dt_bias: u64,
+    /// Per-head `ssm_a`.
+    pub ssm_a: u64,
+    /// Per-head `ssm_norm` weight.
+    pub ssm_norm: u64,
+    /// Per-head gate `z` (the fused attn_gate projection).
+    pub gate: u64,
+    /// Recurrent state S, updated in place.
+    pub state: u64,
+    /// Per-head accumulators, [num_v, head_dim].
+    pub acc: u64,
+    /// Branch output (the block's recurrent output).
+    pub branch: u64,
+    /// Number of value heads.
+    pub num_v: u32,
+    /// Number of key heads.
+    pub num_k: u32,
+    /// Head dim.
+    pub head_dim: u32,
+    /// Batch (tokens in this step).
+    pub batch: u32,
+    /// Conv channels (= num_k + num_k + num_v heads times head_dim).
+    pub channels: u32,
+    /// Conv kernel size.
+    pub kernel_size: u32,
+    /// RMS eps.
+    pub eps: f32,
+    /// 1 when a gate `z` is present (the qwen35 path always passes one).
+    pub has_z: u32,
+}
+
+impl KdaTaskDescriptor {
+    /// Upload this descriptor to device-visible memory and return the DEVICE
+    /// address the caller passes to the ring as `weight_ptr`. Leaks the staging
+    /// buffer on purpose: the wave dereferences it whenever it runs, so it must
+    /// outlive the enqueue.
+    pub fn upload(&self, device: &crate::RocmDevice) -> crate::Result<u64> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        let storage = device.from_cpu_bytes(
+            bytes,
+            &grim_tensor::Shape::new(vec![std::mem::size_of::<Self>()]),
+            grim_tensor::dtype::DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+        )?;
+        let ptr = storage
+            .as_any()
+            .downcast_ref::<crate::RocmStorage>()
+            .and_then(|rs| rs.device_ptr_u64())
+            .ok_or_else(|| crate::Error::Backend("KDA upload: no device ptr".into()))?;
+        std::mem::forget(storage);
+        Ok(ptr)
+    }
+}

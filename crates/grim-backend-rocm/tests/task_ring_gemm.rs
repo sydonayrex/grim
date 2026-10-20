@@ -914,6 +914,7 @@ fn one_wave_launch_runs_the_steps_gemms() {
         attns: Vec::new(),
         moes: Vec::new(),
         peers: Vec::new(),
+        recurrences: Vec::new(),
         gemms: vec![
             TaskRingGemm {
                 m: 1,
@@ -1015,4 +1016,171 @@ fn one_wave_launch_runs_the_steps_gemms() {
         0,
     );
     assert!(r.is_err(), "staged_count 0 with a staged array must be refused");
+}
+
+/// M5: the ring's OP_RECURRENT arm must run the qwen35 KDA/recurrent step
+/// IDENTICALLY to the three kernels it replaces (short-conv causal step, batched
+/// gated delta rule, gated head norm). The standalone kernels are the oracle —
+/// the arm is the thing under test — so a no-op arm fails this on step 0, and an
+/// arm that drops a pass fails on the state it would leave behind.
+///
+/// Two steps with the same inputs: the state carries, so a stale-state arm passes
+/// step 0 and diverges on step 1 (the same trap `kda_batched_parity` exists for).
+#[test]
+fn ring_recurrent_matches_the_standalone_kernels() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    const NV: usize = 6;
+    const NK: usize = 2;
+    const D: usize = 16;
+    const KS: usize = 4;
+    const CHANNELS: usize = 2 * NK * D + NV * D;
+    const EPS: f32 = 1e-6;
+
+    let mut seed: u64 = 0x1234_5678;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let conv_in: Vec<f32> = (0..CHANNELS).map(|_| rnd() * 0.5).collect();
+    let conv_w: Vec<f32> = (0..CHANNELS * KS).map(|_| rnd() * 0.2).collect();
+    let conv_state: Vec<f32> = (0..CHANNELS * (KS - 1)).map(|_| rnd() * 0.1).collect();
+    let alpha: Vec<f32> = (0..NV).map(|_| rnd() * 0.3).collect();
+    let beta: Vec<f32> = (0..NV).map(|_| rnd() * 0.3).collect();
+    let dt_bias: Vec<f32> = (0..NV).map(|_| rnd() * 0.3).collect();
+    let ssm_a: Vec<f32> = (0..NV).map(|_| rnd() * 0.5).collect();
+    let ssm_norm: Vec<f32> = (0..D).map(|_| 1.0 + rnd() * 0.01).collect();
+    let gate: Vec<f32> = (0..NV * D).map(|_| rnd() * 0.5).collect();
+    let state0: Vec<f32> = (0..NV * D * D).map(|_| rnd() * 0.3).collect();
+
+    // ── Ring arm: one descriptor, two steps, state carried in place.
+    let (_ci_s, ci_ptr) = f32_dev(&dev, &conv_in);
+    let (_cw_s, cw_ptr) = f32_dev(&dev, &conv_w);
+    let (_cs_ring_s, cs_ring_ptr) = f32_dev(&dev, &conv_state);
+    let (_co_ring_s, co_ring_ptr) = f32_dev(&dev, &[0.0f32; CHANNELS]);
+    let (a_s, a_ptr) = f32_dev(&dev, &alpha);
+    let (b_s, b_ptr) = f32_dev(&dev, &beta);
+    let (d_s, d_ptr) = f32_dev(&dev, &dt_bias);
+    let (sa_s, sa_ptr) = f32_dev(&dev, &ssm_a);
+    let (sn_s, sn_ptr) = f32_dev(&dev, &ssm_norm);
+    let (g_s, g_ptr) = f32_dev(&dev, &gate);
+    let (st_ring_s, st_ring_ptr) = f32_dev(&dev, &state0);
+    let (_acc_ring_s, acc_ring_ptr) = f32_dev(&dev, &[0.0f32; NV * D]);
+    let (br_ring_s, br_ring_ptr) = f32_dev(&dev, &[0.0f32; NV * D]);
+
+    let desc = grim_backend_rocm::scythe_task_descriptors::KdaTaskDescriptor {
+        conv_in: ci_ptr,
+        conv_w: cw_ptr,
+        conv_bias: 0,
+        conv_state: cs_ring_ptr,
+        conv_out: co_ring_ptr,
+        alpha: a_ptr,
+        beta: b_ptr,
+        dt_bias: d_ptr,
+        ssm_a: sa_ptr,
+        ssm_norm: sn_ptr,
+        gate: g_ptr,
+        state: st_ring_ptr,
+        acc: acc_ring_ptr,
+        branch: br_ring_ptr,
+        num_v: NV as u32,
+        num_k: NK as u32,
+        head_dim: D as u32,
+        batch: 1,
+        channels: CHANNELS as u32,
+        kernel_size: KS as u32,
+        eps: EPS,
+        has_z: 1,
+    };
+    let kda_dev = desc
+        .upload(&dev)
+        .expect("upload KdaTaskDescriptor");
+
+    // ── Standalone oracle: separate copies, same inputs.
+    let (cs_ref_s, _cs_ref_ptr) = f32_dev(&dev, &conv_state);
+    let (co_ref_s, _co_ref_ptr) = f32_dev(&dev, &[0.0f32; CHANNELS]);
+    let (st_ref_s, _st_ref_ptr) = f32_dev(&dev, &state0);
+    let (acc_ref_s, _acc_ref_ptr) = f32_dev(&dev, &[0.0f32; NV * D]);
+    let (br_ref_s, _br_ref_ptr) = f32_dev(&dev, &[0.0f32; NV * D]);
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_desc = gb.push_arg(kda_dev, 144, arg_role::WEIGHT);
+    gb.push(op::RECURRENT, [0; 16], &[h_desc], &[], 0, 0);
+    let graph = gb.finish();
+    let ctx =
+        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+            .expect("ring context")
+            .expect("ring binds the recurrent node");
+    assert_eq!(ctx.plan().recurrences().len(), 1, "the RECURRENT node must bind");
+
+    let mut ring_branches: Vec<Vec<f32>> = Vec::new();
+    let mut ring_states: Vec<Vec<f32>> = Vec::new();
+    let rd = |s: &Box<dyn BackendStorage>| -> Vec<f32> {
+        s.as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap()
+            .to_cpu_vec_f32()
+            .unwrap()
+    };
+    for _step in 0..2 {
+        ctx.enqueue_recurrent(&dev, &ctx.plan().recurrences()[0])
+            .expect("enqueue recurrent");
+        dev.synchronize();
+        ring_branches.push(rd(&br_ring_s));
+        ring_states.push(rd(&st_ring_s));
+    }
+
+    // The standalone oracle runs the SAME two steps on its own buffer copies.
+    let mut ref_branches: Vec<Vec<f32>> = Vec::new();
+    let mut ref_states: Vec<Vec<f32>> = Vec::new();
+    fn rocm_of(s: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        s.as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("RocmStorage")
+    }
+    for _step in 0..2 {
+        dev.short_conv1d_causal_step_into(
+            rocm_of(&_ci_s),
+            rocm_of(&_cw_s),
+            None,
+            rocm_of(&cs_ref_s),
+            rocm_of(&co_ref_s),
+        )
+        .expect("standalone short conv");
+        dev.kda_gated_delta_rule_batched_into(
+            rocm_of(&co_ref_s),
+            rocm_of(&a_s),
+            rocm_of(&b_s),
+            rocm_of(&d_s),
+            rocm_of(&sa_s),
+            rocm_of(&sn_s),
+            Some(rocm_of(&g_s)),
+            rocm_of(&st_ref_s),
+            rocm_of(&acc_ref_s),
+            rocm_of(&br_ref_s),
+            NV,
+            NK,
+            D,
+            EPS,
+        )
+        .expect("standalone KDA");
+        dev.synchronize();
+        ref_branches.push(rd(&br_ref_s));
+        ref_states.push(rd(&st_ref_s));
+    }
+
+    for step in 0..2 {
+        assert_eq!(
+            ring_branches[step],
+            ref_branches[step],
+            "step {step}: the ring's recurrent branch differs from the standalone kernels"
+        );
+        assert_eq!(
+            ring_states[step],
+            ref_states[step],
+            "step {step}: the ring's recurrent STATE differs — a stale-state arm passes step 0"
+        );
+    }
 }

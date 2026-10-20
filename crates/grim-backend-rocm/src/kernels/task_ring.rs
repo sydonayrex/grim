@@ -54,6 +54,11 @@ const OP_ATTN: u32 = 3;
 /// Wave-side opcode for MoE dispatch: casts `weight_ptr` to
 /// `moe_task_descriptor_t*` and calls the fused MoE kernel inline.
 const OP_MOE: u32 = 6;
+/// Wave-side opcode for the qwen35 KDA/recurrent step (M5). The arm casts
+/// `weight_ptr` to a `kda_task_descriptor_t` and runs the short-conv step, the
+/// batched gated delta rule and the gated head norm inline — the same
+/// descriptor-carrying pattern `OP_MOE` uses for the fused MoE.
+const OP_RECURRENT: u32 = 11;
 /// Wave-side opcode for a peer broadcast: write the local source into the PEER
 /// device's buffer (`desc->peer_ptr`). This is M6's handoff primitive — segment
 /// *k* copies its boundary residual straight into segment *k+1*'s input, so the
@@ -87,6 +92,7 @@ pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::ATTENTION, OP_ATTN),
     (crate::task_graph::op::MOE_DISPATCH, OP_MOE),
     (crate::task_graph::op::PEER_COPY, OP_PEER_BROADCAST),
+    (crate::task_graph::op::RECURRENT, OP_RECURRENT),
 ];
 
 /// Translate a task-graph opcode to its wave opcode.
@@ -190,6 +196,16 @@ pub struct TaskRingMoe {
     pub ir_node: u32,
 }
 
+/// One ring-executable qwen35 KDA/recurrent step (M5). The descriptor is
+/// device-resident and carries every buffer the step touches, so the plan only
+/// needs its DEVICE address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingRecurrent {
+    /// Device address of the `KdaTaskDescriptor` (the node's WEIGHT operand).
+    pub kda_dev: u64,
+    pub ir_node: u32,
+}
+
 /// One ring-executable cross-device copy (M6): `dst[0..elems] = src[0..elems]`,
 /// where `dst` lives on the PEER device. `src` is this device's `ACT_IN` and
 /// `dst` is the node's `arg_role::PEER` operand.
@@ -209,6 +225,7 @@ pub struct TaskRingPlan {
     pub attns: Vec<TaskRingAttn>,
     pub moes: Vec<TaskRingMoe>,
     pub peers: Vec<TaskRingPeer>,
+    pub recurrences: Vec<TaskRingRecurrent>,
 }
 
 impl TaskRingPlan {
@@ -226,6 +243,7 @@ impl TaskRingPlan {
         let mut attns = Vec::new();
         let mut moes = Vec::new();
         let mut peers = Vec::new();
+        let mut recurrences = Vec::new();
         // Indexed, not searched: `execute` walks in dependency order rather than
         // node order, so the emitter's own index is the only thing that links a
         // plan entry back to the node it came from.
@@ -235,7 +253,7 @@ impl TaskRingPlan {
             // absent from the plan and keeps running on its ordinary launcher.
             match node.opcode {
                 op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH
-                | op::PEER_COPY => {}
+                | op::PEER_COPY | op::RECURRENT => {}
                 _ => continue,
             }
             let (mut input, mut weight, mut output) = (None, None, None);
@@ -276,6 +294,18 @@ impl TaskRingPlan {
                         continue;
                     }
                     peers.push(TaskRingPeer { elems, src, dst, ir_node: idx as u32 });
+                }
+                op::RECURRENT => {
+                    // The KDA descriptor rides the node's WEIGHT operand — the
+                    // descriptor-carrying convention `OP_MOE` established. A
+                    // RECURRENT node without one is NOT bound: that would be a
+                    // whole recurrent block wearing a single launch's name, and
+                    // the wave would silently execute nothing.
+                    let Some(kda_dev) = weight else { continue };
+                    if kda_dev == 0 {
+                        continue;
+                    }
+                    recurrences.push(TaskRingRecurrent { kda_dev, ir_node: idx as u32 });
                 }
                 op::NORM => {
                     let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
@@ -399,12 +429,13 @@ impl TaskRingPlan {
                 _ => {}
             }
         }
-        Self { gemms, norms, adds, attns, moes, peers }
+        Self { gemms, norms, adds, attns, moes, peers, recurrences }
     }
 
     pub fn is_empty(&self) -> bool {
         self.gemms.is_empty() && self.norms.is_empty() && self.adds.is_empty()
             && self.attns.is_empty() && self.moes.is_empty() && self.peers.is_empty()
+            && self.recurrences.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -431,11 +462,15 @@ impl TaskRingPlan {
         &self.peers
     }
 
+    pub fn recurrences(&self) -> &[TaskRingRecurrent] {
+        &self.recurrences
+    }
+
     /// The ring's whole dispatch set for one step — what the launch-count
     /// assertion measures.
     pub fn step_len(&self) -> usize {
         self.gemms.len() + self.norms.len() + self.adds.len() + self.attns.len()
-            + self.moes.len() + self.peers.len()
+            + self.moes.len() + self.peers.len() + self.recurrences.len()
     }
 
     /// Serialize the plan into the device-side staged array.
@@ -798,6 +833,39 @@ impl TaskRingContext {
             0,
             0,
             p.dst,
+        )?;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Enqueue one qwen35 KDA/recurrent step and drain it with a one-task wave
+    /// (M5). The wave casts `weight_ptr` to the device-resident
+    /// `KdaTaskDescriptor` and runs the short-conv step, the batched gated delta
+    /// rule and the gated head norm inline — three kernels, one wave.
+    pub fn enqueue_recurrent(
+        &self,
+        dev: &crate::RocmDevice,
+        r: &TaskRingRecurrent,
+    ) -> crate::Result<()> {
+        let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &*self.slots,
+            slot,
+            OP_RECURRENT,
+            0,
+            0,
+            0,
+            0,
+            // weight_ptr carries the descriptor, exactly as `OP_MOE` does.
+            r.kda_dev,
+            0,
+            0,
         )?;
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()

@@ -45,6 +45,35 @@ struct __align__(32) moe_task_descriptor_t {
     unsigned long long weights_ptr;
 };
 
+// M5 RECURRENT: the device-resident descriptor the wave's OP_RECURRENT arm casts
+// `desc->weight_ptr` to. It mirrors the Rust `KdaTaskDescriptor` field-for-field
+// (repr(C), u64 x 14 then u32 x 6, f32, u32 = 144 bytes). Layout parity is
+// pinned by `kda_task_descriptor_layout_matches_host`.
+struct __align__(32) kda_task_descriptor_t {
+    unsigned long long conv_in;
+    unsigned long long conv_w;
+    unsigned long long conv_bias;
+    unsigned long long conv_state;
+    unsigned long long conv_out;
+    unsigned long long alpha;
+    unsigned long long beta;
+    unsigned long long dt_bias;
+    unsigned long long ssm_a;
+    unsigned long long ssm_norm;
+    unsigned long long gate;
+    unsigned long long state;
+    unsigned long long acc;
+    unsigned long long branch;
+    unsigned int num_v;
+    unsigned int num_k;
+    unsigned int head_dim;
+    unsigned int batch;
+    unsigned int channels;
+    unsigned int kernel_size;
+    float eps;
+    unsigned int has_z;
+};
+
 // Opcodes (mirror grim_engine::scythe2 doc comment).
 #define OP_NOP        0u
 #define OP_COL_GEMM   1u
@@ -53,6 +82,9 @@ struct __align__(32) moe_task_descriptor_t {
 #define OP_NORM       4u
 #define OP_COMMFUSE   5u
 #define OP_MOE        6u
+// M5 RECURRENT: the qwen35 KDA/recurrent step. The wave casts weight_ptr to
+// `kda_task_descriptor_t` and runs the three kernels inline.
+#define OP_RECURRENT  11u
 #define OP_ADD        7u
 #define OP_PEER_REDUCE    8u
 #define OP_PEER_BROADCAST 9u
@@ -341,6 +373,48 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             unsigned int elems = desc->m;
             for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
                 dst[idx] = src[idx];
+            }
+        } else if (desc->opcode == OP_RECURRENT) {
+            // M5: the qwen35 KDA/recurrent step — three kernels inline:
+            //   1. the short-conv causal step (state-shifted),
+            //   2. the batched gated delta rule (writes the recurrent state),
+            //   3. the gated head norm.
+            // All three are device-callable functions extracted from the kernels
+            // that used to be launched separately, so no hipLaunchKernel is needed.
+            // Every pass is a strided loop (the wave is 128 threads, any geometry);
+            // the __syncthreads() between passes is what makes pass k+1 observe
+            // pass k's writes, since the passes read each other's output.
+            kda_task_descriptor_t* kda = (kda_task_descriptor_t*)desc->weight_ptr;
+            const int num_v = kda->num_v;
+            const int num_k = kda->num_k;
+            const int head_dim = kda->head_dim;
+            const int batch = kda->batch;
+            const int channels = kda->channels;
+            const int kernel_size = kda->kernel_size;
+            const float eps = kda->eps;
+            const int has_z = kda->has_z;
+
+            for (int idx = threadIdx.x; idx < batch * channels; idx += blockDim.x) {
+                short_conv1d_causal_step_dev(
+                    (const float*)kda->conv_in, (const float*)kda->conv_w,
+                    (const float*)kda->conv_bias, (float*)kda->conv_state,
+                    (float*)kda->conv_out, idx, channels, kernel_size);
+            }
+            __syncthreads();
+            const int total = num_v * head_dim;
+            for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+                kda_delta_rule_batched_dev(
+                    (const float*)kda->conv_out, (const float*)kda->alpha,
+                    (const float*)kda->beta, (const float*)kda->dt_bias,
+                    (const float*)kda->ssm_a, (float*)kda->state,
+                    (float*)kda->acc, idx, num_v, num_k, head_dim, eps);
+            }
+            __syncthreads();
+            for (int h = threadIdx.x; h < num_v; h += blockDim.x) {
+                kda_head_norm_gate_dev(
+                    (const float*)kda->acc, (const float*)kda->ssm_norm,
+                    (const float*)kda->gate, (float*)kda->branch,
+                    h, num_v, head_dim, eps, has_z);
             }
         } else if (desc->opcode != OP_NOP) {
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
