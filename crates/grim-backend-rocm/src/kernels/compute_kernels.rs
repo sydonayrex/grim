@@ -1653,18 +1653,24 @@ extern "C" __global__ void grim_copy_bytes(void* dst, const void* src, unsigned 
     }
 }
 
-extern "C" __global__ void grim_short_conv1d_causal_step(
-    const float* x, const float* weight, const float* bias,
-    float* conv_state, float* out, int batch, int channels, int kernel_size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * channels;
-    if (idx >= total) return;
-    int b = idx / channels;
-    int c = idx % channels;
-
+// Device-callable core of `grim_short_conv1d_causal_step`: one channel's causal
+// short-conv step, including the state shift. Extracted so the persistent ring's
+// RECURRENT arm can run it inline instead of launching a separate kernel — the
+// same pattern `grim_moe_fused_grouped_device` gives `OP_MOE`.
+//
+// `idx` is the flat (batch, channel) index; the state offset is
+// `idx * (kernel_size - 1)` because the kernel writes it per channel, not per
+// (batch, channel) pair. The body is byte-for-byte the kernel's own.
+__device__ __forceinline__ void short_conv1d_causal_step_dev(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ conv_state,
+    float* __restrict__ out,
+    int idx, int channels, int kernel_size) {
+    const int c = idx % channels;
     float val = x[idx];
-    int state_offset = (b * channels + c) * (kernel_size - 1);
+    int state_offset = idx * (kernel_size - 1);
     float sum = val * weight[c * kernel_size + (kernel_size - 1)];
     for (int k = 0; k < kernel_size - 1; ++k) {
         sum += conv_state[state_offset + k] * weight[c * kernel_size + k];
@@ -1681,6 +1687,15 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
     if (kernel_size > 1) {
         conv_state[state_offset + kernel_size - 2] = val;
     }
+}
+
+extern "C" __global__ void grim_short_conv1d_causal_step(
+    const float* x, const float* weight, const float* bias,
+    float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * channels) return;
+    short_conv1d_causal_step_dev(x, weight, bias, conv_state, out, idx, channels, kernel_size);
 }
 
 // Causal short conv scan across time steps t in 0..seq_len for prefill / multi-token steps.
@@ -1992,15 +2007,17 @@ __device__ inline float kda_softplus_dev(float x) {
     return log1pf(expf(x));
 }
 
-extern "C" __global__ void grim_kda_gated_delta_rule_batched(
+// Device-callable core of `grim_kda_gated_delta_rule_batched`: one
+// (value head h, output column j) of the batched gated delta rule — the L2 norm
+// of the q/k streams, the decay/gate arithmetic, the state update and the head
+// output. Extracted so the persistent ring's RECURRENT arm can run it inline
+// instead of launching a separate kernel. The body is byte-for-byte the kernel's.
+__device__ __forceinline__ void kda_delta_rule_batched_dev(
     const float* conv_out, const float* alpha, const float* beta,
     const float* dt_bias, const float* ssm_a,
     float* S, float* acc,
-    int num_v, int num_k, int head_dim, float eps
+    int idx, int num_v, int num_k, int head_dim, float eps
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = num_v * head_dim;
-    if (idx >= total) return;
     int h = idx / head_dim;
     int j = idx - h * head_dim;
 
@@ -2130,15 +2147,30 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
     acc[idx] = a * rsqrtf((float) head_dim);
 }
 
+extern "C" __global__ void grim_kda_gated_delta_rule_batched(
+    const float* conv_out, const float* alpha, const float* beta,
+    const float* dt_bias, const float* ssm_a,
+    float* S, float* acc,
+    int num_v, int num_k, int head_dim, float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_v * head_dim) return;
+    kda_delta_rule_batched_dev(
+        conv_out, alpha, beta, dt_bias, ssm_a, S, acc,
+        idx, num_v, num_k, head_dim, eps
+    );
+}
+
 // Second half of the batched KDA step: one thread per value head reduces its
 // d_v accumulators, then applies the reference's `build_norm_gated` - RMS over
 // the whole head, the ssm_norm weight, then the silu(z) gate.
-extern "C" __global__ void grim_kda_head_norm_gate(
+// Device-callable core of `grim_kda_head_norm_gate`: one value head's RMS norm,
+// `norm_weight` scale and silu(z) gate. Extracted for the persistent ring's
+// RECURRENT arm; the body is byte-for-byte the kernel's.
+__device__ __forceinline__ void kda_head_norm_gate_dev(
     const float* acc, const float* norm_weight, const float* z,
-    float* out, int num_v, int head_dim, float eps, int has_z
+    float* out, int h, int num_v, int head_dim, float eps, int has_z
 ) {
-    int h = blockIdx.x * blockDim.x + threadIdx.x;
-    if (h >= num_v) return;
 
     // 4-WIDE UNROLL, SAME ORDER (bit-identical): one thread per head meant 256
     // serial dependent load->FMA iterations for the sum of squares and 256 more
@@ -2193,6 +2225,15 @@ extern "C" __global__ void grim_kda_head_norm_gate(
         }
         out_h[i] = acc_h[i] * inv_rms * norm_weight[i] * g;
     }
+}
+
+extern "C" __global__ void grim_kda_head_norm_gate(
+    const float* acc, const float* norm_weight, const float* z,
+    float* out, int num_v, int head_dim, float eps, int has_z
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= num_v) return;
+    kda_head_norm_gate_dev(acc, norm_weight, z, out, h, num_v, head_dim, eps, has_z);
 }
 
 // GPU KDA Recurrent Prefill scan kernel for seq_len > 1.
