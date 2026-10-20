@@ -1198,6 +1198,13 @@ fn resident_wave_drains_a_staged_set_in_one_launch() {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the resident-wave gate");
         return;
     }
+    if std::env::var("AMD_SERIALIZE_KERNEL").is_ok() {
+        // The driver's one-kernel-at-a-time serialization makes a PARKED wave
+        // deadlock the ring: the wave occupies the device spinning, and the
+        // enqueue that would feed it can never be scheduled.
+        eprintln!("[SKIP] a resident wave cannot run under AMD_SERIALIZE_KERNEL");
+        return;
+    }
     let _guard = DeviceGuard::set(0);
     let dev = grim_backend_rocm::RocmDevice::shared(0);
 
@@ -1285,6 +1292,13 @@ fn resident_wave_drains_a_staged_set_in_one_launch() {
 fn resident_wave_drains_a_node_enqueued_after_it_parked() {
     if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the resident-wave gate");
+        return;
+    }
+    if std::env::var("AMD_SERIALIZE_KERNEL").is_ok() {
+        // The driver's one-kernel-at-a-time serialization makes a PARKED wave
+        // deadlock the ring: the wave occupies the device spinning, and the
+        // enqueue that would feed it can never be scheduled.
+        eprintln!("[SKIP] a resident wave cannot run under AMD_SERIALIZE_KERNEL");
         return;
     }
     let _guard = DeviceGuard::set(0);
