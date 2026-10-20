@@ -19,7 +19,8 @@
 
 use grim_backend_rocm::device::util::DeviceGuard;
 use grim_backend_rocm::kernels::task_ring::{
-    TaskRingGemm, TaskRingPlan, STAGED_CAPACITY, launch_task_ring, wave_launch_count,
+    TaskRingGemm, TaskRingPlan, STAGED_CAPACITY, launch_task_ring, launch_task_ring_resident,
+    wave_launch_count,
 };
 use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -1181,6 +1182,109 @@ fn ring_recurrent_matches_the_standalone_kernels() {
             ring_states[step],
             ref_states[step],
             "step {step}: the ring's recurrent STATE differs — a stale-state arm passes step 0"
+        );
+    }
+}
+
+/// M6 step 3: a RESIDENT wave drains a WHOLE staged set in ONE launch and then
+/// PARKS on the empty queue instead of exiting.
+///
+/// The parking is what makes the one-launch-per-step property possible: the wave
+/// stays alive, so the next step's nodes are drained without another launch. It
+/// leaves through the stop flag or its own poll budget, so a host that forgets
+/// to stop it cannot hold the device.
+#[test]
+fn resident_wave_drains_a_staged_set_in_one_launch() {
+    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the resident-wave gate");
+        return;
+    }
+    let _guard = DeviceGuard::set(0);
+    let dev = grim_backend_rocm::RocmDevice::shared(0);
+
+    // C = A @ B^T (m=1, n=2, k=2).
+    let a = [1.0f32, 2.0];
+    let b = [1.0f32, 0.0, 0.0, 1.0]; // [N=2, K=2] row-major
+    let c_ref: Vec<f32> = (0..2)
+        .map(|n| (0..2).map(|k| a[k] * b[n * 2 + k]).sum())
+        .collect();
+
+    let (_a_s, a_p) = f32_dev(&dev, &a);
+    let (_b_s, b_p) = f32_dev(&dev, &b);
+    let (c_s, c_p) = f32_dev(&dev, &[0.0f32; 2]);
+
+    let plan = TaskRingPlan {
+        norms: Vec::new(),
+        adds: Vec::new(),
+        attns: Vec::new(),
+        moes: Vec::new(),
+        peers: Vec::new(),
+        recurrences: Vec::new(),
+        gemms: vec![TaskRingGemm {
+            m: 1,
+            n: 2,
+            k: 2,
+            input: a_p,
+            weight: b_p,
+            output: c_p,
+            quant: 0,
+            ir_node: u32::MAX,
+        }],
+    };
+    let (staged, count) = plan.stage_on_device(&dev).expect("stage plan");
+    assert_eq!(count, 1, "the descriptor staged");
+
+    let cap: u32 = 8;
+    let slots = dev
+        .alloc_scythe_ring_bytes((cap as usize) * 64)
+        .expect("ring slots");
+    let (tail_s, _) = u32_dev(&dev, 0);
+    let (head_s, _) = u32_dev(&dev, 0);
+    let (stop_s, _) = u32_dev(&dev, 0);
+
+    let before = wave_launch_count();
+    launch_task_ring_resident(
+        &dev,
+        bs(&slots),
+        cap,
+        tail_s.as_ref(),
+        head_s.as_ref(),
+        stop_s.as_ref(),
+        Some(&*staged),
+        count,
+    )
+    .expect("resident ring launch");
+    let after = wave_launch_count();
+    assert_eq!(
+        after - before,
+        1,
+        "the staged set must cost ONE wave launch, not one per node"
+    );
+
+    // The wave is parked, not gone: it drains the staged set and keeps polling.
+    let mut tail_val = 0u32;
+    for _ in 0..2000 {
+        tail_val = tail_s.to_cpu_vec_u32().expect("tail readback")[0];
+        if tail_val >= count {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        tail_val, count,
+        "the resident wave must drain the staged set"
+    );
+
+    let got: Vec<f32> = c_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("c is RocmStorage")
+        .to_cpu_vec_f32()
+        .expect("c readback");
+    for (i, (g, r)) in got.iter().zip(c_ref.iter()).enumerate() {
+        assert!(
+            (g - r).abs() <= 1e-5 * r.abs().max(1.0),
+            "c[{i}]: ring {g} vs reference {r}"
         );
     }
 }

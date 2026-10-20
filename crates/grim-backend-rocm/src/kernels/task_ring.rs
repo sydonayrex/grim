@@ -543,6 +543,10 @@ pub struct TaskRingContext {
     stop: Box<dyn BackendStorage>,
     desc_staging: Box<dyn BackendStorage>,
     capacity: u32,
+    /// M6 step 3: true when a RESIDENT wave is parked on this ring. A resident
+    /// wave is launched once and drains every node the ring is given, so the
+    /// per-node enqueue does not launch a wave of its own.
+    pub resident: bool,
 }
 
 impl std::fmt::Debug for TaskRingContext {
@@ -597,6 +601,7 @@ impl TaskRingContext {
             stop: u32_scalar(0)?,
             desc_staging,
             capacity,
+            resident: false,
         };
         // Stage AFTER the ring exists so the caller gets a fully formed context
         // back; the plan is known non-empty here, so count lands non-zero.
@@ -665,7 +670,7 @@ impl TaskRingContext {
             0,
         )?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -698,7 +703,7 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -726,7 +731,7 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -754,7 +759,7 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -807,7 +812,7 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -838,7 +843,60 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
+        Ok(())
+    }
+
+    /// Drain the ring with a wave — unless a RESIDENT wave is already parked on
+    /// it (M6 step 3), in which case the enqueue only publishes the descriptor
+    /// and the parked wave picks it up. A step then costs ONE launch instead of
+    /// one per node.
+    fn drain(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        if self.resident {
+            return Ok(());
+        }
+        launch_task_ring(
+            dev,
+            &*self.slots,
+            self.capacity,
+            &*self.tail,
+            &*self.head,
+            &*self.stop,
+            None,
+            0,
+        )?;
+        Ok(())
+    }
+
+    /// Launch a RESIDENT wave on this ring (M6 step 3).
+    ///
+    /// The wave parks on an empty queue instead of exiting, so every node the
+    /// ring is given afterwards is drained without another launch. It leaves
+    /// through [`Self::stop_wave`] or its own poll budget.
+    pub fn launch_resident(&mut self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        launch_task_ring_resident(
+            dev,
+            &*self.slots,
+            self.capacity,
+            &*self.tail,
+            &*self.head,
+            &*self.stop,
+            None,
+            0,
+        )?;
+        self.resident = true;
+        Ok(())
+    }
+
+    /// Stop a resident wave: set the stop flag so the parked wave exits.
+    ///
+    /// The publish kernel is a plain store to the pointer it is handed, so it
+    /// sets the stop flag exactly as it sets the head.
+    pub fn stop_wave(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        let stop_ptr = as_rocm(self.stop.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring stop has no device ptr".into()))?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, stop_ptr, 1)?;
         Ok(())
     }
 
@@ -871,7 +929,7 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -912,7 +970,7 @@ impl TaskRingContext {
             m.input,
             m.output,
         )?;
-        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        self.drain(dev)?;
         Ok(())
     }
 
@@ -946,6 +1004,11 @@ static WAVE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 /// lets the wave tell "queue empty" from "nothing enqueued yet".
 static NEXT_HEAD: AtomicU64 = AtomicU64::new(0);
 
+/// How many claim attempts a RESIDENT wave may make before it gives up on its
+/// own (M6 step 3). The wave normally leaves through `stop_wave`; this is the
+/// backstop, so a host that forgets to stop it cannot hold the device.
+pub const RESIDENT_POLL_BUDGET: u32 = 8192;
+
 pub fn wave_launch_count() -> u64 {
     WAVE_LAUNCHES.load(Ordering::Relaxed)
 }
@@ -970,6 +1033,41 @@ pub fn launch_task_ring(
     stop: &dyn BackendStorage,
     staged: Option<&dyn BackendStorage>,
     staged_count: u32,
+) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
+    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, false)
+}
+
+/// M6 step 3: launch the wave in RESIDENT mode.
+///
+/// A resident wave does not exit when the queue drains — it parks on the empty
+/// queue and picks up whatever the ring is given next, so a step costs ONE
+/// launch instead of one per node. It leaves either when `stop_ptr` is set
+/// ([`TaskRingContext::stop_wave`]) or when its poll budget runs out, so a host
+/// that forgets to stop it cannot wedge the device.
+pub fn launch_task_ring_resident(
+    dev: &crate::RocmDevice,
+    slots: &dyn BackendStorage,
+    capacity: u32,
+    tail: &dyn BackendStorage,
+    head: &dyn BackendStorage,
+    stop: &dyn BackendStorage,
+    staged: Option<&dyn BackendStorage>,
+    staged_count: u32,
+) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
+    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_task_ring_inner(
+    dev: &crate::RocmDevice,
+    slots: &dyn BackendStorage,
+    capacity: u32,
+    tail: &dyn BackendStorage,
+    head: &dyn BackendStorage,
+    stop: &dyn BackendStorage,
+    staged: Option<&dyn BackendStorage>,
+    staged_count: u32,
+    resident: bool,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
     // `None, 0` is the pre-existing contract (the host published `head`; the
     // prologue is a no-op). A count with a null array is the bug: the wave would
@@ -1004,7 +1102,23 @@ pub fn launch_task_ring(
     // drains exactly that many. When staged_count == 0 (per-node enqueue), max_tasks
     // cannot be 0 (which exits immediately without executing anything) — give it a
     // generous budget (e.g. 1024 iterations) to drain the queue until head == tail.
-    let mut limit = if staged_count > 0 { staged_count } else { 1024u32 };
+    // The wave's iteration budget = how many claim attempts it may make.
+    //  - staged set: exactly that many descriptors to drain.
+    //  - per-node enqueue: a generous budget, so the wave drains the queue
+    //    until head == tail.
+    //  - RESIDENT: the wave PARKS after the queue drains, so its budget is a
+    //    POLL budget, not a task count. It is bounded so a host that never
+    //    stops it cannot hold the device forever.
+    let mut limit = if resident {
+        RESIDENT_POLL_BUDGET
+    } else if staged_count > 0 {
+        staged_count
+    } else {
+        1024u32
+    };
+    // 1 = the wave parks on an empty queue and only leaves through `stop_ptr`
+    // (or its poll budget); 0 = it exits as soon as the queue drains.
+    let mut resident_flag: u32 = if resident { 1 } else { 0 };
     let mut count = staged_count;
     let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
     dev.launch_compute_kernel(
@@ -1018,7 +1132,7 @@ pub fn launch_task_ring(
             arg(&mut head_ptr),
             arg(&mut stop_ptr),
             arg(&mut limit),
-            arg(&mut 0u32), // resident = 0: the staged prologue resets tail
+            arg(&mut resident_flag), // 1 = park on an empty queue instead of exiting
             arg(&mut staged_ptr),
             arg(&mut count),
         ],
