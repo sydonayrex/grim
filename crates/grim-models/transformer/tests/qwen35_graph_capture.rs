@@ -873,6 +873,16 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
         .as_ref()
         .expect("the capture must publish the emitted task graph");
 
+    // M5 Step 4 keys `forward_replay` on `ring_context.is_some()`, so building
+    // the ring here would make this INSPECTION flag silently reroute the decode
+    // path — the same class as int2v4 reaching capture through a spelling list.
+    // The ring is built only under its own flag.
+    assert!(
+        graph.ring_context.is_none(),
+        "GRIM_EMIT_TASK_GRAPH alone must not build the ring — that would change \
+         what executes, under a flag that only asks for the IR"
+    );
+
     // Structure: 1 embed + 4 layers x (block + FFN GEMM) + 1 NORM + 1 head GEMM.
     assert_eq!(ir.nodes.len(), 1 + 4 * 2 + 2, "node count: {:#?}", {
         let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();

@@ -2398,9 +2398,17 @@ impl DecodeGraph {
     fn publish_task_graph(&mut self) {
         if let Some(b) = self.emitter.take() {
             let ir = b.finish();
-            let dev = crate::device::roc_device::RocmDevice::shared(self.ordinal);
-            if let Ok(ctx) = crate::kernels::task_ring::TaskRingContext::from_graph(&dev, &ir) {
-                self.ring_context = ctx;
+            // The ring is an EXECUTION choice, not an emission side effect.
+            // `GRIM_EMIT_TASK_GRAPH=1` only asks capture to publish the IR for
+            // inspection; building the ring here unconditionally made that debug
+            // flag silently reroute `forward_replay` through the ring, because
+            // Step 4 keys on `ring_context.is_some()`. The ring is built only
+            // under its own flag, so turning emission on cannot change what runs.
+            if std::env::var_os("GRIM_TASK_RING").is_some() {
+                let dev = crate::device::roc_device::RocmDevice::shared(self.ordinal);
+                if let Ok(ctx) = crate::kernels::task_ring::TaskRingContext::from_graph(&dev, &ir) {
+                    self.ring_context = ctx;
+                }
             }
             self.buffers.emitted_task_graph = Some(ir);
         }
