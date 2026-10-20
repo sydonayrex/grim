@@ -644,6 +644,71 @@ fn peer_copy_binds_and_executes() {
     assert_eq!(got, src, "the peer copy must reproduce the source exactly");
 }
 
+/// M6: the ring performs a REAL cross-device copy. The wave's `OP_PEER_BROADCAST`
+/// arm writes `desc->input_ptr` (this device) into `desc->peer_ptr` (the peer
+/// device's buffer), so with peer access granted the segment-boundary handoff
+/// runs inside the ring — which is the point of M6, and is what a plain memcpy
+/// node cannot do.
+///
+/// The single-device gate above proves the BINDING and the arm; this proves the
+/// arm works across devices: the producer's wave must land the bytes in the
+/// CONSUMER's buffer, not in some local scratch.
+#[test]
+fn ring_peer_copy_crosses_devices() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices");
+        return;
+    }
+    let producer = grim_backend_rocm::RocmDevice::try_new(0).expect("dev 0");
+    let consumer = grim_backend_rocm::RocmDevice::try_new(1).expect("dev 1");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    // The grant is directional: the wave runs on the PRODUCER and writes into
+    // the CONSUMER's memory, so producer -> consumer is the direction that
+    // matters.
+    grim_backend_rocm::peer_access::enable_peer_access(0, 1).expect("peer 0->1");
+
+    let src: Vec<f32> = (0..32).map(|i| (i as f32 + 1.0) * 0.5).collect();
+    let (_s_s, s_ptr) = f32_dev(&producer, &src);
+    let (d_s, d_ptr) = f32_dev(&consumer, &[0.0f32; 32]);
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_s = gb.push_arg(s_ptr, 128, arg_role::ACT_IN);
+    let h_d = gb.push_arg(d_ptr, 128, arg_role::PEER);
+    gb.push(
+        op::PEER_COPY,
+        [32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_s, h_d],
+        &[],
+        0,
+        0,
+    );
+    let graph = gb.finish();
+
+    let ctx =
+        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&producer, &graph)
+            .expect("ring context")
+            .expect("ring binds the peer copy");
+    ctx.enqueue_peer_copy(&producer, &ctx.plan().peers()[0])
+        .expect("enqueue peer copy");
+
+    // The write is issued on the producer's stream into the consumer's buffer.
+    producer.synchronize();
+    consumer.synchronize();
+
+    let got: Vec<f32> = d_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap()
+        .to_cpu_vec_f32()
+        .unwrap();
+    assert_eq!(
+        got, src,
+        "the ring's peer copy must land the bytes in the CONSUMER's buffer"
+    );
+}
+
 /// Gate 1: the plan builder's binding rules.
 #[test]
 fn the_plan_binds_only_what_a_ring_can_run() {
