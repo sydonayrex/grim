@@ -911,20 +911,31 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
     assert!(ir.caps.opcodes.contains(&op::GEMM));
     assert_eq!(ir.caps.devices.len(), 1);
 
-    // RECURRENT is emitted but is NOT ring-bound — the wave has no recurrent arm
-    // (the KDA conv/scan/gate chain is several kernels). So the hybrid model must
-    // report `full: false` and NAME it. This keeps the gap visible instead of
-    // letting a future change quietly claim coverage, which is the Q8_0_DOT4
-    // failure mode: an advertised opcode with no arm behind it.
+    // RING-READINESS GATE (replaces the pinned "not full" assertion). The
+    // hybrid model's RECURRENT nodes are now ring-executable: the wave has the
+    // OP_RECURRENT arm, the emitter staged a descriptor for each recurrent layer,
+    // and the plan binds them.
+    //
+    // BOTH halves are asserted, because `ring_ready` alone only says the opcode
+    // is claimed — it cannot see whether the plan can actually bind a node. That
+    // is the Q8_0_DOT4 failure mode: an advertised opcode with no arm behind it.
     let ready = grim_backend_rocm::task_graph::ring_ready(&ir.caps);
     assert!(
-        !ready.full,
-        "RECURRENT has no ring arm, so the hybrid model cannot be ring-ready"
+        ready.full,
+        "the hybrid's opcodes must all be ring-covered; missing {:?}",
+        ready.missing
     );
     assert!(
-        ready.missing.contains(&op::RECURRENT),
-        "the missing set must name RECURRENT: {:?}",
+        ready.missing.is_empty(),
+        "nothing should be missing: {:?}",
         ready.missing
+    );
+    let plan = grim_backend_rocm::kernels::task_ring::TaskRingPlan::from_graph(&ir);
+    assert_eq!(
+        plan.recurrences().len(),
+        2,
+        "both recurrent layers must bind their descriptor: {:?}",
+        plan.recurrences()
     );
     // The argument table is the model's: every arg handle resolves.
     for n in &ir.nodes {

@@ -2273,6 +2273,11 @@ pub struct DecodeGraph {
     pub emitter: Option<crate::task_graph::TaskGraphBuilder>,
     /// M4/M5: persistent task ring context built from the emitted task graph.
     pub ring_context: Option<crate::kernels::task_ring::TaskRingContext>,
+    /// M5: device addresses of the per-layer `KdaTaskDescriptor` the qwen35
+    /// emitter puts on each RECURRENT node. Indexed by LAYER (None for attention
+    /// layers). Staged OUTSIDE capture — an H2D copy inside the capture bracket
+    /// poisons the graph (measured: `hipMemcpyHostToDevice ... error code 906`).
+    pub kda_desc_ptrs: Vec<Option<u64>>,
     ordinal: usize,
 }
 
@@ -2332,6 +2337,7 @@ impl DecodeGraph {
                 None
             },
             ring_context: None,
+            kda_desc_ptrs: Vec::new(),
             ordinal: dev.ordinal,
         }
     }

@@ -3216,6 +3216,71 @@ impl DecodeGraphModel for Qwen35 {
 
         let ords: Vec<usize> = buffers.layer_devices.clone();
         let mut graph = DecodeGraph::new(&dev, buffers, stream);
+
+        // M5: stage the per-recurrent-layer KDA descriptors OUTSIDE the capture
+        // bracket. An H2D copy inside capture poisons it — measured: the emitter
+        // doing this produced `hipMemcpyHostToDevice ... error code 906`. The
+        // KDA buffers above are allocated in the same (non-capturing) place.
+        //
+        // Indexed by LAYER (None for attention layers), so the emitter can look
+        // one up by the layer it is emitting.
+        let mut kda_desc_ptrs: Vec<Option<u64>> = vec![None; self.blocks.len()];
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            if block.is_full_attention {
+                continue;
+            }
+            let Some(kda) = graph.buffers.kda.get(layer_idx).and_then(|k| k.as_ref()) else {
+                continue;
+            };
+            let blk_ord = match block.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
+            let conv_w = block.ssm_conv1d.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no short-conv weight"))
+            })?;
+            let cw = dst_downcast(conv_w.storage().as_ref())?;
+            let dims = cw.shape().dims();
+            let dt_bias = block.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no dt.bias"))
+            })?;
+            let ssm_a = block.ssm_a_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no ssm_a"))
+            })?;
+            let ssm_norm = block.ssm_norm_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no ssm_norm"))
+            })?;
+            let desc = grim_backend_rocm::scythe_task_descriptors::KdaTaskDescriptor {
+                conv_in: graph.buffers.q_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                conv_w: cw.device_ptr_u64().unwrap_or(0),
+                conv_bias: 0,
+                conv_state: graph.buffers.sc_state[layer_idx].device_ptr_u64().unwrap_or(0),
+                conv_out: kda.conv_out.device_ptr_u64().unwrap_or(0),
+                alpha: kda.alpha.device_ptr_u64().unwrap_or(0),
+                beta: kda.beta.device_ptr_u64().unwrap_or(0),
+                dt_bias: dst_downcast(dt_bias.as_ref())?.device_ptr_u64().unwrap_or(0),
+                ssm_a: dst_downcast(ssm_a.as_ref())?.device_ptr_u64().unwrap_or(0),
+                ssm_norm: dst_downcast(ssm_norm.as_ref())?.device_ptr_u64().unwrap_or(0),
+                gate: kda.gate.device_ptr_u64().unwrap_or(0),
+                state: kda.state.device_ptr_u64().unwrap_or(0),
+                acc: kda.acc_scratch.device_ptr_u64().unwrap_or(0),
+                branch: kda.branch.device_ptr_u64().unwrap_or(0),
+                num_v: kda.num_val_heads as u32,
+                num_k: kda.num_key_heads as u32,
+                head_dim: kda.head_dim as u32,
+                batch: graph.buffers.batch.max(1) as u32,
+                channels: dims.first().copied().unwrap_or(0) as u32,
+                kernel_size: dims.get(1).copied().unwrap_or(0) as u32,
+                eps: block.attn_norm.eps,
+                has_z: 1,
+            };
+            kda_desc_ptrs[layer_idx] = Some(
+                desc.upload(&blk_dev)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("kda desc: {e}")))?,
+            );
+        }
+        graph.kda_desc_ptrs = kda_desc_ptrs;
         // A6: derive the per-device capture segments from the placement the
         // buffers were allocated with. Single-device models get one segment
         // and stay on the legacy single-graph path (split_capture() == false).
@@ -3292,7 +3357,7 @@ impl DecodeGraphModel for Qwen35 {
                 } else {
                     grim_backend_rocm::task_graph::op::RECURRENT
                 };
-                let args = [
+                let mut args = vec![
                     (graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
                      graph.buffers.layer_input[i].bytes() as u64, 1u8),
                     (graph.buffers.k_arena[i].device_ptr_u64().unwrap_or(0),
@@ -3302,6 +3367,23 @@ impl DecodeGraphModel for Qwen35 {
                     (graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
                      graph.buffers.layer_output[i].bytes() as u64, 2u8),
                 ];
+                if !is_attn {
+                    // M5: the RECURRENT node's WEIGHT operand is the device-resident
+                    // descriptor the wave's OP_RECURRENT arm casts to. Without it the
+                    // plan cannot bind the node, and `ring_ready` would advertise
+                    // coverage that does not exist.
+                    let ptr = graph.kda_desc_ptrs.get(i).copied().flatten().ok_or_else(|| {
+                        grim_core::error::Error::Backend(format!(
+                            "emit: recurrent layer {i} has no staged KDA descriptor"
+                        ))
+                    })?;
+                    args.push((
+                        ptr,
+                        std::mem::size_of::<grim_backend_rocm::scythe_task_descriptors::KdaTaskDescriptor>()
+                            as u64,
+                        0u8,
+                    ));
+                }
                 let blk = graph.emit_node(kind,
                     [self.cfg.head_dim as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     &args, &[emit_last], blk_ord as u8);

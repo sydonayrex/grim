@@ -121,4 +121,11 @@ pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     // and to `TaskRingPlan::peers`, so advertising it is honest — unlike
     // Q8_0_DOT4, which was listed with no arm at all.
     crate::task_graph::op::PEER_COPY,
+    // M5: the qwen35 KDA/recurrent step. The wave's `OP_RECURRENT` arm casts
+    // the node's WEIGHT operand to a device-resident `KdaTaskDescriptor` and
+    // runs the short-conv step, the batched gated delta rule and the gated head
+    // norm inline. Advertised because the arm, the binding AND the emitter's
+    // descriptor staging all exist — otherwise `ring_ready` would claim coverage
+    // the plan cannot bind, which is the Q8_0_DOT4 failure mode.
+    crate::task_graph::op::RECURRENT,
 ];
