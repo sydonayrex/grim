@@ -600,9 +600,13 @@ impl TaskRingContext {
             &*self.slots,
             slot,
             OP_NORM,
+            // Geometry is (m, k): the wave's NORM arm reads `desc->m` (rows) and
+            // `desc->k` (the normalized axis). The width was being written into
+            // the `n` slot, so `desc->k` was 0 and the arm's inner loop never ran
+            // — the norm wrote nothing and the caller saw Ok.
             n.m,
-            n.k,
             0,
+            n.k,
             n.input,
             n.weight,
             n.output,

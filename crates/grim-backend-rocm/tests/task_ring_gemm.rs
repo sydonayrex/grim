@@ -201,6 +201,20 @@ fn ring_norm_produces_byte_identical_results_across_runs() {
     let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     assert_eq!(r1, r2, "two runs of the same norm must be byte-identical");
+
+    // ORACLE: out[k] = a[k] * rsqrt(mean(a^2) + eps) * w[k], eps = 1e-5 (the
+    // wave arm's fixed constant). f64 on the host; `rsqrtf` is a device
+    // approximation so the bar is 1e-4 relative, not exact.
+    let ss: f64 = a.iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let rms = 1.0 / ((ss / a.len() as f64) + 1e-5).sqrt();
+    for j in 0..a.len() {
+        let want = (a[j] as f64) * rms * (w[j] as f64);
+        assert!(
+            ((r1[j] as f64) - want).abs() <= 1e-4 * want.abs().max(1.0),
+            "norm out[{j}] = {} but the host oracle says {want}",
+            r1[j]
+        );
+    }
 }
 
 /// M5 determinism gate: GEMM must produce byte-identical results across two runs.
@@ -241,6 +255,22 @@ fn ring_gemm_produces_byte_identical_results_across_runs() {
     let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     assert_eq!(r1, r2, "two runs of the same gemm must be byte-identical");
+
+    // ORACLE (ai-troubleshooting-expert: "a gate that cannot fail is not a
+    // gate"). `r1 == r2` alone is satisfied by a ring that silently skips the
+    // node — both outputs stay at their initial value. The VALUE is the real
+    // check: C = A @ W^T, computed here in f64 on the host.
+    for j in 0..n as usize {
+        let mut want = 0.0f64;
+        for i in 0..k as usize {
+            want += (a[i] as f64) * (w[j * k as usize + i] as f64);
+        }
+        assert!(
+            (r1[j] as f64 - want).abs() < 1e-5,
+            "gemm out[{j}] = {} but the host oracle says {want}",
+            r1[j]
+        );
+    }
 }
 
 /// M5 determinism gate: ATTENTION must produce byte-identical results across two runs.
@@ -287,6 +317,17 @@ fn ring_attention_produces_byte_identical_results_across_runs() {
     let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     assert_eq!(r1, r2, "two runs of the same attention must be byte-identical");
+
+    // ORACLE, and an exact one: with seq_len = 1 the softmax is over a single
+    // key, so it is 1 and out == V. No tolerance needed, and it pins the V
+    // operand binding — a swapped k/v, or a node the ring skipped, fails here.
+    assert_eq!(
+        r1,
+        v,
+        "seq_len=1 attention must be exactly V; got {:?} vs {:?}",
+        &r1[..4],
+        &v[..4]
+    );
 }
 
 /// M5 determinism gate: MOE_DISPATCH must produce byte-identical results across two runs.
@@ -377,6 +418,16 @@ fn ring_moe_produces_byte_identical_results_across_runs() {
     let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     assert_eq!(r1, r2, "two runs of the same moe dispatch must be byte-identical");
+
+    // NON-VACUITY: `r1 == r2` is satisfied by a ring that skipped the node —
+    // both outputs would sit at their initial value. The fused MoE kernel has no
+    // host-callable launcher to diff against, so the cheap oracle here is that
+    // the dispatch actually produced signal; its numerics are covered by the
+    // kernel's own parity suite.
+    assert!(
+        r1.iter().any(|&x| x != 0.0),
+        "moe dispatch produced all zeros — the ring never executed the node"
+    );
 }
 
 /// M5 Step 3: Event-Tensor on-device dynamic successor enqueue test for MOE_DISPATCH.
@@ -465,6 +516,13 @@ fn ring_dynamic_moe_produces_byte_identical_results_across_runs() {
     let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
     assert_eq!(r1, r2, "two runs of on-device dynamic moe dispatch must be byte-identical");
+
+    // NON-VACUITY, as above: the dynamic (Event-Tensor) enqueue must actually
+    // produce signal, not leave the output at its initial value.
+    assert!(
+        r1.iter().any(|&x| x != 0.0),
+        "dynamic moe dispatch produced all zeros — the on-device enqueue never ran"
+    );
 }
 
 /// Gate 1: the plan builder's binding rules.
