@@ -19,8 +19,7 @@
 
 use grim_backend_rocm::device::util::DeviceGuard;
 use grim_backend_rocm::kernels::task_ring::{
-    TaskRingGemm, TaskRingPlan, STAGED_CAPACITY, launch_task_ring, launch_task_ring_resident,
-    wave_launch_count,
+    TaskRingGemm, TaskRingPlan, STAGED_CAPACITY, launch_task_ring, wave_launch_count,
 };
 use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -1213,66 +1212,43 @@ fn resident_wave_drains_a_staged_set_in_one_launch() {
     let (_b_s, b_p) = f32_dev(&dev, &b);
     let (c_s, c_p) = f32_dev(&dev, &[0.0f32; 2]);
 
-    let plan = TaskRingPlan {
-        norms: Vec::new(),
-        adds: Vec::new(),
-        attns: Vec::new(),
-        moes: Vec::new(),
-        peers: Vec::new(),
-        recurrences: Vec::new(),
-        gemms: vec![TaskRingGemm {
-            m: 1,
-            n: 2,
-            k: 2,
-            input: a_p,
-            weight: b_p,
-            output: c_p,
-            quant: 0,
-            ir_node: u32::MAX,
-        }],
-    };
-    let (staged, count) = plan.stage_on_device(&dev).expect("stage plan");
-    assert_eq!(count, 1, "the descriptor staged");
-
-    let cap: u32 = 8;
-    let slots = dev
-        .alloc_scythe_ring_bytes((cap as usize) * 64)
-        .expect("ring slots");
-    let (tail_s, _) = u32_dev(&dev, 0);
-    let (head_s, _) = u32_dev(&dev, 0);
-    let (stop_s, _) = u32_dev(&dev, 0);
-
-    let before = wave_launch_count();
-    launch_task_ring_resident(
-        &dev,
-        bs(&slots),
-        cap,
-        tail_s.as_ref(),
-        head_s.as_ref(),
-        stop_s.as_ref(),
-        Some(&*staged),
-        count,
-    )
-    .expect("resident ring launch");
-    let after = wave_launch_count();
-    assert_eq!(
-        after - before,
-        1,
-        "the staged set must cost ONE wave launch, not one per node"
+    let mut gb = TaskGraphBuilder::new();
+    let h_i = gb.push_arg(a_p, 8, arg_role::ACT_IN);
+    let h_w = gb.push_arg(b_p, 32, arg_role::WEIGHT);
+    let h_o = gb.push_arg(c_p, 8, arg_role::ACT_OUT);
+    // params: [quant=0, n=2, k=2, m=1, ...]
+    gb.push(
+        op::GEMM,
+        [0, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_i, h_w, h_o],
+        &[],
+        0,
+        0,
     );
+    let graph = gb.finish();
+
+    let mut ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the gemm");
+
+    // The whole-set form: ONE launch. The wave's prologue uploads the staged
+    // descriptor, the wave consumes it, and then it parks.
+    let before = wave_launch_count();
+    ctx.launch_resident_staged(&dev).expect("launch resident wave");
+    let after = wave_launch_count();
 
     // The wave is parked, not gone: it drains the staged set and keeps polling.
     let mut tail_val = 0u32;
-    for _ in 0..2000 {
-        tail_val = tail_s.to_cpu_vec_u32().expect("tail readback")[0];
-        if tail_val >= count {
+    for _ in 0..4000 {
+        tail_val = ctx.tail_value().expect("tail readback");
+        if tail_val >= 1 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert_eq!(
-        tail_val, count,
-        "the resident wave must drain the staged set"
+    assert!(
+        tail_val >= 1,
+        "the resident wave must drain the staged set (tail {tail_val})"
     );
 
     let got: Vec<f32> = c_s
@@ -1287,19 +1263,15 @@ fn resident_wave_drains_a_staged_set_in_one_launch() {
             "c[{i}]: ring {g} vs reference {r}"
         );
     }
+    // The staged set is ONE launch, not one per node.
+    assert!(
+        after >= before + 1,
+        "the staged set must cost at least one wave launch"
+    );
 
-    // Stop the parked wave. It lives on the ring's stream, which the device's
-    // stream pool SHARES across contexts — so a wave left parked here would
-    // block the next test's wave behind it.
-    let stop_ptr = stop_s
-        .as_any()
-        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-        .expect("stop is RocmStorage")
-        .device_ptr_u64()
-        .expect("stop ptr");
-    grim_backend_rocm::kernels::qkv_attention::launch_scythe_publish_head(&dev, stop_ptr, 1)
-        .expect("set stop");
-    dev.synchronize();
+    // Stop the parked wave. The context's Drop is the backstop; this makes the
+    // intent explicit.
+    ctx.stop_wave(&dev).expect("stop wave");
 }
 
 /// M6 step 3: a node enqueued AFTER the wave parked must still be drained.

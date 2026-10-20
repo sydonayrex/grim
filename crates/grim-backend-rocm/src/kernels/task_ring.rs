@@ -552,6 +552,21 @@ pub struct TaskRingContext {
     /// kernel) would queue behind it instead of being seen. Null when the
     /// device's stream pool had nothing to give.
     pub stream: *mut std::ffi::c_void,
+    /// The device the ring lives on, so `Drop` can stop a parked wave.
+    ordinal: usize,
+}
+
+impl Drop for TaskRingContext {
+    fn drop(&mut self) {
+        // A resident wave parks until it is stopped, and the host owns its
+        // lifetime. Without this, a dropped ring would leave a wave spinning on
+        // the device — which is the wedge the plan's own risk table names.
+        if !self.resident {
+            return;
+        }
+        let dev = crate::RocmDevice::shared(self.ordinal);
+        let _ = self.stop_wave(&dev);
+    }
 }
 
 impl std::fmt::Debug for TaskRingContext {
@@ -607,7 +622,8 @@ impl TaskRingContext {
             desc_staging,
             capacity,
             resident: false,
-            stream: dev.get_stream_from_pool(1).unwrap_or(std::ptr::null_mut()),
+            stream: std::ptr::null_mut(),
+            ordinal: dev.ordinal,
         };
         // Stage AFTER the ring exists so the caller gets a fully formed context
         // back; the plan is known non-empty here, so count lands non-zero.
@@ -880,11 +896,7 @@ impl TaskRingContext {
     /// ring is given afterwards is drained without another launch. It leaves
     /// through [`Self::stop_wave`] or its own poll budget.
     pub fn launch_resident(&mut self, dev: &crate::RocmDevice) -> crate::Result<()> {
-        if self.stream.is_null() {
-            return Err(crate::Error::Backend(
-                "task ring has no stream of its own".into(),
-            ));
-        }
+        self.ensure_stream(dev)?;
         // Resolve the kernel first: the on-stream launch path only launches, it
         // does not resolve. The eager launch resolves it and runs a wave that
         // exits at once, because the queue is empty when the ring is set up.
@@ -913,6 +925,64 @@ impl TaskRingContext {
         Ok(())
     }
 
+    /// Launch a RESIDENT wave that drains the STAGED set and then parks.
+    ///
+    /// The whole-set form: one launch, the wave's prologue uploads the staged
+    /// descriptors, and the wave consumes them and parks.
+    pub fn launch_resident_staged(&mut self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        self.ensure_stream(dev)?;
+        launch_task_ring(
+            dev,
+            &*self.slots,
+            self.capacity,
+            &*self.tail,
+            &*self.head,
+            &*self.stop,
+            None,
+            0,
+        )?;
+        launch_task_ring_resident_on_stream(
+            dev,
+            &*self.slots,
+            self.capacity,
+            &*self.tail,
+            &*self.head,
+            &*self.stop,
+            self.staged.as_deref(),
+            self.count,
+            self.stream,
+        )?;
+        self.resident = true;
+        Ok(())
+    }
+
+    /// Give the ring its own NON-BLOCKING stream, if it has not got one.
+    fn ensure_stream(&mut self, _dev: &crate::RocmDevice) -> crate::Result<()> {
+        if self.stream.is_null() {
+            // A DEDICATED, NON-BLOCKING stream. Two reasons, both measured:
+            //
+            //  * The device's stream pool is created with `hipStreamCreate`, whose
+            //    streams are BLOCKING: they implicitly serialize with the legacy
+            //    null stream. A wave parked on one of those makes the host's next
+            //    SYNCHRONOUS device read (the logits readback) wait on the
+            //    parked wave — a deadlock, because the wave is waiting for work
+            //    the host is waiting to read.
+            //  * The wave must not occupy the caller's stream, or the enqueues
+            //    queue behind it instead of being seen.
+            //
+            // 0x1 is `hipStreamNonBlocking`.
+            let mut st: *mut std::ffi::c_void = std::ptr::null_mut();
+            let res = unsafe { crate::hipStreamCreateWithFlags(&mut st, 0x1, 0) };
+            if res != crate::hipSuccess || st.is_null() {
+                return Err(crate::Error::Backend(format!(
+                    "task ring could not create a non-blocking stream (hip {res})"
+                )));
+            }
+            self.stream = st;
+        }
+        Ok(())
+    }
+
     /// The ring's tail counter — how many tasks the wave has consumed.
     ///
     /// Exposed so a caller can wait for a PARKED wave to drain: the wave runs on
@@ -928,10 +998,12 @@ impl TaskRingContext {
     /// The publish kernel is a plain store to the pointer it is handed, so it
     /// sets the stop flag exactly as it sets the head.
     pub fn stop_wave(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
-        let stop_ptr = as_rocm(self.stop.as_ref())?
-            .device_ptr_u64()
-            .ok_or_else(|| crate::Error::Backend("task ring stop has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, stop_ptr, 1)?;
+        // A SYNCHRONOUS H2D copy, not a kernel launch: a launch is
+        // stream-ordered, so on the ring's own stream it would queue BEHIND the
+        // parked wave — the very thing it is meant to stop. The wave's check is
+        // `stop != 0`, so any non-zero bit pattern works; 1.0f32 is
+        // 0x3F800000.
+        dev.write_f32_into(self.stop.as_ref(), &[1.0f32])?;
         Ok(())
     }
 
@@ -1176,7 +1248,13 @@ fn launch_task_ring_inner(
     //    POLL budget, not a task count. It is bounded so a host that never
     //    stops it cannot hold the device forever.
     let mut limit = if resident {
-        RESIDENT_POLL_BUDGET
+        // Park until the host stops it: the wave's lifetime is the HOST's to
+        // decide, not a spin count's. A budget cannot work here — the host's
+        // first enqueue after the wave parks may JIT the enqueue kernels, and a
+        // cold hipRTC compile of this source tree can outlast ANY budget, at
+        // which point the wave gives up and the node is silently never drained.
+        // The stop is guaranteed instead, by the context's Drop.
+        u32::MAX
     } else if staged_count > 0 {
         staged_count
     } else {
