@@ -166,6 +166,307 @@ fn ring_produces_byte_identical_results_across_runs() {
     }
 }
 
+/// M5 determinism gate: NORM must produce byte-identical results across two runs.
+#[test]
+fn ring_norm_produces_byte_identical_results_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let a: Vec<f32> = (0..64).map(|i| (i as f32 + 1.0) * 0.25).collect();
+    let w: Vec<f32> = (0..64).map(|i| 1.0 + (i as f32) * 0.01).collect();
+    let (_a_s, a_ptr) = f32_dev(&dev, &a);
+    let (_w_s, w_ptr) = f32_dev(&dev, &w);
+    let (o1_s, o1_ptr) = f32_dev(&dev, &[0.0f32; 64]);
+    let (o2_s, o2_ptr) = f32_dev(&dev, &[0.0f32; 64]);
+
+    let mut graph_b = TaskGraphBuilder::new();
+    let h_a = graph_b.push_arg(a_ptr, 256, arg_role::ACT_IN);
+    let h_w = graph_b.push_arg(w_ptr, 256, arg_role::WEIGHT);
+    let h_o1 = graph_b.push_arg(o1_ptr, 256, arg_role::ACT_OUT);
+    let h_o2 = graph_b.push_arg(o2_ptr, 256, arg_role::ACT_OUT);
+    // params: [0, k=64, m=1, ...]
+    graph_b.push(op::NORM, [0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_a, h_w, h_o1], &[], 0, 0);
+    graph_b.push(op::NORM, [0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_a, h_w, h_o2], &[], 0, 0);
+    let graph = graph_b.finish();
+
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the norms");
+
+    ctx.enqueue_norm(&dev, &ctx.norms()[0]).expect("enqueue norm 1");
+    ctx.enqueue_norm(&dev, &ctx.norms()[1]).expect("enqueue norm 2");
+    dev.synchronize();
+
+    let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    assert_eq!(r1, r2, "two runs of the same norm must be byte-identical");
+}
+
+/// M5 determinism gate: GEMM must produce byte-identical results across two runs.
+#[test]
+fn ring_gemm_produces_byte_identical_results_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let m = 1u32;
+    let n = 4u32;
+    let k = 8u32;
+    let a: Vec<f32> = (0..k).map(|i| (i as f32) * 0.5).collect();
+    let w: Vec<f32> = (0..(n * k)).map(|i| ((i % 5) as f32) * 0.25).collect();
+    let (_a_s, a_ptr) = f32_dev(&dev, &a);
+    let (_w_s, w_ptr) = f32_dev(&dev, &w);
+    let (o1_s, o1_ptr) = f32_dev(&dev, &[0.0f32; 4]);
+    let (o2_s, o2_ptr) = f32_dev(&dev, &[0.0f32; 4]);
+
+    let mut graph_b = TaskGraphBuilder::new();
+    let h_a = graph_b.push_arg(a_ptr, (k * 4) as u64, arg_role::ACT_IN);
+    let h_w = graph_b.push_arg(w_ptr, (n * k * 4) as u64, arg_role::WEIGHT);
+    let h_o1 = graph_b.push_arg(o1_ptr, (n * 4) as u64, arg_role::ACT_OUT);
+    let h_o2 = graph_b.push_arg(o2_ptr, (n * 4) as u64, arg_role::ACT_OUT);
+    // params: [quant=0, n=4, k=8, m=1, ...]
+    graph_b.push(op::GEMM, [0, n, k, m, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_a, h_w, h_o1], &[], 0, 0);
+    graph_b.push(op::GEMM, [0, n, k, m, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_a, h_w, h_o2], &[], 0, 0);
+    let graph = graph_b.finish();
+
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the gemms");
+
+    ctx.enqueue_gemm(&dev, &ctx.plan().gemms[0]).expect("enqueue gemm 1");
+    ctx.enqueue_gemm(&dev, &ctx.plan().gemms[1]).expect("enqueue gemm 2");
+    dev.synchronize();
+
+    let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    assert_eq!(r1, r2, "two runs of the same gemm must be byte-identical");
+}
+
+/// M5 determinism gate: ATTENTION must produce byte-identical results across two runs.
+#[test]
+fn ring_attention_produces_byte_identical_results_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let seq_len = 1u32;
+    let num_heads = 2u32;
+    let head_dim = 64u32;
+    let total = (seq_len * num_heads * head_dim) as usize;
+
+    let q: Vec<f32> = (0..total).map(|i| (i as f32) * 0.05).collect();
+    let k: Vec<f32> = (0..total).map(|i| ((i + 1) as f32) * 0.03).collect();
+    let v: Vec<f32> = (0..total).map(|i| ((i + 2) as f32) * 0.02).collect();
+
+    let (_q_s, q_ptr) = f32_dev(&dev, &q);
+    let (_k_s, k_ptr) = f32_dev(&dev, &k);
+    let (_v_s, v_ptr) = f32_dev(&dev, &v);
+    let (o1_s, o1_ptr) = f32_dev(&dev, &vec![0.0f32; total]);
+    let (o2_s, o2_ptr) = f32_dev(&dev, &vec![0.0f32; total]);
+
+    let mut graph_b = TaskGraphBuilder::new();
+    let h_q = graph_b.push_arg(q_ptr, (total * 4) as u64, arg_role::ACT_IN);
+    let h_k = graph_b.push_arg(k_ptr, (total * 4) as u64, arg_role::WEIGHT);
+    let h_v = graph_b.push_arg(v_ptr, (total * 4) as u64, arg_role::SCRATCH);
+    let h_o1 = graph_b.push_arg(o1_ptr, (total * 4) as u64, arg_role::ACT_OUT);
+    let h_o2 = graph_b.push_arg(o2_ptr, (total * 4) as u64, arg_role::ACT_OUT);
+    // params: [seq_len, num_heads, head_dim, ...]
+    graph_b.push(op::ATTENTION, [seq_len, num_heads, head_dim, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_q, h_k, h_v, h_o1], &[], 0, 0);
+    graph_b.push(op::ATTENTION, [seq_len, num_heads, head_dim, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_q, h_k, h_v, h_o2], &[], 0, 0);
+    let graph = graph_b.finish();
+
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the attns");
+
+    ctx.enqueue_attn(&dev, &ctx.plan().attns()[0]).expect("enqueue attn 1");
+    ctx.enqueue_attn(&dev, &ctx.plan().attns()[1]).expect("enqueue attn 2");
+    dev.synchronize();
+
+    let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    assert_eq!(r1, r2, "two runs of the same attention must be byte-identical");
+}
+
+/// M5 determinism gate: MOE_DISPATCH must produce byte-identical results across two runs.
+#[test]
+fn ring_moe_produces_byte_identical_results_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let hidden = 8usize;
+    let inter = 8usize;
+    let num_experts = 4usize;
+    let num_tokens = 2usize;
+    let top_k = 2usize;
+    let block_size = 1usize;
+
+    let x: Vec<f32> = (0..(num_tokens * hidden)).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    let gate_w: Vec<f32> = (0..(num_experts * inter * hidden)).map(|i| ((i % 7) as f32) * 0.05).collect();
+    let up_w: Vec<f32> = (0..(num_experts * inter * hidden)).map(|i| ((i % 5) as f32) * 0.05).collect();
+    let down_w: Vec<f32> = (0..(num_experts * hidden * inter)).map(|i| ((i % 3) as f32) * 0.05).collect();
+
+    let token_ids: Vec<u32> = vec![0, 0, 1, 1];
+    let expert_ids: Vec<u32> = vec![0, 1, 2, 3];
+    let weights: Vec<f32> = vec![0.6, 0.4, 0.7, 0.3];
+
+    let (_x_s, x_ptr) = f32_dev(&dev, &x);
+    let (_gw_s, gw_ptr) = f32_dev(&dev, &gate_w);
+    let (_uw_s, uw_ptr) = f32_dev(&dev, &up_w);
+    let (_dw_s, dw_ptr) = f32_dev(&dev, &down_w);
+
+    let (ti_s, _ti_ptr) = u32_dev(&dev, 0);
+    let (ei_s, _ei_ptr) = u32_dev(&dev, 0);
+    let (_w_s, w_ptr) = f32_dev(&dev, &weights);
+    let _ = (ti_s, ei_s);
+
+    // Upload token_ids & expert_ids vectors
+    let ti_bytes: Vec<u8> = token_ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let ti_storage: Box<dyn BackendStorage> = dev
+        .from_cpu_bytes(
+            &ti_bytes,
+            &Shape::new(vec![token_ids.len()]),
+            DType { arith: ArithType::U32, storage: DTypeStorage::Native },
+        )
+        .expect("token_ids upload");
+    let ti_dev_ptr = ti_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().device_ptr_u64().unwrap();
+
+    let ei_bytes: Vec<u8> = expert_ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let ei_storage: Box<dyn BackendStorage> = dev
+        .from_cpu_bytes(
+            &ei_bytes,
+            &Shape::new(vec![expert_ids.len()]),
+            DType { arith: ArithType::U32, storage: DTypeStorage::Native },
+        )
+        .expect("expert_ids upload");
+    let ei_dev_ptr = ei_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().device_ptr_u64().unwrap();
+
+    let (o1_s, o1_ptr) = f32_dev(&dev, &vec![0.0f32; num_tokens * hidden]);
+    let (o2_s, o2_ptr) = f32_dev(&dev, &vec![0.0f32; num_tokens * hidden]);
+
+    let mut graph_b = TaskGraphBuilder::new();
+    let h_in = graph_b.push_arg(x_ptr, (num_tokens * hidden * 4) as u64, arg_role::ACT_IN);
+    let h_out1 = graph_b.push_arg(o1_ptr, (num_tokens * hidden * 4) as u64, arg_role::ACT_OUT);
+    let h_out2 = graph_b.push_arg(o2_ptr, (num_tokens * hidden * 4) as u64, arg_role::ACT_OUT);
+    let h_gw = graph_b.push_arg(gw_ptr, (gate_w.len() * 4) as u64, arg_role::WEIGHT);
+    let h_uw = graph_b.push_arg(uw_ptr, (up_w.len() * 4) as u64, arg_role::WEIGHT);
+    let h_dw = graph_b.push_arg(dw_ptr, (down_w.len() * 4) as u64, arg_role::WEIGHT);
+    let h_ti = graph_b.push_arg(ti_dev_ptr, (token_ids.len() * 4) as u64, arg_role::SCRATCH);
+    let h_ei = graph_b.push_arg(ei_dev_ptr, (expert_ids.len() * 4) as u64, arg_role::SCRATCH);
+    let h_w = graph_b.push_arg(w_ptr, (weights.len() * 4) as u64, arg_role::SCRATCH);
+
+    // params: [quant_mode=0, hidden, inter, num_tokens, block_size, num_experts, top_k]
+    let params = [
+        0u32, hidden as u32, inter as u32, num_tokens as u32, block_size as u32,
+        num_experts as u32, top_k as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    graph_b.push(op::MOE_DISPATCH, params, &[h_in, h_out1, h_gw, h_uw, h_dw, h_ti, h_ei, h_w], &[], 0, 0);
+    graph_b.push(op::MOE_DISPATCH, params, &[h_in, h_out2, h_gw, h_uw, h_dw, h_ti, h_ei, h_w], &[], 0, 0);
+    let graph = graph_b.finish();
+
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds moes");
+
+    ctx.enqueue_moe(&dev, &ctx.plan().moes()[0]).expect("enqueue moe 1");
+    ctx.enqueue_moe(&dev, &ctx.plan().moes()[1]).expect("enqueue moe 2");
+    dev.synchronize();
+
+    let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    assert_eq!(r1, r2, "two runs of the same moe dispatch must be byte-identical");
+}
+
+/// M5 Step 3: Event-Tensor on-device dynamic successor enqueue test for MOE_DISPATCH.
+///
+/// Asserts that on-device dynamic enqueue (`enqueue_dynamic_moe`) produces
+/// byte-identical results across two runs with zero host-staged descriptors.
+#[test]
+fn ring_dynamic_moe_produces_byte_identical_results_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() { return; }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let hidden = 8usize;
+    let inter = 8usize;
+    let num_experts = 4usize;
+    let num_tokens = 2usize;
+    let top_k = 2usize;
+    let block_size = 1usize;
+
+    let x: Vec<f32> = (0..(num_tokens * hidden)).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    let gate_w: Vec<f32> = (0..(num_experts * inter * hidden)).map(|i| ((i % 7) as f32) * 0.05).collect();
+    let up_w: Vec<f32> = (0..(num_experts * inter * hidden)).map(|i| ((i % 5) as f32) * 0.05).collect();
+    let down_w: Vec<f32> = (0..(num_experts * hidden * inter)).map(|i| ((i % 3) as f32) * 0.05).collect();
+
+    let token_ids: Vec<u32> = vec![0, 0, 1, 1];
+    let expert_ids: Vec<u32> = vec![0, 1, 2, 3];
+    let weights: Vec<f32> = vec![0.6, 0.4, 0.7, 0.3];
+
+    let (_x_s, x_ptr) = f32_dev(&dev, &x);
+    let (_gw_s, gw_ptr) = f32_dev(&dev, &gate_w);
+    let (_uw_s, uw_ptr) = f32_dev(&dev, &up_w);
+    let (_dw_s, dw_ptr) = f32_dev(&dev, &down_w);
+
+    let ti_bytes: Vec<u8> = token_ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let ti_storage: Box<dyn BackendStorage> = dev
+        .from_cpu_bytes(
+            &ti_bytes,
+            &Shape::new(vec![token_ids.len()]),
+            DType { arith: ArithType::U32, storage: DTypeStorage::Native },
+        )
+        .expect("token_ids upload");
+    let ti_dev_ptr = ti_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().device_ptr_u64().unwrap();
+
+    let ei_bytes: Vec<u8> = expert_ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let ei_storage: Box<dyn BackendStorage> = dev
+        .from_cpu_bytes(
+            &ei_bytes,
+            &Shape::new(vec![expert_ids.len()]),
+            DType { arith: ArithType::U32, storage: DTypeStorage::Native },
+        )
+        .expect("expert_ids upload");
+    let ei_dev_ptr = ei_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().device_ptr_u64().unwrap();
+
+    let (_w_s, w_ptr) = f32_dev(&dev, &weights);
+
+    let (o1_s, o1_ptr) = f32_dev(&dev, &vec![0.0f32; num_tokens * hidden]);
+    let (o2_s, o2_ptr) = f32_dev(&dev, &vec![0.0f32; num_tokens * hidden]);
+
+    let mut graph_b = TaskGraphBuilder::new();
+    let h_in = graph_b.push_arg(x_ptr, (num_tokens * hidden * 4) as u64, arg_role::ACT_IN);
+    let h_out1 = graph_b.push_arg(o1_ptr, (num_tokens * hidden * 4) as u64, arg_role::ACT_OUT);
+    let h_out2 = graph_b.push_arg(o2_ptr, (num_tokens * hidden * 4) as u64, arg_role::ACT_OUT);
+    let h_gw = graph_b.push_arg(gw_ptr, (gate_w.len() * 4) as u64, arg_role::WEIGHT);
+    let h_uw = graph_b.push_arg(uw_ptr, (up_w.len() * 4) as u64, arg_role::WEIGHT);
+    let h_dw = graph_b.push_arg(dw_ptr, (down_w.len() * 4) as u64, arg_role::WEIGHT);
+    let h_ti = graph_b.push_arg(ti_dev_ptr, (token_ids.len() * 4) as u64, arg_role::SCRATCH);
+    let h_ei = graph_b.push_arg(ei_dev_ptr, (expert_ids.len() * 4) as u64, arg_role::SCRATCH);
+    let h_w = graph_b.push_arg(w_ptr, (weights.len() * 4) as u64, arg_role::SCRATCH);
+
+    let params = [
+        0u32, hidden as u32, inter as u32, num_tokens as u32, block_size as u32,
+        num_experts as u32, top_k as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    graph_b.push(op::MOE_DISPATCH, params, &[h_in, h_out1, h_gw, h_uw, h_dw, h_ti, h_ei, h_w], &[], 0, 0);
+    graph_b.push(op::MOE_DISPATCH, params, &[h_in, h_out2, h_gw, h_uw, h_dw, h_ti, h_ei, h_w], &[], 0, 0);
+    let graph = graph_b.finish();
+
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds moes");
+
+    ctx.enqueue_dynamic_moe(&dev, &ctx.plan().moes()[0]).expect("enqueue dynamic moe 1");
+    ctx.enqueue_dynamic_moe(&dev, &ctx.plan().moes()[1]).expect("enqueue dynamic moe 2");
+    dev.synchronize();
+
+    let r1: Vec<f32> = o1_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    let r2: Vec<f32> = o2_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap().to_cpu_vec_f32().unwrap();
+    assert_eq!(r1, r2, "two runs of on-device dynamic moe dispatch must be byte-identical");
+}
+
 /// Gate 1: the plan builder's binding rules.
 #[test]
 fn the_plan_binds_only_what_a_ring_can_run() {

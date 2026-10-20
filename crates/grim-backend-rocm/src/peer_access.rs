@@ -187,40 +187,19 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
     }
     // hipDeviceEnablePeerAccess / DisablePeerAccess operate on the CURRENT device, so we must pin the current device to `src` for the duration.
     // Without this, the grant lands on (or fails from) whatever device the caller last touched.
-    let mut prev_device: i32 = 0;
-    let mut pinned = false;
-    if unsafe { crate::device::handles::hipGetDevice(&mut prev_device) } == hipSuccess {
-        if prev_device != src {
-            pinned = crate::device::util::raw_set_device(src) == hipSuccess;
-        } else {
-            pinned = true;
-        }
-    }
-    let outcome = if !pinned && prev_device != src {
-        Err(Error::Backend(
-            "enable_peer_access: could not pin current device to src".into(),
-        ))
+    let _guard = crate::device::util::DeviceGuard::set(src);
+    // Disable first (best practice - peer access persists in the process
+    // address space, so a fresh probe may collide with a stale grant).
+    let _ = unsafe { hipDeviceDisablePeerAccess(dst) };
+    let res = unsafe { hipDeviceEnablePeerAccess(dst, 0) };
+    if res == hipSuccess || res == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+        Ok(true)
     } else {
-        // Disable first (best practice - peer access persists in the process
-        // address space, so a fresh probe may collide with a stale grant).
-        let _ = unsafe { hipDeviceDisablePeerAccess(dst) };
-        let res = unsafe { hipDeviceEnablePeerAccess(dst, 0) };
-        if res == hipSuccess {
-            Ok(true)
-        } else if res == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
-            // Soft success — the runtime already enabled it.
-            Ok(true)
-        } else {
-            Err(Error::Backend(format!(
-                "enable_peer_access: hipDeviceEnablePeerAccess returned code={}",
-                res
-            )))
-        }
-    };
-    if pinned && prev_device != src {
-        let _ = crate::device::util::raw_set_device(prev_device);
+        Err(Error::Backend(format!(
+            "enable_peer_access: hipDeviceEnablePeerAccess returned code={}",
+            res
+        )))
     }
-    outcome
 }
 
 /// Peer link classification for inter-GPU communication paths.

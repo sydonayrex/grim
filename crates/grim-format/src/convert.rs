@@ -415,6 +415,7 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
                 grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)
             }
             grim_tensor::dtype::BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&raw.bytes, elem_count),
+            grim_tensor::dtype::BlockDtype::Q4_1 => grim_quant::dequant_q4_1(&raw.bytes, elem_count),
             grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(&raw.bytes, elem_count),
             grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
                 grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)

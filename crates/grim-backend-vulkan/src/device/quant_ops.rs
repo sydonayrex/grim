@@ -196,6 +196,7 @@ impl QuantOps for VulkanDevice {
                     // Cross-agent courtesy fix: the arm was added upstream
                     // without this vulkan match arm and blocked the tree.
                     BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&b_bytes_cpu, k * n)?,
+                    BlockDtype::Q4_1 => grim_quant::dequant_q4_1(&b_bytes_cpu, k * n)?,
                     // GreyRaven 2:4 flat: the packed form exists
                     // (`pack_grey_raven`) and the host decodes it; what does
                     // not exist is a Vulkan kernel route. Refusing is the

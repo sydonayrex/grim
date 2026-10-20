@@ -1,7 +1,8 @@
 # Debug & Tuning Environment Variables
 
 Full reference for every `GRIM_*` environment variable actually read
-somewhere under `crates/` (124 variables, inventoried 2026-09-24).
+somewhere under `crates/` (131 variables as of 2026-10-17; the original 124
+were inventoried 2026-09-24 and the Phase M knobs below are additions since).
 `docs/configuration.md` covers the 27 core runtime knobs plus
 `grim.toml` precedence; this document is the complete debug/tuning
 surface: name, polarity (which values turn it on/off), default, and
@@ -39,6 +40,7 @@ fails if any variable documented here stops being read in `crates/`.
 | `GRIM_DISABLE_CALIBRATION` | `set` skips the capability micro-benchmark | calibration on | grim-backend-rocm |
 | `GRIM_DOT_GEMV` | on unless `0` / `false` / `off` | on | grim-backend-rocm, grim-models |
 | `GRIM_DOT_GEMV_LEGACY` | `1` / `true` / `on` enables the legacy path | off | grim-backend-rocm |
+| `GRIM_EMIT_TASK_GRAPH` | `set` enables the task-graph emitter: `forward_capture` pushes one node per model-level launch and `end_capture` publishes the IR (`DecodeGraphBuffers::emitted_task_graph`). Unset = the emitter is `None` and capture pays one `Option` check. The published IR is what `forward_interpret_ir` walks and what `ring_ready` classifies | off | grim-backend-rocm |
 | `GRIM_F16_KV` | any value except `0` / `false` / `off` enables f16 KV arenas (global alloc hint, default off); Qwen35 dense arenas default to f16 unless explicitly `0`/`false`/`off` (validated eager+graph); launchers derive f16-ness from arena storage, never env | off (Qwen35: on) | grim-backend-rocm, grim-models |
 | `GRIM_KV_ARENA` | `f32` / `f16` / `int8` / `int4` / `int2v4` — dense ROCm KV-arena representation (int8/int4 = u8 codes + f32 per-(row,kv_head) scales; **eager path only** — decode-graph capture refuses quantized arenas); wins over `GRIM_F16_KV`; launchers read the arena dtype, not this var. `int2v4` (asymmetric 2-bit K / 4-bit V) is implemented: 2-bit keys pack four codes per byte (3 used levels, so it is deliberately coarse), values stay 4-bit, and each side carries its own per-(row,kv_head) f32 scale. Requires `head_dim % 4 == 0`; eager path only (the decode graph refuses quantized arenas). | per-model (`GRIM_F16_KV`, Qwen35: f16) | grim-backend-rocm, grim-models |
 | `GRIM_KV_ARENA_ROWS` | integer token-row capacity for the KV-eviction ring (Phase 3). Set => arena pinned at that many rows: `GRIM_KV_SINKS` leading tokens pinned as attention sinks, newest `rows - sinks` cycled in place. Comma-separated **per-layer** list allowed (`8192,4096,2048`); a `0` entry leaves a layer uncapped; non-uniform lists fall back to eager. Decouples KV memory from `GRIM_CONTEXT`. Unset / `0` = no eviction | unset | grim-models (qwen35), grim-backend-rocm |
@@ -58,6 +60,7 @@ fails if any variable documented here stops being read in `crates/`.
 | `GRIM_GRAPH_RETRY_INTERVAL` | integer eager steps between recapture attempts | `32` | grim-backend-rocm |
 | `GRIM_HIP_TRACE` | `set` enables `[hipMemcpy-trace]` / `[hipDeviceSync-trace]` backtraces | off | grim-backend-rocm |
 | `GRIM_HSACO_CACHE_DIR` | path to JIT HSACO disk cache | temp `grim_hsaco_cache` | grim-backend-rocm, grim-cli |
+| `GRIM_IR_TRACE` | `set` traces task-graph IR execution: `task_graph_exec::execute` prints `[ir-exec] node k/n opcode=…` before each dispatch, and the model interpreters drain the queue (`hipStreamSynchronize`) at every node boundary. Without the drain a device fault is reported during a LATER node's launches and the trace names the wrong node. Zero cost unset (one `var_os` per step) | off | grim-backend-rocm, grim-models-transformer |
 | `GRIM_JIT_CACHE_DIR` | path to compiled HSA code-object cache | `~/.cache/grim/rocm_code_objects` | grim-backend-rocm |
 | `GRIM_KV_QUANT_FORMAT` | `q4khalf` / `q4k` / `q8_0` / `legacy` (also `1` / `2` / `3`) | derived from `quant_bits` | grim-backend-rocm |
 | `GRIM_MXFP4_FUSED_GEMM` | `1` / `true` forces on; `0` / `false` / `off` / `no` forces off | arch-confirmed (RDNA4 gfx12x, UDNA gfx13x, CDNA4 gfx95x) | grim-backend-rocm |

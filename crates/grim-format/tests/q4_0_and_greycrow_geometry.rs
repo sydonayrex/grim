@@ -32,11 +32,34 @@ fn q4_0_is_block_32_with_18_bytes_not_a_kquant_superblock() {
     assert_eq!(d.expected_bytes(160), 18 * 5, "ngram_dim=160 rows");
 }
 
+/// Q4_1 is Q4_0's sibling with a per-block MIN as well as a scale
+/// (`w = q*d + m`, 20 B / 32). It used to refuse here alongside Q4_2/Q5_0/Q5_1
+/// because grim had no decoder for it; it now has one
+/// (`grim_quant::dequant_q4_1`, gated against llama.cpp's
+/// `dequantize_row_q4_1`), so it must be its own block storage with its own
+/// geometry. A refusal is the right answer only while nothing can decode it.
+#[test]
+fn q4_1_is_block_32_with_20_bytes() {
+    let d = map_gguf_dtype_to_storage(GgufDType::Q4_1);
+    assert_eq!(
+        d.storage,
+        Storage::Block(BlockDtype::Q4_1),
+        "Q4_1 must be its own block storage"
+    );
+    assert_ne!(
+        d.storage,
+        Storage::Block(BlockDtype::Q4_0),
+        "Q4_1 carries a per-block min that Q4_0 does not; the two must not share a decode"
+    );
+    // 20 bytes per 32 weights: [f16 d][f16 m][16 nibbles].
+    assert_eq!(d.expected_bytes(32), 20);
+    assert_eq!(d.expected_bytes(256), 160);
+}
+
 #[test]
 fn q4_siblings_refuse_with_correct_geometry_instead_of_posing_as_kquant() {
     for (tag, bytes) in [
-        (GgufDType::Q4_1, 20usize),
-        (GgufDType::Q4_2, 20),
+        (GgufDType::Q4_2, 20usize),
         (GgufDType::Q5_0, 22),
         (GgufDType::Q5_1, 24),
     ] {

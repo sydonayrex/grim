@@ -58,9 +58,10 @@ impl RocmDevice {
             Some(hg_s),
             Some(hu_s),
         )?;
-        // The stash must outlive the stream until the backward launch; stash the
-        // stream handle inside the returned handle for a single synchronize().
-        unsafe { crate::hipStreamSynchronize(stream) };
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        crate::check_hip("charon_grouped_dispatch hipStreamSynchronize", unsafe {
+            crate::hipStreamSynchronize(stream)
+        })?;
         Ok(CharonForwardStash {
             hg: hg_storage,
             hu: hu_storage,

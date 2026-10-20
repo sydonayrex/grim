@@ -66,7 +66,10 @@ fn roundtrip(
     let scale = src.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
     let mut sum_sq = 0.0f64;
     let mut worst = 0.0f32;
-    let mut nonfinite = 0usize;
+    // Not `mut`: the per-element assert below fires before any increment could,
+    // so this counter is a formality kept for the message. `-D unused-mut` is on
+    // workspace-wide, which is what broke this crate's test build.
+    let nonfinite = 0usize;
     for (x, y) in src.iter().zip(back.iter()) {
         assert!(y.is_finite(), "{name}: non-finite reconstructed weight {y}");
         let e = (x - y).abs() / scale;

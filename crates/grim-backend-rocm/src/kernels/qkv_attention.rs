@@ -3062,6 +3062,69 @@ extern "C" __global__ void grim_scythe_write_slot(
         *(unsigned long long*)(slot + 24) = weight_ptr;
         *(unsigned long long*)(slot + 32) = output_ptr;
         *(unsigned long long*)(slot + 40) = peer_ptr;
+        *(unsigned int*)(slot + 48) = 0u; // ST_PENDING
+        __threadfence();
+    }
+}
+
+// Event-Tensor on-device successor enqueue (Task M5 Step 3):
+// Dynamically binds a device-resident MoETaskDescriptor with computed routing pointers
+// and writes the ScytheRing slot and advances head on-device without host round-trip.
+extern "C" __global__ void grim_scythe_enqueue_dynamic_moe(
+    unsigned char* __restrict__ slots_base,
+    unsigned int capacity,
+    unsigned int* __restrict__ head_dev,
+    unsigned char* __restrict__ desc_staging, // device memory holding MoETaskDescriptor
+    unsigned int hidden,
+    unsigned int inter,
+    unsigned int num_tokens,
+    unsigned int block_size,
+    unsigned int num_experts,
+    unsigned int top_k,
+    unsigned int quant_mode,
+    float routed_scaling_factor,
+    unsigned long long gate_w_ptr,
+    unsigned long long up_w_ptr,
+    unsigned long long down_w_ptr,
+    unsigned long long token_ids_ptr,
+    unsigned long long expert_ids_ptr,
+    unsigned long long weights_ptr,
+    unsigned long long input_ptr,
+    unsigned long long output_ptr
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // 1. Fill the device-side MoETaskDescriptor (96 bytes)
+        *(unsigned int*)(desc_staging + 0)  = hidden;
+        *(unsigned int*)(desc_staging + 4)  = inter;
+        *(unsigned int*)(desc_staging + 8)  = num_tokens;
+        *(unsigned int*)(desc_staging + 12) = block_size;
+        *(unsigned int*)(desc_staging + 16) = num_experts;
+        *(unsigned int*)(desc_staging + 20) = top_k;
+        *(unsigned int*)(desc_staging + 24) = quant_mode;
+        *(float*)(desc_staging + 28)        = routed_scaling_factor;
+        *(unsigned long long*)(desc_staging + 32) = gate_w_ptr;
+        *(unsigned long long*)(desc_staging + 40) = up_w_ptr;
+        *(unsigned long long*)(desc_staging + 48) = down_w_ptr;
+        *(unsigned long long*)(desc_staging + 56) = token_ids_ptr;
+        *(unsigned long long*)(desc_staging + 64) = expert_ids_ptr;
+        *(unsigned long long*)(desc_staging + 72) = weights_ptr;
+
+        // 2. Atomically claim slot via head_dev
+        unsigned int head = atomicAdd(head_dev, 1u);
+        unsigned int slot_idx = head & (capacity - 1u);
+
+        // 3. Write task descriptor into ring slot
+        unsigned char* slot = slots_base + (unsigned long long)slot_idx * 64ull;
+        *(unsigned int*)(slot + 0)  = 6u; // OP_MOE
+        *(unsigned int*)(slot + 4)  = num_tokens;
+        *(unsigned int*)(slot + 8)  = num_experts;
+        *(unsigned int*)(slot + 12) = top_k;
+        *(unsigned long long*)(slot + 16) = input_ptr;
+        *(unsigned long long*)(slot + 24) = (unsigned long long)desc_staging;
+        *(unsigned long long*)(slot + 32) = output_ptr;
+        *(unsigned long long*)(slot + 40) = 0ull;
+        *(unsigned int*)(slot + 48) = 0u; // ST_PENDING
+        __threadfence();
     }
 }
 
@@ -5449,6 +5512,90 @@ pub fn launch_scythe_write_slot(
             arg(&mut wep),
             arg(&mut outp),
             arg(&mut pep),
+        ],
+    )
+}
+
+/// Dynamic MoE on-device enqueue launcher. Binds the MoETaskDescriptor and pushes into ScytheRing
+/// fully on-device (HIP-graph capturable, zero host round-trips).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_scythe_enqueue_dynamic_moe(
+    dev: &crate::RocmDevice,
+    slots_base: &dyn BackendStorage,
+    capacity: u32,
+    head_dev_ptr: u64,
+    desc_staging_ptr: u64,
+    hidden: u32,
+    inter: u32,
+    num_tokens: u32,
+    block_size: u32,
+    num_experts: u32,
+    top_k: u32,
+    quant_mode: u32,
+    routed_scaling_factor: f32,
+    gate_w_ptr: u64,
+    up_w_ptr: u64,
+    down_w_ptr: u64,
+    token_ids_ptr: u64,
+    expert_ids_ptr: u64,
+    weights_ptr: u64,
+    input_ptr: u64,
+    output_ptr: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let slots_s = slots_base
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("scythe_enqueue_dynamic_moe: slots must be RocmStorage".into())
+        })?;
+    let mut base_ptr = slots_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("scythe_enqueue_dynamic_moe: slots have no device ptr".into())
+    })?;
+    let mut cap = capacity;
+    let mut hp = head_dev_ptr;
+    let mut dsp = desc_staging_ptr;
+    let mut h = hidden;
+    let mut it = inter;
+    let mut nt = num_tokens;
+    let mut bs = block_size;
+    let mut ne = num_experts;
+    let mut tk = top_k;
+    let mut qm = quant_mode;
+    let mut rsf = routed_scaling_factor;
+    let mut gw = gate_w_ptr;
+    let mut uw = up_w_ptr;
+    let mut dw = down_w_ptr;
+    let mut ti = token_ids_ptr;
+    let mut ei = expert_ids_ptr;
+    let mut w = weights_ptr;
+    let mut inp = input_ptr;
+    let mut outp = output_ptr;
+
+    dev.launch_compute_kernel(
+        "grim_scythe_enqueue_dynamic_moe",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [
+            arg(&mut base_ptr),
+            arg(&mut cap),
+            arg(&mut hp),
+            arg(&mut dsp),
+            arg(&mut h),
+            arg(&mut it),
+            arg(&mut nt),
+            arg(&mut bs),
+            arg(&mut ne),
+            arg(&mut tk),
+            arg(&mut qm),
+            arg(&mut rsf),
+            arg(&mut gw),
+            arg(&mut uw),
+            arg(&mut dw),
+            arg(&mut ti),
+            arg(&mut ei),
+            arg(&mut w),
+            arg(&mut inp),
+            arg(&mut outp),
         ],
     )
 }

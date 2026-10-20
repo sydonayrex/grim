@@ -582,6 +582,7 @@ impl MemoryOps for RocmDevice {
                 ],
             ) {
                 Ok(stream) => {
+                    let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                     let sync_res = unsafe { crate::device::handles::hipStreamSynchronize(stream) };
                     if sync_res == hipSuccess {
                         return Ok(());
@@ -671,6 +672,7 @@ impl MemoryOps for RocmDevice {
                 ],
             ) {
                 Ok(stream) => {
+                    let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                     let sync_res = unsafe { crate::device::handles::hipStreamSynchronize(stream) };
                     if sync_res == hipSuccess {
                         return Ok(());

@@ -1513,7 +1513,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 // code width -- same denominator logic as GreyRaven above.
                 BlockDtype::Int8PerChannel => 8,
                 // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
-                BlockDtype::Q4_0 => 4,
+                BlockDtype::Q4_0 | BlockDtype::Q4_1 => 4,
             };
             (elem_count * bits).div_ceil(8)
         }

@@ -45,6 +45,7 @@ pub fn client() -> &'static Client {
 
 /// Returns true if `device` is an RDNA2 part (gfx10xx), the only family [see: `gcnArchName`, `hipGetDevicePropertiesR0600`]
 fn is_rdna2(device: u32) -> bool {
+    let _guard = crate::device::util::DeviceGuard::set(device as i32);
     let mut prop: hipDeviceProp_tR0600 = unsafe { std::mem::zeroed() };
     let status = unsafe { hipGetDevicePropertiesR0600(&mut prop, device as _) };
     if status != 0 {

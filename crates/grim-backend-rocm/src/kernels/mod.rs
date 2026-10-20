@@ -71,6 +71,10 @@ pub mod scrub_jay;
 pub mod scythe_persistent;
 pub mod silu_mul_quant;
 pub mod speculative_sampler;
+/// Plan Phase M task M4: the persistent task ring — the host-side plan, staged
+/// descriptor array, and ONE-launch submit for `op::GEMM` nodes. Device side is
+/// `scythe_persistent::grim_scythe_persistent_dispatch`'s staged prologue.
+pub mod task_ring;
 /// TreePie (WS-A) 5.0 bpw decode + M=1 GEMV over V_DOT2_F32_F16.
 pub mod tree_pie;
 

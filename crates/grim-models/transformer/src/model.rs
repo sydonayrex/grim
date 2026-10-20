@@ -147,6 +147,58 @@ pub struct Llama {
     pub(crate) boundary_moves: std::sync::atomic::AtomicUsize,
 }
 
+/// Resolve the LM head projection.
+///
+/// `output.weight` is normally present. llama.cpp OMITS it when the checkpoint
+/// ties the head to the token embedding (`tie_word_embeddings` — Llama-3.2-1B
+/// and -3B, SmolLM2), and the head IS the embedding matrix: both are stored
+/// `[vocab, hidden]`, so the tied case loads the same tensor through the
+/// embedding's own prefix. A genuinely missing head that is not tied (no
+/// `tok_embeddings` either) still fails with the head's own error, which names
+/// the tensor the caller asked for.
+fn load_output_head(
+    ws: &grim_nn::WeightSource<'_>,
+    cfg: &LlamaConfig,
+    tp: TensorParallelConfig,
+) -> Result<Linear> {
+    let head_err = match Linear::load_column_parallel(
+        &ws.pp("output"),
+        cfg.hidden_size,
+        cfg.vocab_size,
+        /*has_bias=*/ cfg.has_output_bias,
+        tp,
+    ) {
+        Ok(o) => return Ok(o),
+        Err(e) => e,
+    };
+    let ws_unsharded = ws.with_tp_config(TensorParallelConfig::default());
+    match Linear::load(
+        &ws_unsharded.pp("output"),
+        cfg.hidden_size,
+        cfg.vocab_size,
+        false,
+    ) {
+        Ok(o) => Ok(o),
+        Err(_) => match Linear::load(
+            &ws_unsharded.pp("tok_embeddings"),
+            cfg.hidden_size,
+            cfg.vocab_size,
+            false,
+        ) {
+            Ok(o) => {
+                if std::env::var("GRIM_LOADER_TRACE").is_ok() {
+                    eprintln!(
+                        "[loader-trace] no output.weight; LM head tied to tok_embeddings \
+                         (tie_word_embeddings)"
+                    );
+                }
+                Ok(o)
+            }
+            Err(_) => Err(head_err.into()),
+        },
+    }
+}
+
 impl Llama {
     /// Load a `Llama` model with TP config taken from the `WeightSource`.
     /// The `WeightSource` is the single source of truth for TP - it carries the `(rank,.
@@ -180,24 +232,7 @@ impl Llama {
             cfg.rms_norm_eps,
             cfg.has_norm_bias,
         )?;
-        let output = match Linear::load_column_parallel(
-            &ws.pp("output"),
-            cfg.hidden_size,
-            cfg.vocab_size,
-            /*has_bias=*/ cfg.has_output_bias,
-            tp,
-        ) {
-            Ok(o) => o,
-            Err(_) => {
-                let ws_unsharded = ws.with_tp_config(TensorParallelConfig::default());
-                Linear::load(
-                    &ws_unsharded.pp("output"),
-                    cfg.hidden_size,
-                    cfg.vocab_size,
-                    false,
-                )?
-            }
-        };
+        let output = load_output_head(ws, &cfg, tp)?;
         let num_layers = cfg.num_layers;
 
         // Weight sanity check: models that loaded with zeroed weights should fail at load time rather than silently returning Unimplemented on first forward.
@@ -318,24 +353,7 @@ impl Llama {
             cfg.rms_norm_eps,
             cfg.has_norm_bias,
         )?;
-        let output = match Linear::load_column_parallel(
-            &ws.pp("output"),
-            cfg.hidden_size,
-            cfg.vocab_size,
-            /*has_bias=*/ cfg.has_output_bias,
-            tp,
-        ) {
-            Ok(o) => o,
-            Err(_) => {
-                let ws_unsharded = ws.with_tp_config(TensorParallelConfig::default());
-                Linear::load(
-                    &ws_unsharded.pp("output"),
-                    cfg.hidden_size,
-                    cfg.vocab_size,
-                    false,
-                )?
-            }
-        };
+        let output = load_output_head(ws, &cfg, tp)?;
         let layer_count = cfg.num_layers;
         Ok(Self {
             cfg,

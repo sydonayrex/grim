@@ -459,7 +459,18 @@ pub struct TaskRingContext {
     tail: Box<dyn BackendStorage>,
     head: Box<dyn BackendStorage>,
     stop: Box<dyn BackendStorage>,
+    desc_staging: Box<dyn BackendStorage>,
     capacity: u32,
+}
+
+impl std::fmt::Debug for TaskRingContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskRingContext")
+            .field("plan", &self.plan)
+            .field("count", &self.count)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 impl TaskRingContext {
@@ -485,6 +496,15 @@ impl TaskRingContext {
                 },
             )
         };
+        // 128 bytes staging for on-device dynamic task descriptors (e.g. MoETaskDescriptor)
+        let desc_staging = dev.from_cpu_bytes(
+            &vec![0u8; 128],
+            &Shape::new(vec![128]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )?;
         let mut ctx = Self {
             plan,
             staged: None,
@@ -493,6 +513,7 @@ impl TaskRingContext {
             tail: u32_scalar(0)?,
             head: u32_scalar(0)?,
             stop: u32_scalar(0)?,
+            desc_staging,
             capacity,
         };
         // Stage AFTER the ring exists so the caller gets a fully formed context
@@ -561,7 +582,7 @@ impl TaskRingContext {
             g.output,
             0,
         )?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
         launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
         Ok(())
     }
@@ -590,7 +611,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
         launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
         Ok(())
     }
@@ -618,7 +639,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
         launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
         Ok(())
     }
@@ -646,7 +667,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
         launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
         Ok(())
     }
@@ -699,7 +720,48 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
+        Ok(())
+    }
+
+    /// Dynamic (data-dependent) on-device MoE enqueue (Task M5 Step 3).
+    ///
+    /// Unlike `enqueue_moe` which stages descriptors on the host, this enqueues
+    /// an on-device descriptor construction and atomic ring slot claim without
+    /// host round-trip, executing via Event-Tensor on-device triggering.
+    pub fn enqueue_dynamic_moe(&self, dev: &crate::RocmDevice, m: &TaskRingMoe) -> crate::Result<()> {
+        use crate::scythe_task_descriptors::moe_quant_mode;
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        let desc_staging_ptr = as_rocm(self.desc_staging.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring desc_staging has no device ptr".into()))?;
+
+        crate::kernels::qkv_attention::launch_scythe_enqueue_dynamic_moe(
+            dev,
+            &*self.slots,
+            self.capacity,
+            head_ptr,
+            desc_staging_ptr,
+            m.hidden,
+            m.inter,
+            m.num_tokens,
+            m.block_size,
+            m.num_experts,
+            m.top_k,
+            moe_quant_mode::FP32,
+            m.routed_scaling_factor,
+            m.gate_w,
+            m.up_w,
+            m.down_w,
+            m.token_ids,
+            m.expert_ids,
+            m.weights,
+            m.input,
+            m.output,
+        )?;
         launch_task_ring(dev, &*self.slots, self.capacity, &*self.tail, &*self.head, &*self.stop, None, 0)?;
         Ok(())
     }
@@ -788,7 +850,11 @@ pub fn launch_task_ring(
         None => std::ptr::null_mut(),
     };
     let mut cap = capacity;
-    let mut limit = staged_count;
+    // When staged_count > 0, the prologue uploads staged_count descriptors and the wave
+    // drains exactly that many. When staged_count == 0 (per-node enqueue), max_tasks
+    // cannot be 0 (which exits immediately without executing anything) — give it a
+    // generous budget (e.g. 1024 iterations) to drain the queue until head == tail.
+    let mut limit = if staged_count > 0 { staged_count } else { 1024u32 };
     let mut count = staged_count;
     let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
     dev.launch_compute_kernel(

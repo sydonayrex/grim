@@ -465,6 +465,7 @@ impl RocmDevice {
                     best_ms = f64::INFINITY;
                     break;
                 }
+                let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 let stream = self.active_stream();
                 if unsafe { hipStreamSynchronize(stream) } != hipSuccess {
                     best_ms = f64::INFINITY;
@@ -553,6 +554,7 @@ impl RocmDevice {
         }
 
         let mut best = (fallback_block_dim, f64::INFINITY);
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         for cand in std::iter::once(fallback_block_dim).chain(candidates) {
             let mut best_ms = f64::INFINITY;
             for rep in 0..3 {
@@ -573,6 +575,7 @@ impl RocmDevice {
                 }
                 best_ms = best_ms.min(t0.elapsed().as_secs_f64() * 1e3);
             }
+
             if best_ms < best.1 {
                 best = (cand, best_ms);
             }

@@ -87,7 +87,9 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     const unsigned int* head_ptr,
     const unsigned int* stop_ptr,
     unsigned int max_tasks,
-    unsigned int resident)
+    unsigned int resident,
+    const scythe_task_descriptor_t* staged,
+    unsigned int staged_count)
 {
     // Lane zero owns queue control; the whole block cooperates on the claimed descriptor so Charon receives the launch width it expects.
     // Shared state also gives every lane the same termination condition.
@@ -97,6 +99,26 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     // WI-SB6 idle backoff: unthrottled global atomics from a tight spin wedged the wave on RDNA4 under ROCm 7.2 (idle-gap-then-wedge, scythe2 plan log 2026-08-24).
     // Exponential s_sleep backoff, capped, resets the moment a task claims.
     __shared__ unsigned int backoff_shift;
+    // M4 staged-descriptor prologue. Every caller so far passes staged_count = 0
+    // and keeps the old contract (the host publishes `head` before launch and the
+    // poll loop drains what it finds). When staged_count != 0 the wave takes the
+    // descriptors from the device-side `staged` array itself: one launch both
+    // uploads the descriptors and consumes them, which is the property the phase
+    // exists to buy (N descriptor-write launches per step become zero).
+    //
+    // tail is RESET here rather than left monotonic: a single-use ring per step
+    // needs both ends repointed, otherwise step 2 would see tail == head from
+    // step 1 and terminate without consuming anything. resident=1 (parking) waves
+    // must not use this path — their whole point is a persistent tail.
+    if (staged_count != 0u && threadIdx.x == 0) {
+        for (unsigned int i = 0; i < staged_count; ++i) {
+            slots[i & (capacity - 1u)] = staged[i];
+        }
+        atomicExch((unsigned int*)tail_ptr, 0u);
+        atomicExch((unsigned int*)head_ptr, staged_count);
+        backoff_shift = 0;
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
         terminate = 0;
         backoff_shift = 0;

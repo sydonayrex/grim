@@ -2271,6 +2271,8 @@ pub struct DecodeGraph {
     /// finished IR is published to `buffers.emitted_task_graph` at
     /// `end_capture`.
     pub emitter: Option<crate::task_graph::TaskGraphBuilder>,
+    /// M4/M5: persistent task ring context built from the emitted task graph.
+    pub ring_context: Option<crate::kernels::task_ring::TaskRingContext>,
     ordinal: usize,
 }
 
@@ -2329,6 +2331,7 @@ impl DecodeGraph {
             } else {
                 None
             },
+            ring_context: None,
             ordinal: dev.ordinal,
         }
     }
@@ -2394,9 +2397,16 @@ impl DecodeGraph {
     /// Publish the finished IR (called from `end_capture`).
     fn publish_task_graph(&mut self) {
         if let Some(b) = self.emitter.take() {
-            self.buffers.emitted_task_graph = Some(b.finish());
+            let ir = b.finish();
+            let dev = crate::device::roc_device::RocmDevice::shared(self.ordinal);
+            if let Ok(ctx) = crate::kernels::task_ring::TaskRingContext::from_graph(&dev, &ir) {
+                self.ring_context = ctx;
+            }
+            self.buffers.emitted_task_graph = Some(ir);
         }
-    }    /// Open segment `seg`'s capture bracket: begin capture on ITS stream under
+    }
+
+    /// Open segment `seg`'s capture bracket: begin capture on ITS stream under
     /// ITS device's guard, and raise THIS segment device's capture gate
     /// pointing at THIS segment's stream — `active_stream()` on that device
     /// then returns the capturing stream, so plain launches route into the

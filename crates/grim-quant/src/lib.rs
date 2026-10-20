@@ -219,6 +219,14 @@ pub const GREYCROW_ENCODER_VERSION: u32 = 1;
 /// This is the format GreyCrow is built on. It exists because GGUF's
 /// Q4_0/Q4_1/Q4_2 used to be typed as `KQuant(Q4K)` (144-byte super-blocks),
 /// so a Q4_0 payload was sliced and decoded with the wrong geometry.
+///
+/// **Nibble order** is llama.cpp's `dequantize_row_q4_0`
+/// (`ggml-quants.c:1525-1531`): byte `j` carries element `j` in its LOW nibble
+/// and element `j + 16` in its HIGH nibble. The block is split into HALVES, not
+/// adjacent pairs. Reading `qs[i/2]` with a parity nibble selector instead
+/// permutes every 32-weight group, and a round-trip test against this same
+/// function cannot see that — the permutation is its own inverse. The oracle
+/// has to be the reference formula, and end to end a model that talks.
 pub fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     let blocks = n.div_ceil(32);
     if bytes.len() < blocks * 18 {
@@ -233,11 +241,48 @@ pub fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
         let blk = &bytes[b * 18..b * 18 + 18];
         let d = f16_to_f32(blk[0], blk[1]);
         let base = b * 32;
-        let count = (n - base).min(32);
-        for i in 0..count {
-            let byte = blk[2 + i / 2];
-            let nib = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-            out[base + i] = (nib as f32 - 8.0) * d;
+        for j in 0..16 {
+            let q = blk[2 + j];
+            if base + j < n {
+                out[base + j] = ((q & 0x0F) as f32 - 8.0) * d;
+            }
+            if base + j + 16 < n {
+                out[base + j + 16] = ((q >> 4) as f32 - 8.0) * d;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Dequantize legacy GGUF Q4_1 (type 3): 20-byte blocks of
+/// `[f16 d][f16 m][16 bytes of nibbles]`, one block per 32 weights,
+/// `w = nibble * d + m`. Mirrors llama.cpp `dequantize_row_q4_1`
+/// (`ggml-quants.c:1542-1553`): `d` and `m` are the per-block scale and
+/// minimum, and the nibble packing is Q4_0's — byte `j` is element `j` (low
+/// nibble) and element `j + 16` (high nibble).
+pub fn dequant_q4_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    let blocks = n.div_ceil(32);
+    if bytes.len() < blocks * 20 {
+        return Err(Error::Backend(format!(
+            "dequant_q4_1: need {} bytes for {n} weights, got {}",
+            blocks * 20,
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0.0f32; n];
+    for b in 0..blocks {
+        let blk = &bytes[b * 20..b * 20 + 20];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let m = f16_to_f32(blk[2], blk[3]);
+        let base = b * 32;
+        for j in 0..16 {
+            let q = blk[4 + j];
+            if base + j < n {
+                out[base + j] = (q & 0x0F) as f32 * d + m;
+            }
+            if base + j + 16 < n {
+                out[base + j + 16] = (q >> 4) as f32 * d + m;
+            }
         }
     }
     Ok(out)
@@ -290,17 +335,29 @@ pub fn repack_q40_to_greycrow_g32(
             let blk = &bytes[(col * blocks + g) * 18..(col * blocks + g) * 18 + 18];
             sc[(col * blocks + g) * 2..(col * blocks + g) * 2 + 2].copy_from_slice(&blk[0..2]);
             let base = col * words_per_col + g * 4; // 32/8 words per group
-            for w in 0..4 {
-                // 32 weights = 16 bytes = 4 u32 words, consecutive, low
-                // nibble first -- the same order Q4_0 stores.
-                let word = u32::from_le_bytes([
-                    blk[2 + w * 4],
-                    blk[2 + w * 4 + 1],
-                    blk[2 + w * 4 + 2],
-                    blk[2 + w * 4 + 3],
-                ]);
-                qw[(base + w) * 4..(base + w) * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            // A NIBBLE shuffle, not a byte copy. The two layouts number the 32
+            // weights differently: Q4_0 splits the group into halves (byte `e`
+            // is element `e` low and element `e+16` high — `ggml-quants.c:1525`),
+            // while GreyCrow's 8-codes-per-word layout numbers them adjacently
+            // (`dequant_greycrow_g32` reads code `i` as nibble `i` of the word).
+            // Copying the bytes verbatim therefore PERMUTES every group. This
+            // used to pass its bit-exactness test only because `dequant_q4_0`
+            // carried the same adjacent-pair misreading.
+            let mut group = [0u8; 16];
+            for e in 0..32usize {
+                let src = if e < 16 {
+                    blk[2 + e] & 0x0F
+                } else {
+                    blk[2 + (e - 16)] >> 4
+                };
+                let dst_byte = 4 * (e / 8) + (e % 8) / 2;
+                if (e % 8) % 2 == 0 {
+                    group[dst_byte] = src;
+                } else {
+                    group[dst_byte] |= src << 4;
+                }
             }
+            qw[base * 4..base * 4 + 16].copy_from_slice(&group);
         }
     }
     Ok((qw, sc, zr))
@@ -6009,11 +6066,16 @@ mod tests {
         let bits = f32_to_f16_bits(scale);
         let mut blk = [0u8; 18];
         blk[0..2].copy_from_slice(&bits.to_le_bytes());
+        // llama.cpp's Q4_0 encoder splits the group into halves: element `i`
+        // (i < 16) is the LOW nibble of byte `i`, element `i + 16` is the HIGH
+        // nibble of byte `i` (`ggml-quants.c:1525-1531`). The adjacent-pair
+        // packing this helper used to do matched a decoder with the same
+        // misreading, so the pair agreed while both were wrong.
         for (i, &q) in nibbles.iter().enumerate() {
-            if i % 2 == 0 {
-                blk[2 + i / 2] = q & 0x0F;
+            if i < 16 {
+                blk[2 + i] = q & 0x0F;
             } else {
-                blk[2 + i / 2] |= (q & 0x0F) << 4;
+                blk[2 + (i - 16)] |= (q & 0x0F) << 4;
             }
         }
         blk
@@ -11944,5 +12006,98 @@ mod gsq_flush_tests {
         assert_eq!(flushed, 0);
         let legacy = quantize_gsq_rco_3p5_block(&data, &mut out);
         assert!(legacy.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod q4_1_tests {
+    use super::*;
+
+    /// The nibble ORDER, pinned with literals rather than re-derived.
+    ///
+    /// This test used to rebuild the expected value with the implementation's
+    /// own formula (`blk[4 + i / 2]` plus a parity nibble selector), so it
+    /// certified the reading instead of the code — and both were wrong: llama.cpp
+    /// splits the 32-weight block into HALVES (`ggml-quants.c:1542-1553`), so
+    /// byte `j` is element `j` (low nibble) and element `j + 16` (high nibble).
+    /// The adjacent-pair order this test used to assert permutes every group,
+    /// which is invisible to a round-trip and visible immediately in a model's
+    /// output (it turned Llama-3.2-1B-Q4_1 into `EAEAEAEA`).
+    ///
+    /// Block: d = 1.0, m = 0.0, and byte `j` = `((15 - j) << 4) | j`. So element
+    /// `j` must be `j` and element `j + 16` must be `15 - j` — no arithmetic
+    /// from the code under test.
+    #[test]
+    fn dequant_q4_1_nibble_order_is_halves_not_adjacent_pairs() {
+        let mut blk = vec![0u8; 20];
+        blk[0] = 0x00;
+        blk[1] = 0x3C; // d = 1.0
+        blk[2] = 0x00;
+        blk[3] = 0x00; // m = 0.0
+        for j in 0..16u8 {
+            blk[4 + j as usize] = ((15 - j) << 4) | j;
+        }
+        let out = dequant_q4_1(&blk, 32).expect("dequant");
+        let want: Vec<f32> = (0..32)
+            .map(|i| if i < 16 { i as f32 } else { 15.0 - (i - 16) as f32 })
+            .collect();
+        assert_eq!(out, want, "low nibbles are elements 0..16, high are 16..32");
+    }
+
+    /// `w = nibble * d + m`, with a non-trivial `m` so a decoder that ignored
+    /// the minimum (or applied the scale to it) cannot pass.
+    #[test]
+    fn dequant_q4_1_applies_scale_and_minimum() {
+        let mut blk = vec![0u8; 20];
+        blk[0] = 0x00;
+        blk[1] = 0x40; // d = 2.0
+        blk[2] = 0x00;
+        blk[3] = 0xBC; // m = -1.0
+        for j in 0..16u8 {
+            // low nibble j%16 = j, high nibble = 15 - j
+            blk[4 + j as usize] = ((15 - j) << 4) | j;
+        }
+        let out = dequant_q4_1(&blk, 32).expect("dequant");
+        let want: Vec<f32> = (0..32)
+            .map(|i| {
+                let nib = if i < 16 { i as f32 } else { 15.0 - (i - 16) as f32 };
+                nib * 2.0 - 1.0
+            })
+            .collect();
+        assert_eq!(out, want);
+    }
+
+    /// A partial final block (n not a multiple of 32) must not over-read the
+    /// payload.
+    #[test]
+    fn dequant_q4_1_handles_a_partial_tail_block() {
+        // n = 40 -> ceil(40/32) = 2 blocks = 40 bytes of payload.
+        let payload = vec![0u8; 40];
+        let out = dequant_q4_1(&payload, 40).expect("dequant");
+        assert_eq!(out.len(), 40);
+        // d = 0, m = 0 -> all zeros, but the point is no over-read panic.
+        assert!(out.iter().all(|x| *x == 0.0));
+    }
+
+    /// The same order pin for Q4_0, whose decoder carried the same defect and
+    /// whose `repack_q40_to_greycrow_g32` "bit-exact" gate compared against it
+    /// (so both agreed while both were wrong).
+    #[test]
+    fn dequant_q4_0_nibble_order_is_halves_not_adjacent_pairs() {
+        let mut blk = vec![0u8; 18];
+        blk[0] = 0x00;
+        blk[1] = 0x3C; // d = 1.0
+        for j in 0..16u8 {
+            // Bias by 8: element j must be (j - 8), element j+16 must be (15-j-8).
+            blk[2 + j as usize] = ((15 - j) << 4) | j;
+        }
+        let out = dequant_q4_0(&blk, 32).expect("dequant");
+        let want: Vec<f32> = (0..32)
+            .map(|i| {
+                let nib = if i < 16 { i as f32 } else { 15.0 - (i - 16) as f32 };
+                nib - 8.0
+            })
+            .collect();
+        assert_eq!(out, want);
     }
 }

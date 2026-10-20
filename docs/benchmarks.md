@@ -622,3 +622,69 @@ that the IQ GEMV is near its practical limit in this kernel structure. Further
 gains are structural — matrix cores with a vectorized dequant, or a q8_1-act
 integer dot — and both change the accumulation order, so they need a
 tolerance/PPL gate rather than bit-parity.
+
+## Task-graph ring readiness by model (Phase M, 2026-10-17)
+
+Phase M emits a per-step task graph during capture and asks, per model, how much
+of it a persistent device-side ring (M4 onward) can execute. The predicate
+`task_graph::ring_ready(&CapabilitySet)` is DERIVED from the emitted IR — never
+a hand-maintained model list — so a model that gains an opcode is re-classified
+automatically, and a `full: false` verdict always names what is missing.
+
+Measured on GPU 1 with `GRIM_GPU_TEST=1 GRIM_CONTEXT=512`, each checkpoint
+loaded through its OWN model type (`cargo test -p grim-cli --test
+model_zoo_ir_coverage`; never routed through `Qwen35::load`):
+
+| Model | Shape | IR nodes | Opcodes in the IR | `ring_ready` |
+|---|---|---|---|---|
+| `models/Llama-3.2-1B-Instruct-Q4_1.gguf` | dense attention | 35 | GEMM(1), ATTENTION(8), NORM(10), ELEMENTWISE(12) | `full: false`, all four missing |
+| `models/Xing4.0/Xing4.0-29B-A4B-IQ3_M-MTP.gguf` | MoE + MLA | 83 | GEMM(1), MOE_DISPATCH(6), ATTENTION(8), NORM(10), ELEMENTWISE(12) | `full: false`, all five missing |
+
+`RING_OPCODES` names the opcodes the ring implements; M4 converted
+**op::GEMM**, so it is `[GEMM]` and both models now report it as COVERED:
+
+| Model | `missing` after M4 | Still unconverted |
+|---|---|---|
+| llama-dense | ATTENTION(8), NORM(10), ELEMENTWISE(12) | 3 |
+| xing40-moe-mla | MOE_DISPATCH(6), ATTENTION(8), NORM(10), ELEMENTWISE(12) | 4 |
+
+The gate derives its expectation from `RING_OPCODES` rather than asserting
+"everything is missing", so a constant predicate cannot pass and the table above
+is a consequence of the code, not a restatement of it. Measured by
+`cargo test -p grim-cli --test model_zoo_ir_coverage`.
+
+The conversion itself: M4's ring binds the executable GEMM subset of an emitted
+graph (role-resolved operands, real geometry, native weight only), stages the
+descriptors once, and drains them with the existing persistent wave. On the real
+Llama checkpoint 16 of 35 IR nodes convert and the ring's logits are
+**bit-identical** to the launcher path (`0.000e0`, three steps). The wave's GEMM
+arm is the existing scalar f32 reference, so a QUANTIZED GEMM still runs on its
+launcher — a Q8_0 dot4 arm is the next entry. One launch per STEP (rather than
+per node) needs a resident wave on its own stream; that is task M6, because a
+non-resident wave on the caller's stream serializes with the host's attention
+kernels.
+
+### Per-node quantization coverage (the GEMM axis)
+
+`params[0]` on a GEMM node carries that weight's `QuantFormat` id (`0` = native,
+host-dequantized at load), so the axis is measured rather than asserted:
+
+| Model | GEMM `params[0]` | Reading |
+|---|---|---|
+| Llama-3.2-1B Q4_1 | `[0, 0, …, 0, 7]` | sixteen host-dequantized Q4_1 linears (`0`) plus a packed **Q6_K** head (`7`) |
+| Xing4.0-29B A4B | `[5, 5, 7]` | two dense lead blocks in **Q4_K** (`5`) plus a **Q6_K** head (`7`) |
+
+Q4_0/Q4_1 have no `QuantFormat` and no device dispatch, so they are
+host-dequantized by design — the Q4_1 row is exercised as *decoder* coverage,
+not as an axis value. Xing4.0's 38 MoE layers carry their expert counts in
+`params[0..2]`, so MoE banks are not yet on the axis (recorded gap). The head
+GEMM's `params[1]` carries the output width (the logits length), kept when the
+axis moved to slot 0.
+
+### What the IR must not lie about (2026-10-17)
+
+The Xing40 emitter chained both its final NORM and its head GEMM off the last
+layer's node, giving the IR **two sinks** and telling a scheduler it could run
+the head before the norm. The PM-4 gate caught it on re-run — a reminder that an
+emitter and the graph it publishes are two separate claims, and only the gate
+tests the second.

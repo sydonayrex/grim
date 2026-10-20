@@ -739,6 +739,26 @@ fn materialize_vulkan(
     ))
 }
 
+/// Whether a packed weight of this storage can be multiplied in place.
+///
+/// The answer is DERIVED from the `QuantFormat` mapping rather than a
+/// hand-written list: every `KQuantScheme` has a canonical format AND a
+/// matching device dispatch (`dtype.rs`'s round-trip test enforces the
+/// pairing), while the legacy block formats (`Q4_0`/`Q4_1`, 18/20 B per 32
+/// weights) have neither — `quantized_matmul` would miss its match arm and land
+/// in the generic `self.matmul` on packed bytes, which is why
+/// `TryFrom<&Storage> for QuantFormat` refuses them.
+///
+/// A storage with no mapping therefore has no packed path on ANY backend, so
+/// keeping it packed only defers the failure to the first forward
+/// (`Linear::forward: quantized storage Block(Q4_1) has no QuantFormat
+/// mapping`) after a load that could have served it. Materialize it as f32
+/// instead — the same policy `Embedding::load` applies through
+/// `embedding_has_packed_gather`.
+fn has_packed_matmul(storage: &Storage) -> bool {
+    grim_tensor::QuantFormat::try_from(storage).is_ok()
+}
+
 fn materialize(
     raw: RawTensor,
     shape: Shape,
@@ -769,6 +789,7 @@ fn materialize(
     if dtype.is_quantized()
         && !matches!(dtype.storage, Storage::ResidualPacked(_))
         && !matches!(dtype.storage, Storage::GroupInt(_))
+        && has_packed_matmul(&dtype.storage)
     {
         #[cfg(feature = "rocm-mem")]
         if let Device::Rocm(ordinal) = device {
@@ -931,6 +952,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale).
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&raw.bytes, n),
+            BlockDtype::Q4_1 => grim_quant::dequant_q4_1(&raw.bytes, n),
             // GreyRaven-HW tiled: hardware order + sidx words decode to the
             // coupled-pruned dense model. Row/col counts from the tensor shape.
             BlockDtype::Fp8Sparse24Hw => {

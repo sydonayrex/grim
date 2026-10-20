@@ -130,6 +130,7 @@ pub(crate) fn cuda_dequant_quantized_storage(
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale) — same
             // host decode the vulkan quant_ops arm uses.
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(b_bytes, elem_count),
+            BlockDtype::Q4_1 => grim_quant::dequant_q4_1(b_bytes, elem_count),
             // GreyRaven 2:4: the packed form exists (`pack_grey_raven`) and the
             // host decodes it (`dequant_grey_raven`); what does not exist is a
             // CUDA kernel route. Unimplemented rather than a dense fallback:
