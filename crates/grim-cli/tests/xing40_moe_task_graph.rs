@@ -192,11 +192,35 @@ fn xing40_moe_loads_emits_and_replays_like_eager() {
         ready.full,
         ready.missing
     );
-    assert!(!ready.full, "the ring implements no opcodes yet");
-    assert!(
-        ready.missing.contains(&op::MOE_DISPATCH),
-        "MOE_DISPATCH must be reported missing, not silently assumed"
+    // The readiness expectation is DERIVED from `RING_OPCODES`, not hardcoded.
+    // This gate used to assert `!ready.full` ("the ring implements no opcodes
+    // yet"), which was true when RING_OPCODES was `[GEMM]` but became false the
+    // moment M5 added MOE_DISPATCH/ATTENTION/NORM/ELEMENTWISE — the Xing4.0 IR is
+    // now fully covered, so the honest expectation is `full: true` with an empty
+    // missing set. Hardcoding either direction fails on a correct predicate.
+    let ring: std::collections::BTreeSet<u32> =
+        grim_backend_rocm::task_graph_exec::RING_OPCODES.iter().copied().collect();
+    let mut expect_missing = ir.caps.opcodes.clone();
+    expect_missing.remove(&op::FALLBACK);
+    for r in &ring {
+        expect_missing.remove(r);
+    }
+    assert_eq!(
+        ready.full,
+        expect_missing.is_empty(),
+        "xing40: `full` must be exactly 'nothing is missing' (ring covers {ring:?})"
     );
+    let missing_set: std::collections::BTreeSet<u32> = ready.missing.iter().copied().collect();
+    assert_eq!(
+        missing_set, expect_missing,
+        "xing40: missing must be exactly the IR's opcodes minus the ring's"
+    );
+    if !ready.full {
+        assert!(
+            !ready.missing.is_empty(),
+            "xing40: not full but nothing missing — the predicate is not derived"
+        );
+    }
 
     // The warmups executed; reset the replay state to the eager session's
     // empty history.
