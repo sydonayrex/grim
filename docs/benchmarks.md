@@ -631,27 +631,36 @@ of it a persistent device-side ring (M4 onward) can execute. The predicate
 a hand-maintained model list — so a model that gains an opcode is re-classified
 automatically, and a `full: false` verdict always names what is missing.
 
-Measured on GPU 1 with `GRIM_GPU_TEST=1 GRIM_CONTEXT=512`, each checkpoint
-loaded through its OWN model type (`cargo test -p grim-cli --test
-model_zoo_ir_coverage`; never routed through `Qwen35::load`):
+Measured with `GRIM_GPU_TEST=1 GRIM_CONTEXT=512`, each checkpoint loaded through
+its OWN model type (`cargo test -p grim-cli --test model_zoo_ir_coverage`; never
+routed through `Qwen35::load`). Re-measured 2026-10-19, after M5:
 
 | Model | Shape | IR nodes | Opcodes in the IR | `ring_ready` |
 |---|---|---|---|---|
-| `models/Llama-3.2-1B-Instruct-Q4_1.gguf` | dense attention | 35 | GEMM(1), ATTENTION(8), NORM(10), ELEMENTWISE(12) | `full: false`, all four missing |
-| `models/Xing4.0/Xing4.0-29B-A4B-IQ3_M-MTP.gguf` | MoE + MLA | 83 | GEMM(1), MOE_DISPATCH(6), ATTENTION(8), NORM(10), ELEMENTWISE(12) | `full: false`, all five missing |
+| `models/Llama-3.2-1B-Instruct-Q4_1.gguf` | dense attention | 35 | GEMM(1), ATTENTION(8), NORM(10), ELEMENTWISE(12) | **`full: true`**, `missing=[]` |
+| `models/Xing4.0/Xing4.0-29B-A4B-IQ3_M-MTP.gguf` | MoE + MLA | 83 | GEMM(1), MOE_DISPATCH(6), ATTENTION(8), NORM(10), ELEMENTWISE(12) | **`full: true`**, `missing=[]` |
 
-`RING_OPCODES` names the opcodes the ring implements; M4 converted
-**op::GEMM**, so it is `[GEMM]` and both models now report it as COVERED:
+`RING_OPCODES` names the opcodes the ring implements. M4 converted **op::GEMM**;
+M5 added NORM, ELEMENTWISE, ATTENTION and MOE_DISPATCH — which is every opcode
+either zoo model emits — so both now report `full: true`:
 
-| Model | `missing` after M4 | Still unconverted |
+| Model | `missing` after M5 | Still unconverted |
 |---|---|---|
-| llama-dense | ATTENTION(8), NORM(10), ELEMENTWISE(12) | 3 |
-| xing40-moe-mla | MOE_DISPATCH(6), ATTENTION(8), NORM(10), ELEMENTWISE(12) | 4 |
+| llama-dense | (none) | 0 |
+| xing40-moe-mla | (none) | 0 |
 
-The gate derives its expectation from `RING_OPCODES` rather than asserting
-"everything is missing", so a constant predicate cannot pass and the table above
-is a consequence of the code, not a restatement of it. Measured by
-`cargo test -p grim-cli --test model_zoo_ir_coverage`.
+`Q8_0_DOT4` is deliberately NOT listed: the wave has no dot4 arm, and the number
+it was given (8) is the wave's `OP_PEER_REDUCE` — so listing it made `ring_ready`
+report coverage that did not exist, and binding it would have dispatched an
+all-reduce for a quantized GEMM. It returns when the arm does, which is the
+plan's PM-6 target. `every_advertised_ring_opcode_maps_to_an_implemented_wave_arm`
+parses the kernel's own `#define OP_*` lines and fails if any advertised opcode
+has no arm.
+
+The gate derives BOTH `full` and `missing` from `RING_OPCODES` rather than
+asserting "everything is missing" or "never full", so a constant predicate cannot
+pass and the table above is a consequence of the code, not a restatement of it.
+Measured by `cargo test -p grim-cli --test model_zoo_ir_coverage`.
 
 The conversion itself: M4's ring binds the executable GEMM subset of an emitted
 graph (role-resolved operands, real geometry, native weight only), stages the
