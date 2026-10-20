@@ -41,8 +41,7 @@ use crate::task_graph::{arg_role, op, ArgEntry, TaskGraph};
 
 /// Wave-side opcode for a row-major-B GEMM: B is `[N, K]`, `C = A @ B^T`.
 /// This is the `matmul_op` convention, which is what grim's dense linears use.
-const OP_ROW_GEMM: u32 = 2;
-/// Wave-side opcode for an RMS norm over the last axis (`eps` is fixed in the
+const OP_ROW_GEMM: u32 = 2;/// Wave-side opcode for an RMS norm over the last axis (`eps` is fixed in the
 /// kernel). Matches the arm in `scythe_persistent::KERNEL_SOURCE`.
 const OP_NORM: u32 = 4;
 /// Wave-side opcode for element-wise add: `out[i] = a[i] + b[i]` over `m*n`
@@ -68,15 +67,20 @@ const OP_MOE: u32 = 6;
 /// M5 adds NORM (already bound, was missing from RING_OPCODES), ELEMENTWISE
 /// (OP_ADD — a binary add), ATTENTION (OP_ATTN — flash attention), and
 /// MOE_DISPATCH (OP_MOE — fused MoE with data-dependent routing schedule).
-const OP_Q8_0_DOT4: u32 = 8; // V_DOT4_I32_IU8 integer-dot arm (Q8_0 quantized GEMM)
-
+///
+/// `Q8_0_DOT4` was listed here and in `RING_OPCODES` but is NOT implemented: the
+/// wave has no dot4 arm, and the number it was given (8) is the wave's
+/// `OP_PEER_REDUCE`. Advertising it made `ring_ready` report a model as fully
+/// covered while the node actually fell back to its launcher — and had it ever
+/// been bound, the wave would have run an all-reduce instead of a GEMM. It is
+/// removed until the arm exists; the invariant that keeps it out is gated by
+/// `every_advertised_ring_opcode_maps_to_an_implemented_wave_arm`.
 pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::GEMM, OP_ROW_GEMM),
     (crate::task_graph::op::NORM, OP_NORM),
     (crate::task_graph::op::ELEMENTWISE, OP_ADD),
     (crate::task_graph::op::ATTENTION, OP_ATTN),
     (crate::task_graph::op::MOE_DISPATCH, OP_MOE),
-    (crate::task_graph::op::Q8_0_DOT4, OP_Q8_0_DOT4),
 ];
 
 /// Translate a task-graph opcode to its wave opcode.

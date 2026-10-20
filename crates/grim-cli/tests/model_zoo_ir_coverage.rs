@@ -166,23 +166,15 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
         }
 
         // The predicate is a function of the caps AND the ring's opcode list:
-        // what is missing must be exactly the graph's opcodes that the ring
-        // does not implement. Deriving the expectation from RING_OPCODES — rather
-        // than asserting "everything is missing" — is what stops a constant
-        // predicate from passing, and it is the only form of this assertion that
-        // survives the ring gaining an opcode.
+        // what is missing must be exactly the graph's opcodes that the ring does
+        // not implement, and `full` must be exactly "nothing is missing".
+        //
+        // Deriving BOTH from RING_OPCODES is what stops a constant predicate from
+        // passing. Hardcoding `!ready.full` did not survive the ring gaining
+        // opcodes: once M5 added NORM/ELEMENTWISE/ATTENTION, the dense model's IR
+        // became fully covered, and a gate that insists otherwise fails on a
+        // CORRECT predicate.
         let ready = grim_backend_rocm::task_graph::ring_ready(&ir.caps);
-        assert!(
-            !ready.full,
-            "{}: a graph with unconverted opcodes cannot report full",
-            e.label
-        );
-        assert!(
-            !ready.missing.is_empty(),
-            "{}: not full but nothing missing — the predicate is not derived",
-            e.label
-        );
-        assert!(!ready.reason.is_empty());
         let ring: std::collections::BTreeSet<u32> =
             grim_backend_rocm::task_graph_exec::RING_OPCODES.iter().copied().collect();
         let mut expect_missing = ir.caps.opcodes.clone();
@@ -190,10 +182,25 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
         for r in &ring {
             expect_missing.remove(r);
         }
+        assert_eq!(
+            ready.full,
+            expect_missing.is_empty(),
+            "{}: `full` must be exactly 'nothing is missing' (ring covers {:?})",
+            e.label,
+            ring
+        );
+        if !ready.full {
+            assert!(
+                !ready.missing.is_empty(),
+                "{}: not full but nothing missing — the predicate is not derived",
+                e.label
+            );
+        }
+        assert!(!ready.reason.is_empty());
         let missing_set: std::collections::BTreeSet<u32> = ready.missing.iter().copied().collect();
         assert_eq!(
             missing_set, expect_missing,
-            "{}: missing must be exactly the graph's opcodes",
+            "{}: missing must be exactly the graph's opcodes minus the ring's",
             e.label
         );
         eprintln!(

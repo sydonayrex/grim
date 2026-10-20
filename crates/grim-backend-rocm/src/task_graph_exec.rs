@@ -99,18 +99,22 @@ pub fn execute(
 /// persistent wave. The wave's GEMM arm computes in f32, so a QUANTIZED weight is
 /// not executable by it — that node stays on its launcher, which is the fallback
 /// contract and is why the ring never dequantizes. A Q8_0 dot4 arm (plan
-/// condition 4's named target) is the next entry.
+/// condition 4's named target) is the next entry — and it is deliberately NOT
+/// listed until that arm exists: listing it made `ring_ready` report a model as
+/// fully covered while the node fell back to its launcher, and its number
+/// collided with the wave's `OP_PEER_REDUCE`.
 ///
 /// This list is the ONLY hand-maintained part of the readiness predicate:
 /// everything else about [`crate::task_graph::ring_ready`] is derived from the
 /// capability set, so a model that gains an op is automatically re-classified
 /// and an op that is added to a model's IR without ring support shows up in
-/// `missing` rather than being silently assumed.
+/// `missing` rather than being silently assumed. The hand-maintained part is
+/// pinned against the kernel by
+/// `every_advertised_ring_opcode_maps_to_an_implemented_wave_arm`.
 pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     crate::task_graph::op::GEMM,
     crate::task_graph::op::NORM,
     crate::task_graph::op::ELEMENTWISE,
     crate::task_graph::op::ATTENTION,
     crate::task_graph::op::MOE_DISPATCH,
-    crate::task_graph::op::Q8_0_DOT4,
 ];

@@ -525,6 +525,74 @@ fn ring_dynamic_moe_produces_byte_identical_results_across_runs() {
     );
 }
 
+/// The readiness predicate advertises `RING_OPCODES`, and `WAVE_OPCODES` maps each
+/// of them to a wave opcode. Both halves must be true OF THE KERNEL, and both have
+/// been violated: `Q8_0_DOT4` was advertised with no wave arm at all, and the
+/// number it was given (8) is the wave's `OP_PEER_REDUCE` — so had it ever been
+/// bound, the ring would have run an all-reduce instead of a quantized GEMM.
+///
+/// This parses the kernel's own source, so the one hand-maintained list cannot
+/// drift from the kernel it claims to describe.
+#[test]
+fn every_advertised_ring_opcode_maps_to_an_implemented_wave_arm() {
+    use grim_backend_rocm::kernels::task_ring::{wave_opcode, WAVE_OPCODES};
+    use grim_backend_rocm::task_graph_exec::RING_OPCODES;
+
+    let src = grim_backend_rocm::kernels::scythe_persistent::KERNEL_SOURCE;
+
+    // wave opcode number -> macro name, from the kernel's own `#define OP_X <n>u`.
+    let mut by_number: std::collections::BTreeMap<u32, String> = Default::default();
+    for line in src.lines() {
+        let Some(rest) = line.trim().strip_prefix("#define OP_") else {
+            continue;
+        };
+        let mut it = rest.split_whitespace();
+        let (Some(name), Some(value)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if let Some(v) = value.strip_suffix('u') {
+            if let Ok(n) = v.parse::<u32>() {
+                by_number.insert(n, format!("OP_{name}"));
+            }
+        }
+    }
+    assert!(
+        by_number.len() >= 8,
+        "parsed too few opcode defines — the parse is wrong, not the kernel: {by_number:?}"
+    );
+
+    for &(ir_op, wave) in WAVE_OPCODES {
+        let macro_name = by_number
+            .get(&wave)
+            .unwrap_or_else(|| panic!("WAVE_OPCODES maps IR op {ir_op} to wave {wave}, which has no #define"));
+        assert!(
+            src.contains(&format!("desc->opcode == {macro_name}")),
+            "WAVE_OPCODES maps IR op {ir_op} to wave {wave} ({macro_name}), but the kernel \
+             never dispatches on it — the ring would silently execute nothing"
+        );
+    }
+
+    // Everything the readiness predicate advertises must be in that mapping, or
+    // `ring_ready` reports a model as fully covered while nodes fall back.
+    for &op in RING_OPCODES {
+        assert!(
+            wave_opcode(op).is_some(),
+            "RING_OPCODES advertises {op} but WAVE_OPCODES has no entry for it"
+        );
+    }
+
+    // Regression net for the specific defect the scan above CANNOT see: the old
+    // `Q8_0_DOT4 -> 8` entry pointed at a number the kernel DOES dispatch — as
+    // `OP_PEER_REDUCE`. So "has an arm" was satisfied while the semantics were
+    // wrong (an all-reduce for a quantized GEMM). Re-admitting it requires a real
+    // dot4 arm, which is why this is pinned by name.
+    assert!(
+        wave_opcode(grim_backend_rocm::task_graph::op::Q8_0_DOT4).is_none(),
+        "Q8_0_DOT4 must stay unmapped until a dot4 arm exists — its old number (8) is \
+         OP_PEER_REDUCE, so mapping it dispatches the wrong kernel"
+    );
+}
+
 /// Gate 1: the plan builder's binding rules.
 #[test]
 fn the_plan_binds_only_what_a_ring_can_run() {
