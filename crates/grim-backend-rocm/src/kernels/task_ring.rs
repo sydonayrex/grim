@@ -1042,7 +1042,15 @@ static NEXT_HEAD: AtomicU64 = AtomicU64::new(0);
 /// How many claim attempts a RESIDENT wave may make before it gives up on its
 /// own (M6 step 3). The wave normally leaves through `stop_wave`; this is the
 /// backstop, so a host that forgets to stop it cannot hold the device.
-pub const RESIDENT_POLL_BUDGET: u32 = 8192;
+///
+/// The budget must outlast the host's FIRST enqueue after the wave parks: that
+/// enqueue JITs `grim_scythe_write_slot` and `grim_scythe_publish_head` on its
+/// first use in the process, which can take longer than a small budget — and a
+/// wave that expires first leaves the node undrained, which reads as an
+/// intermittent failure rather than as a timeout. Each idle iteration costs a
+/// backoff sleep (~2 us), so 1<<20 is a couple of seconds of parking: long
+/// enough to cover the JIT, short enough to be a real backstop.
+pub const RESIDENT_POLL_BUDGET: u32 = 1 << 20;
 
 pub fn wave_launch_count() -> u64 {
     WAVE_LAUNCHES.load(Ordering::Relaxed)
