@@ -491,7 +491,17 @@ impl TaskRingPlan {
         dev: &crate::RocmDevice,
     ) -> crate::Result<(Box<dyn BackendStorage>, u32)> {
         let count = self.gemms.len().min(STAGED_CAPACITY as usize);
-        let mut bytes = vec![0u8; count * std::mem::size_of::<ScytheTaskDescriptor>()];
+        // The PEER copies ride the SAME staged set, AFTER the GEMMs.
+        //
+        // A boundary handoff is a PEER_COPY and nothing else: its plan has no
+        // GEMM, so a staged set that carried only GEMMs would be EMPTY for it
+        // — and an empty staged set is refused at the launch boundary. The
+        // order is the plan's own order (the IR node order), because the wave
+        // drains the slots in that order and the handoff's tasks are ordered
+        // (clear the flag, copy the data, set the flag).
+        let peer_count = self.peers.len().min((STAGED_CAPACITY as usize).saturating_sub(count));
+        let total = count + peer_count;
+        let mut bytes = vec![0u8; total * std::mem::size_of::<ScytheTaskDescriptor>()];
         for (i, g) in self.gemms.iter().take(count).enumerate() {
             let desc = ScytheTaskDescriptor {
                 opcode: OP_ROW_GEMM,
@@ -513,6 +523,31 @@ impl TaskRingPlan {
             };
             bytes[off..off + cell.len()].copy_from_slice(cell);
         }
+        // The peer copies, in the plan's order. The wave's `OP_PEER_BROADCAST`
+        // arm takes the element count in `m`, the source in `input_ptr` and the
+        // PEER destination in `peer_ptr` — the same layout `enqueue_peer_copy`
+        // writes, so a staged copy and an enqueued copy are the same task.
+        for (j, p) in self.peers.iter().take(peer_count).enumerate() {
+            let desc = ScytheTaskDescriptor {
+                opcode: OP_PEER_BROADCAST,
+                m: p.elems,
+                n: 0,
+                k: 0,
+                input_ptr: p.src,
+                weight_ptr: 0,
+                output_ptr: 0,
+                peer_ptr: p.dst,
+                status: 0,
+            };
+            let off = (count + j) * std::mem::size_of::<ScytheTaskDescriptor>();
+            let cell = unsafe {
+                std::slice::from_raw_parts(
+                    &desc as *const ScytheTaskDescriptor as *const u8,
+                    std::mem::size_of::<ScytheTaskDescriptor>(),
+                )
+            };
+            bytes[off..off + cell.len()].copy_from_slice(cell);
+        }
         let storage = dev.from_cpu_bytes(
             &bytes,
             &Shape::new(vec![bytes.len()]),
@@ -521,7 +556,7 @@ impl TaskRingPlan {
                 storage: DTypeStorage::Native,
             },
         )?;
-        Ok((storage, count as u32))
+        Ok((storage, total as u32))
     }
 }
 
@@ -565,6 +600,12 @@ pub struct TaskRingContext {
     /// wave walks the slots in tail order, and the slot a node lands in is
     /// `head % capacity`.
     last_slot: std::sync::atomic::AtomicUsize,
+    /// True once the wave kernel has been resolved for this ring.
+    ///
+    /// The on-stream launch path only LAUNCHES; the kernel has to be loaded
+    /// first. Resolving it once per ring keeps the hot path free of the extra
+    /// host call a per-token resolution would cost.
+    wave_resolved: std::sync::atomic::AtomicBool,
     /// True once the resident wave has been stopped AND confirmed gone.
     ///
     /// The confirmation is the point: a wave that has been told to stop but has
@@ -697,6 +738,7 @@ impl TaskRingContext {
             stream: std::ptr::null_mut(),
             ordinal: dev.ordinal,
             last_slot: std::sync::atomic::AtomicUsize::new(0),
+            wave_resolved: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(false),
         };
         // Stage AFTER the ring exists so the caller gets a fully formed context
@@ -766,7 +808,7 @@ impl TaskRingContext {
             g.output,
             0,
         )?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -800,7 +842,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -829,7 +871,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -858,7 +900,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -912,7 +954,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -944,7 +986,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1031,6 +1073,13 @@ impl TaskRingContext {
     /// A scratch ring is used instead: the wave sees an empty queue, exits at
     /// once, and this ring's slots are untouched.
     fn resolve_wave_kernel(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        // ONCE per ring. The on-stream launch path only launches, so the kernel
+        // has to be loaded first — but a resolution launch on the hot path
+        // would cost a host call per token, which is exactly what the handoff
+        // is trying to remove.
+        if self.wave_resolved.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let scratch = dev.alloc_scythe_ring_bytes(64)?;
         let u32_scalar = |v: u32| -> crate::Result<Box<dyn BackendStorage>> {
             let bytes = v.to_ne_bytes().to_vec();
@@ -1055,7 +1104,13 @@ impl TaskRingContext {
             stop.as_ref(),
             None,
             0,
-        )?;
+        )?
+        // The scratch buffers are freed when this function returns, so the
+        // wave that is reading them must be done first. Without the wait, the
+        // free races the wave — the same use-after-free class the resident
+        // wave's lifetime fix closed.
+        .synchronize()?;
+        self.wave_resolved.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1216,7 +1271,7 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1278,6 +1333,38 @@ impl TaskRingContext {
             self.count,
         )?
         .synchronize()?;
+        Ok(())
+    }
+
+    /// Launch this ring's staged set on an EXPLICIT stream, WITHOUT waiting.
+    ///
+    /// The wave lands in the caller's stream ORDER — so a caller that has
+    /// already launched the producer's graph on that stream gets the copy
+    /// strictly after it. This is what the boundary handoff needs: the copy
+    /// must not run before the graph that fills the buffer it reads.
+    ///
+    /// The kernel is resolved first, on a scratch ring, so this launch cannot
+    /// race anything: `launch_compute_kernel_on_stream` only launches.
+    pub fn launch_staged_on_stream(
+        &self,
+        dev: &crate::RocmDevice,
+        stream: *mut std::ffi::c_void,
+    ) -> crate::Result<()> {
+        let staged = self.staged.as_deref().ok_or_else(|| {
+            crate::Error::Backend("task ring context has no staged array".into())
+        })?;
+        self.resolve_wave_kernel(dev)?;
+        launch_task_ring_staged_on_stream(
+            dev,
+            &**self.slots,
+            self.capacity,
+            &**self.tail,
+            &**self.head,
+            &**self.stop,
+            staged,
+            self.count,
+            stream,
+        )?;
         Ok(())
     }
 }
@@ -1353,6 +1440,42 @@ pub fn launch_scythe_wait_flag(
         crate::HipDim3::new(1, 1, 1),
         crate::HipDim3::new(32, 1, 1),
         &mut [arg(&mut fp), arg(&mut ms), arg(&mut obs)],
+    )
+}
+
+/// Launch the staged set on an EXPLICIT stream, WITHOUT waiting for it.
+///
+/// The boundary handoff needs the wave to be ORDERED AFTER the producer's
+/// graph on the producer's OWN stream: a wave on a stream of its own would
+/// race the very graph it is supposed to follow, and could copy a half-written
+/// activation. So the wave goes on the caller's stream, and the caller decides
+/// where in that stream's order it lands.
+///
+/// The kernel must already be resolved (the on-stream path only launches) —
+/// see [`TaskRingContext::resolve_wave_kernel`].
+#[allow(clippy::too_many_arguments)]
+pub fn launch_task_ring_staged_on_stream(
+    dev: &crate::RocmDevice,
+    slots: &dyn BackendStorage,
+    capacity: u32,
+    tail: &dyn BackendStorage,
+    head: &dyn BackendStorage,
+    stop: &dyn BackendStorage,
+    staged: &dyn BackendStorage,
+    staged_count: u32,
+    stream: *mut std::ffi::c_void,
+) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
+    launch_task_ring_inner(
+        dev,
+        slots,
+        capacity,
+        tail,
+        head,
+        stop,
+        Some(staged),
+        staged_count,
+        false,
+        Some(stream),
     )
 }
 

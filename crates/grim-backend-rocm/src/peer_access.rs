@@ -5,6 +5,8 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::MemoryOps;
 
 use crate::device::helpers::check_hip;
 use crate::{HipErrorT, hipSuccess};
@@ -299,6 +301,237 @@ unsafe fn gcn_arch_for(device: i32) -> Cow<'static, str> {
     }
     Cow::Owned("gfx9999".to_string())
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// M6: the segment-boundary handoff with NO host event.
+//
+// A6's boundary is a HOST-issued peer copy plus a cross-stream event: the
+// copy is enqueued on the producing segment's stream, an event is recorded
+// after it, and the consuming segment's stream waits on that event. Three
+// host calls per boundary per token, and a host-visible synchronisation.
+//
+// M6 replaces all three with ONE wave launch and ONE device-side wait:
+//
+//   * The PRODUCER's ring carries three PEER_COPY tasks, in this order:
+//       1. clear the consumer's flag (write 0.0),
+//       2. copy the activation (src on the producer -> dst on the consumer),
+//       3. set the consumer's flag (write 1.0).
+//     One wave launch drains all three, in order.
+//
+//   * The CONSUMER's device spins on its own flag until it leaves zero. The
+//     flag is in the CONSUMER's memory, written by the producer over peer
+//     access — a direction MEASURED to be visible to the consumer's device
+//     with no host sync (see the `a_peer_write_is_visible_to_the_consumer_
+//     device` gate). The consumer never reads the producer's memory.
+//
+// The ORDER of the three tasks is what makes the flag safe. The producer
+// clears the flag itself, at the START of its own step, so the consumer never
+// has to reset anything: there is no window in which a late reset could
+// clobber the next step's signal (the failure mode of a consumer-side reset).
+//
+// The consumer's wait is bounded and reports what it saw, so a producer that
+// never ran shows up as a TIMEOUT rather than as a wedged device.
+pub struct BoundaryHandoff {
+    /// The producer's ring: it holds the three PEER_COPY tasks.
+    ring: crate::kernels::task_ring::TaskRingContext,
+    /// The consumer's flag. It lives on the CONSUMER's device — the consumer's
+    /// own spin reads it without any peer access.
+    flag: Box<dyn grim_tensor::backend::BackendStorage>,
+    /// Where the consumer's wait kernel records what it observed.
+    observed: Box<dyn grim_tensor::backend::BackendStorage>,
+    /// The producer's one-word sources: 0.0f32 to clear the flag, 1.0f32 to
+    /// set it. They are STATIC: the flag's value is produced by WHICH task
+    /// runs, not by a per-token host write.
+    _zero_src: Box<dyn grim_tensor::backend::BackendStorage>,
+    _one_src: Box<dyn grim_tensor::backend::BackendStorage>,
+}
+
+/// How many times the consumer's wait kernel spins before it gives up.
+///
+/// Each spin costs a short sleep, so this is a few hundred milliseconds of
+/// patience — long enough for a producer that is merely late, short enough
+/// that a producer that never ran is reported rather than waited on.
+pub const BOUNDARY_WAIT_SPINS: u32 = 2_000_000;
+
+impl BoundaryHandoff {
+    /// Prepare a handoff from `src` (on the producer) to `dst` (on the
+    /// consumer), copying `elems` floats.
+    ///
+    /// The peer grant must already be enabled producer -> consumer: the wave's
+    /// peer arm writes the CONSUMER's memory directly, which is a different
+    /// mechanism from `hipMemcpyPeerAsync` (the copy engine).
+    pub fn prepare(
+        producer: &crate::RocmDevice,
+        consumer: &crate::RocmDevice,
+        src: &crate::memory::storage::RocmStorage,
+        dst: &crate::memory::storage::RocmStorage,
+        elems: u32,
+    ) -> Result<Self> {
+        use crate::task_graph::{arg_role, op, TaskGraphBuilder};
+
+        if elems == 0 {
+            return Err(Error::Backend(
+                "boundary handoff: a copy of zero elements is not a handoff".into(),
+            ));
+        }
+        let src_ptr = src
+            .device_ptr_u64()
+            .ok_or_else(|| Error::Backend("boundary handoff: src has no device ptr".into()))?;
+        let dst_ptr = dst
+            .device_ptr_u64()
+            .ok_or_else(|| Error::Backend("boundary handoff: dst has no device ptr".into()))?;
+
+        // A one-element device buffer on the given device.
+        let f32_scalar = |dev: &crate::RocmDevice, v: f32| -> Result<Box<dyn grim_tensor::backend::BackendStorage>> {
+            Ok(dev.from_cpu_bytes(
+                &v.to_ne_bytes(),
+                &grim_tensor::Shape::new(vec![1]),
+                grim_tensor::dtype::DType {
+                    arith: grim_tensor::ArithType::F32,
+                    storage: grim_tensor::dtype::Storage::Native,
+                },
+            )?)
+        };
+        let u32_scalar = |dev: &crate::RocmDevice, v: u32| -> Result<Box<dyn grim_tensor::backend::BackendStorage>> {
+            Ok(dev.from_cpu_bytes(
+                &v.to_ne_bytes(),
+                &grim_tensor::Shape::new(vec![1]),
+                grim_tensor::dtype::DType {
+                    arith: grim_tensor::ArithType::U32,
+                    storage: grim_tensor::dtype::Storage::Native,
+                },
+            )?)
+        };
+        let ptr_of = |st: &Box<dyn grim_tensor::backend::BackendStorage>, what: &str| -> Result<u64> {
+            st.as_any()
+                .downcast_ref::<crate::memory::storage::RocmStorage>()
+                .ok_or_else(|| Error::Backend(format!("boundary handoff: {what} is not RocmStorage")))?
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend(format!("boundary handoff: {what} has no device ptr")))
+        };
+
+        // The consumer's flag: one float on the CONSUMER's device. It starts at
+        // zero, which is what the consumer's spin waits on.
+        let flag = f32_scalar(consumer, 0.0)?;
+        let flag_ptr = ptr_of(&flag, "flag")?;
+        // Where the consumer's wait kernel records what it observed.
+        let observed = u32_scalar(consumer, 0)?;
+        // The producer's STATIC flag sources: zero to clear the flag, one to
+        // set it. The flag's value comes from WHICH task runs, not from a
+        // per-token host write.
+        let zero_src = f32_scalar(producer, 0.0)?;
+        let zero_ptr = ptr_of(&zero_src, "zero_src")?;
+        let one_src = f32_scalar(producer, 1.0)?;
+        let one_ptr = ptr_of(&one_src, "one_src")?;
+
+        // The IR: three PEER_COPY nodes, in the order the wave must run them.
+        let mut gb = TaskGraphBuilder::new();
+        let h_zero = gb.push_arg(zero_ptr, 4, arg_role::ACT_IN);
+        let h_one = gb.push_arg(one_ptr, 4, arg_role::ACT_IN);
+        let h_src = gb.push_arg(src_ptr, elems as u64 * 4, arg_role::ACT_IN);
+        let h_flag = gb.push_arg(flag_ptr, 4, arg_role::PEER);
+        let h_dst = gb.push_arg(dst_ptr, elems as u64 * 4, arg_role::PEER);
+        // 1. clear the flag
+        gb.push(
+            op::PEER_COPY,
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[h_zero, h_flag],
+            &[],
+            0,
+            0,
+        );
+        // 2. copy the activation
+        gb.push(
+            op::PEER_COPY,
+            [elems, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[h_src, h_dst],
+            &[],
+            0,
+            0,
+        );
+        // 3. set the flag
+        gb.push(
+            op::PEER_COPY,
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[h_one, h_flag],
+            &[],
+            0,
+            0,
+        );
+        let graph = gb.finish();
+
+        let ring = crate::kernels::task_ring::TaskRingContext::from_graph(producer, &graph)?
+            .ok_or_else(|| {
+                Error::Backend("boundary handoff: the ring did not bind the peer copies".into())
+            })?;
+
+        Ok(Self {
+            ring,
+            flag,
+            observed,
+            _zero_src: zero_src,
+            _one_src: one_src,
+        })
+    }
+
+    /// Launch the copy on the PRODUCER's stream.
+    ///
+    /// The wave lands in that stream's ORDER, so a caller that has already
+    /// launched the producer's graph on the same stream gets the copy strictly
+    /// after it. One host call; no host event.
+    pub fn launch_copy(&self, producer: &crate::RocmDevice, producer_stream: *mut c_void) -> Result<()> {
+        self.ring.launch_staged_on_stream(producer, producer_stream)?;
+        Ok(())
+    }
+
+    /// Launch the CONSUMER's device-side wait on the consumer's stream.
+    ///
+    /// The kernel spins until the flag leaves zero. It is launched BEFORE the
+    /// consumer's graph on the same stream, so the graph starts only after the
+    /// handoff landed. One host call; no host event.
+    pub fn launch_wait(&self, consumer: &crate::RocmDevice) -> Result<()> {
+        let flag_ptr = self
+            .flag
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .and_then(|r| r.device_ptr_u64())
+            .ok_or_else(|| Error::Backend("boundary handoff: flag has no device ptr".into()))?;
+        let obs_ptr = self
+            .observed
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .and_then(|r| r.device_ptr_u64())
+            .ok_or_else(|| Error::Backend("boundary handoff: observed has no device ptr".into()))?;
+        crate::kernels::task_ring::launch_scythe_wait_flag(
+            consumer,
+            flag_ptr,
+            BOUNDARY_WAIT_SPINS,
+            obs_ptr,
+        )?;
+        Ok(())
+    }
+
+    /// What the consumer's wait observed: zero means it timed out.
+    pub fn observed(&self) -> Result<u32> {
+        let r = self
+            .observed
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .ok_or_else(|| Error::Backend("boundary handoff: observed is not RocmStorage".into()))?;
+        Ok(r.to_cpu_vec_u32()?.first().copied().unwrap_or(0))
+    }
+
+    /// The consumer's flag value, read on the host.
+    pub fn flag_value(&self) -> Result<f32> {
+        let r = self
+            .flag
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .ok_or_else(|| Error::Backend("boundary handoff: flag is not RocmStorage".into()))?;
+        Ok(r.to_cpu_vec_f32()?.first().copied().unwrap_or(0.0))
+    }
+}
+
 
 #[cfg(test)]
 mod self_tests {

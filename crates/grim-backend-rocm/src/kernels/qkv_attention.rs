@@ -5462,6 +5462,37 @@ pub fn launch_scythe_publish_head(
     Ok(handle)
 }
 
+/// Publish the ring's head counter WITHOUT a host synchronisation.
+///
+/// The synchronising variant ([`launch_scythe_publish_head`]) ends with
+/// `hipStreamSynchronize`, which makes every enqueue a HOST-visible
+/// synchronisation — the opposite of what a ring is for: the ring exists so a
+/// step costs ONE launch instead of one per node, and a host sync per node
+/// gives that back.
+///
+/// The publish does not need it. The kernel's store reaches L2 (global stores
+/// are not cached in L1 on RDNA) and the kernel's completion makes it visible
+/// device-wide; the wave reads the counter with a device-scope atomic, which
+/// reads L2. The cross-stream case — the wave parked on the ring's own
+/// stream while the publish runs on the caller's — is exactly what
+/// `resident_wave_drains_a_node_enqueued_after_it_parked` gates: a node
+/// enqueued AFTER the wave parked is still drained, which it cannot be unless
+/// the publish reached the wave's stream.
+pub fn launch_scythe_publish_head_async(
+    dev: &crate::RocmDevice,
+    head_dev_ptr: u64,
+    head_value: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut hp = head_dev_ptr;
+    let mut hv = head_value;
+    dev.launch_compute_kernel(
+        "grim_scythe_publish_head",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [arg(&mut hp), arg(&mut hv)],
+    )
+}
+
 /// ScytheRing descriptor write — fully on-device (no host pack, no H2D).
 /// Writes one 64-byte task descriptor into ring slot `slot_idx`. Launched as
 /// grid (1,1,1)/block (1,1,1): thread 0 packs the fields. This is HIP-graph
