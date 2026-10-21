@@ -3137,6 +3137,18 @@ extern "C" __global__ void grim_scythe_publish_head(
 ) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *head_dev = head_value;
+        // FENCE, and it is load-bearing.
+        //
+        // The head counter is read by the ring's wave, which runs on ANOTHER
+        // stream — often another CU. A global store without a fence can stay in
+        // the publisher's L1, and the wave's read (a device-scope atomic, which
+        // bypasses L1) then sees the OLD head and finds no work: the node is
+        // silently never drained.
+        //
+        // The host-side synchronisation that used to follow this launch was
+        // masking it (a stream sync flushes the publisher's caches). With the
+        // publish no longer synchronised, the fence IS the ordering.
+        __threadfence();
     }
 }
 

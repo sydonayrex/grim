@@ -2432,15 +2432,30 @@ impl DecodeGraph {
             if producer_ord == consumer_ord {
                 return;
             }
-            if let Err(e) = crate::peer_access::enable_peer_access(
-                producer_ord as i32,
-                consumer_ord as i32,
-            ) {
-                eprintln!(
-                    "[decode-graph] boundary {k}: peer access {producer_ord}->{consumer_ord} \
-                     unavailable ({e}); keeping the A6 boundary"
-                );
-                return;
+            // BOTH grants, and each is load-bearing:
+            //
+            //  * producer -> consumer: the wave's peer arm writes the
+            //    activation (and the flag) into the CONSUMER's memory. A direct
+            //    peer write needs the grant; the copy engine's
+            //    `hipMemcpyPeerAsync` does not, which is why A6's boundary
+            //    never asked for it.
+            //  * consumer -> producer: the consumer's DEVICE polls the
+            //    producer's tail over peer access, and a peer READ needs the
+            //    grant in the other direction.
+            //
+            // Missing the second one is a page fault on the consumer, not a
+            // wrong answer.
+            for (a, b) in [
+                (producer_ord as i32, consumer_ord as i32),
+                (consumer_ord as i32, producer_ord as i32),
+            ] {
+                if let Err(e) = crate::peer_access::enable_peer_access(a, b) {
+                    eprintln!(
+                        "[decode-graph] boundary {k}: peer access {a}->{b} unavailable ({e}); \
+                         keeping the A6 boundary"
+                    );
+                    return;
+                }
             }
             let producer = crate::RocmDevice::shared(producer_ord);
             let consumer = crate::RocmDevice::shared(consumer_ord);

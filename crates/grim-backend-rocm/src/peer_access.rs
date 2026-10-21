@@ -72,16 +72,27 @@ pub fn boundary_host_sync_count() -> u64 {
 
 /// Is M6's ring handoff enabled?
 ///
-/// OFF by default. The handoff replaces A6's host-issued peer copy + event
+/// ON by default. The handoff replaces A6's host-issued peer copy + event
 /// with a wave launch + a device-side wait, and it needs peer access granted
 /// between the two devices (the wave's peer arm writes the consumer's memory
 /// DIRECTLY, which is a different mechanism from the copy engine's
-/// `hipMemcpyPeerAsync`). That grant changes the process's device topology in
-/// a way whose interaction with the rest of the ring is not yet understood —
-/// see the note in `plans/PLAN-multigpu-per-device-graphs.md` — so the
-/// handoff is opt-in until it is.
+/// `hipMemcpyPeerAsync`).
+///
+/// The grant was the thing that had to be understood before the handoff could
+/// be the default: it was the only candidate for the cross-test hang, and
+/// MEASURED it is not — the hang was a device-wide synchronisation issued
+/// while the ring's resident wave was parked (the allocation's synchronous
+/// upload waits for EVERY stream on the device, including the ring's
+/// non-blocking one). That cycle is broken by the wave's IDLE budget, and the
+/// allocation ordering it exposed is now the ring's documented rule.
+///
+/// `GRIM_RING_HANDOFF=0` turns it OFF, which restores A6's host-issued peer
+/// copy + event for a bisect.
 pub fn ring_handoff_enabled() -> bool {
-    std::env::var("GRIM_RING_HANDOFF").map(|v| v == "1").unwrap_or(false)
+    match std::env::var("GRIM_RING_HANDOFF") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
 }
 
 /// Enqueue a peer copy `src (on src_stream's device) -> dst`, then order

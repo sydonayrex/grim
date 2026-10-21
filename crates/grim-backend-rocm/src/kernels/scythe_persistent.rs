@@ -123,6 +123,16 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     const scythe_task_descriptor_t* staged,
     unsigned int staged_count)
 {
+    // The stop flag is NOT cleared here. The host clears it, on THIS ring's
+    // stream, before it launches the wave — so the clear and the launch are
+    // ordered. Clearing it from inside the wave would race the host's stop:
+    // a stop that lands BEFORE the wave starts would be undone by the wave's
+    // own clear, and the wave would park forever.
+    //
+    // The flag means "no wave is running on this ring": the wave sets it when
+    // it leaves (on its own idle budget or on the host's stop), and the host
+    // sets it to ask the wave to stop.
+
     // Lane zero owns queue control; the whole block cooperates on the claimed descriptor so Charon receives the launch width it expects.
     // Shared state also gives every lane the same termination condition.
     __shared__ unsigned int claimed_slot;
@@ -167,7 +177,18 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
         backoff_shift = 0;
     }
     __syncthreads();
-    for (unsigned int iteration = 0; iteration < max_tasks; ++iteration) {
+    // The budget counts IDLE polls, not total iterations: a wave that is being
+    // FED must not expire, however long the feeding takes (the first enqueue
+    // after the wave parks can JIT the enqueue kernels, and a cold hipRTC
+    // compile of this source tree can outlast ANY wall-clock budget).
+    //
+    // An idle budget is also the DEADLOCK BOUND: a host that synchronises the
+    // device while the wave is parked waits for the wave, and the wave waits
+    // for the host — the ONLY thing that breaks that cycle is the wave giving
+    // up on its own. With an idle budget it gives up after the budget, so the
+    // host's wait is bounded instead of infinite.
+    unsigned int idle_polls = 0;
+    while (idle_polls < max_tasks) {
         if (atomicAdd((unsigned int*)stop_ptr, 0) != 0u) break;
         if (threadIdx.x == 0) {
             active = 0;
@@ -194,6 +215,7 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (threadIdx.x == 0)
                 terminate = atomicAdd((unsigned int*)head_ptr, 0) == atomicAdd(tail_ptr, 0);
             __syncthreads();
+            idle_polls++;
             // WI-SB6 resident wave: an empty queue is not a stop condition - the worker parks
             // here until the host publishes new work via head, and exits only through stop_ptr (or max_tasks).
             if (terminate && !resident) break;
@@ -208,6 +230,9 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             }
             continue;
         }
+        // Work resets the idle budget: the wave is being fed, so it must not
+        // expire under the host.
+        idle_polls = 0;
         scythe_task_descriptor_t* desc = &slots[claimed_slot];
 
         // Dispatch on opcode.
@@ -449,6 +474,14 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             atomicAdd(tail_ptr, 1);
         }
         __syncthreads();
+    }
+    // Leave the stop flag SET when the wave leaves on its own: the flag means
+    // "no wave is running on this ring", and the host uses it to know it must
+    // launch a fresh wave before the next enqueue. A host that only ever sets
+    // the flag (never clears it) would read the same value, so the two uses
+    // agree: set = not running.
+    if (threadIdx.x == 0) {
+        atomicExch((unsigned int*)stop_ptr, 1u);
     }
 }
 

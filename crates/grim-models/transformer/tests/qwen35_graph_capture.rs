@@ -981,10 +981,10 @@ fn the_ring_handoff_matches_a6_and_removes_a_host_sync_per_token() {
     // One split hybrid, replayed N tokens, returning the logits and the number
     // of host-visible boundary synchronisations the replay issued.
     let run = |with_handoff: bool| -> (Vec<Vec<f32>>, u64) {
-        if with_handoff {
-            unsafe { std::env::set_var("GRIM_RING_HANDOFF", "1") };
-        } else {
-            unsafe { std::env::remove_var("GRIM_RING_HANDOFF") };
+        // The handoff is ON by default now, so the A6 run must turn it OFF
+        // explicitly — "unset" no longer means A6.
+        unsafe {
+            std::env::set_var("GRIM_RING_HANDOFF", if with_handoff { "1" } else { "0" });
         }
         let mut cfg = tiny_cfg();
         cfg.num_layers = 4;
