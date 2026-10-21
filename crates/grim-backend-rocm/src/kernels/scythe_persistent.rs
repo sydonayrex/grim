@@ -452,6 +452,47 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
 // The spin is BOUNDED and the observed status is written out either way, so a
 // producer that never runs shows up as a TIMEOUT (the status is still PENDING)
 // rather than as a wedged device.
+//
+// The shared primitive is the SPIN: poll a 32-bit word until it reaches a
+// target value, or the spin budget runs out. The word is read through a
+// `volatile` pointer so the compiler cannot hoist the load out of the loop —
+// the value may live in ANOTHER device's memory, and only the hardware knows
+// when it changes.
+extern "C" __device__ unsigned int grim_scythe_spin_u32(
+    const volatile unsigned int* word,
+    unsigned int until_value,
+    unsigned int max_spins)
+{
+    unsigned int spins = 0;
+    unsigned int v = *word;
+    while (v != until_value && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *word;
+        spins++;
+    }
+    return v;
+}
+
+// Spin until the word becomes NON-ZERO.
+//
+// This is NOT the same predicate as `grim_scythe_spin_u32`: that one exits
+// when the word EQUALS a target, and a completion flag needs the opposite —
+// it starts at zero and must leave zero. Passing zero as the target would
+// exit IMMEDIATELY, on the initial value, which is the opposite of waiting.
+extern "C" __device__ unsigned int grim_scythe_spin_nonzero(
+    const volatile unsigned int* word,
+    unsigned int max_spins)
+{
+    unsigned int spins = 0;
+    unsigned int v = *word;
+    while (v == 0u && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *word;
+        spins++;
+    }
+    return v;
+}
+
 extern "C" __global__ void grim_scythe_wait_descriptor(
     const scythe_task_descriptor_t* slots,
     unsigned int slot_idx,
@@ -461,14 +502,26 @@ extern "C" __global__ void grim_scythe_wait_descriptor(
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     const volatile unsigned int* status =
         (const volatile unsigned int*)&slots[slot_idx].status;
-    unsigned int spins = 0;
-    unsigned int s = *status;
-    while (s == ST_PENDING && spins < max_spins) {
-        __builtin_amdgcn_s_sleep(64);
-        s = *status;
-        spins++;
-    }
-    *observed_status = s;
+    *observed_status = grim_scythe_spin_u32(status, ST_COMPLETE, max_spins);
+}
+
+// M6: wait for a FLAG to become non-zero, DEVICE-SIDE.
+//
+// This is the cross-device completion flag: the producer's wave writes a
+// non-zero word into the CONSUMER's memory, and the consumer's device spins
+// on that word until it changes. The consumer never polls the producer's
+// memory, so the only cross-device traffic is the flag itself.
+//
+// Bounded, and the observed value is written out either way: a producer that
+// never ran shows up as a TIMEOUT (the flag is still zero) rather than as a
+// wedged device.
+extern "C" __global__ void grim_scythe_wait_flag(
+    const volatile unsigned int* flag,
+    unsigned int max_spins,
+    unsigned int* observed)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    *observed = grim_scythe_spin_nonzero(flag, max_spins);
 }
 "#;
 

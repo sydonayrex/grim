@@ -1330,6 +1330,32 @@ pub fn launch_scythe_wait_descriptor(
     )
 }
 
+/// M6: wait (device-side) for a FLAG to become non-zero.
+///
+/// The cross-device completion flag: the producer's wave writes a non-zero
+/// word into the CONSUMER's memory, and the consumer's device spins on that
+/// word. The consumer never polls the producer's memory — the flag is the only
+/// cross-device traffic — and no host event is involved.
+///
+/// Bounded, and the observed value is written out either way, so a producer
+/// that never ran shows up as a TIMEOUT (the flag is still zero).
+pub fn launch_scythe_wait_flag(
+    dev: &crate::RocmDevice,
+    flag_ptr: u64,
+    max_spins: u32,
+    observed_dev: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut fp = flag_ptr;
+    let mut ms = max_spins;
+    let mut obs = observed_dev;
+    dev.launch_compute_kernel(
+        "grim_scythe_wait_flag",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut fp), arg(&mut ms), arg(&mut obs)],
+    )
+}
+
 /// How many claim attempts a RESIDENT wave may make before it gives up on its
 /// own (M6 step 3). The wave normally leaves through `stop_wave`; this is the
 /// backstop, so a host that forgets to stop it cannot hold the device.

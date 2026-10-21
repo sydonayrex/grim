@@ -1614,3 +1614,122 @@ fn a_dropped_resident_ring_leaves_no_wave_behind() {
     );
     ctx.stop_wave(&dev).expect("stop wave");
 }
+
+/// M6 step 2, the DISCRIMINATING question: can the CONSUMER's DEVICE see the
+/// producer's peer write without any host synchronisation?
+///
+/// This decides the shape of the whole handoff:
+///
+///  * If YES — the producer's wave writes the completion flag straight into the
+///    CONSUMER's memory, and the consumer's device spins on that flag. The
+///    handoff needs no host event at all, which is M6's whole point.
+///  * If NO — a peer write is not visible to the peer device until the host
+///    synchronises, so the flag would have to travel through the copy engine
+///    (`hipMemcpyPeerAsync`), which is a HOST call and would put the event
+///    straight back.
+///
+/// The existing `ring_peer_copy_crosses_devices` gate does NOT answer this:
+/// it reads the consumer's buffer back ON THE HOST after synchronising both
+/// devices, which proves the bytes arrived, not that the consumer's DEVICE
+/// could see them on its own.
+///
+/// So: the producer's wave writes a non-zero float into a flag buffer that
+/// lives on the CONSUMER; the consumer's device then spins on that buffer in a
+/// kernel, with no host synchronisation in between.
+///
+/// The second half is the NEGATIVE CONTROL: a flag nobody writes must make the
+/// spin TIME OUT (observed zero) rather than report a completion. Without it,
+/// the first half could pass for the wrong reason — a spin that exits at once
+/// on a stale or pre-set flag would look exactly like a successful handoff.
+#[test]
+fn a_peer_write_is_visible_to_the_consumer_device() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices");
+        return;
+    }
+    let producer = grim_backend_rocm::RocmDevice::try_new(0).expect("dev 0");
+    let consumer = grim_backend_rocm::RocmDevice::try_new(1).expect("dev 1");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    grim_backend_rocm::peer_access::enable_peer_access(0, 1).expect("peer 0->1");
+
+    // The flags live on the CONSUMER. The producer's wave writes into the
+    // first one over peer access; the consumer's device spins on it. The
+    // second one is never written — it is the control.
+    let (flag_s, flag_ptr) = f32_dev(&consumer, &[0.0f32]);
+    let (ctrl_s, ctrl_ptr) = f32_dev(&consumer, &[0.0f32]);
+    // The source of the write: one float, 1.0f32 (a non-zero bit pattern).
+    let (_src_s, src_ptr) = f32_dev(&producer, &[1.0f32]);
+    // Where the consumer records what it saw.
+    let (obs_s, obs_ptr) = u32_dev(&consumer, 0);
+    let (ctrl_obs_s, ctrl_obs_ptr) = u32_dev(&consumer, 0);
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_s = gb.push_arg(src_ptr, 4, arg_role::ACT_IN);
+    let h_d = gb.push_arg(flag_ptr, 4, arg_role::PEER);
+    gb.push(
+        op::PEER_COPY,
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_s, h_d],
+        &[],
+        0,
+        0,
+    );
+    let graph = gb.finish();
+
+    let ctx =
+        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&producer, &graph)
+            .expect("ring context")
+            .expect("ring binds the peer copy");
+    ctx.enqueue_peer_copy(&producer, &ctx.plan().peers()[0])
+        .expect("enqueue peer copy");
+
+    // The CONSUMER spins on the flag — on the consumer's own device, with NO
+    // host synchronisation between the producer's write and this read.
+    grim_backend_rocm::kernels::task_ring::launch_scythe_wait_flag(
+        &consumer,
+        flag_ptr,
+        10_000_000,
+        obs_ptr,
+    )
+    .expect("launch flag wait");
+    // The control: nobody writes this one, so the spin must run out.
+    grim_backend_rocm::kernels::task_ring::launch_scythe_wait_flag(
+        &consumer,
+        ctrl_ptr,
+        200_000,
+        ctrl_obs_ptr,
+    )
+    .expect("launch control wait");
+
+    let observed = obs_s.to_cpu_vec_u32().expect("read observed")[0];
+    assert_ne!(
+        observed, 0,
+        "the consumer's DEVICE must see the producer's peer write with no host sync \
+         (the flag stayed zero for the whole spin)"
+    );
+    let flag = flag_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap()
+        .to_cpu_vec_f32()
+        .unwrap();
+    assert_eq!(flag[0], 1.0f32, "the flag must hold the producer's value");
+
+    // The control must have TIMED OUT, not reported a completion.
+    let ctrl_observed = ctrl_obs_s.to_cpu_vec_u32().expect("read control")[0];
+    assert_eq!(
+        ctrl_observed, 0,
+        "a flag nobody writes must time out with zero, not report a completion"
+    );
+    let ctrl = ctrl_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap()
+        .to_cpu_vec_f32()
+        .unwrap();
+    assert_eq!(ctrl[0], 0.0f32, "the control flag must still be zero");
+}
