@@ -64,6 +64,17 @@ const OP_RECURRENT: u32 = 11;
 /// *k* copies its boundary residual straight into segment *k+1*'s input, so the
 /// handoff never leaves the GPU and the host-side event disappears.
 const OP_PEER_BROADCAST: u32 = 9;
+/// Wave-side opcode for the Q8_0 dot4 GEMV (plan PM-6 / condition 4): the
+/// activation is Q8_1 and the weight is Q8_0, and the arm is the INTEGER dot
+/// the launcher's `grim_dot4_q80_q81_gemv` does — the ring never dequantizes.
+const OP_Q8_0_DOT4: u32 = 12;
+
+/// The IR's QuantFormat id for Q8_0 — `params[0]` of a `Q8_0_DOT4` node.
+///
+/// The node says which format its weight is in, and the arm reads Q8_0
+/// BLOCKS; a different format's bytes are not blocks at all, so a node whose
+/// `params[0]` says anything else is refused rather than misread.
+const Q8_0_FORMAT_ID: u32 = grim_tensor::QuantFormat::Q8_0 as u32;
 
 /// The task-graph `op` → wave opcode translation (M5: opcode generalization).
 ///
@@ -82,8 +93,10 @@ const OP_PEER_BROADCAST: u32 = 9;
 /// wave has no dot4 arm, and the number it was given (8) is the wave's
 /// `OP_PEER_REDUCE`. Advertising it made `ring_ready` report a model as fully
 /// covered while the node actually fell back to its launcher — and had it ever
-/// been bound, the wave would have run an all-reduce instead of a GEMM. It is
-/// removed until the arm exists; the invariant that keeps it out is gated by
+/// been bound, the wave would have run an all-reduce instead of a GEMM.
+/// **The arm now exists** (`OP_Q8_0_DOT4`, 2026-10-20): the wave runs the
+/// launcher's own `grim_dot4_q80_q81_gemv` body, so the arm's answer is
+/// bit-identical to the launcher's. The old number is still pinned out by
 /// `every_advertised_ring_opcode_maps_to_an_implemented_wave_arm`.
 pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::GEMM, OP_ROW_GEMM),
@@ -93,6 +106,7 @@ pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::MOE_DISPATCH, OP_MOE),
     (crate::task_graph::op::PEER_COPY, OP_PEER_BROADCAST),
     (crate::task_graph::op::RECURRENT, OP_RECURRENT),
+    (crate::task_graph::op::Q8_0_DOT4, OP_Q8_0_DOT4),
 ];
 
 /// Translate a task-graph opcode to its wave opcode.
@@ -125,6 +139,30 @@ pub struct TaskRingGemm {
     /// weight, a missing operand), and those occupy no plan slot — so counting
     /// GEMM nodes and indexing the plan by that count desyncs the moment one is
     /// skipped.
+    pub ir_node: u32,
+}
+
+/// One ring-executable Q8_0 dot4 GEMV (plan PM-6 / condition 4).
+///
+/// The activation is Q8_1 (packed 36-byte blocks: fp16 d, fp16 sum, 32 int8
+/// codes) and the weight is Q8_0 (packed 34-byte blocks: fp16 d, 32 int8
+/// codes), so the arm never dequantizes: it is the integer dot, in the
+/// launcher's own device body.
+///
+/// Geometry is `m` (rows of the activation), `n` (the output width — the
+/// weight's columns) and `k` (the reduction width, a multiple of 32).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskRingQ8Dot4 {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    /// The Q8_1 activation.
+    pub input: u64,
+    /// The Q8_0 weight.
+    pub weight: u64,
+    /// The f32 output, `[m, n]`.
+    pub output: u64,
+    /// The IR node index this entry was derived from.
     pub ir_node: u32,
 }
 
@@ -226,6 +264,8 @@ pub struct TaskRingPlan {
     pub moes: Vec<TaskRingMoe>,
     pub peers: Vec<TaskRingPeer>,
     pub recurrences: Vec<TaskRingRecurrent>,
+    /// The Q8_0 dot4 GEMVs (plan PM-6 / condition 4).
+    pub q8_dot4s: Vec<TaskRingQ8Dot4>,
 }
 
 impl TaskRingPlan {
@@ -244,6 +284,7 @@ impl TaskRingPlan {
         let mut moes = Vec::new();
         let mut peers = Vec::new();
         let mut recurrences = Vec::new();
+        let mut q8_dot4s = Vec::new();
         // Indexed, not searched: `execute` walks in dependency order rather than
         // node order, so the emitter's own index is the only thing that links a
         // plan entry back to the node it came from.
@@ -253,7 +294,7 @@ impl TaskRingPlan {
             // absent from the plan and keeps running on its ordinary launcher.
             match node.opcode {
                 op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH
-                | op::PEER_COPY | op::RECURRENT => {}
+                | op::PEER_COPY | op::RECURRENT | op::Q8_0_DOT4 => {}
                 _ => continue,
             }
             let (mut input, mut weight, mut output) = (None, None, None);
@@ -426,16 +467,41 @@ impl TaskRingPlan {
                     }
                     gemms.push(TaskRingGemm { m, n, k, input: i, weight: w, output: o, quant: node.params[0], ir_node: idx as u32 });
                 }
+                op::Q8_0_DOT4 => {
+                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
+                    // The Q8_0 dot4 GEMV: `n`/`k`/`m` in params[1..4], exactly
+                    // like the f32 GEMM's geometry, and params[0] carries the
+                    // weight's QuantFormat (which must be Q8_0 — the arm reads
+                    // Q8_0 blocks and a different format's bytes are not
+                    // blocks at all).
+                    let n = node.params[1];
+                    let k = node.params[2];
+                    let m = node.params[3];
+                    if m == 0 || n == 0 || k == 0 {
+                        continue;
+                    }
+                    // The K reduction is in 32-element blocks on both sides, so
+                    // a K that is not a multiple of 32 would read past the
+                    // weight's last block. The launcher rounds K down; the arm
+                    // must refuse rather than read past the end.
+                    if k % 32 != 0 {
+                        continue;
+                    }
+                    if node.params[0] != Q8_0_FORMAT_ID {
+                        continue;
+                    }
+                    q8_dot4s.push(TaskRingQ8Dot4 { m, n, k, input: i, weight: w, output: o, ir_node: idx as u32 });
+                }
                 _ => {}
             }
         }
-        Self { gemms, norms, adds, attns, moes, peers, recurrences }
+        Self { gemms, norms, adds, attns, moes, peers, recurrences, q8_dot4s }
     }
 
     pub fn is_empty(&self) -> bool {
         self.gemms.is_empty() && self.norms.is_empty() && self.adds.is_empty()
             && self.attns.is_empty() && self.moes.is_empty() && self.peers.is_empty()
-            && self.recurrences.is_empty()
+            && self.recurrences.is_empty() && self.q8_dot4s.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -466,11 +532,17 @@ impl TaskRingPlan {
         &self.recurrences
     }
 
+    /// The Q8_0 dot4 GEMVs this plan can run.
+    pub fn q8_dot4s(&self) -> &[TaskRingQ8Dot4] {
+        &self.q8_dot4s
+    }
+
     /// The ring's whole dispatch set for one step — what the launch-count
     /// assertion measures.
     pub fn step_len(&self) -> usize {
         self.gemms.len() + self.norms.len() + self.adds.len() + self.attns.len()
             + self.moes.len() + self.peers.len() + self.recurrences.len()
+            + self.q8_dot4s.len()
     }
 
     /// Serialize the plan into the device-side staged array.
@@ -900,6 +972,36 @@ impl TaskRingContext {
             &**self.slots,
             slot,
             OP_ROW_GEMM,
+            g.m,
+            g.n,
+            g.k,
+            g.input,
+            g.weight,
+            g.output,
+            0,
+        )?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        self.drain(dev)?;
+        Ok(())
+    }
+
+    /// Enqueue one Q8_0 dot4 GEMV and drain it with a one-task wave.
+    ///
+    /// The activation is Q8_1 and the weight is Q8_0 (the arm reads packed
+    /// blocks), and the geometry is the launcher's: `m` rows of the
+    /// activation, `n` output columns, `k` the reduction width.
+    pub fn enqueue_q8_dot4(&self, dev: &crate::RocmDevice, g: &TaskRingQ8Dot4) -> crate::Result<()> {
+        let head_value = self.next_head.fetch_add(1, Ordering::Relaxed);
+        let head_ptr = as_rocm(self.head.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
+        let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
+        crate::kernels::qkv_attention::launch_scythe_write_slot(
+            dev,
+            &**self.slots,
+            slot,
+            OP_Q8_0_DOT4,
             g.m,
             g.n,
             g.k,

@@ -1418,16 +1418,29 @@ extern "C" __global__ void grim_dot4_q80_norm_f32act_gemv(
 }
 
 
-extern "C" __global__ void grim_dot4_q80_q81_gemv(
+// The Q8_0 x Q8_1 GEMV BODY, shared by the standalone kernel and the ring's
+// `OP_Q8_0_DOT4` arm (plan PM-6 / condition 4).
+//
+// One call is one 32-lane GROUP's share of the work: the group owns the
+// output row `row` and the four output columns starting at `col_base`, and
+// its 32 lanes split the K-blocks between them. The final reduction is a
+// 32-lane shuffle tree (offsets 16..1), so the group MUST be 32 lanes: on a
+// wave64 card a 32-lane group is half a wave, and XOR with 16 never crosses
+// that half, so the tree still reduces exactly those 32 lanes.
+//
+// The standalone kernel launches this with blockDim=32 (one group per block);
+// the wave's arm calls it once per 32-lane group of its 128 threads. SAME
+// source, SAME per-lane block loop, SAME reduction order — so the arm's
+// result is BIT-IDENTICAL to the launcher's, which is what the gate asserts.
+// Two copies of this arithmetic would drift (and a quantized GEMM's rounding
+// is exactly the kind of thing that hides a drift until the logits move).
+__device__ __forceinline__ void grim_dot4_q80_q81_gemv_body(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q80,
     float* __restrict__ C,
-    int M, int N, int K)
+    int M, int N, int K,
+    int row, int col_base, int lane)
 {
-    const int col_base = blockIdx.x * 4;
-    const int row      = blockIdx.y;
-    const int lane     = threadIdx.x;
-
     if (row >= M || col_base >= N) return;
 
     const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
@@ -1482,6 +1495,16 @@ extern "C" __global__ void grim_dot4_q80_q81_gemv(
             C[(long long)row * N + col_base + j] = facc[j];
         }
     }
+}
+
+extern "C" __global__ void grim_dot4_q80_q81_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q80,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_q80_q81_gemv_body(A_q81, B_q80, C, M, N, K,
+                                blockIdx.y, blockIdx.x * 4, threadIdx.x);
 }
 
 // Down-projection activation-reuse experiment: consume a prequantized Q8.1

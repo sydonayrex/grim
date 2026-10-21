@@ -98,11 +98,13 @@ pub fn execute(
 /// emitted graph, stages its descriptors once, and drains them with the existing
 /// persistent wave. The wave's GEMM arm computes in f32, so a QUANTIZED weight is
 /// not executable by it — that node stays on its launcher, which is the fallback
-/// contract and is why the ring never dequantizes. A Q8_0 dot4 arm (plan
-/// condition 4's named target) is the next entry — and it is deliberately NOT
-/// listed until that arm exists: listing it made `ring_ready` report a model as
-/// fully covered while the node fell back to its launcher, and its number
-/// collided with the wave's `OP_PEER_REDUCE`.
+/// contract and is why the ring never dequantizes.
+///
+/// The Q8_0 dot4 arm (plan condition 4's named target) LANDED on 2026-10-20:
+/// `op::Q8_0_DOT4` is a separate opcode because a Q8_0 weight cannot run on
+/// the f32 arm, and the wave's arm is the launcher's own
+/// `grim_dot4_q80_q81_gemv` body — the integer dot, no dequantization, and a
+/// bit-identical answer.
 ///
 /// This list is the ONLY hand-maintained part of the readiness predicate:
 /// everything else about [`crate::task_graph::ring_ready`] is derived from the
@@ -118,8 +120,7 @@ pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     crate::task_graph::op::ATTENTION,
     crate::task_graph::op::MOE_DISPATCH,
     // M6: the cross-device handoff. Bound to the wave's `OP_PEER_BROADCAST` arm
-    // and to `TaskRingPlan::peers`, so advertising it is honest — unlike
-    // Q8_0_DOT4, which was listed with no arm at all.
+    // and to `TaskRingPlan::peers`, so advertising it is honest.
     crate::task_graph::op::PEER_COPY,
     // M5: the qwen35 KDA/recurrent step. The wave's `OP_RECURRENT` arm casts
     // the node's WEIGHT operand to a device-resident `KdaTaskDescriptor` and
@@ -128,4 +129,12 @@ pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     // descriptor staging all exist — otherwise `ring_ready` would claim coverage
     // the plan cannot bind, which is the Q8_0_DOT4 failure mode.
     crate::task_graph::op::RECURRENT,
+    // PM-6 / condition 4: the Q8_0 dot4 GEMV. The wave's `OP_Q8_0_DOT4` arm
+    // runs the launcher's OWN `grim_dot4_q80_q81_gemv` body, so the ring's
+    // answer is bit-identical to the launcher's — and the ring never
+    // dequantizes. Advertised now that the arm, the binding AND the geometry
+    // checks exist; the number it was given before (8) was the wave's
+    // `OP_PEER_REDUCE`, and that mistake is still pinned out by
+    // `every_advertised_ring_opcode_maps_to_an_implemented_wave_arm`.
+    crate::task_graph::op::Q8_0_DOT4,
 ];

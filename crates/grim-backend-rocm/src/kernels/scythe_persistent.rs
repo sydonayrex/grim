@@ -89,6 +89,11 @@ struct __align__(32) kda_task_descriptor_t {
 #define OP_PEER_REDUCE    8u
 #define OP_PEER_BROADCAST 9u
 #define OP_PEER_GATHER    10u
+// PM-6 / condition 4: the Q8_0 dot4 GEMV. The activation is Q8_1 (packed
+// 36-byte blocks) and the weight is Q8_0 (packed 34-byte blocks), so this arm
+// never dequantizes anything — it is the integer dot the launcher's
+// `grim_dot4_q80_q81_gemv` does, called through the SAME device body.
+#define OP_Q8_0_DOT4 12u
 
 // Status codes.
 #define ST_PENDING  0u
@@ -416,6 +421,40 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             unsigned int elems = desc->m;
             for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
                 dst[idx] = src[idx];
+            }
+        } else if (desc->opcode == OP_Q8_0_DOT4) {
+            // PM-6 / condition 4: the Q8_0 dot4 GEMV.
+            //   desc->input_ptr  = the Q8_1 activation (packed 36-byte blocks)
+            //   desc->weight_ptr = the Q8_0 weight      (packed 34-byte blocks)
+            //   desc->output_ptr = the f32 output [M, N]
+            //   desc->m / n / k  = M (rows), N (output width), K (reduction)
+            //
+            // The work decomposition is the standalone kernel's: one 32-lane
+            // GROUP owns one output row and four output columns, and its lanes
+            // split the K-blocks. The wave's 128 threads are four such groups,
+            // each taking the groups' share of the (row, col-group) tasks in
+            // turn. The 32-lane granularity is not an arbitrary choice — the
+            // body's reduction is a 32-lane shuffle tree, so a wider group
+            // would reduce a DIFFERENT set of partial sums and the arm's
+            // answer would stop being bit-identical to the launcher's.
+            const unsigned char* a_q81 = (const unsigned char*)desc->input_ptr;
+            const unsigned char* b_q80 = (const unsigned char*)desc->weight_ptr;
+            float* c_out = (float*)desc->output_ptr;
+            const int M = (int)desc->m;
+            const int N = (int)desc->n;
+            const int K = (int)desc->k;
+            if (M > 0 && N > 0 && K > 0) {
+                const int n_col_groups = (N + 3) / 4;
+                const int n_tasks = M * n_col_groups;
+                const int lane = (int)(threadIdx.x % 32u);
+                const int group = (int)(threadIdx.x / 32u);
+                const int n_groups = (int)((blockDim.x + 31u) / 32u);
+                for (int task = group; task < n_tasks; task += n_groups) {
+                    const int row = task / n_col_groups;
+                    const int col_base = (task % n_col_groups) * 4;
+                    grim_dot4_q80_q81_gemv_body(a_q81, b_q80, c_out, M, N, K,
+                                                row, col_base, lane);
+                }
             }
         } else if (desc->opcode == OP_RECURRENT) {
             // M5: the qwen35 KDA/recurrent step — three kernels inline:

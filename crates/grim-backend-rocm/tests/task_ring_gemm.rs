@@ -24,7 +24,7 @@ use grim_backend_rocm::kernels::task_ring::{
 };
 use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
-use grim_tensor::{BackendStorage, MemoryOps, Shape};
+use grim_tensor::{BackendStorage, CoreTensorOps, MemoryOps, Shape};
 
 /// M5: the plan builder's binding rules for the new opcodes.
 ///
@@ -585,12 +585,21 @@ fn every_advertised_ring_opcode_maps_to_an_implemented_wave_arm() {
     // Regression net for the specific defect the scan above CANNOT see: the old
     // `Q8_0_DOT4 -> 8` entry pointed at a number the kernel DOES dispatch — as
     // `OP_PEER_REDUCE`. So "has an arm" was satisfied while the semantics were
-    // wrong (an all-reduce for a quantized GEMM). Re-admitting it requires a real
-    // dot4 arm, which is why this is pinned by name.
-    assert!(
-        wave_opcode(grim_backend_rocm::task_graph::op::Q8_0_DOT4).is_none(),
-        "Q8_0_DOT4 must stay unmapped until a dot4 arm exists — its old number (8) is \
-         OP_PEER_REDUCE, so mapping it dispatches the wrong kernel"
+    // wrong (an all-reduce for a quantized GEMM). The dot4 arm now exists
+    // (2026-10-20, `OP_Q8_0_DOT4`), so the mapping is REQUIRED — and the
+    // number it must NOT be is still pinned, because that mistake is not
+    // visible to the scan above.
+    let dot4_wave = wave_opcode(grim_backend_rocm::task_graph::op::Q8_0_DOT4)
+        .expect("Q8_0_DOT4 must be mapped now that the dot4 arm exists");
+    assert_ne!(
+        dot4_wave,
+        8,
+        "Q8_0_DOT4 must not map to wave opcode 8 — that is OP_PEER_REDUCE, an \
+         all-reduce, not a GEMM"
+    );
+    assert_eq!(
+        dot4_wave, 12,
+        "Q8_0_DOT4 maps to the wave's OP_Q8_0_DOT4 (12)"
     );
 }
 
@@ -919,6 +928,7 @@ fn one_wave_launch_runs_the_steps_gemms() {
         moes: Vec::new(),
         peers: Vec::new(),
         recurrences: Vec::new(),
+        q8_dot4s: Vec::new(),
         gemms: vec![
             TaskRingGemm {
                 m: 1,
@@ -1187,6 +1197,298 @@ fn ring_recurrent_matches_the_standalone_kernels() {
             "step {step}: the ring's recurrent STATE differs — a stale-state arm passes step 0"
         );
     }
+}
+
+/// PM-6 (plan condition 4): the ring's Q8_0 dot4 arm must reproduce the
+/// LAUNCHER's answer BIT-FOR-BIT.
+///
+/// The arm is the launcher's own `grim_dot4_q80_q81_gemv` body, called with
+/// one 32-lane group per (row, four columns) task — the same per-lane block
+/// loop and the same 32-lane shuffle tree the standalone kernel uses. If the
+/// arm reduced over a different set of partial sums (a 64-lane group, say),
+/// the two would differ in the last bits of every output: a quantized GEMM's
+/// rounding is exactly the kind of difference that hides until the logits
+/// move. So this gate asserts EQUALITY, not closeness.
+///
+/// The shapes are chosen to exercise the edges: `n` not a multiple of four (the
+/// last column group is partial) and `m > 1` (more than one row, so the wave's
+/// groups have several tasks to split).
+#[test]
+fn the_q8_0_dot4_arm_reproduces_the_standalone_kernel() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    for (m, n, k) in [(1usize, 70usize, 96usize), (3, 66, 128)] {
+        let mut seed: u64 = 0x51EED ^ (m as u64) ^ ((n as u64) << 8) ^ ((k as u64) << 32);
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let a_f32: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        // The Q8_0 weight is packed per COLUMN: row `col` of the packed
+        // buffer is weight column `col` (the kernel reads
+        // `B_q80 + col * n_q_blocks * 34`).
+        let b_f32: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let b_bytes = grim_quant::quant_q80(&b_f32).expect("quant_q80");
+
+        // ── The activation, quantized to Q8_1 by the GPU quantizer (the
+        // production path) so the arm sees the same bytes the launcher does.
+        let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+            &dev,
+            &a_f32,
+            &Shape::new(vec![m, k]),
+            grim_tensor::DType::F32,
+        )
+        .expect("activation");
+        let q81_bytes = (k / 32) * 36 * m;
+        let q81_dev = dev
+            .zeros(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: DTypeStorage::Native,
+                },
+            )
+            .expect("alloc q81");
+        let a_rocm = a_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("a is RocmStorage");
+        let q81_rocm = q81_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("q81 is RocmStorage");
+        dev.launch_quantize_q8_1(a_rocm, q81_rocm, m, k)
+            .expect("quantize q8_1");
+
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_bytes,
+            &Shape::new(vec![n, k]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::KQuant(grim_tensor::KQuantScheme::Q80),
+            },
+        )
+        .expect("upload q80 weight");
+        let b_rocm = b_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("b is RocmStorage");
+
+        // ── The ring's arm: one Q8_0_DOT4 node over the same buffers.
+        let out_shape = Shape::new(vec![m, n]);
+        let out_dev = dev.zeros(&out_shape, DType::F32).expect("alloc out");
+        let out_rocm = out_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("out is RocmStorage");
+        let q81_ptr = q81_rocm.device_ptr_u64().expect("q81 ptr");
+        let b_ptr = b_rocm.device_ptr_u64().expect("weight ptr");
+        let out_ptr = out_rocm.device_ptr_u64().expect("out ptr");
+
+        let mut gb = TaskGraphBuilder::new();
+        let h_act = gb.push_arg(q81_ptr, q81_bytes as u64, arg_role::ACT_IN);
+        let h_w = gb.push_arg(b_ptr, b_bytes.len() as u64, arg_role::WEIGHT);
+        let h_out = gb.push_arg(out_ptr, (m * n * 4) as u64, arg_role::ACT_OUT);
+        // params[0] = the weight's QuantFormat, [1] = N, [2] = K, [3] = M —
+        // the same geometry slots the f32 GEMM uses.
+        gb.push(
+            op::Q8_0_DOT4,
+            [
+                grim_tensor::QuantFormat::Q8_0 as u32,
+                n as u32,
+                k as u32,
+                m as u32,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &[h_act, h_w, h_out],
+            &[],
+            0,
+            0,
+        );
+        let graph = gb.finish();
+        let ctx =
+            grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+                .expect("ring context")
+                .expect("the ring binds the Q8_0_DOT4 node");
+        assert_eq!(
+            ctx.plan().q8_dot4s().len(),
+            1,
+            "the Q8_0_DOT4 node must bind (m={m} n={n} k={k})"
+        );
+        ctx.enqueue_q8_dot4(&dev, &ctx.plan().q8_dot4s()[0])
+            .expect("enqueue q8_0 dot4");
+        dev.synchronize();
+
+        // ── The oracle: the launcher, on its own output buffer.
+        let ref_dev = dev.zeros(&out_shape, DType::F32).expect("alloc ref out");
+        let ref_rocm = ref_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("ref out is RocmStorage");
+        dev.launch_dot4_q80_q81_gemv(q81_rocm, b_rocm, ref_rocm, m, n, k)
+            .expect("standalone q8_0 dot4 gemv");
+        dev.synchronize();
+
+        let got = out_dev.to_cpu_vec_f32().expect("ring readback");
+        let want = ref_dev.to_cpu_vec_f32().expect("reference readback");
+        assert_eq!(
+            got, want,
+            "m={m} n={n} k={k}: the ring's Q8_0 dot4 arm differs from the launcher — \
+             the arm must be the launcher's own body, reduced over the same 32 lanes"
+        );
+    }
+}
+
+/// PM-6: the Q8_0 dot4 arm must be DETERMINISTIC — the same node, run twice,
+/// must produce byte-identical output.
+///
+/// The ring's determinism contract (plan condition 4) is not "the same answer
+/// each run" but "the same ORDER of accumulation each run": a quantized GEMM's
+/// partial sums depend on which lane accumulated which block, so a scheduler
+/// that reorders them changes the last bits. The gate runs the node twice
+/// through the ring and compares the bytes.
+#[test]
+fn ring_q8_0_dot4_produces_byte_identical_results_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    const M: usize = 2;
+    const N: usize = 68;
+    const K: usize = 64;
+    let mut seed: u64 = 0xD07E;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a_f32: Vec<f32> = (0..M * K).map(|_| rnd()).collect();
+    let b_f32: Vec<f32> = (0..N * K).map(|_| rnd()).collect();
+    let b_bytes = grim_quant::quant_q80(&b_f32).expect("quant_q80");
+
+    let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+        &dev,
+        &a_f32,
+        &Shape::new(vec![M, K]),
+        grim_tensor::DType::F32,
+    )
+    .expect("activation");
+    let q81_bytes = (K / 32) * 36 * M;
+    let q81_dev = dev
+        .zeros(
+            &Shape::new(vec![q81_bytes]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )
+        .expect("alloc q81");
+    let a_rocm = a_dev
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("a is RocmStorage");
+    let q81_rocm = q81_dev
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("q81 is RocmStorage");
+    dev.launch_quantize_q8_1(a_rocm, q81_rocm, M, K)
+        .expect("quantize q8_1");
+    let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![N, K]),
+        DType {
+            arith: ArithType::F32,
+            storage: DTypeStorage::KQuant(grim_tensor::KQuantScheme::Q80),
+        },
+    )
+    .expect("upload q80 weight");
+    let b_rocm = b_dev
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("b is RocmStorage");
+
+    let out_shape = Shape::new(vec![M, N]);
+    let out_dev = dev.zeros(&out_shape, DType::F32).expect("alloc out");
+    let out_rocm = out_dev
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("out is RocmStorage");
+    let q81_ptr = q81_rocm.device_ptr_u64().expect("q81 ptr");
+    let b_ptr = b_rocm.device_ptr_u64().expect("weight ptr");
+    let out_ptr = out_rocm.device_ptr_u64().expect("out ptr");
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_act = gb.push_arg(q81_ptr, q81_bytes as u64, arg_role::ACT_IN);
+    let h_w = gb.push_arg(b_ptr, b_bytes.len() as u64, arg_role::WEIGHT);
+    let h_out = gb.push_arg(out_ptr, (M * N * 4) as u64, arg_role::ACT_OUT);
+    gb.push(
+        op::Q8_0_DOT4,
+        [
+            grim_tensor::QuantFormat::Q8_0 as u32,
+            N as u32,
+            K as u32,
+            M as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+        &[h_act, h_w, h_out],
+        &[],
+        0,
+        0,
+    );
+    let graph = gb.finish();
+    let ctx =
+        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+            .expect("ring context")
+            .expect("the ring binds the Q8_0_DOT4 node");
+
+    let mut runs: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..2 {
+        // The output is poisoned between runs: a stale value that survived
+        // would make a no-op arm look deterministic.
+        dev.write_f32_into_async(out_rocm, &vec![-7.0f32; M * N])
+            .expect("poison out");
+        ctx.enqueue_q8_dot4(&dev, &ctx.plan().q8_dot4s()[0])
+            .expect("enqueue q8_0 dot4");
+        dev.synchronize();
+        runs.push(out_dev.to_cpu_vec_f32().expect("readback").iter().flat_map(|v| v.to_ne_bytes().to_vec()).collect());
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the ring's Q8_0 dot4 arm is not byte-identical across runs"
+    );
+    assert!(
+        runs[0].iter().any(|b| *b != 0),
+        "the Q8_0 dot4 output is all zeros — the arm did not write anything"
+    );
 }
 
 /// M6 step 3: a RESIDENT wave drains a WHOLE staged set in ONE launch and then
