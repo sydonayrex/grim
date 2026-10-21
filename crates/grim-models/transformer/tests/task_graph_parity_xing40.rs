@@ -29,7 +29,7 @@ fn task_graph_interpretation_matches_graph_replay() {
     // is the recorded graph, so the bar is fp32-tight. If this ever needs
     // loosening, the IR has stopped describing the walk.
     const INTERPRET_BAR: f32 = 1e-5;
-    run_oracle(
+    let _ = run_oracle(
         "models/Xing4.0/Xing4.0-29B-A4B-IQ3_M-MTP.gguf",
         "xing40-moe",
         &[128000, 6727],

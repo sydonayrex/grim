@@ -72,7 +72,14 @@ fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize) {
 /// assertions. `interpret_bar` is the interpret-vs-replay bar: both paths run
 /// the SAME launchers, so the only permitted difference is kernel scheduling,
 /// not arithmetic.
-fn run_oracle(rel: &str, label: &str, tokens: &[u32], interpret_bar: f32) {
+/// Run the oracle and return the IR's QuantFormat axis (the format ids the
+/// model's quant-carrying nodes named).
+///
+/// The axis is returned because it is the COVERAGE TABLE's row, and a row
+/// that no gate can read is a row nothing can claim. A second checkpoint
+/// (the Xing40's IQ4_NL sibling) is a different set of formats, and the row
+/// it exercises is only exercised if the gate can SEE it.
+fn run_oracle(rel: &str, label: &str, tokens: &[u32], interpret_bar: f32) -> Vec<u32> {
     let device = Device::Rocm(0);
     let model_path = workspace_path(rel);
     let model_path = model_path.to_string_lossy().into_owned();
@@ -424,4 +431,7 @@ fn run_oracle(rel: &str, label: &str, tokens: &[u32], interpret_bar: f32) {
     unsafe {
         std::env::remove_var("GRIM_EMIT_TASK_GRAPH");
     }
+    // The axis, so a caller can assert WHICH formats this checkpoint
+    // exercised — a coverage row nobody can read is a row nobody can claim.
+    ir.caps.quant_modes.iter().copied().collect()
 }

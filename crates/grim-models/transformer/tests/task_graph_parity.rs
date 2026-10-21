@@ -44,7 +44,7 @@ fn task_graph_interpretation_matches_graph_replay() {
     // is the recorded graph, so the bar is fp32-tight. If this ever needs
     // loosening, the IR has stopped describing the walk.
     const INTERPRET_BAR: f32 = 1e-5;
-    run_oracle(
+    let _ = run_oracle(
         "models/Llama-3.2-1B-Instruct-Q4_1.gguf",
         "llama-q41",
         &[128000, 11, 322],
