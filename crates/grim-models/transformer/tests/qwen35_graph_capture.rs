@@ -1086,3 +1086,183 @@ fn the_ring_handoff_matches_a6_and_removes_a_host_sync_per_token() {
          (A6-vs-A6 {control_worst:.3e}, A6-vs-handoff {handoff_worst:.3e})"
     );
 }
+
+/// M6: the Qwen3.5 hybrid's IR walk, with the ring's RECURRENT node taking
+/// the KDA step — and the walk's logits against the launcher path's.
+///
+/// The hybrid is the vehicle that matters: it is the only model with RECURRENT
+/// layers, so it is the only one whose IR walk has to put the ring's node
+/// BETWEEN the projections and the output projection. The ring's
+/// `OP_RECURRENT` arm runs the same three device functions the block's KDA step
+/// runs (the short conv causal step, the batched gated delta rule and the
+/// head-norm gate), and the device waits for it — a kernel spinning on the
+/// descriptor's status — before the output projection reads the branch it
+/// wrote.
+///
+/// The bar is BIT-IDENTICAL: the walk runs the same kernels in the same order,
+/// so any difference is the ring's dispatch changing the arithmetic.
+#[test]
+fn the_qwen35_ring_walk_matches_the_launcher_path() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+    // The IR is only PUBLISHED when the emitter is on, and the ring's plan is
+    // derived from that published IR.
+    unsafe { std::env::set_var("GRIM_EMIT_TASK_GRAPH", "1") };
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
+    // The hybrid must have BOTH kinds of layer: the recurrent ones are what
+    // the ring takes, and the attention ones are what stays on the launchers.
+    let provider = synth_weights_hybrid(4, 2);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load hybrid qwen35");
+    let n_attn = model
+        .blocks
+        .iter()
+        .filter(|b| b.is_full_attention)
+        .count();
+    let n_recurrent = model.blocks.len() - n_attn;
+    assert_eq!((n_attn, n_recurrent), (2, 2), "the hybrid must have both kinds");
+
+    // ---- Arm A: the launcher path (the captured graph, replayed). ----
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("capturable");
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured, "capture must succeed");
+    // The capture's two EAGER warm-ups advanced the KV arena's layer totals
+    // and the recurrent state, so the graph starts its replay with a polluted
+    // history. The walk arms reset theirs (`reset_for_replay`), so this arm
+    // must reset too — otherwise the two arms compare DIFFERENT histories and
+    // the difference looks like an arithmetic defect in the walk.
+    graph.buffers.reset_for_replay().expect("reset (launcher)");
+
+    let mut launcher_logits = Vec::new();
+    for tok in TOKENS {
+        model.forward_replay(&mut graph, tok).expect("launcher replay");
+        launcher_logits.push(graph.read_logits_f32().expect("readback"));
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+
+    // ---- Arm B: the IR walk on its own (no ring) — the M2 oracle. This
+    // isolates the walk from the ring's RECURRENT arm: if the walk alone
+    // differs from the launcher path, the walk is at fault; if it matches and
+    // only the ring arm differs, the arm is. ----
+    let mut gp = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("capturable (walk)");
+    let _ = model.forward_capture(&mut gp, TOKENS[0]);
+    let _ = model.forward_capture(&mut gp, TOKENS[0]);
+    gp.begin_capture().expect("begin capture (walk)");
+    model
+        .forward_capture(&mut gp, TOKENS[0])
+        .expect("recorded capture (walk)");
+    gp.end_capture().expect("end capture (walk)");
+    gp.buffers.reset_for_replay().expect("reset (walk)");
+
+    let mut walk_logits = Vec::new();
+    for tok in TOKENS {
+        model
+            .forward_interpret_ir(&mut gp, tok)
+            .expect("walk interpret");
+        walk_logits.push(gp.read_logits_f32().expect("walk logits"));
+        gp.buffers.current_pos = gp.buffers.current_pos.wrapping_add(1);
+    }
+
+    // ---- Arm C: the IR walk, with the ring's RECURRENT node. ----
+    let mut gp_ring = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("capturable (ring)");
+    let _ = model.forward_capture(&mut gp_ring, TOKENS[0]);
+    let _ = model.forward_capture(&mut gp_ring, TOKENS[0]);
+    gp_ring.begin_capture().expect("begin capture (ring)");
+    model
+        .forward_capture(&mut gp_ring, TOKENS[0])
+        .expect("recorded capture (ring)");
+    gp_ring.end_capture().expect("end capture (ring)");
+    gp_ring.buffers.reset_for_replay().expect("reset (ring)");
+
+    // The ring must be bound to ARM C's OWN IR. The RECURRENT node's WEIGHT
+    // operand is the device address of that graph's `KdaTaskDescriptor`, and
+    // the descriptor holds the addresses of THAT graph's q_buf / conv_out /
+    // branch / state. A ring bound to another graph's IR would run the KDA
+    // step on the WRONG buffers — the walk would then read a branch nobody
+    // wrote, and the difference would look like an arithmetic defect in the
+    // wave's arm when it is a wiring defect in the gate.
+    let ir = gp_ring
+        .buffers
+        .emitted_task_graph
+        .clone()
+        .expect("the capture must publish the IR");
+    let mut ring = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(
+        &grim_backend_rocm::RocmDevice::shared(dev.ordinal()),
+        &ir,
+    )
+    .expect("ring context")
+    .expect("the ring must bind the hybrid's nodes");
+    assert_eq!(
+        ring.plan().recurrences().len(),
+        n_recurrent,
+        "the ring must bind one RECURRENT node per recurrent layer"
+    );
+
+    let mut ring_logits = Vec::new();
+    for tok in TOKENS {
+        model
+            .forward_interpret_ir_ring(&mut gp_ring, tok, &mut ring)
+            .expect("ring interpret");
+        ring_logits.push(gp_ring.read_logits_f32().expect("ring logits"));
+        gp_ring.buffers.current_pos = gp_ring.buffers.current_pos.wrapping_add(1);
+    }
+
+    // ---- The comparison: the RING walk against the M2 walk. ----
+    //
+    // Both arms are WALKS: the same model code, the same kernels, the same
+    // order — the only difference is that one dispatches the recurrent layers'
+    // KDA step to the ring's RECURRENT node. So the comparison is bit-exact,
+    // and any difference is the ring's arm changing the arithmetic.
+    //
+    // (The walk against the CAPTURED GRAPH is a different comparison, and a
+    // looser one: the eager path and the captured path differ by the known
+    // 2.4e-5-class amount — the same difference the qwen35 graph-vs-eager
+    // gate already accepts. That is the M2 oracle's job, not this gate's.)
+    assert_eq!(
+        walk_logits.len(),
+        ring_logits.len(),
+        "both arms must produce the same number of steps"
+    );
+    for (step, (a, b)) in walk_logits.iter().zip(ring_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[qwen35-ring] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e == 0.0,
+            "ring step {step} diverges from the launcher path: worst {e:.3e} at {at} \
+             (launcher {}, ring {})",
+            a[at],
+            b[at]
+        );
+    }
+    eprintln!("[qwen35-ring] the ring's KDA step is bit-identical to the launcher's");
+
+    // And the M2 oracle: the walk against the captured graph, at the bar the
+    // qwen35's graph-vs-eager gate already uses.
+    for (step, (a, b)) in launcher_logits.iter().zip(walk_logits.iter()).enumerate() {
+        let (e, at, _) = worst_scaled(a, b);
+        eprintln!("[qwen35-walk] step {step}: the walk vs the graph replay, worst {e:.3e}");
+        assert!(
+            e <= 1e-4,
+            "the walk diverges from the captured graph at step {step}: worst {e:.3e} at {at}",
+        );
+    }
+    unsafe { std::env::remove_var("GRIM_EMIT_TASK_GRAPH") };
+}

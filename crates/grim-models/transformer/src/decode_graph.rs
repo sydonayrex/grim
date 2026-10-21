@@ -2085,6 +2085,21 @@ fn dev_for_qwen35(qwen: &Qwen35) -> Result<Arc<Dev>> {
     }
 }
 
+
+/// The ring dispatch for a recurrent (KDA) layer's KDA STEP.
+///
+/// The ring's `OP_RECURRENT` arm runs exactly what
+/// [`Qwen35Block::forward_graph_recurrent_kda`] runs — the short conv causal
+/// step, the batched gated delta rule and the head-norm gate — so the IR walk
+/// can dispatch the step to the ring INSTEAD of calling that method. Never
+/// both: the step is either the ring's or the block's.
+pub struct KdaRingDispatch<'a> {
+    /// The ring the step is dispatched to.
+    pub ring: &'a mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    /// The plan's entry for this layer's RECURRENT node.
+    pub entry: grim_backend_rocm::kernels::task_ring::TaskRingRecurrent,
+}
+
 impl Qwen35Block {
     /// Enqueue all kernels for this Qwen35 block into the decode graph bracket.
     pub fn forward_graph(
@@ -2092,6 +2107,7 @@ impl Qwen35Block {
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
+        ring: Option<&mut KdaRingDispatch<'_>>,
     ) -> Result<()> {
         let batch = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
@@ -2543,7 +2559,42 @@ impl Qwen35Block {
             // OP_RECURRENT arm does (the wave runs the same three device
             // functions inline), so the IR walk dispatches EITHER this method
             // OR the ring's node — never both.
-            self.forward_graph_recurrent_kda(layer_idx, buffers, dev)?;
+            match ring {
+                Some(dispatch) => {
+                    // The ring's wave does the step, on the RING's stream.
+                    dispatch
+                        .ring
+                        .enqueue_recurrent(dev, &dispatch.entry)
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "qwen35 ring recurrent step: {e}"
+                            ))
+                        })?;
+                    // The DEVICE waits for the step to land, before the output
+                    // projection reads the branch the step wrote. The wait is a
+                    // kernel on THIS stream that spins on the ring
+                    // descriptor's status — device-side, so the producer and
+                    // the consumer overlap instead of alternating.
+                    let slot = dispatch.ring.last_slot() as u32;
+                    let slots_ptr = dispatch.ring.slots_ptr().map_err(|e| {
+                        grim_core::error::Error::Backend(format!("qwen35 ring slots: {e}"))
+                    })?;
+                    let observed = dispatch
+                        .ring
+                        .wait_device_slot(dev, slots_ptr, slot, dispatch.ring.ring_wait_spins())
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "qwen35 ring wait: {e}"
+                            ))
+                        })?;
+                    if observed != 2 {
+                        return Err(grim_core::error::Error::Backend(format!(
+                            "qwen35 ring recurrent step did not complete (status {observed})"
+                        )));
+                    }
+                }
+                None => self.forward_graph_recurrent_kda(layer_idx, buffers, dev)?,
+            }
 
             // 4. Output projection (ssm_out)
             self.forward_graph_recurrent_out(layer_idx, buffers, dev, act)?;
@@ -2905,6 +2956,152 @@ impl Qwen35Block {
 }
 
 // ─── DecodeGraphModel implementation for Qwen3.5 ───────────────────────────
+
+impl Qwen35 {
+
+    /// M6: the Qwen3.5 IR walk.
+    ///
+    /// The IR's RECURRENT nodes are dispatched to the task ring — the ring's
+    /// `OP_RECURRENT` arm runs the same three device functions the block's KDA
+    /// step runs (the short conv causal step, the batched gated delta rule and
+    /// the head-norm gate), so the step goes to the ring INSTEAD of the
+    /// block's method, never both.
+    ///
+    /// Every OTHER node goes through the model's ordinary launcher path for
+    /// that stage — the fallback contract the IR conversion relies on. The
+    /// ring's `OP_ATTENTION` arm is NOT the block's fused attention, and the
+    /// ring's `OP_NORM` fixes an epsilon the model does not, so dispatching
+    /// those would be a wrong answer, not a fast one.
+    fn qwen35_interpret_ir(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        mut ring: Option<&mut grim_backend_rocm::kernels::task_ring::TaskRingContext>,
+    ) -> Result<()> {
+        let dev = dev_for_qwen35(self)?;
+        // Every segment's pos scalar starts at this step's position.
+        let pos = graph.buffers.current_pos;
+        graph
+            .buffers
+            .write_pos_all_segments(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        // This step's token, exactly as `forward_replay` does it: the gather
+        // reads `token_ids_dev`, and only the capture ever wrote it. The pos
+        // write comes FIRST — that order is load-bearing on the interpret
+        // path (see the plan's M2 note on the interpreters' write order).
+        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        // The EMBEDDING GATHER. The walk runs the launchers instead of
+        // replaying a captured graph, so the gather that `forward_capture`
+        // RECORDS in the graph has to be LAUNCHED here. Without it the walk
+        // reads whatever the capture left in `layer_input[0]`: the same token
+        // at step 0 (so step 0 looks right) and a stale embedding from step 1
+        // on (so step 1 diverges by an order of magnitude). This is the same
+        // class of defect the M2 oracle found in Xing40 — a missing INPUT,
+        // not an IR-fidelity failure.
+        let emb_w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            emb_w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        // The ring's plan is derived from THIS IR, so its RECURRENT entries are
+        // in the IR's node order — the same order the recurrent layers appear
+        // in below.
+        let mut recurrent_idx = 0usize;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let blk_ord = match block.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
+            let _guard = grim_backend_rocm::DeviceGuard::set(blk_ord as i32);
+            let mut dispatch = match ring.as_deref_mut() {
+                Some(r) if !block.is_full_attention => {
+                    let entry = r
+                        .plan()
+                        .recurrences()
+                        .get(recurrent_idx)
+                        .cloned()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend(format!(
+                                "qwen35 interpret: the ring bound no RECURRENT entry for layer {i}"
+                            ))
+                        })?;
+                    recurrent_idx += 1;
+                    Some(KdaRingDispatch { ring: r, entry })
+                }
+                _ => None,
+            };
+            block.forward_graph(i, &graph.buffers, &blk_dev, dispatch.as_mut())?;
+        }
+        if ring.is_some() && recurrent_idx == 0 {
+            return Err(grim_core::error::Error::Backend(
+                "qwen35 interpret: the ring took no RECURRENT node — the IR has no recurrent layer".into(),
+            ));
+        }
+
+        // The head: the final norm and the output projection, on the LAST
+        // segment's device (the head must live in the last segment's graph).
+        let last_ord = match self.output.weight().device() {
+            grim_tensor::Device::Rocm(o) => *o,
+            _ => dev.ordinal(),
+        };
+        let last_dev = grim_backend_rocm::RocmDevice::shared(last_ord);
+        {
+            let _guard = grim_backend_rocm::DeviceGuard::set(last_ord as i32);
+            self.forward_graph_head(graph, &last_dev)?;
+        }
+
+        // The devices the step touched.
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        if !ords.contains(&last_ord) {
+            ords.push(last_ord);
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        Ok(())
+    }
+
+    /// The final norm and the output projection (the head).
+    ///
+    /// Split out of `forward_capture` so the IR walk and the capture path run
+    /// the SAME two launches — the head is where a duplicated entry point
+    /// would show up first, because its output is the logits.
+    fn forward_graph_head(
+        &self,
+        graph: &DecodeGraph,
+        last_dev: &grim_backend_rocm::RocmDevice,
+    ) -> Result<()> {
+        let h_shape = graph.buffers.head_input.shape().clone();
+        last_dev
+            .rms_norm_into(
+                &graph.buffers.head_input,
+                &**self.output_norm.weight.storage(),
+                self.output_norm.eps,
+                &graph.buffers.head_input,
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        linear_into(
+            last_dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
+        )?;
+        Ok(())
+    }
+}
 
 impl DecodeGraphModel for Qwen35 {
     /// Convert every K-quant linear's weight to u4 lanes NOW, so the first
@@ -3425,7 +3622,7 @@ impl DecodeGraphModel for Qwen35 {
             if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
                 eprintln!("[graph-trace] layer {i}/{} on rocm:{blk_ord} (capturing={})", self.blocks.len(), graph.capturing);
             }
-            block.forward_graph(i, &graph.buffers, &blk_dev)?;
+            block.forward_graph(i, &graph.buffers, &blk_dev, None)?;
             if graph.emitter.is_some() && graph.capturing {
                 let is_attn = (i + 1) % self.cfg.full_attention_interval.max(1) == 0;
                 let kind = if is_attn {
@@ -3514,15 +3711,8 @@ impl DecodeGraphModel for Qwen35 {
         if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
             eprintln!("[graph-trace] final norm + head on rocm:{last_ord} (capturing={})", graph.capturing);
         }
-        let h_shape = graph.buffers.head_input.shape().clone();
-        last_dev.rms_norm_into(
-            &graph.buffers.head_input,
-            &**self.output_norm.weight.storage(),
-            self.output_norm.eps,
-            &graph.buffers.head_input,
-            &h_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        // The head's two launches, through the SAME method the IR walk uses.
+        self.forward_graph_head(graph, &last_dev)?;
 
         if graph.emitter.is_some() && graph.capturing {
             emit_last = graph.emit_node(
@@ -3535,15 +3725,6 @@ impl DecodeGraphModel for Qwen35 {
                 &[emit_last],
                 last_ord as u8,
             );
-        }
-        linear_into(
-            &last_dev,
-            &graph.buffers.head_input,
-            self.output.weight(),
-            &graph.buffers.head_output,
-            &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
-        )?;
-        if graph.emitter.is_some() && graph.capturing {
             let _ = graph.emit_node(
                 grim_backend_rocm::task_graph::op::GEMM,
                 gemm_params(
@@ -3572,6 +3753,23 @@ impl DecodeGraphModel for Qwen35 {
         }
 
         Ok(())
+    }
+
+    /// M2: interpret the published IR for one decode step, with every node on
+    /// the model's own launchers (the compatibility oracle's route).
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        self.qwen35_interpret_ir(graph, token_id, None)
+    }
+
+    /// M6: the same walk, with the IR's RECURRENT nodes dispatched to the
+    /// persistent task ring.
+    fn forward_interpret_ir_ring(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: &mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    ) -> Result<()> {
+        self.qwen35_interpret_ir(graph, token_id, Some(ring))
     }
 
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
@@ -3881,6 +4079,7 @@ impl DecodeGraphModel for Qwen35 {
         }
         Ok(out)
     }
+
 }
 
 // ─── Gemma2 Block Graph Forward ───────────────────────────────────────────

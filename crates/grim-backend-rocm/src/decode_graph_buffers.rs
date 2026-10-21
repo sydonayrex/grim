@@ -962,6 +962,11 @@ impl DecodeGraphBuffers {
                         &dev.allocator,
                         dev.ordinal,
                     )?);
+                    // The short-conv state is a STATE: a fresh session has no
+                    // history, so it starts at zero and not at whatever the
+                    // recycled block held.
+                    let last = sc_state.last().expect("just pushed");
+                    Self::zero_device_buffer(dev, last)?;
                 }
             }
             Ok(())
@@ -1214,6 +1219,36 @@ impl DecodeGraphBuffers {
         Ok(())
     }
 
+    /// Zero a device buffer on the device's active stream.
+    ///
+    /// The caching allocator hands out RECYCLED blocks, and a recycled block
+    /// still holds the previous owner's values. A buffer that must START at
+    /// zero — the recurrent state, the short-conv state — therefore has to be
+    /// zeroed explicitly: a fresh `hipMalloc` happens to be zero, but the
+    /// second graph to ask for the same size gets the first graph's leftovers.
+    ///
+    /// The symptom this fixes is nasty precisely because it is small: two runs
+    /// of the same model on the same weights disagreed in the 1e-5 class, and
+    /// the divergence moved with the ALLOCATION HISTORY rather than with the
+    /// code. A recurrent state that is not zero at the start of a session is
+    /// a wrong answer, not a slow one.
+    fn zero_device_buffer(dev: &RocmDevice, buf: &RocmStorage) -> Result<()> {
+        let ptr = buf
+            .device_ptr_u64()
+            .ok_or_else(|| Error::Backend("zero_device_buffer: no device ptr".into()))?
+            as *mut c_void;
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let res = unsafe {
+            crate::device::handles::hipMemsetAsync(ptr, 0, buf.bytes, dev.active_stream())
+        };
+        if res != crate::hipSuccess {
+            return Err(Error::Backend(format!(
+                "zero_device_buffer: hipMemsetD8Async {res}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Allocate one layer's KDA recurrent device buffers (state + projections).
     /// MUST run outside capture.
     pub fn allocate_kda_layer(
@@ -1280,6 +1315,9 @@ impl DecodeGraphBuffers {
             &dev.allocator,
             dev.ordinal,
         )?;
+        // The recurrent state starts a SESSION, so it starts at zero — not at
+        // whatever the recycled block happened to hold.
+        Self::zero_device_buffer(dev, &state)?;
 
         self.kda[layer_idx] = Some(KdaLayerBuffers {
             state,

@@ -643,6 +643,9 @@ pub struct TaskRingContext {
     /// the one that feeds it — so the host also knows when the wave may be
     /// gone, and can launch a fresh one before publishing the next node.
     wave_last_work_ms: std::sync::atomic::AtomicU64,
+    /// A one-word scratch buffer the device-side wait kernel writes its
+    /// observation into.
+    wait_observed: Box<dyn BackendStorage>,
     /// True once the resident wave has been stopped AND confirmed gone.
     ///
     /// The confirmation is the point: a wave that has been told to stop but has
@@ -776,6 +779,17 @@ impl TaskRingContext {
             ordinal: dev.ordinal,
             last_slot: std::sync::atomic::AtomicUsize::new(0),
             next_head: std::sync::atomic::AtomicU32::new(0),
+            wait_observed: {
+                let bytes = 0u32.to_ne_bytes().to_vec();
+                dev.from_cpu_bytes(
+                    &bytes,
+                    &Shape::new(vec![1]),
+                    DType {
+                        arith: ArithType::U32,
+                        storage: DTypeStorage::Native,
+                    },
+                )?
+            },
             wave_last_work_ms: std::sync::atomic::AtomicU64::new(host_now_ms()),
             wave_resolved: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -1385,6 +1399,51 @@ impl TaskRingContext {
             .ok_or_else(|| crate::Error::Backend("task ring tail has no device ptr".into()))?)
     }
 
+    /// How many spins the device-side wait kernel may make before it gives
+    /// up. Generous: the producer is a wave on this same device, so the wait
+    /// is short unless the producer never ran.
+    pub fn ring_wait_spins(&self) -> u32 {
+        RESIDENT_WAVE_WAIT_SPINS
+    }
+
+    /// Wait, ON THE DEVICE, for a ring descriptor to complete.
+    ///
+    /// The wait is a KERNEL on the caller's active stream: it spins on the
+    /// descriptor's status field and writes what it observed into the ring's
+    /// scratch buffer. It is device-side on purpose — a host wait would
+    /// serialise the producer and the consumer, which is the whole point of
+    /// the ring.
+    ///
+    /// Returns the observed status: 2 (ST_COMPLETE) when the descriptor
+    /// finished, 0 (ST_PENDING) when the spin ran out — which means the
+    /// producer never ran and the caller is looking at stale data.
+    ///
+    /// The read-back is a DEVICE-to-HOST copy, which is safe while a wave is
+    /// parked: the copy is not staged through the host, so it does not wait
+    /// for the device the way a pageable host-to-device copy does.
+    pub fn wait_device_slot(
+        &self,
+        dev: &crate::RocmDevice,
+        slots_ptr: u64,
+        slot: u32,
+        spins: u32,
+    ) -> crate::Result<u32> {
+        let observed_ptr = as_rocm(self.wait_observed.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| {
+                crate::Error::Backend("task ring wait scratch has no device ptr".into())
+            })?;
+        crate::kernels::task_ring::launch_scythe_wait_descriptor(
+            dev,
+            slots_ptr,
+            slot,
+            spins,
+            observed_ptr,
+        )?;
+        let v = as_rocm(self.wait_observed.as_ref())?.to_cpu_vec_u32()?;
+        Ok(v.first().copied().unwrap_or(0))
+    }
+
     /// The ring slot the most recent enqueue wrote to.
     pub fn last_slot(&self) -> usize {
         self.last_slot.load(Ordering::Relaxed)
@@ -1882,6 +1941,13 @@ pub const RESIDENT_POLL_BUDGET: u32 = 1 << 20;
 /// A wave that outlives it (a slow clock, a deep backoff) is stopped and
 /// waited for before the fresh one is launched, so the two never race.
 pub const RESIDENT_WAVE_MAX_IDLE_MS: u64 = 30_000;
+
+/// How many spins the device-side wait kernel may make before it gives up.
+///
+/// Generous on purpose: the producer is a wave on the same device, so the
+/// wait is short. The budget is what turns "the producer never ran" into a
+/// REPORTED TIMEOUT instead of a wedged device.
+pub const RESIDENT_WAVE_WAIT_SPINS: u32 = 200_000_000;
 
 /// How many IDLE polls a resident wave may make before it gives up.
 ///
