@@ -204,6 +204,9 @@ pub struct DecodeGraphBuffers {
     pub sc_bx: Vec<RocmStorage>,
     pub sc_sum: Vec<RocmStorage>,
     pub sc_y: Vec<RocmStorage>,     // [batch, h_dim]
+    /// The short-conv's causal state, ZEROED at allocation: a fresh session
+    /// has no history, and the caching allocator hands out recycled blocks
+    /// that still hold the previous owner's values.
     pub sc_state: Vec<RocmStorage>, // [h_dim*(l_cache-1)] per layer
     /// Shared read-only dummy ([1], zeros) for unused attention inputs
     /// (o_proj weights with fuse_o=0, alibi slopes with has_alibi=0).
