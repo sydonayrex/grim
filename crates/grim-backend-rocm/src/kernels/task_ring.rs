@@ -537,10 +537,16 @@ pub struct TaskRingContext {
     count: u32,
     /// The ring itself, owned by the context and reused across steps: the wave
     /// repoints tail/head every step, so the same buffers serve all of them.
-    slots: Box<dyn BackendStorage>,
-    tail: Box<dyn BackendStorage>,
-    head: Box<dyn BackendStorage>,
-    stop: Box<dyn BackendStorage>,
+    ///
+    /// These four are `ManuallyDrop` so that `Drop` can DECIDE whether to free
+    /// them: a wave that is still parked is reading them, and freeing device
+    /// memory under a live kernel is a use-after-free that wedges the device.
+    /// When the wave cannot be confirmed gone, they are leaked instead (a few
+    /// KB, in exchange for a device that still works).
+    slots: std::mem::ManuallyDrop<Box<dyn BackendStorage>>,
+    tail: std::mem::ManuallyDrop<Box<dyn BackendStorage>>,
+    head: std::mem::ManuallyDrop<Box<dyn BackendStorage>>,
+    stop: std::mem::ManuallyDrop<Box<dyn BackendStorage>>,
     desc_staging: Box<dyn BackendStorage>,
     capacity: u32,
     /// M6 step 3: true when a RESIDENT wave is parked on this ring. A resident
@@ -554,6 +560,18 @@ pub struct TaskRingContext {
     pub stream: *mut std::ffi::c_void,
     /// The device the ring lives on, so `Drop` can stop a parked wave.
     ordinal: usize,
+    /// The ring slot the most recent enqueue wrote to. A consumer that waits on
+    /// that descriptor's completion (M6) needs to know which slot it is: the
+    /// wave walks the slots in tail order, and the slot a node lands in is
+    /// `head % capacity`.
+    last_slot: std::sync::atomic::AtomicUsize,
+    /// True once the resident wave has been stopped AND confirmed gone.
+    ///
+    /// The confirmation is the point: a wave that has been told to stop but has
+    /// not yet left its poll loop is still reading the ring's buffers, so the
+    /// buffers must not be freed. `stop_wave` waits for the exit; this flag
+    /// records that it happened, and makes a second stop a no-op.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for TaskRingContext {
@@ -561,11 +579,65 @@ impl Drop for TaskRingContext {
         // A resident wave parks until it is stopped, and the host owns its
         // lifetime. Without this, a dropped ring would leave a wave spinning on
         // the device — which is the wedge the plan's own risk table names.
-        if !self.resident {
+        //
+        // The stream is the marker: `ensure_stream` creates it only on the
+        // resident launch paths, so a non-null stream means a wave may be
+        // parked. `stop_wave` sets the flag AND waits for the wave to leave
+        // (a bounded `hipStreamQuery` poll on the ring's own stream) — the wait
+        // matters, because otherwise the ring's buffers are freed while the
+        // wave is still reading them, and the wave never sees the flag (it
+        // reads freed, possibly reused memory) and spins for the life of the
+        // process.
+        if self.stream.is_null() {
+            self.free_ring_buffers();
             return;
         }
         let dev = crate::RocmDevice::shared(self.ordinal);
-        let _ = self.stop_wave(&dev);
+        let stopped = self.stop_wave(&dev).is_ok();
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        if stopped {
+            unsafe {
+                let _ = crate::hipStreamDestroy(self.stream);
+            }
+            self.stream = std::ptr::null_mut();
+            self.free_ring_buffers();
+        } else {
+            // The wave could not be confirmed gone, so it may still be reading
+            // the slots, the tail, the head and the stop flag — and it is
+            // running ON this stream.
+            //
+            // Freeing the buffers now is a use-after-free on the device, and
+            // the observed consequence of exactly that was the wave spinning on
+            // freed memory forever, wedging the device for the whole process.
+            // Destroying the stream is just as bad: `hipStreamDestroy` on a
+            // stream with a live kernel BLOCKS until that kernel finishes, and
+            // this kernel is parked forever.
+            //
+            // So LEAK both: a couple of KB and one stream, in exchange for a
+            // device that still works. The leak is reported, not silent.
+            eprintln!(
+                "[task-ring] leaking the ring's stream and buffers ({} slots, \
+                 tail/head/stop): the resident wave was not confirmed gone and may still be \
+                 reading them",
+                self.capacity
+            );
+        }
+    }
+}
+
+impl TaskRingContext {
+    /// Free the ring's device buffers.
+    ///
+    /// The four buffers are `ManuallyDrop`, so this is the ONLY place they are
+    /// released. It is called on the path where the wave is known to be gone;
+    /// on the other path they are deliberately leaked.
+    fn free_ring_buffers(&mut self) {
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.slots);
+            std::mem::ManuallyDrop::drop(&mut self.tail);
+            std::mem::ManuallyDrop::drop(&mut self.head);
+            std::mem::ManuallyDrop::drop(&mut self.stop);
+        }
     }
 }
 
@@ -615,15 +687,17 @@ impl TaskRingContext {
             plan,
             staged: None,
             count: 0,
-            slots: Box::new(slots),
-            tail: u32_scalar(0)?,
-            head: u32_scalar(0)?,
-            stop: u32_scalar(0)?,
+            slots: std::mem::ManuallyDrop::new(Box::new(slots)),
+            tail: std::mem::ManuallyDrop::new(u32_scalar(0)?),
+            head: std::mem::ManuallyDrop::new(u32_scalar(0)?),
+            stop: std::mem::ManuallyDrop::new(u32_scalar(0)?),
             desc_staging,
             capacity,
             resident: false,
             stream: std::ptr::null_mut(),
             ordinal: dev.ordinal,
+            last_slot: std::sync::atomic::AtomicUsize::new(0),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         };
         // Stage AFTER the ring exists so the caller gets a fully formed context
         // back; the plan is known non-empty here, so count lands non-zero.
@@ -678,9 +752,10 @@ impl TaskRingContext {
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_ROW_GEMM,
             g.m,
@@ -704,9 +779,10 @@ impl TaskRingContext {
     pub fn enqueue_norm(&self, dev: &crate::RocmDevice, n: &TaskRingNorm) -> crate::Result<()> {
         let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_NORM,
             // Geometry is (m, k): the wave's NORM arm reads `desc->m` (rows) and
@@ -736,9 +812,10 @@ impl TaskRingContext {
     pub fn enqueue_add(&self, dev: &crate::RocmDevice, a: &TaskRingAdd) -> crate::Result<()> {
         let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_ADD,
             a.m,
@@ -764,9 +841,10 @@ impl TaskRingContext {
     pub fn enqueue_attn(&self, dev: &crate::RocmDevice, a: &TaskRingAttn) -> crate::Result<()> {
         let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_ATTN,
             a.seq_len,
@@ -817,9 +895,10 @@ impl TaskRingContext {
         let desc_ptr = desc.upload(dev)?;
         let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_MOE,
             m.num_tokens,
@@ -848,9 +927,10 @@ impl TaskRingContext {
     pub fn enqueue_peer_copy(&self, dev: &crate::RocmDevice, p: &TaskRingPeer) -> crate::Result<()> {
         let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_PEER_BROADCAST,
             p.elems,
@@ -879,11 +959,11 @@ impl TaskRingContext {
         }
         launch_task_ring(
             dev,
-            &*self.slots,
+            &**self.slots,
             self.capacity,
-            &*self.tail,
-            &*self.head,
-            &*self.stop,
+            &**self.tail,
+            &**self.head,
+            &**self.stop,
             None,
             0,
         )?;
@@ -898,25 +978,17 @@ impl TaskRingContext {
     pub fn launch_resident(&mut self, dev: &crate::RocmDevice) -> crate::Result<()> {
         self.ensure_stream(dev)?;
         // Resolve the kernel first: the on-stream launch path only launches, it
-        // does not resolve. The eager launch resolves it and runs a wave that
-        // exits at once, because the queue is empty when the ring is set up.
-        launch_task_ring(
-            dev,
-            &*self.slots,
-            self.capacity,
-            &*self.tail,
-            &*self.head,
-            &*self.stop,
-            None,
-            0,
-        )?;
+        // does not resolve. The resolution launch runs on a SCRATCH ring, never
+        // this one: a wave over the real ring would race the resident wave for
+        // its slots, and the loser spins on a slot it cannot claim.
+        self.resolve_wave_kernel(dev)?;
         launch_task_ring_resident_on_stream(
             dev,
-            &*self.slots,
+            &**self.slots,
             self.capacity,
-            &*self.tail,
-            &*self.head,
-            &*self.stop,
+            &**self.tail,
+            &**self.head,
+            &**self.stop,
             None,
             0,
             self.stream,
@@ -931,28 +1003,59 @@ impl TaskRingContext {
     /// descriptors, and the wave consumes them and parks.
     pub fn launch_resident_staged(&mut self, dev: &crate::RocmDevice) -> crate::Result<()> {
         self.ensure_stream(dev)?;
-        launch_task_ring(
-            dev,
-            &*self.slots,
-            self.capacity,
-            &*self.tail,
-            &*self.head,
-            &*self.stop,
-            None,
-            0,
-        )?;
+        // Resolve the kernel on a SCRATCH ring, never on this one: the on-stream
+        // launch path only launches, so the kernel has to be loaded first — but
+        // resolving it by launching a wave over THIS ring would race the
+        // resident wave for the very slots the resident wave is about to drain.
+        self.resolve_wave_kernel(dev)?;
         launch_task_ring_resident_on_stream(
             dev,
-            &*self.slots,
+            &**self.slots,
             self.capacity,
-            &*self.tail,
-            &*self.head,
-            &*self.stop,
+            &**self.tail,
+            &**self.head,
+            &**self.stop,
             self.staged.as_deref(),
             self.count,
             self.stream,
         )?;
         self.resident = true;
+        Ok(())
+    }
+
+    /// Resolve the wave kernel WITHOUT running a wave over this ring.
+    ///
+    /// The on-stream launch path only launches; the kernel must already be
+    /// resolved. Resolving it by LAUNCHING the wave would run a real wave over
+    /// this ring's slots — and it would race the resident wave for them.
+    /// A scratch ring is used instead: the wave sees an empty queue, exits at
+    /// once, and this ring's slots are untouched.
+    fn resolve_wave_kernel(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        let scratch = dev.alloc_scythe_ring_bytes(64)?;
+        let u32_scalar = |v: u32| -> crate::Result<Box<dyn BackendStorage>> {
+            let bytes = v.to_ne_bytes().to_vec();
+            Ok(dev.from_cpu_bytes(
+                &bytes,
+                &grim_tensor::Shape::new(vec![1]),
+                grim_tensor::dtype::DType {
+                    arith: grim_tensor::ArithType::U32,
+                    storage: grim_tensor::dtype::Storage::Native,
+                },
+            )?)
+        };
+        let tail = u32_scalar(0)?;
+        let head = u32_scalar(0)?;
+        let stop = u32_scalar(0)?;
+        launch_task_ring(
+            dev,
+            &scratch,
+            1,
+            tail.as_ref(),
+            head.as_ref(),
+            stop.as_ref(),
+            None,
+            0,
+        )?;
         Ok(())
     }
 
@@ -983,6 +1086,19 @@ impl TaskRingContext {
         Ok(())
     }
 
+    /// The ring's slot array DEVICE address — a consumer that waits on a
+    /// descriptor's completion needs to point at it.
+    pub fn slots_ptr(&self) -> crate::Result<u64> {
+        Ok(as_rocm(self.slots.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring slots have no device ptr".into()))?)
+    }
+
+    /// The ring slot the most recent enqueue wrote to.
+    pub fn last_slot(&self) -> usize {
+        self.last_slot.load(Ordering::Relaxed)
+    }
+
     /// The ring's tail counter — how many tasks the wave has consumed.
     ///
     /// Exposed so a caller can wait for a PARKED wave to drain: the wave runs on
@@ -993,18 +1109,82 @@ impl TaskRingContext {
         Ok(v.first().copied().unwrap_or(0))
     }
 
-    /// Stop a resident wave: set the stop flag so the parked wave exits.
+    /// Stop a resident wave: set the stop flag so the parked wave exits, and
+    /// WAIT for it to actually exit.
     ///
     /// The publish kernel is a plain store to the pointer it is handed, so it
     /// sets the stop flag exactly as it sets the head.
     pub fn stop_wave(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        // Stopping twice is harmless but must not double-count: the second
+        // call finds the flag already set and the wave already gone.
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         // A SYNCHRONOUS H2D copy, not a kernel launch: a launch is
         // stream-ordered, so on the ring's own stream it would queue BEHIND the
         // parked wave — the very thing it is meant to stop. The wave's check is
         // `stop != 0`, so any non-zero bit pattern works; 1.0f32 is
         // 0x3F800000.
         dev.write_f32_into(self.stop.as_ref(), &[1.0f32])?;
+        // Then WAIT for the wave to leave. Without this the ring's buffers can
+        // be freed while the wave is still spinning on them: the wave reads the
+        // stop flag from freed (and possibly reused) memory, may never see the
+        // flag, and spins for the life of the process — holding the device and
+        // wedging every later allocation. That was the suite-level hang: the
+        // wait-node gate parked a wave, dropped its context, and the next test
+        // never got past its first allocation.
+        //
+        // The wait is a BOUNDED POLL of `hipStreamQuery` on the ring's OWN
+        // non-blocking stream, not `hipStreamSynchronize`: synchronize would
+        // block forever if the wave never noticed the flag, turning a
+        // diagnosable failure into a hang. The poll also gives the wave's exit
+        // an OBSERVABLE — the stream goes idle — so "stopped" can mean "the
+        // wave really left" rather than "the host asked it to".
+        if !self.wait_for_wave_exit() {
+            return Err(crate::Error::Backend(
+                "task ring: the resident wave did not leave its poll loop after the stop flag \
+                 was set — it is still reading the ring's buffers"
+                    .into(),
+            ));
+        }
+        self.stopped.store(true, Ordering::Release);
+        WAVE_STOPS.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Block until the resident wave has left its poll loop.
+    ///
+    /// Returns `true` when the ring's stream went idle (the wave really left)
+    /// and `false` when it did not within the budget. Safe to call when no
+    /// wave is resident: the stream is either null or carries no work.
+    ///
+    /// The budget is a poll count, not a `hipStreamSynchronize`: a wave that
+    /// never noticed the stop flag must not be able to block the host forever.
+    fn wait_for_wave_exit(&self) -> bool {
+        if self.stream.is_null() {
+            return true;
+        }
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        for _ in 0..WAVE_EXIT_POLL_BUDGET {
+            let res = unsafe { crate::hipStreamQuery(self.stream) };
+            if res == crate::hipSuccess {
+                return true;
+            }
+            if res != crate::hipErrorNotReady {
+                eprintln!(
+                    "[task-ring] hipStreamQuery on the ring stream failed (hip {res}); \
+                     the wave's exit cannot be confirmed"
+                );
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!(
+            "[task-ring] the resident wave did not leave its poll loop within {} ms of the stop \
+             flag; it is still reading the ring's buffers",
+            WAVE_EXIT_POLL_BUDGET
+        );
+        false
     }
 
     /// Enqueue one qwen35 KDA/recurrent step and drain it with a one-task wave
@@ -1018,9 +1198,10 @@ impl TaskRingContext {
     ) -> crate::Result<()> {
         let head_value = NEXT_HEAD.fetch_add(1, Ordering::Relaxed) as u32;
         let slot = (head_value as u64 % self.capacity as u64) as usize;
+        self.last_slot.store(slot, Ordering::Relaxed);
         crate::kernels::qkv_attention::launch_scythe_write_slot(
             dev,
-            &*self.slots,
+            &**self.slots,
             slot,
             OP_RECURRENT,
             0,
@@ -1056,7 +1237,7 @@ impl TaskRingContext {
 
         crate::kernels::qkv_attention::launch_scythe_enqueue_dynamic_moe(
             dev,
-            &*self.slots,
+            &**self.slots,
             self.capacity,
             head_ptr,
             desc_staging_ptr,
@@ -1088,11 +1269,11 @@ impl TaskRingContext {
         })?;
         launch_task_ring(
             dev,
-            &*self.slots,
+            &**self.slots,
             self.capacity,
-            &*self.tail,
-            &*self.head,
-            &*self.stop,
+            &**self.tail,
+            &**self.head,
+            &**self.stop,
             Some(staged),
             self.count,
         )?
@@ -1106,10 +1287,48 @@ impl TaskRingContext {
 /// launcher path spends one launch per GEMM node, the ring spends one per step.
 static WAVE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Resident waves that were stopped AND confirmed gone.
+///
+/// A wave that was told to stop but has not yet left its poll loop is still
+/// reading the ring's buffers. Counting the confirmed stops makes that
+/// distinction observable: a gate can assert that every resident wave the
+/// process launched was accounted for, instead of discovering a leak as a hang
+/// in a later test.
+static WAVE_STOPS: AtomicU64 = AtomicU64::new(0);
+
 /// Host-side monotonic head counter for the per-node enqueue path. The device
 /// `head` scalar is published from this; monotonic across steps, which is what
 /// lets the wave tell "queue empty" from "nothing enqueued yet".
 static NEXT_HEAD: AtomicU64 = AtomicU64::new(0);
+
+/// M6: wait (device-side) for a ring descriptor to complete.
+///
+/// The wave moves a descriptor's status PENDING -> RUNNING -> COMPLETE, so this
+/// is how a consumer observes a cross-device handoff WITHOUT a host event: the
+/// wait is a node in the consumer's graph, so the producer and the consumer
+/// overlap instead of alternating.
+///
+/// The spin is bounded: the observed status is written out either way, so a
+/// producer that never ran shows up as a timeout (the status is still PENDING)
+/// rather than as a wedged device.
+pub fn launch_scythe_wait_descriptor(
+    dev: &crate::RocmDevice,
+    slots_base: u64,
+    slot_idx: u32,
+    max_spins: u32,
+    observed_status_dev: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut sb = slots_base;
+    let mut si = slot_idx;
+    let mut ms = max_spins;
+    let mut obs = observed_status_dev;
+    dev.launch_compute_kernel(
+        "grim_scythe_wait_descriptor",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut sb), arg(&mut si), arg(&mut ms), arg(&mut obs)],
+    )
+}
 
 /// How many claim attempts a RESIDENT wave may make before it gives up on its
 /// own (M6 step 3). The wave normally leaves through `stop_wave`; this is the
@@ -1124,8 +1343,27 @@ static NEXT_HEAD: AtomicU64 = AtomicU64::new(0);
 /// enough to cover the JIT, short enough to be a real backstop.
 pub const RESIDENT_POLL_BUDGET: u32 = 1 << 20;
 
+/// How long the host waits for a stopped resident wave to leave its poll loop,
+/// in milliseconds.
+///
+/// The wave notices the stop flag within an idle backoff (~2 us), so this is
+/// orders of magnitude more than it needs — it is a backstop against a wave
+/// that can never leave, not a tuning knob. A wave that outlasts it is
+/// REPORTED, not waited on forever.
+const WAVE_EXIT_POLL_BUDGET: u32 = 5_000;
+
 pub fn wave_launch_count() -> u64 {
     WAVE_LAUNCHES.load(Ordering::Relaxed)
+}
+
+/// Resident waves that were stopped and CONFIRMED gone.
+///
+/// Every resident wave the process launched must appear here once its context
+/// is dropped: a wave that is still parked when its ring's buffers are freed
+/// reads freed memory, misses the stop flag and spins for the life of the
+/// process — a device-wide wedge that shows up as a hang in some LATER test.
+pub fn wave_stop_count() -> u64 {
+    WAVE_STOPS.load(Ordering::Relaxed)
 }
 
 /// ONE launch for the whole step's GEMM set.

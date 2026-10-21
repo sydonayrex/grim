@@ -19,7 +19,8 @@
 
 use grim_backend_rocm::device::util::DeviceGuard;
 use grim_backend_rocm::kernels::task_ring::{
-    TaskRingGemm, TaskRingPlan, STAGED_CAPACITY, launch_task_ring, wave_launch_count,
+    TaskRingGemm, TaskRingPlan, STAGED_CAPACITY, launch_scythe_wait_descriptor, launch_task_ring,
+    wave_launch_count, wave_stop_count,
 };
 use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -1378,4 +1379,238 @@ fn resident_wave_drains_a_node_enqueued_after_it_parked() {
     // Stop the parked wave.
     ctx.stop_wave(&dev).expect("stop wave");
     dev.synchronize();
+}
+
+/// M6: a consumer observes a ring descriptor's completion DEVICE-SIDE, by
+/// polling the descriptor's `status` (the wave moves it PENDING -> RUNNING ->
+/// COMPLETE). This is the mechanism that removes the HOST event between two
+/// segments: the wait is a NODE in the consumer's graph, so producer and
+/// consumer overlap instead of alternating.
+///
+/// Two branches, both gated: the wait observes COMPLETE when the descriptor
+/// completes, and it TIMES OUT (bounded) when the descriptor never completes —
+/// a producer that never ran must not wedge the device.
+#[test]
+fn a_wait_node_observes_a_ring_descriptors_completion() {
+    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the wait-node gate");
+        return;
+    }
+    if std::env::var("AMD_SERIALIZE_KERNEL").is_ok() {
+        eprintln!("[SKIP] a resident wave cannot run under AMD_SERIALIZE_KERNEL");
+        return;
+    }
+    let _guard = DeviceGuard::set(0);
+    let dev = grim_backend_rocm::RocmDevice::shared(0);
+
+    let a = [1.0f32, 2.0];
+    let b = [1.0f32, 0.0, 0.0, 1.0];
+    let c_ref: Vec<f32> = (0..2)
+        .map(|n| (0..2).map(|k| a[k] * b[n * 2 + k]).sum())
+        .collect();
+
+    let (_a_s, a_p) = f32_dev(&dev, &a);
+    let (_b_s, b_p) = f32_dev(&dev, &b);
+    let (c_s, c_p) = f32_dev(&dev, &[0.0f32; 2]);
+
+    let mut gb = TaskGraphBuilder::new();
+    let h_i = gb.push_arg(a_p, 8, arg_role::ACT_IN);
+    let h_w = gb.push_arg(b_p, 32, arg_role::WEIGHT);
+    let h_o = gb.push_arg(c_p, 8, arg_role::ACT_OUT);
+    gb.push(
+        op::GEMM,
+        [0, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_i, h_w, h_o],
+        &[],
+        0,
+        0,
+    );
+    let graph = gb.finish();
+
+    let mut ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the gemm");
+
+    // The wave first: it resolves the kernel and parks on the ring's stream.
+    // Allocated BEFORE the wave starts: an allocation can synchronize the device,
+    // and a parked wave would never satisfy it.
+    let scratch = dev
+        .alloc_scythe_ring_bytes(64)
+        .expect("scratch slots");
+    let scratch_base = scratch
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("scratch is RocmStorage")
+        .device_ptr_u64()
+        .expect("scratch ptr");
+
+    ctx.launch_resident(&dev).expect("launch resident wave");
+
+    // The node is enqueued (descriptor written, head published) on the CALLER's
+    // stream; the wave is on the ring's, so the two run concurrently.
+    ctx.enqueue_gemm(&dev, &ctx.plan().gemms[0])
+        .expect("enqueue gemm");
+    let slot = ctx.last_slot();
+
+    // The wait node is AFTER the enqueue on the caller's stream, so it is
+    // ordered after the descriptor write. It spins on the descriptor's status.
+    let (obs_s, obs_p) = u32_dev(&dev, 0);
+    launch_scythe_wait_descriptor(
+        &dev,
+        ctx.slots_ptr().expect("slots ptr"),
+        slot as u32,
+        10_000_000,
+        obs_p,
+    )
+    .expect("launch wait node");
+
+    // NOT `dev.synchronize()`: that is `hipDeviceSynchronize`, which waits for
+    // EVERY stream — including the parked wave, which never exits on its own.
+    // The D2H read is issued on the null stream, which waits for the wait node
+    // (on the caller's stream) but NOT for the ring's non-blocking stream. The
+    // wait node exits when the wave completes the descriptor, or when its
+    // bounded spin runs out.
+    let observed = obs_s.to_cpu_vec_u32().expect("read observed")[0];
+    assert_eq!(
+        observed, 2,
+        "the wait node must observe ST_COMPLETE (2), got {observed}"
+    );
+    // And the node it waited for really ran.
+    let got: Vec<f32> = c_s
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("c is RocmStorage")
+        .to_cpu_vec_f32()
+        .expect("c readback");
+    for (i, (g, r)) in got.iter().zip(c_ref.iter()).enumerate() {
+        assert!(
+            (g - r).abs() <= 1e-5 * r.abs().max(1.0),
+            "c[{i}]: ring {g} vs reference {r}"
+        );
+    }
+
+    // The bounded exit: a descriptor that never completes must TIME OUT, not
+    // wedge the device. The observed status stays PENDING (0).
+    let (obs2_s, obs2_p) = u32_dev(&dev, 0);
+    // A FRESH slot array the wave never touches: the ring's own slots are walked
+    // by the wave (it claims slot 0, 1, ... and marks each COMPLETE as it goes),
+    // so waiting on one of those would see a completion that is not the copy's.
+    // ALLOCATED BEFORE THE WAVE STARTS: an allocation can synchronize the device,
+    // and a parked wave would never satisfy it.
+    launch_scythe_wait_descriptor(&dev, scratch_base, 0u32, 1000, obs2_p)
+        .expect("launch wait node (timeout case)");
+    let observed2 = obs2_s.to_cpu_vec_u32().expect("read observed 2")[0];
+    assert_ne!(
+        observed2, 2,
+        "a descriptor that never ran must NOT report ST_COMPLETE"
+    );
+
+    // Stop the parked wave; only THEN is a device-wide sync safe.
+    ctx.stop_wave(&dev).expect("stop wave");
+    dev.synchronize();
+}
+
+/// One GEMM node over real device buffers.
+///
+/// The graph holds raw device POINTERS, so the storages must outlive it: the
+/// returned vector is the caller's job to keep alive. The wave writes through
+/// those pointers, and a freed buffer would turn a bookkeeping assertion into
+/// a page fault.
+fn one_gemm_graph(
+    dev: &grim_backend_rocm::RocmDevice,
+) -> (
+    grim_backend_rocm::task_graph::TaskGraph,
+    Vec<Box<dyn BackendStorage>>,
+) {
+    let a = [1.0f32, 2.0];
+    let b = [1.0f32, 0.0, 0.0, 1.0];
+    let (a_s, a_p) = f32_dev(dev, &a);
+    let (b_s, b_p) = f32_dev(dev, &b);
+    let (c_s, c_p) = f32_dev(dev, &[0.0f32; 2]);
+    let mut gb = TaskGraphBuilder::new();
+    let h_i = gb.push_arg(a_p, 8, arg_role::ACT_IN);
+    let h_w = gb.push_arg(b_p, 32, arg_role::WEIGHT);
+    let h_o = gb.push_arg(c_p, 8, arg_role::ACT_OUT);
+    gb.push(
+        op::GEMM,
+        [0, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[h_i, h_w, h_o],
+        &[],
+        0,
+        0,
+    );
+    (gb.finish(), vec![a_s, b_s, c_s])
+}
+
+/// M6 step 3 regression: a DROPPED resident ring must leave NO wave behind.
+///
+/// The defect this pins: `Drop` used to set the stop flag and return. The
+/// wave is a spin loop, so it needs a MOMENT to notice the flag — and the
+/// drop then freed the ring's buffers (slots, tail, head, stop) out from under
+/// it. The wave read the stop flag from freed — and by then possibly REUSED —
+/// memory, missed the flag, and spun for the life of the process, holding the
+/// device. The symptom was never in the dropping test: the NEXT test to
+/// allocate on that device hung, with no error and no diagnostic.
+///
+/// Two assertions, one for each half of the fix:
+///  * the drop CONFIRMS the wave's exit (`wave_stop_count` advances), and
+///  * a second ring on the same device still works afterwards.
+#[test]
+fn a_dropped_resident_ring_leaves_no_wave_behind() {
+    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the resident-drop gate");
+        return;
+    }
+    if std::env::var("AMD_SERIALIZE_KERNEL").is_ok() {
+        eprintln!("[SKIP] a resident wave cannot run under AMD_SERIALIZE_KERNEL");
+        return;
+    }
+    let _guard = DeviceGuard::set(0);
+    let dev = grim_backend_rocm::RocmDevice::shared(0);
+
+    let stops_before = wave_stop_count();
+
+    {
+        let (graph, _keep) = one_gemm_graph(&dev);
+        let mut ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(
+            &dev, &graph,
+        )
+        .expect("ring context")
+        .expect("ring binds the gemm");
+        ctx.launch_resident(&dev).expect("launch resident wave");
+        // The wave is parked now. Dropping the context must stop it AND wait
+        // for it to leave.
+    }
+
+    assert_eq!(
+        wave_stop_count(),
+        stops_before + 1,
+        "dropping a resident ring must confirm its wave's exit (stopped {} -> {})",
+        stops_before,
+        wave_stop_count()
+    );
+
+    // The device must still be usable: a fresh ring, a fresh resident wave, and
+    // a real drain. With the old Drop this never completed — the leaked wave
+    // held the device and the next allocation hung.
+    let (graph, _keep) = one_gemm_graph(&dev);
+    let mut ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the gemm");
+    ctx.launch_resident_staged(&dev)
+        .expect("launch resident staged wave");
+
+    let mut tail_val = 0u32;
+    for _ in 0..4000 {
+        tail_val = ctx.tail_value().expect("tail readback");
+        if tail_val >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        tail_val >= 1,
+        "a ring created after a dropped resident ring must still drain (tail {tail_val})"
+    );
+    ctx.stop_wave(&dev).expect("stop wave");
 }

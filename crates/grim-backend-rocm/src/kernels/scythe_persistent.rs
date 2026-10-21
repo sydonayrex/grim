@@ -168,6 +168,13 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 if (atomicCAS((unsigned int*)&candidate->status, ST_PENDING, ST_RUNNING) == ST_PENDING) {
                     active = 1;
                     backoff_shift = 0; // snap back to fast polling on real work
+                } else {
+                    // The slot is already COMPLETE (or ERROR): it is not this
+                    // wave's work. SKIP it. Spinning here instead wedged the wave
+                    // forever — a wave that cannot claim its next slot never
+                    // advances the tail, so it never terminates and never lets
+                    // the host stop it either.
+                    atomicAdd(tail_ptr, 1);
                 }
             }
         }
@@ -432,6 +439,36 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
         }
         __syncthreads();
     }
+}
+
+// M6: wait for a ring descriptor to complete, DEVICE-SIDE.
+//
+// The wave moves a descriptor's status PENDING -> RUNNING -> COMPLETE, so a
+// consumer observes a cross-device handoff by polling that field. This is what
+// lets the consumer's graph wait for the producer's PEER_COPY without a HOST
+// event: the wait is a NODE in the consumer's graph, so the two sides overlap
+// instead of alternating.
+//
+// The spin is BOUNDED and the observed status is written out either way, so a
+// producer that never runs shows up as a TIMEOUT (the status is still PENDING)
+// rather than as a wedged device.
+extern "C" __global__ void grim_scythe_wait_descriptor(
+    const scythe_task_descriptor_t* slots,
+    unsigned int slot_idx,
+    unsigned int max_spins,
+    unsigned int* observed_status)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const volatile unsigned int* status =
+        (const volatile unsigned int*)&slots[slot_idx].status;
+    unsigned int spins = 0;
+    unsigned int s = *status;
+    while (s == ST_PENDING && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        s = *status;
+        spins++;
+    }
+    *observed_status = s;
 }
 "#;
 

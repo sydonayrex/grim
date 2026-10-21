@@ -17,6 +17,13 @@ pub type HipErrorT = i32;
 #[allow(non_upper_case_globals)]
 pub const hipSuccess: HipErrorT = 0;
 
+/// `hipErrorNotReady` — the return of a query that found work still in flight.
+///
+/// HIP's own value (600). Used to tell "not finished yet" apart from "the
+/// query itself failed".
+#[allow(non_upper_case_globals)]
+pub const hipErrorNotReady: HipErrorT = 600;
+
 // ======== RocmHandle: typed wrapper around an optional HIP stream ========
 
 /// A `ComputeHandle` contract — the caller submits work on a stream and [see: `synchronize()`]
@@ -155,6 +162,13 @@ unsafe extern "C" {
     ) -> HipErrorT;
     pub fn hipStreamDestroy(stream: *mut c_void) -> HipErrorT;
     pub fn hipStreamSynchronize(stream: *mut c_void) -> HipErrorT;
+    /// Non-blocking query: `hipSuccess` when every operation on the stream has
+    /// completed, `hipErrorNotReady` while any is still in flight.
+    ///
+    /// This is the OBSERVABLE form of "has the kernel left": a bounded poll
+    /// can tell the difference between a kernel that finished and one that is
+    /// still spinning, without blocking the host forever.
+    pub fn hipStreamQuery(stream: *mut c_void) -> HipErrorT;
     #[link_name = "hipMemcpyAsync"]
     fn raw_hipMemcpyAsync(
         dst: *mut c_void,
