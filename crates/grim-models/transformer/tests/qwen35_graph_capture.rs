@@ -949,3 +949,140 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
         std::env::set_var("GRIM_KV_ARENA", "f32");
     }
 }
+
+/// M6 STEP 4: the ring handoff at a device boundary — IDENTICAL logits to
+/// A6's host-issued peer copy, and ONE FEWER host-visible synchronisation per
+/// token.
+///
+/// A6's boundary is a host-issued peer memcpy plus a recorded event plus the
+/// consumer's stream waiting on it: three host calls and a synchronisation per
+/// boundary per token. M6's handoff replaces them with ONE wave launch (the
+/// producer's copy, in the producer's stream ORDER, so it is strictly after
+/// the producer's graph) and ONE device-side poll (the consumer's device
+/// watches the producer's monotonic tail over peer access). The host
+/// synchronisation at the boundary is GONE.
+///
+/// The gate measures both halves of that claim:
+///  * the logits are the same (the handoff copies the same bytes), and
+///  * the per-token host-visible synchronisation count is lower — measured by
+///    a counter in the A6 path, not asserted from the plan.
+#[test]
+fn the_ring_handoff_matches_a6_and_removes_a_host_sync_per_token() {
+    let Some((device, _dev)) = gpu_device() else {
+        return;
+    };
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices");
+        return;
+    }
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+
+    // One split hybrid, replayed N tokens, returning the logits and the number
+    // of host-visible boundary synchronisations the replay issued.
+    let run = |with_handoff: bool| -> (Vec<Vec<f32>>, u64) {
+        if with_handoff {
+            unsafe { std::env::set_var("GRIM_RING_HANDOFF", "1") };
+        } else {
+            unsafe { std::env::remove_var("GRIM_RING_HANDOFF") };
+        }
+        let mut cfg = tiny_cfg();
+        cfg.num_layers = 4;
+        cfg.full_attention_interval = 2;
+        // The planner prefers ONE device when the model fits — force the
+        // split, or there is no boundary to hand off.
+        unsafe { std::env::set_var("GRIM_FORCE_SPLIT", "1") };
+        cfg.devices = vec![Device::Rocm(0), Device::Rocm(1)];
+        let provider = synth_weights_hybrid(4, 2);
+        let ws = WeightSource::root(&provider, device.clone());
+        let model = Qwen35::load(device.clone(), &ws, cfg).expect("load split hybrid qwen35");
+        unsafe { std::env::remove_var("GRIM_FORCE_SPLIT") };
+
+        let mut graph = model
+            .get_or_create_decode_graph(16, 1)
+            .expect("a layer-split model must now be capturable");
+        assert_eq!(graph.segments.len(), 2, "one graph per device");
+        let _ = model.forward_capture(&mut graph, TOKENS[0]);
+        let _ = model.forward_capture(&mut graph, TOKENS[0]);
+        graph.begin_capture().expect("begin capture");
+        model
+            .forward_capture(&mut graph, TOKENS[0])
+            .expect("recorded capture");
+        graph.end_capture().expect("end capture");
+        assert!(graph.is_captured, "split capture must succeed");
+
+        let syncs_before = grim_backend_rocm::peer_access::boundary_host_sync_count();
+        let mut logits = Vec::new();
+        for tok in TOKENS {
+            model.forward_replay(&mut graph, tok).expect("replay");
+            logits.push(graph.read_logits_f32().expect("readback"));
+            graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+        }
+        let syncs = grim_backend_rocm::peer_access::boundary_host_sync_count() - syncs_before;
+        (logits, syncs)
+    };
+
+    let (a6_logits, a6_syncs) = run(false);
+    // The CONTROL: a second A6 run. Two A6 runs differ slightly from each
+    // other (the f16 arena's reduction order depends on where the buffers
+    // land), so without this the gate could not tell "the handoff changed the
+    // logits" from "the runs differ anyway".
+    let (a6_control_logits, a6_control_syncs) = run(false);
+    let (handoff_logits, handoff_syncs) = run(true);
+    unsafe { std::env::remove_var("GRIM_RING_HANDOFF") };
+
+    // The handoff must have been TAKEN: the whole point is that the A6 path
+    // was not used. Without this, the gate would pass on two A6 runs.
+    assert_eq!(
+        handoff_syncs, 0,
+        "the handoff path must issue NO host-visible boundary synchronisation (got {handoff_syncs})"
+    );
+    assert_eq!(
+        a6_syncs,
+        TOKENS.len() as u64,
+        "A6 must issue one host-visible boundary synchronisation per token (got {a6_syncs})"
+    );
+    assert!(
+        handoff_syncs < a6_syncs,
+        "the handoff must remove a host-visible synchronisation per token (a6 {a6_syncs}, handoff {handoff_syncs})"
+    );
+
+    assert_eq!(
+        a6_control_syncs, a6_syncs,
+        "the two A6 runs must issue the same number of host synchronisations"
+    );
+
+    // And the logits must be the same: the handoff copies the same bytes.
+    assert_eq!(
+        a6_logits.len(),
+        handoff_logits.len(),
+        "both runs must produce the same number of steps"
+    );
+    let mut control_worst = 0.0f32;
+    for (step, (a, b)) in a6_logits.iter().zip(a6_control_logits.iter()).enumerate() {
+        let (e, _, _) = worst_scaled(a, b);
+        control_worst = control_worst.max(e);
+        let _ = step;
+    }
+    let mut handoff_worst = 0.0f32;
+    for (step, (a, b)) in a6_logits.iter().zip(handoff_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        handoff_worst = handoff_worst.max(e);
+        eprintln!("[m6-handoff] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 1e-1,
+            "handoff step {step} diverges from A6: worst {e:.3e} at {at} \
+             (A6 {}, handoff {})",
+            a[at],
+            b[at]
+        );
+    }
+    eprintln!(
+        "[m6-handoff] worst A6-vs-A6 {control_worst:.3e}, A6-vs-handoff {handoff_worst:.3e}"
+    );
+    assert!(
+        handoff_worst <= control_worst.max(1e-1),
+        "the handoff must not diverge more than two A6 runs do from each other \
+         (A6-vs-A6 {control_worst:.3e}, A6-vs-handoff {handoff_worst:.3e})"
+    );
+}

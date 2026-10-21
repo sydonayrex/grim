@@ -490,59 +490,76 @@ impl TaskRingPlan {
         &self,
         dev: &crate::RocmDevice,
     ) -> crate::Result<(Box<dyn BackendStorage>, u32)> {
-        let count = self.gemms.len().min(STAGED_CAPACITY as usize);
-        // The PEER copies ride the SAME staged set, AFTER the GEMMs.
+        // The staged set is the plan's tasks in IR-NODE ORDER, not in bucket
+        // order. The order is the WAVE's execution order, so a task that
+        // another task depends on must come first — the boundary handoff is
+        // exactly that: the sequence counter is advanced by an ELEMENTWISE
+        // task, and the flag copy that publishes it must read the advanced
+        // value. Bucket order (gemms, then adds, then peers) would put the
+        // publish before the advance.
         //
-        // A boundary handoff is a PEER_COPY and nothing else: its plan has no
-        // GEMM, so a staged set that carried only GEMMs would be EMPTY for it
-        // — and an empty staged set is refused at the launch boundary. The
-        // order is the plan's own order (the IR node order), because the wave
-        // drains the slots in that order and the handoff's tasks are ordered
-        // (clear the flag, copy the data, set the flag).
-        let peer_count = self.peers.len().min((STAGED_CAPACITY as usize).saturating_sub(count));
-        let total = count + peer_count;
+        // Only the tasks whose descriptor is self-contained are staged: a
+        // GEMM, an ELEMENTWISE add and a PEER copy. The others (attention,
+        // MoE, recurrent) carry a device-side descriptor of their own and are
+        // enqueued per node.
+        let mut staged: Vec<(u32, ScytheTaskDescriptor)> = Vec::new();
+        for g in &self.gemms {
+            staged.push((
+                g.ir_node,
+                ScytheTaskDescriptor {
+                    opcode: OP_ROW_GEMM,
+                    m: g.m,
+                    n: g.n,
+                    k: g.k,
+                    input_ptr: g.input,
+                    weight_ptr: g.weight,
+                    output_ptr: g.output,
+                    peer_ptr: 0,
+                    status: 0,
+                },
+            ));
+        }
+        for a in &self.adds {
+            staged.push((
+                a.ir_node,
+                ScytheTaskDescriptor {
+                    opcode: OP_ADD,
+                    m: a.m,
+                    n: a.n,
+                    k: 0,
+                    input_ptr: a.input_a,
+                    weight_ptr: a.input_b,
+                    output_ptr: a.output,
+                    peer_ptr: 0,
+                    status: 0,
+                },
+            ));
+        }
+        for p in &self.peers {
+            staged.push((
+                p.ir_node,
+                ScytheTaskDescriptor {
+                    opcode: OP_PEER_BROADCAST,
+                    m: p.elems,
+                    n: 0,
+                    k: 0,
+                    input_ptr: p.src,
+                    weight_ptr: 0,
+                    output_ptr: 0,
+                    peer_ptr: p.dst,
+                    status: 0,
+                },
+            ));
+        }
+        staged.sort_by_key(|(ir_node, _)| *ir_node);
+        staged.truncate(STAGED_CAPACITY as usize);
+        let total = staged.len();
         let mut bytes = vec![0u8; total * std::mem::size_of::<ScytheTaskDescriptor>()];
-        for (i, g) in self.gemms.iter().take(count).enumerate() {
-            let desc = ScytheTaskDescriptor {
-                opcode: OP_ROW_GEMM,
-                m: g.m,
-                n: g.n,
-                k: g.k,
-                input_ptr: g.input,
-                weight_ptr: g.weight,
-                output_ptr: g.output,
-                peer_ptr: 0,
-                status: 0,
-            };
+        for (i, (_, desc)) in staged.iter().enumerate() {
             let off = i * std::mem::size_of::<ScytheTaskDescriptor>();
             let cell = unsafe {
                 std::slice::from_raw_parts(
-                    &desc as *const ScytheTaskDescriptor as *const u8,
-                    std::mem::size_of::<ScytheTaskDescriptor>(),
-                )
-            };
-            bytes[off..off + cell.len()].copy_from_slice(cell);
-        }
-        // The peer copies, in the plan's order. The wave's `OP_PEER_BROADCAST`
-        // arm takes the element count in `m`, the source in `input_ptr` and the
-        // PEER destination in `peer_ptr` — the same layout `enqueue_peer_copy`
-        // writes, so a staged copy and an enqueued copy are the same task.
-        for (j, p) in self.peers.iter().take(peer_count).enumerate() {
-            let desc = ScytheTaskDescriptor {
-                opcode: OP_PEER_BROADCAST,
-                m: p.elems,
-                n: 0,
-                k: 0,
-                input_ptr: p.src,
-                weight_ptr: 0,
-                output_ptr: 0,
-                peer_ptr: p.dst,
-                status: 0,
-            };
-            let off = (count + j) * std::mem::size_of::<ScytheTaskDescriptor>();
-            let cell = unsafe {
-                std::slice::from_raw_parts(
-                    &desc as *const ScytheTaskDescriptor as *const u8,
+                    desc as *const ScytheTaskDescriptor as *const u8,
                     std::mem::size_of::<ScytheTaskDescriptor>(),
                 )
             };
@@ -1149,6 +1166,18 @@ impl TaskRingContext {
             .ok_or_else(|| crate::Error::Backend("task ring slots have no device ptr".into()))?)
     }
 
+    /// The ring's TAIL counter address — the ring's MONOTONIC step counter.
+    ///
+    /// A consumer on ANOTHER device polls this to learn that a handoff
+    /// landed: the wave advances it once per task, and a peer READ is
+    /// coherent on this hardware. The value changes every step, so a consumer
+    /// can tell one handoff from the next.
+    pub fn tail_ptr(&self) -> crate::Result<u64> {
+        Ok(as_rocm(self.tail.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| crate::Error::Backend("task ring tail has no device ptr".into()))?)
+    }
+
     /// The ring slot the most recent enqueue wrote to.
     pub fn last_slot(&self) -> usize {
         self.last_slot.load(Ordering::Relaxed)
@@ -1476,6 +1505,145 @@ pub fn launch_task_ring_staged_on_stream(
         staged_count,
         false,
         Some(stream),
+    )
+}
+
+/// M6: poll a MONOTONIC counter on ANOTHER device, on an EXPLICIT stream.
+///
+/// The cross-device completion signal: the counter lives in the PRODUCER's
+/// memory and advances once per handoff, and the consumer's own "last seen"
+/// register says how far it has got. A peer READ is coherent on this
+/// hardware, so the consumer sees the producer's advance.
+///
+/// The kernel must be pre-resolved under this entry name — see
+/// [`launch_scythe_wait_flag_on_stream`].
+pub fn launch_scythe_wait_counter_on_stream(
+    dev: &crate::RocmDevice,
+    counter_ptr: u64,
+    last_seen_ptr: u64,
+    max_spins: u32,
+    observed_dev: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cp = counter_ptr;
+    let mut ls = last_seen_ptr;
+    let mut ms = max_spins;
+    let mut obs = observed_dev;
+    dev.launch_compute_kernel_on_stream(
+        "grim_scythe_wait_counter",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut cp), arg(&mut ls), arg(&mut ms), arg(&mut obs)],
+        stream,
+        0,
+    )
+}
+
+/// M6: poll a MONOTONIC counter, eagerly (no stream binding).
+///
+/// Used to RESOLVE the kernel under its own entry name: the on-stream launch
+/// path only launches, so the entry has to be in the resolved-function cache.
+/// A zero-spin launch resolves it and returns at once.
+pub fn launch_scythe_wait_counter(
+    dev: &crate::RocmDevice,
+    counter_ptr: u64,
+    last_seen_ptr: u64,
+    max_spins: u32,
+    observed_dev: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cp = counter_ptr;
+    let mut ls = last_seen_ptr;
+    let mut ms = max_spins;
+    let mut obs = observed_dev;
+    dev.launch_compute_kernel(
+        "grim_scythe_wait_counter",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut cp), arg(&mut ls), arg(&mut ms), arg(&mut obs)],
+    )
+}
+
+/// M6: wait (device-side) for a FLAG to CHANGE, on an EXPLICIT stream.
+///
+/// The cross-device completion signal for a REPEATED handoff: the producer
+/// writes a value that changes per handoff, and the consumer waits for the
+/// flag to differ from the value it last saw. `last_seen` is the CONSUMER's
+/// own register, so the comparison needs no host involvement.
+///
+/// The kernel must be pre-resolved under this entry name — see
+/// [`launch_scythe_wait_flag_on_stream`].
+pub fn launch_scythe_wait_flag_change_on_stream(
+    dev: &crate::RocmDevice,
+    flag_ptr: u64,
+    last_seen_ptr: u64,
+    max_spins: u32,
+    observed_dev: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut fp = flag_ptr;
+    let mut ls = last_seen_ptr;
+    let mut ms = max_spins;
+    let mut obs = observed_dev;
+    dev.launch_compute_kernel_on_stream(
+        "grim_scythe_wait_flag_change",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut fp), arg(&mut ls), arg(&mut ms), arg(&mut obs)],
+        stream,
+        0,
+    )
+}
+
+/// M6: wait (device-side) for a FLAG to CHANGE, eagerly (no stream binding).
+///
+/// Used to RESOLVE the kernel under its own entry name: the on-stream launch
+/// path only launches, so the entry has to be in the resolved-function cache.
+/// A zero-spin launch resolves it and returns at once.
+pub fn launch_scythe_wait_flag_change(
+    dev: &crate::RocmDevice,
+    flag_ptr: u64,
+    last_seen_ptr: u64,
+    max_spins: u32,
+    observed_dev: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut fp = flag_ptr;
+    let mut ls = last_seen_ptr;
+    let mut ms = max_spins;
+    let mut obs = observed_dev;
+    dev.launch_compute_kernel(
+        "grim_scythe_wait_flag_change",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut fp), arg(&mut ls), arg(&mut ms), arg(&mut obs)],
+    )
+}
+
+/// M6: wait (device-side) for a FLAG on an EXPLICIT stream.
+///
+/// The consumer's wait must be ordered BEFORE the consumer's graph, and the
+/// consumer's graph runs on its SEGMENT's stream — not on the device's active
+/// stream. So the wait is launched on the segment's stream.
+///
+/// The kernel must be pre-resolved under this entry name (the on-stream path
+/// only launches): [`BoundaryHandoff`](crate::peer_access::BoundaryHandoff)
+/// resolves it with a zero-spin eager launch when it is prepared.
+pub fn launch_scythe_wait_flag_on_stream(
+    dev: &crate::RocmDevice,
+    flag_ptr: u64,
+    max_spins: u32,
+    observed_dev: u64,
+    stream: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut fp = flag_ptr;
+    let mut ms = max_spins;
+    let mut obs = observed_dev;
+    dev.launch_compute_kernel_on_stream(
+        "grim_scythe_wait_flag",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [arg(&mut fp), arg(&mut ms), arg(&mut obs)],
+        stream,
+        0,
     )
 }
 

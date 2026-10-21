@@ -57,6 +57,33 @@ pub fn p2p_memcpy_async(
     }
 }
 
+/// Host-visible boundary synchronisations issued by the A6 path.
+///
+/// One per boundary per token: the host records an event after the copy and
+/// the consumer's stream waits on it. M6's handoff issues NONE of these — its
+/// completion is observed by the consumer's DEVICE.
+static BOUNDARY_HOST_SYNCS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many host-visible boundary synchronisations this process has issued.
+pub fn boundary_host_sync_count() -> u64 {
+    BOUNDARY_HOST_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Is M6's ring handoff enabled?
+///
+/// OFF by default. The handoff replaces A6's host-issued peer copy + event
+/// with a wave launch + a device-side wait, and it needs peer access granted
+/// between the two devices (the wave's peer arm writes the consumer's memory
+/// DIRECTLY, which is a different mechanism from the copy engine's
+/// `hipMemcpyPeerAsync`). That grant changes the process's device topology in
+/// a way whose interaction with the rest of the ring is not yet understood —
+/// see the note in `plans/PLAN-multigpu-per-device-graphs.md` — so the
+/// handoff is opt-in until it is.
+pub fn ring_handoff_enabled() -> bool {
+    std::env::var("GRIM_RING_HANDOFF").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Enqueue a peer copy `src (on src_stream's device) -> dst`, then order
 /// `dst_stream` after it. The copy must NOT be captured (it runs between two
 /// graph launches in the replay driver), and `dst_stream` must not start the
@@ -69,6 +96,11 @@ pub fn copy_boundary_ordered(
     dst_stream: *mut c_void,
     ev: *mut c_void,
 ) -> Result<()> {
+    // A6's boundary synchronisation is a HOST-VISIBLE one: the host records an
+    // event and the consumer's stream waits on it, so the host is in the loop
+    // at every boundary of every token. Counted so M6's gate can MEASURE the
+    // difference rather than assert it.
+    BOUNDARY_HOST_SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use crate::device::util::DeviceGuard;
     let (src_dev, dst_dev) = (src.device_ordinal() as i32, dst.device_ordinal() as i32);
     let bytes = src.bytes().min(dst.bytes());
@@ -334,16 +366,21 @@ unsafe fn gcn_arch_for(device: i32) -> Cow<'static, str> {
 pub struct BoundaryHandoff {
     /// The producer's ring: it holds the three PEER_COPY tasks.
     ring: crate::kernels::task_ring::TaskRingContext,
-    /// The consumer's flag. It lives on the CONSUMER's device — the consumer's
-    /// own spin reads it without any peer access.
-    flag: Box<dyn grim_tensor::backend::BackendStorage>,
+    /// The producer's ring TAIL counter — the MONOTONIC step counter the
+    /// consumer polls over peer access.
+    ///
+    /// It lives on the PRODUCER's side on purpose. MEASURED: a peer READ is
+    /// coherent on this hardware (the consumer sees the producer's advance),
+    /// but a peer WRITE is NOT — the consumer that read a line before the
+    /// write keeps seeing the stale value, which is why an earlier
+    /// flag-in-consumer-memory design was withdrawn.
+    tail_ptr: u64,
     /// Where the consumer's wait kernel records what it observed.
     observed: Box<dyn grim_tensor::backend::BackendStorage>,
-    /// The producer's one-word sources: 0.0f32 to clear the flag, 1.0f32 to
-    /// set it. They are STATIC: the flag's value is produced by WHICH task
-    /// runs, not by a per-token host write.
-    _zero_src: Box<dyn grim_tensor::backend::BackendStorage>,
-    _one_src: Box<dyn grim_tensor::backend::BackendStorage>,
+    /// The CONSUMER's "last seen" register: the producer's counter value it
+    /// already consumed. The wait compares against it, so the consumer knows a
+    /// NEW handoff landed rather than seeing the old one again.
+    _last_seen: Box<dyn grim_tensor::backend::BackendStorage>,
 }
 
 /// How many times the consumer's wait kernel spins before it gives up.
@@ -352,6 +389,15 @@ pub struct BoundaryHandoff {
 /// patience — long enough for a producer that is merely late, short enough
 /// that a producer that never ran is reported rather than waited on.
 pub const BOUNDARY_WAIT_SPINS: u32 = 2_000_000;
+
+impl std::fmt::Debug for BoundaryHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundaryHandoff")
+            .field("peers", &self.ring.plan().peers().len())
+            .field("tail_ptr", &self.tail_ptr)
+            .finish()
+    }
+}
 
 impl BoundaryHandoff {
     /// Prepare a handoff from `src` (on the producer) to `dst` (on the
@@ -381,17 +427,7 @@ impl BoundaryHandoff {
             .device_ptr_u64()
             .ok_or_else(|| Error::Backend("boundary handoff: dst has no device ptr".into()))?;
 
-        // A one-element device buffer on the given device.
-        let f32_scalar = |dev: &crate::RocmDevice, v: f32| -> Result<Box<dyn grim_tensor::backend::BackendStorage>> {
-            Ok(dev.from_cpu_bytes(
-                &v.to_ne_bytes(),
-                &grim_tensor::Shape::new(vec![1]),
-                grim_tensor::dtype::DType {
-                    arith: grim_tensor::ArithType::F32,
-                    storage: grim_tensor::dtype::Storage::Native,
-                },
-            )?)
-        };
+        // A one-element u32 device buffer on the given device.
         let u32_scalar = |dev: &crate::RocmDevice, v: u32| -> Result<Box<dyn grim_tensor::backend::BackendStorage>> {
             Ok(dev.from_cpu_bytes(
                 &v.to_ne_bytes(),
@@ -410,50 +446,26 @@ impl BoundaryHandoff {
                 .ok_or_else(|| Error::Backend(format!("boundary handoff: {what} has no device ptr")))
         };
 
-        // The consumer's flag: one float on the CONSUMER's device. It starts at
-        // zero, which is what the consumer's spin waits on.
-        let flag = f32_scalar(consumer, 0.0)?;
-        let flag_ptr = ptr_of(&flag, "flag")?;
-        // Where the consumer's wait kernel records what it observed.
+        // Where the consumer's wait kernel records what it observed, and the
+        // consumer's "last seen" register: zero, so the producer's first
+        // advance (a non-zero tail) differs from it.
         let observed = u32_scalar(consumer, 0)?;
-        // The producer's STATIC flag sources: zero to clear the flag, one to
-        // set it. The flag's value comes from WHICH task runs, not from a
-        // per-token host write.
-        let zero_src = f32_scalar(producer, 0.0)?;
-        let zero_ptr = ptr_of(&zero_src, "zero_src")?;
-        let one_src = f32_scalar(producer, 1.0)?;
-        let one_ptr = ptr_of(&one_src, "one_src")?;
+        let observed_ptr = ptr_of(&observed, "observed")?;
+        let last_seen = u32_scalar(consumer, 0)?;
+        let last_seen_ptr = ptr_of(&last_seen, "last_seen")?;
 
         // The IR: three PEER_COPY nodes, in the order the wave must run them.
         let mut gb = TaskGraphBuilder::new();
-        let h_zero = gb.push_arg(zero_ptr, 4, arg_role::ACT_IN);
-        let h_one = gb.push_arg(one_ptr, 4, arg_role::ACT_IN);
         let h_src = gb.push_arg(src_ptr, elems as u64 * 4, arg_role::ACT_IN);
-        let h_flag = gb.push_arg(flag_ptr, 4, arg_role::PEER);
         let h_dst = gb.push_arg(dst_ptr, elems as u64 * 4, arg_role::PEER);
-        // 1. clear the flag
-        gb.push(
-            op::PEER_COPY,
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            &[h_zero, h_flag],
-            &[],
-            0,
-            0,
-        );
-        // 2. copy the activation
+        // The activation copy. The COMPLETION is the ring's own tail counter:
+        // the wave advances it as it drains, and the consumer polls it over
+        // peer access. So there is no completion task to stage — the copy IS
+        // the work, and the tail IS the signal.
         gb.push(
             op::PEER_COPY,
             [elems, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             &[h_src, h_dst],
-            &[],
-            0,
-            0,
-        );
-        // 3. set the flag
-        gb.push(
-            op::PEER_COPY,
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            &[h_one, h_flag],
             &[],
             0,
             0,
@@ -465,12 +477,30 @@ impl BoundaryHandoff {
                 Error::Backend("boundary handoff: the ring did not bind the peer copies".into())
             })?;
 
+        // The producer's tail counter: the MONOTONIC step counter the
+        // consumer polls.
+        let tail_ptr = ring.tail_ptr()?;
+
+        // Resolve the WAIT kernel on the CONSUMER, eagerly and harmlessly:
+        // the on-stream launch path only launches, so the entry has to be in
+        // the resolved-function cache under its own name. A zero-spin launch
+        // returns at once and still does the resolution.
+        {
+            let _guard = crate::device::util::DeviceGuard::set(consumer.ordinal as i32);
+            crate::kernels::task_ring::launch_scythe_wait_counter(
+                consumer,
+                tail_ptr,
+                last_seen_ptr,
+                0,
+                observed_ptr,
+            )?;
+        }
+
         Ok(Self {
             ring,
-            flag,
+            tail_ptr,
             observed,
-            _zero_src: zero_src,
-            _one_src: one_src,
+            _last_seen: last_seen,
         })
     }
 
@@ -484,29 +514,34 @@ impl BoundaryHandoff {
         Ok(())
     }
 
-    /// Launch the CONSUMER's device-side wait on the consumer's stream.
+    /// Launch the CONSUMER's device-side wait on the CONSUMER's stream.
     ///
     /// The kernel spins until the flag leaves zero. It is launched BEFORE the
     /// consumer's graph on the same stream, so the graph starts only after the
     /// handoff landed. One host call; no host event.
-    pub fn launch_wait(&self, consumer: &crate::RocmDevice) -> Result<()> {
-        let flag_ptr = self
-            .flag
-            .as_any()
-            .downcast_ref::<crate::memory::storage::RocmStorage>()
-            .and_then(|r| r.device_ptr_u64())
-            .ok_or_else(|| Error::Backend("boundary handoff: flag has no device ptr".into()))?;
+    ///
+    /// `stream` must be the consumer SEGMENT's stream — the consumer's graph
+    /// runs on that one, and the wait has to be ordered before it.
+    pub fn launch_wait(&self, consumer: &crate::RocmDevice, stream: *mut c_void) -> Result<()> {
         let obs_ptr = self
             .observed
             .as_any()
             .downcast_ref::<crate::memory::storage::RocmStorage>()
             .and_then(|r| r.device_ptr_u64())
             .ok_or_else(|| Error::Backend("boundary handoff: observed has no device ptr".into()))?;
-        crate::kernels::task_ring::launch_scythe_wait_flag(
+        let last_seen_ptr = self
+            ._last_seen
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .and_then(|r| r.device_ptr_u64())
+            .ok_or_else(|| Error::Backend("boundary handoff: last_seen has no device ptr".into()))?;
+        crate::kernels::task_ring::launch_scythe_wait_counter_on_stream(
             consumer,
-            flag_ptr,
+            self.tail_ptr,
+            last_seen_ptr,
             BOUNDARY_WAIT_SPINS,
             obs_ptr,
+            stream,
         )?;
         Ok(())
     }
@@ -521,14 +556,9 @@ impl BoundaryHandoff {
         Ok(r.to_cpu_vec_u32()?.first().copied().unwrap_or(0))
     }
 
-    /// The consumer's flag value, read on the host.
-    pub fn flag_value(&self) -> Result<f32> {
-        let r = self
-            .flag
-            .as_any()
-            .downcast_ref::<crate::memory::storage::RocmStorage>()
-            .ok_or_else(|| Error::Backend("boundary handoff: flag is not RocmStorage".into()))?;
-        Ok(r.to_cpu_vec_f32()?.first().copied().unwrap_or(0.0))
+    /// The producer's tail counter, read on the host.
+    pub fn tail_value(&self) -> Result<u32> {
+        Ok(self.ring.tail_value()?)
     }
 }
 

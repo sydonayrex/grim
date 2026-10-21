@@ -2266,6 +2266,17 @@ pub struct DecodeGraph {
     /// One event PER BOUNDARY (index = producing segment ordinal), each
     /// created under a DeviceGuard on the producing device. Task A4.
     pub boundary_evs: Vec<*mut std::ffi::c_void>,
+    /// M6: one handoff PER BOUNDARY (index = producing segment ordinal, the
+    /// same indexing as `boundary_evs`).
+    ///
+    /// A handoff is the producer's ring (carrying the boundary's PEER_COPY
+    /// tasks) plus the consumer's completion flag. When it is present,
+    /// `replay_chain` uses it INSTEAD of A6's host-issued peer copy + event:
+    /// the producer's wave does the copy and the consumer's DEVICE spins on
+    /// the flag, so the host issues no boundary synchronisation at all.
+    ///
+    /// EMPTY means the A6 path — the default, unless `GRIM_RING_HANDOFF=1`.
+    pub boundary_handoffs: Vec<Option<crate::peer_access::BoundaryHandoff>>,
     /// M1/M2: the task-graph emitter, Some only when
     /// `GRIM_EMIT_TASK_GRAPH=1`. `forward_capture` pushes nodes into it; the
     /// finished IR is published to `buffers.emitted_task_graph` at
@@ -2338,6 +2349,7 @@ impl DecodeGraph {
             },
             ring_context: None,
             kda_desc_ptrs: Vec::new(),
+            boundary_handoffs: Vec::new(),
             ordinal: dev.ordinal,
         }
     }
@@ -2380,6 +2392,78 @@ impl DecodeGraph {
                 ev
             })
             .collect();
+        self.build_boundary_handoffs();
+    }
+
+    /// M6: build one handoff per device boundary, when the handoff is enabled.
+    ///
+    /// The handoff replaces A6's host-issued peer copy + cross-stream event
+    /// with a wave launch (the producer's copy) and a device-side wait (the
+    /// consumer's flag). It needs peer access granted between the two
+    /// devices — the wave's peer arm writes the consumer's memory DIRECTLY,
+    /// which is a different mechanism from the copy engine's
+    /// `hipMemcpyPeerAsync` — so the grant is taken here, once, at setup.
+    ///
+    /// OFF unless `GRIM_RING_HANDOFF=1`: the grant changes the process's
+    /// device topology, and its interaction with the rest of the ring is not
+    /// yet understood (see the plan's M6 note).
+    fn build_boundary_handoffs(&mut self) {
+        self.boundary_handoffs = Vec::new();
+        if !crate::peer_access::ring_handoff_enabled() || self.segments.len() < 2 {
+            return;
+        }
+        let n_boundaries = self.segments.len() - 1;
+        // The handoff's element count: the boundary buffer's floats, capped by
+        // the destination's — the same min A6's `copy_boundary_ordered` takes.
+        for k in 0..n_boundaries {
+            let Some(src) = self.buffers.boundary_out.get(k) else {
+                return;
+            };
+            let consumer_layers = &self.segments[k + 1].layers;
+            let Some(dst) = self.buffers.layer_input.get(consumer_layers.start) else {
+                return;
+            };
+            let elems = (src.bytes().min(dst.bytes()) / 4) as u32;
+            if elems == 0 {
+                return;
+            }
+            let producer_ord = self.segments[k].device;
+            let consumer_ord = self.segments[k + 1].device;
+            if producer_ord == consumer_ord {
+                return;
+            }
+            if let Err(e) = crate::peer_access::enable_peer_access(
+                producer_ord as i32,
+                consumer_ord as i32,
+            ) {
+                eprintln!(
+                    "[decode-graph] boundary {k}: peer access {producer_ord}->{consumer_ord} \
+                     unavailable ({e}); keeping the A6 boundary"
+                );
+                return;
+            }
+            let producer = crate::RocmDevice::shared(producer_ord);
+            let consumer = crate::RocmDevice::shared(consumer_ord);
+            match crate::peer_access::BoundaryHandoff::prepare(
+                &producer, &consumer, src, dst, elems,
+            ) {
+                Ok(h) => self.boundary_handoffs.push(Some(h)),
+                Err(e) => {
+                    eprintln!(
+                        "[decode-graph] boundary {k}: handoff preparation failed ({e}); \
+                         keeping the A6 boundary"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// True when every boundary has a handoff, so `replay_chain` can use them.
+    fn use_boundary_handoffs(&self) -> bool {
+        !self.boundary_handoffs.is_empty()
+            && self.boundary_handoffs.len() == self.segments.len().saturating_sub(1)
+            && self.boundary_handoffs.iter().all(|h| h.is_some())
     }
 
     fn split_capture(&self) -> bool {
@@ -2791,24 +2875,47 @@ impl DecodeGraph {
         if self.segments.iter().any(|s| s.exec.is_null()) {
             return Err(Error::Backend("replay_chain: a segment is not captured".into()));
         }
+        let handoffs = self.use_boundary_handoffs();
         for seg in 0..self.segments.len() {
+            if handoffs && seg > 0 {
+                // M6: the consumer's DEVICE waits for the previous boundary's
+                // copy to land — no host event. The wait is on the consumer's
+                // OWN segment stream, so the consumer's graph (launched next,
+                // on that same stream) starts only after the handoff landed.
+                let consumer = crate::RocmDevice::shared(self.segments[seg].device);
+                let h = self.boundary_handoffs[seg - 1]
+                    .as_ref()
+                    .expect("handoff presence checked");
+                h.launch_wait(&consumer, self.segments[seg].stream)?;
+            }
             self.replay_segment(seg)?;
             if seg + 1 < self.segments.len() {
                 let s = &self.segments[seg];
                 let n = &self.segments[seg + 1];
-                let ev = self
-                    .boundary_evs
-                    .get(seg)
-                    .copied()
-                    .unwrap_or(std::ptr::null_mut());
-                if ev.is_null() {
-                    return Err(Error::Backend(format!(
-                        "replay_chain: no boundary event for segment {seg}"
-                    )));
+                if handoffs {
+                    // M6: the producer's wave does the copy, on the producer's
+                    // own stream — so it is ordered AFTER the producer's graph,
+                    // which was just launched on that same stream.
+                    let producer = crate::RocmDevice::shared(s.device);
+                    let h = self.boundary_handoffs[seg]
+                        .as_ref()
+                        .expect("handoff presence checked");
+                    h.launch_copy(&producer, s.stream)?;
+                } else {
+                    let ev = self
+                        .boundary_evs
+                        .get(seg)
+                        .copied()
+                        .unwrap_or(std::ptr::null_mut());
+                    if ev.is_null() {
+                        return Err(Error::Backend(format!(
+                            "replay_chain: no boundary event for segment {seg}"
+                        )));
+                    }
+                    let src = &self.buffers.boundary_out[seg];
+                    let dst = &self.buffers.layer_input[n.layers.start];
+                    crate::peer_access::copy_boundary_ordered(src, dst, s.stream, n.stream, ev)?;
                 }
-                let src = &self.buffers.boundary_out[seg];
-                let dst = &self.buffers.layer_input[n.layers.start];
-                crate::peer_access::copy_boundary_ordered(src, dst, s.stream, n.stream, ev)?;
             }
         }
         Ok(())

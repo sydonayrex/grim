@@ -142,12 +142,23 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     // needs both ends repointed, otherwise step 2 would see tail == head from
     // step 1 and terminate without consuming anything. resident=1 (parking) waves
     // must not use this path — their whole point is a persistent tail.
+    // The tail is NOT reset: it is the ring's MONOTONIC step counter, and a
+    // consumer on another device polls it to learn that a handoff landed. A
+    // counter that restarted at zero every launch could not be told apart
+    // from the previous launch's value, so a consumer would consume a stale
+    // signal.
+    //
+    // The slots are therefore written at the tail's CURRENT offset, and head
+    // points past the new set: the wave claims slot `tail & (capacity - 1)`,
+    // so the staged descriptors must land exactly where it will look.
     if (staged_count != 0u && threadIdx.x == 0) {
+        // atomicAdd(0) READS the tail without writing it: the counter must
+        // keep advancing across launches, so it must not be reset here.
+        unsigned int tail_base = atomicAdd((unsigned int*)tail_ptr, 0u);
         for (unsigned int i = 0; i < staged_count; ++i) {
-            slots[i & (capacity - 1u)] = staged[i];
+            slots[(tail_base + i) & (capacity - 1u)] = staged[i];
         }
-        atomicExch((unsigned int*)tail_ptr, 0u);
-        atomicExch((unsigned int*)head_ptr, staged_count);
+        atomicExch((unsigned int*)head_ptr, tail_base + staged_count);
         backoff_shift = 0;
     }
     __syncthreads();
@@ -503,6 +514,72 @@ extern "C" __global__ void grim_scythe_wait_descriptor(
     const volatile unsigned int* status =
         (const volatile unsigned int*)&slots[slot_idx].status;
     *observed_status = grim_scythe_spin_u32(status, ST_COMPLETE, max_spins);
+}
+
+// M6: poll a MONOTONIC counter on ANOTHER device, DEVICE-SIDE.
+//
+// The cross-device completion signal. The counter lives in the PRODUCER's
+// memory and advances once per handoff, so a consumer that polls it can tell
+// one handoff from the next — a value that merely left zero could not.
+//
+// A peer READ is coherent on this hardware (measured: the consumer sees the
+// producer's descriptor transition), unlike a peer WRITE, which is why the
+// counter lives on the producer's side.
+//
+// The consumer's own "last seen" register says how far it has got, so the
+// comparison needs no host involvement. Bounded, and the observed value is
+// written out either way: a producer that never ran shows up as a TIMEOUT
+// rather than as a wedged device.
+extern "C" __global__ void grim_scythe_wait_counter(
+    const volatile unsigned int* counter,
+    unsigned int* last_seen,
+    unsigned int max_spins,
+    unsigned int* observed)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    unsigned int last = *last_seen;
+    unsigned int spins = 0;
+    unsigned int v = *counter;
+    while (v <= last && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *counter;
+        spins++;
+    }
+    *observed = v;
+    *last_seen = v;
+}
+
+// M6: wait for a FLAG to CHANGE, DEVICE-SIDE.
+//
+// This is the cross-device completion signal for a REPEATED handoff. A flag
+// that merely leaves zero cannot carry a second handoff: after the first
+// handoff the flag is non-zero, so the next wait would exit immediately on the
+// STALE value and let the consumer run before the new copy landed.
+//
+// So the producer writes a value that CHANGES per handoff (a counter the
+// wave increments), and the consumer waits for the flag to DIFFER from the
+// value it last saw. The consumer's own register is the "last seen", so the
+// comparison needs no host involvement.
+//
+// Bounded, and the observed value is written out either way: a producer that
+// never ran shows up as a TIMEOUT rather than as a wedged device.
+extern "C" __global__ void grim_scythe_wait_flag_change(
+    const volatile unsigned int* flag,
+    unsigned int* last_seen,
+    unsigned int max_spins,
+    unsigned int* observed)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    unsigned int last = *last_seen;
+    unsigned int spins = 0;
+    unsigned int v = *flag;
+    while (v == last && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *flag;
+        spins++;
+    }
+    *observed = v;
+    *last_seen = v;
 }
 
 // M6: wait for a FLAG to become non-zero, DEVICE-SIDE.
