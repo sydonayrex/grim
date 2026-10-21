@@ -218,7 +218,13 @@ impl TaskGraphBuilder {
             caps.opcodes.insert(n.opcode);
             caps.devices.insert(n.device);
             caps.max_fan_in = caps.max_fan_in.max(n.n_deps);
-            if n.opcode == op::GEMM {
+            // The QuantFormat axis: the nodes that CARRY a format id in
+            // slot 0. A GEMM's slot 0 is its weight's format; a
+            // MOE_DISPATCH's is its expert BANKS' format (the MoE's
+            // expert weights are a different format from the dense
+            // linears around them, and an axis that only saw the dense
+            // ones claimed coverage the model does not have).
+            if n.opcode == op::GEMM || n.opcode == op::MOE_DISPATCH {
                 caps.quant_modes.insert(n.params[0]);
             }
             if n.opcode == op::PEER_COPY {

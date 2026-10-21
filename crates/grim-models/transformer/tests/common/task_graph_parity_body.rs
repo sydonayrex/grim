@@ -349,40 +349,47 @@ fn run_oracle(rel: &str, label: &str, tokens: &[u32], interpret_bar: f32) {
         std::mem::forget(ring);
     }
 
-    // ── The coverage table's QuantFormat axis is FED: every GEMM node names
-    // its weight format, and `quant_modes` is derived from them.
-    let gemm_params: Vec<u32> = ir
+    // ── The coverage table's QuantFormat axis is FED: every node that
+    // carries a weight format names it, and `quant_modes` is derived from
+    // them. A GEMM's slot 0 is its weight's format; a MOE_DISPATCH's is its
+    // expert BANKS' format (the MoE's experts are a different format from
+    // the dense linears around them, and an axis that only saw the dense
+    // ones claimed coverage the model does not have).
+    let quant_params: Vec<u32> = ir
         .nodes
         .iter()
-        .filter(|n| n.opcode == grim_backend_rocm::task_graph::op::GEMM)
+        .filter(|n| {
+            n.opcode == grim_backend_rocm::task_graph::op::GEMM
+                || n.opcode == grim_backend_rocm::task_graph::op::MOE_DISPATCH
+        })
         .map(|n| n.params[0])
         .collect();
     assert!(
-        !gemm_params.is_empty(),
+        !quant_params.is_empty(),
         "{label}: no GEMM nodes carry a quant param"
     );
-    eprintln!("[{label}] GEMM params[0] (QuantFormat ids, 0 = native): {gemm_params:?}");
+    eprintln!("[{label}] quant params[0] (QuantFormat ids, 0 = native): {quant_params:?}");
     // Negative control on the axis itself. The head nodes used to put
     // `vocab_size` in slot 0; that reads as a plausible integer and silently
     // widened `quant_modes` with a geometry value. `QuantFormat`'s ids are
     // contiguous from 1, so `1..=last` is exactly "is a variant".
     let last_id = grim_tensor::QuantFormat::Iq1M as u32;
-    for &q in &gemm_params {
+    for &q in &quant_params {
         assert!(
             q == 0 || (1..=last_id).contains(&q),
-            "{label}: GEMM params[0] = {q} is not a QuantFormat id \
+            "{label}: a quant-carrying node's params[0] = {q} is not a QuantFormat id \
              (0 = native, 1..={last_id} = variants) — the coverage axis has \
              been fed a geometry value"
         );
     }
     assert!(
         !ir.caps.quant_modes.is_empty(),
-        "{label}: quant_modes must be derived from the GEMM nodes"
+        "{label}: quant_modes must be derived from the quant-carrying nodes"
     );
     assert_eq!(
         ir.caps.quant_modes,
-        gemm_params.iter().copied().collect(),
-        "{label}: quant_modes must equal the set of GEMM params[0]"
+        quant_params.iter().copied().collect(),
+        "{label}: quant_modes must equal the set of the quant-carrying nodes' params[0]"
     );
     // Moving `vocab_size` out of slot 0 must not DROP it. The head is the last
     // GEMM, and its output width is exactly the logits length.
@@ -398,7 +405,7 @@ fn run_oracle(rel: &str, label: &str, tokens: &[u32], interpret_bar: f32) {
         "{label}: the head GEMM node must still record its output width in params[1]"
     );
     assert!(
-        gemm_params.len() > 1,
+        quant_params.len() > 1,
         "{label}: expected per-layer FFN GEMMs in addition to the head"
     );
 

@@ -1386,9 +1386,28 @@ impl DecodeGraphModel for Llama {
                 emit_last = match self.moe_blocks.get(i) {
                     // An MoE layer's FFN is the dispatch itself: routing triple
                     // plus the per-layer output staging.
-                    Some(Some(_)) => graph.emit_node(
+                    Some(Some(moe_block)) => graph.emit_node(
                         grim_backend_rocm::task_graph::op::MOE_DISPATCH,
-                        [0; 16],
+                        // params[0] = the expert banks' QuantFormat (the
+                        // coverage axis), params[5] = num_experts,
+                        // params[6] = top_k — the slots the ring's MOE
+                        // binding reads. The GEOMETRY slots stay 0: the node
+                        // is descriptive, and the ring refuses a node it
+                        // cannot bind (the same contract the FFN node
+                        // follows).
+                        {
+                            let mut p = [0u32; 16];
+                            p[0] = moe_block
+                                .moe
+                                .experts
+                                .gate
+                                .first()
+                                .map(|g| gemm_quant_param(g.weight()))
+                                .unwrap_or(0);
+                            p[5] = moe_block.moe.router.num_experts as u32;
+                            p[6] = moe_block.moe.router.top_k as u32;
+                            p
+                        },
                         &[
                             (
                                 graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
@@ -9351,7 +9370,25 @@ impl Xing40 {
                 grim_backend_rocm::decode_graph_buffers::emit_node_into(
                     emitter,
                     grim_backend_rocm::task_graph::op::MOE_DISPATCH,
-                    [cfg.n_routed_experts as u32, cfg.num_experts_per_tok as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    // params[0] = the expert banks' QuantFormat (the coverage
+                    // axis — the MoE's experts are a different format from the
+                    // dense linears, and an axis that only saw the dense ones
+                    // claimed coverage the model does not have), params[5] =
+                    // num_experts, params[6] = top_k — the slots the ring's
+                    // MOE binding reads. The expert counts used to sit in
+                    // params[0..2], where the format belongs.
+                    {
+                        let mut p = [0u32; 16];
+                        p[0] = layer
+                            .moe
+                            .as_ref()
+                            .and_then(|m| m.experts.first())
+                            .map(|e| gemm_quant_param(e.w1.weight()))
+                            .unwrap_or(0);
+                        p[5] = cfg.n_routed_experts as u32;
+                        p[6] = cfg.num_experts_per_tok as u32;
+                        p
+                    },
                     &[
                         (
                             buffers.moe_route_experts.device_ptr_u64().unwrap_or(0),
