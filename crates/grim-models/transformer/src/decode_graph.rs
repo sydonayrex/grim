@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
+use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::decode_graph_buffers::{
     ConvDeviceSeed, ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
     check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
@@ -2534,133 +2535,18 @@ impl Qwen35Block {
             )?;
         } else {
             // KDA Recurrent layer forward pass inside captured HIP graph
-            let qkv_lin = self.attn_qkv.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing attn_qkv".into())
-            })?;
-            let alpha_lin = self.ssm_alpha.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_alpha".into())
-            })?;
-            let beta_lin = self.ssm_beta.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_beta".into())
-            })?;
-            let gate_lin = self.attn_gate.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing attn_gate (z)".into())
-            })?;
-            let conv_w = self.ssm_conv1d.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_conv1d".into())
-            })?;
-            if conv_w.storage().device_ptr().is_none() {
-                return Err(grim_core::error::Error::Backend(
-                    "ssm_conv1d weight lacks valid device pointer for graph capture".into(),
-                ));
-            }
-            let dt_bias_d = self.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_dt_bias_dev".into())
-            })?;
-            let ssm_a_d = self.ssm_a_dev.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_a_dev".into())
-            })?;
-            let ssm_norm_d = self.ssm_norm_dev.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_norm_dev".into())
-            })?;
-            let kda_buf = buffers
-                .kda
-                .get(layer_idx)
-                .and_then(|o| o.as_ref())
-                .ok_or_else(|| {
-                    grim_core::error::Error::Backend(format!(
-                        "missing KDA graph buffers for layer {layer_idx}"
-                    ))
-                })?;
-
             // 1. Projections: QKV -> q_buf, alpha -> kda_alpha, beta -> kda_beta, gate (z) -> gate_buf
-            linear_into_named(
-                dev,
-                normed,
-                qkv_lin.weight(),
-                &buffers.q_buf[layer_idx],
-                act,
-                "kda.attn_qkv",
-                layer_idx,
-            )?;
-            linear_into_named(
-                dev,
-                normed,
-                alpha_lin.weight(),
-                &kda_buf.alpha,
-                act,
-                "kda.alpha",
-                layer_idx,
-            )?;
-            linear_into_named(
-                dev,
-                normed,
-                beta_lin.weight(),
-                &kda_buf.beta,
-                act,
-                "kda.beta",
-                layer_idx,
-            )?;
-            linear_into_named(
-                dev,
-                normed,
-                gate_lin.weight(),
-                &kda_buf.gate,
-                act,
-                "kda.attn_gate",
-                layer_idx,
-            )?;
+            self.forward_graph_recurrent_projections(layer_idx, buffers, dev, normed, act)?;
 
-            // 2. Short conv causal step into kda_buf.conv_out
-            if layer_idx >= buffers.sc_state.len() {
-                return Err(grim_core::error::Error::Backend(format!(
-                    "layer {layer_idx} >= sc_state {}",
-                    buffers.sc_state.len()
-                )));
-            }
-            dev.short_conv1d_causal_step_into(
-                &buffers.q_buf[layer_idx],
-                conv_w.storage().as_ref(),
-                None,
-                &buffers.sc_state[layer_idx],
-                &kda_buf.conv_out,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
-
-            // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
-            let n_val_heads = self.cfg_ssm_num_value_heads();
-            let n_key_heads = self.cfg_ssm_num_key_heads();
-            let head_dim = self.cfg_ssm_head_dim();
-            let eps = self.attn_norm.eps;
-            dev.kda_gated_delta_rule_batched_into(
-                &kda_buf.conv_out,
-                &kda_buf.alpha,
-                &kda_buf.beta,
-                dt_bias_d.as_ref(),
-                ssm_a_d.as_ref(),
-                ssm_norm_d.as_ref(),
-                Some(&kda_buf.gate),
-                &kda_buf.state,
-                &kda_buf.acc_scratch,
-                &kda_buf.branch,
-                n_val_heads,
-                n_key_heads,
-                head_dim,
-                eps,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
+            // 2+3. The KDA STEP: the short conv causal step and the batched
+            // gated delta rule + head norm. This is EXACTLY what the ring's
+            // OP_RECURRENT arm does (the wave runs the same three device
+            // functions inline), so the IR walk dispatches EITHER this method
+            // OR the ring's node — never both.
+            self.forward_graph_recurrent_kda(layer_idx, buffers, dev)?;
 
             // 4. Output projection (ssm_out)
-            let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
-                grim_core::error::Error::Backend("missing ssm_out projection".into())
-            })?;
-            linear_into(
-                dev,
-                &kda_buf.branch,
-                out_proj.weight(),
-                &buffers.norm_buf[layer_idx],
-                act,
-            )?;
+            self.forward_graph_recurrent_out(layer_idx, buffers, dev, act)?;
         }
 
         // Destination for final block output (residual add writes directly into next layer or head_input)
@@ -2826,6 +2712,196 @@ impl Qwen35Block {
 
         Ok(())
     }
+
+    /// The recurrent (KDA) layer's PROJECTIONS — step 1 of the block's path.
+    ///
+    /// Split out so the IR walk can dispatch the KDA STEP to the ring between
+    /// these projections and the output projection. The capture path calls the
+    /// SAME method, so there is one implementation of the block's sequence —
+    /// duplicating it is how two entry points drift apart.
+    pub fn forward_graph_recurrent_projections(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+        normed: &Storage,
+        act: &RocmStorage,
+    ) -> Result<()> {
+        let qkv_lin = self.attn_qkv.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing attn_qkv".into())
+        })?;
+        let alpha_lin = self.ssm_alpha.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_alpha".into())
+        })?;
+        let beta_lin = self.ssm_beta.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_beta".into())
+        })?;
+        let gate_lin = self.attn_gate.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing attn_gate (z)".into())
+        })?;
+        let kda_buf = buffers
+            .kda
+            .get(layer_idx)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(format!(
+                    "missing KDA graph buffers for layer {layer_idx}"
+                ))
+            })?;
+        linear_into_named(
+            dev,
+            normed,
+            qkv_lin.weight(),
+            &buffers.q_buf[layer_idx],
+            act,
+            "kda.attn_qkv",
+            layer_idx,
+        )?;
+        linear_into_named(
+            dev,
+            normed,
+            alpha_lin.weight(),
+            &kda_buf.alpha,
+            act,
+            "kda.alpha",
+            layer_idx,
+        )?;
+        linear_into_named(
+            dev,
+            normed,
+            beta_lin.weight(),
+            &kda_buf.beta,
+            act,
+            "kda.beta",
+            layer_idx,
+        )?;
+        linear_into_named(
+            dev,
+            normed,
+            gate_lin.weight(),
+            &kda_buf.gate,
+            act,
+            "kda.attn_gate",
+            layer_idx,
+        )?;
+        Ok(())
+    }
+
+    /// The recurrent (KDA) layer's KDA STEP — steps 2 and 3 of the block's
+    /// path: the short conv causal step and the batched gated delta rule with
+    /// its head-norm gate.
+    ///
+    /// This is EXACTLY what the ring's `OP_RECURRENT` arm does (the wave runs
+    /// the same three device functions inline), so the IR walk can dispatch the
+    /// step to the ring INSTEAD of calling this — never both.
+    pub fn forward_graph_recurrent_kda(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+    ) -> Result<()> {
+        let conv_w = self.ssm_conv1d.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_conv1d".into())
+        })?;
+        if conv_w.storage().device_ptr().is_none() {
+            return Err(grim_core::error::Error::Backend(
+                "ssm_conv1d weight lacks valid device pointer for graph capture".into(),
+            ));
+        }
+        let dt_bias_d = self.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_dt_bias_dev".into())
+        })?;
+        let ssm_a_d = self.ssm_a_dev.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_a_dev".into())
+        })?;
+        let ssm_norm_d = self.ssm_norm_dev.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_norm_dev".into())
+        })?;
+        let kda_buf = buffers
+            .kda
+            .get(layer_idx)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(format!(
+                    "missing KDA graph buffers for layer {layer_idx}"
+                ))
+            })?;
+
+        // 2. Short conv causal step into kda_buf.conv_out
+        if layer_idx >= buffers.sc_state.len() {
+            return Err(grim_core::error::Error::Backend(format!(
+                "layer {layer_idx} >= sc_state {}",
+                buffers.sc_state.len()
+            )));
+        }
+        dev.short_conv1d_causal_step_into(
+            &buffers.q_buf[layer_idx],
+            conv_w.storage().as_ref(),
+            None,
+            &buffers.sc_state[layer_idx],
+            &kda_buf.conv_out,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
+
+        // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
+        let n_val_heads = self.cfg_ssm_num_value_heads();
+        let n_key_heads = self.cfg_ssm_num_key_heads();
+        let head_dim = self.cfg_ssm_head_dim();
+        let eps = self.attn_norm.eps;
+        dev.kda_gated_delta_rule_batched_into(
+            &kda_buf.conv_out,
+            &kda_buf.alpha,
+            &kda_buf.beta,
+            dt_bias_d.as_ref(),
+            ssm_a_d.as_ref(),
+            ssm_norm_d.as_ref(),
+            Some(&kda_buf.gate),
+            &kda_buf.state,
+            &kda_buf.acc_scratch,
+            &kda_buf.branch,
+            n_val_heads,
+            n_key_heads,
+            head_dim,
+            eps,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
+        Ok(())
+    }
+
+    /// The recurrent (KDA) layer's OUTPUT PROJECTION — step 4 of the block's
+    /// path: `ssm_out` applied to the branch the KDA step produced.
+    ///
+    /// Split out because it is the step that must run AFTER the ring's
+    /// RECURRENT node: the branch it reads is written by the KDA step.
+    pub fn forward_graph_recurrent_out(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+        act: &RocmStorage,
+    ) -> Result<()> {
+        let kda_buf = buffers
+            .kda
+            .get(layer_idx)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(format!(
+                    "missing KDA graph buffers for layer {layer_idx}"
+                ))
+            })?;
+        let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
+            grim_core::error::Error::Backend("missing ssm_out projection".into())
+        })?;
+        linear_into(
+            dev,
+            &kda_buf.branch,
+            out_proj.weight(),
+            &buffers.norm_buf[layer_idx],
+            act,
+        )?;
+        Ok(())
+    }
+
 }
 
 // ─── DecodeGraphModel implementation for Qwen3.5 ───────────────────────────
