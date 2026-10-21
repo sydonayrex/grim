@@ -49,6 +49,22 @@ struct Entry {
     /// Opcode whose PRESENCE proves this emitter names its exotic op.
     must_contain: Option<u32>,
     must_not_contain: Option<u32>,
+    /// Whether this model's IR may carry FALLBACK nodes.
+    ///
+    /// A FALLBACK node means "there is a launch here the ring cannot name" —
+    /// which is the plan's fallback contract for an op with no opcode yet. It
+    /// is only a DEFECT when the emitter could have named the launch: the
+    /// LFM2's ShortConv branch and its fused Q8_0 down-plus-residual
+    /// projection are both launches with no ring opcode, so that model's IR
+    /// legitimately carries FALLBACK nodes.
+    allow_fallback: bool,
+    /// The token the capture feeds.
+    ///
+    /// Per entry, because the vocabularies differ: the Llama's is 128256 and
+    /// the LFM2's is 65536, and a token past the end of the vocabulary makes
+    /// the embedding gather read out of bounds — a GPU fault that looks
+    /// nothing like "the token is wrong".
+    token: u32,
 }
 
 #[test]
@@ -67,12 +83,28 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
             label: "llama-dense",
             must_contain: None,
             must_not_contain: Some(grim_backend_rocm::task_graph::op::MOE_DISPATCH),
+            allow_fallback: false,
+            token: 128000,
         },
         Entry {
             rel: "models/Xing4.0/Xing4.0-29B-A4B-IQ3_M-MTP.gguf",
             label: "xing40-moe-mla",
             must_contain: Some(grim_backend_rocm::task_graph::op::MOE_DISPATCH),
             must_not_contain: None,
+            allow_fallback: false,
+            token: 128000,
+        },
+        Entry {
+            // The LFM2 family (M5's PM-5 gap): the short-convolution family's
+            // own row. Its IR carries FALLBACK nodes for the launches the ring
+            // has no opcode for (the ShortConv branches, and the Q8_0
+            // down-plus-residual projection the launcher fuses).
+            rel: "models/LFM2.5-350M-Q8_0.gguf",
+            label: "lfm2-shortconv",
+            must_contain: Some(grim_backend_rocm::task_graph::op::ATTENTION),
+            must_not_contain: Some(grim_backend_rocm::task_graph::op::MOE_DISPATCH),
+            allow_fallback: true,
+            token: 100,
         },
     ];
 
@@ -86,7 +118,7 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
         let lm = grim_engine::model_loader::load_model_from_gguf(&path, device.clone())
             .unwrap_or_else(|err| panic!("{}: load: {err}", e.label));
 
-        let token: u32 = 128000;
+        let token: u32 = e.token;
         // Warmups + capture. The replay/parity halves live in the per-model
         // gates (llama_q41_task_graph, xing40_moe_task_graph); this gate is
         // about EMITTER COVERAGE across the zoo, so it stops at the IR.
@@ -129,12 +161,14 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
             "{}: no task graph emitted",
             e.label
         );
-        assert!(
-            !ops.contains(&grim_backend_rocm::task_graph::op::FALLBACK),
-            "{}: FALLBACK in the IR means the emitter skipped a launch it could \
-             not name: {ops:?}",
-            e.label
-        );
+        if !e.allow_fallback {
+            assert!(
+                !ops.contains(&grim_backend_rocm::task_graph::op::FALLBACK),
+                "{}: FALLBACK in the IR means the emitter skipped a launch it could \
+                 not name: {ops:?}",
+                e.label
+            );
+        }
         assert_eq!(
             ir.sinks,
             vec![(ir.nodes.len() - 1) as u32],

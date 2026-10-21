@@ -192,7 +192,7 @@ fn refuse_uncapturable_kv_arena(device: &Device) -> Result<()> {
     )))
 }
 
-fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&grim_backend_rocm::RocmStorage> {
+pub(crate) fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&grim_backend_rocm::RocmStorage> {
     dst_downcast(t.storage().as_ref())
 }
 
@@ -307,7 +307,7 @@ fn linear_into_named(
 /// exists for it by design); otherwise the `QuantFormat` enum ordinal via
 /// `TryFrom<&Storage>`. A storage with no mapping (legacy Q4_0/Q4_1) records 0
 /// too — those dequantize at load, so the launcher that runs IS native.
-fn gemm_quant_param(w: &grim_tensor::Tensor) -> u32 {
+pub(crate) fn gemm_quant_param(w: &grim_tensor::Tensor) -> u32 {
     grim_tensor::QuantFormat::try_from(&w.dtype().storage)
         .map(|f| f as u32)
         .unwrap_or(0)
@@ -318,7 +318,7 @@ fn gemm_quant_param(w: &grim_tensor::Tensor) -> u32 {
 /// operands (`arg_role::WEIGHT` names the weight matrix — see
 /// `task_ring::TaskRingPlan::from_graph`), so a ring that could not see geometry
 /// would still be able to refuse a node rather than guess.
-fn gemm_params_geom(quant: u32, n: u32, k: u32, m: u32) -> [u32; 16] {
+pub(crate) fn gemm_params_geom(quant: u32, n: u32, k: u32, m: u32) -> [u32; 16] {
     let mut p = gemm_params(quant, n);
     p[2] = k;
     p[3] = m;
@@ -336,14 +336,14 @@ fn gemm_params(quant: u32, out_width: u32) -> [u32; 16] {
     p
 }
 
-fn is_q80(t: &grim_tensor::Tensor) -> bool {
+pub(crate) fn is_q80(t: &grim_tensor::Tensor) -> bool {
     matches!(
         t.dtype().storage,
         grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
     )
 }
 
-fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
+pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
     hidden != 0
         && hidden % 32 == 0
         && dev.supports_dot4()
@@ -2049,6 +2049,14 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
 
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
         self.forward_replay(graph, token_id)
+    }
+
+    /// M5 (PM-5 gap): the LFM2's IR walk. The LFM2 used to publish NO task
+    /// graph at all — `lfm2_graph.rs`'s capture walk made no `emit_node`
+    /// calls — so the coverage table had no LFM2 row and the ring had nothing
+    /// to bind. The emitter and this walk land together.
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        self.lfm2_interpret_ir(graph, token_id)
     }
 
     fn eager_kv_seed_sources<'a>(
