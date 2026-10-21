@@ -23,6 +23,17 @@
 //!   `a_consumer_sees_the_producers_update_through_a_peer_read` gates, and
 //!   what the two handoff gates exercise end to end.
 //!
+//! ## Why (the transport)
+//!
+//! `rocm-smi --showtopo` on this box: the link type between every GPU pair is
+//! **PCIE** (weight 40, 2 hops) — there is no XGMI between these cards. A peer
+//! write therefore travels over PCIe, and the writer's store is not promptly
+//! reflected in the reader's cached copy of the line; a peer READ, by
+//! contrast, goes to the producer's memory rather than to a locally cached
+//! copy. That is the asymmetry the design above is built around, and it is
+//! also why the handoff is opt-in: the peer grant it needs puts a PCIe peer
+//! path into the production loop.
+//!
 //! ## An open cross-test interaction
 //!
 //! A device-1 test that runs BEFORE a device-0 ring test in one process makes
