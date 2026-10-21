@@ -29,7 +29,7 @@ use grim_models_transformer::decode_graph::DecodeGraphModel;
 use grim_models_transformer::qwen35::{Qwen35, Qwen35Config};
 use grim_nn::WeightSource;
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
-use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Tensor};
 
 static KV_FORMAT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -60,6 +60,37 @@ fn raw_f32(seed: u32, shape: Vec<usize>) -> RawTensor {
         bytes,
         shape,
         dtype: DType::F32,
+        provenance: grim_tensor::QuantProvenance::GrimNative,
+    }
+}
+
+/// A deterministic IQ4_NL-PACKED tensor: the format's real packing, through
+/// the quantizer, not a fake byte pattern.
+///
+/// The coverage table's QuantFormat axis reads the weight's STORAGE, so a
+/// weight that was dequantized at load would report "native" and the row
+/// would stay unexercised no matter how many models carried the format. The
+/// row needs a weight that stays PACKED — which is also the state the ROCm
+/// fast path keeps it in.
+fn raw_iq4nl(seed: u32, shape: Vec<usize>) -> RawTensor {
+    let n: usize = shape.iter().product();
+    let mut data = Vec::with_capacity(n);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    for _ in 0..n {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let v = ((state >> 8) as f32 / 8_388_608.0) - 1.0;
+        data.push(v * 0.05);
+    }
+    let bytes = grim_quant::quant_iq4nl(&data).expect("quant_iq4nl");
+    RawTensor {
+        bytes,
+        shape,
+        dtype: DType {
+            arith: ArithType::F32,
+            storage: grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::IQ4NL),
+        },
         provenance: grim_tensor::QuantProvenance::GrimNative,
     }
 }
@@ -102,6 +133,16 @@ fn synth_weights_layers(n: usize) -> SynthProvider {
 /// scalar/vector KDA gates. Dims derive from `Qwen35Config::default()`'s
 /// ssm fields (d_state 128, d_conv 4, dt_rank 48, n_group 16), NOT literals.
 fn synth_weights_hybrid(n: usize, interval: usize) -> SynthProvider {
+    synth_weights_hybrid_with(n, interval, false)
+}
+
+/// The same model, with the FFN's down-projection weight in IQ4_NL.
+///
+/// The coverage table's IQ4_NL row needs a model that genuinely carries the
+/// format (see [`raw_iq4nl`]): the axis reads the weight's storage, so a
+/// weight that arrives dequantized would report "native" and the row would
+/// stay unexercised.
+fn synth_weights_hybrid_with(n: usize, interval: usize, iq4nl_down: bool) -> SynthProvider {
     let q_dim = HEADS * HEAD_DIM;
     let kv_dim = KV_HEADS * HEAD_DIM;
     let d_state = 128usize;
@@ -125,7 +166,16 @@ fn synth_weights_hybrid(n: usize, interval: usize) -> SynthProvider {
         put(&mut m, &format!("{p}.ffn_norm.weight"), vec![HIDDEN]);
         put(&mut m, &format!("{p}.ffn_gate.weight"), vec![INTER, HIDDEN]);
         put(&mut m, &format!("{p}.ffn_up.weight"), vec![INTER, HIDDEN]);
-        put(&mut m, &format!("{p}.ffn_down.weight"), vec![HIDDEN, INTER]);
+        if iq4nl_down {
+            // The layer index is the seed: deterministic, and distinct per
+            // layer (the shared `seed` counter is borrowed by `put`).
+            m.insert(
+                format!("{p}.ffn_down.weight"),
+                raw_iq4nl(i as u32 + 7, vec![HIDDEN, INTER]),
+            );
+        } else {
+            put(&mut m, &format!("{p}.ffn_down.weight"), vec![HIDDEN, INTER]);
+        }
         if is_attn {
             put(&mut m, &format!("{p}.attn_q.weight"), vec![2 * q_dim, HIDDEN]);
             put(&mut m, &format!("{p}.attn_k.weight"), vec![kv_dim, HIDDEN]);
@@ -1262,6 +1312,124 @@ fn the_qwen35_ring_walk_matches_the_launcher_path() {
         assert!(
             e <= 1e-4,
             "the walk diverges from the captured graph at step {step}: worst {e:.3e} at {at}",
+        );
+    }
+    unsafe { std::env::remove_var("GRIM_EMIT_TASK_GRAPH") };
+}
+
+/// The IQ4_NL coverage row: a model whose weight is IQ4_NL must put Iq4Nl
+/// on the IR's QuantFormat axis, and the walk must still reproduce the
+/// captured graph.
+///
+/// The row's REAL-checkpoint vehicles are both unusable here, and the reasons
+/// are worth recording:
+///
+/// - The Xing40's IQ4_NL sibling (`xing4_0-29b-IQ4_NL.gguf`) is 20.1 GB of
+///   4.5 bpw weights against this 17.1 GB card. It cannot be resident, and
+///   the failure mode without a pre-flight is misleading: the load
+///   "succeeds" through the managed-memory fallback and the first kernel
+///   launch faults with `vram_free = 0.00`.
+/// - The Gemma-4 E4B IQ4_NL checkpoint (`gemma-4-E4B-it-IQ4_NL.gguf`, 5.2
+///   GB — it WOULD fit) cannot be LOADED: the tree has no Gemma-3/4 GGUF
+///   loader. `general.architecture` is `gemma4`, the loader routes it to the
+///   Gemma (v1) type, and that type asks for `blk.N.wq.weight` while the
+///   checkpoint carries `blk.N.attn_q.weight` — and beyond the naming, the
+///   model is a dense sliding-window attention with per-layer rope dims and
+///   logit softcapping, none of which the tree implements.
+///
+/// So the row is exercised with a SYNTHETIC model whose down-projection
+/// weight is genuinely IQ4_NL-PACKED: the format is carried by the storage
+/// (which is what the axis reads), the emitter names it, the axis carries
+/// it, and the walk still reproduces the captured graph. The format's ROCm
+/// matmul arm exists (`KQuantScheme::IQ4NL` in `quantized_matmul`), so the
+/// weight is really executed, not just labelled.
+#[test]
+fn the_iq4nl_row_is_on_the_coverage_axis() {
+    let Some((device, _dev)) = gpu_device() else {
+        return;
+    };
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("GRIM_KV_ARENA", "f32") };
+    unsafe { std::env::set_var("GRIM_EMIT_TASK_GRAPH", "1") };
+
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 2;
+    let provider = synth_weights_hybrid_with(4, 2, true);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, cfg).expect("load iq4nl qwen35");
+
+    // ── The captured graph (the reference) and the IR it publishes.
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("capturable");
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    let ir = graph
+        .buffers
+        .emitted_task_graph
+        .clone()
+        .expect("the capture must publish the IR");
+    let iq4nl = grim_tensor::QuantFormat::Iq4Nl as u32;
+    assert!(
+        ir.caps.quant_modes.contains(&iq4nl),
+        "the IQ4_NL model's axis {:?} does not carry Iq4Nl ({iq4nl}) — the coverage \
+         row is still unexercised",
+        ir.caps.quant_modes
+    );
+    eprintln!(
+        "[iq4nl-row] the axis is {:?} (Iq4Nl = {iq4nl})",
+        ir.caps.quant_modes
+    );
+
+    // ── The walk must reproduce the captured graph (the M2 oracle), with the
+    // IQ4_NL weight in play.
+    let mut gp = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("capturable (walk)");
+    let _ = model.forward_capture(&mut gp, TOKENS[0]);
+    let _ = model.forward_capture(&mut gp, TOKENS[0]);
+    gp.begin_capture().expect("begin capture (walk)");
+    model
+        .forward_capture(&mut gp, TOKENS[0])
+        .expect("recorded capture (walk)");
+    gp.end_capture().expect("end capture (walk)");
+    gp.buffers.reset_for_replay().expect("reset (walk)");
+
+    // BOTH arms must start from an empty arena. The capture's two EAGER
+    // warm-ups advanced the KV arena's layer totals, so the graph's history
+    // carries two rows the walk's graph does not have — and the attention
+    // then reads a different number of rows, which shows up at step 1 (the
+    // step-0 rows are the same token, so the difference is small there and
+    // grows).
+    graph.buffers.reset_for_replay().expect("reset (replay)");
+
+    let mut replay_logits = Vec::new();
+    for tok in TOKENS {
+        model.forward_replay(&mut graph, tok).expect("graph replay");
+        replay_logits.push(graph.read_logits_f32().expect("replay logits"));
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+    let mut walk_logits = Vec::new();
+    for tok in TOKENS {
+        model
+            .forward_interpret_ir(&mut gp, tok)
+            .expect("walk interpret");
+        walk_logits.push(gp.read_logits_f32().expect("walk logits"));
+        gp.buffers.current_pos = gp.buffers.current_pos.wrapping_add(1);
+    }
+    for (step, (a, b)) in replay_logits.iter().zip(walk_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[iq4nl-row] step {step}: the walk vs the graph replay, worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 1e-4,
+            "the IQ4_NL model's walk diverges from the captured graph at step {step}: \
+             worst {e:.3e} at {at}"
         );
     }
     unsafe { std::env::remove_var("GRIM_EMIT_TASK_GRAPH") };

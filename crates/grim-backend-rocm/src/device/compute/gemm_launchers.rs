@@ -2756,6 +2756,26 @@ impl RocmDevice {
                 }
                 return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
             }
+            DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
+                // The IQ4_NL decode leg: the SCALAR fused dequant-GEMM, on the
+                // f32 activation (no q8_1 scratch needed).
+                //
+                // It must NOT ride the generic or-pattern's WMMA leg below.
+                // That leg is a fused dequant whose tile assumes the weight's
+                // 32-element blocks line up with the tile's K extent; IQ4_NL
+                // packs 32 weights in 18 BYTES, and the WMMA leg read the
+                // wrong bytes — the qwen35 hybrid with an IQ4_NL
+                // down-projection returned NaN logits on BOTH the graph and
+                // the walk (measured 2026-10-21). The same separation the
+                // GSQ-RCO arm above documents: a format whose blocks do not
+                // fill the tile gets its OWN leg, so a wrong-but-plausible
+                // decode is impossible.
+                let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("linear_decode_into: a not RocmStorage".into())
+                })?;
+                self.launch_fused_dequant_gemm_iq4nl(a_rocm, w, out, m, n, k)?;
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+            }
             DTypeStorage::KQuant(
                 scheme @ (KQuantScheme::Q4K
                 | KQuantScheme::Q5K
@@ -2763,7 +2783,6 @@ impl RocmDevice {
                 | KQuantScheme::Q2K
                 | KQuantScheme::Q3K
                 | KQuantScheme::IQ3S
-                | KQuantScheme::IQ4NL
                 | KQuantScheme::IQ4XS
                 | KQuantScheme::IQ2S
                 | KQuantScheme::IQ2XS
