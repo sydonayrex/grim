@@ -697,3 +697,285 @@ layer's node, giving the IR **two sinks** and telling a scheduler it could run
 the head before the norm. The PM-4 gate caught it on re-run — a reminder that an
 emitter and the graph it publishes are two separate claims, and only the gate
 tests the second.
+
+## The M=1 decode regime: three experiments, then the kernel they licensed (2026-10-22)
+
+Plan (local working document, alongside the sibling
+`plans/META-SYNTHESIS-res1-res8-vs-rocm-kernels.md` that named the three
+experiments): `plans/PLAN-m1-decode-regime-experiments.md`. Corpus:
+`old/res8/` (76 papers, 2026). The three experiments are the ones
+`plans/META-SYNTHESIS-res1-res8-vs-rocm-kernels.md` §4 #5 named as "nobody
+has run".
+
+Card: **RX 9060 XT (gfx1200), ordinal 1** — the measurement card. Card 0
+(RX 9070 XT, gfx1201) is reserved and was not used. ROCm 7.2.4, wave32.
+
+### (b) rho = TC:CC — DONE
+
+`tests/rdna4_rho_microbench.rs` (the infrastructure already existed; there
+was no recorded result).
+
+```
+[rho] fp32 VALU: 6.4 TFLOP/s | wmma f16 TC: 70.1 TFLOP/s | rho = 11.04
+```
+
+**rho = 11.04 >> 1**, so the "the CUDA cores are too slow to feed the
+tensor cores" branch is decisively rejected: dequant work on the VALU is
+cheap next to the TC, and a fused-dequant matrix-core path is structurally
+right for M>1. Two consequences the plan did not anticipate:
+
+- **The IQ family cannot use the tensor core at all.** Their 4-bit codes
+  are table *indices*, not numbers, and gfx1200/1201 expose no int8 WMMA
+  (the int8 matrix path arrives with gfx950). The WMMA route can serve the
+  K-quants and the u4-lane path; it can never serve the IQ family, whose
+  improvement must come from the *lookup*.
+- **For M=1 rho is nearly irrelevant** — there is no MMA at M=1 — so it
+  does not move the decode plan.
+
+Caveat: the plan asked for gfx1201; the measurement is gfx1200 because
+card 0 is reserved. Both are RDNA4 and both CC and TC scale with CU
+count, so rho is expected to carry over; the expectation is **rho ~ 11,
+not a measured 11.04 on gfx1201**.
+
+### (a) The compute-only decode GEMV — DONE, and it moves the diagnosis
+
+New probe: `crates/grim-backend-rocm/tests/m1_decode_regime_probe.rs`
+(working-set sweep, cold/warm pair, and a **kernel census**).
+
+**The census is not optional.** The first sweep set `GRIM_DOT_GEMV=1` and
+measured "Q4_K", and Q4_K came out 12x faster than the committed 81.2
+GB/s. The trace explains it: **the Q4_K arm of `linear_decode_into` takes
+the u4-lane route** — a LOSSY W4A4 requantization — because
+`try_u4_lane_decode` allows it for Q4_K and refuses it for Q5_K/Q6_K on
+fidelity grounds. The first sweep measured a different weight
+representation, not a different unpack.
+
+| format | kernel actually launched | per launch, n=4096 k=5120 m=1 | VGPR | scratch spill |
+|---|---|---|---|---|
+| Q4_K | `grim_quantize_u4_group128` + `grim_dot8_w4a4_gemv` | 29 us (u4-lane) | - | - |
+| Q5_K | `grim_dot4_q5k_q81_gemv` | 245 us | **192** | **180 B** |
+| Q6_K | `grim_dot4_q6k_q81_gemv` | 178 us | **192** | **88 B** |
+| Q2_K | `grim_dot4_q2k_q81_gemv` | 120 us | 64 | 0 |
+| Q3_K | `grim_dot4_q3k_q81_gemv` | 145 us | 88 | 0 |
+| Q4_K (exact) | `grim_dot4_q4k_q81_gemv_fast` | 130 us | 72 | 0 |
+| Q8_0 | `grim_dot4_q80_f32act_gemv` | 55 us | 64 | 0 |
+
+**Working-set sweep** (k=5120, m=1, working set 3 MB -> 138 MB; `t_cold`
+rotates over 8 weight copies so the bytes come from DRAM):
+
+| format | marginal GB/s | t_cold/t_warm at the 27B shape | fixed per-launch cost |
+|---|---|---|---|
+| Q4_K (exact) | 98 | 0.90 | ~0-10 us |
+| Q6_K | 85 | 0.97 | ~0 us |
+| Q2_K | 78 | ~1.0 | ~0 us |
+| Q3_K | 62 | - | - |
+| Q5_K | 59 | 0.97 | ~9-12 us |
+| Q8_0 | 39 | 1.00 | ~20 us |
+| Q4_K u4-lane (lossy) | **~300 warm** | 0.90 | - |
+
+**Three measured conclusions:**
+
+1. **NOT bandwidth-bound.** `t_cold ≈ t_warm` (0.90-1.00) at every
+   format and every working set. The DRAM term is fully hidden under the
+   kernel's own work.
+2. **NOT a per-launch floor.** The fit gives a fixed per-launch cost of
+   0-20 us, not the 1-3 ms the floor probe reported for the PRE-HOIST
+   kernel at k=4096.
+3. **WORK-bound** — the unpack, exactly as `old/res8` §2.1 argues. The
+   byte-count counter-example is inside the measurement: **Q2_K reads the
+   FEWEST bytes of any K-quant (6.9 MB) and is among the SLOWEST (120 us)**;
+   Q6_K reads 2.5x more and is FASTER (178 us).
+
+**The ceiling is not the silicon.** The u4-lane path reaches ~300 GB/s
+warm on the same shapes with no per-element dequant at all. The exact
+K-quant dot4 legs sit **3-5x below what a different (lossy) weight
+representation achieves on the same shape** — and that gap is an
+unpack/structure gap, not a bytes gap.
+
+### The kernel change the experiments licensed: Q2_K word-wide-mask unpack
+
+`grim_dot4_q2k_q81_gemv` fetched the four 2-bit codes of a 4-weight group
+with **FOUR SEPARATE 1-BYTE LOADS**. Q2_K stores one code per BYTE, so the
+four codes are four CONSECUTIVE bytes and **one 32-bit load delivers all
+of them**. The mask is exact: the codes are the 2-bit field at bit `shift`
+of each byte, `shift = 2*run` in {0,2,4,6}, and after `w >> shift` each
+byte's low 2 bits still come from its own byte (the bits shifted in from
+the next byte land at bit `8-shift >= 2` and are masked off), so
+
+    (w >> shift) & 0x03030303  ==  the stock per-byte extraction
+
+bit for bit. **The same mask the landed group hoist already uses for the
+Q5_K `qh` field.** The dword is 4-byte aligned by construction and the
+load is a 4-byte `__builtin_memcpy`, so it is alignment-safe regardless.
+
+**Gate** (`tests/dot4_kquant_grouped_parity.rs`, the `q2k` row): byte for
+byte against the stock kernel at five shapes, **both driven through
+launchers** so the gate sees the dispatch's grid (the Q4_K lesson: a gate
+that called the kernel with its own grid stayed green while the launcher
+fed it half the columns), and both against the llama.cpp-faithful
+`dequant_q2k` dotted with the same q8_1 codes.
+
+| | per launch | GB/s |
+|---|---|---|
+| stock (4 byte loads per group) | 0.459 ms | 63.7 |
+| **word-wide-mask (1 dword per group)** | **0.374 ms** | **78.2** |
+| | **1.23x** | byte-identical (15/15 shapes) |
+
+`GRIM_Q2K_DOT4_FAST=0` keeps the stock kernel reachable.
+
+### The next change, named by the measurement: the two SPILLING legs
+
+**The two slowest exact legs are the two that spill.** `dot4_q5k_q81_gemv`
+and `dot4_q6k_q81_gemv` compile to 192 VGPRs with 180 B and 88 B of
+scratch spill per thread; the Q4_K `_fast` sibling is at 72 VGPRs and 0 B.
+They fully unroll 4 columns x 8 sub-blocks x 8 e-iterations, and the
+spill puts a local-memory round trip inside a kernel that is **not**
+bandwidth-bound.
+
+This is `old/res8`'s 2607.01590 finding, measured on grim's own silicon:
+**a kernel that compiles and passes correctness but silently violates an
+on-chip capacity limit runs 20-41x slower than the hardware allows.** The
+register file is an on-chip capacity limit. The fix under way is to bound
+the unroll on the two innermost loops of each kernel, which is
+**bit-identical by construction** (the int32 accumulation is an exact
+integer chain whose order does not change, and the float accumulation still
+runs once per sub-block in the same order).
+
+### (c) The phase-level breakdown of the decode window — the constant is NAMED
+
+`GRIM_PHASE_TRACE=1` in `run.rs` prints the per-step distribution, the
+excess over the steady state, the slowest steps with the path that carried
+them, and the per-path totals.
+
+RX 9060 XT (gfx1200), `GRIM_CONTEXT=4096 GRIM_KV_ARENA=int8`, prompt
+"Paris, and the", the same model at TWO token counts — the plan's
+falsifier ("the constant is identified by what does *not* scale with
+tokens"):
+
+| | 8 tokens | 32 tokens |
+|---|---|---|
+| window | 4.994 s | 12.807 s |
+| p50 (the steady state) | **361.7 ms** | **353.6 ms** |
+| step_sum | 4.936 s | 12.763 s |
+| steady (median x n) | 2.894 s | 11.317 s |
+| **EXCESS** | **2.042 s (40.9% of the window)** | **1.447 s (11.3%)** |
+| slowest: prefill | 1711.0 ms | 1101.0 ms |
+| 2nd slowest: **eager (the capture step)** | **1044.0 ms** | **1022.1 ms** |
+| graph-sampled (the steady state) | 6 x 363.4 ms | 30 x 354.7 ms |
+| reported ms/token | 460.66 | 376.20 |
+
+1. **The steady state is 354-362 ms/step** and is the SAME at both token
+   counts — it is the per-token work.
+2. **The one-time cost is the prefill plus the graph capture's eager step,
+   and it does not scale with tokens**: the eager step is **1044.0 ms at 8
+   tokens and 1022.1 ms at 32** — constant to within 2%. The plan's
+   hypothesis (capture running the model eagerly, or the prefill tail) is
+   confirmed, and the alternative it had to exclude (a cost that scales
+   with the prompt length) is excluded for the eager step.
+3. **So a short benchmark run overstates ms/token by up to 25-40%.** At 8
+   tokens the reported 460.66 ms/token is 361.7 ms of per-token work plus
+   2.042 s of one-time cost smeared over 8 tokens; at 32 tokens the
+   reported 376.20 ms/token is 353.6 ms plus 1.447 s. **Every ms/token
+   figure in the corpus measured over a short token count carries this
+   inflation** — including the plan's own "606.3 ms/token" for the 27B
+   (32 tokens), whose ~12 s constant is this same structure scaled by the
+   model.
+
+**What this kills.** The plan had already ranked the host-side per-token
+work (logits D2H, sampling, MTP bookkeeping) LAST, on the grounds that
+the unexplained time is a constant rather than per-token work. That is now
+measured rather than argued: the per-token host work is inside the
+354-362 ms steady state, and the one-time cost is prefill + capture.
+
+**The actionable consequence.** The capture's eager step is a **one-time
+1.02 s on the 9B**, paid on the FIRST decode step (where the u4-lane
+prewarm also lands). A benchmark that reports an average over a short run
+is mostly reporting its own startup. Report the **median step** and the
+**excess** separately, and treat the capture step as a startup cost to be
+amortised over a long run.
+
+### The two kernel changes the experiments licensed, and their measurements
+
+Both are gated on **byte-identity** against the retained oracle
+(`tests/dot4_kquant_grouped_parity.rs`), both driven through **launchers**
+so the gate sees the dispatch's grid — the Q4_K lesson: a gate that called
+the kernel with its own grid stayed green while the launcher fed it half
+the columns — and both checked against the llama.cpp-faithful
+`dequant_*` dotted with the same q8_1 codes, so byte-identity cannot be
+satisfied by two identically wrong kernels. **15/15 shapes byte-identical.**
+
+| | per launch, n=17408 k=5120 m=1 | GB/s | change |
+|---|---|---|---|
+| **Q5_K** | 1.090 -> **0.687 ms** | 56.2 -> **89.2** | **1.59x** |
+| **Q6_K** | 0.923 -> **0.732 ms** | 79.2 -> **99.9** | **1.26x** |
+| **Q2_K** | 0.459 -> **0.372 ms** | 63.7 -> **78.5** | **1.23x** |
+| Q4_K | 0.606 -> 0.614 ms | 82.7 -> 81.7 | unchanged |
+
+**Change 1 — the Q2_K word-wide-mask code unpack.** The stock
+`grim_dot4_q2k_q81_gemv` fetched the four 2-bit codes of a 4-weight group
+with **FOUR SEPARATE 1-BYTE LOADS** and re-assembled them with four
+shifts and three ORs. Q2_K stores one code per BYTE (84 B / 256 weights,
+`qs[64]` at offset 16), so the four codes of a group are four CONSECUTIVE
+bytes and **one 32-bit load delivers all of them**. The mask is exact: the
+codes are the 2-bit field at bit `shift` of each byte, `shift = 2*run` in
+{0,2,4,6}, and after `w >> shift` each byte's low 2 bits still come from
+its own byte (the bits shifted in from the next byte land at bit
+`8-shift >= 2` and are masked off), so
+
+    (w >> shift) & 0x03030303  ==  the stock per-byte extraction
+
+bit for bit. **The same mask the landed group hoist already uses for the
+Q5_K `qh` field.** The dword is 4-byte aligned by construction and the
+load is a 4-byte `__builtin_memcpy`, so it is alignment-safe regardless.
+`GRIM_Q2K_DOT4_FAST=0` keeps the stock kernel reachable.
+
+**Change 2 — the unroll bound on the two SPILLING legs.** The Q5_K and
+Q6_K kernels fully unrolled 4 columns x 8 sub-blocks x 8 e-iterations and
+compiled to **192 VGPRs with 180 B and 88 B of scratch spill per
+thread** — the same shape as the Q4_K `_fast` variant's own history ("the
+stock 4-col kernel compiles to 192 VGPRs + 560 B scratch -> 1 wave/SIMD
+plus local-memory spills; the 88-VGPR q8_0 sibling sustains 300 GB/s").
+The spill puts a local-memory round trip inside a kernel that is **not**
+bandwidth-bound. Bounding the unroll on the two innermost loops is
+**bit-identical by construction**: the int32 accumulation is an exact
+integer chain whose order does not change, and the float accumulation
+still runs once per sub-block in the same order.
+
+| kernel | VGPR | scratch | |
+|---|---|---|---|
+| `dot4_q5k_q81_gemv` | 192 -> **64** | 180 B -> **0** | |
+| `dot4_q6k_q81_gemv` | 192 -> **104** | 88 B -> **0** | |
+| `dot4_q4k_q81_gemv_fast` | 72 | 0 | |
+| `dot4_q3k_q81_gemv` | 88 | 0 | |
+| `dot4_q2k_q81_gemv_fast` | 96 | 0 | |
+| `dot4_q80_f32act_gemv` | 64 | 0 | |
+
+**No K-quant dot4 kernel spills any more** — every one is in the same
+64-104 VGPR band as the Q8_0 sibling that sustains 300 GB/s. The two legs
+that spilled are the two that moved most.
+
+**A trap worth recording.** The first attempt at change 2 applied the
+unroll bound to the **Q4_K stock kernel** instead of Q5_K: the two share
+the same `for (int is = 0; is < 8; ++is)` loop text, and a first-match
+text replacement does not know which kernel it is in. The kernel census
+caught it (Q6_K's VGPRs moved and Q5_K's did not). The edit is now scoped
+to the Q5_K kernel's own region.
+
+### What is left
+
+- **Q3_K (62.1 GB/s, 88 VGPRs, no spill)** is the last K-quant format
+  with a byte-wise unpack. Its `qs` is one 2-bit code per BYTE, so the
+  same `0x03030303` mask applies to its magnitude plane; its sign plane
+  is a separate bit-plane that cannot be masked, so the win will be
+  smaller than Q2_K's.
+- **The IQ family** (17.2 GB/s GEMV on the 27B; IQ4_XS is 117 of the
+  Q4_K_M mix's tensors) is the largest remaining low-bandwidth path, and
+  it is the one the corpus has a mechanism for that the tree does not:
+  **CodeGEMM's Psumbook** (precompute each centroid's inner product
+  against the activation; the hot loop becomes a code-indexed gather of
+  FP16 partial sums; ~0.9% build overhead; 1.83x over AQLM) and the ETH
+  paper's one-stage argument (the two-stage "build a LUT then accumulate"
+  pipeline is what makes the IQ-style kernels slow; 1.0-18.1x over
+  RSR++). Experiment (b) bounds this: the **tensor core cannot serve the
+  IQ family at all** (its 4-bit codes are table indices, not numbers, and
+  gfx1200 exposes no int8 WMMA), so the IQ path's lever is the lookup.

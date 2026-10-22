@@ -1417,6 +1417,18 @@ pub async fn cmd_run(
     // Generation loop
     let mut decode_total_us: u64 = 0;
     let mut decode_count: u64 = 0;
+    // GRIM_PHASE_TRACE=1: the phase-level wall-clock breakdown of the decode
+    // window (experiment (c) of plans/PLAN-m1-decode-regime-experiments.md).
+    //
+    // The plan's open item was the ~12 s CONSTANT inside the 27B's reported
+    // per-token number: a constant that size is a ONE-TIME cost landing
+    // inside the averaged window, not per-token work, and until it is named
+    // "606 ms/token" is an average over an unexplained constant. The
+    // per-step (path, duration) list is what identifies it: a constant shows
+    // up as a few steps that are orders of magnitude above the steady state.
+    let phase_trace_on = std::env::var_os("GRIM_PHASE_TRACE").is_some();
+    let phase_window_start = std::time::Instant::now();
+    let mut phase_steps: Vec<(u64, &'static str)> = Vec::new();
     while generated < max_tokens {
         // Prefill on first pass to populate KV caches; decode one token at a time after.
         // HIGH-3: save first_pass before input_ids block mutates it to avoid wrong positions.
@@ -1561,6 +1573,9 @@ pub async fn cmd_run(
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                if phase_trace_on {
+                    phase_steps.push((step_us, "graph-sampled"));
+                }
                 step_timing!(step_us, "graph-sampled");
                 tok
             }
@@ -1568,6 +1583,9 @@ pub async fn cmd_run(
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                if phase_trace_on {
+                    phase_steps.push((step_us, "graph-logits"));
+                }
                 step_timing!(step_us, "graph-logits");
                 let logits_vec = logits.to_vec_f32()?;
                 let last_start = logits_vec.len().saturating_sub(vocab);
@@ -1647,8 +1665,14 @@ pub async fn cmd_run(
                 if !is_prefill {
                     decode_total_us += step_us;
                     decode_count += 1;
+                    if phase_trace_on {
+                        phase_steps.push((step_us, "eager"));
+                    }
                     step_timing!(step_us, "eager");
                 } else {
+                    if phase_trace_on {
+                        phase_steps.push((step_us, "prefill"));
+                    }
                     step_timing!(step_us, "prefill");
                 }
 
@@ -1843,6 +1867,69 @@ pub async fn cmd_run(
             tps,
             bw_str
         );
+    }
+    // GRIM_PHASE_TRACE=1: name the constant. The reported average is
+    // total/count; if the window also holds a one-time cost (the graph
+    // capture's eager warmup, the prefill tail, the lane prewarm) the average
+    // is that cost smeared over every token. The steady state is the
+    // MEDIAN step; the excess is everything above median*n.
+    if phase_trace_on && !phase_steps.is_empty() {
+        let mut durs: Vec<u64> = phase_steps.iter().map(|(us, _)| *us).collect();
+        durs.sort_unstable();
+        let n = durs.len();
+        let p50 = durs[n / 2];
+        let p90 = durs[((n as f64 * 0.9) as usize).min(n - 1)];
+        let max = durs[n - 1];
+        let sum: u64 = durs.iter().sum();
+        let steady = p50 as u64 * n as u64;
+        let excess = sum.saturating_sub(steady);
+        eprintln!(
+            "[phase-trace] window={:.3}s steps={n} p50={:.1}ms p90={:.1}ms max={:.1}ms",
+            phase_window_start.elapsed().as_secs_f64(),
+            p50 as f64 / 1000.0,
+            p90 as f64 / 1000.0,
+            max as f64 / 1000.0
+        );
+        eprintln!(
+            "[phase-trace] step_sum={:.3}s  steady(median*n)={:.3}s  EXCESS={:.3}s ({:.1}% of the window)",
+            sum as f64 / 1e6,
+            steady as f64 / 1e6,
+            excess as f64 / 1e6,
+            excess as f64 / 1e6 / (phase_window_start.elapsed().as_secs_f64().max(1e-9)) * 100.0
+        );
+        // The slowest steps, with their path: the constant is NAMED by which
+        // path carried it.
+        let mut by_cost: Vec<(u64, &'static str)> = phase_steps.clone();
+        by_cost.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut shown = 0usize;
+        for (us, path) in &by_cost {
+            if shown >= 6 {
+                break;
+            }
+            eprintln!(
+                "[phase-trace] slow step #{shown}: {:.1} ms  path={path}",
+                *us as f64 / 1000.0
+            );
+            shown += 1;
+        }
+        // Per-path totals.
+        let mut paths: Vec<(&'static str, u64, u64)> = Vec::new();
+        for (us, path) in &phase_steps {
+            match paths.iter_mut().find(|(p, _, _)| p == path) {
+                Some((_, tot, cnt)) => {
+                    *tot += us;
+                    *cnt += 1;
+                }
+                None => paths.push((path, *us, 1)),
+            }
+        }
+        for (path, tot, cnt) in &paths {
+            eprintln!(
+                "[phase-trace] path {path:<14} n={cnt:<5} total={:.3}s  mean={:.2}ms",
+                *tot as f64 / 1e6,
+                *tot as f64 / 1e3 / (*cnt).max(1) as f64
+            );
+        }
     }
     // B3: operator-visible graph status (PLAN-reduce-d2h-h2d).
     if matches!(device, Device::Rocm(_)) {
