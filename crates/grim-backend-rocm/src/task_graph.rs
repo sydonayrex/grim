@@ -59,6 +59,56 @@ pub mod arg_role {
     pub const PEER: u8 = 5;
 }
 
+/// The Q8_0 launch-path contract (M7.4).
+///
+/// A Q8_0 projection can be computed three ways, and WHICH one runs is
+/// decided by the architecture and by environment variables — the dot4
+/// integer GEMV, the WMMA fused-dequant GEMV, or (for the down projection)
+/// the fused dot4-plus-residual-add. Today that decision is re-derived at
+/// every launch, from `std::env::var` and the device's arch flag, so the
+/// answer can differ between two launches of the SAME model in the SAME
+/// process if an env var changes — and the IR cannot say which path a node
+/// took, because the IR's opcode is chosen by the same re-derivation.
+///
+/// res7 §9d's QEffect (arXiv:2609.23536) is the model: "Explicit
+/// state/resource contracts... enforced identically under eager and replay."
+/// The contract is not a mechanism; it is the statement of WHICH mutations a
+/// replay may legitimately see. So the decision is made ONCE, and the IR
+/// CARRIES it as data — a node's opcode says which path it is, and the
+/// launcher and the ring read that same decision rather than deriving
+/// their own.
+pub mod q8_0_path {
+    /// The Q8_0 projection is NOT on a dot4 path — it is the WMMA
+    /// fused-dequant GEMV.
+    ///
+    /// This is the DEFAULT, and it is the safe one: the dot4 path is exact
+    /// only on the architectures that sign-extend both packed operands
+    /// (RDNA3/4 and UDNA), and `GRIM_DOT_GEMV=0` turns it off everywhere.
+    /// A model on an older arch, or with the switch off, takes this path.
+    pub const WMMA_DEQUANT: u32 = 0;
+    /// The Q8_0 projection is the dot4 integer GEMV with a Q8_1
+    /// (prequantized) activation.
+    pub const DOT4_Q81: u32 = 1;
+    /// The Q8_0 projection is the dot4 integer GEMV with an f32
+    /// activation, quantized in registers.
+    ///
+    /// This is the path the models' plain Q8_0 projections take, and the one
+    /// the ring's `OP_Q8_0_DOT4_F32ACT` arm reproduces.
+    pub const DOT4_F32ACT: u32 = 2;
+
+    /// The contract's slot in a node's `params`.
+    ///
+    /// Slot 8 — after the geometry slots (0 = quant mode, 1 = N, 2 = K,
+    /// 3 = M) and clear of them, because slot 0 carries the quant mode that
+    /// feeds the coverage axis and a path id there would widen the axis.
+    pub const PARAM_SLOT: usize = 8;
+
+    /// The path id a node carries, or `WMMA_DEQUANT` when it carries none.
+    pub fn from_params(params: &[u32; 16]) -> u32 {
+        params[PARAM_SLOT]
+    }
+}
+
 /// One entry in the model-owned argument table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArgEntry {

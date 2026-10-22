@@ -647,7 +647,7 @@ fn qwen35_graph_serves_curdvk_eviction_like_eager() {
 /// interpreter's input contract.
 #[test]
 fn qwen35_capture_emits_a_structurally_true_task_graph() {
-    let Some((device, _dev)) = gpu_device() else {
+    let Some((device, dev)) = gpu_device() else {
         return;
     };
     let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -787,6 +787,33 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
             "the fused QKV's Q8_0 dot4 must be named (M7.1)"
         );
     }
+    // M7.4: the Q8_0 PATH CONTRACT. Every Q8_0 dot4 node carries the path
+    // the device resolved, and the IR's answer must be the one the launcher
+    // would take — the contract exists so the IR and the launcher read the
+    // SAME decision, not each their own.
+    {
+        use grim_backend_rocm::task_graph::q8_0_path;
+        let shared = grim_backend_rocm::RocmDevice::shared(dev.ordinal());
+        let mut checked = 0usize;
+        for n in &ir.nodes {
+            if n.opcode != op::Q8_0_DOT4_F32ACT {
+                continue;
+            }
+            let carried = q8_0_path::from_params(&n.params);
+            // The node's own K (params[2]) resolves the contract — not some
+            // other launch's geometry.
+            let expected = shared.q8_0_path_contract(n.params[2] as usize);
+            assert_eq!(
+                carried, expected,
+                "the IR's Q8_0 path contract ({carried}) disagrees with the \
+                 device's ({expected}) for a node with k={} (M7.4)",
+                n.params[2]
+            );
+            checked += 1;
+        }
+        eprintln!("[struct] the Q8_0 path contract agrees on {checked} node(s)");
+    }
+
     // And the launches the ring CANNOT run are FALLBACK nodes, not nodes
     // wearing an opcode that names a different computation.
     assert!(

@@ -1084,6 +1084,41 @@ impl RocmDevice {
         true
     }
 
+    /// The Q8_0 launch-path CONTRACT for this device (M7.4).
+    ///
+    /// The decision is made HERE, ONCE, and the IR carries the answer — so
+    /// the launcher and the ring read the SAME decision instead of each
+    /// re-deriving it from the environment and the arch. That is res7 §9d's
+    /// QEffect (arXiv:2609.23536) applied: "Explicit state/resource
+    /// contracts... enforced identically under eager and replay."
+    ///
+    /// The rules, in the order they apply:
+    ///
+    ///  1. `GRIM_DOT_GEMV=0` turns the dot4 path off everywhere, so the
+    ///     projection is the WMMA fused-dequant GEMV.
+    ///  2. Otherwise, a Q8_0 projection on a dot4-capable arch with
+    ///     `k % 32 == 0` is the f32-activation dot4 — the path the models'
+    ///     plain projections take, and the one the ring's
+    ///     `OP_Q8_0_DOT4_F32ACT` arm reproduces.
+    ///  3. Otherwise it is the WMMA fused-dequant GEMV.
+    ///
+    /// The prequantized Q8_1-activation variant is a SEPARATE contract
+    /// value, not a mode of this one: it is a different LAUNCH (a different
+    /// activation layout), so the IR's opcode for it is `OP_Q8_0_DOT4` and
+    /// not `OP_Q8_0_DOT4_F32ACT`.
+    pub fn q8_0_path_contract(&self, k: usize) -> u32 {
+        use crate::task_graph::q8_0_path;
+        let dot_disabled = matches!(
+            std::env::var("GRIM_DOT_GEMV").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if self.is_dot4_arch && !dot_disabled && k >= 32 && k % 32 == 0 {
+            q8_0_path::DOT4_F32ACT
+        } else {
+            q8_0_path::WMMA_DEQUANT
+        }
+    }
+
     /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver
     pub fn allocator_stats(&self) -> (usize, usize) {
         self.allocator.stats()

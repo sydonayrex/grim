@@ -2638,7 +2638,14 @@ impl RocmDevice {
                 let k_aligned = k - (k % 32);
                 // `grim_sdot4` now sign-extends both packed operands, so the
                 // dot4 leg is exact for signed Q8_0 codes on every arch.
-                if self.is_dot4_arch && !dot_disabled && k_aligned >= 32 {
+                //
+                // M7.4: the path is the DEVICE'S CONTRACT
+                // (`q8_0_path_contract`), not a re-derivation here. The
+                // contract is resolved once — the same resolution the IR
+                // carries — so the launcher and the ring cannot disagree
+                // about which path a Q8_0 projection takes.
+                let path = self.q8_0_path_contract(k);
+                if path == crate::task_graph::q8_0_path::DOT4_F32ACT && k_aligned >= 32 {
                     let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                         Error::Backend("linear_decode_into: a not RocmStorage".into())
                     })?;

@@ -513,26 +513,19 @@ impl Lfm2 {
                 if let Some(w) = warg {
                     dargs.push(w);
                 }
+                // M7.4: the node carries the Q8_0 PATH CONTRACT — the
+                // decision made ONCE (by the device) and read from the SAME
+                // place the launcher reads it, so the IR and the launcher
+                // cannot disagree about which path this projection takes.
+                let path = dev.q8_0_path_contract(ffn_k);
+                let mut dp = [0u32; 16];
+                dp[1] = n;
+                dp[2] = ffn_k as u32;
+                dp[3] = m;
+                dp[grim_backend_rocm::task_graph::q8_0_path::PARAM_SLOT] = path;
                 emit_last = graph.emit_node(
                     grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
-                    [
-                        0,
-                        n,
-                        ffn_k as u32,
-                        m,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
+                    dp,
                     &dargs,
                     &[emit_last],
                     ord,

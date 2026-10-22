@@ -2364,26 +2364,20 @@ impl Qwen35Block {
                 // output), which is what the launch computes.
                 if let Some(e) = emit.as_deref_mut() {
                     let n_out = (fused.n_q + fused.n_k + fused.n_v) as u32;
+                    // M7.4: the node carries the Q8_0 PATH CONTRACT — the
+                    // decision made ONCE (by the device) and read from the
+                    // SAME place the launcher reads it, so the IR and the
+                    // launcher cannot disagree about which path this
+                    // projection takes.
+                    let path = dev.q8_0_path_contract(self.hidden_size);
+                    let mut p = [0u32; 16];
+                    p[1] = n_out;
+                    p[2] = self.hidden_size as u32;
+                    p[3] = m as u32;
+                    p[grim_backend_rocm::task_graph::q8_0_path::PARAM_SLOT] = path;
                     e.launch(
                         grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
-                        [
-                            0,
-                            n_out,
-                            self.hidden_size as u32,
-                            m as u32,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ],
+                        p,
                         &[
                             (
                                 act.device_ptr_u64().unwrap_or(0),
@@ -3219,26 +3213,16 @@ impl Qwen35Block {
             // (an ELEMENTWISE node, ring-executable).
             if let Some(e) = emit.as_deref_mut() {
                 let n = wd.weight().shape().dim(0).unwrap_or(0) as u32;
+                // M7.4: the node carries the Q8_0 PATH CONTRACT.
+                let path = dev.q8_0_path_contract(ffn_k);
+                let mut p = [0u32; 16];
+                p[1] = n;
+                p[2] = ffn_k as u32;
+                p[3] = batch.max(1) as u32;
+                p[grim_backend_rocm::task_graph::q8_0_path::PARAM_SLOT] = path;
                 e.launch(
                     grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
-                    [
-                        0,
-                        n,
-                        ffn_k as u32,
-                        batch.max(1) as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
+                    p,
                     &[
                         (
                             buffers.activated_buf[layer_idx].device_ptr_u64().unwrap_or(0),

@@ -150,6 +150,49 @@ fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
         "the IR must carry the Q8_0 down projection's dot4 as its own node \
          (M7.3): {op_counts:?}"
     );
+    // M7.4: the Q8_0 PATH CONTRACT. Every Q8_0 dot4 node must carry the
+    // path the device resolved, and the IR's answer must be the one the
+    // launcher would take. The point of the contract is that the IR and the
+    // launcher read the SAME decision — a node that names one path while
+    // the launcher takes another is the disagreement the contract exists to
+    // prevent.
+    {
+        use grim_backend_rocm::task_graph::q8_0_path;
+        let dev = grim_backend_rocm::RocmDevice::shared(0);
+        let mut checked = 0usize;
+        for n in &ir.nodes {
+            if n.opcode != op::Q8_0_DOT4_F32ACT {
+                continue;
+            }
+            let carried = q8_0_path::from_params(&n.params);
+            // The node's K is params[2], so the contract is resolved with the
+            // node's own geometry — not with some other launch's.
+            let expected = dev.q8_0_path_contract(n.params[2] as usize);
+            assert_eq!(
+                carried, expected,
+                "the IR's Q8_0 path contract ({carried}) disagrees with the \
+                 device's ({expected}) for a node with k={} — the IR and the \
+                 launcher must read the SAME decision (M7.4)",
+                n.params[2]
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the IR must carry at least one Q8_0 dot4 node to check the path \
+             contract (M7.4)"
+        );
+        eprintln!(
+            "[lfm2-ir] the Q8_0 path contract agrees on {checked} node(s): {:?}",
+            q8_0_path::from_params(
+                &ir.nodes
+                    .iter()
+                    .find(|n| n.opcode == op::Q8_0_DOT4_F32ACT)
+                    .expect("a dot4 node")
+                    .params
+            )
+        );
+    }
     // The chain: every node but the first depends on its predecessor, and
     // there is exactly ONE sink (the head's GEMM).
     assert_eq!(
