@@ -2639,23 +2639,43 @@ impl Qwen35Block {
                     // kernel on THIS stream that spins on the ring
                     // descriptor's status — device-side, so the producer and
                     // the consumer overlap instead of alternating.
+                    //
+                    // M7.1b: the wait's VERIFICATION (did the producer
+                    // actually run?) is DEFERRED to the end of the step. The
+                    // M7.0 A/B measured 2 blocking D2H/step here — one per
+                    // recurrent layer — and the megakernel arm came out 2.4x
+                    // SLOWER than the per-kernel path with bit-identical
+                    // output. A blocking D2H cannot complete until the device
+                    // has finished everything queued before it, so each one
+                    // drained the pipeline mid-step, with a whole layer of
+                    // work still to enqueue. This is the corpus's §9c
+                    // finding measured on grim's own hardware: "any
+                    // device-side chaining scheme that waits on completion at
+                    // fine granularity serialises, and the drains multiply
+                    // with the number of transfers per step."
+                    //
+                    // The ORDERING is unchanged: the wait kernel is still
+                    // launched on this stream, so the output projection
+                    // cannot read the branch before the recurrent step wrote
+                    // it. What moves is only the host read-back, which
+                    // becomes ONE per step instead of one per node.
                     let slot = dispatch.ring.last_slot() as u32;
                     let slots_ptr = dispatch.ring.slots_ptr().map_err(|e| {
                         grim_core::error::Error::Backend(format!("qwen35 ring slots: {e}"))
                     })?;
-                    let observed = dispatch
+                    dispatch
                         .ring
-                        .wait_device_slot(dev, slots_ptr, slot, dispatch.ring.ring_wait_spins())
+                        .wait_device_slot_deferred(
+                            dev,
+                            slots_ptr,
+                            slot,
+                            dispatch.ring.ring_wait_spins(),
+                        )
                         .map_err(|e| {
                             grim_core::error::Error::Backend(format!(
                                 "qwen35 ring wait: {e}"
                             ))
                         })?;
-                    if observed != 2 {
-                        return Err(grim_core::error::Error::Backend(format!(
-                            "qwen35 ring recurrent step did not complete (status {observed})"
-                        )));
-                    }
                 }
                 None => self.forward_graph_recurrent_kda(layer_idx, buffers, dev)?,
             }
@@ -3077,6 +3097,15 @@ impl Qwen35 {
         // The ring's plan is derived from THIS IR, so its RECURRENT entries are
         // in the IR's node order — the same order the recurrent layers appear
         // in below.
+        //
+        // M7.1b: the step's deferred waits start from a ZEROED observation
+        // buffer, so a wait that never runs cannot inherit the previous
+        // step's "complete" and pass a step that never happened.
+        if let Some(r) = ring.as_ref() {
+            r.begin_step_waits(&dev).map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 ring begin waits: {e}"))
+            })?;
+        }
         let mut recurrent_idx = 0usize;
         for (i, block) in self.blocks.iter().enumerate() {
             let blk_ord = match block.device {
@@ -3132,6 +3161,30 @@ impl Qwen35 {
         }
         for ord in ords {
             grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+
+        // M7.1b: the deferred wait's VERIFICATION, read back ONCE for the
+        // whole step — after the synchronise above, so the copy finds the
+        // device idle rather than draining a live pipeline. The status is 2
+        // (ST_COMPLETE) when the wait saw the descriptor finish, and 0
+        // (ST_PENDING) when the spin ran out, which means the producer never
+        // ran and the step read stale data.
+        //
+        // The verification is per-STEP rather than per-node, and the trade is
+        // deliberate: a timeout is now reported at the end of the step
+        // rather than at the layer that caused it. A decode step either
+        // produces usable logits or it does not, so the step is the right
+        // granularity — and it is the granularity that removes the drain the
+        // M7.0 A/B measured.
+        if let Some(r) = ring.as_ref() {
+            let observed = r.verify_waits().map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 ring wait verify: {e}"))
+            })?;
+            if observed != 2 {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "qwen35 ring recurrent step did not complete (status {observed})"
+                )));
+            }
         }
         Ok(())
     }

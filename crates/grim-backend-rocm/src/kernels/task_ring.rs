@@ -738,8 +738,22 @@ pub struct TaskRingContext {
     /// the one that feeds it — so the host also knows when the wave may be
     /// gone, and can launch a fresh one before publishing the next node.
     wave_last_work_ms: std::sync::atomic::AtomicU64,
-    /// A one-word scratch buffer the device-side wait kernel writes its
-    /// observation into.
+    /// A scratch buffer the device-side wait kernel writes its observations
+    /// into — ONE WORD PER WAIT, not one word for the whole ring.
+    ///
+    /// M7.1b. The deferred wait keeps the device-side wait kernel (which
+    /// provides the ordering) and drops the per-wait host read-back (which
+    /// drained the pipeline). The verification moves to the end of the step,
+    /// where ONE read-back checks them ALL — and that only works if each
+    /// wait's observation lands in its OWN word. A single shared word would
+    /// leave the LAST wait's observation standing and the earlier ones
+    /// overwritten, so a step whose FIRST wait timed out and whose second
+    /// succeeded would verify clean. A failure that only the first wait saw
+    /// is exactly the failure a gate must not miss.
+    ///
+    /// The buffer is sized for the ring's capacity, which bounds the waits
+    /// one step can have: the ring cannot hold more live descriptors than
+    /// that.
     wait_observed: Box<dyn BackendStorage>,
     /// True once the resident wave has been stopped AND confirmed gone.
     ///
@@ -748,6 +762,13 @@ pub struct TaskRingContext {
     /// buffers must not be freed. `stop_wave` waits for the exit; this flag
     /// records that it happened, and makes a second stop a no-op.
     stopped: std::sync::atomic::AtomicBool,
+    /// The number of deferred waits issued in the CURRENT step.
+    ///
+    /// M7.1b. Each deferred wait claims the next word of the observation
+    /// buffer, so the end-of-step verification knows how many words to check.
+    /// It is reset by [`Self::verify_waits`] — the verification is the end of
+    /// the step, so that is where the next step's count starts.
+    wait_count: std::sync::atomic::AtomicU32,
 }
 
 impl Drop for TaskRingContext {
@@ -875,10 +896,18 @@ impl TaskRingContext {
             last_slot: std::sync::atomic::AtomicUsize::new(0),
             next_head: std::sync::atomic::AtomicU32::new(0),
             wait_observed: {
-                let bytes = 0u32.to_ne_bytes().to_vec();
+                // ONE WORD PER WAIT (M7.1b) — sized to the ring's capacity,
+                // which bounds the waits a single step can have. Zeroed, so a
+                // wait that never ran leaves the word at 0 (ST_PENDING) and
+                // the end-of-step verification sees the timeout rather than
+                // reading a stale word.
+                let bytes = vec![0u32; capacity as usize]
+                    .iter()
+                    .flat_map(|w| w.to_ne_bytes())
+                    .collect::<Vec<u8>>();
                 dev.from_cpu_bytes(
                     &bytes,
-                    &Shape::new(vec![1]),
+                    &Shape::new(vec![capacity as usize]),
                     DType {
                         arith: ArithType::U32,
                         storage: DTypeStorage::Native,
@@ -888,6 +917,7 @@ impl TaskRingContext {
             wave_last_work_ms: std::sync::atomic::AtomicU64::new(host_now_ms()),
             wave_resolved: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            wait_count: std::sync::atomic::AtomicU32::new(0),
         };
         // Resolve the ENQUEUE kernels now, while nothing is parked.
         //
@@ -1546,6 +1576,22 @@ impl TaskRingContext {
     /// The read-back is a DEVICE-to-HOST copy, which is safe while a wave is
     /// parked: the copy is not staged through the host, so it does not wait
     /// for the device the way a pageable host-to-device copy does.
+    ///
+    /// **M7.1b: this blocking read-back is the DRAIN, and it is why the
+    /// megakernel arm lost the A/B.** The M7.0 A/B measured 2 blocking
+    /// D2H/step — one per recurrent layer — and the megakernel arm at
+    /// 2.4x the wavefront's time. A blocking D2H cannot complete until the
+    /// device has finished everything queued before it, so each one DRAINS
+    /// the pipeline at a point where the walk still had a whole layer of work
+    /// to enqueue. This is the corpus's §9c finding measured on grim's own
+    /// hardware: "any device-side chaining scheme that waits on completion
+    /// at fine granularity serialises, and the drains multiply with the
+    /// number of transfers per step."
+    ///
+    /// The wait KERNEL is what provides the ordering, and it stays. The
+    /// read-back only VERIFIES that the wait did not time out, and that
+    /// verification does not have to happen per node — see
+    /// [`Self::wait_device_slot_deferred`].
     pub fn wait_device_slot(
         &self,
         dev: &crate::RocmDevice,
@@ -1567,6 +1613,129 @@ impl TaskRingContext {
         )?;
         let v = as_rocm(self.wait_observed.as_ref())?.to_cpu_vec_u32()?;
         Ok(v.first().copied().unwrap_or(0))
+    }
+
+    /// Wait, ON THE DEVICE, for a ring descriptor to complete, WITHOUT the
+    /// blocking host read-back.
+    ///
+    /// M7.1b. The wait kernel is launched exactly as in
+    /// [`Self::wait_device_slot`] — so the ordering guarantee is identical —
+    /// but the host does NOT read the observation back. The observation lands
+    /// in the ring's device-side scratch buffer, where
+    /// [`Self::verify_waits`] reads it ONCE for a whole step.
+    ///
+    /// WHY THE VERIFICATION CAN BE DEFERRED. The device-side wait kernel
+    /// spins on the descriptor's status field and returns only after the
+    /// descriptor reached ST_COMPLETE (or the spin budget ran out). The
+    /// ORDERING the consumer needs — the output projection must not read the
+    /// branch before the recurrent step wrote it — comes from that kernel
+    /// being ordered on the caller's stream, not from the host reading the
+    /// result. The host read-back answers a different question: "did the
+    /// producer actually run, or did the wait time out?" That question is
+    /// about the STEP, not about the node, and a step that timed out is a
+    /// failed step whichever node timed out.
+    ///
+    /// The cost of the old shape: a blocking D2H per node, each draining the
+    /// pipeline mid-step. The cost of the new shape: ONE blocking D2H per
+    /// step, at the end, after all the work is already queued.
+    ///
+    /// The trade is real and is stated here rather than hidden: a timeout is
+    /// now reported at the END of the step instead of at the node that caused
+    /// it, so the error names the step rather than the layer. That is the
+    /// right trade for a decode loop — a step either produces usable logits
+    /// or it does not — and it is the trade that removes the drain.
+    pub fn wait_device_slot_deferred(
+        &self,
+        dev: &crate::RocmDevice,
+        slots_ptr: u64,
+        slot: u32,
+        spins: u32,
+    ) -> crate::Result<()> {
+        let base_ptr = as_rocm(self.wait_observed.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| {
+                crate::Error::Backend("task ring wait scratch has no device ptr".into())
+            })?;
+        // This wait's OWN word (M7.1b) — one word per wait, so the
+        // end-of-step verification checks every wait and not just the last.
+        let idx = self.wait_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let observed_ptr = base_ptr + (idx as u64) * 4;
+        crate::kernels::task_ring::launch_scythe_wait_descriptor(
+            dev,
+            slots_ptr,
+            slot,
+            spins,
+            observed_ptr,
+        )?;
+        Ok(())
+    }
+
+    /// Begin a step's deferred waits: zero the observation buffer.
+    ///
+    /// M7.1b. The observation words are per-wait and INDEXED from zero, so
+    /// step N's wait #0 lands where step N-1's wait #0 landed. The words
+    /// must therefore start the step at zero — otherwise a wait that never
+    /// runs (the kernel did not launch, or the device faulted before it)
+    /// would leave the PREVIOUS step's "2" (ST_COMPLETE) standing, and the
+    /// verification would pass a step whose wait never happened.
+    ///
+    /// The zeroing is an ASYNCHRONOUS memset on the caller's active stream,
+    /// so it is ordered before the wait kernels the step launches on that
+    /// same stream. It costs one launch per step, not one per wait.
+    pub fn begin_step_waits(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
+        self.wait_count.store(0, std::sync::atomic::Ordering::Release);
+        let ptr = as_rocm(self.wait_observed.as_ref())?
+            .device_ptr_u64()
+            .ok_or_else(|| {
+                crate::Error::Backend("task ring wait scratch has no device ptr".into())
+            })? as *mut std::ffi::c_void;
+        let bytes = as_rocm(self.wait_observed.as_ref())?
+            .bytes()
+            .max(4);
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let res = unsafe {
+            crate::device::handles::hipMemsetAsync(ptr, 0, bytes, dev.active_stream())
+        };
+        if res != crate::hipSuccess {
+            return Err(crate::Error::Backend(format!(
+                "task ring: zeroing the wait observations failed ({res})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read the deferred wait observations back, ONCE, for a whole step.
+    ///
+    /// M7.1b. Returns the observed status: 2 (ST_COMPLETE) when EVERY wait
+    /// saw its descriptor finish, 0 (ST_PENDING) when any wait's spin ran
+    /// out — which means the producer never ran and the step is looking at
+    /// stale data.
+    ///
+    /// EVERY wait's word is checked, not just the last. A single shared
+    /// word would leave the last wait's observation standing and the earlier
+    /// ones overwritten, so a step whose FIRST wait timed out and whose
+    /// second succeeded would verify clean — and a failure only the first
+    /// wait saw is exactly the failure this must not miss.
+    ///
+    /// The read-back is ONE blocking D2H for the step, replacing one per
+    /// node. It must be called after the step's work is done (the caller
+    /// synchronises the device first), so the copy finds the device idle
+    /// rather than draining a live pipeline.
+    pub fn verify_waits(&self) -> crate::Result<u32> {
+        let v = as_rocm(self.wait_observed.as_ref())?.to_cpu_vec_u32()?;
+        let n = self.wait_count.swap(0, std::sync::atomic::Ordering::AcqRel) as usize;
+        // The words are zeroed at allocation, so a word the device never
+        // wrote stays 0 (ST_PENDING) — a wait that never ran is a timeout,
+        // which is what it is.
+        let mut worst = 2u32;
+        for i in 0..n {
+            let observed = v.get(i).copied().unwrap_or(0);
+            if observed != 2 {
+                worst = 0;
+                break;
+            }
+        }
+        Ok(worst)
     }
 
     /// The ring slot the most recent enqueue wrote to.
