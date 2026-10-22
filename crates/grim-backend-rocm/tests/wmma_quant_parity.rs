@@ -645,9 +645,18 @@ fn q8_1_pack(a: &[f32]) -> (Vec<u8>, Vec<f32>) {
         for &v in ch {
             let q = (v * id).round().clamp(-128.0, 127.0) as i32;
             bytes.push(q as i8 as u8);
-            // The kernels' low-bit correction adds `s` back on the sign planes,
-            // so this is the value the kernel actually multiplies by.
-            eff.push(q as f32 * d_eff + if q < 0 { s_eff } else { 0.0 });
+            // The value the kernel actually multiplies by is `q * d`. The
+            // block's `s` is NOT a per-element correction: it is the SUM of
+            // the codes, which the Q4_K/Q5_K kernels use for their dmin term
+            // and the Q6_K kernel does not use at all (Q6_K has no dmin).
+            //
+            // M7.2e: this reference used to add `s` back on the negative
+            // codes, which no leg in this sweep consumes, and the Q4_K/Q2_K
+            // rows' loose 0.5 tolerance was hiding it. With the reference
+            // fixed, the Q6_K row measures ~1e-7 and the Q4_K/Q2_K rows
+            // ~1e-3 — and the tight bars below become meaningful.
+            let _ = s_eff; // the sum is carried in the bytes, not applied per element
+            eff.push(q as f32 * d_eff);
         }
     }
     (bytes, eff)
@@ -744,12 +753,18 @@ fn kquant_scheme_sweep() {
         // Q2_K and Q4_K ride the dot4/q81 legs, which consume act_q81.
         ("Q2_K", GgufDType::Q2K, KQuantScheme::Q2K, 84, true, QK_TOL),
         ("Q4_K", GgufDType::Q4K, KQuantScheme::Q4K, 144, true, QK_TOL),
-        // Q6_K does NOT, by default. The dispatch sends it to the fused-dequant
-        // leg (`launch_fused_dequant_gemm_q6k`, raw f32 A) unless GRIM_Q6K_DOT4
-        // is set, precisely because its dot4 GEMV is not bit-exact at production
-        // shapes. Marking it `true` here compared an f32-activation kernel
-        // against a Q8_1 reference and reported ~1.0e-1 that was never there.
-        ("Q6_K", GgufDType::Q6K, KQuantScheme::Q6K, 210, false, IQ_TOL),
+        // Q6_K DOES, by default (M7.2e). The dot4 leg is on, so the
+        // reference must use the q8_1 codes the kernel consumed.
+        //
+        // The tolerance is the discriminating one, and it is tight on
+        // purpose: the Q6_K dot4 GEMV is the only numerically exact K-quant
+        // dot4 kernel (its own error against the host dequant with the same
+        // q8_1 codes is ~1e-7 relative), while the exact f32 leg — which is
+        // what this row would fall back to if the dot4 leg regressed to off —
+        // carries the Q8_1 activation quantization and measures ~3.6e-3.
+        // So a tolerance of 1e-4 both admits the dot4 leg and FAILS if the
+        // dispatch silently falls back, which is the thing worth catching.
+        ("Q6_K", GgufDType::Q6K, KQuantScheme::Q6K, 210, true, 1e-4),
     ];
 
     const BLOCK_ELEMS: usize = 256;
@@ -914,21 +929,27 @@ fn kquant_scheme_sweep() {
     // agreed with the host to 3.9e-7. Root cause was NOT a decode defect —
     // `try_u4_lane_decode` gates on `m != 1`, so at the only shape decode uses
     // the fused kernel never ran and a lossy W4A4 requantization stood in for
-    // it. Q6_K is now excluded from that route and measures 5.4e-7.
+    // it. Q6_K is now excluded from that route.
     //
-    // Asserted rather than reported: the lane route can be re-enabled for Q6_K
-    // by adding it back to `q5k_decode_skip`, and this is the check that says so.
+    // M7.2e: Q6_K now rides the dot4 leg by default. Measured on the REAL
+    // 27B's output.weight (Q6_K, n=248320, k=5120), the dot4 kernel's own
+    // error against the host dequant with the same q8_1 codes is 9.6e-8
+    // rms-rel (absmax 2.6e-7) — it is the only numerically exact K-quant
+    // dot4 kernel, because Q6_K has no dmin term to round. So the bound here
+    // is tight (1e-4): it admits the dot4 leg and FAILS if the dispatch
+    // falls back to the exact f32 leg, whose Q8_1 activation quantization
+    // measures ~3.6e-3.
     assert!(
         q6k_seen,
         "Q6_K never ran in the sweep — the Q6_K regression check cannot fire if \
          the scheme stopped being exercised"
     );
     assert!(
-        q6k_diff <= 1e-3,
-        "Q6_K is back on the lossy u4-lane route: max_diff {q6k_diff:.3e} \
-         (expected <= 1e-3 now that it uses the exact fused kernel). If this \
-         fires, either Q6_K was re-added to `q5k_decode_skip` in \
-         dequant_k_quants.rs or the W4A4 path regressed."
+        q6k_diff <= 1e-4,
+        "Q6_K's dot4 leg is not what ran: max_diff {q6k_diff:.3e} (expected \
+         <= 1e-4 for the dot4 leg; the exact f32 leg measures ~3.6e-3 because \
+         of the Q8_1 activation quantization). If this fires, the Q6_K dot4 \
+         dispatch leg is off, or the Q6_K dot4 kernel regressed."
     );
 
     println!("\n=== {} failing scheme(s) ===", failures.len());

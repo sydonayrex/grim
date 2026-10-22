@@ -2935,22 +2935,25 @@ impl RocmDevice {
                 match scheme {
                     KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,
                     KQuantScheme::Q5K => self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?,
-                    // Q6_K's dot4 GEMV is not bit-exact at production shapes:
-                    // the Xing4.0-29B lm_head oracle (real output.weight,
-                    // k=3584) measures rel 3.2e-3 / max_abs 1.5 at m=1, while
-                    // the fused-dequant path agrees with the host dequant at
-                    // 3.9e-7. The k=256 arch probes cannot see this (the scale
-                    // skew grows with k), so Q6_K skips the dot4 leg here.
-                    // Same treatment as the IQ3_S fused WMMA GEMM, and gated
-                    // on the same GRIM_Q6K_DOT4 escape hatch as the sibling
-                    // dispatch in device/quant/mod.rs — two sites, one switch,
-                    // so a capture run and an eager run cannot disagree about
+                    // M7.2e: the Q6_K dot4 leg is ON by default — the
+                    // "not bit-exact at production shapes" reason it was off
+                    // is refuted by measurement on the REAL 27B tensors (see
+                    // the sibling dispatch in device/quant/mod.rs for the
+                    // numbers: the Q6_K dot4 kernel's own error is 9.6e-8
+                    // rms-rel against the host dequant with the same q8_1
+                    // codes, i.e. it is the only numerically exact K-quant
+                    // dot4 kernel, and the 3.2e-3 that was cited is the
+                    // Q8_1 activation quantization that the Q4_K and Q5_K
+                    // legs already carry by default).
+                    //
+                    // Two sites, one switch (GRIM_Q6K_DOT4=0 opts out), so a
+                    // capture run and an eager run cannot disagree about
                     // which Q6_K path is trusted.
                     KQuantScheme::Q6K => {
-                        if matches!(
+                        if !matches!(
                             std::env::var("GRIM_Q6K_DOT4").as_deref(),
-                            Ok("1" | "true" | "on")
-                        ) {
+                            Ok("0" | "false" | "off")
+                        ) && crate::device::quant::kquant_dot4_ok_for(n) {
                             self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
                         } else {
                             self.launch_fused_dequant_gemm_q6k(a_s, w, out, m, n, k)?
