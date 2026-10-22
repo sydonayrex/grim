@@ -2222,6 +2222,120 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv(
                     int a4;
                     __builtin_memcpy(&a4, a_codes + e, 4);
 
+                    // M7.2c (the IQ group-hoisting recipe): the four codes of a
+                    // 4-weight group are four nibbles of ONE dword, not four
+                    // 1-byte loads. `qs` is 4-byte aligned at every e here
+                    // (qs at +16, 144-byte super-block stride), so the four
+                    // bytes are one load. The 0x0F0F0F0F mask keeps each byte
+                    // independent, so the word result is identical to the
+                    // per-byte arithmetic it replaces.
+                    unsigned qw4;
+                    __builtin_memcpy(&qw4, qs_sub + e, 4);
+                    int q4 = (int)(half ? ((qw4 >> 4) & 0x0F0F0F0Fu)
+                                        : (qw4 & 0x0F0F0F0Fu));
+
+                    pos_dot = grim_sdot4(a4, q4, pos_dot);
+                }
+
+                // Two-dot decomposition: value_i = d * sc * q_i - dmin * m
+                // dot = sum(a_i * value_i) = d * sc * sum(a_i * q_i) - dmin * m * sum(a_i)
+                float sub_res = d * (float)sc * ((float)pos_dot * d_a) - dmin * (float)m * sum_a;
+                facc[j] += sub_res;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+// M7.2c: the RETAINED ORACLE for the grim_dot4_q4k_q81_gemv group hoist — the pre-change
+// kernel body, verbatim, so the hoist can be gated on BYTE-IDENTICAL
+// output instead of a hand oracle. Not on any dispatch path; only
+// tests/dot4_kquant_grouped_parity.rs launches it.
+extern "C" __global__ void grim_dot4_q4k_q81_gemv_ref(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q4k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const int n_q4k_superblocks = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q4k + (long long)(col_base + j) * n_q4k_superblocks * GRIM_Q4K_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Each thread processes superblocks in strided fashion across the wave (lane, lane + 32, ...)
+    for (int sb = lane; sb < n_q4k_superblocks; sb += 32) {
+        // One Q4_K superblock corresponds to 8 Q8_1 activation blocks (256 elements)
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * GRIM_Q4K_BYTES;
+
+            const unsigned short* h_ptr = (const unsigned short*)b_sb;
+            float d    = fp16_to_float_device(h_ptr[0]);
+            float dmin = fp16_to_float_device(h_ptr[1]);
+
+            const unsigned char* scales = b_sb + 4;
+            const unsigned char* qs     = b_sb + 16;
+
+            // 8 sub-blocks of 32 elements
+            #pragma unroll
+            for (int is = 0; is < 8; ++is) {
+                const unsigned char* a_blk = a_sb + is * GRIM_Q8_1_BYTES;
+                float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                float sum_a = fp16_to_float_device(((const unsigned short*)a_blk)[1]);
+                const signed char* a_codes = (const signed char*)(a_blk + 4);
+
+                unsigned char sc, m;
+                if (is < 4) {
+                    sc = scales[is] & 63;
+                    m  = scales[is + 4] & 63;
+                } else {
+                    sc = (scales[is + 4] & 0x0F) | ((scales[is - 4] >> 6) << 4);
+                    m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                }
+
+                // Sub-block is: group = is / 2 (0..3), half = is % 2 (0: low nibble, 1: high nibble)
+                int group = is / 2;
+                int half  = is % 2;
+                const unsigned char* qs_sub = qs + group * 32;
+
+                int pos_dot = 0;
+                #pragma unroll
+                for (int e = 0; e < 32; e += 4) {
+                    int a4;
+                    __builtin_memcpy(&a4, a_codes + e, 4);
+
                     // Unpack 4 nibbles into 4 i8 values packed in one i32
                     unsigned char b0 = qs_sub[e + 0];
                     unsigned char b1 = qs_sub[e + 1];
@@ -2586,6 +2700,148 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv(
                         int a4;
                         __builtin_memcpy(&a4, a_codes + e, 4);
 
+                        // M7.2c (the IQ group-hoisting recipe): the four
+                        // activation codes are already in `a4` — re-reading
+                        // them as four 1-byte loads was pure waste.
+                        fsum16 += (float)((int)(signed char)(a4 & 0xFF)
+                                        + (int)(signed char)((a4 >> 8) & 0xFF)
+                                        + (int)(signed char)((a4 >> 16) & 0xFF)
+                                        + (int)(signed char)((a4 >> 24) & 0xFF));
+
+                        int l0 = e + 0;
+                        int l1 = e + 1;
+                        int l2 = e + 2;
+                        int l3 = e + 3;
+
+                        int ql_off0 = n * 64 + l0 + ((quarter & 1) ? 32 : 0);
+                        int ql_off1 = n * 64 + l1 + ((quarter & 1) ? 32 : 0);
+                        int ql_off2 = n * 64 + l2 + ((quarter & 1) ? 32 : 0);
+                        int ql_off3 = n * 64 + l3 + ((quarter & 1) ? 32 : 0);
+
+                        // The four ql codes and the four qh high bits are
+                        // four CONSECUTIVE bytes each. Q6_K's super-block
+                        // stride is 210 B, so the block base is only 2-byte
+                        // aligned, and a dword read there is not guaranteed
+                        // aligned -- but a ushort read always is, and two
+                        // ushorts plus a shift rebuild the same dword.
+                        unsigned short ql01, ql23, qh01, qh23;
+                        __builtin_memcpy(&ql01, ql + ql_off0, 2);
+                        __builtin_memcpy(&ql23, ql + ql_off2, 2);
+                        __builtin_memcpy(&qh01, qh + n * 32 + l0, 2);
+                        __builtin_memcpy(&qh23, qh + n * 32 + l2, 2);
+                        unsigned qlw = (unsigned)ql01 | ((unsigned)ql23 << 16);
+                        unsigned qhw = (unsigned)qh01 | ((unsigned)qh23 << 16);
+
+                        // Byte i of `nibw` is code i in its low nibble; byte i
+                        // of `qhw` shifted is the 2-bit qh field of that code.
+                        unsigned nibw = (quarter & 2) ? ((qlw >> 4) & 0x0F0F0F0Fu)
+                                                     : (qlw & 0x0F0F0F0Fu);
+                        unsigned qhb = (qhw >> (2 * quarter)) & 0x03030303u;
+
+                        int q4 = (int)(nibw | (qhb << 4));
+                        pos_dot = grim_sdot4(a4, q4, pos_dot);
+                    }
+
+                    // formula: value_i = d * sc * (q_code - 32)
+                    // sum = d * sc * sum(a_i * q_i) - d * sc * 32 * sum(a_i)
+                    float sub_res = d * (float)sc * ((float)pos_dot * d_a - 32.0f * (fsum16 * d_a));
+                    facc[j] += sub_res;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+
+// M7.2c: the RETAINED ORACLE for the grim_dot4_q6k_q81_gemv group hoist — the pre-change
+// kernel body, verbatim, so the hoist can be gated on BYTE-IDENTICAL
+// output instead of a hand oracle. Not on any dispatch path; only
+// tests/dot4_kquant_grouped_parity.rs launches it.
+extern "C" __global__ void grim_dot4_q6k_q81_gemv_ref(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q6k,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K)
+{
+    const int lane = threadIdx.x; // 0..31
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const int n_q6k_superblocks = K / GRIM_Q6K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q6k + (long long)(col_base + j) * n_q6k_superblocks * GRIM_Q6K_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = lane; sb < n_q6k_superblocks; sb += 32) {
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * GRIM_Q6K_BYTES;
+
+            const unsigned char* ql     = b_sb;
+            const unsigned char* qh     = b_sb + 128;
+            const signed char*   scales = (const signed char*)(b_sb + 192);
+            const unsigned short* d_ptr = (const unsigned short*)(b_sb + 208);
+            float d = fp16_to_float_device(d_ptr[0]);
+
+            #pragma unroll
+            for (int is_sub = 0; is_sub < 8; ++is_sub) {
+                const unsigned char* a_blk = a_sb + is_sub * GRIM_Q8_1_BYTES;
+                float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                float sum_a = fp16_to_float_device(((const unsigned short*)a_blk)[1]);
+                const signed char* a_codes = (const signed char*)(a_blk + 4);
+
+                int n = is_sub / 4;
+                int quarter = is_sub % 4;
+                // is_sub 0..7: for is_sub < 4 (n=0): quarter 0..3
+                // scales indexing: sc_idx = n * 8 + (quarter / 2) + 2 * (quarter % 2)... wait,
+                // let's use exact formula:
+                // quarter = is_sub % 4; n = is_sub / 4;
+                // In each 32-element sub-block, l goes from 0..31: is = l/16, so elements 0..15 have is=0, elements 16..31 have is=1.
+                // We process two halves of 16 elements:
+                #pragma unroll
+                for (int half16 = 0; half16 < 2; ++half16) {
+                    int sc_idx = n * 8 + half16 + 2 * quarter;
+                    signed char sc = scales[sc_idx];
+
+                    int pos_dot = 0;
+                    float fsum16 = 0.0f;
+
+                    #pragma unroll
+                    for (int e16 = 0; e16 < 16; e16 += 4) {
+                        int e = half16 * 16 + e16;
+                        int a4;
+                        __builtin_memcpy(&a4, a_codes + e, 4);
+
                         fsum16 += (float)a_codes[e + 0] + (float)a_codes[e + 1] + (float)a_codes[e + 2] + (float)a_codes[e + 3];
 
                         int l0 = e + 0;
@@ -2645,7 +2901,6 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv(
         }
     }
 }
-
 
 // ─── Phase 4.5b: W4A4 sudot8 GEMV (dot8-insts, RDNA4 gfx1200/gfx1201) ────────
 #if defined(__gfx1200__) || defined(__gfx1201__)
