@@ -773,6 +773,29 @@ rotates over 8 weight copies so the bytes come from DRAM):
 | Q8_0 | 39 | 1.00 | ~20 us |
 | Q4_K u4-lane (lossy) | **~300 warm** | 0.90 | - |
 
+**And the three-way split, measured rather than inferred.** The plan asked for
+three tests. Two were done as measurements and the third turns out to need no
+separate build:
+
+1. **BANDWIDTH — not constrained.** Cold vs warm at matched shape (8 weight
+   copies rotating, so the cold arm's bytes come from DRAM): `t_cold/t_warm` is
+   **0.90-1.00** at every format and every working set from 3 MB to 138 MB.
+2. **LAUNCH — not constrained at the dominant shape, constrained at small
+   ones.** Measured directly: the kernel's own fixed cost (launch + prologue +
+   shuffle reduction) is **33.5 us** at the minimal shape, not the 0-20 us the
+   working-set fit implied. That is **4.9%** of the Q5_K step at n=17408 but
+   **27%** at n=1024. The working-set fit's intercept is not the launch term —
+   it does not reproduce the measured points at the small end (70 us predicted
+   against 122 us measured at n=1024).
+3. **COMPUTE-ONLY — the strict variant is unnecessary, and the reason is
+   arithmetic.** The dot4 mapping gives one wave 4 output columns, so a wave's
+   weight working set is `4 x (K/256) x block_bytes` = **6.6 KB (Q2_K) to
+   16.4 KB (Q6_K)** — and gfx1200's L1 is **32 KB per CU**. **Every K-quant
+   dot4 wave's weight working set fits in L1**, so the warm arm of the
+   cold/warm pair is already the compute-only floor, and the pair shows that
+   removing the DRAM term changes nothing. A register-resident variant could
+   only raise the ceiling, not explain the current behaviour.
+
 **Three measured conclusions:**
 
 1. **NOT bandwidth-bound.** `t_cold ≈ t_warm` (0.90-1.00) at every

@@ -52,6 +52,7 @@
 //! this one attributes the time between them.
 
 use grim_backend_rocm::device::util::gpu_test_lock;
+use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::memory::allocator::RocmCachingAllocator;
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::RocmStorage;
@@ -425,4 +426,177 @@ fn m1_decode_regime_kernel_census() {
         let us = h.time(&dev, 0, false, 1);
         eprintln!("[census] scheme={scheme:?} n={n} k={K} one_launch={us:.1} us");
     }
+}
+
+/// Arm A0b — the IQ-quant decode leg, at the SAME shape as the K-quant
+/// census. The IQ path is 17.2 GB/s GEMV on the 27B and 117 of that model's
+/// tensors are IQ4_XS, so this is the measurement that decides which change
+/// is worth building: the corpus names ONE THREAD PER OUTPUT ELEMENT (the
+/// IQ kernels' mapping) as the biggest structural defect, and the
+/// thread->data mapping, not the format, is what a measurement can move
+/// without touching the checkpoint.
+///
+/// RUN (the census): same rocprofv3 invocation as the K-quant census.
+#[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1"]
+#[test]
+fn iq4xs_decode_kernel_census() {
+    let Some(dev) = gpu_device() else {
+        return;
+    };
+    let n = 4096usize;
+    let alloc: Arc<RocmCachingAllocator> = dev.allocator_handle();
+    let mut sseed: u64 = 91;
+    let mut nxt = move || {
+        sseed ^= sseed << 13;
+        sseed ^= sseed >> 17;
+        sseed ^= sseed << 5;
+        sseed
+    };
+    let vals: Vec<f32> = (0..n * K)
+        .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+        .collect();
+    let packed = grim_quant::quant_iq4xs(&vals).expect("quant_iq4xs");
+    let row_bytes = packed.len() / n;
+    eprintln!(
+        "[census] IQ4XS n={n} k={K} row_bytes={row_bytes} weight_MB={:.2}",
+        (n * row_bytes) as f64 / 1e6
+    );
+    // The IQ decode leg takes the packed bytes through the IQ4_XS arm of
+    // quantized_matmul / linear_decode_into.
+    let w = MemoryOps::from_cpu_bytes(
+        &dev,
+        &packed,
+        &Shape::new(vec![n, K]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ4XS),
+        },
+    )
+    .expect("upload IQ4XS");
+    let w_rocm = w
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .expect("rocm weight storage");
+    let a: Vec<f32> = (0..K).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, K]), DType::F32)
+        .expect("upload act");
+    let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
+    for _ in 0..3 {
+        dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &out)
+            .expect("linear_decode_into");
+    }
+    dev.synchronize();
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &out)
+            .expect("linear_decode_into");
+    }
+    dev.synchronize();
+    let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+    let gbps = ((n * row_bytes) as f64 / 1e9) / (us * 1e-6);
+    eprintln!("[census] IQ4XS one_launch={us:.1} us  weight_GBps={gbps:.1}");
+}
+
+/// Arm A0c — THE LAUNCH BASELINE. The working-set fit gave a fixed
+/// per-launch cost `a` of 0-20 us, but a two-parameter fit over 6 points
+/// is not a sensitive instrument for a term that small. This measures the
+/// launch term directly instead of inferring it:
+///
+///   (i)  the trivial FMA kernel with iters=1 — a launch with ~4
+///        instructions of work, i.e. the pure dispatch cost;
+///  (ii)  the real dot4 kernel at a MINIMAL shape (n=4 -> 1 block,
+///        k=256 -> 1 super-block) — the launch plus the kernel's
+///        prologue/epilogue/reduction, which is everything except
+///        the streaming.
+/// (iii)  the same kernel at the real shape, for the contrast.
+///
+/// The difference between (ii) and (iii) is the streaming; the
+/// difference between (i) and (ii) is the kernel's own fixed cost.
+#[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1"]
+#[test]
+fn m1_decode_launch_baseline() {
+    let Some(dev) = gpu_device() else {
+        return;
+    };
+    // (i) pure launch: the rho microbench kernel with a single iteration.
+    for _ in 0..5 {
+        let _ = grim_backend_rocm::rho_microbench_for_test(&dev, 1);
+    }
+    dev.synchronize();
+    let iters = 2000i32;
+    let _ = grim_backend_rocm::rho_microbench_for_test(&dev, iters);
+    dev.synchronize();
+    // The kernel does `iters` iterations of 4 FMAs per thread; at iters=1
+    // that is the dispatch cost plus a handful of instructions.
+    let one = {
+        let t = std::time::Instant::now();
+        let _ = grim_backend_rocm::rho_microbench_for_test(&dev, 1);
+        dev.synchronize();
+        t.elapsed().as_secs_f64() * 1e6
+    };
+    eprintln!("[launch] (i) trivial kernel, 1 launch      = {one:>8.2} us");
+
+    // (ii) minimal dot4 shape.
+    let alloc: Arc<RocmCachingAllocator> = dev.allocator_handle();
+    let n = 4usize;
+    let k = 256usize;
+    let mut sseed: u64 = 7;
+    let mut nxt = move || {
+        sseed ^= sseed << 13;
+        sseed ^= sseed >> 17;
+        sseed ^= sseed << 5;
+        sseed
+    };
+    let vals: Vec<f32> = (0..n * k).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+    let packed = grim_quant::quant_q5k(&vals).expect("quant_q5k");
+    let w = MemoryOps::from_cpu_bytes(
+        &dev,
+        &packed,
+        &Shape::new(vec![n, k]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q5K),
+        },
+    )
+    .expect("upload");
+    let w_rocm = w.as_any().downcast_ref::<RocmStorage>().expect("rocm");
+    let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, k]), DType::F32)
+        .expect("upload act");
+    let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
+    for _ in 0..3 {
+        dev.launch_dot4_q5k_q81_gemv_for_ab(
+            as_rocm(a_st.as_ref()).unwrap(),
+            w_rocm,
+            &out,
+            1,
+            n,
+            k,
+        )
+        .unwrap();
+    }
+    dev.synchronize();
+    let t = std::time::Instant::now();
+    for _ in 0..2000 {
+        dev.launch_dot4_q5k_q81_gemv_for_ab(
+            as_rocm(a_st.as_ref()).unwrap(),
+            w_rocm,
+            &out,
+            1,
+            n,
+            k,
+        )
+        .unwrap();
+    }
+    dev.synchronize();
+    let us_min = t.elapsed().as_secs_f64() * 1e6 / 2000.0;
+    eprintln!(
+        "[launch] (ii) dot4 Q5K minimal shape n=4 k=256 = {us_min:>8.2} us  (weight {:.1} KB)",
+        (n * (k / 256) * 176) as f64 / 1024.0
+    );
+    // The fit's `a` for Q5_K was 9.2 us (warm) / 12.1 us (cold).
+    eprintln!("[launch]      working-set fit said a = 9.2 us (warm)");
+    eprintln!(
+        "[launch]      minimal-shape launches: {us_min:.2} us -> launch + prologue + reduction"
+    );
 }
