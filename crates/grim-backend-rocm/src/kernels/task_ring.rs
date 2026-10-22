@@ -68,6 +68,10 @@ const OP_PEER_BROADCAST: u32 = 9;
 /// activation is Q8_1 and the weight is Q8_0, and the arm is the INTEGER dot
 /// the launcher's `grim_dot4_q80_q81_gemv` does — the ring never dequantizes.
 const OP_Q8_0_DOT4: u32 = 12;
+/// Wave-side opcode for the f32-ACTIVATION Q8_0 dot4 GEMV — the second of
+/// the format's two launcher variants, and the one the models' plain Q8_0
+/// projections take.
+const OP_Q8_0_DOT4_F32ACT: u32 = 13;
 
 /// The IR's QuantFormat id for Q8_0 — `params[0]` of a `Q8_0_DOT4` node.
 ///
@@ -107,6 +111,7 @@ pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
     (crate::task_graph::op::PEER_COPY, OP_PEER_BROADCAST),
     (crate::task_graph::op::RECURRENT, OP_RECURRENT),
     (crate::task_graph::op::Q8_0_DOT4, OP_Q8_0_DOT4),
+    (crate::task_graph::op::Q8_0_DOT4_F32ACT, OP_Q8_0_DOT4_F32ACT),
 ];
 
 /// Translate a task-graph opcode to its wave opcode.
@@ -162,6 +167,12 @@ pub struct TaskRingQ8Dot4 {
     pub weight: u64,
     /// The f32 output, `[m, n]`.
     pub output: u64,
+    /// True for the f32-ACTIVATION variant (the activation is f32 and the
+    /// arm quantizes it in registers); false for the prequantized-q8_1 one.
+    ///
+    /// The two are DIFFERENT LAUNCHES — different kernels, different
+    /// activation layouts — so the ring has to know which one a node names.
+    pub f32_act: bool,
     /// The IR node index this entry was derived from.
     pub ir_node: u32,
 }
@@ -294,7 +305,10 @@ impl TaskRingPlan {
             // absent from the plan and keeps running on its ordinary launcher.
             match node.opcode {
                 op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH
-                | op::PEER_COPY | op::RECURRENT | op::Q8_0_DOT4 => {}
+                | op::PEER_COPY
+                | op::RECURRENT
+                | op::Q8_0_DOT4
+                | op::Q8_0_DOT4_F32ACT => {}
                 _ => continue,
             }
             let (mut input, mut weight, mut output) = (None, None, None);
@@ -467,7 +481,7 @@ impl TaskRingPlan {
                     }
                     gemms.push(TaskRingGemm { m, n, k, input: i, weight: w, output: o, quant: node.params[0], ir_node: idx as u32 });
                 }
-                op::Q8_0_DOT4 => {
+                op::Q8_0_DOT4 | op::Q8_0_DOT4_F32ACT => {
                     let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
                     // The Q8_0 dot4 GEMV: `n`/`k`/`m` in params[1..4], exactly
                     // like the f32 GEMM's geometry, and params[0] carries the
@@ -490,7 +504,16 @@ impl TaskRingPlan {
                     if node.params[0] != Q8_0_FORMAT_ID {
                         continue;
                     }
-                    q8_dot4s.push(TaskRingQ8Dot4 { m, n, k, input: i, weight: w, output: o, ir_node: idx as u32 });
+                    q8_dot4s.push(TaskRingQ8Dot4 {
+                        m,
+                        n,
+                        k,
+                        input: i,
+                        weight: w,
+                        output: o,
+                        f32_act: node.opcode == op::Q8_0_DOT4_F32ACT,
+                        ir_node: idx as u32,
+                    });
                 }
                 _ => {}
             }
@@ -1001,7 +1024,7 @@ impl TaskRingContext {
             dev,
             &**self.slots,
             slot,
-            OP_Q8_0_DOT4,
+            if g.f32_act { OP_Q8_0_DOT4_F32ACT } else { OP_Q8_0_DOT4 },
             g.m,
             g.n,
             g.k,

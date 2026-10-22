@@ -1355,6 +1355,137 @@ fn the_q8_0_dot4_arm_reproduces_the_standalone_kernel() {
     }
 }
 
+/// PM-6: the f32-ACTIVATION Q8_0 dot4 arm must reproduce the launcher
+/// BIT-EXACTLY, exactly as the prequantized-q8_1 arm does.
+///
+/// This is the variant the models' plain Q8_0 projections take (their
+/// activations are f32, and the kernel quantizes them in registers), so it
+/// is the body a `Q8_0_DOT4` node would actually name once the per-launch
+/// refinement lands. Same discipline as its sibling: the arm calls the
+/// LAUNCHER'S OWN body, so the two must agree in every bit — a quantized
+/// GEMM's rounding is exactly the kind of difference that hides until the
+/// logits move.
+#[test]
+fn the_q8_0_f32act_dot4_arm_reproduces_the_standalone_kernel() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    for (m, n, k) in [(1usize, 70usize, 96usize), (3, 66, 128)] {
+        let mut seed: u64 = 0xF32AC ^ (m as u64) ^ ((n as u64) << 8) ^ ((k as u64) << 32);
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let a_f32: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        let b_f32: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let b_bytes = grim_quant::quant_q80(&b_f32).expect("quant_q80");
+
+        let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+            &dev,
+            &a_f32,
+            &Shape::new(vec![m, k]),
+            grim_tensor::DType::F32,
+        )
+        .expect("activation");
+        let a_rocm = a_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("a is RocmStorage");
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_bytes,
+            &Shape::new(vec![n, k]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::KQuant(grim_tensor::KQuantScheme::Q80),
+            },
+        )
+        .expect("upload q80 weight");
+        let b_rocm = b_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("b is RocmStorage");
+
+        let out_shape = Shape::new(vec![m, n]);
+        let out_dev = dev.zeros(&out_shape, DType::F32).expect("alloc out");
+        let out_rocm = out_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("out is RocmStorage");
+        let a_ptr = a_rocm.device_ptr_u64().expect("a ptr");
+        let b_ptr = b_rocm.device_ptr_u64().expect("weight ptr");
+        let out_ptr = out_rocm.device_ptr_u64().expect("out ptr");
+
+        let mut gb = TaskGraphBuilder::new();
+        let h_act = gb.push_arg(a_ptr, (m * k * 4) as u64, arg_role::ACT_IN);
+        let h_w = gb.push_arg(b_ptr, b_bytes.len() as u64, arg_role::WEIGHT);
+        let h_out = gb.push_arg(out_ptr, (m * n * 4) as u64, arg_role::ACT_OUT);
+        gb.push(
+            op::Q8_0_DOT4_F32ACT,
+            [
+                grim_tensor::QuantFormat::Q8_0 as u32,
+                n as u32,
+                k as u32,
+                m as u32,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &[h_act, h_w, h_out],
+            &[],
+            0,
+            0,
+        );
+        let graph = gb.finish();
+        let ctx =
+            grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+                .expect("ring context")
+                .expect("the ring binds the Q8_0_DOT4_F32ACT node");
+        assert_eq!(
+            ctx.plan().q8_dot4s().len(),
+            1,
+            "the Q8_0_DOT4_F32ACT node must bind (m={m} n={n} k={k})"
+        );
+        assert!(
+            ctx.plan().q8_dot4s()[0].f32_act,
+            "the plan's entry must record the f32-activation variant"
+        );
+        ctx.enqueue_q8_dot4(&dev, &ctx.plan().q8_dot4s()[0])
+            .expect("enqueue q8_0 f32act dot4");
+        dev.synchronize();
+
+        // The oracle: the launcher, on its own output buffer.
+        let ref_dev = dev.zeros(&out_shape, DType::F32).expect("alloc ref out");
+        let ref_rocm = ref_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("ref out is RocmStorage");
+        dev.launch_dot4_q80_f32act_gemv(a_rocm, b_rocm, ref_rocm, m, n, k)
+            .expect("standalone q8_0 f32act gemv");
+        dev.synchronize();
+
+        let got = out_dev.to_cpu_vec_f32().expect("ring readback");
+        let want = ref_dev.to_cpu_vec_f32().expect("reference readback");
+        assert_eq!(
+            got, want,
+            "m={m} n={n} k={k}: the ring's f32-activation Q8_0 dot4 arm differs from the \
+             launcher — the arm must be the launcher's own body"
+        );
+    }
+}
+
 /// PM-6: the Q8_0 dot4 arm must be DETERMINISTIC — the same node, run twice,
 /// must produce byte-identical output.
 ///

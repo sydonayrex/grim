@@ -94,6 +94,11 @@ struct __align__(32) kda_task_descriptor_t {
 // never dequantizes anything — it is the integer dot the launcher's
 // `grim_dot4_q80_q81_gemv` does, called through the SAME device body.
 #define OP_Q8_0_DOT4 12u
+// The f32-ACTIVATION variant of the same format: the activation is f32 and
+// the arm quantizes it in registers, exactly as the launcher's
+// `grim_dot4_q80_f32act_gemv` does. The models' plain Q8_0 paths are the
+// f32-activation ones, so this is the body a Q8_0 dot4 node would name.
+#define OP_Q8_0_DOT4_F32ACT 13u
 
 // Status codes.
 #define ST_PENDING  0u
@@ -454,6 +459,36 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                     const int col_base = (task % n_col_groups) * 4;
                     grim_dot4_q80_q81_gemv_body(a_q81, b_q80, c_out, M, N, K,
                                                 row, col_base, lane);
+                }
+            }
+        } else if (desc->opcode == OP_Q8_0_DOT4_F32ACT) {
+            // The f32-activation Q8_0 dot4 GEMV — the launcher's own
+            // `grim_dot4_q80_f32act_gemv` body, so the arm's answer is
+            // bit-identical to the launcher's.
+            //
+            // The work decomposition is the same 32-lane GROUP shape as the
+            // q81 variant: one group owns one output row and four output
+            // columns, and the 32 lanes split the K-blocks. The 32-lane
+            // granularity is load-bearing — the body's reduction is a
+            // 32-lane shuffle tree, and a wider group would reduce a
+            // DIFFERENT set of partial sums.
+            const float* a_f32 = (const float*)desc->input_ptr;
+            const unsigned char* b_q80 = (const unsigned char*)desc->weight_ptr;
+            float* c_out = (float*)desc->output_ptr;
+            const int M = (int)desc->m;
+            const int N = (int)desc->n;
+            const int K = (int)desc->k;
+            if (M > 0 && N > 0 && K > 0) {
+                const int n_col_groups = (N + 3) / 4;
+                const int n_tasks = M * n_col_groups;
+                const int lane = (int)(threadIdx.x % 32u);
+                const int group = (int)(threadIdx.x / 32u);
+                const int n_groups = (int)((blockDim.x + 31u) / 32u);
+                for (int task = group; task < n_tasks; task += n_groups) {
+                    const int row = task / n_col_groups;
+                    const int col_base = (task % n_col_groups) * 4;
+                    grim_dot4_q80_f32act_gemv_body(a_f32, b_q80, c_out, M, N, K,
+                                                   row, col_base, lane);
                 }
             }
         } else if (desc->opcode == OP_RECURRENT) {

@@ -650,6 +650,32 @@ impl DecodeGraphBuffers {
                 &l_dev.allocator,
                 l_dev.ordinal,
             )?);
+            // ZEROED at allocation, like the recurrent state. The norm buffer
+            // is a scratch slot, and the FUSED paths (the LFM2's norm-fused
+            // Q8_0 projections) never write it — so without this it holds
+            // whatever the recycled block held, and two graphs that captured
+            // at different times disagree on it. A scratch slot that a fused
+            // path leaves untouched must still start at a KNOWN value, or the
+            // model's answer depends on the allocator's history.
+            {
+                let last = norm_buf.last().expect("just pushed");
+                let ptr = last
+                    .device_ptr_u64()
+                    .ok_or_else(|| Error::Backend("norm_buf: no device ptr".into()))?
+                    as *mut std::ffi::c_void;
+                let _guard = crate::device::util::DeviceGuard::set(l_dev.ordinal as i32);
+                let res = unsafe {
+                    crate::device::handles::hipMemsetAsync(
+                        ptr,
+                        0,
+                        last.bytes,
+                        l_dev.active_stream(),
+                    )
+                };
+                if res != crate::hipSuccess {
+                    return Err(Error::Backend(format!("norm_buf memset: {res}")));
+                }
+            }
             attn_max_buf.push(RocmStorage::alloc_gpu(
                 &Shape::new(vec![batch * num_heads.max(1)]),
                 dt.clone(),

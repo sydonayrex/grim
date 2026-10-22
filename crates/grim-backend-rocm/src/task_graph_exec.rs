@@ -137,4 +137,8 @@ pub const RING_OPCODES: &[crate::task_graph::OpCode] = &[
     // `OP_PEER_REDUCE`, and that mistake is still pinned out by
     // `every_advertised_ring_opcode_maps_to_an_implemented_wave_arm`.
     crate::task_graph::op::Q8_0_DOT4,
+    // The f32-ACTIVATION variant of the same format — a different launch (a
+    // different kernel, a different activation layout), and the one the
+    // models' plain Q8_0 projections take.
+    crate::task_graph::op::Q8_0_DOT4_F32ACT,
 ];

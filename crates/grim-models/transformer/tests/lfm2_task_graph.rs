@@ -23,6 +23,16 @@
 //! Run (GPU 1 is the measurement card; GPU 0 is reserved):
 //! `HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 AMD_SERIALIZE_KERNEL=3 GRIM_CONTEXT=512 \
 //!  cargo test -p grim-models-transformer --test lfm2_task_graph -- --nocapture --test-threads=1`
+//!
+//! **`AMD_SERIALIZE_KERNEL=3` is REQUIRED, and the reason is the LFM2's own
+//! known async hazard** (the plan records it: without kernel serialization the
+//! LFM2's graph path "intermittently takes a `Page not present` GPU fault
+//! after the head GEMM — a real async-hazard signature"). This gate makes it
+//! visible in a different shape: the walk and the captured graph disagree in
+//! the 1e-2 class, and the disagreement MOVES between runs and between
+//! processes — the same hazard, seen as a number instead of a fault. The
+//! flag is read by the backend at start-up, so a test cannot turn it on for
+//! itself; the run line has to carry it (as every LFM2 gate's does).
 
 use grim_models_transformer::DecodeGraphModel;
 use grim_tensor::Device;
@@ -51,6 +61,7 @@ fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
     }
     worst
 }
+
 
 #[test]
 fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
@@ -155,6 +166,7 @@ fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
     );
 
     // ── The walk must reproduce the captured graph, bit-exactly.
+    let tokens = [100u32, 200, 300];
     let mut gp = model
         .get_or_create_decode_graph(512, 1)
         .expect("capturable (walk)");
@@ -171,7 +183,6 @@ fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
     graph.buffers.reset_for_replay().expect("reset (replay)");
     gp.buffers.reset_for_replay().expect("reset (walk)");
 
-    let tokens = [100u32, 200, 300];
     let mut replay_logits = Vec::new();
     for tok in tokens {
         model.forward_replay(&mut graph, tok).expect("graph replay");

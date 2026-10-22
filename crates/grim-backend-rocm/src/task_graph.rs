@@ -30,6 +30,13 @@ pub mod op {
     /// *not* the f32 GEMM arm. Distinct from `op::GEMM` because a Q8_0 weight
     /// cannot run on the f32 arm and the ring never dequantizes.
     pub const Q8_0_DOT4: super::OpCode = 15;
+    /// The f32-ACTIVATION variant of the same Q8_0 dot4 GEMM: the activation
+    /// is f32 and the kernel quantizes it in registers, which is the path the
+    /// models' plain Q8_0 projections take. A separate opcode because it is a
+    /// DIFFERENT LAUNCH (a different kernel, a different activation layout),
+    /// and the task-graph-to-wave-opcode table is a function — one IR opcode
+    /// cannot name two wave opcodes.
+    pub const Q8_0_DOT4_F32ACT: super::OpCode = 16;
     /// Extension point: an op with no opcode yet runs through its existing
     /// launcher (Phase M fallback contract). It still participates in the DAG,
     /// so its dependents stay correctly ordered.

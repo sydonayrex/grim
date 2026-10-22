@@ -1223,16 +1223,25 @@ extern "C" __global__ void grim_fp32_gemv(
 // PLAN 2 (Phase D launch reduction): Fused activation quantize + dot4 GEMV.
 // Cooperatively quantizes 32-element blocks of act_f32 into LDS, then computes
 // dot4 against Q8_0 weights with zero separate quantize launch.
-extern "C" __global__ void grim_dot4_q80_f32act_gemv(
+// The Q8_0 x f32-activation dot4 GEMV BODY — the SECOND of the format's two
+// launcher variants (the first is the prequantized-q8_1 one above).
+//
+// Same discipline as that body: the wave's arm calls THIS function, so the
+// ring's answer is bit-identical to the launcher's. The models' plain Q8_0
+// paths are the f32-activation ones, so this is the body a Q8_0 dot4 node
+// would actually name.
+//
+// One call is one 32-lane GROUP's share of the work: the group owns the
+// output row `row` and the four output columns starting at `col_base`, and
+// its 32 lanes split the K-blocks. The 32-lane granularity is load-bearing
+// (the reduction is a 32-lane shuffle tree).
+__device__ __forceinline__ void grim_dot4_q80_f32act_gemv_body(
     const float* __restrict__ act_f32,
     const unsigned char* __restrict__ B_q80,
     float* __restrict__ C,
-    int M, int N, int K)
+    int M, int N, int K,
+    int row, int col_base, int lane)
 {
-    const int col_base = blockIdx.x * 4;
-    const int row      = blockIdx.y;
-    const int lane     = threadIdx.x;
-
     if (row >= M || col_base >= N) return;
 
     const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
@@ -1309,6 +1318,16 @@ extern "C" __global__ void grim_dot4_q80_f32act_gemv(
             C[(long long)row * N + col_base + j] = facc[j];
         }
     }
+}
+
+extern "C" __global__ void grim_dot4_q80_f32act_gemv(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q80,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_q80_f32act_gemv_body(
+        act_f32, B_q80, C, M, N, K, blockIdx.y, blockIdx.x * 4, threadIdx.x);
 }
 
 // PLAN 4 (DukeNukem) Task 3: generic norm-fused single-projection GEMV.
