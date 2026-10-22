@@ -164,6 +164,45 @@ GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q6k_tiled,
 }
 "#;
 
+/// Q3_K / Q2_K tiled kernels — M7.2a.
+///
+/// The IQ recipe (the LDS-tiled prompt GEMM) was landed for Q8_0, Q5_K, Q6_K
+/// and the IQ families, and NOT for these two. The macro is format-agnostic
+/// — it takes the `dequant_*` device helper as a parameter, and both helpers
+/// exist — so the omission was a gap in the stamps, not a limitation of the
+/// recipe.
+///
+/// It cost real time, and it is measurable at the 27B's dominant projection
+/// shape (n=17408, k=5120): at m=64 the scalar fallback re-reads every
+/// weight block M times, and Q3_K measured 7.81 ms (4.9 GB/s) and Q2_K 6.90
+/// ms (4.2 GB/s) where Q5_K/Q6_K/Q8_0 measure ~1.25 ms. The IQ formats
+/// reach ~0.5 ms on the same shape.
+///
+/// Q4_K is NOT here: it already has a hand-written tiled kernel in
+/// `kernels::q4k_gemm` (`grim_fused_dequant_gemm_q4k_tiled`, SPEED-ROC-6),
+/// and a second definition of the same symbol is a redefinition error.
+///
+/// The byte geometry mirrors the scalar kernels: Q3_K 110 B / 256 elements,
+/// Q2_K 84 B / 256.
+#[cfg(feature = "q3k")]
+pub const Q3K_TILED_KERNEL_SOURCE: &str = r#"
+extern "C" {
+GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q3k_tiled,
+                         grim_fused_dequant_gemm_q3k_backward_tiled,
+                         dequant_q3k_element, 256, 110)
+}
+"#;
+
+/// Q2_K tiled kernels — see `Q3K_TILED_KERNEL_SOURCE` for the rationale.
+#[cfg(feature = "q2k")]
+pub const Q2K_TILED_KERNEL_SOURCE: &str = r#"
+extern "C" {
+GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q2k_tiled,
+                         grim_fused_dequant_gemm_q2k_backward_tiled,
+                         dequant_q2k_element, 256, 84)
+}
+"#;
+
 /// Assemble the tiled-source fragment for the enabled feature set. The
 /// `#define GRIM_TILED_QUANT_FWD_BWD` lives in `IQ_Q80_TILED_KERNEL_SOURCE`,
 /// so that fragment must be pushed first whenever any part of this module is.
@@ -174,6 +213,12 @@ pub fn tiled_quant_kernel_source() -> String {
     s.push_str(Q5K_TILED_KERNEL_SOURCE);
     #[cfg(feature = "q6k")]
     s.push_str(Q6K_TILED_KERNEL_SOURCE);
+    // M7.2a: the two formats the IQ recipe never reached. (Q4_K already has
+    // a hand-written tiled kernel in kernels::q4k_gemm.)
+    #[cfg(feature = "q3k")]
+    s.push_str(Q3K_TILED_KERNEL_SOURCE);
+    #[cfg(feature = "q2k")]
+    s.push_str(Q2K_TILED_KERNEL_SOURCE);
     s
 }
 

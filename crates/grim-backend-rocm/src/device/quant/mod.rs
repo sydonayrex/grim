@@ -614,6 +614,24 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if Self::tiled_quant_prompt_ok("q2k", m, n, k) {
+                    // M7.2a: the IQ recipe (the LDS-tiled prompt GEMM) for
+                    // Q2_K. The scalar kernel re-reads every weight block M
+                    // times; the tiled kernel stages a weight tile in LDS once
+                    // and reuses it across TILE_M rows. Measured at the 27B's
+                    // dominant shape (n=17408, k=5120): Q2_K at m=64 was
+                    // 6.90 ms (4.2 GB/s) on the scalar path where Q5_K/Q6_K
+                    // measure ~1.25 ms on the tiled one.
+                    //
+                    // Before the WMMA branch, for the same reason as Q3_K.
+                    self.launch_fused_dequant_gemm_q2k_tiled(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q2k(
                         a_storage,
@@ -715,6 +733,26 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if Self::tiled_quant_prompt_ok("q3k", m, n, k) {
+                    // M7.2a: the IQ recipe for Q3_K — see the Q2_K arm above.
+                    // Measured at the 27B's dominant shape: Q3_K at m=64 was
+                    // 7.81 ms (4.9 GB/s) on the scalar path.
+                    //
+                    // This branch comes BEFORE the WMMA one on purpose. The
+                    // 27B's profile measured the WMMA fused-dequant kernels
+                    // at 19.6 s of a run's 21.6 s of kernel time, and the
+                    // WMMA shape gate (n % 64 == 0, k % 16 == 0) is
+                    // satisfied at the prompt shapes — so WMMA was taking
+                    // these formats' prompt work and losing. The tiled route
+                    // is the recipe that was measured against it.
+                    self.launch_fused_dequant_gemm_q3k_tiled(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q3k(
                         a_storage,

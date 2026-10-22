@@ -2336,6 +2336,134 @@ extern "C" __global__ void grim_dot4_q5k_q81_gemv(
                     int a4;
                     __builtin_memcpy(&a4, a_codes + e, 4);
 
+                    // M7.2b (the IQ group-hoisting recipe, applied to Q5_K):
+                    // the four 4-bit codes and the four `qh` high bits were
+                    // fetched with EIGHT separate 1-byte loads per 4 weights.
+                    // Q5_K spends 2 bytes per weight (one code byte + one qh
+                    // byte) against Q4_K's 0.75, and the measured decode gap
+                    // tracks that byte ratio: Q5_K ran at 8.7 GB/s where Q4_K
+                    // ran at 24.5 at the 27B's dominant shape.
+                    //
+                    // Both fields are 4-byte aligned for every e in this loop
+                    // (qs sits at +48, qh at +16, the super-block stride is
+                    // 176 - all multiples of 4), so the four bytes are one
+                    // dword each. The per-byte nibble/bit extraction then
+                    // becomes two whole-word masks instead of eight
+                    // shift-mask-select triples.
+                    unsigned qw4, qh4;
+                    __builtin_memcpy(&qw4, qs_sub + e, 4);
+                    __builtin_memcpy(&qh4, qh + e, 4);
+
+                    // Byte i of `nib` is code i in its low nibble; byte i of
+                    // `msb` is that code's qh bit at bit 4. The masks keep
+                    // each byte independent, so the word-level result is
+                    // identical to the per-byte arithmetic it replaces.
+                    unsigned nib = half ? ((qw4 >> 4) & 0x0F0F0F0Fu)
+                                        : (qw4 & 0x0F0F0F0Fu);
+                    unsigned msb = ((qh4 >> (2 * group + half)) & 0x01010101u) << 4;
+
+                    int q4 = (int)(nib | msb);
+
+                    pos_dot = grim_sdot4(a4, q4, pos_dot);
+                }
+
+                float sub_res = d * (float)sc * ((float)pos_dot * d_a) - dmin * (float)m * sum_a;
+                facc[j] += sub_res;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+// M7.2b: the RETAINED ORACLE for the Q5_K group-hoisting change above.
+//
+// This is the pre-change `grim_dot4_q5k_q81_gemv` body, verbatim — eight
+// 1-byte loads per 4 weights — kept alive under a second entry point so the
+// hoist can be gated on BYTE-IDENTICAL output instead of a hand oracle. The
+// parity gate is tests/dot4_q5k_grouped_parity.rs.
+//
+// It is NOT on any dispatch path: only the parity gate launches it.
+extern "C" __global__ void grim_dot4_q5k_q81_gemv_ref(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q5k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x; // 0..31
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const int n_q5k_superblocks = K / GRIM_Q5K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q5k + (long long)(col_base + j) * n_q5k_superblocks * GRIM_Q5K_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = lane; sb < n_q5k_superblocks; sb += 32) {
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * GRIM_Q5K_BYTES;
+
+            const unsigned short* h_ptr = (const unsigned short*)b_sb;
+            float d    = fp16_to_float_device(h_ptr[0]);
+            float dmin = fp16_to_float_device(h_ptr[1]);
+
+            const unsigned char* scales = b_sb + 4;
+            const unsigned char* qh     = b_sb + 16;
+            const unsigned char* qs     = b_sb + 48;
+
+            #pragma unroll
+            for (int is = 0; is < 8; ++is) {
+                const unsigned char* a_blk = a_sb + is * GRIM_Q8_1_BYTES;
+                float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                float sum_a = fp16_to_float_device(((const unsigned short*)a_blk)[1]);
+                const signed char* a_codes = (const signed char*)(a_blk + 4);
+
+                unsigned char sc, m;
+                if (is < 4) {
+                    sc = scales[is] & 63;
+                    m  = scales[is + 4] & 63;
+                } else {
+                    sc = (scales[is + 4] & 0x0F) | ((scales[is - 4] >> 6) << 4);
+                    m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                }
+
+                int group = is / 2;
+                int half  = is % 2;
+                const unsigned char* qs_sub = qs + group * 32;
+
+                int pos_dot = 0;
+                #pragma unroll
+                for (int e = 0; e < 32; e += 4) {
+                    int a4;
+                    __builtin_memcpy(&a4, a_codes + e, 4);
+
                     unsigned char b0 = qs_sub[e + 0];
                     unsigned char b1 = qs_sub[e + 1];
                     unsigned char b2 = qs_sub[e + 2];

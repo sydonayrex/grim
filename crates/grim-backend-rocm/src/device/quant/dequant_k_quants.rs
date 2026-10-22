@@ -824,6 +824,95 @@ impl RocmDevice {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q3k", a, b, out, m, n, k, 1)
     }
 
+    /// M7.2a: the IQ recipe (the LDS-tiled prompt GEMM) for Q3_K.
+    ///
+    /// The scalar kernel re-reads every weight block M times; the tiled
+    /// kernel stages a 64x64 weight tile in LDS once and reuses it across
+    /// TILE_M prompt rows. The stamp is
+    /// `GRIM_TILED_QUANT_FWD_BWD(..., dequant_q3k_element, 256, 110)` in
+    /// `kernels::quant_tiled_gemm`, and the byte geometry mirrors the scalar
+    /// kernel: 110 B per 256-element super-block.
+    pub(crate) fn launch_fused_dequant_gemm_q3k_tiled(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q3k_tiled: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q3k_tiled: b has no device ptr".into()))?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q3k_tiled: out has no device ptr".into())
+        })?;
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q3k_tiled",
+            crate::HipDim3::new((n as u32).div_ceil(64), (m as u32).div_ceil(4), 1),
+            crate::HipDim3::new(64, 4, 1),
+            &mut [
+                crate::arg(&mut aptr),
+                crate::arg(&mut bptr),
+                crate::arg(&mut optr),
+                crate::arg(&mut mm),
+                crate::arg(&mut nn),
+                crate::arg(&mut kk),
+            ],
+        )
+    }
+
+    /// M7.2a: the IQ recipe for Q2_K — see
+    /// [`Self::launch_fused_dequant_gemm_q3k_tiled`]. The byte geometry is
+    /// 84 B per 256-element super-block.
+    pub(crate) fn launch_fused_dequant_gemm_q2k_tiled(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q2k_tiled: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q2k_tiled: b has no device ptr".into()))?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q2k_tiled: out has no device ptr".into())
+        })?;
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q2k_tiled",
+            crate::HipDim3::new((n as u32).div_ceil(64), (m as u32).div_ceil(4), 1),
+            crate::HipDim3::new(64, 4, 1),
+            &mut [
+                crate::arg(&mut aptr),
+                crate::arg(&mut bptr),
+                crate::arg(&mut optr),
+                crate::arg(&mut mm),
+                crate::arg(&mut nn),
+                crate::arg(&mut kk),
+            ],
+        )
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_q3k(
         &self,
         dy: &RocmStorage,

@@ -4,7 +4,14 @@
 //!
 //! GPU tests: `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm
 //! --features "q5k q6k gpu-test-shims" --test quant_tiled_gemm`.
-#![cfg(all(feature = "q5k", feature = "q6k", feature = "gpu-test-shims"))]
+#![cfg(all(
+    feature = "q5k",
+    feature = "q6k",
+    feature = "q4k",
+    feature = "q3k",
+    feature = "q2k",
+    feature = "gpu-test-shims"
+))]
 
 use grim_backend_rocm::device::q4k_test_shim;
 use grim_backend_rocm::{RocmCachingAllocator, RocmDevice, RocmStorage};
@@ -88,6 +95,27 @@ const FORMATS: &[(&str, KQuantScheme, usize, usize, &str)] = &[
         256,
         136,
         "grim_fused_dequant_gemm_iq4xs",
+    ),
+    // M7.2a: the K-quants the IQ recipe never reached. Their tiled stamps
+    // are in `kernels::quant_tiled_gemm` and their scalar oracles are the
+    // kernels named here, so the parity is against the SAME arithmetic the
+    // shipping path uses.
+    //
+    // Q4_K is NOT in this table: it has its own hand-written tiled kernel
+    // (SPEED-ROC-6) and its own parity gate in `tests/q4k_tiled_gemm.rs`.
+    (
+        "q3k",
+        KQuantScheme::Q3K,
+        256,
+        110,
+        "grim_fused_dequant_gemm_q3k",
+    ),
+    (
+        "q2k",
+        KQuantScheme::Q2K,
+        256,
+        84,
+        "grim_fused_dequant_gemm_q2k",
     ),
 ];
 

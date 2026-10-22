@@ -86,6 +86,24 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// M7.2a: the SHAPE gate for the IQ recipe (the LDS-tiled prompt GEMM)
+    /// on a given format.
+    ///
+    /// The tiled kernel stages a 64x64 weight tile in LDS and reuses it
+    /// across TILE_M=4 prompt rows, so it pays off when the prompt has
+    /// enough rows to amortise the staging and the tile is expressible:
+    /// `n` must be a multiple of the 64-column tile and `k` a multiple of the
+    /// format's 256-element super-block.
+    ///
+    /// `m >= 2` is the floor: at m == 1 there is no row reuse to amortise,
+    /// and the decode shape has its own (faster) route.
+    ///
+    /// The per-format policy switch is `tiled_quant_enabled`, so every
+    /// format the recipe reaches can be turned off individually for an A/B.
+    pub(crate) fn tiled_quant_prompt_ok(tag: &str, m: usize, n: usize, k: usize) -> bool {
+        Self::tiled_quant_enabled(tag) && m >= 2 && n >= 64 && n % 64 == 0 && k % 256 == 0
+    }
+
     /// SPEED-ROC-8: per-format opt-in flag (GRIM_Q5K_TILED, GRIM_IQ4XS_TILED,
     /// GRIM_Q8_0_TILED, ...). Cached per format tag; default off — the scalar
     /// kernels remain the shipping default until per-model benchmarks flip it.
@@ -106,7 +124,25 @@ impl RocmDevice {
             // 9B perf plan Step 3: default-ON for the measured k-quant
             // formats. The scalar kernel re-reads every weight block M times;
             // at the 9B prefill shape it ran at 0.2 GB/s (skinny_m gate).
-            // q2k/q3k stay opt-in until measured.
+            //
+            // M7.2a: q2k/q3k are NOT default-ON, and the reason is
+            // structural, not a missing measurement. The LDS-tiled recipe
+            // stages a 64(k) x 64(COLUMN) tile — so the 4096 weights it
+            // stages come from 64 DIFFERENT weight rows, and every one of
+            // them needs its own super-block header decoded. There is no
+            // header reuse to amortise, and the per-element header decode
+            // (Q3_K's is a 12-byte aux shuffle into 16 scale bytes) is
+            // paid 4096 times per tile. Measured at the 27B's dominant
+            // shape (n=17408, k=5120, m=64): the tiled route is 99.4 ms
+            // where the scalar route is 7.8 ms — a 12.7x REGRESSION.
+            //
+            // The IQ formats do not have this problem because their
+            // per-element decode is cheap (a grid lookup), so the tiled
+            // recipe pays for itself there. The K-quants need the OTHER half
+            // of the IQ recipe — the GROUP-HOISTED SCALAR kernel, which
+            // decodes the super-block header once per block instead of once
+            // per weight. That is the fix to make; the tiled kernels stay
+            // here, bit-identical and gated, for the day it does.
             matches!(tag, "q4k" | "q5k" | "q6k")
         })
     }

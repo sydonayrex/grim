@@ -1544,6 +1544,51 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// M7.2b: the RETAINED ORACLE for the Q5_K group hoist — the pre-change
+    /// kernel body, kept alive so the hoist can be gated on BYTE-IDENTICAL
+    /// output rather than a hand-written oracle. Not on any dispatch path;
+    /// only tests/dot4_q5k_grouped_parity.rs launches it.
+    pub fn launch_dot4_q5k_q81_gemv_ref_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv_ref",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_dot4_q5k_q81_gemv_named(
+        &self,
+        kernel_name: &str,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         let a_ptr = act_q81
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q5k_q81_gemv: act_q81 has no device ptr".into()))?;
@@ -1563,7 +1608,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q5k_q81_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
