@@ -151,6 +151,7 @@ pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
+pub use crate::memory::storage::{blocking_d2h_count, reset_blocking_d2h_count};
 pub use crate::memory::view::RocmStorageView;
 
 pub use crate::device::helpers::{

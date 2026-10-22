@@ -407,6 +407,8 @@ impl RocmDevice {
         {
             let _leg = crate::device::util::DeviceGuard::set(src_ordinal as i32);
             check_hip("cross-bounce D2H", unsafe {
+                // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+                crate::memory::storage::count_blocking_d2h();
                 hipMemcpyAsync(
                     staging_buf.as_mut_ptr() as *mut c_void,
                     src_ptr,
@@ -2175,6 +2177,8 @@ impl RocmDevice {
             }
         };
         let stream = self.active_stream();
+        // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+        crate::memory::storage::count_blocking_d2h();
         check_hip("hipMemcpyAsync(D2H)", unsafe {
             hipMemcpyAsync(
                 pinned.as_mut_ptr() as *mut c_void,
@@ -2222,6 +2226,8 @@ impl RocmDevice {
             }
         };
         let stream = self.active_stream();
+        // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+        crate::memory::storage::count_blocking_d2h();
         check_hip("hipMemcpyAsync(D2H)", unsafe {
             hipMemcpyAsync(
                 dst.as_mut_ptr() as *mut c_void,

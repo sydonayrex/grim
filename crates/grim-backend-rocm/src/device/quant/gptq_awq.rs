@@ -968,6 +968,8 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("wna16 header: no device ptr".into()))?;
         check_hip("wna16 header D2H", unsafe {
+            // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+            crate::memory::storage::count_blocking_d2h();
             hipMemcpyAsync(
                 pinned.as_mut_ptr() as *mut c_void,
                 ptr as *const c_void,

@@ -1893,15 +1893,23 @@ impl DecodeGraphBuffers {
                 let mut host_eager_v = vec![0u8; n_bytes];
                 let mut host_graph_v = vec![0u8; n_bytes];
                 check_hip("seed_kv_arena D2H eager_k", unsafe {
+                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                    crate::memory::storage::count_blocking_d2h();
                     crate::hipMemcpy(host_eager_k.as_mut_ptr() as *mut std::ffi::c_void, src_k, n_bytes, HipMemcpyKind::DeviceToHost)
                 })?;
                 check_hip("seed_kv_arena D2H graph_k", unsafe {
+                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                    crate::memory::storage::count_blocking_d2h();
                     crate::hipMemcpy(host_graph_k.as_mut_ptr() as *mut std::ffi::c_void, dst_k, n_bytes, HipMemcpyKind::DeviceToHost)
                 })?;
                 check_hip("seed_kv_arena D2H eager_v", unsafe {
+                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                    crate::memory::storage::count_blocking_d2h();
                     crate::hipMemcpy(host_eager_v.as_mut_ptr() as *mut std::ffi::c_void, src_v, n_bytes, HipMemcpyKind::DeviceToHost)
                 })?;
                 check_hip("seed_kv_arena D2H graph_v", unsafe {
+                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                    crate::memory::storage::count_blocking_d2h();
                     crate::hipMemcpy(host_graph_v.as_mut_ptr() as *mut std::ffi::c_void, dst_v, n_bytes, HipMemcpyKind::DeviceToHost)
                 })?;
                     let k_diff = host_eager_k.iter().zip(host_graph_k.iter()).filter(|(a, b)| a != b).count();

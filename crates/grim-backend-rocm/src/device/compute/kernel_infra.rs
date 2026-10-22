@@ -95,6 +95,8 @@ impl RocmDevice {
         // D2H copy only 4 bytes of result
         let mut res: f32 = 0.0f32;
         check_hip("gpu_reduce_sum D2H", unsafe {
+            // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+            crate::memory::storage::count_blocking_d2h();
             hipMemcpyAsync(
                 &mut res as *mut f32 as *mut c_void,
                 out_p as *mut c_void,
@@ -181,6 +183,8 @@ impl RocmDevice {
 
         let mut res: f32 = 0.0f32;
         check_hip("gpu_reduce_max D2H", unsafe {
+            // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+            crate::memory::storage::count_blocking_d2h();
             hipMemcpyAsync(
                 &mut res as *mut f32 as *mut c_void,
                 out_p as *mut c_void,
@@ -299,6 +303,8 @@ impl RocmDevice {
 
         let mut res: u32 = 0u32;
         check_hip("gpu_argmax D2H", unsafe {
+            // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+            crate::memory::storage::count_blocking_d2h();
             hipMemcpyAsync(
                 &mut res as *mut u32 as *mut c_void,
                 out_p as *mut c_void,

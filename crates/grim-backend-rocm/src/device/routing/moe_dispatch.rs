@@ -2127,6 +2127,8 @@ impl RocmDevice {
                     let rd = |ptr: *const c_void, n: usize| -> Vec<f32> {
                         let mut b = vec![0u8; n * 4];
                         let _ = unsafe {
+                            // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                            crate::memory::storage::count_blocking_d2h();
                             crate::hipMemcpy(
                                 b.as_mut_ptr() as *mut c_void,
                                 ptr,
@@ -2178,6 +2180,8 @@ impl RocmDevice {
                     let rd = |ptr: *const c_void, n: usize| -> Vec<f32> {
                         let mut b = vec![0u8; n * 4];
                         let _ = unsafe {
+                            // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                            crate::memory::storage::count_blocking_d2h();
                             crate::hipMemcpy(
                                 b.as_mut_ptr() as *mut c_void,
                                 ptr,
@@ -2245,6 +2249,8 @@ impl RocmDevice {
                     let tok0 = toks_slice[0] as usize;
                     let mut head = [0f32; 4];
                     let _ = unsafe {
+                        // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                        crate::memory::storage::count_blocking_d2h();
                         crate::hipMemcpy(
                             head.as_mut_ptr() as *mut c_void,
                             (out_p as usize + tok0 * hidden * 4) as *mut c_void,
@@ -2254,6 +2260,8 @@ impl RocmDevice {
                     };
                     let mut dt_head = [0f32; 4];
                     let _ = unsafe {
+                        // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                        crate::memory::storage::count_blocking_d2h();
                         crate::hipMemcpy(
                             dt_head.as_mut_ptr() as *mut c_void,
                             dt_p as *const c_void,
