@@ -66,6 +66,122 @@ extern "C" {
         return dl * (float)q_biased;
     }
 
+    /// M7.2f: the GROUP HEADER of a Q3_K 16-weight group, decoded once.
+    ///
+    /// The per-element decoder re-does the 12-byte ggml aux shuffle for EVERY
+    /// weight, which is ~40 ops and 12 byte loads each. The IQ recipe
+    /// (the IQ1_S D2-2 change) is to hoist the part of a group that is
+    /// CONSTANT.
+    ///
+    /// It returns the SELECTED scale, not the 16-byte array, and that is not
+    /// a detail: a per-thread array indexed by a runtime index lands in
+    /// SCRATCH memory, and every weight then pays a scratch load that the 32
+    /// lanes of a wave cannot coalesce (each lane has its own scratch
+    /// address). Measured: the array form ran the tile at 15.3 ms against
+    /// the WMMA path's 7.8 ms; the value form is one register.
+    ///
+    /// `in_sb` is the index of the group's FIRST weight inside the
+    /// super-block. The scale index (n, _j, lo_hi) is constant across the
+    /// group's 16 weights, so one shuffle serves the whole group.
+    __device__ __forceinline__ void dequant_q3k_header(
+        const unsigned char* block_ptr,
+        int in_sb,
+        float* d_out,
+        float* dmin_out,
+        float* s0_out,
+        float* s1_out)
+    {
+        const unsigned char* scales_ptr = block_ptr + 96;
+        *d_out    = fp16_to_float_device(((const unsigned short*)(block_ptr + 108))[0]);
+        *dmin_out = 0.0f;   // Q6_K-style: Q3_K has no dmin term
+        *s1_out   = 0.0f;
+
+        const unsigned int kmask1 = 0x03030303u;
+        const unsigned int kmask2 = 0x0F0F0F0Fu;
+        unsigned int aux0 = ((unsigned int)scales_ptr[0]) | (((unsigned int)scales_ptr[1]) << 8)
+                          | (((unsigned int)scales_ptr[2]) << 16) | (((unsigned int)scales_ptr[3]) << 24);
+        unsigned int aux1 = ((unsigned int)scales_ptr[4]) | (((unsigned int)scales_ptr[5]) << 8)
+                          | (((unsigned int)scales_ptr[6]) << 16) | (((unsigned int)scales_ptr[7]) << 24);
+        unsigned int tmp  = ((unsigned int)scales_ptr[8]) | (((unsigned int)scales_ptr[9]) << 8)
+                          | (((unsigned int)scales_ptr[10]) << 16) | (((unsigned int)scales_ptr[11]) << 24);
+        unsigned int qw0 = (aux0 & kmask2) | (((tmp >>  0) & kmask1) << 4);
+        unsigned int qw1 = (aux1 & kmask2) | (((tmp >>  2) & kmask1) << 4);
+        unsigned int qw2 = ((aux0 >> 4) & kmask2) | (((tmp >>  4) & kmask1) << 4);
+        unsigned int qw3 = ((aux1 >> 4) & kmask2) | (((tmp >>  6) & kmask1) << 4);
+        unsigned int auxs[4] = { qw0, qw1, qw2, qw3 };
+
+        int n     = in_sb / 128;
+        int _j    = (in_sb % 128) / 32;
+        int lo_hi = (in_sb % 32) / 16;
+        int sc_idx = n * 8 + _j * 2 + lo_hi;
+        int t = sc_idx / 4;
+        int b2 = sc_idx % 4;
+        unsigned int v = (auxs[t] >> (8 * b2)) & 0xFF;
+        *s0_out = (float)((int)(v >= 128u ? (int)v - 256 : (int)v) - 32);
+    }
+
+    /// M7.2f: FOUR Q3_K weights from one already-decoded group header.
+    ///
+    /// The four codes are four nibbles of four CONSECUTIVE bytes and the four
+    /// sign bits are four bits of four CONSECUTIVE hmask bytes, so each field
+    /// is one wide read instead of four 1-byte reads. Q3_K's 110-byte
+    /// super-block stride only guarantees 2-byte alignment, so the wide read
+    /// is a pair of ushorts rather than a dword.
+    __device__ __forceinline__ void dequant_q3k_quad(
+        const unsigned char* block_ptr,
+        int in_sb,
+        float d,
+        float dmin,
+        float scale_val,
+        float unused_s1,
+        float* o0,
+        float* o1,
+        float* o2,
+        float* o3)
+    {
+        const unsigned char* hmask = block_ptr + 0;
+        const unsigned char* qs    = block_ptr + 32;
+
+        int n     = in_sb / 128;
+        int _j    = (in_sb % 128) / 32;
+        int lo_hi = (in_sb % 32) / 16;
+        int l     = in_sb % 16;
+        float dl = d * scale_val;
+
+        int shift  = _j * 2;
+        int q_off  = n * 32 + l + lo_hi * 16;
+        int hm_off = l + lo_hi * 16;
+
+        unsigned short q01, q23, h01, h23;
+        __builtin_memcpy(&q01, qs + q_off, 2);
+        __builtin_memcpy(&q23, qs + q_off + 2, 2);
+        __builtin_memcpy(&h01, hmask + hm_off, 2);
+        __builtin_memcpy(&h23, hmask + hm_off + 2, 2);
+        unsigned qw = (unsigned)q01 | ((unsigned)q23 << 16);
+        unsigned hw = (unsigned)h01 | ((unsigned)h23 << 16);
+
+        {
+            int q_val  = (int)(((qw >> 0) & 0xFFu) >> shift) & 3;
+            int hm_bit = (int)(((hw >> 0) & 0xFFu) >> (_j + n * 4)) & 1;
+            *o0 = dl * (float)(q_val - (hm_bit ? 0 : 4));
+        }
+        {
+            int q_val  = (int)(((qw >> 8) & 0xFFu) >> shift) & 3;
+            int hm_bit = (int)(((hw >> 8) & 0xFFu) >> (_j + n * 4)) & 1;
+            *o1 = dl * (float)(q_val - (hm_bit ? 0 : 4));
+        }
+        {
+            int q_val  = (int)(((qw >> 16) & 0xFFu) >> shift) & 3;
+            int hm_bit = (int)(((hw >> 16) & 0xFFu) >> (_j + n * 4)) & 1;
+            *o2 = dl * (float)(q_val - (hm_bit ? 0 : 4));
+        }
+        {
+            int q_val  = (int)(((qw >> 24) & 0xFFu) >> shift) & 3;
+            int hm_bit = (int)(((hw >> 24) & 0xFFu) >> (_j + n * 4)) & 1;
+            *o3 = dl * (float)(q_val - (hm_bit ? 0 : 4));
+        }
+    }
+
     // Latent-cache embedding gather for Q3_K tables (xing4.0 token_embd):
     // mirrors grim_embedding_q4k_gather with the 110-byte Q3_K super-block.
     extern "C" __global__ void grim_embedding_q3k_gather(

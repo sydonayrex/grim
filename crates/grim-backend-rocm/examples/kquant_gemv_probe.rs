@@ -94,8 +94,22 @@ fn main() {
          \n[kquant-gemv] formats that never got it."
     );
 
+    // The M list is configurable so the prompt path can be swept: the
+    // tiled route and the WMMA route reuse the weights across different
+    // numbers of rows (4 vs 16), so which one wins can depend on M.
+    let ms: Vec<usize> = std::env::var("GRIM_PROBE_MS")
+        .ok()
+        .and_then(|v| {
+            v.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![1usize, 64]);
+
     for q in K_QUANTS {
-        for m in [1usize, 64] {
+        for m in ms.iter().copied() {
             let row_bytes = (k / q.block_elems) * q.block_bytes;
             let mut bytes = vec![0u8; n * row_bytes];
             // A deterministic non-uniform pattern so a kernel that reads

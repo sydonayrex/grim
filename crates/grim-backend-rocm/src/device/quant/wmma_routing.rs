@@ -125,24 +125,38 @@ impl RocmDevice {
             // formats. The scalar kernel re-reads every weight block M times;
             // at the 9B prefill shape it ran at 0.2 GB/s (skinny_m gate).
             //
-            // M7.2a: q2k/q3k are NOT default-ON, and the reason is
-            // structural, not a missing measurement. The LDS-tiled recipe
-            // stages a 64(k) x 64(COLUMN) tile — so the 4096 weights it
-            // stages come from 64 DIFFERENT weight rows, and every one of
-            // them needs its own super-block header decoded. There is no
-            // header reuse to amortise, and the per-element header decode
-            // (Q3_K's is a 12-byte aux shuffle into 16 scale bytes) is
-            // paid 4096 times per tile. Measured at the 27B's dominant
-            // shape (n=17408, k=5120, m=64): the tiled route is 99.4 ms
-            // where the scalar route is 7.8 ms — a 12.7x REGRESSION.
+            // M7.2a/f: q2k/q3k are NOT default-ON, and the reason is
+            // measured, not a missing measurement.
             //
-            // The IQ formats do not have this problem because their
-            // per-element decode is cheap (a grid lookup), so the tiled
-            // recipe pays for itself there. The K-quants need the OTHER half
-            // of the IQ recipe — the GROUP-HOISTED SCALAR kernel, which
-            // decodes the super-block header once per block instead of once
-            // per weight. That is the fix to make; the tiled kernels stay
-            // here, bit-identical and gated, for the day it does.
+            // The plain LDS-tiled recipe stages a 64(k) x 64(COLUMN) tile,
+            // so the 4096 weights it stages come from 64 DIFFERENT weight
+            // rows and each needs its own super-block header decoded: there
+            // is no header reuse to amortise, and Q3_K's header is a 12-byte
+            // aux shuffle into 16 scale bytes. Measured at the 27B's
+            // dominant shape (n=17408, k=5120): the plain tile ran 99.4 ms
+            // where the incumbent ran 7.8 ms — a 12.7x REGRESSION.
+            //
+            // M7.2f applied the IQ recipe's group hoist to that tile
+            // (GRIM_TILED_QUANT_FWD_BWD_GROUPED: the header is decoded once
+            // per 16-weight group, and the four codes of a group come out
+            // of one wide read). It is bit-identical to the scalar kernel,
+            // forward and backward, and it makes the TILE 6.5x faster
+            // (Q3_K 99.4 -> 15.3 ms, Q2_K 99.7 -> 11.6 ms) — so the recipe
+            // DOES transfer to the tiled route.
+            //
+            // But the tile is still 1.6-2.0x SLOWER than the incumbent at
+            // every M (Q3_K: 15.3 vs 7.6 ms at m=64, 59.7 vs 27.6 at m=256,
+            // 233 vs 111 at m=1024), so the route stays off. What the tile
+            // spends its time on is still not identified: with the header
+            // stubbed out it is 10.7 ms, against the plain macro's ~0.6 ms
+            // of staging at the same shape, and neither the thread mapping
+            // nor force-inlining the quad moves it.
+            //
+            // The incumbent for these two formats is the SCALAR dequant
+            // GEMM, and it is already at the L2 limit (38 MB of weights read
+            // M=64 times over is 2.4 GB in 7.6 ms = 320 GB/s). The headroom
+            // is the tile's 4x-lower traffic; the blocker is the tile's
+            // staging cost, which is the next thing to measure.
             matches!(tag, "q4k" | "q5k" | "q6k")
         })
     }

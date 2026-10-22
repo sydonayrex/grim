@@ -8,7 +8,74 @@ extern "C" {
     /// Dequantize one Q2_K element from an 84-byte super-block.
     /// Layout: scales[16] @0..16, qs[64] @16..80, d (f16) @80, dmin (f16) @82.
     /// `in_sb` is the weight index within the 256-weight super-block (0..255).
-    __device__ inline float dequant_q2k_element(const unsigned char* block_ptr, int in_sb) {
+        /// M7.2f: the GROUP HEADER of a Q2_K 16-weight group, decoded once.
+    ///
+    /// Returns the two 4-bit scales of the group's sub-block as VALUES, not
+    /// as an array: a per-thread array indexed at runtime lands in scratch
+    /// memory, and every weight would then pay a scratch load the wave
+    /// cannot coalesce.
+    __device__ __forceinline__ void dequant_q2k_header(
+        const unsigned char* block_ptr,
+        int in_sb,
+        float* d_out,
+        float* dmin_out,
+        float* s0_out,
+        float* s1_out)
+    {
+        *d_out    = fp16_to_float_device(((const unsigned short*)(block_ptr + 80))[0]);
+        *dmin_out = fp16_to_float_device(((const unsigned short*)(block_ptr + 82))[0]);
+        const int sub = in_sb / 16;
+        const unsigned char s = block_ptr[sub];
+        *s0_out = (float)(s & 0x0F);
+        *s1_out = (float)(s >> 4);
+    }
+
+    /// M7.2f: FOUR Q2_K weights from one already-decoded group header.
+    ///
+    /// The four codes are four 2-bit fields of four CONSECUTIVE bytes (the
+    /// interleaved llama.cpp layout), so one dword carries all four. Q2_K's
+    /// 84-byte super-block stride is a multiple of 4, so the wide read is
+    /// 4-byte aligned.
+    __device__ __forceinline__ void dequant_q2k_quad(
+        const unsigned char* block_ptr,
+        int in_sb,
+        float d,
+        float dmin,
+        float sc,
+        float m,
+        float* o0,
+        float* o1,
+        float* o2,
+        float* o3)
+    {
+        const unsigned char* qs = block_ptr + 16;
+
+        int sub = in_sb / 16;
+        int w   = in_sb % 16;
+
+        int q_byte  = (sub / 8) * 32 + (w % 16) + (sub % 2) * 16;
+        int q_shift = 2 * ((sub % 8) / 2);
+        unsigned qw;
+        __builtin_memcpy(&qw, qs + q_byte, 4);
+        {
+            int code = (int)(((qw >> 0) & 0xFFu) >> q_shift) & 0x03;
+            *o0 = d * sc * (float)code - dmin * m;
+        }
+        {
+            int code = (int)(((qw >> 8) & 0xFFu) >> q_shift) & 0x03;
+            *o1 = d * sc * (float)code - dmin * m;
+        }
+        {
+            int code = (int)(((qw >> 16) & 0xFFu) >> q_shift) & 0x03;
+            *o2 = d * sc * (float)code - dmin * m;
+        }
+        {
+            int code = (int)(((qw >> 24) & 0xFFu) >> q_shift) & 0x03;
+            *o3 = d * sc * (float)code - dmin * m;
+        }
+    }
+
+__device__ inline float dequant_q2k_element(const unsigned char* block_ptr, int in_sb) {
         const unsigned char* scales = block_ptr;
         const unsigned char* qs = block_ptr + 16;
         float d    = fp16_to_float_device(((const unsigned short*)(block_ptr + 80))[0]);

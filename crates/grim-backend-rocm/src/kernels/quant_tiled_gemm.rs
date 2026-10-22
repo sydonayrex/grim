@@ -187,9 +187,9 @@ GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q6k_tiled,
 #[cfg(feature = "q3k")]
 pub const Q3K_TILED_KERNEL_SOURCE: &str = r#"
 extern "C" {
-GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q3k_tiled,
-                         grim_fused_dequant_gemm_q3k_backward_tiled,
-                         dequant_q3k_element, 256, 110)
+GRIM_TILED_QUANT_FWD_BWD_GROUPED(grim_fused_dequant_gemm_q3k_tiled,
+                                 grim_fused_dequant_gemm_q3k_backward_tiled,
+                                 dequant_q3k_header, dequant_q3k_quad, 256, 110)
 }
 "#;
 
@@ -197,10 +197,138 @@ GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q3k_tiled,
 #[cfg(feature = "q2k")]
 pub const Q2K_TILED_KERNEL_SOURCE: &str = r#"
 extern "C" {
-GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q2k_tiled,
-                         grim_fused_dequant_gemm_q2k_backward_tiled,
-                         dequant_q2k_element, 256, 84)
+GRIM_TILED_QUANT_FWD_BWD_GROUPED(grim_fused_dequant_gemm_q2k_tiled,
+                                 grim_fused_dequant_gemm_q2k_backward_tiled,
+                                 dequant_q2k_header, dequant_q2k_quad, 256, 84)
 }
+"#;
+
+
+/// M7.2f: the GROUPED tiling macro — the LDS-tiled recipe WITH the group
+/// hoist, which the plain macro cannot express.
+///
+/// The plain `GRIM_TILED_QUANT_FWD_BWD` calls `DEQ(block, in_sb)` once per
+/// staged weight, so a format whose per-element decoder re-derives the
+/// super-block header pays for it 4096 times per tile. For the K-quants that
+/// is the whole cost: measured at the 27B's shape, the untiled-group Q3_K
+/// tile ran 12.7x SLOWER than the scalar path (99.4 ms against 7.8 ms),
+/// because Q3_K's header is a 12-byte ggml aux shuffle into 16 scale bytes
+/// and the tile's 4096 weights come from 64 DIFFERENT weight rows, so
+/// there is no header to amortise inside the weight loop.
+///
+/// This macro gives the tile the IQ recipe's shape: a 64-wide k chunk lies
+/// inside ONE super-block (BLK=256 divides it), so the header is decoded
+/// ONCE per (column, chunk) and the weights of that column are then read
+/// four at a time with wide loads.
+///
+/// `HDR(blk, &d, &dmin, sc16)` decodes the group header; `W4(blk, in_sb, d,
+/// dmin, sc16, out4)` decodes FOUR consecutive weights of that group into
+/// `out4`. Both are format-specific; the tiling is not.
+pub const GROUPED_TILED_MACRO_SOURCE: &str = r#"
+#define GRIM_TILED_QUANT_FWD_BWD_GROUPED(FWD, BWD, HDR, W4, BLK, BYTES)            \
+    __global__ void FWD(const float* __restrict__ A,                                 \
+                        const unsigned char* __restrict__ B,                         \
+                        float* __restrict__ C,                                       \
+                        int M, int N, int K)                                         \
+    {                                                                                \
+        __shared__ float sW[64][64];                                                 \
+        __shared__ float sA[4][64];                                                  \
+        const int col0 = blockIdx.x * 64;                                            \
+        const int row0 = blockIdx.y * 4;                                             \
+        const int tx = threadIdx.x;                                                  \
+        const int ty = threadIdx.y;                                                  \
+        const int row = row0 + ty;                                                   \
+        const int col = col0 + tx;                                                   \
+        const bool tile_ok = (row < M) && (col < N);                                 \
+        const int row_bytes = (K / (BLK)) * (BYTES);                                 \
+        float acc = 0.0f;                                                            \
+        for (int k0 = 0; k0 < K; k0 += 64) {                                         \
+            float hd = 0.0f, hdm = 0.0f, hsc = 0.0f, hsm = 0.0f;                    \
+            const unsigned char* blk = (const unsigned char*)0;                      \
+            if (col < N && k0 < K) {                                                 \
+                blk = B + (long long)col * row_bytes                                 \
+                    + (long long)(k0 / (BLK)) * (BYTES);                             \
+                HDR(blk, (k0 % (BLK)) + ty * 16, &hd, &hdm, &hsc, &hsm);            \
+            }                                                                        \
+            for (int kg = 0; kg < 4; ++kg) {                                         \
+                /* FOUR SEPARATE SCALARS, not an array: a local array      \
+                   indexed at runtime lands in SCRATCH memory, and the     \
+                   scratch traffic is per-thread, so the 32 lanes of a wave \
+                   cannot coalesce it. */                                      \
+                float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;                  \
+                if (blk != (const unsigned char*)0) {                                \
+                    W4(blk, (k0 % (BLK)) + ty * 16 + kg * 4,                        \
+                       hd, hdm, hsc, hsm, &w0, &w1, &w2, &w3);                     \
+                }                                                                    \
+                const int kk0 = ty * 16 + kg * 4;                                    \
+                sW[kk0 + 0][tx] = (kk0 + 0 < 64 && k0 + kk0 + 0 < K) ? w0 : 0.0f;   \
+                sW[kk0 + 1][tx] = (kk0 + 1 < 64 && k0 + kk0 + 1 < K) ? w1 : 0.0f;   \
+                sW[kk0 + 2][tx] = (kk0 + 2 < 64 && k0 + kk0 + 2 < K) ? w2 : 0.0f;   \
+                sW[kk0 + 3][tx] = (kk0 + 3 < 64 && k0 + kk0 + 3 < K) ? w3 : 0.0f;   \
+            }                                                                        \
+            {                                                                        \
+                const int gk = k0 + tx;                                              \
+                const int rr = row0 + ty;                                            \
+                sA[ty][tx] = (rr < M && gk < K) ? A[(long long)rr * K + gk] : 0.0f;  \
+            }                                                                        \
+            __syncthreads();                                                         \
+            if (tile_ok) {                                                           \
+                for (int kk = 0; kk < 64; ++kk) acc += sA[ty][kk] * sW[kk][tx];      \
+            }                                                                        \
+            __syncthreads();                                                         \
+        }                                                                            \
+        if (tile_ok) C[(long long)row * N + col] = acc;                              \
+    }                                                                                \
+    __global__ void BWD(const float* __restrict__ dY,                                \
+                        const unsigned char* __restrict__ B,                         \
+                        float* __restrict__ dX,                                      \
+                        int M, int N, int K)                                         \
+    {                                                                                \
+        __shared__ float sW[64][64];                                                 \
+        __shared__ float sY[4][64];                                                  \
+        const int k0 = blockIdx.x * 64;                                              \
+        const int row0 = blockIdx.y * 4;                                             \
+        const int tx = threadIdx.x;                                                  \
+        const int ty = threadIdx.y;                                                  \
+        const int row = row0 + ty;                                                   \
+        const int kcol = k0 + tx;                                                    \
+        const bool tile_ok = (row < M) && (kcol < K);                                \
+        const int row_bytes = (K / (BLK)) * (BYTES);                                 \
+        float acc = 0.0f;                                                            \
+        for (int n0 = 0; n0 < N; n0 += 64) {                                         \
+            float hd = 0.0f, hdm = 0.0f, hsc = 0.0f, hsm = 0.0f;                    \
+            const unsigned char* blk = (const unsigned char*)0;                      \
+            const int gn = n0 + tx;                                                  \
+            if (gn < N && k0 < K) {                                                  \
+                blk = B + (long long)gn * row_bytes                                  \
+                    + (long long)(k0 / (BLK)) * (BYTES);                             \
+                HDR(blk, (k0 % (BLK)) + ty * 16, &hd, &hdm, &hsc, &hsm);            \
+            }                                                                        \
+            for (int kg = 0; kg < 4; ++kg) {                                         \
+                float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;                  \
+                if (blk != (const unsigned char*)0) {                                \
+                    W4(blk, (k0 % (BLK)) + ty * 16 + kg * 4,                        \
+                       hd, hdm, hsc, hsm, &w0, &w1, &w2, &w3);                     \
+                }                                                                    \
+                const int kk0 = ty * 16 + kg * 4;                                    \
+                sW[tx][kk0 + 0] = (kk0 + 0 < 64 && k0 + kk0 + 0 < K) ? w0 : 0.0f;   \
+                sW[tx][kk0 + 1] = (kk0 + 1 < 64 && k0 + kk0 + 1 < K) ? w1 : 0.0f;   \
+                sW[tx][kk0 + 2] = (kk0 + 2 < 64 && k0 + kk0 + 2 < K) ? w2 : 0.0f;   \
+                sW[tx][kk0 + 3] = (kk0 + 3 < 64 && k0 + kk0 + 3 < K) ? w3 : 0.0f;   \
+            }                                                                        \
+            {                                                                        \
+                const int gn2 = n0 + tx;                                             \
+                const int rr = row0 + ty;                                            \
+                sY[ty][tx] = (rr < M && gn2 < N) ? dY[(long long)rr * N + gn2] : 0.0f; \
+            }                                                                        \
+            __syncthreads();                                                         \
+            if (tile_ok) {                                                           \
+                for (int cc = 0; cc < 64; ++cc) acc += sY[ty][cc] * sW[cc][tx];      \
+            }                                                                        \
+            __syncthreads();                                                         \
+        }                                                                            \
+        if (tile_ok) dX[(long long)row * K + kcol] = acc;                            \
+    }
 "#;
 
 /// Assemble the tiled-source fragment for the enabled feature set. The
@@ -208,6 +336,8 @@ GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_q2k_tiled,
 /// so that fragment must be pushed first whenever any part of this module is.
 pub fn tiled_quant_kernel_source() -> String {
     let mut s = String::new();
+    // The grouped macro must be defined before any stamp that uses it.
+    s.push_str(GROUPED_TILED_MACRO_SOURCE);
     s.push_str(IQ_Q80_TILED_KERNEL_SOURCE);
     #[cfg(feature = "q5k")]
     s.push_str(Q5K_TILED_KERNEL_SOURCE);
