@@ -890,16 +890,30 @@ impl LlamaBlock {
                 .unwrap_or(0);
             let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
             if use_fused_down {
-                dev.launch_dot4_q80_f32act_add_gemv(
+                // M7.3: the launcher STOPS FUSING, so the IR can name the
+                // dot4 and the residual add as separate nodes. The
+                // decomposition is SAFE, and measured: the fused kernel's
+                // `C[out_idx] = res + facc[j]` and the split path's `dot4`
+                // then `grim_add` are the same f32 add of the same values
+                // (the `fused_decomposition_bit_exact` gate measures 0/4096
+                // elements differing, under the default tiling AND both the
+                // TILE16 and TILE8 switches). The cost is 1.08x — one extra
+                // launch.
+                dev.launch_dot4_q80_f32act_gemv(
                     &buffers.activated_buf[layer_idx],
                     rocm_storage(wd.weight())?,
-                    Some(&buffers.layer_output[layer_idx]),
-                    dst_downcast(residual_dst)?,
+                    dst_downcast(&buffers.norm_buf[layer_idx])?,
                     batch.max(1),
                     wd.weight().shape().dim(0).unwrap_or(0),
                     ffn_k,
                 )
-                .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+                .map_err(|e| grim_core::error::Error::Backend(format!("down dot4: {e}")))?;
+                add_graph(
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    dst_downcast(residual_dst)?,
+                    dev,
+                )?;
             } else {
                 linear_into_named(
                     dev,
@@ -3166,16 +3180,106 @@ impl Qwen35Block {
         let local_dst: &Storage = residual_dst;
 
         if use_fused_down {
-            dev.launch_dot4_q80_f32act_add_gemv(
+            // M7.3: the launcher STOPS FUSING. The fused launch did the
+            // integer dot and the residual add in one kernel; the IR has to
+            // name the dot4 as its own node (a Q8_0_DOT4_F32ACT node, which
+            // the ring CAN execute) and the add as its own (an ELEMENTWISE
+            // node, which it also can) — and a node's opcode must name the
+            // computation the ring would actually run.
+            //
+            // The decomposition is SAFE, and measured: the fused kernel's
+            // `C[out_idx] = res + facc[j]` and the split path's
+            // `dot4` then `grim_add` (`c[i] = a[i] + b[i]`) are the same f32
+            // add of the same values, and the gate
+            // `fused_decomposition_bit_exact` measures 0/4096 elements
+            // differing, under the default tiling AND both the TILE16 and
+            // TILE8 switches. The cost is 1.08x (46.8 -> 50.5 us on the
+            // 9B's down-projection shape) — one extra launch.
+            //
+            // The dot4 writes to the block's norm_buf (the same place the
+            // unfused path wrote it), and the add then folds the residual
+            // into it, exactly as the unfused path did.
+            dev.launch_dot4_q80_f32act_gemv(
                 &buffers.activated_buf[layer_idx],
                 rocm_storage(wd.weight())?,
-                Some(&buffers.layer_output[layer_idx]),
-                dst_downcast(local_dst)?,
+                dst_downcast(&buffers.norm_buf[layer_idx])?,
                 batch.max(1),
                 wd.weight().shape().dim(0).unwrap_or(0),
                 ffn_k,
             )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("down dot4: {e}")))?;
+            add_graph(
+                &buffers.layer_output[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                dst_downcast(local_dst)?,
+                dev,
+            )?;
+            // M7.3: the two launches are two nodes — the dot4 (a
+            // Q8_0_DOT4_F32ACT node, ring-executable) and the residual add
+            // (an ELEMENTWISE node, ring-executable).
+            if let Some(e) = emit.as_deref_mut() {
+                let n = wd.weight().shape().dim(0).unwrap_or(0) as u32;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
+                    [
+                        0,
+                        n,
+                        ffn_k as u32,
+                        batch.max(1) as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[
+                        (
+                            buffers.activated_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.activated_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            rocm_storage(wd.weight())?.device_ptr_u64().unwrap_or(0),
+                            rocm_storage(wd.weight())?.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+                let elems = buffers.layer_output[layer_idx].shape().elem_count() as u32;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                    [elems, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            buffers.layer_output[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.layer_output[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            dst_downcast(local_dst)?.device_ptr_u64().unwrap_or(0),
+                            dst_downcast(local_dst)?.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+            }
         } else {
             linear_into(
                 dev,

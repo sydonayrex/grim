@@ -134,6 +134,22 @@ fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
         op_counts.contains_key(&op::NORM),
         "the IR must carry the head's norm: {op_counts:?}"
     );
+    // M7.3: the fused-launch DECOMPOSITION. The launcher no longer fuses the
+    // Q8_0 down projection with the residual add, so the IR names the dot4
+    // as its own node — a Q8_0_DOT4_F32ACT node, which the ring CAN
+    // execute — and the residual add as an ELEMENTWISE node, which it also
+    // can. Before M7.3 the pair was ONE FALLBACK node, because a fused
+    // launch is one computation and no single ring opcode named it.
+    //
+    // The decomposition is bit-identical (the `fused_decomposition_bit_exact`
+    // gate measures 0/4096 elements differing, under the default tiling AND
+    // both the TILE16 and TILE8 switches), and the walk-vs-replay parity
+    // below is the end-to-end check.
+    assert!(
+        op_counts.contains_key(&op::Q8_0_DOT4_F32ACT),
+        "the IR must carry the Q8_0 down projection's dot4 as its own node \
+         (M7.3): {op_counts:?}"
+    );
     // The chain: every node but the first depends on its predecessor, and
     // there is exactly ONE sink (the head's GEMM).
     assert_eq!(

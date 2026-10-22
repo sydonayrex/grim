@@ -469,12 +469,15 @@ impl Lfm2 {
                 &[emit_last],
                 ord,
             );
-            // The FFN's down projection — a GEMM node, but ONLY on the path
-            // where the launcher really runs that projection on its own. The
-            // fused path (a Q8_0 down projection plus the residual add in one
-            // launch) is a FALLBACK node: a GEMM node would tell the ring to
-            // compute the projection WITHOUT the residual add, which is a
-            // different answer, not a faster one.
+            // The FFN's down projection.
+            //
+            // M7.3: the launcher STOPS FUSING, so the Q8_0 down projection
+            // and the residual add are TWO launches and the IR names them as
+            // TWO nodes: a Q8_0_DOT4_F32ACT node (the ring's arm for the
+            // f32-activation Q8_0 GEMV) and an ELEMENTWISE node (the
+            // ring's OP_ADD). Before M7.3 this was ONE FALLBACK node, because
+            // a fused launch is one computation and no single ring opcode
+            // names it.
             let ffn_k = graph.buffers.activated_buf[i]
                 .shape()
                 .dims()
@@ -484,10 +487,73 @@ impl Lfm2 {
             let fused_down = crate::decode_graph::dot_fused_ok(dev, ffn_k)
                 && crate::decode_graph::is_q80(&layer.ffn_down.weight);
             if fused_down {
+                // The dot4 node.
+                let n = layer.ffn_down.weight.shape().dim(0).unwrap_or(0) as u32;
+                let m = batch as u32;
+                let weight = rocm_storage(&layer.ffn_down.weight).ok();
+                let warg = weight.map(|ws| {
+                    (
+                        ws.device_ptr_u64().unwrap_or(0),
+                        ws.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                    )
+                });
+                let mut dargs = vec![
+                    (
+                        graph.buffers.activated_buf[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.activated_buf[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.norm_buf[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ];
+                if let Some(w) = warg {
+                    dargs.push(w);
+                }
                 emit_last = graph.emit_node(
-                    grim_backend_rocm::task_graph::op::FALLBACK,
-                    [0u32; 16],
-                    &[],
+                    grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
+                    [
+                        0,
+                        n,
+                        ffn_k as u32,
+                        m,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &dargs,
+                    &[emit_last],
+                    ord,
+                );
+                // The residual add node.
+                let elems = graph.buffers.layer_output[i].shape().elem_count() as u32;
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                    [elems, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.layer_output[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.norm_buf[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                    ],
                     &[emit_last],
                     ord,
                 );
@@ -1198,16 +1264,35 @@ impl Lfm2Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("prequant down+add: {e}")))?;
             } else {
-                dev.launch_dot4_q80_f32act_add_gemv(
+                // M7.3: the launcher STOPS FUSING, so the IR can name the
+                // dot4 (a Q8_0_DOT4_F32ACT node, which the ring CAN
+                // execute) and the residual add (an ELEMENTWISE node, which
+                // it also can) as SEPARATE nodes. A node's opcode must name
+                // the computation the ring would actually run, and a fused
+                // launch is one computation.
+                //
+                // The decomposition is SAFE, and measured: the fused kernel's
+                // `C[out_idx] = res + facc[j]` and the split path's `dot4`
+                // then `grim_add` (`c[i] = a[i] + b[i]`) are the same f32
+                // add of the same values. The gate
+                // `fused_decomposition_bit_exact` measures 0/4096 elements
+                // differing, under the default tiling AND both the TILE16
+                // and TILE8 switches. The cost is 1.08x — one extra launch.
+                dev.launch_dot4_q80_f32act_gemv(
                     &buffers.activated_buf[layer_idx],
                     rocm_storage(&self.ffn_down.weight)?,
-                    Some(&buffers.layer_output[layer_idx]),
-                    residual_dst,
+                    dst_downcast(&buffers.norm_buf[layer_idx])?,
                     m,
                     ffn_n,
                     ffn_k,
                 )
-                .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+                .map_err(|e| grim_core::error::Error::Backend(format!("down dot4: {e}")))?;
+                add_graph(
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    residual_dst,
+                    dev,
+                )?;
             }
         } else {
             linear_into(
