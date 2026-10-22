@@ -2025,6 +2025,130 @@ extern "C" __global__ void grim_dot4_q2k_q81_gemv(
 }
 
 
+
+// ─── Q2_K dot4 GEMV: word-wide-mask code unpack (res8 P1) ────────────────
+//
+// The stock Q2_K kernel above fetched the four 2-bit codes of a 4-weight
+// group with FOUR SEPARATE 1-BYTE LOADS (grim_extract4_q2k_ilv) and then
+// re-assembled them into a 32-bit word with four shifts and three ORs. The
+// Q2_K block stores one code per BYTE (84 B / 256 weights, qs[64] at
+// offset 16), so the four codes of a group are four CONSECUTIVE bytes and
+// one 32-bit load delivers all of them.
+//
+// The mask is exact: the codes are the 2-bit field at bit `shift` of each
+// byte, shift = 2*run in {0,2,4,6}. After `w >> shift`, each byte's low
+// 2 bits still come from its own byte (the bits shifted in from the NEXT
+// byte land at bit 8-shift >= 2 and are masked off by 0x03030303), so
+//
+//     (w >> shift) & 0x03030303  ==  the stock per-byte extraction
+//
+// bit for bit, for every shift in {0,2,4,6}. This is the SAME mask the
+// landed group hoist uses for the Q5_K `qh` field.
+//
+// ALIASING: the dword is 4-byte aligned by construction. The offset of a
+// group from the tensor base is col*n_sb*84 + sb*84 + 16 + nh*32 +
+// hplane*16 + i, every term a multiple of 4 (84 = 4*21, and i steps by 4),
+// and the tensor base is a device allocation (256-byte aligned). The load is
+// a __builtin_memcpy of 4 bytes, which is alignment-safe regardless.
+//
+// The grid mapping (4 output columns per workgroup, 32 lanes per block),
+// the accumulation order and the arithmetic are IDENTICAL to the stock
+// kernel, so the only difference is how the codes are read. Parity:
+// tests/dot4_kquant_grouped_parity.rs (q2k row), byte-identity against the
+// retained stock kernel AND against the llama.cpp-faithful dequant_q2k
+// dotted with the same q8_1 codes.
+extern "C" __global__ void grim_dot4_q2k_q81_gemv_fast(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q2k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q2k + (long long)(col_base + j) * n_sb * 84
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = lane; sb < n_sb; sb += 32) {
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * 84;
+            float d    = fp16_to_float_device(((const unsigned short*)b_sb)[40]); // byte 80
+            float dmin = fp16_to_float_device(((const unsigned short*)b_sb)[41]); // byte 82
+
+            for (int half_pair = 0; half_pair < 8; half_pair++) {
+                const unsigned char* a_blk = a_sb + half_pair * GRIM_Q8_1_BYTES;
+                float d_a   = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                const signed char* a_codes = (const signed char*)(a_blk + 4);
+
+                for (int half = 0; half < 2; half++) {
+                    const int sub = half_pair * 2 + half;
+                    const float sc = (float)(b_sb[sub] & 0x0F);
+                    const float mi = (float)(b_sb[sub] >> 4);
+
+                    const int nh = sub / 8;
+                    const int run = (sub % 8) / 2;
+                    const int hplane = sub % 2;
+                    const unsigned char* qs_ilv = b_sb + 16 + nh * 32 + hplane * 16;
+                    const int shift = 2 * run;
+                    int pos = 0;
+                    int a_sum = 0;
+                    #pragma unroll
+                    for (int i = 0; i < 16; i += 4) {
+                        int a4;
+                        __builtin_memcpy(&a4, a_codes + half * 16 + i, 4);
+                        // ONE 32-bit load for the four codes, then one whole-word
+                        // mask, instead of four 1-byte loads and four
+                        // select/shift/pack steps. Bit-identical by
+                        // construction (see the note above the kernel).
+                        unsigned int w4;
+                        __builtin_memcpy(&w4, qs_ilv + i, 4);
+                        int q4 = (int)((w4 >> shift) & 0x03030303u);
+                        pos = grim_sdot4(a4, q4, pos);
+                        a_sum += a_codes[half * 16 + i];
+                        a_sum += a_codes[half * 16 + i + 1];
+                        a_sum += a_codes[half * 16 + i + 2];
+                        a_sum += a_codes[half * 16 + i + 3];
+                    }
+                    facc[j] += d * sc * ((float)pos * d_a)
+                             - dmin * mi * ((float)a_sum * d_a);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+
 // ─── Phase 4.5f: Q3_K dot4 GEMV (two-dot + sign-plane correction) ────────
 // Grim Q3_K layout (matches grim_quant::dequant_q3k, llama.cpp spec):
 // 110 bytes per 256: hmask[32] (sign bits), qs[64] (2-bit magnitudes),
@@ -2195,6 +2319,22 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv(
             const unsigned char* qs     = b_sb + 16;
 
             // 8 sub-blocks of 32 elements
+            // REGISTER PRESSURE (2026-10-22). The full unroll of
+            // 4 columns x 8 sub-blocks x 8 e-iterations compiled this
+            // kernel to 192 VGPRs with 180 B of SCRATCH SPILL per thread
+            // (rocprofv3 kernel-symbol dump). The Q4_K `_fast` sibling
+            // reaches 72 VGPRs and 0 B of scratch, and the Q8_0 sibling
+            // 64 VGPRs and 0 B. The spill puts a local-memory round trip
+            // in the inner loop of a kernel that is NOT bandwidth-bound
+            // (m1_decode_regime_probe: Q5_K cold ~= warm at every
+            // working set), so the spill is the thing to remove.
+            //
+            // BIT-IDENTICAL by construction: the only thing that changes is
+            // how far the compiler unrolls. The int32 accumulation
+            // (`pos_dot = grim_sdot4(...)`) is an exact integer chain
+            // whose ORDER is unchanged, and the float accumulation
+            // (`facc[j] += sub_res`) still runs once per `is` in the same
+            // order. Bounding the unroll cannot change either value.
             #pragma unroll
             for (int is = 0; is < 8; ++is) {
                 const unsigned char* a_blk = a_sb + is * GRIM_Q8_1_BYTES;
@@ -2424,7 +2564,24 @@ extern "C" __global__ void grim_dot4_q5k_q81_gemv(
             const unsigned char* qh     = b_sb + 16;
             const unsigned char* qs     = b_sb + 48;
 
-            #pragma unroll
+            // REGISTER PRESSURE (2026-10-22). Fully unrolling
+            // 4 columns x 8 sub-blocks x 8 e-iterations compiled this
+            // kernel to 192 VGPRs with 180 B of SCRATCH SPILL per thread
+            // (rocprofv3 kernel-symbol dump) — the same shape as the
+            // Q6_K sibling, and the Q4_K `_fast` variant's own history
+            // ("the stock 4-col kernel compiles to 192 VGPRs + 560 B
+            // scratch -> 1 wave/SIMD plus local-memory spills; the 88-VGPR
+            // q8_0 sibling sustains 300 GB/s"). The spill puts a
+            // local-memory round trip inside a kernel that is NOT
+            // bandwidth-bound (m1_decode_regime_probe: Q5_K cold ~= warm
+            // at every working set), so the spill is what to remove.
+            //
+            // BIT-IDENTICAL by construction: only the unroll factor
+            // changes. The int32 accumulation (`pos_dot = grim_sdot4(...)`)
+            // is an exact integer chain whose ORDER is unchanged, and the
+            // float accumulation (`facc[j] += sub_res`) still runs once
+            // per `is` in the same order.
+            #pragma unroll 2
             for (int is = 0; is < 8; ++is) {
                 const unsigned char* a_blk = a_sb + is * GRIM_Q8_1_BYTES;
                 float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
@@ -2445,7 +2602,7 @@ extern "C" __global__ void grim_dot4_q5k_q81_gemv(
                 const unsigned char* qs_sub = qs + group * 32;
 
                 int pos_dot = 0;
-                #pragma unroll
+                #pragma unroll 2
                 for (int e = 0; e < 32; e += 4) {
                     int a4;
                     __builtin_memcpy(&a4, a_codes + e, 4);
@@ -2671,7 +2828,12 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv(
             const unsigned short* d_ptr = (const unsigned short*)(b_sb + 208);
             float d = fp16_to_float_device(d_ptr[0]);
 
-            #pragma unroll
+            // REGISTER PRESSURE (2026-10-22): 192 VGPRs + 88 B of scratch
+            // spill per thread. Same reasoning and the same bit-identity
+            // argument as the Q5_K sibling above: bounding the unroll
+            // changes neither the int32 accumulation order nor the float
+            // accumulation order.
+            #pragma unroll 2
             for (int is_sub = 0; is_sub < 8; ++is_sub) {
                 const unsigned char* a_blk = a_sb + is_sub * GRIM_Q8_1_BYTES;
                 float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
@@ -2694,7 +2856,7 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv(
                     int pos_dot = 0;
                     float fsum16 = 0.0f;
 
-                    #pragma unroll
+                    #pragma unroll 2
                     for (int e16 = 0; e16 < 16; e16 += 4) {
                         int e = half16 * 16 + e16;
                         int a4;

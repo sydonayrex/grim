@@ -96,6 +96,11 @@ fn scheme(name: &str) -> (usize, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>, fn(
         "q4k" => (144, grim_quant::quant_q4k, grim_quant::dequant_q4k),
         "q5k" => (176, grim_quant::quant_q5k, grim_quant::dequant_q5k),
         "q6k" => (210, grim_quant::quant_q6k, grim_quant::dequant_q6k),
+        // Q2_K: 84 bytes per 256 weights, one 2-bit code per BYTE in qs[64]
+        // at offset 16. The word-wide-mask variant reads a 4-weight group
+        // with ONE 32-bit load and `& 0x03030303` instead of four 1-byte
+        // loads — the same mask the Q5_K `qh` field already uses.
+        "q2k" => (84, grim_quant::quant_q2k, grim_quant::dequant_q2k),
         other => panic!("unknown scheme {other}"),
     }
 }
@@ -177,6 +182,16 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
             // through its own launcher rather than the process-wide
             // GRIM_DOT4_FAST OnceLock.
             dev.launch_dot4_q4k_q81_gemv_stock_for_ab(a_r, b_r, o_new, m, n, k)
+                .map_err(|e| format!("launch new: {e}"))?;
+        }
+        "q2k" => {
+            // Both sides go through a LAUNCHER, so the gate sees the grid the
+            // dispatch actually uses. The Q4_K lesson: a gate that called
+            // the kernel with its own grid stayed green while the launcher
+            // fed it a grid covering half the columns.
+            dev.launch_dot4_q2k_q81_gemv_stock_for_ab(a_r, b_r, o_ref, m, n, k)
+                .map_err(|e| format!("launch ref: {e}"))?;
+            dev.launch_dot4_q2k_q81_gemv_for_ab(a_r, b_r, o_new, m, n, k)
                 .map_err(|e| format!("launch new: {e}"))?;
         }
         "q5k" => {
@@ -264,7 +279,7 @@ fn kquant_grouped_matches_retained_oracle() -> Result<(), String> {
         (4096, 68, 1),
         (4096, 68, 8),
     ] {
-        for s in ["q4k", "q5k", "q6k"] {
+        for s in ["q4k", "q5k", "q6k", "q2k"] {
             grouped_parity(s, k, n, m)?;
         }
     }
@@ -349,6 +364,13 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
             |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
+        // Q2_K: "new" is the word-wide-mask variant (the default through the
+        // launcher), "ref" is the stock 4-byte-load kernel. Both are driven
+        // through launchers so the grid is the dispatch's own.
+        "q2k" => (
+            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+        ),
         _ => (
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
@@ -385,7 +407,7 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
 
 #[test]
 fn kquant_grouped_speed_ab() -> Result<(), String> {
-    for s in ["q4k", "q5k", "q6k"] {
+    for s in ["q4k", "q5k", "q6k", "q2k"] {
         speed_ab(s)?;
     }
     Ok(())
