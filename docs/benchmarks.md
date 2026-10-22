@@ -961,6 +961,30 @@ text replacement does not know which kernel it is in. The kernel census
 caught it (Q6_K's VGPRs moved and Q5_K's did not). The edit is now scoped
 to the Q5_K kernel's own region.
 
+### End to end: what the kernel win is worth, and what it is NOT
+
+The same 9B run, same card, same prompt, 32 tokens, before and after the
+two kernel changes (`GRIM_PHASE_TRACE=1`):
+
+| | p50 (the steady state) | reported ms/token |
+|---|---|---|
+| before | 353.6 ms | 376.20 |
+| **after** | **348.4 ms** | 370.68 |
+
+**1.5% end to end, and that is the honest number.** The kernel-level win
+is 1.56x on Q5_K and 1.28x on Q6_K, but the 9B's Q4_K_M mix is
+**Q4_K 104, Q5_K 131, Q6_K 30, Q3_K 7, IQ4_XS 117, Q8_0 106** — the
+K-quants are a minority of the decode work, and the two families that
+dominate the count (**IQ4_XS at 117 and Q8_0 at 106**) are untouched by
+these changes. A 1.56x on the K-quant projections cannot move a
+mixed-format decode far, and the measurement says so rather than the
+headline.
+
+**This is where the corpus's mechanism for the IQ family becomes the next
+lever**, and it is a bigger prize than the K-quants: 117 of the 9B's
+tensors and 117 of the 27B's are IQ4_XS, and that path runs at **17.2
+GB/s** against the K-quants' 78-100.
+
 ### What is left
 
 - **Q3_K (62.1 GB/s, 88 VGPRs, no spill)** is the last K-quant format
