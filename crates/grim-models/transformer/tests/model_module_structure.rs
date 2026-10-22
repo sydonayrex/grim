@@ -62,11 +62,6 @@ const KNOWN_ORPHANS: &[(&str, &str, &str)] = &[
         "ModelArchitecture::Gemma3 shares an arm with Gemma and constructs Gemma",
     ),
     (
-        "gemma4",
-        "unimplemented: MoE, per-layer embeddings, shared-KV, SWA, softcap, attn_post_norm",
-        "ModelArchitecture::Gemma4 shares an arm with Gemma and constructs Gemma",
-    ),
-    (
         "phi3",
         "unimplemented: ffn_norm, SWA, rope-factoring",
         "ModelArchitecture::Phi3 shares an arm with Phi2 and constructs Phi2",

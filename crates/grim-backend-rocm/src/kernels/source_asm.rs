@@ -273,6 +273,19 @@ mod source_asm_self_tests {
                 count, sym
             );
         }
+        // The Q6_K element decoder lives in `q6k_gemm.rs` (next to the gather
+        // kernel that uses it), not in the shared file. It still has to be
+        // unique in the ASSEMBLED source: a second copy is a redefinition
+        // error, and it only surfaces as a hipRTC compile error on whichever
+        // model happens to need it.
+        for sym in ["float dequant_q6k_element("] {
+            let count = src.matches(sym).count();
+            assert_eq!(
+                count, 1,
+                "__device__ symbol defined {} times (expected 1): '{}'",
+                count, sym
+            );
+        }
     }
 
     /// Nutcracker steals 2 bits of the block-scale byte for its selector, so the

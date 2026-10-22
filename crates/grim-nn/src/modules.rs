@@ -1675,13 +1675,31 @@ fn embedding_has_packed_gather(storage: &Storage, device: &grim_tensor::Device) 
     // a host packed gather (`CpuDevice::embedding_packed`, A2) that dequants
     // one row at a time -- so K-quant tables in a verified scheme stay packed
     // everywhere instead of deflating to f32 at load.
-    // Verified schemes: Q4K + IQ3S + IQ2S.
-    let _ = device;
+    //
+    // The CPU dequants a row with the same `grim_quant::dequant_*` the matmul
+    // path uses, so a packed gather agrees with the matmul by construction.
+    // Its schemes: Q4K + IQ3S + IQ2S + Q6K + Q5K.
+    //
+    // An accelerator has an on-device gather for Q4K + IQ3S + IQ2S + Q6K
+    // (`grim_embedding_q6k_gather` for the last), so Gemma 4's per-layer
+    // embedding table - a Q6K table of `[262144, 42*256]`, 2.3 GB packed
+    // against 11.3 GB inflated - stays packed on the card too.
+    if device.is_cpu() {
+        return matches!(
+            storage,
+            Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ2S)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q5K)
+        );
+    }
     matches!(
         storage,
         Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
             | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S)
             | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ2S)
+            | Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K)
     )
 }
 
