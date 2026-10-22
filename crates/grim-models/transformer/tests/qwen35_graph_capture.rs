@@ -690,22 +690,110 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
          what executes, under a flag that only asks for the IR"
     );
 
-    // Structure: 1 embed + 4 layers x (block + FFN GEMM) + 1 NORM + 1 head GEMM.
-    assert_eq!(ir.nodes.len(), 1 + 4 * 2 + 2, "node count: {:#?}", {
-        let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
-        ops
-    });
+    // M7.1: the structure is now PER-LAUNCH. The attention blocks name each
+    // of their launches as its own node, so the IR describes the walk
+    // exactly rather than summarising a whole block with one node. The
+    // RECURRENT layers keep their summary node (the ring's OP_RECURRENT arm
+    // runs the whole KDA step, which is one launch).
+    //
+    // The node count is asserted as a COUNT of the attention layers' launches
+    // rather than as a literal, because the literal would be a copy of the
+    // block's launch list — and a copy is exactly what can drift. What is
+    // pinned here is the SHAPE: one embedding gather, then per layer the
+    // attention layers' per-launch chain and the recurrent layers' summary
+    // node, then the final norm and the head.
     use grim_backend_rocm::task_graph::op;
     let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
-    assert_eq!(ops[0], op::ELEMENTWISE, "first node is the embedding gather");
-    for (li, i) in (0..4).enumerate() {
-        let block = ops[1 + li * 2];
-        let want = if (i + 1) % 2 == 0 { op::ATTENTION } else { op::RECURRENT };
-        assert_eq!(block, want, "layer {i} block op");
-        assert_eq!(ops[2 + li * 2], op::GEMM, "layer {i} FFN op");
+    eprintln!("[struct] the first 12 opcodes: {:?}", &ops[..12.min(ops.len())]);
+    for (i, n) in ir.nodes.iter().take(6).enumerate() {
+        eprintln!("[struct] node {i}: opcode={} n_args={} n_deps={} deps={:?} dev={}",
+            n.opcode, n.n_args, n.n_deps, &n.deps[..n.n_deps as usize], n.device);
     }
-    assert_eq!(ops[9], op::NORM, "final norm");
-    assert_eq!(ops[10], op::GEMM, "head");
+    eprintln!("[struct] total nodes: {}", ops.len());
+    assert_eq!(ops[0], op::ELEMENTWISE, "first node is the embedding gather");
+
+    // The attention layers' launches: the nodes between a layer's start and
+    // the next layer's start. The block's FIRST launch is the norm, and its
+    // LAST is the output projection, with the ring-executable ops (NORM,
+    // GEMM, ELEMENTWISE, Q8_0_DOT4_F32ACT) named where the ring could run
+    // them and FALLBACK everywhere else.
+    //
+    // The count is asserted PER LAYER, and each attention layer must have
+    // MORE than one node — that is the whole point of M7.1: a block that
+    // summarised its launches as ONE node is what the refinement removes.
+    let mut layer_starts = Vec::new();
+    {
+        // The recurrent layers' summary nodes carry op::RECURRENT, so they
+        // mark the layer boundaries unambiguously.
+        let mut idx = 1usize; // past the embedding gather
+        for _ in 0..4 {
+            layer_starts.push(idx);
+            // Skip this layer's nodes: the attention layers have many, the
+            // recurrent ones exactly one. The next RECURRENT node (or the
+            // final NORM) ends the layer.
+            while idx < ops.len() && ops[idx] != op::RECURRENT && ops[idx] != op::NORM {
+                idx += 1;
+            }
+            if idx < ops.len() && ops[idx] == op::RECURRENT {
+                idx += 1;
+            }
+        }
+    }
+    for (li, &start) in layer_starts.iter().enumerate() {
+        let layer = li;
+        let is_attn = (layer + 1) % 2 == 0;
+        if is_attn {
+            // The attention layer's nodes run from `start` to the next
+            // layer's start.
+            let end = layer_starts.get(li + 1).copied().unwrap_or(ops.len());
+            let n = end - start;
+            assert!(
+                n > 1,
+                "layer {layer} is an attention layer, so its launches must be \
+                 named individually (M7.1) — the IR gives it {n} node(s)"
+            );
+        }
+    }
+
+    // The chain is total: every node except the first depends on its
+    // predecessor, so the single sink is the head.
+    assert_eq!(ir.sinks, vec![(ir.nodes.len() - 1) as u32]);
+
+    // The IR now names the attention block's launches, so it MUST contain
+    // the opcodes the block's own launches use: the norm, the projections,
+    // the residual add, and the fused QKV's Q8_0 dot4.
+    assert!(
+        ops.contains(&op::NORM),
+        "the attention block's RMSNorm must be named (M7.1)"
+    );
+    assert!(
+        ops.contains(&op::ELEMENTWISE),
+        "the residual add must be named (M7.1)"
+    );
+    // The fused QKV's Q8_0 dot4 is named only when the model ACTUALLY takes
+    // the fused path, which needs all three projections present AND Q8_0
+    // (row-exact). The synthetic model here carries f32 weights, so it takes
+    // the plain path and there is no dot4 to name. The assertion is therefore
+    // conditional on the model having the fused weights — a gate that
+    // demanded a node the model never performs would be a gate demanding a
+    // fiction.
+    let has_fused_qkv = model
+        .blocks
+        .iter()
+        .any(|b| b.is_full_attention && b.wqkv_q80_fused.is_some());
+    if has_fused_qkv {
+        assert!(
+            ops.contains(&op::Q8_0_DOT4_F32ACT),
+            "the fused QKV's Q8_0 dot4 must be named (M7.1)"
+        );
+    }
+    // And the launches the ring CANNOT run are FALLBACK nodes, not nodes
+    // wearing an opcode that names a different computation.
+    assert!(
+        ops.contains(&op::FALLBACK),
+        "the launches with no ring arm (the copies, the RoPE, the KV append, \
+         the arena attention, the output gate) must be FALLBACK nodes (M7.1)"
+    );
 
     // The chain is total: every node except the first depends on its
     // predecessor, so the single sink is the head.
@@ -713,7 +801,23 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
 
     // Derived caps, single device.
     assert!(!ir.caps.needs_peer, "single-device gate model");
-    assert!(ir.caps.opcodes.contains(&op::ATTENTION));
+    // M7.1: the attention block's ARENA attention is a FALLBACK node, not an
+    // ATTENTION node. The wave's OP_ATTN arm is a flash-attention over
+    // (q, k, v, out) with a 256 head_dim limit; the block's attention reads
+    // the PACKED KV arena with per-head scales and a ring-bounded live row
+    // count. They are different computations, so a node naming the block's
+    // launch with the ring's ATTENTION opcode would tell the ring to
+    // compute a DIFFERENT answer — which is precisely what the LFM2's
+    // FALLBACK nodes exist to prevent.
+    //
+    // So the gate asserts the OPPOSITE of what it asserted before M7.1: the
+    // IR must NOT contain an ATTENTION node for this model, because this
+    // model's attention is not the ring's attention.
+    assert!(
+        !ir.caps.opcodes.contains(&op::ATTENTION),
+        "the qwen35 arena attention is not the ring's OP_ATTN arm, so the IR \
+         must not claim an ATTENTION node (M7.1)"
+    );
     assert!(ir.caps.opcodes.contains(&op::RECURRENT));
     assert!(ir.caps.opcodes.contains(&op::GEMM));
     assert_eq!(ir.caps.devices.len(), 1);
@@ -1023,6 +1127,20 @@ fn the_qwen35_ring_walk_matches_the_launcher_path() {
         "the ring must bind one RECURRENT node per recurrent layer"
     );
 
+    // M7.1: the DRAIN BUDGET. The per-launch split multiplies the IR's node
+    // count, and the whole risk of that is that it multiplies the RING's
+    // drains — the corpus's §9c finding ("any device-side chaining scheme
+    // that waits on completion at fine granularity serialises, and the drains
+    // multiply with the number of transfers per step"), measured on grim's
+    // own hardware.
+    //
+    // So the budget is a GATE, not a note: the ring walk must cost the SAME
+    // number of waves and the SAME number of blocking D2H per step as it did
+    // before the split. The per-launch nodes are FALLBACK nodes (the ring
+    // has no arm for them), so they must not reach the ring at all — and
+    // this asserts exactly that, in the only terms that matter.
+    let waves_before = grim_backend_rocm::kernels::task_ring::wave_launch_count();
+    let d2h_before = grim_backend_rocm::blocking_d2h_count();
     let mut ring_logits = Vec::new();
     for tok in TOKENS {
         model
@@ -1031,6 +1149,33 @@ fn the_qwen35_ring_walk_matches_the_launcher_path() {
         ring_logits.push(gp_ring.read_logits_f32().expect("ring logits"));
         gp_ring.buffers.current_pos = gp_ring.buffers.current_pos.wrapping_add(1);
     }
+    let steps = TOKENS.len() as u64;
+    let waves = grim_backend_rocm::kernels::task_ring::wave_launch_count() - waves_before;
+    let d2h = grim_backend_rocm::blocking_d2h_count() - d2h_before;
+    eprintln!(
+        "[qwen35-ring] the ring walk's drain budget: {waves} wave(s) and \
+         {d2h} blocking D2H over {steps} step(s)"
+    );
+    // The recurrent layers are the ONLY ring work, so the budget is one wave
+    // per recurrent layer per step — no more. The per-launch split must not
+    // add any: the FALLBACK nodes never reach the wave.
+    assert!(
+        waves <= n_recurrent as u64 * steps,
+        "the per-launch split multiplied the ring's wave launches: {waves} waves \
+         for {n_recurrent} recurrent layer(s) over {steps} step(s) (M7.1's drain \
+         budget)"
+    );
+    // The blocking D2H is the VERIFICATION read-back, once per step (M7.1b
+    // deferred it from once per node). The logits readback below is the
+    // test's own, and it is one per step too — so the budget is one per
+    // step for the ring's verification, and the test's readback adds one
+    // more. The gate is on the ring's share, which is what the budget is
+    // about: it must not grow with the node count.
+    assert!(
+        d2h <= 2 * steps,
+        "the per-launch split multiplied the ring's blocking D2H reads: {d2h} \
+         over {steps} step(s) (M7.1b's deferred verification, M7.1's drain budget)"
+    );
 
     // ---- The comparison: the RING walk against the M2 walk. ----
     //

@@ -2164,14 +2164,96 @@ pub struct KdaRingDispatch<'a> {
     pub entry: grim_backend_rocm::kernels::task_ring::TaskRingRecurrent,
 }
 
+/// Records each launch a block performs as its own IR node (M7.1).
+///
+/// The block's launches are named where they HAPPEN — at the call site,
+/// immediately after the launch — so the IR cannot drift from the walk: a
+/// launch that is not named is a launch the IR does not describe, and the
+/// node-count gate catches it.
+///
+/// The opcodes are the ones the RING can actually execute, and FALLBACK for
+/// the rest. A node the ring would run differently is a FALLBACK node, not a
+/// node wearing the wrong opcode: the ring's `OP_ATTENTION` arm is NOT the
+/// block's arena attention, and its `OP_NORM` arm fixes eps at 1e-5, so
+/// naming either for a launch that is not that arm would tell the ring to
+/// compute a DIFFERENT answer.
+///
+/// `deps` chains the nodes in launch order, so the IR is a total chain and
+/// the walk's dependency order is the launch order.
+pub struct LaunchEmitter<'a> {
+    emitter: &'a mut Option<grim_backend_rocm::task_graph::TaskGraphBuilder>,
+    /// The node the next launch depends on.
+    prev: u32,
+    /// The device ordinal the launches run on.
+    dev_ord: u8,
+    /// How many launches have been named.
+    pub count: usize,
+}
+
+impl<'a> LaunchEmitter<'a> {
+    /// A recorder over the graph's emitter, or `None` when emission is off.
+    pub fn new(
+        emitter: &'a mut Option<grim_backend_rocm::task_graph::TaskGraphBuilder>,
+        prev: u32,
+        dev_ord: u8,
+    ) -> Option<Self> {
+        if emitter.is_none() {
+            return None;
+        }
+        Some(Self {
+            emitter,
+            prev,
+            dev_ord,
+            count: 0,
+        })
+    }
+
+    /// Name one launch as its own node, chained to the previous one.
+    pub fn launch(
+        &mut self,
+        opcode: grim_backend_rocm::task_graph::OpCode,
+        params: [u32; 16],
+        args: &[(u64, u64, u8)],
+    ) {
+        // The FIRST node in a chain has no dependency. `u32::MAX` is the
+        // "no node" sentinel the emitter uses, and passing it as a
+        // dependency would index the node table out of bounds.
+        let deps: &[u32] = if self.prev == u32::MAX { &[] } else { &[self.prev] };
+        let node = grim_backend_rocm::decode_graph_buffers::emit_node_into(
+            self.emitter,
+            opcode,
+            params,
+            args,
+            deps,
+            self.dev_ord,
+        );
+        if node != u32::MAX {
+            self.prev = node;
+            self.count += 1;
+        }
+    }
+
+    /// The node the last launch produced — what the NEXT node depends on.
+    pub fn last(&self) -> u32 {
+        self.prev
+    }
+}
+
 impl Qwen35Block {
     /// Enqueue all kernels for this Qwen35 block into the decode graph bracket.
+    ///
+    /// M7.1: `emit` names each launch the block performs as its own IR
+    /// node, so the IR describes the walk EXACTLY rather than summarising a
+    /// whole block with one node. `None` is the production path (no
+    /// emission), and the launches are identical either way — the emitter
+    /// only RECORDS what the block already does.
     pub fn forward_graph(
         &self,
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
         ring: Option<&mut KdaRingDispatch<'_>>,
+        mut emit: Option<&mut LaunchEmitter<'_>>,
     ) -> Result<()> {
         let batch = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
@@ -2186,6 +2268,37 @@ impl Qwen35Block {
             &h_shape,
         )
         .map_err(grim_core::error::Error::Tensor)?;
+        // M7.1: the norm is its own node. It is a NORM node only when the
+        // ring's arm would compute the SAME answer — and the ring's NORM arm
+        // fixes eps at 1e-5 (the Llama-family value), so a model whose
+        // epsilon differs is a FALLBACK node, not a NORM node wearing the
+        // wrong constant.
+        if let Some(e) = emit.as_deref_mut() {
+            let eps_ok = (self.attn_norm.eps - 1e-5).abs() < f32::EPSILON;
+            let opcode = if eps_ok {
+                grim_backend_rocm::task_graph::op::NORM
+            } else {
+                grim_backend_rocm::task_graph::op::FALLBACK
+            };
+            let m = batch as u32;
+            let k = h_shape.dims().last().copied().unwrap_or(0) as u32;
+            e.launch(
+                opcode,
+                [0, k, m, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (
+                        buffers.layer_input[layer_idx].device_ptr_u64().unwrap_or(0),
+                        buffers.layer_input[layer_idx].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                        buffers.norm_buf[layer_idx].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+            );
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
         let hd = self.head_dim;
@@ -2206,6 +2319,17 @@ impl Qwen35Block {
                     .map_err(|e| {
                         grim_core::error::Error::Backend(format!("qwen35 qkv quant: {e}"))
                     })?;
+                // M7.1: the quantize is its own node. The ring has no
+                // QUANTIZE arm, so it is a FALLBACK node — a node that
+                // names a launch the ring cannot run, which is exactly what
+                // the fallback contract says to emit.
+                if let Some(e) = emit.as_deref_mut() {
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::FALLBACK,
+                        [0u32; 16],
+                        &[],
+                    );
+                }
                 dev.launch_fused_qkv_dot4_into(
                     act,
                     &fused.storage,
@@ -2215,6 +2339,58 @@ impl Qwen35Block {
                     self.hidden_size,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 fused qkv: {e}")))?;
+                // M7.1: the fused QKV dot4 is a Q8_0_DOT4_F32ACT node — the
+                // ring's arm for the f32-activation Q8_0 GEMV, which is the
+                // variant this launch is (the activation is f32 and the arm
+                // quantizes it in registers).
+                //
+                // The geometry the arm needs is m rows of the activation, n
+                // output columns, k the reduction width — and the fused
+                // projection's n is `n_q + n_k + n_v` (the whole fused
+                // output), which is what the launch computes.
+                if let Some(e) = emit.as_deref_mut() {
+                    let n_out = (fused.n_q + fused.n_k + fused.n_v) as u32;
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
+                        [
+                            0,
+                            n_out,
+                            self.hidden_size as u32,
+                            m as u32,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                        &[
+                            (
+                                act.device_ptr_u64().unwrap_or(0),
+                                act.bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                            ),
+                            (
+                                fused.storage.device_ptr_u64().unwrap_or(0),
+                                fused.storage.bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                            ),
+                            (
+                                buffers.fused_qkv_out[layer_idx]
+                                    .device_ptr_u64()
+                                    .unwrap_or(0),
+                                buffers.fused_qkv_out[layer_idx].bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                            ),
+                        ],
+                    );
+                }
 
                 let staged: &Storage = &buffers.fused_qkv_out[layer_idx];
                 dev.copy_slice_into(&buffers.q_buf[layer_idx], staged, 0, fused.n_q)
@@ -2229,6 +2405,17 @@ impl Qwen35Block {
                     fused.n_v,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the three slices are three FALLBACK nodes (the ring
+                // has no COPY arm; its OP_ADD is `out = a + b`, not a copy).
+                if let Some(e) = emit.as_deref_mut() {
+                    for _ in 0..3 {
+                        e.launch(
+                            grim_backend_rocm::task_graph::op::FALLBACK,
+                            [0u32; 16],
+                            &[],
+                        );
+                    }
+                }
             } else {
                 let wq = self.wq.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wq in full attention block".into())
@@ -2266,6 +2453,45 @@ impl Qwen35Block {
                     "attn.v",
                     layer_idx,
                 )?;
+                // M7.1: the three plain projections are three GEMM nodes —
+                // the ring's GEMM arm computes in f32, so a NATIVE weight is
+                // a node it can run, and a quantized one is a FALLBACK.
+                if let Some(e) = emit.as_deref_mut() {
+                    for w in [wq, wk, wv] {
+                        let weight = w.weight();
+                        let native = crate::decode_graph::rocm_storage(weight)
+                            .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                            .unwrap_or(false);
+                        let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                        let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                        e.launch(
+                            if native {
+                                grim_backend_rocm::task_graph::op::GEMM
+                            } else {
+                                grim_backend_rocm::task_graph::op::FALLBACK
+                            },
+                            [
+                                0,
+                                n,
+                                k,
+                                batch as u32,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                            &[],
+                        );
+                    }
+                }
             }
 
             // 3. Split the fused Q|gate. `q_buf` holds [Q | gate] at 2*q_dim;
@@ -2290,6 +2516,16 @@ impl Qwen35Block {
                 nh * hd,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 split gate: {e}")))?;
+            // M7.1: the two halves are two FALLBACK nodes (no COPY arm).
+            if let Some(e) = emit.as_deref_mut() {
+                for _ in 0..2 {
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::FALLBACK,
+                        [0u32; 16],
+                        &[],
+                    );
+                }
+            }
 
             // 3b. Optional per-head Q/K norm
             if let Some(qn) = &self.attn_q_norm {
@@ -2302,6 +2538,20 @@ impl Qwen35Block {
                     &qn_shape,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the per-head Q norm is its own node — a NORM node
+                // only when the ring's fixed 1e-5 epsilon is this model's.
+                if let Some(e) = emit.as_deref_mut() {
+                    let eps_ok = (qn.eps - 1e-5).abs() < f32::EPSILON;
+                    e.launch(
+                        if eps_ok {
+                            grim_backend_rocm::task_graph::op::NORM
+                        } else {
+                            grim_backend_rocm::task_graph::op::FALLBACK
+                        },
+                        [0, hd as u32, (batch * nh) as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        &[],
+                    );
+                }
             }
             if let Some(kn) = &self.attn_k_norm {
                 let kn_shape = Shape::new(vec![batch * nkv, hd]);
@@ -2313,6 +2563,19 @@ impl Qwen35Block {
                     &kn_shape,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the per-head K norm is its own node.
+                if let Some(e) = emit.as_deref_mut() {
+                    let eps_ok = (kn.eps - 1e-5).abs() < f32::EPSILON;
+                    e.launch(
+                        if eps_ok {
+                            grim_backend_rocm::task_graph::op::NORM
+                        } else {
+                            grim_backend_rocm::task_graph::op::FALLBACK
+                        },
+                        [0, hd as u32, (batch * nkv) as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        &[],
+                    );
+                }
             }
 
             // 4. RoPE. Partial rotary + NeoX half-split pairing, matching
@@ -2334,6 +2597,15 @@ impl Qwen35Block {
                 steps,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+            // M7.1: the Q RoPE is its own node. The ring has no ROPE arm, so
+            // it is a FALLBACK node.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             let k3 = Shape::new(vec![batch, nkv * steps, hd]);
             dev.rope_dev_base_into(
@@ -2346,6 +2618,14 @@ impl Qwen35Block {
                 steps,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+            // M7.1: the K RoPE is its own node.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             // 5. KV append to arenas
             let kv_stride = nkv * hd;
@@ -2478,6 +2758,18 @@ impl Qwen35Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
             }
+            // M7.1: the KV appends are their own nodes. There is ONE append
+            // launch per tensor (K and V), and the ring has no KV_APPEND arm,
+            // so they are FALLBACK nodes.
+            if let Some(e) = emit.as_deref_mut() {
+                for _ in 0..2 {
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::FALLBACK,
+                        [0u32; 16],
+                        &[],
+                    );
+                }
+            }
 
             // 6. Attention kernel
             if arena_i8 {
@@ -2573,6 +2865,22 @@ impl Qwen35Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
             }
+            // M7.1: the attention is its own node — and a FALLBACK node, NOT
+            // an ATTENTION node. The ring's OP_ATTN arm is the flash-
+            // attention over (q, k, v, out) with a 256 head_dim limit; the
+            // block's attention is the ARENA attention (packed KV codes, per-
+            // head scales, a ring-bounded live row count). They are different
+            // computations, so a node naming this launch with the ring's
+            // ATTENTION opcode would tell the ring to compute a DIFFERENT
+            // answer — which is the failure mode the LFM2's FALLBACK nodes
+            // exist to avoid.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             // Bump pos_dev
             grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
@@ -2601,6 +2909,16 @@ impl Qwen35Block {
             .map_err(|e| {
                 grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid_mul: {e}"))
             })?;
+            // M7.1: the output gate is its own node — a FALLBACK node, since
+            // the ring's OP_ADD is `out = a + b` and this is
+            // `out = out * sigmoid(gate)`.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             // 7. Output projection (wo)
             let wo = self.wo.as_ref().ok_or_else(|| {
@@ -2613,6 +2931,44 @@ impl Qwen35Block {
                 &buffers.norm_buf[layer_idx],
                 act,
             )?;
+            // M7.1: the output projection is its own node — a GEMM node when
+            // the weight is NATIVE (the ring's GEMM arm computes in f32) and
+            // a FALLBACK node when it is quantized (the arm cannot run a
+            // quantized weight).
+            if let Some(e) = emit.as_deref_mut() {
+                let weight = wo.weight();
+                let native = crate::decode_graph::rocm_storage(weight)
+                    .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                    .unwrap_or(false);
+                let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                e.launch(
+                    if native {
+                        grim_backend_rocm::task_graph::op::GEMM
+                    } else {
+                        grim_backend_rocm::task_graph::op::FALLBACK
+                    },
+                    [
+                        0,
+                        n,
+                        k,
+                        batch as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[],
+                );
+            }
         } else {
             // KDA Recurrent layer forward pass inside captured HIP graph
             // 1. Projections: QKV -> q_buf, alpha -> kda_alpha, beta -> kda_beta, gate (z) -> gate_buf
@@ -2828,6 +3184,41 @@ impl Qwen35Block {
                 &buffers.norm_buf[layer_idx],
                 act,
             )?;
+            // M7.1: the FFN's down projection is its own node.
+            if let Some(e) = emit.as_deref_mut() {
+                let weight = self.ffn_down.weight();
+                let native = crate::decode_graph::rocm_storage(weight)
+                    .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                    .unwrap_or(false);
+                let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                e.launch(
+                    if native {
+                        grim_backend_rocm::task_graph::op::GEMM
+                    } else {
+                        grim_backend_rocm::task_graph::op::FALLBACK
+                    },
+                    [
+                        0,
+                        n,
+                        k,
+                        batch as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[],
+                );
+            }
 
             // Residual 2 add: layer_output + ffn_out -> local_dst
             add_graph(
@@ -2836,6 +3227,34 @@ impl Qwen35Block {
                 dst_downcast(local_dst)?,
                 dev,
             )?;
+            // M7.1: the residual add is its own node — an ELEMENTWISE node,
+            // which IS the ring's OP_ADD (`out = a + b`).
+            if let Some(e) = emit.as_deref_mut() {
+                let elems = buffers.layer_output[layer_idx].shape().elem_count() as u32;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                    [elems, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            buffers.layer_output[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.layer_output[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            dst_downcast(local_dst)?
+                                .device_ptr_u64()
+                                .unwrap_or(0),
+                            dst_downcast(local_dst)?.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+            }
         }
 
         // A3: on a device boundary the residual already went into
@@ -3131,7 +3550,7 @@ impl Qwen35 {
                 }
                 _ => None,
             };
-            block.forward_graph(i, &graph.buffers, &blk_dev, dispatch.as_mut())?;
+            block.forward_graph(i, &graph.buffers, &blk_dev, dispatch.as_mut(), None)?;
         }
         if ring.is_some() && recurrent_idx == 0 {
             return Err(grim_core::error::Error::Backend(
@@ -3739,14 +4158,33 @@ impl DecodeGraphModel for Qwen35 {
             if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
                 eprintln!("[graph-trace] layer {i}/{} on rocm:{blk_ord} (capturing={})", self.blocks.len(), graph.capturing);
             }
-            block.forward_graph(i, &graph.buffers, &blk_dev, None)?;
-            if graph.emitter.is_some() && graph.capturing {
-                let is_attn = (i + 1) % self.cfg.full_attention_interval.max(1) == 0;
-                let kind = if is_attn {
-                    grim_backend_rocm::task_graph::op::ATTENTION
-                } else {
-                    grim_backend_rocm::task_graph::op::RECURRENT
-                };
+            // M7.1: the attention block names each of its launches as its own
+            // node, so the IR describes the walk exactly. The emitter is
+            // created here (it needs the graph's builder) and handed to the
+            // block, which names each launch WHERE it happens.
+            let is_attn = (i + 1) % self.cfg.full_attention_interval.max(1) == 0;
+            // The per-launch nodes are emitted ONLY during the capture
+            // bracket, like every other node: the warm-up calls run the same
+            // code with capturing=false, and a node pushed there would land
+            // in the IR before the embedding gather — a graph whose first
+            // node is not its first launch.
+            let mut emitter = if is_attn && graph.capturing {
+                LaunchEmitter::new(&mut graph.emitter, emit_last, blk_ord as u8)
+            } else {
+                None
+            };
+            block.forward_graph(i, &graph.buffers, &blk_dev, None, emitter.as_mut())?;
+            if let Some(e) = emitter.as_ref() {
+                emit_last = e.last();
+            }
+            if graph.emitter.is_some() && graph.capturing && !is_attn {
+                // The RECURRENT layer keeps its summary node: the ring's
+                // OP_RECURRENT arm runs the whole KDA STEP (the short conv,
+                // the gated delta rule and the head norm), so one node
+                // names one launch, and there is no per-launch split to make
+                // (the recurrent path's launches are the recurrent step's
+                // internals, which the arm runs inline).
+                let kind = grim_backend_rocm::task_graph::op::RECURRENT;
                 let mut args = vec![
                     (graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
                      graph.buffers.layer_input[i].bytes() as u64, 1u8),
