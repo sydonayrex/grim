@@ -1888,6 +1888,55 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1-4 A/B launcher: the Q4_K DMMV variant (2 columns x ALL M
+    /// rows per workgroup, M <= 8, weight bytes read once instead of M
+    /// times). Grid (n/2, 1). NOT on any dispatch path.
+    pub fn launch_dot4_q4k_q81_gemv_dmmv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if m > 8 {
+            return Err(Error::Backend(format!(
+                "dot4_q4k_dmmv: M={m} > 8 exceeds the kernel's register contract"
+            )));
+        }
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_dmmv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_dmmv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_dmmv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(2), 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_dmmv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// M7.2c: the RETAINED ORACLE for the Q4_K group hoist — the pre-change
     /// stock kernel body, kept alive so the hoist can be gated on
     /// BYTE-IDENTICAL output rather than a hand-written oracle. It uses the

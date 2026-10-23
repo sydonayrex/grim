@@ -3782,6 +3782,151 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv_fast(
     }
 }
 
+// ─── Phase res0-T1-4: Q4_K DMMV (num_rows batching, zolotukhin lever) ─────
+// The chunked-prefill lever from the RDNA4 DMMV work (zolotukhin 2026-04-22,
+// "why RDNA4 prefill wants a 32-column DMMV before a GEMM"): at M rows of
+// 2..8, the single-row dot4 kernel re-reads each weight byte M times (grid.y
+// = M). This variant assigns ONE workgroup to 2 weight columns x ALL M rows
+// (caller guarantees M <= 8, launcher-enforced): the Q4_K super-block
+// header, the scale shuffle and the packed code words are read/decoded ONCE
+// and reused across the row loop. Weight traffic divides by M.
+//
+// Byte-identity: row r's accumulation order (sb lane stride, g loop, w8
+// loop, the two-dot terms) is IDENTICAL to grim_dot4_q4k_q81_gemv_fast for
+// that row, so dmmv(M=8) must equal 8 single-row launches bit for bit —
+// gate: tests/dot_gemv_parity.rs dot4_q4k_dmmv_parity.
+extern "C" __global__ void grim_dot4_q4k_q81_gemv_dmmv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q4k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 2;
+    const int lane     = threadIdx.x;
+    if (col_base >= N) return;
+    if (M > 8) return; // launcher contract; refuse silently-wrong shapes
+
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const int n_q4k_superblocks = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+
+    const unsigned char* b_col[2];
+    const int active_cols = (col_base + 2 <= N) ? 2 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q4k + (long long)(col_base + j) * n_q4k_superblocks * GRIM_Q4K_BYTES
+                 : nullptr;
+    }
+
+    float facc[8][2];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        facc[r][0] = 0.0f;
+        facc[r][1] = 0.0f;
+    }
+
+    for (int sb = lane; sb < n_q4k_superblocks; sb += 32) {
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * GRIM_Q4K_BYTES;
+
+            const unsigned short* h_ptr = (const unsigned short*)b_sb;
+            float d    = fp16_to_float_device(h_ptr[0]);
+            float dmin = fp16_to_float_device(h_ptr[1]);
+
+            const unsigned char* scales = b_sb + 4;
+            const unsigned char* qs     = b_sb + 16;
+
+            #pragma unroll 2
+            for (int g = 0; g < 4; ++g) {
+                int is0 = 2 * g;
+                int is1 = 2 * g + 1;
+                unsigned char sc0, m0, sc1, m1;
+                if (is0 < 4) {
+                    sc0 = scales[is0] & 63;
+                    m0  = scales[is0 + 4] & 63;
+                    sc1 = scales[is1] & 63;
+                    m1  = scales[is1 + 4] & 63;
+                } else {
+                    sc0 = (scales[is0 + 4] & 0x0F) | ((scales[is0 - 4] >> 6) << 4);
+                    m0  = (scales[is0 + 4] >> 4)  | ((scales[is0] >> 6) << 4);
+                    sc1 = (scales[is1 + 4] & 0x0F) | ((scales[is1 - 4] >> 6) << 4);
+                    m1  = (scales[is1 + 4] >> 4)  | ((scales[is1] >> 6) << 4);
+                }
+
+                const unsigned char* qs_sub = qs + g * 32;
+
+                // The packed code words are row-INDEPENDENT: decode once.
+                unsigned int words[8];
+                #pragma unroll
+                for (int w8 = 0; w8 < 8; ++w8) {
+                    unsigned int word;
+                    __builtin_memcpy(&word, qs_sub + w8 * 4, 4);
+                    words[w8] = word;
+                }
+                unsigned int lo[8];
+                unsigned int hi[8];
+                #pragma unroll
+                for (int w8 = 0; w8 < 8; ++w8) {
+                    lo[w8] = words[w8] & 0x0F0F0F0Fu;
+                    hi[w8] = (words[w8] >> 4) & 0x0F0F0F0Fu;
+                }
+
+                for (int r = 0; r < M; ++r) {
+                    // Row pointer computed inline (a prebuilt a_row[8] array
+                    // under `#pragma unroll` miscompiled on gfx1200: the
+                    // dmmv gate measured facc[r] == row r-1's data).
+                    const unsigned char* a_sb =
+                        A_q81 + (long long)r * n_q81_blocks * GRIM_Q8_1_BYTES
+                              + sb * 8 * GRIM_Q8_1_BYTES;
+                    const unsigned char* a_blk0 = a_sb + is0 * GRIM_Q8_1_BYTES;
+                    const unsigned char* a_blk1 = a_sb + is1 * GRIM_Q8_1_BYTES;
+                    float d_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[0]);
+                    float sum_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[1]);
+                    float d_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[0]);
+                    float sum_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[1]);
+                    const signed char* a_codes0 = (const signed char*)(a_blk0 + 4);
+                    const signed char* a_codes1 = (const signed char*)(a_blk1 + 4);
+
+                    int pos_lo = 0;
+                    int pos_hi = 0;
+                    #pragma unroll
+                    for (int w8 = 0; w8 < 8; ++w8) {
+                        int a4lo, a4hi;
+                        __builtin_memcpy(&a4lo, a_codes0 + w8 * 4, 4);
+                        __builtin_memcpy(&a4hi, a_codes1 + w8 * 4, 4);
+                        pos_lo = grim_sdot4(a4lo, (int)lo[w8], pos_lo);
+                        pos_hi = grim_sdot4(a4hi, (int)hi[w8], pos_hi);
+                    }
+
+                    facc[r][j] += d * (float)sc0 * ((float)pos_lo * d_a0) - dmin * (float)m0 * sum_a0;
+                    facc[r][j] += d * (float)sc1 * ((float)pos_hi * d_a1) - dmin * (float)m1 * sum_a1;
+                }
+            }
+        }
+    }
+
+    for (int r = 0; r < M; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                facc[r][j] += __shfl_xor(facc[r][j], off);
+        }
+    }
+
+    if (lane == 0) {
+        for (int r = 0; r < M; ++r) {
+            for (int j = 0; j < 2; j++) {
+                if (j < active_cols) {
+                    C[(long long)r * N + col_base + j] = facc[r][j];
+                }
+            }
+        }
+    }
+}
+
 // ─── Phase res8-T2: IQ4_XS dot4 GEMV pair (stock + word-nibble fast) ──────
 // IQ4_XS layout (matches grim_quant::dequant_iq4xs): 136 bytes per
 // 256-weight super-block — f16 d @0, scales_h[2] @2, scales_l[8] @4,
