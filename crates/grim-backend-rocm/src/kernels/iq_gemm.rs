@@ -2184,15 +2184,7 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         int M, int N, int K)
     {
         __shared__ unsigned long long s_grid[1024];
-        const int tid = threadIdx.x;
-        if (tid < 1024) {
-            // 256 threads preload 4 entries each.
-            #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int i = tid + e * 256;
-                s_grid[i] = IQ2S_GRID[i];
-            }
-        }
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) s_grid[i] = IQ2S_GRID[i];
         __syncthreads();
 
         const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2356,9 +2348,10 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
     {
         __shared__ unsigned int s_grid[256];
         __shared__ unsigned int s_signs[128];
-        const int tid = threadIdx.x;
-        if (tid < 256) s_grid[tid] = IQ3XXS_GRID[tid];
-        if (tid < 128) s_signs[tid] = KSIGNS_IQ2XS[tid];
+        // Block-size-agnostic cooperative preload (the launch sweep runs
+        // block sizes other than 256; a tid<N guard under-loads there).
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) s_grid[i] = IQ3XXS_GRID[i];
+        for (int i = threadIdx.x; i < 128; i += blockDim.x) s_signs[i] = KSIGNS_IQ2XS[i];
         __syncthreads();
 
         const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2612,12 +2605,11 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         // A/B measured 0.77x for exactly that), while a word read with the
         // byte selected in-register stays on ds_read_b32.
         __shared__ unsigned int s_grid32[512];
-        const int tid = threadIdx.x;
-        if (tid < 512) {
-            s_grid32[tid] = (unsigned int)IQ3S_GRID_B[tid][0]
-                          | ((unsigned int)IQ3S_GRID_B[tid][1] << 8)
-                          | ((unsigned int)IQ3S_GRID_B[tid][2] << 16)
-                          | ((unsigned int)IQ3S_GRID_B[tid][3] << 24);
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            s_grid32[i] = (unsigned int)IQ3S_GRID_B[i][0]
+                        | ((unsigned int)IQ3S_GRID_B[i][1] << 8)
+                        | ((unsigned int)IQ3S_GRID_B[i][2] << 16)
+                        | ((unsigned int)IQ3S_GRID_B[i][3] << 24);
         }
         __syncthreads();
 

@@ -323,6 +323,60 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T2-6 sweep launcher: same contract as
+    /// `launch_fused_deq_gemm_simple` but with an explicit block size, so the
+    /// launch-parameter sweep can run the SAME kernel at 64/128/256/512
+    /// threads (the kernel bodies are block-size agnostic: linear idx and
+    /// strided LDS preloads). Byte-identity must hold at every size — gate:
+    /// tests/iq_lds_codebook_ab.rs `iq_lds_block_sweep`.
+    pub fn launch_fused_deq_gemm_simple_block_for_ab(
+        &self,
+        name: &str,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: a has no device ptr", name)))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: b has no device ptr", name)))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
+        let total_elems = (m as u64) * (n as u64);
+        let grid_x: u32 = total_elems
+            .div_ceil(block_size as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(block_size as u32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub(crate) fn launch_fused_deq_gemm_simple(
         &self,
         name: &str,

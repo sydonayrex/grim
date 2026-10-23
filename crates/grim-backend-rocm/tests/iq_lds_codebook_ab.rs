@@ -209,3 +209,152 @@ fn iq_lds_codebook_ab() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// res0-T2-6: launch-parameter sweep. The IQ grouped/LDS kernels are
+/// block-size agnostic (linear idx, strided preloads), so the SAME kernel
+/// runs at 64/128/256/512 threads. Byte-identity at every size is the gate
+/// (the strided-preload fix exists exactly because a tid<N guard would
+/// under-load at block<256); the timing picks the per-format block size.
+#[test]
+fn iq_lds_block_sweep() -> Result<(), String> {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    let m = 1usize;
+    let n = 4096usize;
+    let cases: [(KQuantScheme, &str, &str, &str, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>); 3] = [
+        (
+            KQuantScheme::IQ3XXS,
+            "iq3xxs",
+            "grim_fused_dequant_gemm_iq3xxs_grouped_lds",
+            "grim_fused_dequant_gemm_iq3xxs_grouped",
+            grim_quant::quant_iq3xxs,
+        ),
+        (
+            KQuantScheme::IQ3S,
+            "iq3s",
+            "grim_fused_dequant_gemm_iq3s_grouped_lds",
+            "grim_fused_dequant_gemm_iq3s_grouped",
+            grim_quant::quant_iq3s,
+        ),
+        (
+            KQuantScheme::IQ2S,
+            "iq2s",
+            "grim_fused_dequant_gemm_iq2s_grouped_lds",
+            "grim_fused_dequant_gemm_iq2s_grouped",
+            grim_quant::quant_iq2s,
+        ),
+    ];
+    for (scheme, name, lds_kernel, stock_kernel, quant) in cases {
+        let mut rng = Lcg(0x5EE ^ 77);
+        let _ = &mut rng;
+        let mut sseed: u64 = 0x5EE1;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let vals: Vec<f32> = (0..n * K).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+        let packed = quant(&vals).map_err(|e| format!("quant: {e}"))?;
+        let w_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &packed,
+            &Shape::new(vec![n, K]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(scheme),
+            },
+        )
+        .map_err(|e| format!("w h2d: {e}"))?;
+        let a: Vec<f32> = (0..K).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let a_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &f32_bytes(&a),
+            &Shape::new(vec![m * K]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+        )
+        .map_err(|e| format!("a h2d: {e}"))?;
+        let mk_out = || -> Result<Box<dyn BackendStorage>, String> {
+            MemoryOps::alloc_storage(
+                &dev,
+                &Shape::new(vec![m * n]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: Storage::Native,
+                },
+            )
+            .map_err(|e| format!("out alloc: {e}"))
+        };
+        let a_r = as_rocm(a_st.as_ref()).unwrap();
+        let w_r = as_rocm(w_st.as_ref()).unwrap();
+
+        // Reference at the production block size via the A/B launchers.
+        let out_ref = mk_out()?;
+        match name {
+            "iq3xxs" => dev
+                .launch_fused_dequant_gemm_iq3xxs_stock_for_ab(a_r, w_r, as_rocm(out_ref.as_ref()).unwrap(), m, n, K)
+                .map_err(|e| e.to_string())?,
+            "iq3s" => dev
+                .launch_fused_dequant_gemm_iq3s_stock_for_ab(a_r, w_r, as_rocm(out_ref.as_ref()).unwrap(), m, n, K)
+                .map_err(|e| e.to_string())?,
+            _ => dev
+                .launch_fused_dequant_gemm_iq2s_stock_for_ab(a_r, w_r, as_rocm(out_ref.as_ref()).unwrap(), m, n, K)
+                .map_err(|e| e.to_string())?,
+        };
+        dev.synchronize();
+        let ref_bits: Vec<u32> = f32_vec(&out_ref)?
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+
+        for kernel in [lds_kernel, stock_kernel] {
+            let mut line = format!("{name} {kernel}:");
+            for bs in [64usize, 128, 256, 512, 1024] {
+                let out = mk_out()?;
+                dev.launch_fused_deq_gemm_simple_block_for_ab(
+                    kernel,
+                    a_r,
+                    w_r,
+                    as_rocm(out.as_ref()).unwrap(),
+                    m,
+                    n,
+                    K,
+                    bs,
+                )
+                .map_err(|e| format!("{kernel} bs={bs}: {e}"))?;
+                dev.synchronize();
+                // Byte-identity vs the production reference at every size.
+                let got = f32_vec(&out)?;
+                let same = got
+                    .iter()
+                    .zip(ref_bits.iter())
+                    .all(|(x, y)| x.to_bits() == *y);
+                assert!(same, "{name} {kernel} bs={bs}: NOT byte-identical to the 256-thread reference");
+                for _ in 0..3 {
+                    dev.launch_fused_deq_gemm_simple_block_for_ab(
+                        kernel, a_r, w_r, as_rocm(out.as_ref()).unwrap(), m, n, K, bs,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                dev.synchronize();
+                let t0 = std::time::Instant::now();
+                for _ in 0..50 {
+                    dev.launch_fused_deq_gemm_simple_block_for_ab(
+                        kernel, a_r, w_r, as_rocm(out.as_ref()).unwrap(), m, n, K, bs,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                dev.synchronize();
+                let us = t0.elapsed().as_secs_f64() * 1e6 / 50.0;
+                line.push_str(&format!("  bs{bs}={us:.1}us"));
+            }
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
