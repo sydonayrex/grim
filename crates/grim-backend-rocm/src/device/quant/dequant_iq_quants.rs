@@ -291,6 +291,42 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1 A/B launcher: the codebook-cache LDS variant of the IQ2_S
+    /// grouped kernel. NOT the production dispatch.
+    pub fn launch_fused_dequant_gemm_iq2s_lds_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq2s_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// res0-T1 A/B wrapper: the PRODUCTION IQ2_S decode leg (grouped).
+    pub fn launch_fused_dequant_gemm_iq2s_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq2s(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq2s(
         &self,
         a: &RocmStorage,
@@ -300,17 +336,22 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
-        self.launch_fused_deq_gemm_simple(
-            "grim_fused_dequant_gemm_iq2s_grouped",
-            a,
-            b,
-            out,
-            m,
-            n,
-            k,
-            1,
-        )
+        // res0-T1: the codebook-cache LDS variant is the DEFAULT — 2.04x at
+        // n=4096, 1.11x at n=17408, byte-identical both. GRIM_IQ_LDS=0 is
+        // the escape hatch; the scalar entry stays as the parity oracle.
+        static LDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lds = *LDS.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ_LDS").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let kernel_name = if lds {
+            "grim_fused_dequant_gemm_iq2s_grouped_lds"
+        } else {
+            "grim_fused_dequant_gemm_iq2s_grouped"
+        };
+        self.launch_fused_deq_gemm_simple(kernel_name, a, b, out, m, n, k, 1)
     }
 
     /// Scalar IQ2_S oracle for the grouped kernel's parity gate.
@@ -347,6 +388,42 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1 A/B launcher: the codebook-cache LDS variant of the IQ3_XXS
+    /// grouped kernel. NOT the production dispatch.
+    pub fn launch_fused_dequant_gemm_iq3xxs_lds_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq3xxs_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// res0-T1 A/B wrapper: the PRODUCTION IQ3_XXS decode leg (grouped).
+    pub fn launch_fused_dequant_gemm_iq3xxs_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq3xxs(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq3xxs(
         &self,
         a: &RocmStorage,
@@ -356,18 +433,24 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // D2-2: group-hoisted kernel (see `..._iq1s`); the scalar entry below
-        // stays as the parity oracle.
-        self.launch_fused_deq_gemm_simple(
-            "grim_fused_dequant_gemm_iq3xxs_grouped",
-            a,
-            b,
-            out,
-            m,
-            n,
-            k,
-            1,
-        )
+        // res0-T1: the codebook-cache LDS variant is the DEFAULT — it beat
+        // the plain grouped kernel at BOTH A/B shapes (1.81x at n=4096,
+        // 1.15x at n=17408, byte-identical both). GRIM_IQ_LDS=0 keeps the
+        // plain grouped kernel reachable as an escape hatch; the scalar
+        // entry stays as the parity oracle.
+        static LDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lds = *LDS.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ_LDS").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let kernel_name = if lds {
+            "grim_fused_dequant_gemm_iq3xxs_grouped_lds"
+        } else {
+            "grim_fused_dequant_gemm_iq3xxs_grouped"
+        };
+        self.launch_fused_deq_gemm_simple(kernel_name, a, b, out, m, n, k, 1)
     }
 
     /// Scalar IQ3_XXS oracle for the grouped kernel's parity gate.
@@ -404,6 +487,42 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1 A/B launcher: the codebook-cache LDS variant of the IQ3_S
+    /// grouped kernel. NOT the production dispatch.
+    pub fn launch_fused_dequant_gemm_iq3s_lds_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq3s_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// res0-T1 A/B wrapper: the PRODUCTION IQ3_S decode leg (grouped).
+    pub fn launch_fused_dequant_gemm_iq3s_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq3s(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq3s(
         &self,
         a: &RocmStorage,
@@ -414,6 +533,10 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
         // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        // res0-T1: the LDS codebook variant was measured 1.18x FASTER at
+        // n=4096 but 0.78x SLOWER at n=17408 (preload + syncthreads beat by
+        // L2 amortization at large N), so it is NOT shipped here — the
+        // `_grouped_lds` launcher stays reachable as an A/B arm.
         self.launch_fused_deq_gemm_simple(
             "grim_fused_dequant_gemm_iq3s_grouped",
             a,
