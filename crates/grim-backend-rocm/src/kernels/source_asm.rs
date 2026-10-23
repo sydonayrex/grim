@@ -58,6 +58,9 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::wmma_iq_gemm::KERNEL_SOURCE);
     // SPEED-ROC: FP8 E4M3 WMMA GEMM — 383 TFLOPS on RDNA4 (2x FP16).
     s.push_str(crate::kernels::wmma_fp8_gemm::KERNEL_SOURCE);
+    // res0-T1-3: INT8 WMMA probe (rocwmma iu8, RDNA4). Probe launcher only —
+    // not in the dispatch.
+    s.push_str(crate::kernels::wmma_i8_gemm::WMMA_I8_KERNEL_SOURCE);
     s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::q4k_dequant::Q8_0_DEQUANT_SOURCE);
     // grim_dequant_q4k must ride in the same aggregate unit — without this

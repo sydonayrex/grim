@@ -1434,6 +1434,152 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1-3 probe launcher: INT8 x UINT8 -> INT32 WMMA (RDNA4).
+    /// A [M,K] int8 row-major, B [N,K] uint8 row-major, D [M,N] int32.
+    /// Both A and B padded to whole 16-row tiles (same OOB contract as the
+    /// fp8 kernel: load_matrix_sync is unmasked, only the store is).
+    pub fn launch_wmma_gemm_iu8_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 16;
+        const TILE_N: usize = 16;
+        const N_TILES_PER_BLOCK: usize = 2;
+        let n_per_block = TILE_N * N_TILES_PER_BLOCK;
+
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8: b has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8: out has no device ptr".into()))?;
+
+        if k % 16 != 0 {
+            return Err(Error::Backend(format!("wmma_iu8: K={k} must be divisible by 16")));
+        }
+        let tile = 16usize;
+        if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8: A must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                a.bytes()
+            )));
+        }
+        if b.bytes() % (tile * k) != 0 || b.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8: B must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                b.bytes()
+            )));
+        }
+
+        let grid_dim = HipDim3::new(
+            (n as u32).div_ceil(n_per_block as u32),
+            (m as u32).div_ceil(TILE_M as u32),
+            1,
+        );
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_gemm_iu8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// res0-T1-3 probe launcher: the 4-M-tile variant (B reused across 4
+    /// row tiles per block). Same OOB contract as launch_wmma_gemm_iu8_for_ab.
+    pub fn launch_wmma_gemm_iu8_mtile_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 64; // 4 x 16
+        const TILE_N: usize = 16;
+        const N_TILES_PER_BLOCK: usize = 2;
+        let n_per_block = TILE_N * N_TILES_PER_BLOCK;
+
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8_mtile: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8_mtile: b has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8_mtile: out has no device ptr".into()))?;
+
+        if k % 16 != 0 {
+            return Err(Error::Backend(format!("wmma_iu8_mtile: K={k} must be divisible by 16")));
+        }
+        let tile = 16usize;
+        if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8_mtile: A must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                a.bytes()
+            )));
+        }
+        if b.bytes() % (tile * k) != 0 || b.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8_mtile: B must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                b.bytes()
+            )));
+        }
+
+        let grid_dim = HipDim3::new(
+            (n as u32).div_ceil(n_per_block as u32),
+            (m as u32).div_ceil(TILE_M as u32),
+            1,
+        );
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_gemm_iu8_mtile",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub fn launch_wmma_gemm_fp8_e4m3_for_ab(
         &self,
         a: &RocmStorage,
