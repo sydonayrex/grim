@@ -2759,6 +2759,56 @@ impl RocmDevice {
                 got: vec![1, n],
             });
         }
+        // res0-T1-2 SPARSITY OPPORTUNITY PROBE. Env-gated (GRIM_SPARSE_PROBE=1,
+        // capped by GRIM_SPARSE_PROBE_MAX_CALLS, default 2000): copy the f32
+        // activation to host and report what fraction of 32-wide k-groups are
+        // DEAD — max|a| in group below tau x the call's global max — for tau in
+        // {0.02, 0.05, 0.1}. A dead k-group means SpQt-style skip saves that
+        // group's weight bytes for ALL n outputs, so the dead-group fraction
+        // IS the byte-savings fraction. One JSONL line per call: post-process
+        // outside. This is a probe; the D2H sync makes it slow by design.
+        if std::env::var("GRIM_SPARSE_PROBE").as_deref() == Ok("1") {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let max_calls: usize = std::env::var("GRIM_SPARSE_PROBE_MAX_CALLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000);
+            let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c < max_calls {
+                if let Some(a_rocm) = a.as_any().downcast_ref::<RocmStorage>() {
+                    if a_rocm.dtype().arith == grim_tensor::ArithType::F32 {
+                        if let Ok(host) = a_rocm.copy_to_host() {
+                            let vals: Vec<f32> = host
+                                .chunks_exact(4)
+                                .map(|ch| f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]))
+                                .collect();
+                            let gmax = vals.iter().fold(0f32, |m, v| m.max(v.abs()));
+                            let mut dead = [0usize; 3];
+                            let taus = [0.02f32, 0.05, 0.1];
+                            let mut total_groups = 0usize;
+                            for row in 0..m {
+                                for g0 in (0..k).step_by(32) {
+                                    let gend = (g0 + 32).min(k);
+                                    let g = vals[row * k + g0..row * k + gend]
+                                        .iter()
+                                        .fold(0f32, |mx, v| mx.max(v.abs()));
+                                    total_groups += 1;
+                                    for (ti, tau) in taus.iter().enumerate() {
+                                        if g < tau * gmax {
+                                            dead[ti] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "[sparse-probe] {{\"call\":{c},\"m\":{m},\"n\":{n},\"k\":{k},\"groups\":{total_groups},\"dead02\":{},\"dead05\":{},\"dead10\":{},\"gmax\":{gmax:.4}}}",
+                                dead[0], dead[1], dead[2]
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let need_q81 = m * (k / 32) * 36;
         let dot_disabled = matches!(
             std::env::var("GRIM_DOT_GEMV").as_deref(),
