@@ -182,6 +182,86 @@ extern "C" {
         }
     }
 
+    /// M7.2g: the GROUP-HOISTED Q3_K scalar forward GEMM.
+    ///
+    /// `grim_fused_dequant_gemm_q3k` calls `dequant_q3k_element` once per
+    /// weight, and that helper re-decodes the 12-byte ggml aux shuffle + the
+    /// whole 16-scale header for EVERY weight (~40 ops + 12 byte loads). The
+    /// IQ recipe (the IQ1_S D2-2 change) is to hoist the part of a group that
+    /// is CONSTANT: within one 256-weight super-block the header (d + all 16
+    /// scales) is identical, so it is decoded ONCE per super-block and the
+    /// per-weight code only picks its scale out of the pre-decoded header.
+    ///
+    /// All 16 scales are packed into four u32 registers (4 bytes each) so the
+    /// header state stays in registers, not scratch memory — a per-thread
+    /// array indexed by runtime sc_idx would land in scratch and each weight
+    /// would pay an uncoalesced scratch load.
+    ///
+    /// Byte-identical to `grim_fused_dequant_gemm_q3k` (same per-weight
+    /// values, same ascending accumulation order over k).
+    __device__ __forceinline__ void dequant_q3k_header_all(
+        const unsigned char* block_ptr,
+        float* d_out,
+        unsigned int scales_packed[4])
+    {
+        const unsigned char* scales_ptr = block_ptr + 96;
+        *d_out = fp16_to_float_device(((const unsigned short*)(block_ptr + 108))[0]);
+
+        // Decode the 12-byte ggml aux shuffle into 16 signed scale bytes,
+        // packed 4 per u32. Identical bit layout to dequant_q3k_element.
+        const unsigned int kmask1 = 0x03030303u;
+        const unsigned int kmask2 = 0x0F0F0F0Fu;
+        unsigned int aux0 = ((unsigned int)scales_ptr[0]) | (((unsigned int)scales_ptr[1]) << 8)
+                          | (((unsigned int)scales_ptr[2]) << 16) | (((unsigned int)scales_ptr[3]) << 24);
+        unsigned int aux1 = ((unsigned int)scales_ptr[4]) | (((unsigned int)scales_ptr[5]) << 8)
+                          | (((unsigned int)scales_ptr[6]) << 16) | (((unsigned int)scales_ptr[7]) << 24);
+        unsigned int tmp  = ((unsigned int)scales_ptr[8]) | (((unsigned int)scales_ptr[9]) << 8)
+                          | (((unsigned int)scales_ptr[10]) << 16) | (((unsigned int)scales_ptr[11]) << 24);
+        unsigned int qw0 = (aux0 & kmask2) | (((tmp >>  0) & kmask1) << 4);
+        unsigned int qw1 = (aux1 & kmask2) | (((tmp >>  2) & kmask1) << 4);
+        unsigned int qw2 = ((aux0 >> 4) & kmask2) | (((tmp >>  4) & kmask1) << 4);
+        unsigned int qw3 = ((aux1 >> 4) & kmask2) | (((tmp >>  6) & kmask1) << 4);
+        scales_packed[0] = qw0;
+        scales_packed[1] = qw1;
+        scales_packed[2] = qw2;
+        scales_packed[3] = qw3;
+    }
+
+    /// M7.2g: ONE Q3_K weight from an already-decoded group header.
+    ///
+    /// Byte-identical to the per-weight body of `dequant_q3k_element`, but
+    /// reads the selected scale from the pre-decoded `scales_packed` instead
+    /// of re-running the 12-byte shuffle.
+    __device__ __forceinline__ float dequant_q3k_weight(
+        const unsigned char* block_ptr,
+        int in_sb,
+        float d,
+        const unsigned int scales_packed[4])
+    {
+        const unsigned char* hmask = block_ptr + 0;
+        const unsigned char* qs    = block_ptr + 32;
+
+        int n     = in_sb / 128;
+        int _j    = (in_sb % 128) / 32;
+        int lo_hi = (in_sb % 32) / 16;
+        int l     = in_sb % 16;
+        int sc_idx = n * 8 + _j * 2 + lo_hi;
+
+        // Extract the selected signed scale byte from the packed header.
+        unsigned int raw = (scales_packed[sc_idx >> 2] >> (8 * (sc_idx & 3))) & 0xFFu;
+        int8_t sv = (int8_t)(raw & 0xFF);
+        float scale_val = (float)(sv - 32);
+        float dl = d * scale_val;
+
+        int shift = _j * 2;
+        int q_off = n * 32 + l + lo_hi * 16;
+        int q_val = (qs[q_off] >> shift) & 3;
+        int hm_bit = (hmask[l + lo_hi * 16] >> (_j + n * 4)) & 1;
+        int q_biased = q_val - (hm_bit ? 0 : 4);
+
+        return dl * (float)q_biased;
+    }
+
     // Latent-cache embedding gather for Q3_K tables (xing4.0 token_embd):
     // mirrors grim_embedding_q4k_gather with the 110-byte Q3_K super-block.
     extern "C" __global__ void grim_embedding_q3k_gather(
@@ -230,6 +310,52 @@ extern "C" {
         }
 
         C[row * N + col] = acc;
+    }
+
+    /// M7.2g: the GROUP-HOISTED Q3_K forward GEMM. Same grid and same
+    /// per-output-element loop as `grim_fused_dequant_gemm_q3k`, but the
+    /// super-block header (d + all 16 scales) is decoded once per
+    /// super-block instead of once per weight.
+    ///
+    /// Byte-identical to `grim_fused_dequant_gemm_q3k`. Retained oracle is
+    /// that kernel itself; see tests/q3k_q2k_scalar_grouped_parity.rs.
+    __global__ void grim_fused_dequant_gemm_q3k_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_q3k,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 110;   // block_q3_K = 110 bytes
+        const unsigned char* row_b_ptr = B_q3k + col * row_bytes;
+
+        float acc = 0.0f;
+        int cur_sb = -1;
+        const unsigned char* block_ptr = (const unsigned char*)0;
+        float d = 0.0f;
+        unsigned int scales[4] = {0u, 0u, 0u, 0u};
+
+        for (int k = 0; k < K; ++k) {
+            int sb_idx = k / 256;
+            int in_sb = k % 256;
+            if (sb_idx != cur_sb) {
+                cur_sb = sb_idx;
+                block_ptr = row_b_ptr + (long long)sb_idx * 110;
+                dequant_q3k_header_all(block_ptr, &d, scales);
+            }
+            float a_val = A[(long long)row * K + k];
+            float w_val = dequant_q3k_weight(block_ptr, in_sb, d, scales);
+            acc += a_val * w_val;
+        }
+
+        C[(long long)row * N + col] = acc;
     }
 
     __global__ void grim_fused_dequant_backward_gemm_q3k(

@@ -775,6 +775,32 @@ impl RocmDevice {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q2k", a, b, out, m, n, k, 1)
     }
 
+    /// M7.2g: the group-hoisted Q2_K scalar forward GEMM.
+    ///
+    /// Decodes the super-block header once per block instead of once per
+    /// weight; byte-identical to `grim_fused_dequant_gemm_q2k`. Not on any
+    /// dispatch path; only tests/q3k_q2k_scalar_grouped_parity.rs launches it.
+    pub fn launch_fused_dequant_gemm_q2k_grouped_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_q2k_grouped",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_q2k(
         &self,
         dy: &RocmStorage,
@@ -822,6 +848,32 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q3k", a, b, out, m, n, k, 1)
+    }
+
+    /// M7.2g: the group-hoisted Q3_K scalar forward GEMM.
+    ///
+    /// Decodes the super-block header once per block instead of once per
+    /// weight; byte-identical to `grim_fused_dequant_gemm_q3k`. Not on any
+    /// dispatch path; only tests/q3k_q2k_scalar_grouped_parity.rs launches it.
+    pub fn launch_fused_dequant_gemm_q3k_grouped_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_q3k_grouped",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            1,
+        )
     }
 
     /// M7.2a: the IQ recipe (the LDS-tiled prompt GEMM) for Q3_K.

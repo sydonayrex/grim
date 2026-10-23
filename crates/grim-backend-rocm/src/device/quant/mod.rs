@@ -673,7 +673,11 @@ impl QuantOps for RocmDevice {
                         k,
                     )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q2k(
+                    // M7.2g: the group-hoisted scalar GEMM — byte-identical to
+                    // `launch_fused_dequant_gemm_q2k`, 2.29x faster at m=1
+                    // (16.6 vs 38.0 ms at n=17408 k=5120). Used as the final
+                    // fallback when dot4 (m==1) and WMMA both decline.
+                    self.launch_fused_dequant_gemm_q2k_grouped_for_ab(
                         a_storage,
                         b_storage,
                         &out_storage,
@@ -794,7 +798,11 @@ impl QuantOps for RocmDevice {
                         k,
                     )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q3k(
+                    // M7.2g: the group-hoisted scalar GEMM — byte-identical to
+                    // `launch_fused_dequant_gemm_q3k`, 2.29x faster at m=1
+                    // (16.6 vs 38.0 ms at n=17408 k=5120). Used as the final
+                    // fallback when dot4 (m==1), u4 lanes, and WMMA all decline.
+                    self.launch_fused_dequant_gemm_q3k_grouped_for_ab(
                         a_storage,
                         b_storage,
                         &out_storage,
