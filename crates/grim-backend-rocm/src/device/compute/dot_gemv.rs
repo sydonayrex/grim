@@ -1414,6 +1414,96 @@ impl RocmDevice {
         )
     }
 
+    /// res8-T2: IQ4_XS x Q8_1 GEMV via sudot4 over the kvalues_iq4nl table.
+    /// A/B wrapper for the word-nibble FAST kernel. NOT the production
+    /// dispatch: the decode leg still routes IQ4_XS through the f32-act
+    /// `_grouped` fused kernel (103.9 GB/s at n=4096/k=5120 per the census)
+    /// until the A/B earns a default switch.
+    pub fn launch_dot4_iq4xs_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_fast",
+        )
+    }
+
+    /// res8-T2: the byte-wise STOCK IQ4_XS dot4 kernel — the fast kernel's
+    /// byte-identity oracle and A/B counterpart.
+    pub fn launch_dot4_iq4xs_q81_gemv_stock_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv",
+        )
+    }
+
+    fn launch_dot4_iq4xs_q81_gemv_with(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        kernel_name: &str,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Phase 4.5f: Q3_K x Q8_1 GEMV via sudot4 + two-dot + sign correction (RDNA3/4).
     /// Public A/B wrapper around [`Self::launch_dot4_q3k_q81_gemv`] -- Q3_K (110 B / 256 weights).
     ///

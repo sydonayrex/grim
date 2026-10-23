@@ -101,6 +101,12 @@ fn scheme(name: &str) -> (usize, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>, fn(
         // with ONE 32-bit load and `& 0x03030303` instead of four 1-byte
         // loads — the same mask the Q5_K `qh` field already uses.
         "q2k" => (84, grim_quant::quant_q2k, grim_quant::dequant_q2k),
+        // IQ4_XS: 136 bytes per 256 weights — d f16 @0, scales_h[2] @2,
+        // scales_l[8] @4, qs[128] @8. The codes are NIBBLES: weights 0..15
+        // take the LOW nibble of qs[0..15], weights 16..31 the HIGH nibble of
+        // the SAME bytes; values go through kvalues_iq4nl (NOT linear in the
+        // code), so the dot4 kernel packs kvalues[code] into the i8 operand.
+        "iq4xs" => (136, grim_quant::quant_iq4xs, grim_quant::dequant_iq4xs),
         other => panic!("unknown scheme {other}"),
     }
 }
@@ -194,6 +200,16 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
             dev.launch_dot4_q2k_q81_gemv_for_ab(a_r, b_r, o_new, m, n, k)
                 .map_err(|e| format!("launch new: {e}"))?;
         }
+        "iq4xs" => {
+            // Both dot4 sides through launchers (the Q4_K lesson). The
+            // production baseline the A/B is judged against is the f32-act
+            // `_grouped` fused kernel (103.9 GB/s at n=4096/k=5120), timed
+            // separately in `iq4xs_dot4_vs_grouped_speed_ab`.
+            dev.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a_r, b_r, o_ref, m, n, k)
+                .map_err(|e| format!("launch ref: {e}"))?;
+            dev.launch_dot4_iq4xs_q81_gemv_for_ab(a_r, b_r, o_new, m, n, k)
+                .map_err(|e| format!("launch new: {e}"))?;
+        }
         "q5k" => {
             dev.launch_dot4_q5k_q81_gemv_ref_for_ab(a_r, b_r, o_ref, m, n, k)
                 .map_err(|e| format!("launch ref: {e}"))?;
@@ -236,6 +252,7 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
     // dequant dotted with the same activation codes.
     let a_deq = dequant_q81(&q81, m * k);
     let mut worst = 0.0f32;
+    let mut worst_case = (0usize, 0usize, 0f32, 0f32, 0f32);
     let mut nonzero = 0usize;
     for row in 0..m {
         for col in 0..n {
@@ -250,8 +267,18 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
                 nonzero += 1;
             }
             let d = (got - acc).abs() / acc.abs().max(1e-3);
-            worst = worst.max(d);
+            if d > worst {
+                worst = d;
+                worst_case = (row, col, got, acc, (got - acc).abs());
+            }
         }
+    }
+    if worst > 1e-2 {
+        let (row, col, got, acc, absd) = worst_case;
+        eprintln!(
+            "{scheme_name} worst k={k} n={n} m={m}: ({row},{col}) got={got} oracle={acc} \
+             abs_diff={absd:.3e} rel={worst:.3e}"
+        );
     }
     assert_eq!(
         nonzero, m * n,
@@ -279,7 +306,7 @@ fn kquant_grouped_matches_retained_oracle() -> Result<(), String> {
         (4096, 68, 1),
         (4096, 68, 8),
     ] {
-        for s in ["q4k", "q5k", "q6k", "q2k"] {
+        for s in ["q4k", "q5k", "q6k", "q2k", "iq4xs"] {
             grouped_parity(s, k, n, m)?;
         }
     }
@@ -371,6 +398,10 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
             |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
+        "iq4xs" => (
+            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+        ),
         _ => (
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
@@ -407,8 +438,112 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
 
 #[test]
 fn kquant_grouped_speed_ab() -> Result<(), String> {
-    for s in ["q4k", "q5k", "q6k", "q2k"] {
+    for s in ["q4k", "q5k", "q6k", "q2k", "iq4xs"] {
         speed_ab(s)?;
+    }
+    Ok(())
+}
+
+/// The REAL A/B for IQ4_XS: the dot4 fast kernel against the production
+/// f32-act `_grouped` fused kernel (103.9 GB/s at n=4096/k=5120 per the
+/// census). The dot4-vs-stock comparison in `speed_ab` only proves the word
+/// unpack is faster than its own byte twin; this one decides whether the
+/// dot4 kernel earns a default switch at all.
+#[test]
+fn iq4xs_dot4_vs_grouped_speed_ab() -> Result<(), String> {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    let (blk_bytes, quant, _dequant) = scheme("iq4xs");
+    let k = 5120usize;
+    let m = 1usize;
+
+    let time_shape = |n: usize| -> Result<(), String> {
+        let f32ty = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let u8ty = DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        };
+        let row_bytes = (k / 256) * blk_bytes;
+        let mut rng = Lcg(0xBEEF_0042 ^ (n as u64));
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
+        let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![m * k]), f32ty)
+            .map_err(|e| format!("a h2d: {e}"))?;
+        let q81_len = m * (k / 32) * 36;
+        let q81_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; q81_len],
+            &Shape::new(vec![q81_len]),
+            u8ty.clone(),
+        )
+        .map_err(|e| format!("q81 alloc: {e}"))?;
+        dev.launch_quantize_q8_1(
+            as_rocm(a_st.as_ref()).unwrap(),
+            as_rocm(q81_st.as_ref()).unwrap(),
+            m,
+            k,
+        )
+        .map_err(|e| format!("quantize: {e}"))?;
+        dev.synchronize();
+        let mut bq = vec![0u8; n * row_bytes];
+        for col in 0..n {
+            let packed = quant(&b[col * k..(col + 1) * k]).map_err(|e| format!("quant: {e}"))?;
+            bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
+        }
+        let b_st = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
+            .map_err(|e| format!("b h2d: {e}"))?;
+        let out_st = MemoryOps::alloc_storage(
+            &dev,
+            &Shape::new(vec![m * n]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+        )
+        .map_err(|e| format!("out alloc: {e}"))?;
+        let a_r = as_rocm(q81_st.as_ref()).unwrap();
+        let b_r = as_rocm(b_st.as_ref()).unwrap();
+        let a_f = as_rocm(a_st.as_ref()).unwrap();
+        let o_r = as_rocm(out_st.as_ref()).unwrap();
+
+        let time_it = |f: &dyn Fn() -> Result<*mut std::ffi::c_void, String>| -> f64 {
+            for _ in 0..5 {
+                f().unwrap();
+            }
+            dev.synchronize();
+            let iters = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                f().unwrap();
+            }
+            dev.synchronize();
+            t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        let bytes = (n * row_bytes) as f64;
+        let t_dot4 = time_it(&|| {
+            dev.launch_dot4_iq4xs_q81_gemv_for_ab(a_r, b_r, o_r, m, n, k)
+                .map_err(|e| e.to_string())
+        });
+        let t_grouped = time_it(&|| {
+            dev.launch_fused_dequant_gemm_iq4xs_for_ab(a_f, b_r, o_r, m, n, k)
+                .map_err(|e| e.to_string())
+        });
+        println!(
+            "iq4xs dot4-vs-grouped n={n} k={k} m={m}: dot4 {t_dot4:.1} us ({:.1} GB/s)  \
+             grouped-f32 {t_grouped:.1} us ({:.1} GB/s)  speedup {:.2}x",
+            bytes / t_dot4 / 1e3,
+            bytes / t_grouped / 1e3,
+            t_grouped / t_dot4
+        );
+        Ok(())
+    };
+    for n in [4096usize, 17408usize] {
+        time_shape(n)?;
     }
     Ok(())
 }

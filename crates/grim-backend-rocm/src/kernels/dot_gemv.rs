@@ -3517,6 +3517,174 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv_fast(
     }
 }
 
+// ─── Phase res8-T2: IQ4_XS dot4 GEMV pair (stock + word-nibble fast) ──────
+// IQ4_XS layout (matches grim_quant::dequant_iq4xs): 136 bytes per
+// 256-weight super-block — f16 d @0, scales_h[2] @2, scales_l[8] @4,
+// qs[128] @8. Eight 32-weight groups; group ib has
+//   ls = ((sc_l[ib>>1] >> (4*(ib&1))) & 0xF) | (((scales_h >> (2*ib)) & 3) << 4)
+//   dl = d * (ls - 32)
+// and its 32 codes are NIBBLES of qs[0..15]: weights 0..15 take the LOW
+// nibble of bytes 0..15, weights 16..31 the HIGH nibble of the SAME bytes.
+// Values go through kvalues_iq4nl (an arbitrary i8 table, NOT linear in the
+// code), so unlike Q2_K/Q3_K the dot4 operand is kvalues[code] packed into
+// an i8x4 word — a 16-entry LDS table, not a mask-and-dot of the raw codes.
+// One 32-weight group spans exactly one q8_1 activation block, so the
+// per-group accumulation is pos = Σ sdot4(a4, kv4) over the group's 32
+// codes (low half then high half) and facc += dl * pos * d_a.
+//
+// STOCK: one 1-byte load per qs byte, nibble picked per weight.
+// FAST: one 32-bit load per 4 qs bytes, `& 0x0F0F0F0F` / `>>4 & 0x0F0F0F0F`
+// — the nibble selector is fixed per half and the byte index is carried by
+// the byte lanes of the word, so the extracted codes are identical. The two
+// kernels share the grid mapping (4 output columns per 32-lane block,
+// lanes striding super-blocks), the accumulation order and the arithmetic,
+// so they are byte-identical by construction; parity:
+// tests/dot4_kquant_grouped_parity.rs (iq4xs row).
+__device__ __forceinline__ int grim_kv4_iq4xs(const int* tbl, unsigned int q4) {
+    return (tbl[q4 & 0xFF] & 0xFF)
+         | ((tbl[(q4 >> 8) & 0xFF] & 0xFF) << 8)
+         | ((tbl[(q4 >> 16) & 0xFF] & 0xFF) << 16)
+         | ((tbl[(q4 >> 24) & 0xFF] & 0xFF) << 24);
+}
+
+__device__ __forceinline__ void grim_iq4xs_dot4_body(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K,
+    int col_base, int row, int lane, int word_unpack)
+{
+    if (row >= M || col_base >= N) return;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    __shared__ int kv_tbl[16];
+    if (lane < 16) {
+        kv_tbl[lane] = (lane == 0) ? -127 : (lane == 1) ? -104 : (lane == 2) ? -83
+                     : (lane == 3) ? -65  : (lane == 4) ? -49  : (lane == 5) ? -35
+                     : (lane == 6) ? -22  : (lane == 7) ? -10  : (lane == 8) ? 1
+                     : (lane == 9) ? 13   : (lane == 10) ? 25  : (lane == 11) ? 38
+                     : (lane == 12) ? 53  : (lane == 13) ? 69  : (lane == 14) ? 89 : 113;
+    }
+    __syncthreads();
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_iq4xs + (long long)(col_base + j) * n_sb * 136
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = lane; sb < n_sb; sb += 32) {
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * 136;
+            const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+            const unsigned int scales_h =
+                (unsigned int)b_sb[2] | ((unsigned int)b_sb[3] << 8);
+            const unsigned char* sc_l = b_sb + 4;
+            const unsigned char* qs = b_sb + 8;
+
+            #pragma unroll
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = (int)((sc_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                             | (((int)((scales_h >> (2 * ib)) & 3)) << 4);
+                const float dl = d * (float)(ls - 32);
+                const unsigned char* a_blk = a_sb + ib * GRIM_Q8_1_BYTES;
+                const float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                const signed char* a_codes = (const signed char*)(a_blk + 4);
+                // group ib owns qs[ib*16 .. ib*16+16]; both nibble halves
+                // live in these same 16 bytes.
+                const unsigned char* qs_g = qs + ib * 16;
+
+                int pos = 0;
+                if (word_unpack) {
+                    #pragma unroll
+                    for (int w8 = 0; w8 < 4; ++w8) {
+                        unsigned int word;
+                        __builtin_memcpy(&word, qs_g + w8 * 4, 4);
+                        int a4;
+                        __builtin_memcpy(&a4, a_codes + w8 * 4, 4);
+                        pos = grim_sdot4(a4, grim_kv4_iq4xs(kv_tbl, word & 0x0F0F0F0Fu), pos);
+                    }
+                    #pragma unroll
+                    for (int w8 = 0; w8 < 4; ++w8) {
+                        unsigned int word;
+                        __builtin_memcpy(&word, qs_g + w8 * 4, 4);
+                        int a4;
+                        __builtin_memcpy(&a4, a_codes + 16 + w8 * 4, 4);
+                        pos = grim_sdot4(a4, grim_kv4_iq4xs(kv_tbl, (word >> 4) & 0x0F0F0F0Fu), pos);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int w8 = 0; w8 < 4; ++w8) {
+                        unsigned int q4 = (unsigned int)(qs_g[w8 * 4] & 0x0F)
+                                        | ((unsigned int)(qs_g[w8 * 4 + 1] & 0x0F) << 8)
+                                        | ((unsigned int)(qs_g[w8 * 4 + 2] & 0x0F) << 16)
+                                        | ((unsigned int)(qs_g[w8 * 4 + 3] & 0x0F) << 24);
+                        int a4;
+                        __builtin_memcpy(&a4, a_codes + w8 * 4, 4);
+                        pos = grim_sdot4(a4, grim_kv4_iq4xs(kv_tbl, q4), pos);
+                    }
+                    #pragma unroll
+                    for (int w8 = 0; w8 < 4; ++w8) {
+                        unsigned int q4 = (unsigned int)(qs_g[w8 * 4] >> 4)
+                                        | ((unsigned int)(qs_g[w8 * 4 + 1] >> 4) << 8)
+                                        | ((unsigned int)(qs_g[w8 * 4 + 2] >> 4) << 16)
+                                        | ((unsigned int)(qs_g[w8 * 4 + 3] >> 4) << 24);
+                        int a4;
+                        __builtin_memcpy(&a4, a_codes + 16 + w8 * 4, 4);
+                        pos = grim_sdot4(a4, grim_kv4_iq4xs(kv_tbl, q4), pos);
+                    }
+                }
+                facc[j] += dl * ((float)pos * d_a);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+extern "C" __global__ void grim_dot4_iq4xs_q81_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_iq4xs_dot4_body(A_q81, B_iq4xs, C, M, N, K,
+                         blockIdx.x * 4, blockIdx.y, threadIdx.x, 0);
+}
+
+extern "C" __global__ void grim_dot4_iq4xs_q81_gemv_fast(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_iq4xs_dot4_body(A_q81, B_iq4xs, C, M, N, K,
+                         blockIdx.x * 4, blockIdx.y, threadIdx.x, 1);
+}
+
 "#;
 
 #[cfg(test)]

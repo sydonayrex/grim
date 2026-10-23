@@ -726,6 +726,21 @@ impl RocmDevice {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4xs", a, b, out, m, n, k, 1)
     }
 
+    /// A/B wrapper around the PRODUCTION IQ4_XS decode leg (the group-hoisted
+    /// f32-act `_grouped` kernel), so the dot4-vs-grouped speed gate and the
+    /// parity harness drive the same launcher the dispatch runs.
+    pub fn launch_fused_dequant_gemm_iq4xs_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq4xs(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_iq4xs(
         &self,
         dy: &RocmStorage,
