@@ -1234,3 +1234,33 @@ Net: of the twelve, exactly one (rocprofiler-pc-sampling) targets grim's open
 measurement gap, and the silicon refuses it today. The counters question now
 hinges on card 0: Metrix's metric DB labels its cache/LDS metrics gfx1201 —
 running them means using the RESERVED card, which needs explicit approval.
+
+### The card-0 counter pass was ATTEMPTED (approved) and STALLS — counter question closed negatively
+
+With explicit user approval, the Metrix counter pass ran on gfx1201 (card 0)
+with the LDS-vs-stock fixture (8+8 launches, filter `.*iq3xxs.*`, metrics
+l2_hit_rate / lds_bank_conflict_percent / hbm_read_bandwidth /
+bytes_transferred_hbm / bytes_transferred_l2). RESULT: **the target
+process slept 14+ minutes inside rocprofiler counter setup and never
+executed a single replayed launch** — killed at ~14 min, zero samples.
+This is the third independent tool confirming the same wall:
+
+| tool | result on gfx12 |
+|---|---|
+| Metrix (gfx1200) | no counter metrics in its DB |
+| PC sampling (rocprofv3) | both methods rejected: "not supported on any of the agents" |
+| Metrix on gfx1201 (card 0) | **stalls in counter collection, never runs** |
+| rocprofiler-compute (cloned, latest) | no gfx1200/gfx1201 mentions in the tree |
+
+**Conclusion: hardware-counter-based cache analysis is platform-blocked
+on consumer RDNA under ROCm 7.2.4.** The L1/L2 question stands answered by
+what works: footprint arithmetic (dot4 waves L1-resident 6.6-16.4 KB <
+32 KB), the block sweep (256 optimal), the measured A/B results themselves
+(LDS staging 1.81-2.04x; byte-array LDS rows 0.77x - the bank-conflict
+symptom), and the analytical split. No further counter attempts are
+warranted on this stack.
+
+**Housekeeping:** `rocm-smi` no longer exists on this box — the install
+now ships **`amd-smi`** (`amd-smi list`, `amd-smi metric -g N` for activity;
+`process list` unsupported here). The GPU-busy gate for future sessions
+uses `amd-smi metric` GFX_ACTIVITY plus `pgrep -x` for known binaries.
