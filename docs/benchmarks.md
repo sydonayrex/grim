@@ -1183,22 +1183,29 @@ it targeted is also narrowed (46.5→91 GB/s).
 
 ### BLOCKED (tools exist upstream, not on this box)
 
-- **Xtrace (T2-5)**: the paper's tool (g-watch) is not installed;
-  /usr/sbin/xtrace is the X11 protocol tracer, unrelated (and X11 is
-  deprecated for Wayland anyway). NOT NEEDED today: rocprofv3 kernel-trace
-  already delivers per-launch us/VGPR/scratch, the rho microbench gives the
-  measured roofline, and the intra-kernel stall gap only matters when
-  hand-tuning one kernel body.
-- **Kerncap (T2-7)**: AMDResearch/intellikit not installed as a tool — but
-  the capability exists locally: `old/repo/Hyperloom-main/` vendors AMD's
-  Hyperloom incl. **kernelforge** (agentic kernel-optimization loop:
-  kernel_backends incl. HIP, roofline_ceiling, gemm_tune, campaign
-  evaluation; intellikit documented as its transitive dep). Caveats: Python
-  + agent-SDK driven (claude/codex CLI subprocess), validated on
-  MI300X/MI355X (CDNA), targets vLLM/SGLang workloads. grim's cheaper
-  equivalent: the kernels are JIT'd from Rust strings, so a grim-side
-  `--export-kernel-probe <name>` (kernel name + args + source -> standalone
-  hiprtc harness) is an afternoon and needs no Python toolchain.
+- **IntelliKit is VENDORED AND INSTALLED** (correction): 
+  `old/repo/intellikit-main/` carries Kerncap/Metrix/Linex/Nexus/Accordo +
+  MCP servers; kerncap+metrix+linex installed into
+  `old/repo/intellikit-main/.venv` (python3.14 venv — system python is
+  externally managed, no pip). VERIFIED WORKING: `metrix profile
+  --time-only` per-dispatch durations on the iq3xxs LDS target (84-92 us,
+  matches the 87.9 us host-timed figure). COUNTER STATUS on gfx1200:
+  Metrix's metric DB has NO gfx1200 entries (l2_hit_rate,
+  lds_bank_conflict_percent, memory_cache profile all "not available on
+  gfx1200"); the listed metrics are labeled gfx1201 = reserved card 0 —
+  running them needs explicit user approval for card 0. The profiling
+  FIXTURE exists: `metrix_target_iq3xxs_lds` in
+  tests/iq_lds_codebook_ab.rs (8 launches, replay-friendly).
+- **PC sampling (the stall-attribution gap)**: the new
+  rocprofiler-pc-sampling skill is the right tool, and rocprofv3 accepts
+  the flags — but BOTH stochastic and host_trap are rejected: "Given PC
+  sampling configuration is not supported on any of the agents" (gfx1200/
+  gfx1201 under ROCm 7.2.4). HARDWARE/STACK-BLOCKED, recorded with the
+  attempted configurations. /usr/sbin/xtrace is glibc's pcprofile tracer
+  (not X11, and not the GPU Xtrace paper either) — no xtrace on this box
+  is the GPU tool.
+- **kernelforge** (Hyperloom, `old/repo/Hyperloom-main/`) stays the
+  heavyweight option: Python + claude/codex-SDK driven, CDNA/MI-validated.
 - **Cache-topology microbench (T3-9 second half)**: no counter access on
   this stack (rocprofv3 --pmc multi-pass impractical, rocprof v1
   unsupported); MT4G's methodology requires porting its suite to RDNA4.

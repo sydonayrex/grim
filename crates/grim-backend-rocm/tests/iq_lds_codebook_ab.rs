@@ -358,3 +358,69 @@ fn iq_lds_block_sweep() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// res0-T3-9 counter target: launches the iq3xxs LDS kernel a HANDFUL of
+/// times so an external profiler (metrix --profile memory) replays a short
+/// app instead of the whole census. Not a gate — a profiling fixture.
+#[test]
+fn metrix_target_iq3xxs_lds() -> Result<(), String> {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    let m = 1usize;
+    let n = 4096usize;
+    let mut sseed: u64 = 0x7E57;
+    let mut nxt = move || {
+        sseed ^= sseed << 13;
+        sseed ^= sseed >> 17;
+        sseed ^= sseed << 5;
+        sseed
+    };
+    let vals: Vec<f32> = (0..n * K).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+    let packed = grim_quant::quant_iq3xxs(&vals).map_err(|e| format!("quant: {e}"))?;
+    let w_st = MemoryOps::from_cpu_bytes(
+        &dev,
+        &packed,
+        &Shape::new(vec![n, K]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ3XXS),
+        },
+    )
+    .map_err(|e| format!("w h2d: {e}"))?;
+    let a: Vec<f32> = (0..K).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let a_st = MemoryOps::from_cpu_bytes(
+        &dev,
+        &f32_bytes(&a),
+        &Shape::new(vec![m * K]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("a h2d: {e}"))?;
+    let out = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![m * n]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("out alloc: {e}"))?;
+    let a_r = as_rocm(a_st.as_ref()).unwrap();
+    let w_r = as_rocm(w_st.as_ref()).unwrap();
+    let o_r = as_rocm(out.as_ref()).unwrap();
+    for _ in 0..3 {
+        dev.launch_fused_dequant_gemm_iq3xxs_lds_for_ab(a_r, w_r, o_r, m, n, K)
+            .map_err(|e| format!("launch: {e}"))?;
+    }
+    for _ in 0..5 {
+        dev.launch_fused_dequant_gemm_iq3xxs_lds_for_ab(a_r, w_r, o_r, m, n, K)
+            .map_err(|e| format!("launch: {e}"))?;
+    }
+    dev.synchronize();
+    println!("metrix target: 8 iq3xxs LDS launches done");
+    Ok(())
+}
