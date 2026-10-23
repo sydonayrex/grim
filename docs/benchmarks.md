@@ -1119,3 +1119,83 @@ window 28.104 s, p50 356.0 ms, p90 362.1, **EXCESS 2.389 s = 8.5%**
 356.0 — short-run inflation shrinks to ~3% at 72 tokens. Output coherent;
 decode-graph replay served every step. **Standing rule: report steady p50
 with EXCESS separated; a ms/token from a <32-token window is not comparable.**
+
+## Tiered lever implementation: res0/res9/res10 adoption round (2026-10-22)
+
+Commits 8e5de37e, 6ce1a56d, 189e047d, 8c471de6, and the two that follow.
+All gates byte-identity through launchers on GPU 1 unless stated.
+
+### SHIPPED
+
+**IQ codebook-cache LDS variants (T1-1, 8e5de37e)** — VQ-LLM/SPHQuant lever.
+Tables staged in `__shared__` once per block (cooperative, block-size-agnostic
+strided preload); math and order unchanged, so the pair is byte-identical.
+iq3xxs **1.81x** n=4096 (91.3 GB/s) / 1.15x n=17408 → DEFAULT
+(`GRIM_IQ_LDS=0` escape). iq2s **2.04x** / 1.11x → DEFAULT. iq3s 1.18x but
+**0.78x** at n=17408 (preload+syncthreads beat by L2 amortization at large N)
+→ stays stock, recorded. Two lessons banked: LDS byte-array rows (`[512][4]`)
+measured 0.77x — rows must be word-packed with in-register byte extraction;
+LDS byte reads are slow.
+
+**Q4_K DMMV num-rows variant (T1-4, 8c471de6)** — zolotukhin's
+chunked-prefill lever. One workgroup = 2 columns x ALL M rows (M<=8);
+weights decoded once instead of M times. Byte-identical to M single-row
+launches at M=1/2/4/8. A/B: **1.20x (M=2), 1.22x (M=4), 1.32x (M=8)**
+n=4096; 1.22x n=17408 M=8. Modest vs the 8x read saving because the
+single-row path was already partially cache-resident. Probe launchers only
+(`launch_dot4_q4k_q81_gemv_dmmv_for_ab`); needs a chunked-prefill caller to
+ship.
+
+### MEASURED — DECISION POINTS
+
+**INT8 WMMA prefill (T1-3, 6ce1a56d)** — rocwmma int8 on gfx12 REJECTS
+int8 x uint8 (SOA_INT layouts differ), both operands signed; unsigned weight
+codes map via (code-8) + the -8*sum(a) two-dot correction. i32 gate
+BIT-IDENTICAL at 3 shapes. Naive 16x32 tile: 1.9-8.3 TFLOP/s (B-re-read
+bound); 4-M-tile B-reuse: **12.4 TFLOP/s ceiling** — 10x under grim's
+measured f16 prefill. The 2x nameplate I8 rate does not materialize either:
+**measured rho (T3-9) = f16 46.9 / I8 63.7 TFLOP/s = 1.36x, not 2x**.
+The lever stays closed unless the big-tile skeleton (LDS staging, double
+buffering) is ported AND the measured 1.36x rate justifies it — it does not
+today.
+
+**Sparsity opportunity (T1-2, 189e047d)** — GRIM_SPARSE_PROBE on the 9B's
+real decode activations: dead 32-wide k-groups (tau x global-max):
+**70.1% at tau=0.10**, 37.2% at 0.05, 10.5% at 0.02 (k=4096 projections
+75%/38.5%/7.5%; k=12288 gate/up 59.2%/34.1%/17.5%). The tau=0.1 number says
+up to ~3x decode from weight-byte skipping is in play if accuracy holds —
+the only lever that beats the bandwidth wall. Next: SpQt-style zigzag layout
++ collector + skip kernels, gated on oracle closeness + PPL (not
+byte-identity), calibrated against an eval harness.
+
+### MEASURED — LEVERS SPENT OR CLOSED
+
+**Block-size sweep (T2-6)** — the IQ grouped/LDS kernels are block-size
+agnostic; 64/128/256/512/1024 swept with byte-identity at every size:
+**256 wins or ties everywhere** (512/1024 up to 1.6x worse). grim's
+BLOCK_SIZE=256 default stays; this lever is spent.
+
+**LDS-built LUT for IQ3XXS (T3-8) — closed analytically.** trapetum's
+additive-VQ LUT needs value-level reuse: dot(a, s⊙grid[c]) with PER-ELEMENT
+signs cannot be reused across columns (the sign vector is per-column
+weight data), so the LUT build is not amortized at M=1. Post-T1-1 the gap
+it targeted is also narrowed (46.5→91 GB/s).
+
+### BLOCKED (tools exist upstream, not on this box)
+
+- **Xtrace (T2-5)**: the paper's tool (g-watch) is not installed;
+  /usr/sbin/xtrace is the X11 protocol tracer, unrelated. Retry path: build
+  from the paper's repo, then splice-trace one dot4/_grouped GEMV.
+- **Kerncap (T2-7)**: AMDResearch/intellikit not installed. Retry path:
+  clone + build, capture one real IQ dispatch → standalone reproducer.
+- **Cache-topology microbench (T3-9 second half)**: no counter access on
+  this stack (rocprofv3 --pmc multi-pass impractical, rocprof v1
+  unsupported); MT4G's methodology requires porting its suite to RDNA4.
+
+### Standing end-to-end status
+
+Decode-relevant shipped this round: IQ3XXS 46.5→91.3 GB/s and IQ2_S
+37.4→81.5 GB/s decode legs (byte-identical). The 9B's Q4_K_M mix carries no
+IQ3XXS/IQ2S tensors, so the end-to-end p50 (356.0 ms, 72-token protocol) is
+unchanged by design; the wins land on IQ-format checkpoints (Xing4.0-class,
+Swift-1.5 27B-class).
