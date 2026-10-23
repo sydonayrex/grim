@@ -57,4 +57,33 @@ extern "C" __global__ void grim_rho_wmma_f16(float* out, int iters) {
     for (int e = 0; e < c0.num_elements; ++e) s += c0.x[e] + c1.x[e] + c2.x[e] + c3.x[e];
     if (lane == 0 && wave == (blockIdx.x & 1023)) out[wave & 4095] = s;
 }
+
+// res0-T3-9: the INT8 twin — RDNA4's I8 WMMA rate is claimed 2x the FP16
+// rate (2048 vs 1024 FLOP/clk/CU, GPUOpen matrix-cores table); this measures
+// it. Same skeleton, int8 fragments, i32 accumulators (8192 I8 ops per
+// mma_sync, same count as the f16 kernel's FLOPs).
+extern "C" __global__ void grim_rho_wmma_i8(float* out, int iters) {
+    using namespace rocwmma;
+    const int wave = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    fragment<matrix_a, 16, 16, 16, int8_t, row_major> ma;
+    fragment<matrix_b, 16, 16, 16, int8_t, col_major> mb;
+    fragment<accumulator, 16, 16, 16, int32_t> c0, c1, c2, c3;
+    fill_fragment(c0, 0); fill_fragment(c1, 0);
+    fill_fragment(c2, 0); fill_fragment(c3, 0);
+    __shared__ int8_t buf[256];
+    const int lane = threadIdx.x & 31;
+    if (threadIdx.x < 256) buf[threadIdx.x] = (int8_t)(threadIdx.x % 7);
+    __syncthreads();
+    load_matrix_sync(ma, buf, 16);
+    load_matrix_sync(mb, buf, 16);
+    for (int i = 0; i < iters; i += 4) {
+        mma_sync(c0, ma, mb, c0);
+        mma_sync(c1, ma, mb, c1);
+        mma_sync(c2, ma, mb, c2);
+        mma_sync(c3, ma, mb, c3);
+    }
+    int s = 0;
+    for (int e = 0; e < c0.num_elements; ++e) s += c0.x[e] + c1.x[e] + c2.x[e] + c3.x[e];
+    if (lane == 0 && wave == (blockIdx.x & 1023)) out[wave & 4095] = (float)s;
+}
 "#;

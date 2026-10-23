@@ -4249,5 +4249,12 @@ pub fn rho_microbench_for_test(dev: &RocmDevice, iters: i32) -> Result<(f64, f64
     let waves = threads / 32;
     let tc_tflops = (waves * (itw as u64 / 4) * 4 * 8192) as f64 / t / 1e12;
 
+    // res0-T3-9: the measured I8 WMMA rate (same op count per mma_sync).
+    let _ = run("grim_rho_wmma_i8", 100);
+    let t8 = run("grim_rho_wmma_i8", itw);
+    let tc8_tflops = (waves * (itw as u64 / 4) * 4 * 8192) as f64 / t8 / 1e12;
+    let _ = tc8_tflops;
+    eprintln!("[rho] gfx I8 WMMA: {tc8_tflops:.1} TFLOP/s (f16 {tc_tflops:.1})");
+
     Ok((cc_tflops, tc_tflops))
 }
