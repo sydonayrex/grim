@@ -1184,10 +1184,21 @@ it targeted is also narrowed (46.5→91 GB/s).
 ### BLOCKED (tools exist upstream, not on this box)
 
 - **Xtrace (T2-5)**: the paper's tool (g-watch) is not installed;
-  /usr/sbin/xtrace is the X11 protocol tracer, unrelated. Retry path: build
-  from the paper's repo, then splice-trace one dot4/_grouped GEMV.
-- **Kerncap (T2-7)**: AMDResearch/intellikit not installed. Retry path:
-  clone + build, capture one real IQ dispatch → standalone reproducer.
+  /usr/sbin/xtrace is the X11 protocol tracer, unrelated (and X11 is
+  deprecated for Wayland anyway). NOT NEEDED today: rocprofv3 kernel-trace
+  already delivers per-launch us/VGPR/scratch, the rho microbench gives the
+  measured roofline, and the intra-kernel stall gap only matters when
+  hand-tuning one kernel body.
+- **Kerncap (T2-7)**: AMDResearch/intellikit not installed as a tool — but
+  the capability exists locally: `old/repo/Hyperloom-main/` vendors AMD's
+  Hyperloom incl. **kernelforge** (agentic kernel-optimization loop:
+  kernel_backends incl. HIP, roofline_ceiling, gemm_tune, campaign
+  evaluation; intellikit documented as its transitive dep). Caveats: Python
+  + agent-SDK driven (claude/codex CLI subprocess), validated on
+  MI300X/MI355X (CDNA), targets vLLM/SGLang workloads. grim's cheaper
+  equivalent: the kernels are JIT'd from Rust strings, so a grim-side
+  `--export-kernel-probe <name>` (kernel name + args + source -> standalone
+  hiprtc harness) is an afternoon and needs no Python toolchain.
 - **Cache-topology microbench (T3-9 second half)**: no counter access on
   this stack (rocprofv3 --pmc multi-pass impractical, rocprof v1
   unsupported); MT4G's methodology requires porting its suite to RDNA4.
