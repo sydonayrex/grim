@@ -1026,3 +1026,20 @@ GB/s** against the K-quants' 78-100.
   RSR++). Experiment (b) bounds this: the **tensor core cannot serve the
   IQ family at all** (its 4-bit codes are table indices, not numbers, and
   gfx1200 exposes no int8 WMMA), so the IQ path's lever is the lookup.
+
+## The IQ4_XS decode census: the 17.2 GB/s premise is refuted (2026-10-22, PLAN-iq-family-decode T1)
+
+`iq4xs_decode_kernel_census` (n=4096, k=5120, m=1, 11.14 MB packed, GPU 1, rocprofv3 `--kernel-trace`):
+
+| kernel | grid | VGPR | scratch | n | µs/launch |
+|---|---|---|---|---|---|
+| `grim_fused_dequant_gemm_iq4xs_grouped` | 4096 | 80 | 0 | 23 | **102.7** |
+| `grim_quantize_q8_1` (activation pre-quant) | 40960 | 16 | 0 | 23 | 3.1 |
+
+Host-timed: **107.2 µs/launch = 103.9 GB/s effective**. The decode leg takes the
+`_grouped` (D2-2 group-hoisted) arm — no u4-lane W4A4 route, no dot4 leg exists
+for IQ4_XS, no scratch spill. 103.9 GB/s is ABOVE the stock Q4_K (81.2) and Q6_K
+(99.9) dot4 levels: **the "IQ family 17.2 GB/s" figure described the pre-group-hoist
+fused kernel and no longer describes the decode leg.** The warp-per-column-group
+rewrite (T2) proceeds as an A/B only — it must beat 103.9 GB/s by >1.15× to ship
+as a default.
