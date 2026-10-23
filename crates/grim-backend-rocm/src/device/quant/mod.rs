@@ -514,39 +514,56 @@ impl QuantOps for RocmDevice {
                     Ok("0" | "false" | "off")
                 );
                 if q6k_dot4_ok
-                    && crate::device::quant::kquant_dot4_ok_for(n)
                     && (is_rdna2 || is_rdna34)
                     && m == 1
                     && !dot_disabled
                     && k % 256 == 0
                 {
-                    let q81_bytes = (k / 32) * 36 * m;
-                    let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
-                    let need_alloc = match buf_guard.as_ref() {
-                        Some(s) => s.bytes < q81_bytes,
-                        None => true,
-                    };
-                    if need_alloc {
-                        *buf_guard = Some(RocmStorage::alloc_gpu(
-                            &shape,
-                            DType {
-                                arith: ArithType::U8,
-                                storage: DTypeStorage::Native,
-                            },
-                            &self.allocator,
-                            self.ordinal,
-                        )?);
-                    }
-                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
-                    if a_prequant {
-                        drop(buf_guard);
-                        self.launch_dot4_q6k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if crate::device::quant::kquant_dot4_ok_for(n) {
+                        // Body tensor: dot4 with Q8_1 activations (fast, Q8_1 act
+                        // error is acceptable inside the body — diluted over 64 layers).
+                        let q81_bytes = (k / 32) * 36 * m;
+                        let shape = Shape::new(vec![q81_bytes]);
+                        let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                        let need_alloc = match buf_guard.as_ref() {
+                            Some(s) => s.bytes < q81_bytes,
+                            None => true,
+                        };
+                        if need_alloc {
+                            *buf_guard = Some(RocmStorage::alloc_gpu(
+                                &shape,
+                                DType {
+                                    arith: ArithType::U8,
+                                    storage: DTypeStorage::Native,
+                                },
+                                &self.allocator,
+                                self.ordinal,
+                            )?);
+                        }
+                        let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                        if a_prequant {
+                            drop(buf_guard);
+                            self.launch_dot4_q6k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                        } else {
+                            let act_q81 = buf_guard.as_ref().unwrap();
+                            let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                            fence_act_quant(self, q_stream);
+                            self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                        }
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
-                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
-                        fence_act_quant(self, q_stream);
-                        self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                        // LM HEAD (n >= 65536): dot4 with f32 activations (fast,
+                        // exact activations — head output IS the token, so no
+                        // Q8_1 quantization error allowed). Falls back to the
+                        // exact fused-dequant leg (~4.9 GB/s) when dot4 can't
+                        // run (m > 1, k % 256 != 0, etc.).
+                        self.launch_dot4_q6k_f32act_gemv_for_ab(
+                            a_storage,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
+                        )?;
                     }
                 } else if is_rdna34 && m >= 64 && n % 128 == 0 && k % 256 == 0 {
                     self.launch_wmma_big64x128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;

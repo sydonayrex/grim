@@ -2953,8 +2953,23 @@ impl RocmDevice {
                         if !matches!(
                             std::env::var("GRIM_Q6K_DOT4").as_deref(),
                             Ok("0" | "false" | "off")
-                        ) && crate::device::quant::kquant_dot4_ok_for(n) {
-                            self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                        ) {
+                            if crate::device::quant::kquant_dot4_ok_for(n) {
+                                // Body tensor: dot4 with Q8_1 activations (fast).
+                                self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                            } else {
+                                // LM HEAD: dot4 with f32 activations (fast,
+                                // exact activations). Falls back to exact
+                                // fused-dequant when dot4 can't run.
+                                self.launch_dot4_q6k_f32act_gemv_for_ab(
+                                    act_q81,
+                                    w,
+                                    out,
+                                    m,
+                                    n,
+                                    k,
+                                )?
+                            }
                         } else {
                             self.launch_fused_dequant_gemm_q6k(a_s, w, out, m, n, k)?
                         }

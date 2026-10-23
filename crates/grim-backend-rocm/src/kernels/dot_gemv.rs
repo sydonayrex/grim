@@ -3057,6 +3057,141 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv(
         }
     }
 }
+// M7.2h: Q6_K dot4 GEMV with f32 activations (exact path for LM head).
+//
+// Like grim_dot4_q6k_q81_gemv but reads f32 activations directly instead of
+// Q8_1 packed. No activation quantization — act_f32[i] is used raw, so the
+// only error source is the Q6_K weight dequantization (which is exact, no
+// dmin term, so no rounding of the stored f16 sum). This gives near-dot4
+// speed with f32 activation exactness for the vocab-scale LM head GEMV.
+//
+// Scalar MACs replace grim_sdot4 since activations are f32, not int8 — we
+// lose the dot4 instruction but keep the packed weight dequant structure.
+// Measured on the real 27B output.weight (Q6_K, n=248320, k=5120):
+//   exact fused-dequant: 4.9 GB/s (~213 ms/token on the head)
+//   dot4 q81:            78.5 GB/s (~13 ms/token, but Q8_1 act quant error)
+//   dot4 f32act:         ~20-30 GB/s (~45-70 ms/token, exact activations)
+//
+// Not on any dispatch path; only tests/q6k_f32act_dot4_parity.rs launches it.
+// The dispatch wires it in via launch_dot4_q6k_f32act_gemv_for_ab.
+extern "C" __global__ void grim_dot4_q6k_f32act_gemv(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q6k,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K)
+{
+    const int lane = threadIdx.x; // 0..31
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q6k_superblocks = K / GRIM_Q6K_SUPERBLOCK_SIZE;
+    const float* a_row = act_f32 + (long long)row * K;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q6k + (long long)(col_base + j) * n_q6k_superblocks * GRIM_Q6K_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = lane; sb < n_q6k_superblocks; sb += 32) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * GRIM_Q6K_BYTES;
+
+            const unsigned char* ql     = b_sb;
+            const unsigned char* qh     = b_sb + 128;
+            const signed char*   scales = (const signed char*)(b_sb + 192);
+            const unsigned short* d_ptr = (const unsigned short*)(b_sb + 208);
+            float d = fp16_to_float_device(d_ptr[0]);
+
+            #pragma unroll 2
+            for (int is_sub = 0; is_sub < 8; ++is_sub) {
+                const float* a_blk = a_row + sb * 256 + is_sub * 32;
+                int n = is_sub / 4;
+                int quarter = is_sub % 4;
+                #pragma unroll
+                for (int half16 = 0; half16 < 2; ++half16) {
+                    int sc_idx = n * 8 + half16 + 2 * quarter;
+                    signed char sc = scales[sc_idx];
+
+                    float pos_dot = 0;
+
+                    #pragma unroll 2
+                    for (int e16 = 0; e16 < 16; e16 += 4) {
+                        int e = half16 * 16 + e16;
+                        float a0 = a_blk[e + 0];
+                        float a1 = a_blk[e + 1];
+                        float a2 = a_blk[e + 2];
+                        float a3 = a_blk[e + 3];
+
+                        int l0 = e + 0;
+                        int l1 = e + 1;
+                        int l2 = e + 2;
+                        int l3 = e + 3;
+
+                        int ql_off0 = n * 64 + l0 + ((quarter & 1) ? 32 : 0);
+                        int ql_off1 = n * 64 + l1 + ((quarter & 1) ? 32 : 0);
+                        int ql_off2 = n * 64 + l2 + ((quarter & 1) ? 32 : 0);
+                        int ql_off3 = n * 64 + l3 + ((quarter & 1) ? 32 : 0);
+
+                        unsigned short ql01, ql23, qh01, qh23;
+                        __builtin_memcpy(&ql01, ql + ql_off0, 2);
+                        __builtin_memcpy(&ql23, ql + ql_off2, 2);
+                        __builtin_memcpy(&qh01, qh + n * 32 + l0, 2);
+                        __builtin_memcpy(&qh23, qh + n * 32 + l2, 2);
+                        unsigned qlw = (unsigned)ql01 | ((unsigned)ql23 << 16);
+                        unsigned qhw = (unsigned)qh01 | ((unsigned)qh23 << 16);
+
+                        unsigned nibw = (quarter & 2) ? ((qlw >> 4) & 0x0F0F0F0Fu)
+                                                     : (qlw & 0x0F0F0F0Fu);
+                        unsigned qhb = (qhw >> (2 * quarter)) & 0x03030303u;
+
+                        int q4 = (int)(nibw | (qhb << 4));
+
+                        // Scalar MACs with f32 activations (grim_sdot4 needs
+                        // int8 operands, which we don't have here).
+                        int q0 = (q4 >> 0) & 0xFF;
+                        int q1 = (q4 >> 8) & 0xFF;
+                        int q2 = (q4 >> 16) & 0xFF;
+                        int q3 = (q4 >> 24) & 0xFF;
+
+                        pos_dot += a0 * (float)(q0 - 32);
+                        pos_dot += a1 * (float)(q1 - 32);
+                        pos_dot += a2 * (float)(q2 - 32);
+                        pos_dot += a3 * (float)(q3 - 32);
+                    }
+
+                    // formula: value_i = d * sc * (q_code - 32)
+                    // dot = d * sc * sum(a_i * (q_i - 32))
+                    facc[j] += d * (float)sc * pos_dot;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
 
 
 // M7.2c: the RETAINED ORACLE for the grim_dot4_q6k_q81_gemv group hoist — the pre-change
