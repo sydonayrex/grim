@@ -1217,3 +1217,20 @@ Decode-relevant shipped this round: IQ3XXS 46.5→91.3 GB/s and IQ2_S
 IQ3XXS/IQ2S tensors, so the end-to-end p50 (356.0 ms, 72-token protocol) is
 unchanged by design; the wins land on IQ-format checkpoints (Xing4.0-class,
 Swift-1.5 27B-class).
+
+### New AMD skills review (2026-10-22, ~/.agents/skills/)
+
+| skill | what it is | grim verdict |
+|---|---|---|
+| rocprofiler-pc-sampling | rocprofv3 PC sampling (stochastic/host_trap) + a 565-line stall-reason analyzer | **RIGHT TOOL, HARDWARE-BLOCKED**: both methods rejected on gfx1200/gfx1201 ("not supported on any of the agents", ROCm 7.2.4) — attempted with the recorded configurations. Retry on a ROCm/driver rev that lists gfx12 configs. |
+| rocm-doctor | ROCm/HIP/PyTorch/llama.cpp breakage diagnosis | Not needed (stack healthy); keep for future driver events. |
+| magpie-kernel-evaluator | Benchmarks vLLM/SGLang/Atom, TraceLens reports, kernel eval loop | Framework-oriented (Magpie targets vLLM/SGLang); grim is a Rust runtime — not applicable directly. |
+| hyperloom-workload-optimizer | The Hyperloom agentic serving optimizer | Instinct/CDNA + vLLM/SGLang — not applicable to grim on RDNA. |
+| tracelens-analysis-orchestrator | PyTorch profiler trace analysis | PyTorch-trace-oriented; grim has no torch traces. Not applicable. |
+| quark-torch-llm-ptq / quark-install | AMD Quark PTQ for PyTorch/HF models | Relevant ONLY if grim needs custom-quantized checkpoints produced by Quark (e.g. a W4A8 or rotated format grim later serves); grim serves GGUF/.grim today. File for the format-expansion day. |
+| lemonade-router-builder / local-ai-* / serving-llms-on-epyc / serving-llms-on-instinct | Lemonade routing, local AI app integration, EPYC/Instinct serving deployment | Deployment/serving skills; orthogonal to grim kernel work. |
+
+Net: of the twelve, exactly one (rocprofiler-pc-sampling) targets grim's open
+measurement gap, and the silicon refuses it today. The counters question now
+hinges on card 0: Metrix's metric DB labels its cache/LDS metrics gfx1201 —
+running them means using the RESERVED card, which needs explicit approval.
