@@ -107,6 +107,11 @@ fn scheme(name: &str) -> (usize, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>, fn(
         // the SAME bytes; values go through kvalues_iq4nl (NOT linear in the
         // code), so the dot4 kernel packs kvalues[code] into the i8 operand.
         "iq4xs" => (136, grim_quant::quant_iq4xs, grim_quant::dequant_iq4xs),
+        // Q3_K: 110 bytes per 256 — hmask[32] (sign bits, stays per-byte),
+        // qs[64] (one 2-bit magnitude per BYTE, so a 4-weight group is four
+        // consecutive bytes: one 32-bit load + & 0x03030303), scales[12],
+        // f16 d @108.
+        "q3k" => (110, grim_quant::quant_q3k, grim_quant::dequant_q3k),
         other => panic!("unknown scheme {other}"),
     }
 }
@@ -210,6 +215,14 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
             dev.launch_dot4_iq4xs_q81_gemv_for_ab(a_r, b_r, o_new, m, n, k)
                 .map_err(|e| format!("launch new: {e}"))?;
         }
+        "q3k" => {
+            // "ref" = the stock per-byte magnitude loads; "new" = the
+            // word-wide-mask default through the launcher's OnceLock.
+            dev.launch_dot4_q3k_q81_gemv_stock_for_ab(a_r, b_r, o_ref, m, n, k)
+                .map_err(|e| format!("launch ref: {e}"))?;
+            dev.launch_dot4_q3k_q81_gemv_for_ab(a_r, b_r, o_new, m, n, k)
+                .map_err(|e| format!("launch new: {e}"))?;
+        }
         "q5k" => {
             dev.launch_dot4_q5k_q81_gemv_ref_for_ab(a_r, b_r, o_ref, m, n, k)
                 .map_err(|e| format!("launch ref: {e}"))?;
@@ -306,7 +319,7 @@ fn kquant_grouped_matches_retained_oracle() -> Result<(), String> {
         (4096, 68, 1),
         (4096, 68, 8),
     ] {
-        for s in ["q4k", "q5k", "q6k", "q2k", "iq4xs"] {
+        for s in ["q4k", "q5k", "q6k", "q2k", "iq4xs", "q3k"] {
             grouped_parity(s, k, n, m)?;
         }
     }
@@ -402,6 +415,10 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
             |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
+        "q3k" => (
+            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+        ),
         _ => (
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
@@ -438,7 +455,7 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
 
 #[test]
 fn kquant_grouped_speed_ab() -> Result<(), String> {
-    for s in ["q4k", "q5k", "q6k", "q2k", "iq4xs"] {
+    for s in ["q4k", "q5k", "q6k", "q2k", "iq4xs", "q3k"] {
         speed_ab(s)?;
     }
     Ok(())

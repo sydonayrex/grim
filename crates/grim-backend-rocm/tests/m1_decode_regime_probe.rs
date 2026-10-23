@@ -497,6 +497,97 @@ fn iq4xs_decode_kernel_census() {
     eprintln!("[census] IQ4XS one_launch={us:.1} us  weight_GBps={gbps:.1}");
 }
 
+/// Arm A2b — THE IQ FAMILY CENSUS (PLAN-iq-family-decode T3). The same
+/// measurement as `iq4xs_decode_kernel_census` for the table-index IQ
+/// formats the 27B's experts carry: IQ3_XXS (98 B/256), IQ3_S (110 B/256),
+/// IQ2_S (100 B/256). Times the production decode leg via
+/// `linear_decode_into` (m=1), which routes each scheme through its
+/// group-hoisted fused kernel; the rocprofv3 census names the kernel that
+/// actually ran.
+#[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1"]
+#[test]
+fn iq_family_decode_census() {
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+        std::env::set_var("GRIM_DECODE_W4A4", "0");
+        std::env::set_var("GRIM_DECODE_EXACT_GEMV", "0");
+    }
+    let Some(dev) = gpu_device() else {
+        return;
+    };
+    let n = 4096usize;
+    let alloc: Arc<RocmCachingAllocator> = dev.allocator_handle();
+    let cases: [(KQuantScheme, &str, usize, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>); 3] = [
+        (
+            KQuantScheme::IQ3XXS,
+            "iq3xxs",
+            98,
+            grim_quant::quant_iq3xxs,
+        ),
+        (KQuantScheme::IQ3S, "iq3s", 110, grim_quant::quant_iq3s),
+        (KQuantScheme::IQ2S, "iq2s", 100, grim_quant::quant_iq2s),
+    ];
+    for (scheme, name, blk, quant) in cases {
+        let mut sseed: u64 = 97;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let vals: Vec<f32> = (0..n * K)
+            .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+            .collect();
+        let packed = quant(&vals).expect(name);
+        let row_bytes = packed.len() / n;
+        if row_bytes != (K / 256) * blk {
+            eprintln!("[census] {name}: row_bytes {row_bytes} != expected {}", (K / 256) * blk);
+        }
+        eprintln!(
+            "[census] {name} n={n} k={K} row_bytes={row_bytes} weight_MB={:.2}",
+            (n * row_bytes) as f64 / 1e6
+        );
+        let w = match MemoryOps::from_cpu_bytes(
+            &dev,
+            &packed,
+            &Shape::new(vec![n, K]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(scheme),
+            },
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[census] {name}: upload failed: {e}");
+                continue;
+            }
+        };
+        let w_rocm = w
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .expect("rocm weight storage");
+        let a: Vec<f32> = (0..K).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, K]), DType::F32)
+            .expect("upload act");
+        let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
+        for _ in 0..3 {
+            dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &out)
+                .map_err(|e| format!("{name}: {e}"))
+                .expect("linear_decode_into");
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &out)
+                .expect("linear_decode_into");
+        }
+        dev.synchronize();
+        let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+        let gbps = ((n * row_bytes) as f64 / 1e9) / (us * 1e-6);
+        eprintln!("[census] {name} one_launch={us:.1} us  weight_GBps={gbps:.1}");
+    }
+}
+
 /// Arm A0c — THE LAUNCH BASELINE. The working-set fit gave a fixed
 /// per-launch cost `a` of 0-20 us, but a two-parameter fit over 6 points
 /// is not a sensitive instrument for a term that small. This measures the

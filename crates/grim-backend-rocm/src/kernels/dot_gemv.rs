@@ -2274,6 +2274,136 @@ extern "C" __global__ void grim_dot4_q3k_q81_gemv(
     }
 }
 
+// ─── Q3_K dot4 GEMV: word-wide-mask magnitude plane (res8 P5) ─────────────
+// The stock Q3_K kernel above fetches each 2-bit magnitude code with its
+// own 1-byte load. Q3_K's qs[] is ONE code per BYTE (hmask[32] | qs[64] at
+// offset 32), so the four codes of a 4-weight group are four consecutive
+// bytes: one 32-bit load plus `(w >> shift) & 0x03030303` delivers all
+// four, bit-identically, for every shift in {0,2,4,6} — the same mask and
+// the same argument as the Q2_K fast kernel. The SIGN plane (hmask) is one
+// bit spread across bytes at byte-granular positions and cannot be masked
+// word-wide; it keeps the per-byte loads. Grid mapping, accumulation order
+// and arithmetic are identical to the stock kernel. Parity:
+// tests/dot4_kquant_grouped_parity.rs (q3k row).
+extern "C" __global__ void grim_dot4_q3k_q81_gemv_fast(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q3k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q3k + (long long)(col_base + j) * n_sb * 110
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int ones4 = 0x01010101;
+
+    for (int sb = lane; sb < n_sb; sb += 32) {
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * 110;
+            const unsigned char* hmask = b_sb;
+            const unsigned char* qs    = b_sb + 32;
+            const unsigned char* scales = b_sb + 96;
+            float d = fp16_to_float_device(((const unsigned short*)b_sb)[54]); // byte 108
+
+            int sc[16];
+            {
+                unsigned aux0 = (unsigned)scales[0] | ((unsigned)scales[1] << 8)
+                              | ((unsigned)scales[2] << 16) | ((unsigned)scales[3] << 24);
+                unsigned aux1 = (unsigned)scales[4] | ((unsigned)scales[5] << 8)
+                              | ((unsigned)scales[6] << 16) | ((unsigned)scales[7] << 24);
+                unsigned tmp  = (unsigned)scales[8] | ((unsigned)scales[9] << 8)
+                              | ((unsigned)scales[10] << 16) | ((unsigned)scales[11] << 24);
+                unsigned kmask1 = 0x03030303u;
+                unsigned kmask2 = 0x0F0F0F0Fu;
+                unsigned a0 = (aux0 & kmask2) | ((tmp & kmask1) << 4);
+                unsigned a1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+                unsigned a2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                unsigned a3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                unsigned auxs[4] = { a0, a1, a2, a3 };
+                for (int t = 0; t < 4; ++t)
+                    for (int b2 = 0; b2 < 4; ++b2) {
+                        unsigned v = (auxs[t] >> (8 * b2)) & 0xFF;
+                        sc[t * 4 + b2] = (int)(v >= 128u ? (int)v - 256 : (int)v);
+                    }
+            }
+
+            unsigned char m_bit = 1;
+            int _is = 0;
+            for (int half = 0; half < 2; half++) {
+                int shift = 0;
+                for (int j4 = 0; j4 < 4; j4++) {
+                    const unsigned char* a_blk = a_sb + (half * 4 + j4) * GRIM_Q8_1_BYTES;
+                    float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                    const signed char* codes = (const signed char*)(a_blk + 4);
+
+                    for (int h2 = 0; h2 < 2; h2++) {
+                        const float dl = d * (float)(sc[_is] - 32);
+                        _is += 1;
+                        int pos = 0;
+                        int corr = 0;
+                        #pragma unroll
+                        for (int i = 0; i < 16; i += 4) {
+                            int a4;
+                            __builtin_memcpy(&a4, codes + h2 * 16 + i, 4);
+                            // ONE 32-bit load for the four 2-bit magnitudes,
+                            // then one whole-word mask, instead of four
+                            // 1-byte loads and four select/shift/steps.
+                            // Bit-identical for every shift in {0,2,4,6}
+                            // (see the note above the kernel).
+                            unsigned int w4;
+                            __builtin_memcpy(&w4, qs + half * 32 + h2 * 16 + i, 4);
+                            int q4 = (int)((w4 >> shift) & 0x03030303u);
+                            int mask4 = 0;
+                            #pragma unroll
+                            for (int e2 = 0; e2 < 4; ++e2) {
+                                int l = h2 * 16 + i + e2;
+                                mask4 |= ((hmask[l] & m_bit) != 0) ? 0 : (0xFF << (8 * e2));
+                            }
+                            pos = grim_sdot4(a4, q4, pos);
+                            corr = grim_sdot4(a4 & mask4, ones4, corr);
+                        }
+                        facc[j] += dl * d_a * ((float)pos - 4.0f * (float)corr);
+                    }
+                    shift += 2;
+                    m_bit = (unsigned char)((m_bit << 1) & 0xFF);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 extern "C" __global__ void grim_dot4_q4k_q81_gemv(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q4k,
