@@ -1043,3 +1043,79 @@ for IQ4_XS, no scratch spill. 103.9 GB/s is ABOVE the stock Q4_K (81.2) and Q6_K
 fused kernel and no longer describes the decode leg.** The warp-per-column-group
 rewrite (T2) proceeds as an A/B only — it must beat 103.9 GB/s by >1.15× to ship
 as a default.
+
+## PLAN-iq-family-decode: T2-T7 results (2026-10-22, commits 41bdd6b5, 1b4f57d9)
+
+### T2 - the dot4 mapping does NOT transfer to IQ4_XS (measured-negative)
+
+A q8_1-activation dot4 pair for IQ4_XS (`grim_dot4_iq4xs_q81_gemv` stock +
+`_fast` word-nibble) was built and gated: **15/15 shapes byte-identical
+stock-vs-fast through launchers, oracle rel err ~2e-6 vs
+`dequant_iq4xs`** (the first run caught a real defect: group `ib`'s 16 code
+bytes are `qs+ib*16`, not `qs[0..15]`). Speed at n=17408/k=5120/m=1:
+
+| arm | time | GB/s |
+|---|---|---|
+| dot4 fast (word nibble) | 3.037 ms | 15.6 |
+| dot4 stock (byte nibble) | 3.045 ms | 15.5 |
+| production `_grouped` f32-act | 0.688 ms | **68.8** |
+
+0.14x/0.23x vs `_grouped` at n=4096/17408. The codes are kvalues_iq4nl
+TABLE INDICES, so the integer dot pays a 16-entry LDS gather per 4 weights
+(1.00x fast-vs-stock: the unpack never mattered — the gather dominates).
+**`_grouped` stays the dispatch default**; the dot4 pair lives on as
+A/B-only launchers. This is exactly what experiment (b) predicted: IQ
+cannot ride the tensor core or the integer dot.
+
+### T3 - IQ2/IQ3 census: headroom is real, but the lever is the grid-table path
+
+`iq_family_decode_census` (n=4096, k=5120, m=1, GPU 1, rocprofv3):
+
+| format | kernel | VGPR | scratch | µs | GB/s (packed) |
+|---|---|---|---|---|---|
+| IQ3_XXS | `_grouped` | 48 | 0 | 158.7 | 46.5 |
+| IQ3_S | `_grouped` | 48 | 0 | 175.5 | 47.6 |
+| IQ2_S | `_grouped` | 64 | 0 | 165.6 | 37.4 |
+
+2-3x off the K-quant level — but dot4 is **mathematically inapplicable**:
+2-3-bit codes index 32-byte grid vectors, not per-weight scalars, so there
+is no i8x4 operand to build. The measured traffic structure: each 32-weight
+group reads a 32-byte grid-table row from a 1-8 KB `static const` table
+(L2-resident) — real traffic is ~2.6x the packed bytes for IQ3_XXS. The
+next lever here is restructuring the grid-table read pattern, not the
+thread mapping.
+
+### T4 - Psumbook closed without a build (two independent refutations)
+
+1. Arithmetic: at M=1 a codebook LUT's build cost EQUALS the direct cost —
+   each 256-entry grid is consumed ~once per super-block position, so there
+   is no amortization. CodeGEMM's 0.9% overhead claim is a large-M result.
+2. Measurement: the dot4 pair above IS the "gather instead of dequant" arm
+   on this hardware, and it lost 4.4-7.5x. The ETH one-stage argument holds:
+   the `_grouped` kernels already are the one-stage dequant+accumulate.
+
+### T5 - Q3_K word-wide magnitude plane: byte-identical, NEUTRAL
+
+`grim_dot4_q3k_q81_gemv_fast`: one 32-bit load + `& 0x03030303` replaces
+four 1-byte loads per magnitude group; sign plane stays per-byte. 15/15
+shapes byte-identical, oracle ~2e-6. **70.2 vs 69.8 GB/s = 1.01x** — the
+sign plane and the 12-byte scale shuffle dominate, as predicted. Default
+flipped to fast (never worse); `GRIM_Q3K_DOT4_FAST=0` escape.
+
+### T6 - L1/L2 counter split: BLOCKED, recorded analytically
+
+rocprofv3 `--pmc` replays the whole test once per counter pass; on this
+census test it exceeded 12 minutes and was killed (rocprof v1 unsupported
+on this GPU). Retry path: a single-launch microtest per kernel, not the
+census. Analytical split in place of counters: K-quant dot4 waves are
+L1-resident by footprint (6.6-16.4 KB < 32 KB/CU); the IQ grids are
+L2-resident by table size (1-8 KB).
+
+### T7 - the long-window protocol, validated
+
+9B (Q4_K_M, GPU 1, ctx 4096, --raw, 72 generated tokens, GRIM_PHASE_TRACE):
+window 28.104 s, p50 356.0 ms, p90 362.1, **EXCESS 2.389 s = 8.5%**
+(11.3% at 32 tokens, 40.9% at 8), reported avg 366.39 ms/token vs steady
+356.0 — short-run inflation shrinks to ~3% at 72 tokens. Output coherent;
+decode-graph replay served every step. **Standing rule: report steady p50
+with EXCESS separated; a ms/token from a <32-token window is not comparable.**
