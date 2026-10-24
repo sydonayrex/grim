@@ -687,6 +687,10 @@ impl CoreTensorOps for RocmDevice {
             KQuantScheme::Q4K => (256, 144, "grim_embedding_q4k"),
             KQuantScheme::IQ2S => (256, 82, "grim_embedding_iq2s_gather"),
             KQuantScheme::IQ3S => (256, 110, "grim_embedding_iq3s_gather"),
+            // Q6_K: Gemma 4's per-layer embedding table. 2.3 GB packed against
+            // 11.3 GB inflated to f32; the inflated form does not fit beside
+            // the model on a 16 GB card.
+            KQuantScheme::Q6K => (256, 210, "grim_embedding_q6k_gather"),
             other => {
                 return Err(Error::Unimplemented(format!(
                     "embedding_packed: no on-device gather for {other:?}"

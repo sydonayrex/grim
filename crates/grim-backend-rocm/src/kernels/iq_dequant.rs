@@ -7,55 +7,76 @@ extern "C" {
 
     // ─── IQ dequant helpers (mirrors iq_gemm.rs device functions) ──
 
+    // block_iq2_xxs: 66 bytes / 256 weights. d(f16) @0, qs[64] @2 — no signs
+    // field; the top 4 bits of each group's aux32 carry the sub-scale and the
+    // low 28 bits carry four 7-bit sign patterns. Was a stub with a fabricated
+    // `(idx + i%8) % 4 - 1.5` grid and a `blk + 34` signs field this layout
+    // does not have. Mirrors `grim_quant::dequant_iq2xxs` and charon.rs.
     __device__ inline float dequant_iq2xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 34;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * val * sign_val;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        const unsigned char* aux8 = qs + 8 * ib32;
+        unsigned int aux32 = (unsigned int)aux8[4]
+                           | ((unsigned int)aux8[5] << 8)
+                           | ((unsigned int)aux8[6] << 16)
+                           | ((unsigned int)aux8[7] << 24);
+        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.25f;
+        unsigned long long gv = IQ2XXS_GRID[aux8[l]];
+        unsigned int signs = KSIGNS_IQ2XS[(aux32 >> (7 * l)) & 127];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
+    // block_iq2_xs: 74 bytes / 256 weights. d(f16) @0, qs[64] @2, scales[8] @66
+    // — one scale byte per 32 weights, NOT a per-16 sub-scale at offset 34, and
+    // there is no `signs` field: signs ride `q_val >> 9`. Was the same stub as
+    // IQ2_XXS above. Mirrors `grim_quant::dequant_iq2xs` and charon.rs.
     __device__ inline float dequant_iq2xs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 34;
-        const unsigned char* signs = blk + 42;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        const unsigned char* scales = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned char sc_byte = scales[ib32];
+        float db = d * (0.5f + (float)((l < 2) ? (sc_byte & 0x0F) : (sc_byte >> 4))) * 0.25f;
+        int q_off = (ib32 * 4 + l) * 2;
+        unsigned int q_val = (unsigned int)qs[q_off] | ((unsigned int)qs[q_off + 1] << 8);
+        unsigned long long gv = IQ2XS_GRID[q_val & 511];
+        unsigned int signs = KSIGNS_IQ2XS[q_val >> 9];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
+
     __device__ inline float dequant_iq2s_device(const unsigned char* blk, int in_sb) {
-        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 50;
-        const unsigned char* signs = blk + 58;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        return dequant_iq2s(blk, in_sb);
     }
 
     __device__ inline float dequant_iq3xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 66;
-        int grid_idx = qs[in_sb / 8];
-        int sub_idx = in_sb % 8;
-        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
-        int sign_byte_idx = (in_sb / 8);
-        if (sign_byte_idx >= 30) sign_byte_idx = 29;
-        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * base_val * 0.25f * sign_val;
+        const unsigned char* ss = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned int aux = (unsigned int)ss[4 * ib32]
+                         | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                         | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                         | ((unsigned int)ss[4 * ib32 + 3] << 24);
+        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+        unsigned int gv = (j < 4) ? IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]]
+                                  : IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+        int jj = (j < 4) ? j : j - 4;
+        float g = (float)((gv >> (8 * jj)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
     // block_q3_S layout, mirroring grim_quant::dequant_iq3s exactly:
@@ -210,7 +231,7 @@ extern "C" {
     {
         const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + (size_t)b * 96;
+        const unsigned char* blk = packed + (size_t)b * 98;  /* IQ3_XXS: 98 B per 256 */;
         float* dst = out + (size_t)b * 256;
         const int base = threadIdx.x * 4;
         float4 v;

@@ -3100,6 +3100,7 @@ mod kq_native_integration_tests {
         )
         .expect("out2");
         {
+            let _guard = grim_backend_rocm::device::util::DeviceGuard::set(0);
             let zero = vec![0u8; hidden * 4];
             let tmp = grim_backend_rocm::RocmStorage::alloc_gpu(
                 &grim_tensor::Shape::new(vec![hidden]),
@@ -3236,6 +3237,7 @@ mod kq_native_integration_tests {
         const ITERS: usize = 50;
 
         // warmup + time the kq per-pair kernel (memset per iter: it atomicAdds)
+        let _guard = grim_backend_rocm::device::util::DeviceGuard::set(0);
         let t0 = std::time::Instant::now();
         for _ in 0..ITERS {
             unsafe {

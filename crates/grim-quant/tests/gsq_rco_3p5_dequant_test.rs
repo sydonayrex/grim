@@ -19,6 +19,28 @@ use grim_quant::{
 };
 use grim_tensor::provider::TensorProvider;
 
+/// Resolve a workspace-relative checkpoint path, or `None` if absent.
+///
+/// `cargo test` sets the CWD to the *package* root (`crates/grim-quant`), not
+/// the workspace root, so a bare `models/...` relative path never resolves and
+/// the real-checkpoint gates below silently `return` — a green that ran
+/// nothing. Try the CWD first (so a developer pointing at a scratch checkout
+/// still works), then walk up from the crate manifest to the workspace root.
+fn find_checkpoint(rel: &str) -> Option<std::path::PathBuf> {
+    let direct = std::path::PathBuf::from(rel);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for up in manifest.ancestors() {
+        let cand = up.join(rel);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 fn f32_to_f16_le(v: f32) -> [u8; 2] {
     let s = v.to_bits();
     let sign = ((s >> 16) & 0x8000) as u16;
@@ -211,11 +233,15 @@ fn short_buffer_is_rejected() {
 }
 
 #[test]
-fn all_zero_block_has_no_representable_scale_on_encode() {
+fn all_zero_block_encodes_as_flushed_zeros() {
+    // All-zero blocks carry no representable scale: the encoder now flushes them
+    // to d=0/codes=0 (a counted, non-erroring path) instead of returning Err,
+    // because released GSQ-RCO artifacts carry ~50% zero-scale blocks. See
+    // quantize_gsq_rco_3p5_block_counted for the rationale.
     let vals = vec![0.0f32; BLOCK_SIZE_GSQ_RCO_3P5];
-    let mut packed = vec![0u8; BLOCK_BYTES_GSQ_RCO_3P5];
-    let err = quantize_gsq_rco_3p5_block(&vals, &mut packed).expect_err("all-zero block");
-    assert!(format!("{err}").contains("all zeros"));
+    let mut packed = vec![1u8; BLOCK_BYTES_GSQ_RCO_3P5];
+    quantize_gsq_rco_3p5_block(&vals, &mut packed).expect("all-zero block encodes");
+    assert!(packed.iter().all(|&b| b == 0), "flushed block must be all zeros");
 }
 
 /// Hand-constructed golden vector in the style of `golden_dequant.rs`: the packed
@@ -265,24 +291,45 @@ fn golden_hand_built_block_matches_spec_derived_values() {
 fn real_checkpoint_blocks_decode_to_finite_sane_weights() {
     use grim_format::gguf::read_gguf;
     use std::io::BufReader;
-    use std::path::Path;
 
-    let path = "models/QWen38-Flash/Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf";
-    if !Path::new(path).exists() {
-        eprintln!("skipping: {path} not present");
-        return;
-    }
+    let Some(path) = find_checkpoint("models/QWen38-Flash/Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf")
+    else {
+        panic!("checkpoint missing: models/QWen38-Flash/Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf \
+                 — this gate must not silently skip; it is the only host-side \
+                 check that a real GSQ-RCO artifact decodes sanely");
+    };
+    let path = path.to_string_lossy().to_string();
 
-    let f = std::fs::File::open(path).expect("open checkpoint");
+    let f = std::fs::File::open(&path).expect("open checkpoint");
     let gguf = read_gguf(BufReader::new(f)).expect("parse gguf header");
 
+    // This checkpoint is tag 42 (`Q2_0`), NOT tag 81 (`GsqRco3p5`): see
+    // `KQuantScheme::Q2_0` in grim-tensor/src/dtype.rs — "The Qwen3.8-Flash-Next
+    // GSQ-RCO-3.5bit release writes tag 42", and the build manifest's
+    // `runtime_requirements` lists `Q2_0`. Same 64-weight/18-byte geometry, but
+    // the codebook is shifted by one level (`y = (q-1)*d` vs GSQ-RCO's
+    // `y = (q-2)*d`), so it must decode with `dequant_q2_0`. The original
+    // selector also demanded a `ffn_down_exps` tensor name from a MoE expert
+    // layout this checkpoint does not use, so it matched nothing and skipped.
+    // Every tag-42 tensor in this checkpoint is a 3-D MoE expert tensor
+    // (`blk.N.ffn_down_exps.weight`). The block stream is a flat, contiguous
+    // byte sequence whatever the rank, so slicing the first NB blocks off the
+    // front is layout-independent and needs no reshape.
     let t = gguf
         .tensors
         .iter()
-        .find(|t| t.dtype == GgufDType::GsqRco3p5 && t.name.ends_with("ffn_down_exps.weight"))
-        .expect("a tag-42 ffn_down_exps tensor must exist");
+        .find(|t| t.dtype == GgufDType::Q2_0 && t.name.starts_with("blk."))
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = gguf.tensors.iter().map(|t| t.name.as_str()).take(5).collect();
+            panic!(
+                "no Q2_0 (tag 42) tensor under blk.* in the Flash checkpoint; \
+                 first tensors: {names:?}"
+            )
+        });
 
-    let nblocks = (t.size_bytes as usize) / BLOCK_BYTES_GSQ_RCO_3P5;
+    const Q2_0_BLOCK_BYTES: usize = 18;
+    const Q2_0_BLOCK_SIZE: usize = 64;
+    let nblocks = (t.size_bytes as usize) / Q2_0_BLOCK_BYTES;
     const NB: usize = 512;
     assert!(
         nblocks >= NB,
@@ -290,18 +337,18 @@ fn real_checkpoint_blocks_decode_to_finite_sane_weights() {
     );
 
     // `get_packed` hands back the raw slice for this tensor without dequantizing.
-    let provider = grim_format::tprov::GgufProvider::open(path).expect("open provider");
+    let provider = grim_format::tprov::GgufProvider::open(&path).expect("open provider");
     let raw = provider
         .get_packed(&t.name)
         .expect("packed bytes for tag-42 tensor");
 
-    let mut all = Vec::with_capacity(NB * BLOCK_SIZE_GSQ_RCO_3P5);
+    let mut all = Vec::with_capacity(NB * Q2_0_BLOCK_SIZE);
     for b in 0..NB {
-        let s = b * BLOCK_BYTES_GSQ_RCO_3P5;
+        let s = b * Q2_0_BLOCK_BYTES;
         all.extend(
-            dequant_gsq_rco_3p5(
-                &raw.bytes[s..s + BLOCK_BYTES_GSQ_RCO_3P5],
-                BLOCK_SIZE_GSQ_RCO_3P5,
+            grim_quant::dequant_q2_0(
+                &raw.bytes[s..s + Q2_0_BLOCK_BYTES],
+                Q2_0_BLOCK_SIZE,
             )
             .expect("real block dequant"),
         );
@@ -323,23 +370,128 @@ fn real_checkpoint_blocks_decode_to_finite_sane_weights() {
         "mean |w| was {mean_abs} — blocks decoded to near-constant garbage"
     );
 
-    // Per-block 4-level grid: the distinct nonzero magnitudes in a single block
-    // must be exactly {d, 2d}. This catches a layout that yields a plausible
-    // range but the wrong internal structure.
-    let first = &all[..BLOCK_SIZE_GSQ_RCO_3P5];
-    let d = -first[0]
-        .abs()
-        .max(first.iter().fold(0.0f32, |m, v| m.max(v.abs())));
-    let mags: std::collections::BTreeSet<u32> = first
+    // Per-block 4-level grid: `Q2_0` decodes `y = (q - 1) * d` over a 2-bit code,
+    // so the level set is `{-d, 0, +d, +2d}`. The distinct nonzero magnitudes
+    // across the decoded blocks must be a subset of {d, 2d} in units of the
+    // per-block scale. Aggregated over NB blocks, not one block: a single real
+    // block need not exercise every code, so asserting {d,2d} on block 0 alone
+    // is flaky on real data (block 0 here carried only level 1).
+    let mut bad: Vec<(usize, f32)> = Vec::new();
+    for blk in all.chunks(Q2_0_BLOCK_SIZE) {
+        let d = blk.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-12);
+        for (i, &v) in blk.iter().enumerate() {
+            if v.abs() <= 1e-9 {
+                continue;
+            }
+            let units = (v.abs() / d).round() as i32;
+            if units != 1 && units != 2 {
+                bad.push((i, v));
+                break;
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} blocks decoded off the 4-level {{d,2d}} grid (first: index {}, value {})",
+        bad.len(),
+        bad.first().map(|x| x.0).unwrap_or(0),
+        bad.first().map(|x| x.1).unwrap_or(0.0)
+    );
+}
+
+// ---- Real IQ3_XXS checkpoint bytes (the 27B's dominant K-quant) -------------
+
+/// The 27B checkpoint that emitted all-NaN logits at step 0 is NOT a GSQ-RCO
+/// model. Its tensor histogram is
+/// `{BF16:96, F32:360, IQ1_M:4, IQ1_S:4, IQ2_S:72, IQ2_XS:32, IQ2_XXS:30,
+///   IQ3_S:97, IQ3_XXS:83, IQ4_XS:33, Q2_K:28, Q4_K:19, Q6_K:8}` — zero tag-81
+/// tensors. `IQ3_XXS` is the single largest K-quant family (83 tensors) and it
+/// decodes on the device through `launch_wmma_fused_dequant_iq3xxs`
+/// (`gemm_launchers.rs:2821`), i.e. `wmma_quantized_gemm.rs` — the file
+/// `041cb708` fixed for a NaN in the Q4_K leg.
+///
+/// `wmma_quant_parity.rs` covers only `Q4K` and `Q80`, so that leg has no
+/// parity gate at all: a scheme that NaNs on real bytes is invisible to every
+/// test in the tree. This is the host-side half of that gap — it reads REAL
+/// artifact blocks (not bytes this crate packed itself, which would
+/// round-trip any layout bug into agreement) and requires finite, sane
+/// weights. If the device leg is the remaining half, it is caught by adding
+/// `IQ3XXS` to the WMMA parity sweep.
+#[test]
+fn real_checkpoint_iq3xxs_blocks_decode_to_finite_sane_weights() {
+    use grim_tensor::dtype::KQuantScheme;
+    use std::io::BufReader;
+
+    let Some(path) = find_checkpoint("models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf")
+    else {
+        panic!("checkpoint missing: models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf \
+                 — this gate must not silently skip; IQ3_XXS is the 27B's dominant \
+                 K-quant scheme and the one that produced all-NaN step-0 logits");
+    };
+    let path = path.to_string_lossy().to_string();
+
+    let f = std::fs::File::open(&path).expect("open checkpoint");
+    let gguf = grim_format::gguf::read_gguf(BufReader::new(f)).expect("parse gguf header");
+    // The single largest K-quant family in this checkpoint. Assert the tag so
+    // the test cannot silently drift onto a different scheme if the artifact
+    // is ever re-quantized.
+    let t = gguf
+        .tensors
+        .iter()
+        .find(|t| {
+            t.dtype == grim_format::gguf::GgufDType::IQ3_XXS
+                && t.name.starts_with("blk.")
+                && (t.name.contains("ffn_down") || t.name.contains("ffn_up")
+                    || t.name.contains("ssm_out") || t.name.contains("attn_gate"))
+        })
+        .expect("an IQ3_XXS linear weight must exist in the 27B checkpoint");
+    assert_eq!(t.shape().len(), 2, "{} should be 2-D, got {:?}", t.name, t.dims);
+    let n_weights = t.elem_count();
+
+    let provider = grim_format::tprov::GgufProvider::open(&path).expect("open provider");
+    let raw = provider
+        .get_packed(&t.name)
+        .expect("packed IQ3_XXS bytes from the real checkpoint");
+    let got = grim_quant::dequant_iq3xxs(&raw.bytes, n_weights)
+        .unwrap_or_else(|e| panic!("{}: real IQ3_XXS dequant failed: {e}", t.name));
+    assert_eq!(got.len(), n_weights, "{}: dequant length mismatch", t.name);
+
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "{}: all {n_weights} real IQ3_XXS weights must be finite; got NaN/inf",
+        t.name
+    );
+    let absmax = got.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let mean_abs = got.iter().map(|v| v.abs()).sum::<f32>() / got.len() as f32;
+    assert!(
+        absmax < 1.0,
+        "{}: IQ3_XXS weights should be small; absmax was {absmax} \
+         (a wrong block layout reads scales from the wrong offset and produces \
+          values in the tens of thousands, or NaN)",
+        t.name
+    );
+    assert!(
+        mean_abs > 1e-5,
+        "{}: mean |w| was {mean_abs} — decoded to near-constant garbage",
+        t.name
+    );
+
+    // Non-degenerate per block: a correct IQ3_XXS block spans the 8-level
+    // grid, so the distinct rounded magnitudes must exceed a couple of levels.
+    // Catches a layout that lands in a plausible range but has no internal
+    // structure.
+    let distinct: std::collections::BTreeSet<u32> = got
         .iter()
         .filter(|v| v.abs() > 1e-9)
-        .map(|v| (v.abs() / d).round() as u32)
+        .map(|v| {
+            let d = absmax.max(1e-12);
+            ((v.abs() / d * 8.0).round() as u32).min(8)
+        })
         .collect();
-    assert_eq!(
-        mags,
-        [1u32, 2]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<u32>>(),
-        "block 0 magnitudes (in units of d) should be exactly {{d, 2d}}, got {mags:?}"
+    assert!(
+        distinct.len() >= 4,
+        "{}: only {} distinct magnitude levels survived; expected the \
+         IQ3_XXS 8-level grid", t.name, distinct.len()
     );
+    let _ = KQuantScheme::IQ3XXS; // pin the scheme this gate is about
 }

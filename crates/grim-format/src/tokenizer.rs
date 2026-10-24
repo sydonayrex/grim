@@ -343,7 +343,9 @@ impl GgufTokenizer {
 
         // Load BPE merges from GGUF metadata if the model type is BPE.
         // HF tokenizer.json-style merges may be stored as tokenizer.ggml.merges (array of ["tokenA", "tokenB"] or "tokenA tokenB").
-        let bpe_merges = if model_type == "bpe" || model_type == "gpt2" {
+        // "gemma4" is a BPE tokenizer as well (llama.cpp: `type = LLAMA_VOCAB_TYPE_BPE`
+        // at `src/llama-vocab.cpp:2113`), but with an SPM-style pre-tokenizer.
+        let bpe_merges = if model_type == "bpe" || model_type == "gpt2" || model_type == "gemma4" {
             metadata
                 .get("tokenizer.ggml.merges")
                 .and_then(|v| v.as_array())
@@ -483,6 +485,11 @@ impl GgufTokenizer {
         // to map text → byte-level unicode chars, then apply BPE merges rank-by-rank.
         if self.model_type == "bpe" {
             return self.encode_bpe(text, &special_tokens);
+        }
+
+        // Gemma 4 is BPE with an SPM-style pre-tokenizer (see `encode_spm_bpe`).
+        if self.model_type == "gemma4" {
+            return self.encode_spm_bpe(text, &special_tokens);
         }
 
         // Legacy path: SentencePiece / llama-style tokenizers. Added tokens are
@@ -721,6 +728,135 @@ impl GgufTokenizer {
         result
     }
 
+    /// Gemma-4 encoding: SPM-style BPE.
+    ///
+    /// llama.cpp's pre-tokenizer for `tokenizer.ggml.model = "gemma4"`
+    /// (`src/llama-vocab.cpp:2228-2232` and `:527-535`):
+    ///
+    ///   * every space becomes U+2581 (`llama_escape_whitespace`,
+    ///     `src/llama-vocab.cpp:3385`),
+    ///   * the text splits on NEWLINES ONLY (`[^\n]+|[\n]+`),
+    ///   * the BPE merges run over the WHOLE piece - no word-level pre-split,
+    ///   * there is no GPT-2 byte encoding, so a symbol with no vocab entry
+    ///     falls back to the `<0xXX>` byte form.
+    ///
+    /// The GPT-2 byte-level path would encode " capital" as "Ġ" + "capital"
+    /// (ids 245237 + 41626 in the E4B vocabulary) where the reference emits
+    /// the single "▁capital" (id 5279). That is a structurally different
+    /// prompt, and the model answers it with well-formed garbage.
+    fn encode_spm_bpe(&self, text: &str, special_tokens: &[&str]) -> Vec<u32> {
+        let mut result: Vec<u32> = Vec::new();
+        let mut remaining = text;
+
+        loop {
+            // Leftmost-longest special-token partition, the same rule the
+            // byte-level path uses.
+            let mut found: Option<(&str, usize)> = None;
+            for st in special_tokens {
+                if let Some(pos) = remaining.find(st) {
+                    match found {
+                        None => found = Some((st, pos)),
+                        Some((cur, cur_pos)) => {
+                            if pos < cur_pos || (pos == cur_pos && st.len() > cur.len()) {
+                                found = Some((st, pos));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (chunk, rest) = match found {
+                Some((st, pos)) => {
+                    let (before, after) = remaining.split_at(pos);
+                    (before, Some((st, &after[st.len()..])))
+                }
+                None => (remaining, None),
+            };
+
+            if !chunk.is_empty() {
+                result.extend(self.encode_spm_bpe_chunk(chunk));
+            }
+
+            match rest {
+                Some((st, r)) => {
+                    if let Some(&id) = self.token_to_id.get(st) {
+                        result.push(id);
+                    }
+                    remaining = r;
+                }
+                None => break,
+            }
+        }
+        result
+    }
+
+    /// One raw chunk of Gemma-4 text: escape the spaces, split on newlines,
+    /// then merge each piece.
+    fn encode_spm_bpe_chunk(&self, text: &str) -> Vec<u32> {
+        let escaped = text.replace(' ', "\u{2581}");
+        let mut ids: Vec<u32> = Vec::new();
+        for piece in split_newline_runs(&escaped) {
+            if piece.is_empty() {
+                continue;
+            }
+            // A run of newlines is one vocab entry when the vocabulary has it;
+            // the BPE merge lookup cannot see a newline inside a token
+            // (`src/llama-vocab.cpp:637-644`).
+            if piece.chars().all(|c| c == '\n') {
+                if let Some(&id) = self.token_to_id.get(piece) {
+                    ids.push(id);
+                    continue;
+                }
+            }
+            ids.extend(self.bpe_merge_spm_piece(piece));
+        }
+        ids
+    }
+
+    /// Merge one Gemma-4 piece with the BPE ranks, lowest rank first, then
+    /// look the merged symbols up.
+    fn bpe_merge_spm_piece(&self, piece: &str) -> Vec<u32> {
+        let Some(merges) = &self.bpe_merges else {
+            return self.encode_fallback(piece);
+        };
+
+        let mut symbols: Vec<String> = piece.chars().map(|c| c.to_string()).collect();
+        loop {
+            let mut best_rank: Option<u32> = None;
+            let mut best_idx: Option<usize> = None;
+            for i in 0..symbols.len().saturating_sub(1) {
+                let pair = format!("{} {}", symbols[i], symbols[i + 1]);
+                if let Some(&rank) = merges.get(&pair) {
+                    if best_rank.is_none() || rank < best_rank.unwrap() {
+                        best_rank = Some(rank);
+                        best_idx = Some(i);
+                    }
+                }
+            }
+            let Some(idx) = best_idx else { break };
+            let merged = format!("{}{}", symbols[idx], symbols[idx + 1]);
+            symbols[idx] = merged;
+            symbols.remove(idx + 1);
+        }
+
+        let mut ids: Vec<u32> = Vec::new();
+        for sym in &symbols {
+            if let Some(&id) = self.token_to_id.get(sym) {
+                ids.push(id);
+                continue;
+            }
+            // No byte encoding, so the byte fallback is the `<0xXX>` form
+            // (`src/llama-vocab.cpp:722-733`).
+            for b in sym.as_bytes() {
+                let key = format!("<0x{b:02X}>");
+                if let Some(&id) = self.token_to_id.get(&key) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
     /// Apply BPE merges to a single chunk of text (no special tokens).
     fn bpe_encode_chunk(&self, text: &str, encoder: &HashMap<u8, char>) -> Vec<u32> {
         let merges = match &self.bpe_merges {
@@ -850,7 +986,7 @@ impl GgufTokenizer {
                 out.push_str(t);
             }
         }
-        if self.model_type == "llama" || self.model_type == "lfm2" {
+        if self.model_type == "llama" || self.model_type == "lfm2" || self.model_type == "gemma4" {
             out = out.replace("\u{2581}", " ");
         }
         out = out.replace('\u{0120}', " ").replace('\u{010A}', "\n");
@@ -2312,5 +2448,117 @@ mod xing_added_token_tests {
                 "`{want}` must be recognised as an added token; got {added:?}"
             );
         }
+    }
+}
+
+/// Split a string into maximal runs of non-newline characters and maximal
+/// runs of newline characters - the `[^\n]+|[\n]+` pre-tokenizer split.
+fn split_newline_runs(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let is_nl = bytes[i] == b'\n';
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j] == b'\n') == is_nl {
+            j += 1;
+        }
+        out.push(&text[start..j]);
+        start = j;
+        i = j;
+    }
+    out
+}
+
+#[cfg(test)]
+mod gemma4_tokenizer_tests {
+    use super::*;
+
+    /// Add the character-level merges that assemble `word` from its characters,
+    /// in the order a BPE trainer would emit them (the rank grows along the
+    /// chain, so the merge sequence rebuilds the word).
+    fn merges_for(word: &str, rank: &mut u32, merges: &mut HashMap<String, u32>) {
+        let chars: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+        for i in 1..chars.len() {
+            let left: String = chars[..i].concat();
+            let right: String = chars[i].to_string();
+            merges.insert(format!("{left} {right}"), *rank);
+            *rank += 1;
+        }
+    }
+
+    /// Build a Gemma-4-shaped tokenizer: SPM-style BPE over a small vocabulary.
+    ///
+    /// The vocabulary mirrors the real E4B layout - the space marker is
+    /// U+2581 and the words carry it as a prefix - and the merges are the
+    /// "first second" pairs llama.cpp reads from `tokenizer.ggml.merges`.
+    fn gemma4_tokenizer() -> GgufTokenizer {
+        let vocab = [
+            "<pad>", "<bos>", "The", "▁capital", "▁of", "▁France", "▁is", "a", "b", "▁ab",
+        ];
+        let tokens: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
+        let mut token_to_id = HashMap::new();
+        for (i, t) in tokens.iter().enumerate() {
+            token_to_id.insert(t.clone(), i as u32);
+        }
+        let mut merges = HashMap::new();
+        let mut rank = 0u32;
+        for word in ["The", "▁capital", "▁of", "▁France", "▁is", "▁ab"] {
+            merges_for(word, &mut rank, &mut merges);
+        }
+        GgufTokenizer {
+            tokens,
+            token_to_id,
+            scores: None,
+            model_type: "gemma4".into(),
+            bpe_merges: Some(merges),
+            byte_decoder: None,
+            eos_token_id: Some(1),
+            bos_token_id: Some(1),
+            add_bos_token: true,
+            unk_token_id: Some(0),
+            chat_template: None,
+            architecture: Some("gemma4".into()),
+            added_tokens: vec![],
+        }
+    }
+
+    /// The Gemma-4 tokenizer escapes the spaces to U+2581 and merges over the
+    /// WHOLE piece, so " capital" is ONE token.
+    ///
+    /// The GPT-2 byte-level path (what this tokenizer used to run) emits
+    /// "Ġ" + "capital" instead - a structurally different prompt, and the
+    /// model answers it with well-formed garbage.
+    #[test]
+    fn gemma4_escapes_spaces_and_merges_over_the_whole_piece() {
+        let tok = gemma4_tokenizer();
+        let ids = tok.encode("The capital of France is");
+        assert_eq!(
+            ids,
+            vec![2, 3, 4, 5, 6],
+            "expected the space-prefixed word tokens, got {ids:?}"
+        );
+    }
+
+    /// The merge chain runs inside a word: "▁" + "a" + "b" is one token.
+    #[test]
+    fn gemma4_applies_the_merge_ranks() {
+        let tok = gemma4_tokenizer();
+        let ids = tok.encode(" ab");
+        assert_eq!(ids, vec![9], "the merge must produce the single ▁ab token");
+    }
+
+    /// The pre-tokenizer splits on newlines only, so a newline between two
+    /// words keeps them apart instead of gluing them into one merge chain.
+    #[test]
+    fn gemma4_splits_on_newlines_only() {
+        let tok = gemma4_tokenizer();
+        let ids = tok.encode("a\nb");
+        assert_eq!(
+            ids,
+            vec![7, 8],
+            "a newline must not glue the words together, got {ids:?}"
+        );
     }
 }

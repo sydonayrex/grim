@@ -266,6 +266,7 @@ impl Lfm2 {
                         k_scales_dev: None,
                         v_scales_dev: None,
                         gdl_state: state_ptr,
+                        device_ordinal: 0,
                         _anchor: std::marker::PhantomData,
                     }));
                 }
@@ -343,6 +344,7 @@ impl Lfm2 {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -397,10 +399,345 @@ impl Lfm2 {
             batch * hidden,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+        // M5 (PM-5 gap): the LFM2 emitter. Until this, `lfm2_graph.rs`'s
+        // capture walk made no `emit_node` calls, so LFM2 models published NO
+        // task graph at all — the coverage table had no LFM2 row and the ring
+        // had nothing to bind.
+        //
+        // The nodes are DESCRIPTIVE of the walk at the granularity the walk
+        // has: a layer is a branch (attention or ShortConv) plus an FFN, so a
+        // layer contributes a branch node and an FFN node. A node the RING
+        // cannot execute is a FALLBACK node (the plan's fallback contract: an
+        // op with no opcode yet runs through its existing launcher), which is
+        // the LFM2's ShortConv branch — a stateful conv the ring has no arm
+        // for.
+        let mut emit_last: u32 = u32::MAX;
+        let emitting = graph.emitter.is_some() && graph.capturing;
+        if emitting {
+            let seg0 = graph.segments.first().map(|s| s.device).unwrap_or(dev.ordinal());
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (
+                        graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                        graph.buffers.token_ids_dev.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        graph.buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_input[0].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[],
+                seg0 as u8,
+            );
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             layer.forward_graph(i, &graph.buffers, dev)?;
+            if !emitting {
+                continue;
+            }
+            let ord = dev.ordinal() as u8;
+            // The branch: an attention layer is an ATTENTION node; a
+            // ShortConv/GDL layer has no ring arm, so it is a FALLBACK node.
+            // The GEOMETRY slots stay 0: the node stands for the whole
+            // branch (the norm, the projections, the RoPE, the KV append and
+            // the attention), which is NOT the ring's flash-attention arm, and
+            // a node the ring cannot execute must not look like one it can.
+            let branch_op = if layer.is_attention() {
+                grim_backend_rocm::task_graph::op::ATTENTION
+            } else {
+                grim_backend_rocm::task_graph::op::FALLBACK
+            };
+            emit_last = graph.emit_node(
+                branch_op,
+                [0u32; 16],
+                &[
+                    (
+                        graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_input[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_output[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[emit_last],
+                ord,
+            );
+            // The FFN's down projection.
+            //
+            // M7.3: the launcher STOPS FUSING, so the Q8_0 down projection
+            // and the residual add are TWO launches and the IR names them as
+            // TWO nodes: a Q8_0_DOT4_F32ACT node (the ring's arm for the
+            // f32-activation Q8_0 GEMV) and an ELEMENTWISE node (the
+            // ring's OP_ADD). Before M7.3 this was ONE FALLBACK node, because
+            // a fused launch is one computation and no single ring opcode
+            // names it.
+            let ffn_k = graph.buffers.activated_buf[i]
+                .shape()
+                .dims()
+                .last()
+                .copied()
+                .unwrap_or(0);
+            let fused_down = crate::decode_graph::dot_fused_ok(dev, ffn_k)
+                && crate::decode_graph::is_q80(&layer.ffn_down.weight);
+            if fused_down {
+                // The dot4 node.
+                let n = layer.ffn_down.weight.shape().dim(0).unwrap_or(0) as u32;
+                let m = batch as u32;
+                let weight = rocm_storage(&layer.ffn_down.weight).ok();
+                let warg = weight.map(|ws| {
+                    (
+                        ws.device_ptr_u64().unwrap_or(0),
+                        ws.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                    )
+                });
+                let mut dargs = vec![
+                    (
+                        graph.buffers.activated_buf[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.activated_buf[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.norm_buf[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ];
+                if let Some(w) = warg {
+                    dargs.push(w);
+                }
+                // M7.4: the node carries the Q8_0 PATH CONTRACT — the
+                // decision made ONCE (by the device) and read from the SAME
+                // place the launcher reads it, so the IR and the launcher
+                // cannot disagree about which path this projection takes.
+                let path = dev.q8_0_path_contract(ffn_k);
+                let mut dp = [0u32; 16];
+                dp[1] = n;
+                dp[2] = ffn_k as u32;
+                dp[3] = m;
+                dp[grim_backend_rocm::task_graph::q8_0_path::PARAM_SLOT] = path;
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
+                    dp,
+                    &dargs,
+                    &[emit_last],
+                    ord,
+                );
+                // The residual add node.
+                let elems = graph.buffers.layer_output[i].shape().elem_count() as u32;
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                    [elems, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.layer_output[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.norm_buf[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                    ],
+                    &[emit_last],
+                    ord,
+                );
+            } else {
+                let weight = rocm_storage(&layer.ffn_down.weight).ok();
+                let n = layer.ffn_down.weight.shape().dim(0).unwrap_or(0) as u32;
+                let m = batch as u32;
+                let (params, warg) = match weight {
+                    Some(ws) => {
+                        let p = crate::decode_graph::gemm_params_geom(
+                            crate::decode_graph::gemm_quant_param(&layer.ffn_down.weight),
+                            n,
+                            ffn_k as u32,
+                            m,
+                        );
+                        (
+                            p,
+                            (
+                                ws.device_ptr_u64().unwrap_or(0),
+                                ws.bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                            ),
+                        )
+                    }
+                    None => (
+                        [0u32; 16],
+                        (
+                            0u64,
+                            0u64,
+                            grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                        ),
+                    ),
+                };
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::GEMM,
+                    params,
+                    &[
+                        (
+                            graph.buffers.activated_buf[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.activated_buf[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        warg,
+                        (
+                            graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.norm_buf[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                    &[emit_last],
+                    ord,
+                );
+            }
         }
         self.output_forward_graph(&graph.buffers, dev)?;
+        if emitting {
+            let ord = dev.ordinal() as u8;
+            // The head: the final norm and the output projection. The norm is
+            // IN-PLACE (it reduces each row before storing), so its input and
+            // output are the same buffer.
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::NORM,
+                [
+                    0,
+                    self.cfg.hidden_size as u32,
+                    batch as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                &[
+                    (
+                        graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                        graph.buffers.head_input.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                        graph.buffers.head_input.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[emit_last],
+                ord,
+            );
+            let out_ws = rocm_storage(&self.output.weight).ok();
+            let (params, warg) = match out_ws {
+                Some(ws) => (
+                    crate::decode_graph::gemm_params_geom(
+                        crate::decode_graph::gemm_quant_param(&self.output.weight),
+                        self.output.weight.shape().dim(0).unwrap_or(0) as u32,
+                        self.cfg.hidden_size as u32,
+                        batch as u32,
+                    ),
+                    (
+                        ws.device_ptr_u64().unwrap_or(0),
+                        ws.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                    ),
+                ),
+                None => (
+                    [0u32; 16],
+                    (
+                        0u64,
+                        0u64,
+                        grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                    ),
+                ),
+            };
+            let _ = graph.emit_node(
+                grim_backend_rocm::task_graph::op::GEMM,
+                params,
+                &[
+                    (
+                        graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                        graph.buffers.head_input.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    warg,
+                    (
+                        graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                        graph.buffers.head_output.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[emit_last],
+                ord,
+            );
+        }
+        Ok(())
+    }
+
+    /// M5: the LFM2 IR walk — the model's own launch sequence, executed
+    /// through the launchers instead of replayed from a captured graph.
+    ///
+    /// The IR is DESCRIPTIVE here: the walk follows the MODEL's layers (the
+    /// same order `forward_capture` records), and the IR's nodes are what the
+    /// RING binds against. That is the shape the qwen35's walk has too: the
+    /// walk and the capture share the model's code, and the IR describes it.
+    ///
+    /// The order matters: the position is written BEFORE the token (the
+    /// established interpret-path order — the plan's M2 note on the two
+    /// writes), and the embedding gather reads the token, so the gather has
+    /// to come after the token write.
+    pub fn lfm2_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        let dev = dev_for(self)?;
+        let pos = graph.buffers.current_pos;
+        graph
+            .buffers
+            .write_pos_all_segments(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        // The embedding gather — the walk runs the launchers, so the gather
+        // the capture RECORDS has to be LAUNCHED here.
+        let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+        // The layers, in the model's order.
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_graph(i, &graph.buffers, &dev)?;
+        }
+        // The head.
+        self.output_forward_graph(&graph.buffers, &dev)?;
+        // The device the step touched. The caller's first D2H is NULL-stream
+        // ordered and must not race these launches (the same seam
+        // `forward_replay` closes).
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -428,6 +765,18 @@ impl Lfm2 {
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        // Same seam Qwen35 and now Llama close: the replay runs on the graph's
+        // pool stream and the caller's first D2H (`hipMemcpy`) is NULL-stream
+        // ordered, so without this a logits readback can race kernels still in
+        // flight. (`forward_replay_batch` still returns unsynced — its callers
+        // own the ordering; do not copy this there blindly.)
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -908,16 +1257,35 @@ impl Lfm2Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("prequant down+add: {e}")))?;
             } else {
-                dev.launch_dot4_q80_f32act_add_gemv(
+                // M7.3: the launcher STOPS FUSING, so the IR can name the
+                // dot4 (a Q8_0_DOT4_F32ACT node, which the ring CAN
+                // execute) and the residual add (an ELEMENTWISE node, which
+                // it also can) as SEPARATE nodes. A node's opcode must name
+                // the computation the ring would actually run, and a fused
+                // launch is one computation.
+                //
+                // The decomposition is SAFE, and measured: the fused kernel's
+                // `C[out_idx] = res + facc[j]` and the split path's `dot4`
+                // then `grim_add` (`c[i] = a[i] + b[i]`) are the same f32
+                // add of the same values. The gate
+                // `fused_decomposition_bit_exact` measures 0/4096 elements
+                // differing, under the default tiling AND both the TILE16
+                // and TILE8 switches. The cost is 1.08x — one extra launch.
+                dev.launch_dot4_q80_f32act_gemv(
                     &buffers.activated_buf[layer_idx],
                     rocm_storage(&self.ffn_down.weight)?,
-                    Some(&buffers.layer_output[layer_idx]),
-                    residual_dst,
+                    dst_downcast(&buffers.norm_buf[layer_idx])?,
                     m,
                     ffn_n,
                     ffn_k,
                 )
-                .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+                .map_err(|e| grim_core::error::Error::Backend(format!("down dot4: {e}")))?;
+                add_graph(
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    residual_dst,
+                    dev,
+                )?;
             }
         } else {
             linear_into(

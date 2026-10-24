@@ -487,7 +487,13 @@ pub fn fused_or_scalar_attention_i8_arena_device(
     window: Option<usize>,
     device: &Device,
 ) -> Result<Tensor> {
-    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    // 3-D on purpose: the packed K codes' last axis is a head's BYTE count
+    // (`head_dim` for int8, `head_dim/2` for int4 and int2v4), so a reader that
+    // takes head_dim from the arena halves it on the 4-bit formats and
+    // misaligns every K/V read. Passing the geometry here is what makes the
+    // arena's shape free to describe the packed bytes. `qkv_attention_*`
+    // flattens the returned storage back to [steps, heads*dim].
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
     let dev = pick_device_for_storage_device(device);
     let cache_offset = kv_len.saturating_sub(steps);
     let (storage, _handle) = dev.qkv_attention_i8(
@@ -564,7 +570,7 @@ pub fn fused_or_scalar_attention_i4_arena_device(
     window: Option<usize>,
     device: &Device,
 ) -> Result<Tensor> {
-    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
     let dev = pick_device_for_storage_device(device);
     let cache_offset = kv_len.saturating_sub(steps);
     let (storage, _handle) = dev.qkv_attention_i4(
@@ -641,7 +647,7 @@ pub fn fused_or_scalar_attention_i2v4_arena_device(
     window: Option<usize>,
     device: &Device,
 ) -> Result<Tensor> {
-    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
     let dev = pick_device_for_storage_device(device);
     let cache_offset = kv_len.saturating_sub(steps);
     let (storage, _handle) = dev.qkv_attention_i2v4(

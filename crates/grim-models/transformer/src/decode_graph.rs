@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
+use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::decode_graph_buffers::{
     ConvDeviceSeed, ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
     check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
@@ -54,6 +55,72 @@ pub trait DecodeGraphModel: Send + Sync {
 
     /// Replay an instantiated decode graph with the given token ID.
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()>;
+
+    /// M2: interpret the PUBLISHED task graph for one decode step.
+    ///
+    /// Walks `graph.buffers.emitted_task_graph` in dependency order
+    /// (`task_graph_exec::execute`) and dispatches each node through this
+    /// model's EXISTING launchers — the compatibility oracle of plan task M2:
+    /// "IR execution == graph replay, for any model", available before any new
+    /// kernel exists. The FALLBACK contract lives here: a node whose opcode
+    /// this model cannot dispatch individually runs through the model's
+    /// ordinary launcher path for that stage rather than erroring, so one
+    /// exotic op costs a model its megakernel only on that node.
+    ///
+    /// Default: `Unimplemented` — a model without an interpreter still
+    /// captures and replays; only the IR-execution oracle is unavailable.
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        let _ = (graph, token_id);
+        Err(grim_core::error::Error::Unimplemented(
+            "model has no task-graph interpreter (forward_interpret_ir)".into(),
+        ))
+    }
+
+    /// M4: interpret the published IR with its GEMM nodes routed to the
+    /// persistent task ring instead of their launchers.
+    ///
+    /// `ring` is the caller's REUSABLE context ([`TaskRingContext`]): the
+    /// descriptors are staged once, so the context outlives a single step and the
+    /// steady-state step performs no upload. Every node that is NOT an
+    /// executable GEMM goes through its ordinary launcher exactly as
+    /// [`Self::forward_interpret_ir`] does, which is the fallback contract the
+    /// conversion relies on.
+    ///
+    /// Default: `Unimplemented` — M4 converts one opcode at a time, so a model
+    /// without this method is simply not ring-converted yet.
+    fn forward_interpret_ir_ring(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: &mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    ) -> Result<()> {
+        let _ = (graph, token_id, ring);
+        Err(grim_core::error::Error::Unimplemented(
+            "model has no task-graph ring interpreter (forward_interpret_ir_ring)".into(),
+        ))
+    }
+
+    /// The shared IR walk behind the two entry points above.
+    ///
+    /// `ring = None` is the M2 route: GEMM nodes are served by the block
+    /// launchers (ATTENTION's dispatch) and the head stage. `Some` routes each
+    /// GEMM node to the persistent wave instead — ONE launch for the whole set.
+    ///
+    /// Declared on the trait (default `Unimplemented`) rather than as an
+    /// inherent method so every model's interpreter shares ONE walk: the two
+    /// entry points cannot drift apart, and a model that has not converted to
+    /// the ring still gets the M2 walk for free.
+    fn interpret_ir(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: Option<&mut grim_backend_rocm::kernels::task_ring::TaskRingContext>,
+    ) -> Result<()> {
+        let _ = (graph, token_id, ring);
+        Err(grim_core::error::Error::Unimplemented(
+            "model has no task-graph IR walk (interpret_ir)".into(),
+        ))
+    }
 
     /// Export eager device KV arenas for prefill KV seeding into the graph pool.
     fn eager_kv_seed_sources<'a>(
@@ -104,7 +171,28 @@ fn dev_for_llama(llama: &Llama) -> Result<Arc<Dev>> {
     }
 }
 
-fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&grim_backend_rocm::RocmStorage> {
+/// Refuse graph capture when the KV arena's format has no DEVICE-TOTAL
+/// append + attention pair.
+///
+/// Asked of the resolved FORMAT, not of an env spelling list. The list this
+/// replaced had to be extended for every new format, and it answered a
+/// different question from the one that matters: K2V4 has EAGER kernels and no
+/// capturable pair, so `has_device_kernels` is true while `graph_kernel_pair`
+/// is false. Getting that wrong is silent — capture succeeds, and the 8-bit
+/// kernels read 4-codes-per-byte keys as if each byte were one code.
+fn refuse_uncapturable_kv_arena(device: &Device) -> Result<()> {
+    use grim_backend_rocm::KvArenaFormat as F;
+    let fmt = crate::qwen35::kv_arena_format_qwen(device);
+    if fmt.graph_kernel_pair() || matches!(fmt, F::F32 | F::F16) {
+        return Ok(());
+    }
+    Err(grim_core::error::Error::Backend(format!(
+        "decode graph: {fmt:?} has no device-total append/attend kernel pair \
+         (eager fallback)"
+    )))
+}
+
+pub(crate) fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&grim_backend_rocm::RocmStorage> {
     dst_downcast(t.storage().as_ref())
 }
 
@@ -214,14 +302,48 @@ fn linear_into_named(
     Ok(())
 }
 
-fn is_q80(t: &grim_tensor::Tensor) -> bool {
+/// The coverage table's QuantFormat axis (plan condition 3): the GEMM `params[0]`
+/// scalar. `0` = native (unquantized f32/f16 weights — no QuantFormat variant
+/// exists for it by design); otherwise the `QuantFormat` enum ordinal via
+/// `TryFrom<&Storage>`. A storage with no mapping (legacy Q4_0/Q4_1) records 0
+/// too — those dequantize at load, so the launcher that runs IS native.
+pub(crate) fn gemm_quant_param(w: &grim_tensor::Tensor) -> u32 {
+    grim_tensor::QuantFormat::try_from(&w.dtype().storage)
+        .map(|f| f as u32)
+        .unwrap_or(0)
+}
+
+/// GEMM node params for a node the RING (M4) could actually execute: `[0]` quant,
+/// `[1]` output width N, `[2]` K, `[3]` M. Roles on the args are what bind the
+/// operands (`arg_role::WEIGHT` names the weight matrix — see
+/// `task_ring::TaskRingPlan::from_graph`), so a ring that could not see geometry
+/// would still be able to refuse a node rather than guess.
+pub(crate) fn gemm_params_geom(quant: u32, n: u32, k: u32, m: u32) -> [u32; 16] {
+    let mut p = gemm_params(quant, n);
+    p[2] = k;
+    p[3] = m;
+    p
+}
+
+/// Built here rather than as a 16-literal at each call site because the axis
+/// is only useful if EVERY emitter agrees on slot 0 — a geometry value in
+/// slot 0 (the head nodes used to put `vocab_size` there) reads as a valid
+/// format id and silently widens the coverage set.
+fn gemm_params(quant: u32, out_width: u32) -> [u32; 16] {
+    let mut p = [0u32; 16];
+    p[0] = quant;
+    p[1] = out_width;
+    p
+}
+
+pub(crate) fn is_q80(t: &grim_tensor::Tensor) -> bool {
     matches!(
         t.dtype().storage,
         grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
     )
 }
 
-fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
+pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
     hidden != 0
         && hidden % 32 == 0
         && dev.supports_dot4()
@@ -433,7 +555,7 @@ impl LlamaBlock {
         let q3 = Shape::new(vec![batch, nh * steps, hd]);
         dev.rope_dev_base_into(
             &buffers.q_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             &buffers.q_buf[layer_idx],
             &rope_cfg,
             &q3,
@@ -445,7 +567,7 @@ impl LlamaBlock {
         let k3 = Shape::new(vec![batch, nkv * steps, hd]);
         dev.rope_dev_base_into(
             &buffers.k_buf[layer_idx],
-            &buffers.pos_dev,
+            buffers.pos_dev_for(dev.ordinal()),
             &buffers.k_buf[layer_idx],
             &rope_cfg,
             &k3,
@@ -481,7 +603,7 @@ impl LlamaBlock {
             dev,
             &buffers.k_arena[layer_idx],
             &buffers.k_buf[layer_idx],
-            &buffers.pos_dev,
+            &buffers.layer_totals[layer_idx],
             kv_stride,
             steps,
             batch,
@@ -494,7 +616,7 @@ impl LlamaBlock {
             dev,
             &buffers.v_arena[layer_idx],
             &buffers.v_buf[layer_idx],
-            &buffers.pos_dev,
+            &buffers.layer_totals[layer_idx],
             kv_stride,
             steps,
             batch,
@@ -512,7 +634,7 @@ impl LlamaBlock {
             &buffers.attn_out_buf[layer_idx],
             &buffers.attn_max_buf[layer_idx],
             &buffers.attn_sum_buf[layer_idx],
-            &buffers.pos_dev,
+            &buffers.layer_totals[layer_idx],
             nh as u32,
             nkv as u32,
             hd as u32,
@@ -521,10 +643,10 @@ impl LlamaBlock {
             1.0 / (hd as f32).sqrt(),
             0,
             0.0,
-            &buffers.attn_dummy,
+            buffers.attn_dummy_for(dev.ordinal()),
             0,
             0,
-            &buffers.attn_dummy,
+            buffers.attn_dummy_for(dev.ordinal()),
             0,
             batch,
             arena_slot_stride,
@@ -533,31 +655,49 @@ impl LlamaBlock {
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
         // Bump pos_dev
-        grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
+        grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
             .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
-
-        // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
-        //
-        // This was MISSING: the graph went from the attention straight to `wo`,
-        // so the fused gate half was computed and then discarded. The reference
-        // applies it (qwen35.cpp:321-328):
-        //     gate_sigmoid = ggml_sigmoid(ctx0, gate);
-        //     cur          = ggml_mul(ctx0, cur, gate_sigmoid);
-        // and Qwen3.5/3.8 always has an output gate on its attention layers, so
-        // this silently changes every attention layer's output. It is a
-        // CORRECTNESS fix, not a shape fix: with the shapes right this would
-        // still be wrong.
-        //
-        // `q_head_buf` is dead after the RoPE, so the sigmoid lands there and no
-        // third buffer is needed.
-        // Fused sigmoid*attn output gate epilogue (Plan Phase 2)
-        dev.sigmoid_mul_into(
-            &buffers.q_gate_buf[layer_idx],
-            &buffers.attn_out_buf[layer_idx],
+        // D1-2a: the layer OWN total -- the append row index and the
+        // attention live-row count come from here, so a per-layer CurDKV
+        // compaction can reset it without touching the shared rope position.
+        grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.layer_totals[layer_idx], steps, batch)
+            .map_err(|e| grim_core::error::Error::Backend(format!("bump layer total: {e}")))?;
+        // D1: clamp the layer total to the ring capacity, reproducing the
+        // eager path reset of current_pos at the eviction boundary (no-op
+        // when the ring is unlimited).
+        grim_backend_rocm::launch_clamp_layer_total(
+            dev,
+            &buffers.layer_totals[layer_idx],
+            buffers.kv_ring.cap_rows,
+            batch,
         )
-        .map_err(|e| {
-            grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid_mul: {e}"))
-        })?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("clamp total: {e}")))?;
+
+        // NOTE: there is deliberately NO attention-output-gate epilogue here.
+        //
+        // This block used to end with
+        // `sigmoid_mul_into(q_gate_buf[layer_idx], attn_out_buf[layer_idx])`,
+        // copied from the Qwen3.5 block below, where it is correct
+        // (`qwen35.cpp:321-328`). `q_gate_buf` is written by exactly one
+        // producer — `Qwen35Block::forward_graph`, which splits the fused
+        // Q+gate projection into `q_buf`/`q_gate_buf` — so in the Llama block
+        // that read is of an UNWRITTEN buffer, and the gate is a per-layer
+        // `out *= sigmoid(garbage)` on every attention layer.
+        //
+        // Measured on `Llama-3.2-1B-Instruct-Q4_1` (the plan's condition-1a
+        // fixture), graph replay vs the same model's eager path, step 0 of an
+        // empty arena: `grim_sigmoid_mul` ran 16x per graph forward and 0x per
+        // eager forward, and the replayed logits were uncorrelated with eager
+        // (worst |diff| 1.070e1 against an eager logit scale of 1.069e1,
+        // argmax 29299 vs eager 17346, 74242/128256 columns off by >10% of the
+        // scale). The Q6_K head both paths use was separately verified against
+        // a host `dequant_q6k` reference at this exact shape
+        // (`examples/q6k_head_probe.rs`: graph leg 7.0e-7, eager leg 2.7e-4),
+        // which is what localized the divergence to this epilogue.
+        //
+        // A Llama-family model that genuinely has an attention output gate must
+        // FILL `q_gate_buf` here first; until something does, the graph's job is
+        // to reproduce the eager path, and the eager path has no gate.
 
         // 7. Output projection (wo) + residual add
         linear_into_named(
@@ -750,16 +890,30 @@ impl LlamaBlock {
                 .unwrap_or(0);
             let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
             if use_fused_down {
-                dev.launch_dot4_q80_f32act_add_gemv(
+                // M7.3: the launcher STOPS FUSING, so the IR can name the
+                // dot4 and the residual add as separate nodes. The
+                // decomposition is SAFE, and measured: the fused kernel's
+                // `C[out_idx] = res + facc[j]` and the split path's `dot4`
+                // then `grim_add` are the same f32 add of the same values
+                // (the `fused_decomposition_bit_exact` gate measures 0/4096
+                // elements differing, under the default tiling AND both the
+                // TILE16 and TILE8 switches). The cost is 1.08x — one extra
+                // launch.
+                dev.launch_dot4_q80_f32act_gemv(
                     &buffers.activated_buf[layer_idx],
                     rocm_storage(wd.weight())?,
-                    Some(&buffers.layer_output[layer_idx]),
-                    dst_downcast(residual_dst)?,
+                    dst_downcast(&buffers.norm_buf[layer_idx])?,
                     batch.max(1),
                     wd.weight().shape().dim(0).unwrap_or(0),
                     ffn_k,
                 )
-                .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+                .map_err(|e| grim_core::error::Error::Backend(format!("down dot4: {e}")))?;
+                add_graph(
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    dst_downcast(residual_dst)?,
+                    dev,
+                )?;
             } else {
                 linear_into_named(
                     dev,
@@ -850,6 +1004,193 @@ pub(crate) fn prewarm_lane_weights_for(
     Ok(())
 }
 
+impl Llama {
+    /// The coverage table's QuantFormat axis lives in the emitted nodes; the
+    /// head launch is shared verbatim by capture and by the M2 interpreter.
+    fn head_graph(&self, graph: &mut DecodeGraph, dev: &Dev) -> Result<()> {
+        // Final norm + output head. Dispatch on kind exactly as the per-layer
+        // norms do: picking rms where the reference needs layer is the phi2
+        // bug, and the final norm is a second place it can happen.
+        let h_shape = graph.buffers.head_input.shape().clone();
+        let head_w = self
+            .norm
+            .device_weight(self.cfg.hidden_size)
+            .map_err(grim_core::error::Error::Tensor)?;
+        match self.norm.kind {
+            NormKind::Rms => {
+                dev.rms_norm_into(
+                    &graph.buffers.head_input,
+                    &**head_w.storage(),
+                    self.norm.eps,
+                    &graph.buffers.head_input,
+                    &h_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+            NormKind::LayerNorm => {
+                let b = self.norm.bias.as_ref().map(|x| x.storage());
+                dev.layer_norm_into(
+                    &graph.buffers.head_input,
+                    &**head_w.storage(),
+                    b.as_deref().map(|s| s.as_ref()),
+                    self.norm.eps,
+                    &graph.buffers.head_input,
+                    &h_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+        }
+
+        linear_into(
+            dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[0],
+        )?;
+        Ok(())
+    }
+
+    fn moe_graph_arm(&self, i: usize, graph: &mut DecodeGraph, dev: &Dev) -> Result<()> {
+        let Some(Some(moe_block)) = self.moe_blocks.get(i) else {
+            return Ok(());
+        };
+        let batch = graph.buffers.batch.max(1);
+        let act = &graph.buffers.act_q81_buf[i];
+        let ffn_shape = graph.buffers.layer_output[i].shape().clone();
+
+        // 1. FFN norm into staging
+        dev.rms_norm_into(
+            &graph.buffers.layer_output[i],
+            &**moe_block.ffn_norm.weight.storage(),
+            moe_block.ffn_norm.eps,
+            &graph.buffers.norm_buf[i],
+            &ffn_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        let normed: &Storage = &graph.buffers.norm_buf[i];
+
+        // 2. Router gate GEMV [batch, n_expert]
+        linear_into(
+            &dev,
+            normed,
+            moe_block.moe.router.gate.weight(),
+            &graph.buffers.moe_gate_logits[i],
+            act,
+        )?;
+
+        // 3. Top-K routing on-device
+        let num_experts = moe_block.moe.router.num_experts;
+        let top_k = moe_block.moe.router.top_k.min(num_experts).max(1);
+        let (route_mode, bias_rocm) = match moe_block.moe.router.kind {
+            grim_nn::moe::RouterKind::SoftmaxTopK
+            | grim_nn::moe::RouterKind::SoftmaxTopKRenorm => {
+                (moe_block.moe.router.softmax_route_mode(), None)
+            }
+            grim_nn::moe::RouterKind::SigmoidTopKWithBias => {
+                let b_rocm = moe_block.moe.router.correction_bias.as_ref().and_then(|b| {
+                    b.storage()
+                        .as_ref()
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                });
+                (2, b_rocm)
+            }
+        };
+
+        dev.moe_route_topk_on_device(
+            &graph.buffers.moe_gate_logits[i],
+            bias_rocm,
+            &graph.buffers.moe_route_tokens,
+            &graph.buffers.moe_route_experts,
+            &graph.buffers.moe_route_weights,
+            batch,
+            num_experts,
+            top_k,
+            route_mode,
+            // Mirrors the eager-GPU path: upstream's `norm_w`. A no-op for the
+            // renormalized softmax mode (route_mode 3 already sums to 1), but
+            // required for sigmoid gating.
+            moe_block.moe.router.renorm,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+        // 4. Resident scratch + stacked weights (cache hit after warmup)
+        let experts = (0..num_experts)
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: moe_block.moe.experts.gate[e].clone(),
+                up: moe_block.moe.experts.up[e].clone(),
+                down: moe_block.moe.experts.down[e].clone(),
+            })
+            .collect::<Vec<_>>();
+
+        // Global / layer charon cache: ensure resident weights
+        static CHARON_CACHES: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    usize,
+                    std::sync::Arc<crate::shared_moe::CharonCache>,
+                >,
+            >,
+        > = std::sync::OnceLock::new();
+        let caches = CHARON_CACHES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let cache = {
+            let mut guard = caches.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .entry(i)
+                .or_insert_with(|| {
+                    std::sync::Arc::new(crate::shared_moe::CharonCache::new())
+                })
+                .clone()
+        };
+
+        let (_, _, _, gate_buf, up_buf, down_buf) =
+            crate::shared_moe::ensure_charon_scratch(
+                dev.ordinal(),
+                batch,
+                top_k,
+                &experts,
+                &cache,
+            )?;
+
+        let norm_rocm = dst_downcast(normed)?;
+        dev.moe_fused_dispatch_resident_routing_into(
+            norm_rocm,
+            gate_buf.as_ref(),
+            up_buf.as_ref(),
+            down_buf.as_ref(),
+            &graph.buffers.moe_route_tokens,
+            &graph.buffers.moe_route_experts,
+            &graph.buffers.moe_route_weights,
+            batch * top_k,
+            &graph.buffers.moe_out[i],
+            self.cfg.hidden_size,
+            experts[0].gate.weight.shape().dim(0).unwrap_or(0),
+            moe_block.moe.routed_scaling_factor,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+        // 5. Residual add in place
+        add_graph(
+            &graph.buffers.layer_output[i],
+            &graph.buffers.moe_out[i],
+            &graph.buffers.layer_output[i],
+            &dev,
+        )?;
+
+        // Publish to next layer or head_input
+        let n_layers = graph.buffers.layer_input.len();
+        let dst: &Storage = if i + 1 < n_layers {
+            &graph.buffers.layer_input[i + 1]
+        } else {
+            &graph.buffers.head_input
+        };
+        publish_into(&dev, dst, &graph.buffers.layer_output[i])?;
+        Ok(())
+    }
+}
+
 impl DecodeGraphModel for Llama {
     /// Convert every K-quant linear to u4 lanes now (see prewarm_lane_weights).
     fn prewarm_lane_weights(&self) -> Result<()> {
@@ -879,14 +1220,13 @@ impl DecodeGraphModel for Llama {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
-        // int4 dense KV arenas historically miss a graph-safe i4 kernel pair; refuse
-        // capture (run.rs then uses the eager path, which is correct).
-        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4" | "int8" | "i8" | "q8")) {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph: quantized KV (int8/int4) graph path disabled (eager fallback)".into(),
-            ));
-        }
         let dev = dev_for_llama(self)?;
+        // Refuse capture for any arena whose DEVICE-TOTAL kernel pair does not
+        // exist. Asked of the resolved FORMAT, not of an env spelling list: a
+        // list has to be extended for every new format and answers a different
+        // question from the one that matters (the eager kernels exist for K2V4;
+        // the capturable pair does not).
+        refuse_uncapturable_kv_arena(&self.device)?;
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
@@ -936,7 +1276,13 @@ impl DecodeGraphModel for Llama {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
-        Ok(DecodeGraph::new(&dev, buffers, stream))
+        let ords: Vec<usize> = buffers.layer_devices.clone();
+        let mut graph = DecodeGraph::new(&dev, buffers, stream);
+        // A6: derive the per-device capture segments from the placement the
+        // buffers were allocated with. Single-device models get one segment
+        // and stay on the legacy single-graph path (split_capture() == false).
+        graph.set_layer_devices(&ords);
+        Ok(graph)
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
@@ -967,183 +1313,244 @@ impl DecodeGraphModel for Llama {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
 
+        // M2/PM-3 emitter (condition 1a): one node per model-level launch, only
+        // inside the capture bracket — warmups run this same code with
+        // capturing=false and must not push duplicate nodes. Each layer emits
+        // an ATTENTION block node plus its FFN node (GEMM, or MOE_DISPATCH when
+        // the layer is an MoE block); the per-launch refinement inside
+        // `forward_graph` is follow-on work.
+        let mut emit_last: u32 = u32::MAX;
+        if graph.emitter.is_some() && graph.capturing {
+            let seg0 = graph
+                .segments
+                .first()
+                .map(|s| s.device)
+                .unwrap_or(dev.ordinal());
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (
+                        graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                        graph.buffers.token_ids_dev.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        graph.buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                        graph.buffers.layer_input[0].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[],
+                seg0 as u8,
+            );
+        }
+
         // Forward all layers
         for (i, layer) in self.layers.iter().enumerate() {
             layer.forward_graph(i, &graph.buffers, &dev)?;
 
-            if let Some(Some(moe_block)) = self.moe_blocks.get(i) {
-                let act = &graph.buffers.act_q81_buf[i];
-                let ffn_shape = graph.buffers.layer_output[i].shape().clone();
-
-                // 1. FFN norm into staging
-                dev.rms_norm_into(
-                    &graph.buffers.layer_output[i],
-                    &**moe_block.ffn_norm.weight.storage(),
-                    moe_block.ffn_norm.eps,
-                    &graph.buffers.norm_buf[i],
-                    &ffn_shape,
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-                let normed: &Storage = &graph.buffers.norm_buf[i];
-
-                // 2. Router gate GEMV [batch, n_expert]
-                linear_into(
-                    &dev,
-                    normed,
-                    moe_block.moe.router.gate.weight(),
-                    &graph.buffers.moe_gate_logits[i],
-                    act,
-                )?;
-
-                // 3. Top-K routing on-device
-                let num_experts = moe_block.moe.router.num_experts;
-                let top_k = moe_block.moe.router.top_k.min(num_experts).max(1);
-                let (route_mode, bias_rocm) = match moe_block.moe.router.kind {
-                    grim_nn::moe::RouterKind::SoftmaxTopK => (0, None),
-                    grim_nn::moe::RouterKind::SoftmaxTopKRenorm => (3, None),
-                    grim_nn::moe::RouterKind::SigmoidTopKWithBias => {
-                        let b_rocm = moe_block.moe.router.correction_bias.as_ref().and_then(|b| {
-                            b.storage()
-                                .as_ref()
-                                .as_any()
-                                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            if graph.emitter.is_some() && graph.capturing {
+                let ord = dev.ordinal() as u8;
+                let blk = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::ATTENTION,
+                    [
+                        self.cfg.head_dim as u32,
+                        self.cfg.num_heads as u32,
+                        self.cfg.num_kv_heads as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[
+                        (
+                            graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.layer_input[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            graph.buffers.k_arena[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.k_arena[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                        ),
+                        (
+                            graph.buffers.v_arena[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.v_arena[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                        ),
+                        (
+                            graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                            graph.buffers.layer_output[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                    &[emit_last],
+                    ord,
+                );
+                emit_last = match self.moe_blocks.get(i) {
+                    // An MoE layer's FFN is the dispatch itself: routing triple
+                    // plus the per-layer output staging.
+                    Some(Some(moe_block)) => graph.emit_node(
+                        grim_backend_rocm::task_graph::op::MOE_DISPATCH,
+                        // params[0] = the expert banks' QuantFormat (the
+                        // coverage axis), params[5] = num_experts,
+                        // params[6] = top_k — the slots the ring's MOE
+                        // binding reads. The GEOMETRY slots stay 0: the node
+                        // is descriptive, and the ring refuses a node it
+                        // cannot bind (the same contract the FFN node
+                        // follows).
+                        {
+                            let mut p = [0u32; 16];
+                            p[0] = moe_block
+                                .moe
+                                .experts
+                                .gate
+                                .first()
+                                .map(|g| gemm_quant_param(g.weight()))
+                                .unwrap_or(0);
+                            p[5] = moe_block.moe.router.num_experts as u32;
+                            p[6] = moe_block.moe.router.top_k as u32;
+                            p
+                        },
+                        &[
+                            (
+                                graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                                graph.buffers.norm_buf[i].bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                            ),
+                            (
+                                graph.buffers.moe_gate_logits[i].device_ptr_u64().unwrap_or(0),
+                                graph.buffers.moe_gate_logits[i].bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                            ),
+                            (
+                                graph.buffers.moe_route_weights.device_ptr_u64().unwrap_or(0),
+                                graph.buffers.moe_route_weights.bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                            ),
+                            (
+                                graph.buffers.moe_out[i].device_ptr_u64().unwrap_or(0),
+                                graph.buffers.moe_out[i].bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                            ),
+                        ],
+                        &[blk],
+                        ord,
+                    ),
+                    // No FFN at all (embedding-only / ffn_disabled layers) —
+                    // nothing launched, so nothing to emit.
+                    _ if layer.ffn_disabled => blk,
+                    _ => {
+                        // The coverage table's QuantFormat axis: the FFN
+                        // node's GEMMs share the block's down-projection
+                        // weight format (gate/up/down are one checkpoint
+                        // quantization for every in-tree Llama).
+                        //
+                        // M4: this node also carries EXECUTABLE geometry —
+                        // the three operands the ring binds by role, plus
+                        // N/K/M in params[1..4]. `gemm_params_geom`'s N/K/M
+                        // are what make the node runnable rather than
+                        // descriptive; a node with no down projection stays
+                        // descriptive (N = 0), and the ring's plan builder
+                        // refuses any node it cannot bind.
+                        let ffn_geom = layer.w_down.as_ref().and_then(|d| {
+                            let weight = d.weight();
+                            let k = graph.buffers.activated_buf[i]
+                                .shape()
+                                .dims()
+                                .last()
+                                .copied()
+                                .unwrap_or(0) as u32;
+                            let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                            let m = graph.buffers.batch.max(1) as u32;
+                            let ws = rocm_storage(weight).ok()?;
+                            Some((
+                                gemm_params_geom(gemm_quant_param(weight), n, k, m),
+                                (
+                                    ws.device_ptr_u64().unwrap_or(0),
+                                    ws.bytes() as u64,
+                                    grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                                ),
+                            ))
                         });
-                        (2, b_rocm)
+                        let (ffn_params, ffn_weight_arg) = ffn_geom.unwrap_or((
+                            gemm_params(0, 0),
+                            (0u64, 0u64, grim_backend_rocm::task_graph::arg_role::SCRATCH),
+                        ));
+                        graph.emit_node(
+                            grim_backend_rocm::task_graph::op::GEMM,
+                            ffn_params,
+                            &[
+                                (
+                                    graph.buffers.activated_buf[i].device_ptr_u64().unwrap_or(0),
+                                    graph.buffers.activated_buf[i].bytes() as u64,
+                                    grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                                ),
+                                ffn_weight_arg,
+                                (
+                                    graph.buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                                    graph.buffers.norm_buf[i].bytes() as u64,
+                                    grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                                ),
+                            ],
+                            &[blk],
+                            ord,
+                        )
                     }
                 };
+            }
 
-                dev.moe_route_topk_on_device(
-                    &graph.buffers.moe_gate_logits[i],
-                    bias_rocm,
-                    &graph.buffers.moe_route_tokens,
-                    &graph.buffers.moe_route_experts,
-                    &graph.buffers.moe_route_weights,
-                    batch,
-                    num_experts,
-                    top_k,
-                    route_mode,
-                    false, // softmax mode already normalizes
-                )
-                .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
-
-                // 4. Resident scratch + stacked weights (cache hit after warmup)
-                let experts = (0..num_experts)
-                    .map(|e| crate::shared_moe::MoeExpert {
-                        gate: moe_block.moe.experts.gate[e].clone(),
-                        up: moe_block.moe.experts.up[e].clone(),
-                        down: moe_block.moe.experts.down[e].clone(),
-                    })
-                    .collect::<Vec<_>>();
-
-                // Global / layer charon cache: ensure resident weights
-                static CHARON_CACHES: std::sync::OnceLock<
-                    std::sync::Mutex<
-                        std::collections::HashMap<
-                            usize,
-                            std::sync::Arc<crate::shared_moe::CharonCache>,
-                        >,
-                    >,
-                > = std::sync::OnceLock::new();
-                let caches = CHARON_CACHES
-                    .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-                let cache = {
-                    let mut guard = caches.lock().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .entry(i)
-                        .or_insert_with(|| {
-                            std::sync::Arc::new(crate::shared_moe::CharonCache::new())
-                        })
-                        .clone()
-                };
-
-                let (_, _, _, gate_buf, up_buf, down_buf) =
-                    crate::shared_moe::ensure_charon_scratch(
-                        dev.ordinal(),
-                        batch,
-                        top_k,
-                        &experts,
-                        &cache,
-                    )?;
-
-                let norm_rocm = dst_downcast(normed)?;
-                dev.moe_fused_dispatch_resident_routing_into(
-                    norm_rocm,
-                    gate_buf.as_ref(),
-                    up_buf.as_ref(),
-                    down_buf.as_ref(),
-                    &graph.buffers.moe_route_tokens,
-                    &graph.buffers.moe_route_experts,
-                    &graph.buffers.moe_route_weights,
-                    batch * top_k,
-                    &graph.buffers.moe_out[i],
-                    hidden,
-                    experts[0].gate.weight.shape().dim(0).unwrap_or(0),
-                    moe_block.moe.routed_scaling_factor,
-                )
-                .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
-
-                // 5. Residual add in place
-                add_graph(
-                    &graph.buffers.layer_output[i],
-                    &graph.buffers.moe_out[i],
-                    &graph.buffers.layer_output[i],
-                    &dev,
-                )?;
-
-                // Publish to next layer or head_input
-                let n_layers = graph.buffers.layer_input.len();
-                let dst: &Storage = if i + 1 < n_layers {
-                    &graph.buffers.layer_input[i + 1]
-                } else {
-                    &graph.buffers.head_input
-                };
-                publish_into(&dev, dst, &graph.buffers.layer_output[i])?;
+            if self.moe_blocks.get(i).map_or(false, |m| m.is_some()) {
+                self.moe_graph_arm(i, graph, &dev)?;
             }
         }
 
-        // Final norm + output head. Dispatch on kind exactly as the per-layer
-        // norms do: picking rms where the reference needs layer is the phi2
-        // bug, and the final norm is a second place it can happen.
-        let h_shape = graph.buffers.head_input.shape().clone();
-        let head_w = self
-            .norm
-            .device_weight(self.cfg.hidden_size)
-            .map_err(grim_core::error::Error::Tensor)?;
-        match self.norm.kind {
-            NormKind::Rms => {
-                dev.rms_norm_into(
-                    &graph.buffers.head_input,
-                    &**head_w.storage(),
-                    self.norm.eps,
-                    &graph.buffers.head_input,
-                    &h_shape,
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-            }
-            NormKind::LayerNorm => {
-                let b = self.norm.bias.as_ref().map(|x| x.storage());
-                dev.layer_norm_into(
-                    &graph.buffers.head_input,
-                    &**head_w.storage(),
-                    b.as_deref().map(|s| s.as_ref()),
-                    self.norm.eps,
-                    &graph.buffers.head_input,
-                    &h_shape,
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-            }
+        self.head_graph(graph, &dev)?;
+        if graph.emitter.is_some() && graph.capturing {
+            let ord = dev.ordinal() as u8;
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::NORM,
+                [self.cfg.hidden_size as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[(
+                    graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                    graph.buffers.head_input.bytes() as u64,
+                    grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                )],
+                &[emit_last],
+                ord,
+            );
+            let _ = graph.emit_node(
+                grim_backend_rocm::task_graph::op::GEMM,
+                gemm_params(
+                    gemm_quant_param(self.output.weight()),
+                    self.cfg.vocab_size as u32,
+                ),
+                &[(
+                    graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                    graph.buffers.head_output.bytes() as u64,
+                    grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                )],
+                &[emit_last],
+                ord,
+            );
         }
-
-        linear_into(
-            &dev,
-            &graph.buffers.head_input,
-            self.output.weight(),
-            &graph.buffers.head_output,
-            &graph.buffers.act_q81_buf[0],
-        )?;
 
         Ok(())
     }
+
+    /// M2 extraction: the MoE FFN arm of `forward_capture`, so the interpreter
+    /// can dispatch a layer's block identically to what capture records.
+    /// No-op for a non-MoE layer.
 
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
         if !graph.is_captured {
@@ -1158,13 +1565,345 @@ impl DecodeGraphModel for Llama {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        // M5 Step 4: If ring_context is present or GRIM_TASK_RING is enabled and the model
+        // has a published task graph, dispatch via the persistent task ring executor.
+        if (std::env::var_os("GRIM_TASK_RING").is_some() || graph.ring_context.is_some())
+            && graph.buffers.emitted_task_graph.is_some()
+        {
+            if let Some(mut ring) = graph.ring_context.take() {
+                let res = self.forward_interpret_ir_ring(graph, token_id, &mut ring);
+                graph.ring_context = Some(ring);
+                res?;
+                return Ok(());
+            } else {
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(dev.ordinal());
+                if let Some(ir) = &graph.buffers.emitted_task_graph {
+                    if let Ok(Some(mut ring)) =
+                        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&rocm_dev, ir)
+                    {
+                        self.forward_interpret_ir_ring(graph, token_id, &mut ring)?;
+                        graph.ring_context = Some(ring);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        // The replay runs on the graph's POOL stream. The caller's first D2H is
+        // a synchronous `hipMemcpy`, stream-ordered on the NULL stream, which
+        // does NOT wait for that pool stream — so a logits readback raced
+        // kernels still in flight. Qwen35's `forward_replay` has synced every
+        // participating device since its split landed; Llama's never did,
+        // which is why its readbacks only stopped faulting under
+        // `AMD_SERIALIZE_KERNEL=3` — serialization was supplying the missing
+        // ordering. Sync the same device set Qwen35 syncs.
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        Ok(())
+    }
+
+    /// M2 interpreter (Llama): per-node dispatch through the same launchers
+    /// capture records. ELEMENTWISE -> embedding gather; ATTENTION -> the
+    /// layer's block launcher + its MoE arm; GEMM / MOE_DISPATCH / NORM nodes
+    /// are SERVED by those block/head launchers (the emitter emits one node
+    /// per logical stage, and Llama's launchers are block-granular — per-op
+    /// splitting of `forward_graph` is follow-on refinement, and the ledger
+    /// here is explicit about which nodes a launcher serves). A FALLBACK node
+    /// in the IR invokes the fallback contract: the whole step runs through
+    /// the ordinary launcher path (this walk with capture off).
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        self.interpret_ir(graph, token_id, None)
+    }
+
+    /// M4: the same walk with the GEMM nodes routed to the task ring.
+    fn forward_interpret_ir_ring(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: &mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    ) -> Result<()> {
+        self.interpret_ir(graph, token_id, Some(ring))
+    }
+
+    /// The shared IR walk. `ring = None` is the M2 route (GEMM nodes are served
+    /// by the block launchers and the head stage); `Some` routes each GEMM node
+    /// to the persistent wave instead — ONE launch for the whole set, with every
+    /// other node still on its launcher.
+    fn interpret_ir(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        mut ring: Option<&mut grim_backend_rocm::kernels::task_ring::TaskRingContext>,
+    ) -> Result<()> {
+        let Some(ir) = graph.buffers.emitted_task_graph.clone() else {
+            return Err(grim_core::error::Error::Backend(
+                "interpret: no published task graph; capture first".into(),
+            ));
+        };
+        let dev = dev_for_llama(self)?;
+        if ir
+            .caps
+            .opcodes
+            .contains(&grim_backend_rocm::task_graph::op::FALLBACK)
+        {
+            return self.forward_capture(graph, token_id);
+        }
+        let pos = graph.buffers.current_pos;
+        graph
+            .buffers
+            .write_pos_all_segments(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        let mut next_layer = 0usize;
+        let n_layers = self.layers.len();
+        // M4: which entry of the ring plan the next GEMM node takes. The plan is
+        // derived from THIS IR in node order, so the two counters walk together;
+        // a GEMM node the plan did not take simply has no plan slot.
+        let mut ring_idx = 0usize;
+        let mut ring_norm_idx = 0usize;
+        // M6: the cross-device handoff counter, same identity-match discipline.
+        let mut ring_peer_idx = 0usize;
+        // PM-6: the Q8_0 dot4 counter, same identity-match discipline.
+        let mut ring_dot4_idx = 0usize;
+        let trace = std::env::var_os("GRIM_IR_TRACE").is_some();
+        grim_backend_rocm::task_graph_exec::execute(&ir, |idx, node| {
+            match node.opcode {
+                grim_backend_rocm::task_graph::op::ELEMENTWISE => {
+                    // Feed THIS step's token, exactly as `forward_replay` does:
+                    // the gather reads `token_ids_dev` and capture is the only
+                    // thing that had ever written it. Without this the
+                    // interpreter re-embedded whatever token the last capture
+                    // recorded — bit-exact on step 0, wrong on every step
+                    // after it. Kept HERE (inside the ELEMENTWISE arm) rather
+                    // than hoisted above the walk: hoisting it moves this
+                    // write ahead of `write_pos_all_segments` and the oracle
+                    // then faults in the interpret arm (recorded in the plan).
+                    crate::lfm2_graph::write_embedding_to_buffer(
+                        &dev,
+                        &graph.buffers.token_ids_dev,
+                        token_id,
+                    )?;
+                    let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+                    let hidden = self.cfg.hidden_size;
+                    let batch = graph.buffers.batch.max(1);
+                    dev.launch_embedding_gather_dev_idx(
+                        w,
+                        &graph.buffers.layer_input[0],
+                        &graph.buffers.token_ids_dev,
+                        hidden,
+                        batch * hidden,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("interpret embed: {e}"))
+                    })?;
+                    Ok(())
+                }
+                grim_backend_rocm::task_graph::op::ATTENTION => {
+                    let i = next_layer;
+                    next_layer += 1;
+                    if i >= n_layers {
+                        return Err(grim_core::error::Error::Backend(format!(
+                            "interpret: IR has more ATTENTION nodes ({}) than layers ({n_layers})",
+                            i + 1
+                        )));
+                    }
+                    self.layers[i].forward_graph(i, &mut graph.buffers, &dev)?;
+                    if self.moe_blocks.get(i).map_or(false, |m| m.is_some()) {
+                        self.moe_graph_arm(i, graph, &dev)?;
+                    }
+                    Ok(())
+                }
+                // M4: with a ring context, the GEMM nodes go to the wave
+                // (ONE launch for the whole set); without one they are served
+                // by the block launcher (ATTENTION's dispatch) or by
+                // `head_graph` after the walk. MOE_DISPATCH and NORM have no
+                // per-node launcher here either way.
+                grim_backend_rocm::task_graph::op::GEMM => {
+                    if let Some(ring) = ring.as_mut() {
+                        // Match the node against the plan BY IDENTITY (its
+                        // emitter index), not by a count of GEMM nodes seen: a
+                        // GEMM the plan could not bind (the Q6_K head, say)
+                        // occupies no slot, so counting desyncs on the very first
+                        // skipped node.
+                        //
+                        // A node that is not the plan's next entry was SKIPPED
+                        // by the plan and stays on its launcher — skipping is the
+                        // plan's job, so it is not an error here. What would be
+                        // an error is the walk finishing without consuming the
+                        // plan exactly; that check runs after the walk.
+                        if let Some(g) = ring.plan().gemms.get(ring_idx) {
+                            if g.ir_node == idx {
+                                ring_idx += 1;
+                                ring.enqueue_gemm(&dev, g).map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "interpret ring: {e}"
+                                    ))
+                                })?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                grim_backend_rocm::task_graph::op::NORM => {
+                    // Same identity match as the GEMM arm. A NORM the plan could
+                    // not bind stays on the launcher — which for the head means
+                    // the norm still runs in `head_graph` below.
+                    if let Some(ring) = ring.as_mut() {
+                        match ring.norms().get(ring_norm_idx).copied() {
+                            Some(nrm) if nrm.ir_node == idx => {
+                                ring_norm_idx += 1;
+                                ring.enqueue_norm(&dev, &nrm).map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "interpret ring norm: {e}"
+                                    ))
+                                })?;
+                            }
+                            Some(nrm) => {
+                                return Err(grim_core::error::Error::Backend(format!(
+                                    "interpret ring: NORM node {idx} is not the plan's next \
+                                     entry ({}) — the IR and the ring plan disagree",
+                                    nrm.ir_node
+                                )));
+                            }
+                            // `None` means the plan has no further entries, so
+                            // THIS node was skipped by it. Skipping is the plan's
+                            // job, not an error; the after-walk check below is
+                            // what catches a plan entry that no node claimed.
+                            None => {}
+                        }
+                    }
+                    Ok(())
+                }
+                grim_backend_rocm::task_graph::op::MOE_DISPATCH => Ok(()),
+                // M6: the cross-device handoff. Identity-matched against the
+                // plan's `peers` exactly like the GEMM and NORM arms, so a node
+                // the plan could not bind (no PEER operand) stays on its
+                // launcher instead of being silently counted.
+                grim_backend_rocm::task_graph::op::PEER_COPY => {
+                    if let Some(ring) = ring.as_mut() {
+                        match ring.plan().peers().get(ring_peer_idx).copied() {
+                            Some(p) if p.ir_node == idx => {
+                                ring_peer_idx += 1;
+                                ring.enqueue_peer_copy(&dev, &p).map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "interpret ring peer copy: {e}"
+                                    ))
+                                })?;
+                            }
+                            Some(p) => {
+                                return Err(grim_core::error::Error::Backend(format!(
+                                    "interpret ring: PEER_COPY node {idx} is not the plan's next \
+                                     entry ({}) — the IR and the ring plan disagree",
+                                    p.ir_node
+                                )));
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(())
+                }
+                // PM-6: the Q8_0 dot4 GEMV. Identity-matched against the plan's
+                // `q8_dot4s` exactly like the GEMM and PEER_COPY arms, so a node
+                // the plan could not bind (a weight that is not Q8_0, a K that
+                // is not a whole number of 32-element blocks) stays on its
+                // launcher instead of being silently counted.
+                grim_backend_rocm::task_graph::op::Q8_0_DOT4 => {
+                    if let Some(ring) = ring.as_mut() {
+                        match ring.plan().q8_dot4s().get(ring_dot4_idx).copied() {
+                            Some(g) if g.ir_node == idx => {
+                                ring_dot4_idx += 1;
+                                ring.enqueue_q8_dot4(&dev, &g).map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "interpret ring q8_0 dot4: {e}"
+                                    ))
+                                })?;
+                            }
+                            Some(g) => {
+                                return Err(grim_core::error::Error::Backend(format!(
+                                    "interpret ring: Q8_0_DOT4 node {idx} is not the plan's next \
+                                     entry ({}) — the IR and the ring plan disagree",
+                                    g.ir_node
+                                )));
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(grim_core::error::Error::Backend(format!(
+                    "interpret: Llama cannot dispatch opcode {other} per node"
+                ))),
+            }?;
+            // A device fault is reported asynchronously, so a node boundary is
+            // only a location if the queue is drained at it. Opt-in (trace
+            // mode): without this, a fault inside node k's kernels is reported
+            // during node k+n's launches and the trace names the wrong node.
+            if trace {
+                dev.synchronize();
+            }
+            Ok(())
+        })?;
+        if next_layer != n_layers {
+            return Err(grim_core::error::Error::Backend(format!(
+                "interpret: dispatched {next_layer} layers but the model has {n_layers}                  — the IR does not describe this model's walk"
+            )));
+        }
+        // M4: the walk must have consumed the ring plan EXACTLY. Skipped nodes
+        // are fine; a plan entry no GEMM node claimed means the IR the plan was
+        // built from is not the IR that was walked.
+        if let Some(ring) = ring {
+            let want = ring.plan().len();
+            if ring_idx != want {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "interpret ring: the walk claimed {ring_idx} of {want} plan entries —                      the IR and the ring plan disagree"
+                )));
+            }
+            let want_n = ring.norms().len();
+            if ring_norm_idx != want_n {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "interpret ring: the walk claimed {ring_norm_idx} of {want_n} NORM plan \
+                     entries — the IR and the ring plan disagree"
+                )));
+            }
+            let want_p = ring.plan().peers().len();
+            if ring_peer_idx != want_p {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "interpret ring: the walk claimed {ring_peer_idx} of {want_p} PEER_COPY \
+                     plan entries — the IR and the ring plan disagree"
+                )));
+            }
+            let want_d = ring.plan().q8_dot4s().len();
+            if ring_dot4_idx != want_d {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "interpret ring: the walk claimed {ring_dot4_idx} of {want_d} Q8_0_DOT4 \
+                     plan entries — the IR and the ring plan disagree"
+                )));
+            }
+        }
+        self.head_graph(graph, &dev)?;
+        // Same seam `forward_replay` closes: the caller's first D2H is
+        // NULL-stream ordered and must not race these launches.
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -1268,6 +2007,7 @@ impl DecodeGraphModel for Llama {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -1323,6 +2063,14 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
 
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
         self.forward_replay(graph, token_id)
+    }
+
+    /// M5 (PM-5 gap): the LFM2's IR walk. The LFM2 used to publish NO task
+    /// graph at all — `lfm2_graph.rs`'s capture walk made no `emit_node`
+    /// calls — so the coverage table had no LFM2 row and the ring had nothing
+    /// to bind. The emitter and this walk land together.
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        self.lfm2_interpret_ir(graph, token_id)
     }
 
     fn eager_kv_seed_sources<'a>(
@@ -1415,13 +2163,111 @@ fn dev_for_qwen35(qwen: &Qwen35) -> Result<Arc<Dev>> {
     }
 }
 
+
+/// The ring dispatch for a recurrent (KDA) layer's KDA STEP.
+///
+/// The ring's `OP_RECURRENT` arm runs exactly what
+/// [`Qwen35Block::forward_graph_recurrent_kda`] runs — the short conv causal
+/// step, the batched gated delta rule and the head-norm gate — so the IR walk
+/// can dispatch the step to the ring INSTEAD of calling that method. Never
+/// both: the step is either the ring's or the block's.
+pub struct KdaRingDispatch<'a> {
+    /// The ring the step is dispatched to.
+    pub ring: &'a mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    /// The plan's entry for this layer's RECURRENT node.
+    pub entry: grim_backend_rocm::kernels::task_ring::TaskRingRecurrent,
+}
+
+/// Records each launch a block performs as its own IR node (M7.1).
+///
+/// The block's launches are named where they HAPPEN — at the call site,
+/// immediately after the launch — so the IR cannot drift from the walk: a
+/// launch that is not named is a launch the IR does not describe, and the
+/// node-count gate catches it.
+///
+/// The opcodes are the ones the RING can actually execute, and FALLBACK for
+/// the rest. A node the ring would run differently is a FALLBACK node, not a
+/// node wearing the wrong opcode: the ring's `OP_ATTENTION` arm is NOT the
+/// block's arena attention, and its `OP_NORM` arm fixes eps at 1e-5, so
+/// naming either for a launch that is not that arm would tell the ring to
+/// compute a DIFFERENT answer.
+///
+/// `deps` chains the nodes in launch order, so the IR is a total chain and
+/// the walk's dependency order is the launch order.
+pub struct LaunchEmitter<'a> {
+    emitter: &'a mut Option<grim_backend_rocm::task_graph::TaskGraphBuilder>,
+    /// The node the next launch depends on.
+    prev: u32,
+    /// The device ordinal the launches run on.
+    dev_ord: u8,
+    /// How many launches have been named.
+    pub count: usize,
+}
+
+impl<'a> LaunchEmitter<'a> {
+    /// A recorder over the graph's emitter, or `None` when emission is off.
+    pub fn new(
+        emitter: &'a mut Option<grim_backend_rocm::task_graph::TaskGraphBuilder>,
+        prev: u32,
+        dev_ord: u8,
+    ) -> Option<Self> {
+        if emitter.is_none() {
+            return None;
+        }
+        Some(Self {
+            emitter,
+            prev,
+            dev_ord,
+            count: 0,
+        })
+    }
+
+    /// Name one launch as its own node, chained to the previous one.
+    pub fn launch(
+        &mut self,
+        opcode: grim_backend_rocm::task_graph::OpCode,
+        params: [u32; 16],
+        args: &[(u64, u64, u8)],
+    ) {
+        // The FIRST node in a chain has no dependency. `u32::MAX` is the
+        // "no node" sentinel the emitter uses, and passing it as a
+        // dependency would index the node table out of bounds.
+        let deps: &[u32] = if self.prev == u32::MAX { &[] } else { &[self.prev] };
+        let node = grim_backend_rocm::decode_graph_buffers::emit_node_into(
+            self.emitter,
+            opcode,
+            params,
+            args,
+            deps,
+            self.dev_ord,
+        );
+        if node != u32::MAX {
+            self.prev = node;
+            self.count += 1;
+        }
+    }
+
+    /// The node the last launch produced — what the NEXT node depends on.
+    pub fn last(&self) -> u32 {
+        self.prev
+    }
+}
+
 impl Qwen35Block {
     /// Enqueue all kernels for this Qwen35 block into the decode graph bracket.
+    ///
+    /// M7.1: `emit` names each launch the block performs as its own IR
+    /// node, so the IR describes the walk EXACTLY rather than summarising a
+    /// whole block with one node. `None` is the production path (no
+    /// emission), and the launches are identical either way — the emitter
+    /// only RECORDS what the block already does.
     pub fn forward_graph(
         &self,
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
+        ring: Option<&mut KdaRingDispatch<'_>>,
+        mut emit: Option<&mut LaunchEmitter<'_>>,
     ) -> Result<()> {
         let batch = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
@@ -1436,6 +2282,37 @@ impl Qwen35Block {
             &h_shape,
         )
         .map_err(grim_core::error::Error::Tensor)?;
+        // M7.1: the norm is its own node. It is a NORM node only when the
+        // ring's arm would compute the SAME answer — and the ring's NORM arm
+        // fixes eps at 1e-5 (the Llama-family value), so a model whose
+        // epsilon differs is a FALLBACK node, not a NORM node wearing the
+        // wrong constant.
+        if let Some(e) = emit.as_deref_mut() {
+            let eps_ok = (self.attn_norm.eps - 1e-5).abs() < f32::EPSILON;
+            let opcode = if eps_ok {
+                grim_backend_rocm::task_graph::op::NORM
+            } else {
+                grim_backend_rocm::task_graph::op::FALLBACK
+            };
+            let m = batch as u32;
+            let k = h_shape.dims().last().copied().unwrap_or(0) as u32;
+            e.launch(
+                opcode,
+                [0, k, m, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (
+                        buffers.layer_input[layer_idx].device_ptr_u64().unwrap_or(0),
+                        buffers.layer_input[layer_idx].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                        buffers.norm_buf[layer_idx].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+            );
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
         let hd = self.head_dim;
@@ -1456,6 +2333,17 @@ impl Qwen35Block {
                     .map_err(|e| {
                         grim_core::error::Error::Backend(format!("qwen35 qkv quant: {e}"))
                     })?;
+                // M7.1: the quantize is its own node. The ring has no
+                // QUANTIZE arm, so it is a FALLBACK node — a node that
+                // names a launch the ring cannot run, which is exactly what
+                // the fallback contract says to emit.
+                if let Some(e) = emit.as_deref_mut() {
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::FALLBACK,
+                        [0u32; 16],
+                        &[],
+                    );
+                }
                 dev.launch_fused_qkv_dot4_into(
                     act,
                     &fused.storage,
@@ -1465,6 +2353,52 @@ impl Qwen35Block {
                     self.hidden_size,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 fused qkv: {e}")))?;
+                // M7.1: the fused QKV dot4 is a Q8_0_DOT4_F32ACT node — the
+                // ring's arm for the f32-activation Q8_0 GEMV, which is the
+                // variant this launch is (the activation is f32 and the arm
+                // quantizes it in registers).
+                //
+                // The geometry the arm needs is m rows of the activation, n
+                // output columns, k the reduction width — and the fused
+                // projection's n is `n_q + n_k + n_v` (the whole fused
+                // output), which is what the launch computes.
+                if let Some(e) = emit.as_deref_mut() {
+                    let n_out = (fused.n_q + fused.n_k + fused.n_v) as u32;
+                    // M7.4: the node carries the Q8_0 PATH CONTRACT — the
+                    // decision made ONCE (by the device) and read from the
+                    // SAME place the launcher reads it, so the IR and the
+                    // launcher cannot disagree about which path this
+                    // projection takes.
+                    let path = dev.q8_0_path_contract(self.hidden_size);
+                    let mut p = [0u32; 16];
+                    p[1] = n_out;
+                    p[2] = self.hidden_size as u32;
+                    p[3] = m as u32;
+                    p[grim_backend_rocm::task_graph::q8_0_path::PARAM_SLOT] = path;
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
+                        p,
+                        &[
+                            (
+                                act.device_ptr_u64().unwrap_or(0),
+                                act.bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                            ),
+                            (
+                                fused.storage.device_ptr_u64().unwrap_or(0),
+                                fused.storage.bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                            ),
+                            (
+                                buffers.fused_qkv_out[layer_idx]
+                                    .device_ptr_u64()
+                                    .unwrap_or(0),
+                                buffers.fused_qkv_out[layer_idx].bytes() as u64,
+                                grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                            ),
+                        ],
+                    );
+                }
 
                 let staged: &Storage = &buffers.fused_qkv_out[layer_idx];
                 dev.copy_slice_into(&buffers.q_buf[layer_idx], staged, 0, fused.n_q)
@@ -1479,6 +2413,17 @@ impl Qwen35Block {
                     fused.n_v,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the three slices are three FALLBACK nodes (the ring
+                // has no COPY arm; its OP_ADD is `out = a + b`, not a copy).
+                if let Some(e) = emit.as_deref_mut() {
+                    for _ in 0..3 {
+                        e.launch(
+                            grim_backend_rocm::task_graph::op::FALLBACK,
+                            [0u32; 16],
+                            &[],
+                        );
+                    }
+                }
             } else {
                 let wq = self.wq.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wq in full attention block".into())
@@ -1516,6 +2461,45 @@ impl Qwen35Block {
                     "attn.v",
                     layer_idx,
                 )?;
+                // M7.1: the three plain projections are three GEMM nodes —
+                // the ring's GEMM arm computes in f32, so a NATIVE weight is
+                // a node it can run, and a quantized one is a FALLBACK.
+                if let Some(e) = emit.as_deref_mut() {
+                    for w in [wq, wk, wv] {
+                        let weight = w.weight();
+                        let native = crate::decode_graph::rocm_storage(weight)
+                            .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                            .unwrap_or(false);
+                        let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                        let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                        e.launch(
+                            if native {
+                                grim_backend_rocm::task_graph::op::GEMM
+                            } else {
+                                grim_backend_rocm::task_graph::op::FALLBACK
+                            },
+                            [
+                                0,
+                                n,
+                                k,
+                                batch as u32,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                            &[],
+                        );
+                    }
+                }
             }
 
             // 3. Split the fused Q|gate. `q_buf` holds [Q | gate] at 2*q_dim;
@@ -1540,6 +2524,16 @@ impl Qwen35Block {
                 nh * hd,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 split gate: {e}")))?;
+            // M7.1: the two halves are two FALLBACK nodes (no COPY arm).
+            if let Some(e) = emit.as_deref_mut() {
+                for _ in 0..2 {
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::FALLBACK,
+                        [0u32; 16],
+                        &[],
+                    );
+                }
+            }
 
             // 3b. Optional per-head Q/K norm
             if let Some(qn) = &self.attn_q_norm {
@@ -1552,6 +2546,20 @@ impl Qwen35Block {
                     &qn_shape,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the per-head Q norm is its own node — a NORM node
+                // only when the ring's fixed 1e-5 epsilon is this model's.
+                if let Some(e) = emit.as_deref_mut() {
+                    let eps_ok = (qn.eps - 1e-5).abs() < f32::EPSILON;
+                    e.launch(
+                        if eps_ok {
+                            grim_backend_rocm::task_graph::op::NORM
+                        } else {
+                            grim_backend_rocm::task_graph::op::FALLBACK
+                        },
+                        [0, hd as u32, (batch * nh) as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        &[],
+                    );
+                }
             }
             if let Some(kn) = &self.attn_k_norm {
                 let kn_shape = Shape::new(vec![batch * nkv, hd]);
@@ -1563,6 +2571,19 @@ impl Qwen35Block {
                     &kn_shape,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the per-head K norm is its own node.
+                if let Some(e) = emit.as_deref_mut() {
+                    let eps_ok = (kn.eps - 1e-5).abs() < f32::EPSILON;
+                    e.launch(
+                        if eps_ok {
+                            grim_backend_rocm::task_graph::op::NORM
+                        } else {
+                            grim_backend_rocm::task_graph::op::FALLBACK
+                        },
+                        [0, hd as u32, (batch * nkv) as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        &[],
+                    );
+                }
             }
 
             // 4. RoPE. Partial rotary + NeoX half-split pairing, matching
@@ -1576,7 +2597,7 @@ impl Qwen35Block {
             let q3 = Shape::new(vec![batch, nh * steps, hd]);
             dev.rope_dev_base_into(
                 &buffers.q_head_buf[layer_idx],
-                &buffers.pos_dev,
+                buffers.pos_dev_for(dev.ordinal()),
                 &buffers.q_head_buf[layer_idx],
                 &rope_cfg,
                 &q3,
@@ -1584,11 +2605,20 @@ impl Qwen35Block {
                 steps,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+            // M7.1: the Q RoPE is its own node. The ring has no ROPE arm, so
+            // it is a FALLBACK node.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             let k3 = Shape::new(vec![batch, nkv * steps, hd]);
             dev.rope_dev_base_into(
                 &buffers.k_buf[layer_idx],
-                &buffers.pos_dev,
+                buffers.pos_dev_for(dev.ordinal()),
                 &buffers.k_buf[layer_idx],
                 &rope_cfg,
                 &k3,
@@ -1596,10 +2626,26 @@ impl Qwen35Block {
                 steps,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+            // M7.1: the K RoPE is its own node.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             // 5. KV append to arenas
             let kv_stride = nkv * hd;
-            let arena_slot_stride = buffers.max_ctx * kv_stride;
+            // Packed arenas address codes in BYTES (the i4 kernel packs two
+            // codes per byte, so its row stride is `kv_stride / 2`). int8 is
+            // 1 byte/elem so bytes == elements and the value is unchanged;
+            // int4 must pass the PACKED byte stride or every slot/row lands 2x
+            // too far. f32/f16 keep the element stride for the plain copy.
+            let arena_slot_stride = match buffers.kv_arena_packed_width() {
+                Some(4) => buffers.max_ctx * (nkv * (hd / 2)),
+                _ => buffers.max_ctx * kv_stride,
+            };
             let max_ctx = buffers.max_ctx;
             // Phase 3: bounds-check the RING row, not the absolute pos. With a
             // capped arena `current_pos` outgrows `max_ctx` by design once the
@@ -1620,11 +2666,29 @@ impl Qwen35Block {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
-            // Phase-2 int8 arenas take the quantizing append (u8 codes + one
-            // f32 scale per (row, kv_head)); f32/f16 take the plain copy. The
-            // decision comes from STORAGE, so the captured graph always
-            // matches what the arenas actually hold.
-            let arena_i8 = buffers.kv_arena_is_int8();
+            // Packed arenas take the quantizing append (codes + one f32 scale
+            // per (row, kv_head)); f32/f16 take the plain copy. The WIDTH comes
+            // from the arena, so the captured graph always matches what the
+            // arenas actually hold — and a width with no capturable pair is an
+            // error here rather than a silent fallthrough to the 8-bit kernels.
+            let packed_bits = buffers.kv_arena_packed_width();
+            match packed_bits {
+                None | Some(8) | Some(4) => {}
+                Some(bits) => {
+                    return Err(grim_core::error::Error::Backend(format!(
+                        "graph KV append: no device-total kernel pair for {bits}-bit KV codes (eager fallback)"
+                    )));
+                }
+            }
+            let arena_i8 = packed_bits == Some(8);
+            let arena_i4 = packed_bits == Some(4);
+            // The i4 kernels' per-row and per-head code terms are PACKED BYTES
+            // (`kv_stride/2`, `head_dim/2`), so the slot stride they receive
+            // must be the arena's BYTE extent. `arena_slot_stride` is ALREADY
+            // that byte extent for int4 (see the `Some(4)` arm above), so it is
+            // passed through unchanged — dividing by 2 here would halve it a
+            // second time and mis-place every non-zero batch slot.
+            let arena_slot_stride_packed = arena_slot_stride;
             if arena_i8 {
                 let scale_slot_stride = buffers.max_ctx * nkv;
                 for (src, dst, scales, tag) in [
@@ -1649,7 +2713,7 @@ impl Qwen35Block {
                     grim_backend_rocm::launch_kv_append_i8(
                         dev,
                         src,
-                        &buffers.pos_dev,
+                        &buffers.layer_totals[layer_idx],
                         dst,
                         sc,
                         kv_stride,
@@ -1665,12 +2729,22 @@ impl Qwen35Block {
                         grim_core::error::Error::Backend(format!("kv_append_i8 {tag}: {e}"))
                     })?;
                 }
+            } else if arena_i4 {
+                let scale_slot_stride = buffers.max_ctx * nkv;
+                for (src, dst, scales, tag) in [
+                    (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], &buffers.k_scale_arena, "k"),
+                    (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], &buffers.v_scale_arena, "v"),
+                ] {
+                    let sc = scales.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph kv_append_i4 {tag}: no scale sidecar for layer {layer_idx}")))?;
+                    grim_backend_rocm::launch_kv_append_i4(dev, src, &buffers.layer_totals[layer_idx], dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring)
+                        .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_i4 {tag}: {e}")))?;
+                }
             } else {
                 grim_backend_rocm::launch_kv_append_batch(
                     dev,
                     &buffers.k_arena[layer_idx],
                     &buffers.k_buf[layer_idx],
-                    &buffers.pos_dev,
+                    &buffers.layer_totals[layer_idx],
                     kv_stride,
                     steps,
                     batch,
@@ -1683,7 +2757,7 @@ impl Qwen35Block {
                     dev,
                     &buffers.v_arena[layer_idx],
                     &buffers.v_buf[layer_idx],
-                    &buffers.pos_dev,
+                    &buffers.layer_totals[layer_idx],
                     kv_stride,
                     steps,
                     batch,
@@ -1691,6 +2765,18 @@ impl Qwen35Block {
                     buffers.kv_ring,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+            }
+            // M7.1: the KV appends are their own nodes. There is ONE append
+            // launch per tensor (K and V), and the ring has no KV_APPEND arm,
+            // so they are FALLBACK nodes.
+            if let Some(e) = emit.as_deref_mut() {
+                for _ in 0..2 {
+                    e.launch(
+                        grim_backend_rocm::task_graph::op::FALLBACK,
+                        [0u32; 16],
+                        &[],
+                    );
+                }
             }
 
             // 6. Attention kernel
@@ -1716,7 +2802,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    &buffers.pos_dev,
+                    &buffers.layer_totals[layer_idx],
                     nh as u32,
                     nkv as u32,
                     hd as u32,
@@ -1725,10 +2811,10 @@ impl Qwen35Block {
                     1.0 / (hd as f32).sqrt(),
                     0,
                     0.0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     batch,
                     arena_slot_stride,
@@ -1738,6 +2824,26 @@ impl Qwen35Block {
                 .map_err(|e| {
                     grim_core::error::Error::Backend(format!("qkv_attention_dev_i8: {e}"))
                 })?;
+            } else if arena_i4 {
+                let scale_slot_stride = buffers.max_ctx * nkv;
+                let k_scales = buffers.k_scale_arena.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph attention_i4: no k scale sidecar for layer {layer_idx}")))?;
+                let v_scales = buffers.v_scale_arena.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph attention_i4: no v scale sidecar for layer {layer_idx}")))?;
+                grim_backend_rocm::launch_qkv_attention_dev_batch_i4(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    k_scales,
+                    &buffers.v_arena[layer_idx],
+                    v_scales,
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.layer_totals[layer_idx],
+                    nh as u32, nkv as u32, hd as u32, steps as u32, steps as u32,
+                    1.0 / (hd as f32).sqrt(), 0, 0.0,
+                    buffers.attn_dummy_for(dev.ordinal()), 0, 0, buffers.attn_dummy_for(dev.ordinal()), 0,
+                    batch, arena_slot_stride_packed, scale_slot_stride, buffers.kv_ring,
+                ).map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention_dev_i4: {e}")))?;
             } else {
                 grim_backend_rocm::launch_qkv_attention_dev_batch(
                     dev,
@@ -1747,7 +2853,7 @@ impl Qwen35Block {
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.attn_max_buf[layer_idx],
                     &buffers.attn_sum_buf[layer_idx],
-                    &buffers.pos_dev,
+                    &buffers.layer_totals[layer_idx],
                     nh as u32,
                     nkv as u32,
                     hd as u32,
@@ -1756,10 +2862,10 @@ impl Qwen35Block {
                     1.0 / (hd as f32).sqrt(),
                     0,
                     0.0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     0,
-                    &buffers.attn_dummy,
+                    buffers.attn_dummy_for(dev.ordinal()),
                     0,
                     batch,
                     arena_slot_stride,
@@ -1767,10 +2873,41 @@ impl Qwen35Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
             }
+            // M7.1: the attention is its own node — and a FALLBACK node, NOT
+            // an ATTENTION node. The ring's OP_ATTN arm is the flash-
+            // attention over (q, k, v, out) with a 256 head_dim limit; the
+            // block's attention is the ARENA attention (packed KV codes, per-
+            // head scales, a ring-bounded live row count). They are different
+            // computations, so a node naming this launch with the ring's
+            // ATTENTION opcode would tell the ring to compute a DIFFERENT
+            // answer — which is the failure mode the LFM2's FALLBACK nodes
+            // exist to avoid.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             // Bump pos_dev
-            grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
+            grim_backend_rocm::launch_bump_i32_slots(dev, buffers.pos_dev_for(dev.ordinal()), steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+            // D1-2a: the layer OWN total -- the append row index and the
+            // attention live-row count come from here, so a per-layer CurDKV
+            // compaction can reset it without touching the shared rope position.
+            grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.layer_totals[layer_idx], steps, batch)
+                .map_err(|e| grim_core::error::Error::Backend(format!("bump layer total: {e}")))?;
+            // D1: clamp the layer total to the ring capacity, reproducing the
+            // eager path reset of current_pos at the eviction boundary (no-op
+            // when the ring is unlimited).
+            grim_backend_rocm::launch_clamp_layer_total(
+                dev,
+                &buffers.layer_totals[layer_idx],
+                buffers.kv_ring.cap_rows,
+                batch,
+            )
+                .map_err(|e| grim_core::error::Error::Backend(format!("clamp total: {e}")))?;
 
             // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
             dev.sigmoid_mul_into(
@@ -1780,6 +2917,16 @@ impl Qwen35Block {
             .map_err(|e| {
                 grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid_mul: {e}"))
             })?;
+            // M7.1: the output gate is its own node — a FALLBACK node, since
+            // the ring's OP_ADD is `out = a + b` and this is
+            // `out = out * sigmoid(gate)`.
+            if let Some(e) = emit.as_deref_mut() {
+                e.launch(
+                    grim_backend_rocm::task_graph::op::FALLBACK,
+                    [0u32; 16],
+                    &[],
+                );
+            }
 
             // 7. Output projection (wo)
             let wo = self.wo.as_ref().ok_or_else(|| {
@@ -1792,140 +2939,137 @@ impl Qwen35Block {
                 &buffers.norm_buf[layer_idx],
                 act,
             )?;
+            // M7.1: the output projection is its own node — a GEMM node when
+            // the weight is NATIVE (the ring's GEMM arm computes in f32) and
+            // a FALLBACK node when it is quantized (the arm cannot run a
+            // quantized weight).
+            if let Some(e) = emit.as_deref_mut() {
+                let weight = wo.weight();
+                let native = crate::decode_graph::rocm_storage(weight)
+                    .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                    .unwrap_or(false);
+                let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                e.launch(
+                    if native {
+                        grim_backend_rocm::task_graph::op::GEMM
+                    } else {
+                        grim_backend_rocm::task_graph::op::FALLBACK
+                    },
+                    [
+                        0,
+                        n,
+                        k,
+                        batch as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[],
+                );
+            }
         } else {
             // KDA Recurrent layer forward pass inside captured HIP graph
-            let qkv_lin = self.attn_qkv.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing attn_qkv".into())
-            })?;
-            let alpha_lin = self.ssm_alpha.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_alpha".into())
-            })?;
-            let beta_lin = self.ssm_beta.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_beta".into())
-            })?;
-            let gate_lin = self.attn_gate.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing attn_gate (z)".into())
-            })?;
-            let conv_w = self.ssm_conv1d.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_conv1d".into())
-            })?;
-            if conv_w.storage().device_ptr().is_none() {
-                return Err(grim_core::error::Error::Backend(
-                    "ssm_conv1d weight lacks valid device pointer for graph capture".into(),
-                ));
-            }
-            let dt_bias_d = self.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_dt_bias_dev".into())
-            })?;
-            let ssm_a_d = self.ssm_a_dev.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_a_dev".into())
-            })?;
-            let ssm_norm_d = self.ssm_norm_dev.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("recurrent block missing ssm_norm_dev".into())
-            })?;
-            let kda_buf = buffers
-                .kda
-                .get(layer_idx)
-                .and_then(|o| o.as_ref())
-                .ok_or_else(|| {
-                    grim_core::error::Error::Backend(format!(
-                        "missing KDA graph buffers for layer {layer_idx}"
-                    ))
-                })?;
-
             // 1. Projections: QKV -> q_buf, alpha -> kda_alpha, beta -> kda_beta, gate (z) -> gate_buf
-            linear_into_named(
-                dev,
-                normed,
-                qkv_lin.weight(),
-                &buffers.q_buf[layer_idx],
-                act,
-                "kda.attn_qkv",
-                layer_idx,
-            )?;
-            linear_into_named(
-                dev,
-                normed,
-                alpha_lin.weight(),
-                &kda_buf.alpha,
-                act,
-                "kda.alpha",
-                layer_idx,
-            )?;
-            linear_into_named(
-                dev,
-                normed,
-                beta_lin.weight(),
-                &kda_buf.beta,
-                act,
-                "kda.beta",
-                layer_idx,
-            )?;
-            linear_into_named(
-                dev,
-                normed,
-                gate_lin.weight(),
-                &kda_buf.gate,
-                act,
-                "kda.attn_gate",
-                layer_idx,
-            )?;
+            self.forward_graph_recurrent_projections(layer_idx, buffers, dev, normed, act)?;
 
-            // 2. Short conv causal step into kda_buf.conv_out
-            if layer_idx >= buffers.sc_state.len() {
-                return Err(grim_core::error::Error::Backend(format!(
-                    "layer {layer_idx} >= sc_state {}",
-                    buffers.sc_state.len()
-                )));
+            // 2+3. The KDA STEP: the short conv causal step and the batched
+            // gated delta rule + head norm. This is EXACTLY what the ring's
+            // OP_RECURRENT arm does (the wave runs the same three device
+            // functions inline), so the IR walk dispatches EITHER this method
+            // OR the ring's node — never both.
+            match ring {
+                Some(dispatch) => {
+                    // The ring's wave does the step, on the RING's stream.
+                    dispatch
+                        .ring
+                        .enqueue_recurrent(dev, &dispatch.entry)
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "qwen35 ring recurrent step: {e}"
+                            ))
+                        })?;
+                    // The DEVICE waits for the step to land, before the output
+                    // projection reads the branch the step wrote. The wait is a
+                    // kernel on THIS stream that spins on the ring
+                    // descriptor's status — device-side, so the producer and
+                    // the consumer overlap instead of alternating.
+                    //
+                    // M7.1b: the wait's VERIFICATION (did the producer
+                    // actually run?) is DEFERRED to the end of the step. The
+                    // M7.0 A/B measured 2 blocking D2H/step here — one per
+                    // recurrent layer — and the megakernel arm came out 2.4x
+                    // SLOWER than the per-kernel path with bit-identical
+                    // output. A blocking D2H cannot complete until the device
+                    // has finished everything queued before it, so each one
+                    // drained the pipeline mid-step, with a whole layer of
+                    // work still to enqueue. This is the corpus's §9c
+                    // finding measured on grim's own hardware: "any
+                    // device-side chaining scheme that waits on completion at
+                    // fine granularity serialises, and the drains multiply
+                    // with the number of transfers per step."
+                    //
+                    // The ORDERING is unchanged: the wait kernel is still
+                    // launched on this stream, so the output projection
+                    // cannot read the branch before the recurrent step wrote
+                    // it. What moves is only the host read-back, which
+                    // becomes ONE per step instead of one per node.
+                    let slot = dispatch.ring.last_slot() as u32;
+                    let slots_ptr = dispatch.ring.slots_ptr().map_err(|e| {
+                        grim_core::error::Error::Backend(format!("qwen35 ring slots: {e}"))
+                    })?;
+                    dispatch
+                        .ring
+                        .wait_device_slot_deferred(
+                            dev,
+                            slots_ptr,
+                            slot,
+                            dispatch.ring.ring_wait_spins(),
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "qwen35 ring wait: {e}"
+                            ))
+                        })?;
+                }
+                None => self.forward_graph_recurrent_kda(layer_idx, buffers, dev)?,
             }
-            dev.short_conv1d_causal_step_into(
-                &buffers.q_buf[layer_idx],
-                conv_w.storage().as_ref(),
-                None,
-                &buffers.sc_state[layer_idx],
-                &kda_buf.conv_out,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
-
-            // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
-            let n_val_heads = self.cfg_ssm_num_value_heads();
-            let n_key_heads = self.cfg_ssm_num_key_heads();
-            let head_dim = self.cfg_ssm_head_dim();
-            let eps = self.attn_norm.eps;
-            dev.kda_gated_delta_rule_batched_into(
-                &kda_buf.conv_out,
-                &kda_buf.alpha,
-                &kda_buf.beta,
-                dt_bias_d.as_ref(),
-                ssm_a_d.as_ref(),
-                ssm_norm_d.as_ref(),
-                Some(&kda_buf.gate),
-                &kda_buf.state,
-                &kda_buf.acc_scratch,
-                &kda_buf.branch,
-                n_val_heads,
-                n_key_heads,
-                head_dim,
-                eps,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
 
             // 4. Output projection (ssm_out)
-            let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
-                grim_core::error::Error::Backend("missing ssm_out projection".into())
-            })?;
-            linear_into(
-                dev,
-                &kda_buf.branch,
-                out_proj.weight(),
-                &buffers.norm_buf[layer_idx],
-                act,
-            )?;
+            self.forward_graph_recurrent_out(layer_idx, buffers, dev, act)?;
         }
 
         // Destination for final block output (residual add writes directly into next layer or head_input)
+        // Crossing a device boundary: write DEVICE-LOCAL into `boundary_out`
+        // (task A3). The old behaviour copied straight into the next layer's
+        // buffer via p2p_memcpy_async INSIDE the capture — a cross-device op
+        // in one graph, which faults on replay. The replay driver (A4)
+        // performs the ordered copy OUTSIDE the graphs.
         let n_layers = buffers.layer_input.len();
-        let residual_dst: &Storage = if layer_idx + 1 < n_layers {
+        let crossing = layer_idx + 1 < n_layers
+            && buffers.layer_devices.get(layer_idx).copied()
+                != buffers.layer_devices.get(layer_idx + 1).copied();
+        let boundary_slot = if crossing {
+            Some(
+                buffers
+                    .boundary_index(layer_idx)
+                    .expect("device differs, so a boundary must exist"),
+            )
+        } else {
+            None
+        };
+        let residual_dst: &Storage = if crossing {
+            &buffers.boundary_out[boundary_slot.unwrap()]
+        } else if layer_idx + 1 < n_layers {
             &buffers.layer_input[layer_idx + 1]
         } else {
             &buffers.head_input
@@ -2022,17 +3166,104 @@ impl Qwen35Block {
             .unwrap_or(0);
         let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
 
+        let dst_storage = dst_downcast(residual_dst)?;
+        let _ = dst_storage.device_ordinal();
+        // A3: residual_dst is always device-local now (boundary writes land in
+        // `boundary_out` on THIS block's device), so the fused-down/add path
+        // can target it directly — no local staging detour.
+        let local_dst: &Storage = residual_dst;
+
         if use_fused_down {
-            dev.launch_dot4_q80_f32act_add_gemv(
+            // M7.3: the launcher STOPS FUSING. The fused launch did the
+            // integer dot and the residual add in one kernel; the IR has to
+            // name the dot4 as its own node (a Q8_0_DOT4_F32ACT node, which
+            // the ring CAN execute) and the add as its own (an ELEMENTWISE
+            // node, which it also can) — and a node's opcode must name the
+            // computation the ring would actually run.
+            //
+            // The decomposition is SAFE, and measured: the fused kernel's
+            // `C[out_idx] = res + facc[j]` and the split path's
+            // `dot4` then `grim_add` (`c[i] = a[i] + b[i]`) are the same f32
+            // add of the same values, and the gate
+            // `fused_decomposition_bit_exact` measures 0/4096 elements
+            // differing, under the default tiling AND both the TILE16 and
+            // TILE8 switches. The cost is 1.08x (46.8 -> 50.5 us on the
+            // 9B's down-projection shape) — one extra launch.
+            //
+            // The dot4 writes to the block's norm_buf (the same place the
+            // unfused path wrote it), and the add then folds the residual
+            // into it, exactly as the unfused path did.
+            dev.launch_dot4_q80_f32act_gemv(
                 &buffers.activated_buf[layer_idx],
                 rocm_storage(wd.weight())?,
-                Some(&buffers.layer_output[layer_idx]),
-                dst_downcast(residual_dst)?,
+                dst_downcast(&buffers.norm_buf[layer_idx])?,
                 batch.max(1),
                 wd.weight().shape().dim(0).unwrap_or(0),
                 ffn_k,
             )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("down dot4: {e}")))?;
+            add_graph(
+                &buffers.layer_output[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                dst_downcast(local_dst)?,
+                dev,
+            )?;
+            // M7.3: the two launches are two nodes — the dot4 (a
+            // Q8_0_DOT4_F32ACT node, ring-executable) and the residual add
+            // (an ELEMENTWISE node, ring-executable).
+            if let Some(e) = emit.as_deref_mut() {
+                let n = wd.weight().shape().dim(0).unwrap_or(0) as u32;
+                // M7.4: the node carries the Q8_0 PATH CONTRACT.
+                let path = dev.q8_0_path_contract(ffn_k);
+                let mut p = [0u32; 16];
+                p[1] = n;
+                p[2] = ffn_k as u32;
+                p[3] = batch.max(1) as u32;
+                p[grim_backend_rocm::task_graph::q8_0_path::PARAM_SLOT] = path;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::Q8_0_DOT4_F32ACT,
+                    p,
+                    &[
+                        (
+                            buffers.activated_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.activated_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            rocm_storage(wd.weight())?.device_ptr_u64().unwrap_or(0),
+                            rocm_storage(wd.weight())?.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::WEIGHT,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+                let elems = buffers.layer_output[layer_idx].shape().elem_count() as u32;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                    [elems, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            buffers.layer_output[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.layer_output[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            dst_downcast(local_dst)?.device_ptr_u64().unwrap_or(0),
+                            dst_downcast(local_dst)?.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+            }
         } else {
             linear_into(
                 dev,
@@ -2041,20 +3272,460 @@ impl Qwen35Block {
                 &buffers.norm_buf[layer_idx],
                 act,
             )?;
+            // M7.1: the FFN's down projection is its own node.
+            if let Some(e) = emit.as_deref_mut() {
+                let weight = self.ffn_down.weight();
+                let native = crate::decode_graph::rocm_storage(weight)
+                    .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                    .unwrap_or(false);
+                let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                e.launch(
+                    if native {
+                        grim_backend_rocm::task_graph::op::GEMM
+                    } else {
+                        grim_backend_rocm::task_graph::op::FALLBACK
+                    },
+                    [
+                        0,
+                        n,
+                        k,
+                        batch as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[],
+                );
+            }
 
-            // Residual 2 add: layer_output + ffn_out -> residual_dst
+            // Residual 2 add: layer_output + ffn_out -> local_dst
             add_graph(
                 &buffers.layer_output[layer_idx],
                 &buffers.norm_buf[layer_idx],
-                dst_downcast(residual_dst)?,
+                dst_downcast(local_dst)?,
                 dev,
             )?;
+            // M7.1: the residual add is its own node — an ELEMENTWISE node,
+            // which IS the ring's OP_ADD (`out = a + b`).
+            if let Some(e) = emit.as_deref_mut() {
+                let elems = buffers.layer_output[layer_idx].shape().elem_count() as u32;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                    [elems, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            buffers.layer_output[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.layer_output[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            dst_downcast(local_dst)?
+                                .device_ptr_u64()
+                                .unwrap_or(0),
+                            dst_downcast(local_dst)?.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+            }
         }
+
+        // A3: on a device boundary the residual already went into
+        // `boundary_out` (device-local, same device as this block's kernels)
+        // via `residual_dst`, so the write is single-device and the graph
+        // stays clean. The ordered peer copy into the next segment's
+        // `layer_input` happens OUTSIDE the graphs in the replay driver (A4).
+        // The old in-capture `p2p_memcpy_async` handoff is gone.
+
         Ok(())
     }
+
+    /// The recurrent (KDA) layer's PROJECTIONS — step 1 of the block's path.
+    ///
+    /// Split out so the IR walk can dispatch the KDA STEP to the ring between
+    /// these projections and the output projection. The capture path calls the
+    /// SAME method, so there is one implementation of the block's sequence —
+    /// duplicating it is how two entry points drift apart.
+    pub fn forward_graph_recurrent_projections(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+        normed: &Storage,
+        act: &RocmStorage,
+    ) -> Result<()> {
+        let qkv_lin = self.attn_qkv.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing attn_qkv".into())
+        })?;
+        let alpha_lin = self.ssm_alpha.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_alpha".into())
+        })?;
+        let beta_lin = self.ssm_beta.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_beta".into())
+        })?;
+        let gate_lin = self.attn_gate.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing attn_gate (z)".into())
+        })?;
+        let kda_buf = buffers
+            .kda
+            .get(layer_idx)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(format!(
+                    "missing KDA graph buffers for layer {layer_idx}"
+                ))
+            })?;
+        linear_into_named(
+            dev,
+            normed,
+            qkv_lin.weight(),
+            &buffers.q_buf[layer_idx],
+            act,
+            "kda.attn_qkv",
+            layer_idx,
+        )?;
+        linear_into_named(
+            dev,
+            normed,
+            alpha_lin.weight(),
+            &kda_buf.alpha,
+            act,
+            "kda.alpha",
+            layer_idx,
+        )?;
+        linear_into_named(
+            dev,
+            normed,
+            beta_lin.weight(),
+            &kda_buf.beta,
+            act,
+            "kda.beta",
+            layer_idx,
+        )?;
+        linear_into_named(
+            dev,
+            normed,
+            gate_lin.weight(),
+            &kda_buf.gate,
+            act,
+            "kda.attn_gate",
+            layer_idx,
+        )?;
+        Ok(())
+    }
+
+    /// The recurrent (KDA) layer's KDA STEP — steps 2 and 3 of the block's
+    /// path: the short conv causal step and the batched gated delta rule with
+    /// its head-norm gate.
+    ///
+    /// This is EXACTLY what the ring's `OP_RECURRENT` arm does (the wave runs
+    /// the same three device functions inline), so the IR walk can dispatch the
+    /// step to the ring INSTEAD of calling this — never both.
+    pub fn forward_graph_recurrent_kda(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+    ) -> Result<()> {
+        let conv_w = self.ssm_conv1d.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_conv1d".into())
+        })?;
+        if conv_w.storage().device_ptr().is_none() {
+            return Err(grim_core::error::Error::Backend(
+                "ssm_conv1d weight lacks valid device pointer for graph capture".into(),
+            ));
+        }
+        let dt_bias_d = self.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_dt_bias_dev".into())
+        })?;
+        let ssm_a_d = self.ssm_a_dev.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_a_dev".into())
+        })?;
+        let ssm_norm_d = self.ssm_norm_dev.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("recurrent block missing ssm_norm_dev".into())
+        })?;
+        let kda_buf = buffers
+            .kda
+            .get(layer_idx)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(format!(
+                    "missing KDA graph buffers for layer {layer_idx}"
+                ))
+            })?;
+
+        // 2. Short conv causal step into kda_buf.conv_out
+        if layer_idx >= buffers.sc_state.len() {
+            return Err(grim_core::error::Error::Backend(format!(
+                "layer {layer_idx} >= sc_state {}",
+                buffers.sc_state.len()
+            )));
+        }
+        dev.short_conv1d_causal_step_into(
+            &buffers.q_buf[layer_idx],
+            conv_w.storage().as_ref(),
+            None,
+            &buffers.sc_state[layer_idx],
+            &kda_buf.conv_out,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
+
+        // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
+        let n_val_heads = self.cfg_ssm_num_value_heads();
+        let n_key_heads = self.cfg_ssm_num_key_heads();
+        let head_dim = self.cfg_ssm_head_dim();
+        let eps = self.attn_norm.eps;
+        dev.kda_gated_delta_rule_batched_into(
+            &kda_buf.conv_out,
+            &kda_buf.alpha,
+            &kda_buf.beta,
+            dt_bias_d.as_ref(),
+            ssm_a_d.as_ref(),
+            ssm_norm_d.as_ref(),
+            Some(&kda_buf.gate),
+            &kda_buf.state,
+            &kda_buf.acc_scratch,
+            &kda_buf.branch,
+            n_val_heads,
+            n_key_heads,
+            head_dim,
+            eps,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
+        Ok(())
+    }
+
+    /// The recurrent (KDA) layer's OUTPUT PROJECTION — step 4 of the block's
+    /// path: `ssm_out` applied to the branch the KDA step produced.
+    ///
+    /// Split out because it is the step that must run AFTER the ring's
+    /// RECURRENT node: the branch it reads is written by the KDA step.
+    pub fn forward_graph_recurrent_out(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+        act: &RocmStorage,
+    ) -> Result<()> {
+        let kda_buf = buffers
+            .kda
+            .get(layer_idx)
+            .and_then(|o| o.as_ref())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(format!(
+                    "missing KDA graph buffers for layer {layer_idx}"
+                ))
+            })?;
+        let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
+            grim_core::error::Error::Backend("missing ssm_out projection".into())
+        })?;
+        linear_into(
+            dev,
+            &kda_buf.branch,
+            out_proj.weight(),
+            &buffers.norm_buf[layer_idx],
+            act,
+        )?;
+        Ok(())
+    }
+
 }
 
 // ─── DecodeGraphModel implementation for Qwen3.5 ───────────────────────────
+
+impl Qwen35 {
+
+    /// M6: the Qwen3.5 IR walk.
+    ///
+    /// The IR's RECURRENT nodes are dispatched to the task ring — the ring's
+    /// `OP_RECURRENT` arm runs the same three device functions the block's KDA
+    /// step runs (the short conv causal step, the batched gated delta rule and
+    /// the head-norm gate), so the step goes to the ring INSTEAD of the
+    /// block's method, never both.
+    ///
+    /// Every OTHER node goes through the model's ordinary launcher path for
+    /// that stage — the fallback contract the IR conversion relies on. The
+    /// ring's `OP_ATTENTION` arm is NOT the block's fused attention, and the
+    /// ring's `OP_NORM` fixes an epsilon the model does not, so dispatching
+    /// those would be a wrong answer, not a fast one.
+    fn qwen35_interpret_ir(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        mut ring: Option<&mut grim_backend_rocm::kernels::task_ring::TaskRingContext>,
+    ) -> Result<()> {
+        let dev = dev_for_qwen35(self)?;
+        // Every segment's pos scalar starts at this step's position.
+        let pos = graph.buffers.current_pos;
+        graph
+            .buffers
+            .write_pos_all_segments(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        // This step's token, exactly as `forward_replay` does it: the gather
+        // reads `token_ids_dev`, and only the capture ever wrote it. The pos
+        // write comes FIRST — that order is load-bearing on the interpret
+        // path (see the plan's M2 note on the interpreters' write order).
+        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        // The EMBEDDING GATHER. The walk runs the launchers instead of
+        // replaying a captured graph, so the gather that `forward_capture`
+        // RECORDS in the graph has to be LAUNCHED here. Without it the walk
+        // reads whatever the capture left in `layer_input[0]`: the same token
+        // at step 0 (so step 0 looks right) and a stale embedding from step 1
+        // on (so step 1 diverges by an order of magnitude). This is the same
+        // class of defect the M2 oracle found in Xing40 — a missing INPUT,
+        // not an IR-fidelity failure.
+        let emb_w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            emb_w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        // The ring's plan is derived from THIS IR, so its RECURRENT entries are
+        // in the IR's node order — the same order the recurrent layers appear
+        // in below.
+        //
+        // M7.1b: the step's deferred waits start from a ZEROED observation
+        // buffer, so a wait that never runs cannot inherit the previous
+        // step's "complete" and pass a step that never happened.
+        if let Some(r) = ring.as_ref() {
+            r.begin_step_waits(&dev).map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 ring begin waits: {e}"))
+            })?;
+        }
+        let mut recurrent_idx = 0usize;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let blk_ord = match block.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
+            let _guard = grim_backend_rocm::DeviceGuard::set(blk_ord as i32);
+            let mut dispatch = match ring.as_deref_mut() {
+                Some(r) if !block.is_full_attention => {
+                    let entry = r
+                        .plan()
+                        .recurrences()
+                        .get(recurrent_idx)
+                        .cloned()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend(format!(
+                                "qwen35 interpret: the ring bound no RECURRENT entry for layer {i}"
+                            ))
+                        })?;
+                    recurrent_idx += 1;
+                    Some(KdaRingDispatch { ring: r, entry })
+                }
+                _ => None,
+            };
+            block.forward_graph(i, &graph.buffers, &blk_dev, dispatch.as_mut(), None)?;
+        }
+        if ring.is_some() && recurrent_idx == 0 {
+            return Err(grim_core::error::Error::Backend(
+                "qwen35 interpret: the ring took no RECURRENT node — the IR has no recurrent layer".into(),
+            ));
+        }
+
+        // The head: the final norm and the output projection, on the LAST
+        // segment's device (the head must live in the last segment's graph).
+        let last_ord = match self.output.weight().device() {
+            grim_tensor::Device::Rocm(o) => *o,
+            _ => dev.ordinal(),
+        };
+        let last_dev = grim_backend_rocm::RocmDevice::shared(last_ord);
+        {
+            let _guard = grim_backend_rocm::DeviceGuard::set(last_ord as i32);
+            self.forward_graph_head(graph, &last_dev)?;
+        }
+
+        // The devices the step touched.
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        if !ords.contains(&last_ord) {
+            ords.push(last_ord);
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+
+        // M7.1b: the deferred wait's VERIFICATION, read back ONCE for the
+        // whole step — after the synchronise above, so the copy finds the
+        // device idle rather than draining a live pipeline. The status is 2
+        // (ST_COMPLETE) when the wait saw the descriptor finish, and 0
+        // (ST_PENDING) when the spin ran out, which means the producer never
+        // ran and the step read stale data.
+        //
+        // The verification is per-STEP rather than per-node, and the trade is
+        // deliberate: a timeout is now reported at the end of the step
+        // rather than at the layer that caused it. A decode step either
+        // produces usable logits or it does not, so the step is the right
+        // granularity — and it is the granularity that removes the drain the
+        // M7.0 A/B measured.
+        if let Some(r) = ring.as_ref() {
+            let observed = r.verify_waits().map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 ring wait verify: {e}"))
+            })?;
+            if observed != 2 {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "qwen35 ring recurrent step did not complete (status {observed})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The final norm and the output projection (the head).
+    ///
+    /// Split out of `forward_capture` so the IR walk and the capture path run
+    /// the SAME two launches — the head is where a duplicated entry point
+    /// would show up first, because its output is the logits.
+    fn forward_graph_head(
+        &self,
+        graph: &DecodeGraph,
+        last_dev: &grim_backend_rocm::RocmDevice,
+    ) -> Result<()> {
+        let h_shape = graph.buffers.head_input.shape().clone();
+        last_dev
+            .rms_norm_into(
+                &graph.buffers.head_input,
+                &**self.output_norm.weight.storage(),
+                self.output_norm.eps,
+                &graph.buffers.head_input,
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        linear_into(
+            last_dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
+        )?;
+        Ok(())
+    }
+}
 
 impl DecodeGraphModel for Qwen35 {
     /// Convert every K-quant linear's weight to u4 lanes NOW, so the first
@@ -2137,8 +3808,8 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
-        // int4 dense KV arenas still have no graph-safe i4 kernel pair; refuse
-        // capture (run.rs then uses the eager path, which is correct).
+        // Refuse capture for any arena whose DEVICE-TOTAL kernel pair does not
+        // exist. Asked of the resolved FORMAT, not of an env spelling list.
         //
         // int8 IS allowed: `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8`
         // are the captured pair, and they are gated by
@@ -2146,11 +3817,7 @@ impl DecodeGraphModel for Qwen35 {
         // grim-backend-rocm/tests/qkv_attention.rs. That test is what caught the
         // launcher's argument-order defect (it wrote attention output into the
         // scale sidecar and faulted) before capture was enabled.
-        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4")) {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph: int4 KV has no dedicated graph kernel pair (eager fallback)".into(),
-            ));
-        }
+        refuse_uncapturable_kv_arena(&self.device)?;
         // A per-layer KV budget table (`GRIM_KV_ARENA_ROWS=4096,2048,...`) cannot
         // be honored by the graph, which captures ONE ring for every layer:
         // replay would clamp every layer to a single cap. Refuse so the caller
@@ -2163,45 +3830,47 @@ impl DecodeGraphModel for Qwen35 {
                 ));
             }
         }
-        // CurDKV survivor selection runs a host compaction pass that rewrites
-        // `current_pos`; the captured graph bakes `total_dev` as a device
-        // scalar it bumps itself, so it cannot observe the reset. Refuse.
-        if crate::qwen35::parse_evict_mode_env(
-            std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref(),
-        ) == crate::qwen35::EvictionMode::Curdkv
-        {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph: GRIM_KV_EVICT_MODE=curdkv needs the host compaction pass (eager \
-                 fallback)"
-                    .into(),
-            ));
-        }
+        // D1: the CurDKV refusal is GONE. The host pass at the eviction
+        // boundary resets `current_pos` to the retained count; the graph
+        // reproduces that with a captured per-layer clamp node
+        // (`grim_kv_clamp_total`) launched right after each layer's total bump,
+        // so the ring's absolute row sequence matches eager exactly. The host
+        // pass's leverage selection is a no-op at these budgets (n_tokens ==
+        // live == cap == budget -> "keep everything"), so there is no survivor
+        // gather to reproduce; the ring's clamped prefix IS the live set.
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
             ));
         }
-        // The decode graph is recorded on ONE device (`dev_for_qwen35` = the
-        // model's nominal device). A layer-split model has blocks whose weights
-        // and eager KV arenas live on another GPU; recording their kernels into
-        // this device's graph — and seeding the graph arenas from cross-device
-        // eager arenas — dereferences foreign memory. That is the `Page not
-        // present` fault at the first decode step: `seed_kv_arena_from_eager`
-        // issues `hipMemcpyAsync(dst=graph_arena_on_dev0, src=eager_arena_on_dev1)`
-        // on dev0's stream for every layer on dev1. Refuse here so the caller
-        // stays on the eager path, which moves the hidden state per block
-        // explicitly and is correct across devices.
-        let multi_device = match self.blocks.first() {
-            Some(first) => self.blocks.iter().any(|b| b.device != first.device),
-            None => false,
-        };
-        if multi_device {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph is single-device; this model is layer-split across \
-                 multiple GPUs — using eager"
-                    .into(),
-            ));
-        }
+        // SINGLE-DEVICE ONLY. A HIP graph is recorded on ONE device's stream,
+        // and ROCm cannot capture a kernel launched on a DIFFERENT device into
+        // it: the launch is accepted during capture but the node faults on
+        // replay. That is the `Page not present` on the first decode step of a
+        // layer-split model, and it is reproducible in ~30 lines — see
+        // `crates/grim-backend-rocm/examples/p2p_graph_probe.rs` (one `add_into`
+        // on device 1 captured while device 0's stream captures → fault on
+        // GPU node-1). Peer access does NOT help: `enable_peer_access` succeeds
+        // both ways on this box (Pcie class) and the fault still occurs, because
+        // the failure is the capture/replay device mismatch, not pointer
+        // reachability. Enabling P2P and hoping is what produced a crash for
+        // every arena format (f16 included, which uses no packed KV kernel).
+        //
+        // Refuse here so the caller stays on the eager path, which moves the
+        // hidden state per block explicitly and IS correct across devices. On a
+        // two-GPU split eager is also FASTER than a single-GPU graph (two cards
+        // share the weight GEMV), so this costs no throughput. Making the graph
+        // work on a split model needs ONE GRAPH PER DEVICE with the boundary
+        // hidden state handed off between replays — a feature, not a flag.
+        // A6: the single-device refusal is GONE. A layer-split model now
+        // captures ONE GRAPH PER DEVICE (task A2): `set_layer_devices` below
+        // derives the per-device segments, `begin_capture` opens segment 0,
+        // `forward_capture` advances each interior boundary, `end_capture`
+        // closes the last, and `replay_chain` hands the hidden state across
+        // with an ordered peer copy (A4). Legacy single-device graphs never
+        // see any of it (segments stay on the legacy path).
+        // (A6: the placement the buffers were allocated with drives
+        // set_layer_devices below — see the DecodeGraph::new call site.)
         let dev = dev_for_qwen35(self)?;
         let stream = dev
             .get_stream_from_pool(0)
@@ -2262,8 +3931,17 @@ impl DecodeGraphModel for Qwen35 {
         // their branch to `KdaLayerBuffers::branch` at value_dim — so it gets
         // the true `q_dim`. See `attn_out_buf`'s doc for the two references.
         let n_attn_out = self.cfg.num_heads * self.cfg.head_dim;
-        let mut buffers = DecodeGraphBuffers::allocate(
+        let layer_devices: Vec<usize> = self
+            .blocks
+            .iter()
+            .map(|b| match b.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            })
+            .collect();
+        let mut buffers = DecodeGraphBuffers::allocate_with_layer_devices(
             &dev,
+            Some(&layer_devices),
             self.blocks.len(),
             hidden,
             n_q,
@@ -2279,6 +3957,7 @@ impl DecodeGraphModel for Qwen35 {
             0,
             sc_h_dim,
             sc_l_cache,
+            0,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
@@ -2293,14 +3972,44 @@ impl DecodeGraphModel for Qwen35 {
         {
             use grim_backend_rocm::RocmStorage;
             let kv_dt = crate::qwen35::kv_arena_dtype(&self.device);
+            let fmt = crate::qwen35::kv_arena_format_qwen(&self.device);
+            // The capture dispatch reads this to pick a device-total kernel
+            // pair. Recorded from the RESOLVED FORMAT: the arena's shape cannot
+            // tell 8-bit codes from 4-bit ones (its innermost axis is a head's
+            // BYTE count), so the width has to be carried, not inferred.
+            buffers.kv_arena_bits = match fmt {
+                grim_backend_rocm::KvArenaFormat::Int8 => Some(8),
+                grim_backend_rocm::KvArenaFormat::Int4 => Some(4),
+                grim_backend_rocm::KvArenaFormat::Int2V4 => Some(2),
+                _ => None,
+            };
             if kv_dt.arith != grim_tensor::ArithType::F32 {
+                // Packed formats store MULTIPLE codes per byte, so the arena's
+                // trailing dim is the PACKED row extent in bytes, not the f32
+                // element extent. The seeder asserts graph-arena last dim ==
+                // the eager arena's packed kv_stride; a full-width graph arena
+                // fails the seed loud (good) but also doubles every row a
+                // byte-extent kernel indexes (silent). int8 is 1 byte/elem
+                // (no-op); int4 packs 2 codes/byte; int2v4's allocation takes
+                // its wider side (V, 2 codes/byte) per the format's row_bytes.
+                let packed_factor: f64 = match fmt {
+                    grim_backend_rocm::KvArenaFormat::Int4
+                    | grim_backend_rocm::KvArenaFormat::Int2V4 => 0.5,
+                    _ => 1.0,
+                };
                 for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
-                    let shape = arena.shape().clone();
+                    let mut dims = arena.shape().dims().to_vec();
+                    if let Some(last) = dims.last_mut() {
+                        *last = ((*last as f64) * packed_factor) as usize;
+                    }
+                    let shape = grim_tensor::Shape::from_slice(&dims);
+                    let arena_ord = arena.device_ordinal();
+                    let arena_dev = grim_backend_rocm::RocmDevice::shared(arena_ord);
                     let narrowed = RocmStorage::alloc_gpu(
                         &shape,
                         kv_dt.clone(),
-                        &dev.allocator_handle(),
-                        dev.ordinal(),
+                        &arena_dev.allocator_handle(),
+                        arena_ord,
                     )
                     .map_err(|e| {
                         grim_core::error::Error::Backend(format!(
@@ -2308,14 +4017,16 @@ impl DecodeGraphModel for Qwen35 {
                             kv_dt.arith
                         ))
                     })?;
+                    let _ = arena_dev.launch_memset_u8(&narrowed, 0, narrowed.bytes());
                     *arena = narrowed;
                 }
             }
-            // int8 codes need their f32 scale sidecars before capture.
+            // Packed codes need their f32 scale sidecars before capture. One f32
+            // per (row, kv head) per side — the same layout at every width.
             if kv_dt.arith == grim_tensor::ArithType::U8 {
                 let n_kv = self.cfg.num_kv_heads;
-                buffers.allocate_int8_kv_scales(&dev, n_kv).map_err(|e| {
-                    grim_core::error::Error::Backend(format!("graph int8 scales: {e}"))
+                buffers.allocate_packed_kv_scales(&dev, n_kv).map_err(|e| {
+                    grim_core::error::Error::Backend(format!("graph packed KV scales: {e}"))
                 })?;
             }
             // Phase 3: publish the ring so the Qwen35 capture sites bake the
@@ -2367,11 +4078,16 @@ impl DecodeGraphModel for Qwen35 {
                     .unwrap_or(kda_conv)
             };
             if width != n_q && width > 0 {
+                let blk_ord = match block.device {
+                    grim_tensor::Device::Rocm(ord) => ord,
+                    _ => dev.ordinal(),
+                };
+                let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
                 buffers.q_buf[layer_idx] = grim_backend_rocm::RocmStorage::alloc_gpu(
                     &Shape::new(vec![batch, width]),
                     dt.clone(),
-                    &dev.allocator_handle(),
-                    dev.ordinal(),
+                    &blk_dev.allocator_handle(),
+                    blk_ord,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("q_buf layer alloc: {e}")))?;
             }
@@ -2383,14 +4099,90 @@ impl DecodeGraphModel for Qwen35 {
             let d_state = self.cfg.ssm_d_state;
             for (layer_idx, block) in self.blocks.iter().enumerate() {
                 if !block.is_full_attention {
+                    let blk_ord = match block.device {
+                        grim_tensor::Device::Rocm(ord) => ord,
+                        _ => dev.ordinal(),
+                    };
+                    let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
                     buffers.allocate_kda_layer(
-                        &dev, layer_idx, batch, n_val, n_key, d_state, kda_conv,
+                        &blk_dev, layer_idx, batch, n_val, n_key, d_state, kda_conv,
                     )?;
                 }
             }
         }
 
-        Ok(DecodeGraph::new(&dev, buffers, stream))
+        let ords: Vec<usize> = buffers.layer_devices.clone();
+        let mut graph = DecodeGraph::new(&dev, buffers, stream);
+
+        // M5: stage the per-recurrent-layer KDA descriptors OUTSIDE the capture
+        // bracket. An H2D copy inside capture poisons it — measured: the emitter
+        // doing this produced `hipMemcpyHostToDevice ... error code 906`. The
+        // KDA buffers above are allocated in the same (non-capturing) place.
+        //
+        // Indexed by LAYER (None for attention layers), so the emitter can look
+        // one up by the layer it is emitting.
+        let mut kda_desc_ptrs: Vec<Option<u64>> = vec![None; self.blocks.len()];
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            if block.is_full_attention {
+                continue;
+            }
+            let Some(kda) = graph.buffers.kda.get(layer_idx).and_then(|k| k.as_ref()) else {
+                continue;
+            };
+            let blk_ord = match block.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
+            let conv_w = block.ssm_conv1d.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no short-conv weight"))
+            })?;
+            let cw = dst_downcast(conv_w.storage().as_ref())?;
+            let dims = cw.shape().dims();
+            let dt_bias = block.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no dt.bias"))
+            })?;
+            let ssm_a = block.ssm_a_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no ssm_a"))
+            })?;
+            let ssm_norm = block.ssm_norm_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("layer {layer_idx} has no ssm_norm"))
+            })?;
+            let desc = grim_backend_rocm::scythe_task_descriptors::KdaTaskDescriptor {
+                conv_in: graph.buffers.q_buf[layer_idx].device_ptr_u64().unwrap_or(0),
+                conv_w: cw.device_ptr_u64().unwrap_or(0),
+                conv_bias: 0,
+                conv_state: graph.buffers.sc_state[layer_idx].device_ptr_u64().unwrap_or(0),
+                conv_out: kda.conv_out.device_ptr_u64().unwrap_or(0),
+                alpha: kda.alpha.device_ptr_u64().unwrap_or(0),
+                beta: kda.beta.device_ptr_u64().unwrap_or(0),
+                dt_bias: dst_downcast(dt_bias.as_ref())?.device_ptr_u64().unwrap_or(0),
+                ssm_a: dst_downcast(ssm_a.as_ref())?.device_ptr_u64().unwrap_or(0),
+                ssm_norm: dst_downcast(ssm_norm.as_ref())?.device_ptr_u64().unwrap_or(0),
+                gate: kda.gate.device_ptr_u64().unwrap_or(0),
+                state: kda.state.device_ptr_u64().unwrap_or(0),
+                acc: kda.acc_scratch.device_ptr_u64().unwrap_or(0),
+                branch: kda.branch.device_ptr_u64().unwrap_or(0),
+                num_v: kda.num_val_heads as u32,
+                num_k: kda.num_key_heads as u32,
+                head_dim: kda.head_dim as u32,
+                batch: graph.buffers.batch.max(1) as u32,
+                channels: dims.first().copied().unwrap_or(0) as u32,
+                kernel_size: dims.get(1).copied().unwrap_or(0) as u32,
+                eps: block.attn_norm.eps,
+                has_z: 1,
+            };
+            kda_desc_ptrs[layer_idx] = Some(
+                desc.upload(&blk_dev)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("kda desc: {e}")))?,
+            );
+        }
+        graph.kda_desc_ptrs = kda_desc_ptrs;
+        // A6: derive the per-device capture segments from the placement the
+        // buffers were allocated with. Single-device models get one segment
+        // and stay on the legacy single-graph path (split_capture() == false).
+        graph.set_layer_devices(&ords);
+        Ok(graph)
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
@@ -2421,31 +4213,206 @@ impl DecodeGraphModel for Qwen35 {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
 
-        // Forward all layers
-        for (i, block) in self.blocks.iter().enumerate() {
-            block.forward_graph(i, &graph.buffers, &dev)?;
+        // M1/M2 emitter: one node per model-level launch, only during the
+        // capture bracket (warmups run the same code with capturing=false and
+        // must not push duplicate nodes). Each layer emits a block node
+        // (ATTENTION or RECURRENT) plus a GEMM node for its dense FFN; the
+        // per-launch refinement inside forward_graph is follow-on work.
+        let mut emit_last: u32 = u32::MAX;
+        if graph.emitter.is_some() && graph.capturing {
+            let seg0 = graph.segments.first().map(|s| s.device).unwrap_or(dev.ordinal());
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.token_ids_dev.bytes() as u64, 1),
+                    (graph.buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_input[0].bytes() as u64, 2),
+                ],
+                &[],
+                seg0 as u8,
+            );
         }
 
-        // Final norm + output head
-        let h_shape = graph.buffers.head_input.shape().clone();
-        dev.rms_norm_into(
-            &graph.buffers.head_input,
-            &**self.output_norm.weight.storage(),
-            self.output_norm.eps,
-            &graph.buffers.head_input,
-            &h_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        // Forward all layers
+        for (i, block) in self.blocks.iter().enumerate() {
+            let blk_ord = match block.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            };
+            let blk_dev = grim_backend_rocm::RocmDevice::shared(blk_ord);
+            let _guard = grim_backend_rocm::DeviceGuard::set(blk_ord as i32);
+            if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+                eprintln!("[graph-trace] layer {i}/{} on rocm:{blk_ord} (capturing={})", self.blocks.len(), graph.capturing);
+            }
+            // M7.1: the attention block names each of its launches as its own
+            // node, so the IR describes the walk exactly. The emitter is
+            // created here (it needs the graph's builder) and handed to the
+            // block, which names each launch WHERE it happens.
+            let is_attn = (i + 1) % self.cfg.full_attention_interval.max(1) == 0;
+            // The per-launch nodes are emitted ONLY during the capture
+            // bracket, like every other node: the warm-up calls run the same
+            // code with capturing=false, and a node pushed there would land
+            // in the IR before the embedding gather — a graph whose first
+            // node is not its first launch.
+            let mut emitter = if is_attn && graph.capturing {
+                LaunchEmitter::new(&mut graph.emitter, emit_last, blk_ord as u8)
+            } else {
+                None
+            };
+            block.forward_graph(i, &graph.buffers, &blk_dev, None, emitter.as_mut())?;
+            if let Some(e) = emitter.as_ref() {
+                emit_last = e.last();
+            }
+            if graph.emitter.is_some() && graph.capturing && !is_attn {
+                // The RECURRENT layer keeps its summary node: the ring's
+                // OP_RECURRENT arm runs the whole KDA STEP (the short conv,
+                // the gated delta rule and the head norm), so one node
+                // names one launch, and there is no per-launch split to make
+                // (the recurrent path's launches are the recurrent step's
+                // internals, which the arm runs inline).
+                let kind = grim_backend_rocm::task_graph::op::RECURRENT;
+                let mut args = vec![
+                    (graph.buffers.layer_input[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_input[i].bytes() as u64, 1u8),
+                    (graph.buffers.k_arena[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.k_arena[i].bytes() as u64, 0u8),
+                    (graph.buffers.v_arena[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.v_arena[i].bytes() as u64, 0u8),
+                    (graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_output[i].bytes() as u64, 2u8),
+                ];
+                if !is_attn {
+                    // M5: the RECURRENT node's WEIGHT operand is the device-resident
+                    // descriptor the wave's OP_RECURRENT arm casts to. Without it the
+                    // plan cannot bind the node, and `ring_ready` would advertise
+                    // coverage that does not exist.
+                    let ptr = graph.kda_desc_ptrs.get(i).copied().flatten().ok_or_else(|| {
+                        grim_core::error::Error::Backend(format!(
+                            "emit: recurrent layer {i} has no staged KDA descriptor"
+                        ))
+                    })?;
+                    args.push((
+                        ptr,
+                        std::mem::size_of::<grim_backend_rocm::scythe_task_descriptors::KdaTaskDescriptor>()
+                            as u64,
+                        0u8,
+                    ));
+                }
+                let blk = graph.emit_node(kind,
+                    [self.cfg.head_dim as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &args, &[emit_last], blk_ord as u8);
+                let ffn_args = [
+                    (graph.buffers.layer_output[i].device_ptr_u64().unwrap_or(0),
+                     graph.buffers.layer_output[i].bytes() as u64, 1u8),
+                ];
+                // The coverage table's QuantFormat axis: the block's dense FFN
+                // rides ffn_down's checkpoint format.
+                emit_last = graph.emit_node(
+                    grim_backend_rocm::task_graph::op::GEMM,
+                    gemm_params(gemm_quant_param(block.ffn_down.weight()), 0),
+                    &ffn_args, &[blk], blk_ord as u8);
+            }
+            // A6: advance an interior device boundary per the A2 capture
+            // contract — close segment k (whose last layer is i) and open
+            // segment k+1. Legacy single-graph graphs have no segments.
+            if graph.segments.len() > 1 {
+                if let Some(si) = graph.segments.iter().position(|s| s.layers.contains(&i)) {
+                    if i + 1 == graph.segments[si].layers.end
+                        && si + 1 < graph.segments.len()
+                    {
+                        graph.end_capture_segment(si)?;
+                        graph.begin_capture_segment(si + 1)?;
+                    }
+                }
+            }
+        }
 
-        linear_into(
-            &dev,
-            &graph.buffers.head_input,
-            self.output.weight(),
-            &graph.buffers.head_output,
-            &graph.buffers.act_q81_buf[0],
-        )?;
+        // Final norm + output head on output device
+        let last_ord = match self.output.weight().device() {
+            grim_tensor::Device::Rocm(ord) => *ord,
+            _ => match self.device {
+                grim_tensor::Device::Rocm(ord) => ord,
+                _ => dev.ordinal(),
+            },
+        };
+        // A6: the head MUST run inside the last segment's bracket, i.e. on the
+        // last segment's device — assert, don't assume.
+        if graph.segments.len() > 1 {
+            let last_seg = graph.segments.last().expect("segments non-empty");
+            if last_ord != last_seg.device {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "forward_capture: head runs on rocm:{last_ord} but the last capture \
+                     segment is rocm:{} — the head would land in no graph",
+                    last_seg.device
+                )));
+            }
+        }
+        let last_dev = grim_backend_rocm::RocmDevice::shared(last_ord);
+        let _guard = grim_backend_rocm::DeviceGuard::set(last_ord as i32);
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] final norm + head on rocm:{last_ord} (capturing={})", graph.capturing);
+        }
+        // The head's two launches, through the SAME method the IR walk uses.
+        self.forward_graph_head(graph, &last_dev)?;
+
+        if graph.emitter.is_some() && graph.capturing {
+            emit_last = graph.emit_node(
+                grim_backend_rocm::task_graph::op::NORM,
+                [self.cfg.hidden_size as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.head_input.bytes() as u64, 1u8),
+                ],
+                &[emit_last],
+                last_ord as u8,
+            );
+            let _ = graph.emit_node(
+                grim_backend_rocm::task_graph::op::GEMM,
+                gemm_params(
+                    gemm_quant_param(self.output.weight()),
+                    self.cfg.vocab_size as u32,
+                ),
+                &[
+                    (graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                     graph.buffers.head_output.bytes() as u64, 2u8),
+                ],
+                &[emit_last],
+                last_ord as u8,
+            );
+        }
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!(
+                "[graph-trace] head finished (capturing={}): head_in={:#x} (dev={}), head_out={:#x} (dev={}), act_q81={:#x} (dev={})",
+                graph.capturing,
+                graph.buffers.head_input.device_ptr_u64().unwrap_or(0),
+                graph.buffers.head_input.device_ordinal(),
+                graph.buffers.head_output.device_ptr_u64().unwrap_or(0),
+                graph.buffers.head_output.device_ordinal(),
+                graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)].device_ptr_u64().unwrap_or(0),
+                graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)].device_ordinal(),
+            );
+        }
 
         Ok(())
+    }
+
+    /// M2: interpret the published IR for one decode step, with every node on
+    /// the model's own launchers (the compatibility oracle's route).
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        self.qwen35_interpret_ir(graph, token_id, None)
+    }
+
+    /// M6: the same walk, with the IR's RECURRENT nodes dispatched to the
+    /// persistent task ring.
+    fn forward_interpret_ir_ring(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        ring: &mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+    ) -> Result<()> {
+        self.qwen35_interpret_ir(graph, token_id, Some(ring))
     }
 
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
@@ -2461,13 +4428,32 @@ impl DecodeGraphModel for Qwen35 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] executing graph.replay() pos={pos}");
+        }
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] graph.replay() returned ok; syncing devices");
+        }
+        let mut ords = graph.buffers.layer_devices.clone();
+        if !ords.contains(&dev.ordinal()) {
+            ords.push(dev.ordinal());
+        }
+        for ord in ords {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] devices synchronized");
+        }
         Ok(())
     }
 
@@ -2585,24 +4571,29 @@ impl DecodeGraphModel for Qwen35 {
                 (None, None)
             };
 
-            out.push(Some(EagerKvSource {
-                k_dev: k_ptr,
-                v_dev: v_ptr,
-                prefill_len: valid_rows,
-                kv_stride,
-                src_elem_bytes: match k_rocm.dtype().arith {
-                    grim_tensor::ArithType::U8 => 1,
-                    grim_tensor::ArithType::F16 => 2,
-                    _ => 4,
-                },
-                k_scales_dev: ksc_ptr,
-                v_scales_dev: vsc_ptr,
-                gdl_state: None,
-                _anchor: std::marker::PhantomData,
-            }));
-        }
+                let dev_ord = match self.blocks[i].device {
+                    grim_tensor::Device::Rocm(ord) => ord as i32,
+                    _ => 0,
+                };
+                out.push(Some(EagerKvSource {
+                    k_dev: k_ptr,
+                    v_dev: v_ptr,
+                    prefill_len: valid_rows,
+                    kv_stride,
+                    src_elem_bytes: match k_rocm.dtype().arith {
+                        grim_tensor::ArithType::U8 => 1,
+                        grim_tensor::ArithType::F16 => 2,
+                        _ => 4,
+                    },
+                    k_scales_dev: ksc_ptr,
+                    v_scales_dev: vsc_ptr,
+                    gdl_state: None,
+                    device_ordinal: dev_ord,
+                    _anchor: std::marker::PhantomData,
+                }));
+            }
 
-        Ok(out)
+            Ok(out)
     }
 
     fn eager_kda_seed_sources<'a>(
@@ -2731,6 +4722,7 @@ impl DecodeGraphModel for Qwen35 {
         }
         Ok(out)
     }
+
 }
 
 // ─── Gemma2 Block Graph Forward ───────────────────────────────────────────
@@ -3095,9 +5087,12 @@ impl DecodeGraphModel for Gemma2 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -3444,6 +5439,21 @@ macro_rules! impl_llama_wrapper_graph {
                 }
                 fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
                     self.inner.forward_replay(graph, token_id)
+                }
+                fn forward_interpret_ir(
+                    &self,
+                    graph: &mut DecodeGraph,
+                    token_id: u32,
+                ) -> Result<()> {
+                    self.inner.forward_interpret_ir(graph, token_id)
+                }
+                fn forward_interpret_ir_ring(
+                    &self,
+                    graph: &mut DecodeGraph,
+                    token_id: u32,
+                    ring: &mut grim_backend_rocm::kernels::task_ring::TaskRingContext,
+                ) -> Result<()> {
+                    self.inner.forward_interpret_ir_ring(graph, token_id, ring)
                 }
                 fn eager_conv_seed_rings<'a>(
                     &self,
@@ -3988,9 +5998,12 @@ impl DecodeGraphModel for MiniMaxM3 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -4090,6 +6103,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -4495,9 +6509,12 @@ impl DecodeGraphModel for Glm4MoeLite {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -4917,9 +6934,12 @@ impl DecodeGraphModel for GraniteMoeHybrid {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -5356,9 +7376,12 @@ impl DecodeGraphModel for HyV3 {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -5498,9 +7521,12 @@ impl DecodeGraphModel for Chameleon {
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -5601,6 +7627,7 @@ impl DecodeGraphModel for Chameleon {
                 k_scales_dev: None,
                 v_scales_dev: None,
                 gdl_state: None,
+                device_ordinal: 0,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -5899,9 +7926,12 @@ impl DecodeGraphModel for DeepSeek4 {
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
         let pos = graph.buffers.current_pos;
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -6191,9 +8221,12 @@ impl DecodeGraphModel for DeepSeek2 {
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
         let pos = graph.buffers.current_pos;
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -6500,9 +8533,12 @@ impl DecodeGraphModel for DeepSeek32 {
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
         let pos = graph.buffers.current_pos;
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -6656,6 +8692,19 @@ mod tests {
         graph
             .end_capture()
             .unwrap_or_else(|e| panic!("{label}: end capture failed: {e}"));
+        // The two warmups EXECUTED, so they bumped each layer's live-row total
+        // and the position; `eager_logits` came from a fresh session. Resetting
+        // keeps the comparison apples-to-apples.
+        //
+        // Measured, honestly: this does NOT move this test's number. The MoE
+        // variant reports 0.126781 with and without it (to six digits), so the
+        // warmup rows are not what diverges here — that divergence is still
+        // open. It is kept because the invariant it enforces is real and its
+        // absence is a trap (see `reset_for_replay`), not because it fixes this.
+        graph
+            .buffers
+            .reset_for_replay()
+            .unwrap_or_else(|e| panic!("{label}: reset replay state failed: {e}"));
         model
             .forward_replay(&mut graph, token_id)
             .unwrap_or_else(|e| panic!("{label}: replay failed: {e}"));
@@ -7761,6 +9810,1416 @@ pub struct Xing40GraphScratch {
 }
 
 /// Build the scratch on `dev` (called once, outside capture).
+impl Xing40 {
+    /// M2 extraction: the head stage (hc mean, output norm, lm_head), shared
+    /// verbatim by `forward_capture`'s tail and the interpreter.
+    fn head_xing(
+        &self,
+        graph: &mut DecodeGraph,
+        scratch: &mut Xing40GraphScratch,
+        dev: &Dev,
+        hc: usize,
+    ) -> Result<()> {
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        let h_shape = Shape::new(vec![batch, hidden]);
+        // Head: mean the final streams, output_norm, lm_head.
+        dev.launch_hc_mean_step(
+            scratch.sin[0].as_ref(),
+            as_rocm(scratch.meaned.as_ref())?,
+            hc,
+            hidden,
+        )?;
+        dev.rms_norm_into(
+            scratch.meaned.as_ref(),
+            &**self.norm.weight.storage(),
+            self.norm.eps,
+            as_rocm(scratch.meaned.as_ref())?,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        linear_into(
+            dev,
+            scratch.meaned.as_ref(),
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[0],
+        )?;
+        Ok(())
+    }
+
+
+    /// M2 extraction: one Xing40 layer's launch body, shared verbatim by
+    /// `forward_capture`'s loop and the interpreter's per-node dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_layer_body(
+        &self,
+        i: usize,
+        layer: &crate::xing40::Xing40Block,
+        emitter: &mut Option<grim_backend_rocm::task_graph::TaskGraphBuilder>,
+        capturing: bool,
+        buffers: &mut DecodeGraphBuffers,
+        scratch: &mut Xing40GraphScratch,
+        dev: &Dev,
+        stream: *mut std::ffi::c_void,
+        hc: usize,
+        flat: usize,
+    ) -> Result<()> {
+        let batch = buffers.batch.max(1);
+        let hidden = self.cfg.hidden_size;
+        let h_shape = Shape::new(vec![batch, hidden]);
+        let cfg = &self.cfg;
+        let act = &buffers.act_q81_buf[i];
+        // The running stream for this layer. It MUST be sin[i]: the
+        // write-back at the end of a layer publishes into sin[i+1] (and
+        // the last layer into sin[0] for the head), so sin[i] is the slot
+        // this layer reads. It used to read sout[i-1] here while every
+        // op below used sout[i] — two different buffers for one value, and
+        // sout was never written, so every layer after the first consumed
+        // uninitialized memory and the last layer published that NaN back
+        // into sin[0].
+        let sin: &GBox = &scratch.sin[i];
+        // Staging for the attention write-back (see the aliasing note
+        // there): sin[i] is this layer's input, sout[i] is the stream
+        // after the attention contribution has been folded in.
+        let sout: &GBox = &scratch.sout[i];
+
+        // Emitted at the TOP of the layer: the node stands for the whole
+        // layer's block (hc gates + collapse + MLA + write-back) and its
+        // FFN, whose kind is fixed per layer. True dataflow ends: `sin[i]`
+        // is the layer input, the arenas carry its KV, `sout[i]` is the
+        // post-attention staging the write-back fills.
+        if emitter.is_some() && capturing {
+            let ord = dev.ordinal() as u8;
+            let blk = grim_backend_rocm::decode_graph_buffers::emit_node_into(
+                emitter,
+                grim_backend_rocm::task_graph::op::ATTENTION,
+                [
+                    cfg.qk_rope_head_dim as u32,
+                    cfg.num_heads as u32,
+                    cfg.kv_lora_rank as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                &[
+                    (
+                        sin.as_ref()
+                            .as_any()
+                            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                            .map(|r| r.device_ptr_u64().unwrap_or(0))
+                            .unwrap_or(0),
+                        sin.as_ref()
+                            .as_any()
+                            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                            .map(|r| r.bytes() as u64)
+                            .unwrap_or(0),
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        buffers.k_arena[i].device_ptr_u64().unwrap_or(0),
+                        buffers.k_arena[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                    ),
+                    (
+                        buffers.v_arena[i].device_ptr_u64().unwrap_or(0),
+                        buffers.v_arena[i].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                    ),
+                    (
+                        sout.as_ref()
+                            .as_any()
+                            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                            .map(|r| r.device_ptr_u64().unwrap_or(0))
+                            .unwrap_or(0),
+                        sout.as_ref()
+                            .as_any()
+                            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                            .map(|r| r.bytes() as u64)
+                            .unwrap_or(0),
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[last_emitted_node(emitter)],
+                ord,
+            );
+            let _ = if layer.moe.is_some() {
+                grim_backend_rocm::decode_graph_buffers::emit_node_into(
+                    emitter,
+                    grim_backend_rocm::task_graph::op::MOE_DISPATCH,
+                    // params[0] = the expert banks' QuantFormat (the coverage
+                    // axis — the MoE's experts are a different format from the
+                    // dense linears, and an axis that only saw the dense ones
+                    // claimed coverage the model does not have), params[5] =
+                    // num_experts, params[6] = top_k — the slots the ring's
+                    // MOE binding reads. The expert counts used to sit in
+                    // params[0..2], where the format belongs.
+                    {
+                        let mut p = [0u32; 16];
+                        p[0] = layer
+                            .moe
+                            .as_ref()
+                            .and_then(|m| m.experts.first())
+                            .map(|e| gemm_quant_param(e.w1.weight()))
+                            .unwrap_or(0);
+                        p[5] = cfg.n_routed_experts as u32;
+                        p[6] = cfg.num_experts_per_tok as u32;
+                        p
+                    },
+                    &[
+                        (
+                            buffers.moe_route_experts.device_ptr_u64().unwrap_or(0),
+                            buffers.moe_route_experts.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                        ),
+                        (
+                            buffers.moe_out[i].device_ptr_u64().unwrap_or(0),
+                            buffers.moe_out[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                    &[blk],
+                    ord,
+                )
+            } else {
+                // The coverage table's QuantFormat axis: the dense lead
+                // layers' FFN rides mlp.w2's checkpoint format.
+                let ffn_q = layer
+                    .mlp
+                    .as_ref()
+                    .map(|m| gemm_quant_param(m.w2.weight()))
+                    .unwrap_or(0);
+                grim_backend_rocm::decode_graph_buffers::emit_node_into(
+                    emitter,
+                    grim_backend_rocm::task_graph::op::GEMM,
+                    [
+                        ffn_q,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &[
+                        (
+                            buffers.activated_buf[i].device_ptr_u64().unwrap_or(0),
+                            buffers.activated_buf[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::SCRATCH,
+                        ),
+                        (
+                            buffers.norm_buf[i].device_ptr_u64().unwrap_or(0),
+                            buffers.norm_buf[i].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                    &[blk],
+                    ord,
+                )
+            };
+        }
+
+        // ── attn hc: gates over the raw stream state ──
+        dev.rms_norm_into(
+            sin.as_ref(),
+            &**layer.attn_hc.input_norm.weight.storage(),
+            layer.attn_hc.input_norm.eps,
+            as_rocm(scratch.hcn[i].as_ref())?,
+            &Shape::new(vec![batch, flat]),
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        linear_into(
+            &dev,
+            as_rocm(scratch.hcn[i].as_ref())?,
+            &scratch.hc_fn_attn[i],
+            as_rocm(scratch.proj[i].as_ref())?,
+            act,
+        )?;
+        let (iters, geps, cmin, cmax) = layer.attn_hc.gate_consts();
+        dev.mhc_gates_launch_into(
+            as_rocm(scratch.proj[i].as_ref())?,
+            scratch.hc_base[i].as_ref(),
+            scratch.hc_scale[i].as_ref(),
+            as_rocm(scratch.pre[i].as_ref())?,
+            as_rocm(scratch.post[i].as_ref())?,
+            as_rocm(scratch.comb[i].as_ref())?,
+            batch,
+            hc,
+            iters,
+            geps,
+            cmin,
+            cmax,
+        )?;
+        // Snapshot the attention gates before the FFN overwrites them.
+        // Capture-safe: a device-to-device copy on the capturing stream,
+        // no allocation and no sync.
+        {
+            let pdst = as_rocm(scratch.attn_post_snap[i].as_ref())?;
+            dev.copy_slice_into(pdst, scratch.post[i].as_ref(), 0, hc * batch)?;
+            let cdst = as_rocm(scratch.attn_comb_snap[i].as_ref())?;
+            dev.copy_slice_into(cdst, scratch.comb[i].as_ref(), 0, hc * hc * batch)?;
+        }
+        // CAVEAT: this is a WARMUP pass. run.rs runs warmups on UNSEEDED
+        // buffers and then re-seeds, so only values UPSTREAM of the
+        // attention (embedding, collapse, attn gates, q path) are
+        // comparable to an eager run. Anything downstream of the KV
+        // attention reads a stale arena and legitimately differs — two
+        // rounds of chasing that were wasted before this was written down.
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            for (lbl, b) in [
+                ("post", scratch.post.first()),
+                ("comb", scratch.comb.first()),
+            ] {
+                if let Some(b) = b {
+                    if let Ok(st) = as_rocm(b.as_ref()) {
+                        if let Ok(v) = st.to_cpu_vec_f32() {
+                            if lbl == "comb" {
+                                let rows: Vec<f32> = (0..hc)
+                                    .map(|h| (0..hc).map(|i| v[h * hc + i]).sum())
+                                    .collect();
+                                eprintln!("[xing-graph] WARM comb rowsums {rows:?}");
+                            } else {
+                                eprintln!("[xing-graph] WARM post {v:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        dev.launch_hc_collapse_step(
+            // The attention branch reads the layer INPUT. `sout[i]` is the
+            // staging buffer the attention write-back fills further down,
+            // so it is still zeros at this point.
+            sin.as_ref(),
+            as_rocm(scratch.pre[i].as_ref())?,
+            as_rocm(scratch.col[i].as_ref())?,
+            hc,
+            hidden,
+        )?;
+        dev.rms_norm_into(
+            as_rocm(scratch.col[i].as_ref())?,
+            &**layer.attn_norm.weight.storage(),
+            layer.attn_norm.eps,
+            as_rocm(scratch.col[i].as_ref())?,
+            &h_shape,
+        )?;
+        // The FFN branch overwrites `col` later in this layer, so the
+        // attention-branch value is only observable here. Dump during the
+        // WARMUP pass (capturing=false => syncing is legal and the values
+        // are real); during the recorded pass this buffer is stale.
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            if let Ok(st) = as_rocm(scratch.col[0].as_ref()) {
+                if let Ok(v) = st.to_cpu_vec_f32() {
+                    let r =
+                        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                    eprintln!(
+                        "[xing-graph] WARM attn_in L{i}: n {} rms {r:.4e} head {:?}",
+                        v.len(),
+                        &v[..v.len().min(4)]
+                    );
+                }
+            }
+        }
+
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("pre") {
+            return Ok(());
+        }
+        // ── MLA ──
+        let sa = &layer.self_attn;
+        let rank = cfg.kv_lora_rank;
+        let nope = cfg.qk_nope_head_dim;
+        let rope_d = cfg.qk_rope_head_dim;
+        let vd = cfg.v_head_dim;
+        let nh = cfg.num_heads;
+        if let (Some(qa), Some(qn_norm), Some(qb)) =
+            (&sa.q_a_proj, &sa.q_a_layernorm, &sa.q_b_proj)
+        {
+            linear_into(
+                &dev,
+                scratch.col[i].as_ref(),
+                qa.weight(),
+                as_rocm(scratch.qlora[i].as_ref())?,
+                act,
+            )?;
+            dev.rms_norm_into(
+                as_rocm(scratch.qlora[i].as_ref())?,
+                &**qn_norm.weight.storage(),
+                qn_norm.eps,
+                as_rocm(scratch.qlora[i].as_ref())?,
+                &Shape::new(vec![batch, scratch.qlora[i].shape().dims()[1]]),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            linear_into(
+                &dev,
+                scratch.qlora[i].as_ref(),
+                qb.weight(),
+                as_rocm(scratch.qf[i].as_ref())?,
+                act,
+            )?;
+        } else if let Some(ref q_direct) = sa.q_proj_direct {
+            linear_into(
+                &dev,
+                scratch.col[i].as_ref(),
+                q_direct.weight(),
+                as_rocm(scratch.qf[i].as_ref())?,
+                act,
+            )?;
+        }
+        dev.launch_xing_q_split(
+            scratch.qf[i].as_ref(),
+            as_rocm(scratch.qn[i].as_ref())?,
+            as_rocm(scratch.qp[i].as_ref())?,
+            nh,
+            nope,
+            rope_d,
+        )?;
+        // YARN-CORRECT rope: rope_dev_base_into takes only `base` — no
+        // ramp, no mscale — so a YaRN checkpoint rotated by the wrong
+        // angles (rms-identical, values permuted; the qrope array diff
+        // measured max_abs 0.47 at identical rms). grim_rope_yarn_pos0
+        // is the same rotation the eager path's verified kernel does,
+        // reading the current position from pos_dev.
+        {
+            let inv_freq = scratch.rope_inv_freq.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "xing40 graph: no device inv_freq table".into(),
+                )
+            })?;
+            dev.rope_dev_yarn_pos0_into(
+                as_rocm(scratch.qp[i].as_ref())?,
+                &buffers.pos_dev,
+                as_rocm(inv_freq.as_ref())?,
+                as_rocm(scratch.qp[i].as_ref())?,
+                &scratch.rope_cfg,
+                &Shape::new(vec![batch, nh, rope_d]),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
+        // A/B the q rope: the graph ropes the whole [1, nh, rope_d] slab
+        // in place with rope_dev_base_into; eager ropes ONE HEAD AT A TIME
+        // with dev.rope and writes each result back per head. Two
+        // implementations of the same rotation - if one folds the YaRN
+        // mscale and the other does not, every attention output shifts.
+        // `qp` now holds the graph's ANSWER; the pre-rope bytes are
+        // re-derived from `qf` through the same q_split the capture used.
+        // Warmup only: allocation is capture-poison.
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            let Ok(got) = as_rocm(scratch.qp[i].as_ref())?.to_cpu_vec_f32() else {
+                return Ok(());
+            };
+            let pre_shape = Shape::new(vec![1, nh * rope_d]);
+            let nope_shape = Shape::new(vec![1, nh * nope]);
+            let t_pre = dev.zeros(&pre_shape, grim_tensor::DType::F32);
+            let t_nope = dev.zeros(&nope_shape, grim_tensor::DType::F32);
+            if let (Ok(t_pre), Ok(t_nope)) = (t_pre, t_nope) {
+                let t_pre_r: &grim_backend_rocm::RocmStorage =
+                    t_pre.as_any().downcast_ref().expect("rocm");
+                let t_nope_r: &grim_backend_rocm::RocmStorage =
+                    t_nope.as_any().downcast_ref().expect("rocm");
+                if dev
+                    .launch_xing_q_split(
+                        as_rocm(scratch.qf[i].as_ref())?,
+                        t_nope_r,
+                        t_pre_r,
+                        nh,
+                        nope,
+                        rope_d,
+                    )
+                    .is_ok()
+                {
+                    if let Ok(pre) = t_pre.to_cpu_vec_f32() {
+                        let pos = vec![buffers.current_pos];
+                        let head_shape = Shape::new(vec![1, 1, rope_d]);
+                        if let Ok(mut refbuf) = dev.zeros(&pre_shape, grim_tensor::DType::F32) {
+                            let mut ok = true;
+                            for h in 0..nh {
+                                let hs = Shape::new(vec![1, rope_d]);
+                                let head_src = match dev.from_cpu(
+                                    &pre[h * rope_d..(h + 1) * rope_d],
+                                    &hs,
+                                    grim_tensor::DType::F32,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                };
+                                let mut ho =
+                                    match dev.zeros(&head_shape, grim_tensor::DType::F32) {
+                                        Ok(v) => v,
+                                        Err(_) => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    };
+                                match grim_tensor::AttentionOps::rope(
+                                    dev,
+                                    head_src.as_ref(),
+                                    &pos,
+                                    &scratch.rope_cfg,
+                                    &head_shape,
+                                ) {
+                                    Ok((t, _)) => {
+                                        if dev
+                                            .write_cols(
+                                                refbuf.as_mut(),
+                                                nh * rope_d,
+                                                h * rope_d,
+                                                t.as_ref(),
+                                                1,
+                                                rope_d,
+                                            )
+                                            .is_err()
+                                        {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                let _ = &mut ho;
+                            }
+                            if ok {
+                                dev.synchronize();
+                                if let Ok(b) = refbuf.to_cpu_vec_f32() {
+                                    let md = got
+                                        .iter()
+                                        .zip(b.iter())
+                                        .map(|(x, y)| (x - y).abs())
+                                        .fold(0.0f32, f32::max);
+                                    let rg = (got.iter().map(|x| x * x).sum::<f32>()
+                                        / got.len().max(1) as f32)
+                                        .sqrt();
+                                    eprintln!(
+                                        "[xing-graph] QROPE in_place_vs_perhead: max_abs {md:.4e} rel {:.4e} rms {rg:.4e}",
+                                        md as f64 / (rg as f64).max(1e-12)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Absorb W_UK into the nope plane (F32 bank cache, [nh*rank, nope]).
+        if let Some(w_uk) = sa.w_kc_device(0)? {
+            dev.launch_xing_q_absorb(
+                as_rocm(scratch.qn[i].as_ref())?,
+                w_uk,
+                as_rocm(scratch.qabs[i].as_ref())?,
+                nh,
+                rank,
+                nope,
+            )?;
+        } else {
+            return Err(grim_core::error::Error::Backend(
+                "xing40 graph: no device W_UK cache".into(),
+            ));
+        }
+        // KV latent: project, norm c_kv, rope k_pe, pack, append.
+        linear_into(
+            &dev,
+            scratch.col[i].as_ref(),
+            sa.kv_a_proj.weight(),
+            as_rocm(scratch.kvstage[i].as_ref())?,
+            act,
+        )?;
+        dev.launch_xing_q_split(
+            scratch.kvstage[i].as_ref(),
+            as_rocm(scratch.ckv[i].as_ref())?,
+            as_rocm(scratch.kpe[i].as_ref())?,
+            1,
+            rank,
+            rope_d,
+        )?;
+        dev.rms_norm_into(
+            as_rocm(scratch.ckv[i].as_ref())?,
+            &**sa.kv_a_layernorm.weight.storage(),
+            sa.kv_a_layernorm.eps,
+            as_rocm(scratch.ckv[i].as_ref())?,
+            &Shape::new(vec![batch, rank]),
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        // Same yarn-correct rope for k_pe (see the q rope note above).
+        {
+            let inv_freq = scratch.rope_inv_freq.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "xing40 graph: no device inv_freq table".into(),
+                )
+            })?;
+            dev.rope_dev_yarn_pos0_into(
+                as_rocm(scratch.kpe[i].as_ref())?,
+                &buffers.pos_dev,
+                as_rocm(inv_freq.as_ref())?,
+                as_rocm(scratch.kpe[i].as_ref())?,
+                &scratch.rope_cfg,
+                &Shape::new(vec![batch, 1, rope_d]),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
+        dev.launch_xing_pack_latent(
+            as_rocm(scratch.ckv[i].as_ref())?,
+            as_rocm(scratch.kpe[i].as_ref())?,
+            as_rocm(scratch.latent[i].as_ref())?,
+            rank,
+            rope_d,
+        )?;
+        grim_backend_rocm::launch_kv_append_batch(
+            &dev,
+            &buffers.k_arena[i],
+            as_rocm(scratch.latent[i].as_ref())?,
+            &buffers.pos_dev,
+            rank + rope_d,
+            1,
+            batch,
+            buffers.max_ctx * (rank + rope_d),
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
+        // Latent-space attention over the LIVE length (pos_dev + 1); the
+        // normalized latent lands in qabs and W_UV runs as the per-head
+        // GEMV into attn.
+        // The softmax denominator is handed to the kernel rather than
+        // applied by a separate elementwise pass over q. The kernel's
+        // default is 1/sqrt(rank + rope_d); this model folds a YaRN
+        // attention_factor^2 against the *nope + rope* width instead.
+        // Issuing that extra `grim_mul_scalar` inside the capture bracket
+        // hangs the capture dead - bisected with GRIM_KQ_PRESCALE: it hangs
+        // even writing in place into qabs/qp (mode 4), so it is the launch
+        // in the bracket, not the destination buffers.
+        let mscale = cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0f32);
+        let inv_sqrt_d = mscale * mscale / ((nope + rope_d) as f32).sqrt();
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            eprintln!(
+                "[xing-graph] SCALE mscale {mscale:.6} nope {nope} rope_d {rope_d} inv_sqrt_d {inv_sqrt_d:.6e} cfg_yarn {:?}",
+                cfg.rope_yarn.is_some()
+            );
+        }
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("append") {
+            return Ok(());
+        }
+        dev.launch_mla_absorbed_decode_scaled(
+            as_rocm(scratch.qabs[i].as_ref())?,
+            as_rocm(scratch.qp[i].as_ref())?,
+            &buffers.k_arena[i],
+            None,
+            as_rocm(scratch.qattn_latent[i].as_ref())?,
+            nh,
+            rank,
+            rope_d,
+            vd,
+            buffers.max_ctx.max(1),
+            0,
+            0,
+            Some(&buffers.pos_dev),
+            inv_sqrt_d,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mlaout") {
+            return Ok(());
+        }
+        // A/B the value up-projection: `xing_q_absorb` (what the graph
+        // uses) vs a per-head matmul (what eager uses) over the SAME
+        // latent and the SAME w_vc. Both sides are computed here, so
+        // neither depends on a buffer that has not been written yet.
+        // Warmup only: allocating is capture-poison.
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            if let Some(w_vc) = sa.w_vc_device(0)? {
+                let _ =
+                    grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+                let lat = as_rocm(scratch.qattn_latent[i].as_ref())?;
+                let w_r = as_rocm(w_vc)?;
+                let attn_shape = Shape::new(vec![1, nh * vd]);
+                if let (Ok(mut mm), Ok(xg)) = (
+                    dev.zeros(&attn_shape, grim_tensor::DType::F32),
+                    dev.zeros(&attn_shape, grim_tensor::DType::F32),
+                ) {
+                    let mm_m: &mut dyn grim_tensor::BackendStorage = mm.as_mut();
+                    let xg_r: &grim_backend_rocm::RocmStorage =
+                        xg.as_any().downcast_ref().expect("rocm");
+                    dev.launch_xing_q_absorb(lat, w_r, xg_r, nh, vd, rank).ok();
+                    // Each head's [1, vd] must land at column h*vd, not
+                    // overwrite the whole buffer - matmul_into writes the
+                    // full `out`, so stage per head and write_cols it in.
+                    let head_shape = Shape::new(vec![1, vd]);
+                    let mut ok = dev.zeros(&head_shape, grim_tensor::DType::F32).is_ok();
+                    if ok {
+                        for h in 0..nh {
+                            let tmp = match dev.zeros(&head_shape, grim_tensor::DType::F32) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            };
+                            let tmp_r: &grim_backend_rocm::RocmStorage =
+                                tmp.as_any().downcast_ref().expect("rocm");
+                            let lat_h = dev.narrow_cols(
+                                lat,
+                                nh * rank,
+                                h * rank,
+                                1,
+                                rank,
+                                &Shape::new(vec![1, rank]),
+                            );
+                            let w_h = dev.narrow_rows(
+                                w_r,
+                                h * vd,
+                                vd,
+                                rank,
+                                &Shape::new(vec![vd, rank]),
+                            );
+                            if let (Ok((l, _)), Ok((w, _))) = (lat_h, w_h) {
+                                if dev.matmul_into(l.as_ref(), w.as_ref(), tmp_r).is_err() {
+                                    ok = false;
+                                    break;
+                                }
+                                if dev.write_cols(mm_m, nh * vd, h * vd, tmp_r, 1, vd).is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        dev.synchronize();
+                        if let (Ok(a), Ok(b)) = (xg.to_cpu_vec_f32(), mm.to_cpu_vec_f32()) {
+                            let md = a
+                                .iter()
+                                .zip(b.iter())
+                                .map(|(x, y)| (x - y).abs())
+                                .fold(0.0f32, f32::max);
+                            let ra = (a.iter().map(|x| x * x).sum::<f32>()
+                                / a.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] ABSORB xing_vs_matmul: max_abs {md:.4e} rel {:.4e} rms {ra:.4e}",
+                                md / ra.max(1e-12)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(w_vc) = sa.w_vc_device(0)? {
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mla") {
+                return Ok(());
+            }
+            dev.launch_xing_q_absorb(
+                as_rocm(scratch.qattn_latent[i].as_ref())?,
+                w_vc,
+                as_rocm(scratch.attn[i].as_ref())?,
+                nh,
+                vd,
+                rank,
+            )?;
+        } else {
+            return Err(grim_core::error::Error::Backend(
+                "xing40 graph: no device W_VC cache".into(),
+            ));
+        }
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("absorb") {
+            return Ok(());
+        }
+        linear_into(
+            &dev,
+            scratch.attn[i].as_ref(),
+            sa.o_proj.weight(),
+            &buffers.norm_buf[i],
+            act,
+        )?;
+        // Snapshot o_proj's output before the FFN reuses norm_buf.
+        {
+            let dst = as_rocm(scratch.attn_out_snap[i].as_ref())?;
+            dev.copy_slice_into(dst, &buffers.norm_buf[i], 0, hidden)?;
+        }
+        // Host oracle for the Q4_K o_proj. `fused_quant_gemm` cannot be
+        // A/B'd in-process (it deadlocks the warmup), so dequantize the
+        // weight on the host and compute the GEMV directly: that is ground
+        // truth for BOTH paths, and tells us whether the graph's result is
+        // right or merely different. First 512 outputs only - a full
+        // 3584x4096 host GEMV is minutes in a debug build.
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            let n_out = 512.min(hidden);
+            if let (Ok(a), Ok(w), Ok(nb)) = (
+                as_rocm(scratch.attn[i].as_ref())?.to_cpu_vec_f32(),
+                sa.o_proj.weight().to_vec_f32(),
+                as_rocm(&buffers.norm_buf[i]).unwrap().to_cpu_vec_f32(),
+            ) {
+                let k = a.len();
+                let mut max_abs = 0.0f32;
+                let mut ref_rms = 0.0f64;
+                for j in 0..n_out {
+                    let mut acc = 0.0f32;
+                    for c in 0..k {
+                        acc += a[c] * w[j * k + c];
+                    }
+                    ref_rms += (acc as f64) * (acc as f64);
+                    let d = (acc - nb[j]).abs();
+                    if d > max_abs {
+                        max_abs = d;
+                    }
+                }
+                ref_rms = (ref_rms / n_out as f64).sqrt();
+                let got_rms =
+                    (nb[..n_out].iter().map(|x| x * x).sum::<f32>() / n_out as f32).sqrt();
+                eprintln!(
+                    "[xing-graph] OPROJ vs HOST oracle: max_abs {max_abs:.4e} rel {:.4e} ref_rms {ref_rms:.4e} got_rms {got_rms:.4e}",
+                    max_abs as f64 / ref_rms.max(1e-12)
+                );
+                // Same product through the fused-dequant leg, which takes
+                // F32 A instead of quantizing it to Q8_1. If this lands at
+                // ~1e-6 while the dot4 leg sits at ~6e-3, the Q8_1
+                // ACTIVATION quantization is the entire error.
+                if let (Ok(attn_r), Ok(o_ws2)) = (
+                    as_rocm(scratch.attn[i].as_ref()),
+                    as_rocm(sa.o_proj.weight().storage().as_ref()),
+                ) {
+                    if let Ok(fb) =
+                        dev.zeros(&Shape::new(vec![1, hidden]), grim_tensor::DType::F32)
+                    {
+                        let fb_r: &grim_backend_rocm::RocmStorage =
+                            fb.as_any().downcast_ref().expect("rocm");
+                        if dev
+                            .launch_fused_dequant_gemm_q4k_for_ab(
+                                attn_r,
+                                o_ws2,
+                                fb_r,
+                                1,
+                                hidden,
+                                nh * vd,
+                            )
+                            .is_ok()
+                        {
+                            dev.synchronize();
+                            if let Ok(b) = fb.to_cpu_vec_f32() {
+                                let mut md2 = 0.0f32;
+                                for j in 0..n_out.min(hidden) {
+                                    let mut acc = 0.0f32;
+                                    for c in 0..(nh * vd) {
+                                        acc += a[c] * w[j * (nh * vd) + c];
+                                    }
+                                    let d = (acc - b[j]).abs();
+                                    if d > md2 {
+                                        md2 = d;
+                                    }
+                                }
+                                eprintln!(
+                                    "[xing-graph] OPROJ fused-dequant vs HOST oracle: max_abs {md2:.4e} rel {:.4e}",
+                                    md2 as f64 / ref_rms.max(1e-12)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("oproj") {
+            return Ok(());
+        }
+        // The out buffer must NOT alias the streams input. The kernel's
+        // thread (h,d) writes element (h,d) while EVERY thread (i,d)
+        // reads element (h,d), so in-place corrupts the row another head
+        // is still reading — measured as all-NaN streams on every replay.
+        // sout[i] is that staging buffer; the FFN branch below reads it.
+        dev.launch_hc_write_back_step(
+            &buffers.norm_buf[i],
+            as_rocm(scratch.post[i].as_ref())?,
+            as_rocm(scratch.comb[i].as_ref())?,
+            sin.as_ref(),
+            as_rocm(scratch.sout[i].as_ref())?,
+            hc,
+            hidden,
+        )?;
+
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("attn") {
+            return Ok(());
+        }
+        // HOST ORACLE for the attention write-back. Placed HERE on purpose:
+        // `post`/`comb` are overwritten by the FFN's gate call moments
+        // later, so an oracle further down compares the attention
+        // write-back against the FFN's gates and reports garbage (it
+        // reported rel 4.5 that way before this note existed).
+        //   out[h*hidden+d] = post[h]*y[d] + sum_i comb[h*hc+i]*s[i*hidden+d]
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            let sv = as_rocm(scratch.sin[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+            let pv = as_rocm(scratch.post[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            let cv = as_rocm(scratch.comb[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            let ov = as_rocm(scratch.sout[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            if let (Ok(sinv), Ok(nb), Ok(postv), Ok(combv), Ok(soutv)) = (sv, nb, pv, cv, ov) {
+                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                for d in 0..hidden {
+                    for h in 0..hc {
+                        let mut acc = postv[h] * nb[d];
+                        for k in 0..hc {
+                            acc += combv[h * hc + k] * sinv[k * hidden + d];
+                        }
+                        let diff = (acc - soutv[h * hidden + d]).abs();
+                        if diff > md {
+                            md = diff;
+                        }
+                        rr += (acc as f64) * (acc as f64);
+                    }
+                }
+                rr = (rr / (hc * hidden) as f64).sqrt();
+                let rg = (soutv.iter().map(|x| x * x).sum::<f32>() / soutv.len().max(1) as f32)
+                    .sqrt();
+                let rms = |v: &Vec<f32>| {
+                    (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+                };
+                eprintln!(
+                    "[xing-graph] WB inputs rms: sin {:.4e} nb {:.4e} post {:?} comb {:.4e} sout {:.4e}",
+                    rms(&sinv),
+                    rms(&nb),
+                    &postv[..hc.min(postv.len())],
+                    rms(&combv),
+                    rg
+                );
+                eprintln!(
+                    "[xing-graph] ATTN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                    md as f64 / rr.max(1e-12)
+                );
+            }
+        }
+        // ── ffn hc ──
+        // Reads the stream the attention write-back just produced.
+        dev.rms_norm_into(
+            sout.as_ref(),
+            &**layer.ffn_hc.input_norm.weight.storage(),
+            layer.ffn_hc.input_norm.eps,
+            as_rocm(scratch.hcn[i].as_ref())?,
+            &Shape::new(vec![batch, flat]),
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        linear_into(
+            &dev,
+            scratch.hcn[i].as_ref(),
+            &scratch.hc_fn_ffn[i],
+            as_rocm(scratch.proj[i].as_ref())?,
+            act,
+        )?;
+        let (iters, geps, cmin, cmax) = layer.ffn_hc.gate_consts();
+        dev.mhc_gates_launch_into(
+            as_rocm(scratch.proj[i].as_ref())?,
+            // The FFN branch's OWN bias/scale, matching eager's
+            // `self.ffn_hc.gates_d2d` — not the attention branch's.
+            scratch.hc_base_ffn[i].as_ref(),
+            scratch.hc_scale_ffn[i].as_ref(),
+            as_rocm(scratch.pre[i].as_ref())?,
+            as_rocm(scratch.post[i].as_ref())?,
+            as_rocm(scratch.comb[i].as_ref())?,
+            batch,
+            hc,
+            iters,
+            geps,
+            cmin,
+            cmax,
+        )?;
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            // Same warmup caveat as above: the FFN proj reads a stream
+            // built on a stale KV arena.
+            if let Some(b) = scratch.proj.first() {
+                if let Ok(st) = as_rocm(b.as_ref()) {
+                    if let Ok(v) = st.to_cpu_vec_f32() {
+                        let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                            .sqrt();
+                        eprintln!(
+                            "[xing-graph] WARMFFN proj rms {r:.4e} head {:?}",
+                            &v[..6.min(v.len())]
+                        );
+                    }
+                }
+            }
+            if let Some(b) = scratch.comb.first() {
+                if let Ok(st) = as_rocm(b.as_ref()) {
+                    if let Ok(v) = st.to_cpu_vec_f32() {
+                        let rows: Vec<f32> = (0..hc)
+                            .map(|h| (0..hc).map(|i| v[h * hc + i]).sum())
+                            .collect();
+                        eprintln!("[xing-graph] WARMFFN comb rowsums {rows:?}");
+                    }
+                }
+            }
+            if let Some(b) = scratch.post.first() {
+                if let Ok(st) = as_rocm(b.as_ref()) {
+                    if let Ok(v) = st.to_cpu_vec_f32() {
+                        eprintln!("[xing-graph] WARMFFN post {v:?}");
+                    }
+                }
+            }
+            if let Some(b) = scratch.col.first() {
+                if let Ok(st) = as_rocm(b.as_ref()) {
+                    if let Ok(v) = st.to_cpu_vec_f32() {
+                        let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                            .sqrt();
+                        eprintln!(
+                            "[xing-graph] WARMFFN ffn_in n {} rms {r:.4e} head {:?}",
+                            v.len(),
+                            &v[..4.min(v.len())]
+                        );
+                    }
+                }
+            }
+        }
+        // The FFN branch reads the stream the ATTENTION write-back just
+        // produced (`sout[i]`), not the layer input (`sin[i]`) — a replace-all
+        // had flattened both collapses onto `sin`, which the near-zero `post`
+        // gate of layer 0 hid until layer 1's larger gate exposed it.
+        dev.launch_hc_collapse_step(
+            sout.as_ref(),
+            as_rocm(scratch.pre[i].as_ref())?,
+            as_rocm(scratch.col[i].as_ref())?,
+            hc,
+            hidden,
+        )?;
+        dev.rms_norm_into(
+            as_rocm(scratch.col[i].as_ref())?,
+            &**layer.ffn_norm.weight.storage(),
+            layer.ffn_norm.eps,
+            as_rocm(scratch.col[i].as_ref())?,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+
+        // ── FFN branch: dense SwiGLU or noaux_tc MoE ──
+        if let Some(ref mlp) = layer.mlp {
+            linear_into(
+                &dev,
+                scratch.col[i].as_ref(),
+                mlp.w1.weight(),
+                &buffers.gate_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                scratch.col[i].as_ref(),
+                mlp.w3.weight(),
+                &buffers.up_buf[i],
+                act,
+            )?;
+            dev.silu_mul_into(
+                &buffers.gate_buf[i],
+                &buffers.up_buf[i],
+                &buffers.activated_buf[i],
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            linear_into(
+                &dev,
+                &buffers.activated_buf[i],
+                mlp.w2.weight(),
+                &buffers.norm_buf[i],
+                act,
+            )?;
+        } else if let Some(ref moe) = layer.moe {
+            linear_into(
+                &dev,
+                as_rocm(scratch.col[i].as_ref())?,
+                moe.gate.weight(),
+                &buffers.moe_gate_logits[i],
+                act,
+            )?;
+            let bias = moe.correction_bias_dev.as_ref().and_then(|b| {
+                b.storage()
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            });
+            dev.moe_route_topk_on_device(
+                &buffers.moe_gate_logits[i],
+                bias,
+                &buffers.moe_route_tokens,
+                &buffers.moe_route_experts,
+                &buffers.moe_route_weights,
+                batch,
+                cfg.n_routed_experts,
+                moe.num_experts_per_tok,
+                2,    // sigmoid + e_score_correction_bias (noaux_tc)
+                true, // xing4_0.expert_weights_norm
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+            // Snapshot this layer's routing before the next layer
+            // overwrites the shared buffers.
+            {
+                let n = batch * moe.num_experts_per_tok;
+                let e = as_rocm(scratch.route_experts_snap[i].as_ref())?;
+                dev.copy_slice_into(e, &buffers.moe_route_experts, 0, n)?;
+                let w = as_rocm(scratch.route_weights_snap[i].as_ref())?;
+                dev.copy_slice_into(w, &buffers.moe_route_weights, 0, n)?;
+            }
+            // HOST ORACLE for the noaux_tc routing, at the first MoE
+            // layer. Independent of the device kernel: sigmoid the gate
+            // logits, select the top-k on (sigmoid + correction bias),
+            // and normalise the selected sigmoid scores. If the graph
+            // picks different experts than eager, nothing downstream can
+            // agree - and layers 2..39 are all moe+shared, so this is the
+            // first thing to check once layer 0 is oracle-verified.
+            if i == 2 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ =
+                    grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+                let gl = as_rocm(&buffers.moe_gate_logits[i]).and_then(|s| s.to_cpu_vec_f32());
+                let bs = match bias {
+                    Some(b) => match as_rocm(b) {
+                        Ok(r) => r.to_cpu_vec_f32().ok(),
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+                // u32, NOT f32: reading it with to_cpu_vec_f32 reports
+                // zeros and looks exactly like a routing bug.
+                let de = as_rocm(&buffers.moe_route_experts).and_then(|s| s.to_cpu_vec_u32());
+                let dw = as_rocm(&buffers.moe_route_weights).and_then(|s| s.to_cpu_vec_f32());
+                eprintln!(
+                    "[xing-graph] ROUTING probe L2: logits_ok {} bias_ok {} experts_ok {:?} w_ok {}",
+                    gl.is_ok(),
+                    bs.is_some(),
+                    de.as_ref().map(|v| &v[..4.min(v.len())]),
+                    dw.is_ok()
+                );
+                if let (Ok(gl), Some(bs), Ok(de), Ok(dw)) = (gl, bs, de, dw) {
+                    let ne = gl.len();
+                    let sig: Vec<f32> = gl.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+                    let mut order: Vec<usize> = (0..ne).collect();
+                    order.sort_by(|a, b| {
+                        (sig[*b] + bs[*b])
+                            .partial_cmp(&(sig[*a] + bs[*a]))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let sel: Vec<usize> = order
+                        .iter()
+                        .take(moe.num_experts_per_tok)
+                        .copied()
+                        .collect();
+                    let sum: f32 = sel.iter().map(|j| sig[*j]).sum();
+                    let dev_sel: Vec<usize> = de
+                        .iter()
+                        .take(moe.num_experts_per_tok)
+                        .map(|v| *v as usize)
+                        .collect();
+                    let _ = &dev_sel;
+                    let devs: Vec<f32> =
+                        dw.iter().take(moe.num_experts_per_tok).copied().collect();
+                    let same_set = sel.iter().filter(|j| dev_sel.contains(j)).count();
+                    eprintln!(
+                        "[xing-graph] ROUTING oracle: dev_experts {dev_sel:?} dev_w {:?} | host_experts {sel:?} host_w {:?} | overlap {same_set}/{}",
+                        devs.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>(),
+                        sel.iter()
+                            .map(|j| format!("{:.4}", sig[*j] / sum))
+                            .collect::<Vec<_>>(),
+                        moe.num_experts_per_tok
+                    );
+                }
+            }
+            // Arm 1 — native K-quant (zero extra VRAM): PEEK the pointer
+            // arrays prewarmed at pool build; a miss must not upload
+            // inside the capture bracket.
+            let kq = crate::shared_moe::peek_kq_native(&moe.charon_cache);
+            // Arm 2 — WhiteCrow stacks (budget-gated). PEEK, never ensure:
+            // a miss here must not convert (D2H inside the capture
+            // bracket poisons it).
+            let wc = crate::shared_moe::peek_whitecrow_stacks(&moe.charon_cache);
+            if let Some(kq) = kq {
+                let g_ptrs = kq
+                    .gate_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("kq gate ptrs not RocmStorage".into())
+                    })?;
+                let u_ptrs = kq
+                    .up_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("kq up ptrs not RocmStorage".into())
+                    })?;
+                let d_ptrs = kq
+                    .down_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("kq down ptrs not RocmStorage".into())
+                    })?;
+                let col_r = as_rocm(scratch.col[i].as_ref())?;
+                dev.moe_fused_dispatch_kq_native_into(
+                    col_r,
+                    g_ptrs,
+                    u_ptrs,
+                    d_ptrs,
+                    &buffers.moe_route_tokens,
+                    &buffers.moe_route_experts,
+                    &buffers.moe_route_weights,
+                    batch * moe.num_experts_per_tok,
+                    &buffers.moe_out[i],
+                    hidden,
+                    cfg.moe_intermediate_size,
+                    moe.routed_scaling_factor,
+                    kq.gate_bytes / cfg.moe_intermediate_size as u64,
+                    kq.down_bytes / hidden as u64,
+                    i32::from(kq.down_q4k),
+                )?;
+            } else if let Some(wc) = wc {
+                let g_wc = wc
+                    .gate
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("wc gate not RocmStorage".into())
+                    })?;
+                let u_wc = wc
+                    .up
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("wc up not RocmStorage".into())
+                    })?;
+                let d_wc = wc
+                    .down
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("wc down not RocmStorage".into())
+                    })?;
+                let col_r = as_rocm(scratch.col[i].as_ref())?;
+                dev.moe_fused_dispatch_whitecrow_grouped_into(
+                    col_r,
+                    g_wc,
+                    u_wc,
+                    d_wc,
+                    &buffers.moe_route_tokens,
+                    &buffers.moe_route_experts,
+                    &buffers.moe_route_weights,
+                    batch * moe.num_experts_per_tok,
+                    &buffers.moe_out[i],
+                    hidden,
+                    cfg.moe_intermediate_size,
+                    moe.routed_scaling_factor,
+                    wc.gate_stride,
+                    wc.down_stride,
+                )?;
+            } else {
+                let experts: Vec<crate::shared_moe::MoeExpert> = moe
+                    .experts
+                    .iter()
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: e.w1.clone(),
+                        up: e.w3.clone(),
+                        down: e.w2.clone(),
+                    })
+                    .collect();
+                let (_, _, _, g, u, d) = crate::shared_moe::ensure_charon_scratch(
+                    dev.ordinal(),
+                    batch,
+                    moe.num_experts_per_tok,
+                    &experts,
+                    &moe.charon_cache,
+                )?;
+                let col_r = as_rocm(scratch.col[i].as_ref())?;
+                dev.moe_fused_dispatch_resident_routing_into(
+                    col_r,
+                    g.as_ref(),
+                    u.as_ref(),
+                    d.as_ref(),
+                    &buffers.moe_route_tokens,
+                    &buffers.moe_route_experts,
+                    &buffers.moe_route_weights,
+                    batch * moe.num_experts_per_tok,
+                    &buffers.moe_out[i],
+                    hidden,
+                    cfg.moe_intermediate_size,
+                    moe.routed_scaling_factor,
+                )?;
+            }
+            // Shared expert (dense SwiGLU at the shared width) added on top.
+            if let Some(ref shared) = moe.shared_experts {
+                linear_into(
+                    &dev,
+                    scratch.col[i].as_ref(),
+                    shared.w1.weight(),
+                    as_rocm(scratch.shg[i].as_ref())?,
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    scratch.col[i].as_ref(),
+                    shared.w3.weight(),
+                    as_rocm(scratch.shu[i].as_ref())?,
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    scratch.shg[i].as_ref(),
+                    scratch.shu[i].as_ref(),
+                    as_rocm(scratch.sha[i].as_ref())?,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    scratch.sha[i].as_ref(),
+                    shared.w2.weight(),
+                    as_rocm(scratch.sho[i].as_ref())?,
+                    act,
+                )?;
+                add_graph(
+                    &buffers.moe_out[i],
+                    scratch.sho[i].as_ref(),
+                    &buffers.norm_buf[i],
+                    &dev,
+                )?;
+            } else {
+                publish_into(&dev, &buffers.norm_buf[i], &buffers.moe_out[i])?;
+            }
+        } else {
+            return Err(grim_core::error::Error::Backend(format!(
+                "xing40 graph: layer {i} has neither mlp nor moe"
+            )));
+        }
+
+        if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("ffn") {
+            return Ok(());
+        }
+        // HOST ORACLE for the dense FFN's w2 GEMV — the last unverified
+        // link in layer 0. Every other stage is now either bit-identical
+        // to eager or checked against a host oracle, but this one feeds
+        // norm_buf straight into the FFN write-back.
+        //   out[j] = sum_c activated[c] * w2[j, c]
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            if let Some(mlp) = &layer.mlp {
+                let _ =
+                    grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+                let act = as_rocm(&buffers.activated_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+                let w = mlp.w2.weight().to_vec_f32();
+                let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+                if let (Ok(act), Ok(w), Ok(nb)) = (act, w, nb) {
+                    let k = act.len();
+                    let n_out = 512.min(hidden);
+                    let (mut md, mut rr) = (0.0f32, 0.0f64);
+                    for jx in 0..n_out {
+                        let mut acc = 0.0f32;
+                        for c in 0..k {
+                            acc += act[c] * w[jx * k + c];
+                        }
+                        let d = (acc - nb[jx]).abs();
+                        if d > md {
+                            md = d;
+                        }
+                        rr += (acc as f64) * (acc as f64);
+                    }
+                    rr = (rr / n_out as f64).sqrt();
+                    let rg =
+                        (nb[..n_out].iter().map(|x| x * x).sum::<f32>() / n_out as f32).sqrt();
+                    eprintln!(
+                        "[xing-graph] DENSE W2 vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                        md as f64 / rr.max(1e-12)
+                    );
+                }
+            }
+        }
+        // ── ffn write-back: streams carry to the next layer ──
+        let n_layers = buffers.layer_input.len();
+        let dst: &GBox = if i + 1 < n_layers {
+            &scratch.sin[i + 1]
+        } else {
+            &scratch.sin[0] // last layer publishes into the seed slot
+        };
+        dev.launch_hc_write_back_step(
+            &buffers.norm_buf[i],
+            as_rocm(scratch.post[i].as_ref())?,
+            as_rocm(scratch.comb[i].as_ref())?,
+            sout.as_ref(),
+            as_rocm(dst.as_ref())?,
+            hc,
+            hidden,
+        )?;
+        // HOST ORACLE for the FFN write-back, i.e. sin[1] — the value the
+        // per-layer ratio table has tracked since the first session (graph
+        // 3.9997e-3 vs eager 4.03218e-3). Same formula as the attention
+        // write-back, over sout[i] and the FFN's own gates.
+        if i == 0 && !capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(stream);
+            let sv = as_rocm(scratch.sout[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+            let pv = as_rocm(scratch.post[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            let cv = as_rocm(scratch.comb[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            let ov = as_rocm(scratch.sin[1].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+            if let (Ok(sinv), Ok(nb), Ok(postv), Ok(combv), Ok(outv)) = (sv, nb, pv, cv, ov) {
+                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                for d in 0..hidden {
+                    for h in 0..hc {
+                        let mut acc = postv[h] * nb[d];
+                        for k2 in 0..hc {
+                            acc += combv[h * hc + k2] * sinv[k2 * hidden + d];
+                        }
+                        let diff = (acc - outv[h * hidden + d]).abs();
+                        if diff > md {
+                            md = diff;
+                        }
+                        rr += (acc as f64) * (acc as f64);
+                    }
+                }
+                rr = (rr / (hc * hidden) as f64).sqrt();
+                let rg =
+                    (outv.iter().map(|x| x * x).sum::<f32>() / outv.len().max(1) as f32).sqrt();
+                let rms = |v: &Vec<f32>| {
+                    (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+                };
+                eprintln!(
+                    "[xing-graph] FFNWB inputs rms: sout {:.4e} nb {:.4e} post {:?} comb {:.4e} sin1 {:.4e}",
+                    rms(&sinv),
+                    rms(&nb),
+                    &postv[..hc.min(postv.len())],
+                    rms(&combv),
+                    rg
+                );
+                eprintln!(
+                    "[xing-graph] FFN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                    md as f64 / rr.max(1e-12)
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn last_emitted_node(emitter: &Option<grim_backend_rocm::task_graph::TaskGraphBuilder>) -> u32 {
+    emitter
+        .as_ref()
+        .and_then(|b| (b.len() as u32).checked_sub(1))
+        .unwrap_or(u32::MAX)
+}
+
 fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40GraphScratch> {
     let cfg = &model.cfg;
     let hc = cfg.hc_mult;
@@ -8140,7 +11599,6 @@ impl DecodeGraphModel for Xing40 {
         let hidden = self.cfg.hidden_size;
         let hc = scratch.hc;
         let flat = scratch.flat;
-        let cfg = &self.cfg;
 
         // Aliasing probe (env-gated): the graph writes NaN over sin[0] on every
         // replay, and sin is read-only in this body. A pool buffer that OVERLAPS
@@ -8240,1227 +11698,265 @@ impl DecodeGraphModel for Xing40 {
             let dst = as_rocm(scratch.sin0_snap[0].as_ref())?;
             dev.copy_slice_into(dst, scratch.sin[0].as_ref(), 0, flat)?;
         }
-        let h_shape = Shape::new(vec![batch, hidden]);
-        let n_layers = self.layers.len();
+        // PM-4 emitter (condition 1b): one node per model-level launch, only
+        // inside the capture bracket. Xing40 is the MoE+MLA proof vehicle, so
+        // its walk emits ATTENTION nodes for the MLA blocks and — per layer's
+        // FFN kind — either GEMM (dense SwiGLU) or MOE_DISPATCH (noaux_tc
+        // route + dispatch). Emitted through the free fn because this body
+        // holds `buffers` (a `&mut graph.buffers` reborrow) across the walk;
+        // emitter and buffers are disjoint fields.
+        if graph.emitter.is_some() && graph.capturing {
+            let seg0 = graph
+                .segments
+                .first()
+                .map(|s| s.device)
+                .unwrap_or(dev.ordinal());
+            let _ = grim_backend_rocm::decode_graph_buffers::emit_node_into(
+                &mut graph.emitter,
+                grim_backend_rocm::task_graph::op::ELEMENTWISE,
+                [hidden as u32, hc as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[
+                    (
+                        buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
+                        buffers.token_ids_dev.bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                    ),
+                    (
+                        buffers.layer_input[0].device_ptr_u64().unwrap_or(0),
+                        buffers.layer_input[0].bytes() as u64,
+                        grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                    ),
+                ],
+                &[],
+                seg0 as u8,
+            );
+        }
         // Fault bisection: capture only the first N layers (default: all).
         // With 0 the graph holds just the embedding gather + hc fan-out.
         let cap_layers: usize = std::env::var("GRIM_XING_CAPTURE_LAYERS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(usize::MAX);
+        let capturing = graph.capturing;
+        let stream = graph.stream;
+        // Take the emitter out for the loop: the body needs `&mut buffers`
+        // and `&mut emitter` simultaneously, and the compiler cannot split
+        // those borrows through the call. Restored immediately after; a
+        // failure inside the loop kills the capture whole, so a lost emitter
+        // on that path costs nothing.
+        let mut emitter = graph.emitter.take();
         for (i, layer) in self.layers.iter().enumerate().take(cap_layers) {
-            let act = &buffers.act_q81_buf[i];
-            // The running stream for this layer. It MUST be sin[i]: the
-            // write-back at the end of a layer publishes into sin[i+1] (and
-            // the last layer into sin[0] for the head), so sin[i] is the slot
-            // this layer reads. It used to read sout[i-1] here while every
-            // op below used sout[i] — two different buffers for one value, and
-            // sout was never written, so every layer after the first consumed
-            // uninitialized memory and the last layer published that NaN back
-            // into sin[0].
-            let sin: &GBox = &scratch.sin[i];
-            // Staging for the attention write-back (see the aliasing note
-            // there): sin[i] is this layer's input, sout[i] is the stream
-            // after the attention contribution has been folded in.
-            let sout: &GBox = &scratch.sout[i];
-
-            // ── attn hc: gates over the raw stream state ──
-            dev.rms_norm_into(
-                sin.as_ref(),
-                &**layer.attn_hc.input_norm.weight.storage(),
-                layer.attn_hc.input_norm.eps,
-                as_rocm(scratch.hcn[i].as_ref())?,
-                &Shape::new(vec![batch, flat]),
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-            linear_into(
+            self.launch_layer_body(
+                i,
+                layer,
+                &mut emitter,
+                capturing,
+                &mut *buffers,
+                scratch,
                 &dev,
-                as_rocm(scratch.hcn[i].as_ref())?,
-                &scratch.hc_fn_attn[i],
-                as_rocm(scratch.proj[i].as_ref())?,
-                act,
-            )?;
-            let (iters, geps, cmin, cmax) = layer.attn_hc.gate_consts();
-            dev.mhc_gates_launch_into(
-                as_rocm(scratch.proj[i].as_ref())?,
-                scratch.hc_base[i].as_ref(),
-                scratch.hc_scale[i].as_ref(),
-                as_rocm(scratch.pre[i].as_ref())?,
-                as_rocm(scratch.post[i].as_ref())?,
-                as_rocm(scratch.comb[i].as_ref())?,
-                batch,
+                stream,
                 hc,
-                iters,
-                geps,
-                cmin,
-                cmax,
+                flat,
             )?;
-            // Snapshot the attention gates before the FFN overwrites them.
-            // Capture-safe: a device-to-device copy on the capturing stream,
-            // no allocation and no sync.
-            {
-                let pdst = as_rocm(scratch.attn_post_snap[i].as_ref())?;
-                dev.copy_slice_into(pdst, scratch.post[i].as_ref(), 0, hc * batch)?;
-                let cdst = as_rocm(scratch.attn_comb_snap[i].as_ref())?;
-                dev.copy_slice_into(cdst, scratch.comb[i].as_ref(), 0, hc * hc * batch)?;
-            }
-            // CAVEAT: this is a WARMUP pass. run.rs runs warmups on UNSEEDED
-            // buffers and then re-seeds, so only values UPSTREAM of the
-            // attention (embedding, collapse, attn gates, q path) are
-            // comparable to an eager run. Anything downstream of the KV
-            // attention reads a stale arena and legitimately differs — two
-            // rounds of chasing that were wasted before this was written down.
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                for (lbl, b) in [
-                    ("post", scratch.post.first()),
-                    ("comb", scratch.comb.first()),
-                ] {
-                    if let Some(b) = b {
-                        if let Ok(st) = as_rocm(b.as_ref()) {
-                            if let Ok(v) = st.to_cpu_vec_f32() {
-                                if lbl == "comb" {
-                                    let rows: Vec<f32> = (0..hc)
-                                        .map(|h| (0..hc).map(|i| v[h * hc + i]).sum())
-                                        .collect();
-                                    eprintln!("[xing-graph] WARM comb rowsums {rows:?}");
-                                } else {
-                                    eprintln!("[xing-graph] WARM post {v:?}");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            dev.launch_hc_collapse_step(
-                // The attention branch reads the layer INPUT. `sout[i]` is the
-                // staging buffer the attention write-back fills further down,
-                // so it is still zeros at this point.
-                sin.as_ref(),
-                as_rocm(scratch.pre[i].as_ref())?,
-                as_rocm(scratch.col[i].as_ref())?,
-                hc,
-                hidden,
-            )?;
-            dev.rms_norm_into(
-                as_rocm(scratch.col[i].as_ref())?,
-                &**layer.attn_norm.weight.storage(),
-                layer.attn_norm.eps,
-                as_rocm(scratch.col[i].as_ref())?,
-                &h_shape,
-            )?;
-            // The FFN branch overwrites `col` later in this layer, so the
-            // attention-branch value is only observable here. Dump during the
-            // WARMUP pass (capturing=false => syncing is legal and the values
-            // are real); during the recorded pass this buffer is stale.
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                if let Ok(st) = as_rocm(scratch.col[0].as_ref()) {
-                    if let Ok(v) = st.to_cpu_vec_f32() {
-                        let r =
-                            (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                        eprintln!(
-                            "[xing-graph] WARM attn_in L{i}: n {} rms {r:.4e} head {:?}",
-                            v.len(),
-                            &v[..v.len().min(4)]
-                        );
-                    }
-                }
-            }
-
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("pre") {
-                return Ok(());
-            }
-            // ── MLA ──
-            let sa = &layer.self_attn;
-            let rank = cfg.kv_lora_rank;
-            let nope = cfg.qk_nope_head_dim;
-            let rope_d = cfg.qk_rope_head_dim;
-            let vd = cfg.v_head_dim;
-            let nh = cfg.num_heads;
-            if let (Some(qa), Some(qn_norm), Some(qb)) =
-                (&sa.q_a_proj, &sa.q_a_layernorm, &sa.q_b_proj)
-            {
-                linear_into(
-                    &dev,
-                    scratch.col[i].as_ref(),
-                    qa.weight(),
-                    as_rocm(scratch.qlora[i].as_ref())?,
-                    act,
-                )?;
-                dev.rms_norm_into(
-                    as_rocm(scratch.qlora[i].as_ref())?,
-                    &**qn_norm.weight.storage(),
-                    qn_norm.eps,
-                    as_rocm(scratch.qlora[i].as_ref())?,
-                    &Shape::new(vec![batch, scratch.qlora[i].shape().dims()[1]]),
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(
-                    &dev,
-                    scratch.qlora[i].as_ref(),
-                    qb.weight(),
-                    as_rocm(scratch.qf[i].as_ref())?,
-                    act,
-                )?;
-            } else if let Some(ref q_direct) = sa.q_proj_direct {
-                linear_into(
-                    &dev,
-                    scratch.col[i].as_ref(),
-                    q_direct.weight(),
-                    as_rocm(scratch.qf[i].as_ref())?,
-                    act,
-                )?;
-            }
-            dev.launch_xing_q_split(
-                scratch.qf[i].as_ref(),
-                as_rocm(scratch.qn[i].as_ref())?,
-                as_rocm(scratch.qp[i].as_ref())?,
-                nh,
-                nope,
-                rope_d,
-            )?;
-            // YARN-CORRECT rope: rope_dev_base_into takes only `base` — no
-            // ramp, no mscale — so a YaRN checkpoint rotated by the wrong
-            // angles (rms-identical, values permuted; the qrope array diff
-            // measured max_abs 0.47 at identical rms). grim_rope_yarn_pos0
-            // is the same rotation the eager path's verified kernel does,
-            // reading the current position from pos_dev.
-            {
-                let inv_freq = scratch.rope_inv_freq.as_ref().ok_or_else(|| {
-                    grim_core::error::Error::Backend(
-                        "xing40 graph: no device inv_freq table".into(),
-                    )
-                })?;
-                dev.rope_dev_yarn_pos0_into(
-                    as_rocm(scratch.qp[i].as_ref())?,
-                    &buffers.pos_dev,
-                    as_rocm(inv_freq.as_ref())?,
-                    as_rocm(scratch.qp[i].as_ref())?,
-                    &scratch.rope_cfg,
-                    &Shape::new(vec![batch, nh, rope_d]),
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-            }
-            // A/B the q rope: the graph ropes the whole [1, nh, rope_d] slab
-            // in place with rope_dev_base_into; eager ropes ONE HEAD AT A TIME
-            // with dev.rope and writes each result back per head. Two
-            // implementations of the same rotation - if one folds the YaRN
-            // mscale and the other does not, every attention output shifts.
-            // `qp` now holds the graph's ANSWER; the pre-rope bytes are
-            // re-derived from `qf` through the same q_split the capture used.
-            // Warmup only: allocation is capture-poison.
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                let Ok(got) = as_rocm(scratch.qp[i].as_ref())?.to_cpu_vec_f32() else {
-                    return Ok(());
-                };
-                let pre_shape = Shape::new(vec![1, nh * rope_d]);
-                let nope_shape = Shape::new(vec![1, nh * nope]);
-                let t_pre = dev.zeros(&pre_shape, grim_tensor::DType::F32);
-                let t_nope = dev.zeros(&nope_shape, grim_tensor::DType::F32);
-                if let (Ok(t_pre), Ok(t_nope)) = (t_pre, t_nope) {
-                    let t_pre_r: &grim_backend_rocm::RocmStorage =
-                        t_pre.as_any().downcast_ref().expect("rocm");
-                    let t_nope_r: &grim_backend_rocm::RocmStorage =
-                        t_nope.as_any().downcast_ref().expect("rocm");
-                    if dev
-                        .launch_xing_q_split(
-                            as_rocm(scratch.qf[i].as_ref())?,
-                            t_nope_r,
-                            t_pre_r,
-                            nh,
-                            nope,
-                            rope_d,
-                        )
-                        .is_ok()
-                    {
-                        if let Ok(pre) = t_pre.to_cpu_vec_f32() {
-                            let pos = vec![buffers.current_pos];
-                            let head_shape = Shape::new(vec![1, 1, rope_d]);
-                            if let Ok(mut refbuf) = dev.zeros(&pre_shape, grim_tensor::DType::F32) {
-                                let mut ok = true;
-                                for h in 0..nh {
-                                    let hs = Shape::new(vec![1, rope_d]);
-                                    let head_src = match dev.from_cpu(
-                                        &pre[h * rope_d..(h + 1) * rope_d],
-                                        &hs,
-                                        grim_tensor::DType::F32,
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            ok = false;
-                                            break;
-                                        }
-                                    };
-                                    let mut ho =
-                                        match dev.zeros(&head_shape, grim_tensor::DType::F32) {
-                                            Ok(v) => v,
-                                            Err(_) => {
-                                                ok = false;
-                                                break;
-                                            }
-                                        };
-                                    match grim_tensor::AttentionOps::rope(
-                                        dev.as_ref(),
-                                        head_src.as_ref(),
-                                        &pos,
-                                        &scratch.rope_cfg,
-                                        &head_shape,
-                                    ) {
-                                        Ok((t, _)) => {
-                                            if dev
-                                                .write_cols(
-                                                    refbuf.as_mut(),
-                                                    nh * rope_d,
-                                                    h * rope_d,
-                                                    t.as_ref(),
-                                                    1,
-                                                    rope_d,
-                                                )
-                                                .is_err()
-                                            {
-                                                ok = false;
-                                                break;
-                                            }
-                                        }
-                                        _ => {
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-                                    let _ = &mut ho;
-                                }
-                                if ok {
-                                    dev.synchronize();
-                                    if let Ok(b) = refbuf.to_cpu_vec_f32() {
-                                        let md = got
-                                            .iter()
-                                            .zip(b.iter())
-                                            .map(|(x, y)| (x - y).abs())
-                                            .fold(0.0f32, f32::max);
-                                        let rg = (got.iter().map(|x| x * x).sum::<f32>()
-                                            / got.len().max(1) as f32)
-                                            .sqrt();
-                                        eprintln!(
-                                            "[xing-graph] QROPE in_place_vs_perhead: max_abs {md:.4e} rel {:.4e} rms {rg:.4e}",
-                                            md as f64 / (rg as f64).max(1e-12)
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Absorb W_UK into the nope plane (F32 bank cache, [nh*rank, nope]).
-            if let Some(w_uk) = sa.w_kc_device(0)? {
-                dev.launch_xing_q_absorb(
-                    as_rocm(scratch.qn[i].as_ref())?,
-                    w_uk,
-                    as_rocm(scratch.qabs[i].as_ref())?,
-                    nh,
-                    rank,
-                    nope,
-                )?;
-            } else {
-                return Err(grim_core::error::Error::Backend(
-                    "xing40 graph: no device W_UK cache".into(),
-                ));
-            }
-            // KV latent: project, norm c_kv, rope k_pe, pack, append.
-            linear_into(
-                &dev,
-                scratch.col[i].as_ref(),
-                sa.kv_a_proj.weight(),
-                as_rocm(scratch.kvstage[i].as_ref())?,
-                act,
-            )?;
-            dev.launch_xing_q_split(
-                scratch.kvstage[i].as_ref(),
-                as_rocm(scratch.ckv[i].as_ref())?,
-                as_rocm(scratch.kpe[i].as_ref())?,
-                1,
-                rank,
-                rope_d,
-            )?;
-            dev.rms_norm_into(
-                as_rocm(scratch.ckv[i].as_ref())?,
-                &**sa.kv_a_layernorm.weight.storage(),
-                sa.kv_a_layernorm.eps,
-                as_rocm(scratch.ckv[i].as_ref())?,
-                &Shape::new(vec![batch, rank]),
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-            // Same yarn-correct rope for k_pe (see the q rope note above).
-            {
-                let inv_freq = scratch.rope_inv_freq.as_ref().ok_or_else(|| {
-                    grim_core::error::Error::Backend(
-                        "xing40 graph: no device inv_freq table".into(),
-                    )
-                })?;
-                dev.rope_dev_yarn_pos0_into(
-                    as_rocm(scratch.kpe[i].as_ref())?,
-                    &buffers.pos_dev,
-                    as_rocm(inv_freq.as_ref())?,
-                    as_rocm(scratch.kpe[i].as_ref())?,
-                    &scratch.rope_cfg,
-                    &Shape::new(vec![batch, 1, rope_d]),
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-            }
-            dev.launch_xing_pack_latent(
-                as_rocm(scratch.ckv[i].as_ref())?,
-                as_rocm(scratch.kpe[i].as_ref())?,
-                as_rocm(scratch.latent[i].as_ref())?,
-                rank,
-                rope_d,
-            )?;
-            grim_backend_rocm::launch_kv_append_batch(
-                &dev,
-                &buffers.k_arena[i],
-                as_rocm(scratch.latent[i].as_ref())?,
-                &buffers.pos_dev,
-                rank + rope_d,
-                1,
-                batch,
-                buffers.max_ctx * (rank + rope_d),
-                grim_backend_rocm::KvRingPolicy::UNLIMITED,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
-            // Latent-space attention over the LIVE length (pos_dev + 1); the
-            // normalized latent lands in qabs and W_UV runs as the per-head
-            // GEMV into attn.
-            // The softmax denominator is handed to the kernel rather than
-            // applied by a separate elementwise pass over q. The kernel's
-            // default is 1/sqrt(rank + rope_d); this model folds a YaRN
-            // attention_factor^2 against the *nope + rope* width instead.
-            // Issuing that extra `grim_mul_scalar` inside the capture bracket
-            // hangs the capture dead - bisected with GRIM_KQ_PRESCALE: it hangs
-            // even writing in place into qabs/qp (mode 4), so it is the launch
-            // in the bracket, not the destination buffers.
-            let mscale = cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0f32);
-            let inv_sqrt_d = mscale * mscale / ((nope + rope_d) as f32).sqrt();
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                eprintln!(
-                    "[xing-graph] SCALE mscale {mscale:.6} nope {nope} rope_d {rope_d} inv_sqrt_d {inv_sqrt_d:.6e} cfg_yarn {:?}",
-                    cfg.rope_yarn.is_some()
-                );
-            }
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("append") {
-                return Ok(());
-            }
-            dev.launch_mla_absorbed_decode_scaled(
-                as_rocm(scratch.qabs[i].as_ref())?,
-                as_rocm(scratch.qp[i].as_ref())?,
-                &buffers.k_arena[i],
-                None,
-                as_rocm(scratch.qattn_latent[i].as_ref())?,
-                nh,
-                rank,
-                rope_d,
-                vd,
-                buffers.max_ctx.max(1),
-                0,
-                0,
-                Some(&buffers.pos_dev),
-                inv_sqrt_d,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mlaout") {
-                return Ok(());
-            }
-            // A/B the value up-projection: `xing_q_absorb` (what the graph
-            // uses) vs a per-head matmul (what eager uses) over the SAME
-            // latent and the SAME w_vc. Both sides are computed here, so
-            // neither depends on a buffer that has not been written yet.
-            // Warmup only: allocating is capture-poison.
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                if let Some(w_vc) = sa.w_vc_device(0)? {
-                    let _ =
-                        grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                    let lat = as_rocm(scratch.qattn_latent[i].as_ref())?;
-                    let w_r = as_rocm(w_vc)?;
-                    let attn_shape = Shape::new(vec![1, nh * vd]);
-                    if let (Ok(mut mm), Ok(xg)) = (
-                        dev.zeros(&attn_shape, grim_tensor::DType::F32),
-                        dev.zeros(&attn_shape, grim_tensor::DType::F32),
-                    ) {
-                        let mm_m: &mut dyn grim_tensor::BackendStorage = mm.as_mut();
-                        let xg_r: &grim_backend_rocm::RocmStorage =
-                            xg.as_any().downcast_ref().expect("rocm");
-                        dev.launch_xing_q_absorb(lat, w_r, xg_r, nh, vd, rank).ok();
-                        // Each head's [1, vd] must land at column h*vd, not
-                        // overwrite the whole buffer - matmul_into writes the
-                        // full `out`, so stage per head and write_cols it in.
-                        let head_shape = Shape::new(vec![1, vd]);
-                        let mut ok = dev.zeros(&head_shape, grim_tensor::DType::F32).is_ok();
-                        if ok {
-                            for h in 0..nh {
-                                let tmp = match dev.zeros(&head_shape, grim_tensor::DType::F32) {
-                                    Ok(t) => t,
-                                    Err(_) => {
-                                        ok = false;
-                                        break;
-                                    }
-                                };
-                                let tmp_r: &grim_backend_rocm::RocmStorage =
-                                    tmp.as_any().downcast_ref().expect("rocm");
-                                let lat_h = dev.narrow_cols(
-                                    lat,
-                                    nh * rank,
-                                    h * rank,
-                                    1,
-                                    rank,
-                                    &Shape::new(vec![1, rank]),
-                                );
-                                let w_h = dev.narrow_rows(
-                                    w_r,
-                                    h * vd,
-                                    vd,
-                                    rank,
-                                    &Shape::new(vec![vd, rank]),
-                                );
-                                if let (Ok((l, _)), Ok((w, _))) = (lat_h, w_h) {
-                                    if dev.matmul_into(l.as_ref(), w.as_ref(), tmp_r).is_err() {
-                                        ok = false;
-                                        break;
-                                    }
-                                    if dev.write_cols(mm_m, nh * vd, h * vd, tmp_r, 1, vd).is_err()
-                                    {
-                                        ok = false;
-                                        break;
-                                    }
-                                } else {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if ok {
-                            dev.synchronize();
-                            if let (Ok(a), Ok(b)) = (xg.to_cpu_vec_f32(), mm.to_cpu_vec_f32()) {
-                                let md = a
-                                    .iter()
-                                    .zip(b.iter())
-                                    .map(|(x, y)| (x - y).abs())
-                                    .fold(0.0f32, f32::max);
-                                let ra = (a.iter().map(|x| x * x).sum::<f32>()
-                                    / a.len().max(1) as f32)
-                                    .sqrt();
-                                eprintln!(
-                                    "[xing-graph] ABSORB xing_vs_matmul: max_abs {md:.4e} rel {:.4e} rms {ra:.4e}",
-                                    md / ra.max(1e-12)
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(w_vc) = sa.w_vc_device(0)? {
-                if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mla") {
-                    return Ok(());
-                }
-                dev.launch_xing_q_absorb(
-                    as_rocm(scratch.qattn_latent[i].as_ref())?,
-                    w_vc,
-                    as_rocm(scratch.attn[i].as_ref())?,
-                    nh,
-                    vd,
-                    rank,
-                )?;
-            } else {
-                return Err(grim_core::error::Error::Backend(
-                    "xing40 graph: no device W_VC cache".into(),
-                ));
-            }
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("absorb") {
-                return Ok(());
-            }
-            linear_into(
-                &dev,
-                scratch.attn[i].as_ref(),
-                sa.o_proj.weight(),
-                &buffers.norm_buf[i],
-                act,
-            )?;
-            // Snapshot o_proj's output before the FFN reuses norm_buf.
-            {
-                let dst = as_rocm(scratch.attn_out_snap[i].as_ref())?;
-                dev.copy_slice_into(dst, &buffers.norm_buf[i], 0, hidden)?;
-            }
-            // Host oracle for the Q4_K o_proj. `fused_quant_gemm` cannot be
-            // A/B'd in-process (it deadlocks the warmup), so dequantize the
-            // weight on the host and compute the GEMV directly: that is ground
-            // truth for BOTH paths, and tells us whether the graph's result is
-            // right or merely different. First 512 outputs only - a full
-            // 3584x4096 host GEMV is minutes in a debug build.
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                let n_out = 512.min(hidden);
-                if let (Ok(a), Ok(w), Ok(nb)) = (
-                    as_rocm(scratch.attn[i].as_ref())?.to_cpu_vec_f32(),
-                    sa.o_proj.weight().to_vec_f32(),
-                    as_rocm(&buffers.norm_buf[i]).unwrap().to_cpu_vec_f32(),
-                ) {
-                    let k = a.len();
-                    let mut max_abs = 0.0f32;
-                    let mut ref_rms = 0.0f64;
-                    for j in 0..n_out {
-                        let mut acc = 0.0f32;
-                        for c in 0..k {
-                            acc += a[c] * w[j * k + c];
-                        }
-                        ref_rms += (acc as f64) * (acc as f64);
-                        let d = (acc - nb[j]).abs();
-                        if d > max_abs {
-                            max_abs = d;
-                        }
-                    }
-                    ref_rms = (ref_rms / n_out as f64).sqrt();
-                    let got_rms =
-                        (nb[..n_out].iter().map(|x| x * x).sum::<f32>() / n_out as f32).sqrt();
-                    eprintln!(
-                        "[xing-graph] OPROJ vs HOST oracle: max_abs {max_abs:.4e} rel {:.4e} ref_rms {ref_rms:.4e} got_rms {got_rms:.4e}",
-                        max_abs as f64 / ref_rms.max(1e-12)
-                    );
-                    // Same product through the fused-dequant leg, which takes
-                    // F32 A instead of quantizing it to Q8_1. If this lands at
-                    // ~1e-6 while the dot4 leg sits at ~6e-3, the Q8_1
-                    // ACTIVATION quantization is the entire error.
-                    if let (Ok(attn_r), Ok(o_ws2)) = (
-                        as_rocm(scratch.attn[i].as_ref()),
-                        as_rocm(sa.o_proj.weight().storage().as_ref()),
-                    ) {
-                        if let Ok(fb) =
-                            dev.zeros(&Shape::new(vec![1, hidden]), grim_tensor::DType::F32)
-                        {
-                            let fb_r: &grim_backend_rocm::RocmStorage =
-                                fb.as_any().downcast_ref().expect("rocm");
-                            if dev
-                                .launch_fused_dequant_gemm_q4k_for_ab(
-                                    attn_r,
-                                    o_ws2,
-                                    fb_r,
-                                    1,
-                                    hidden,
-                                    nh * vd,
-                                )
-                                .is_ok()
-                            {
-                                dev.synchronize();
-                                if let Ok(b) = fb.to_cpu_vec_f32() {
-                                    let mut md2 = 0.0f32;
-                                    for j in 0..n_out.min(hidden) {
-                                        let mut acc = 0.0f32;
-                                        for c in 0..(nh * vd) {
-                                            acc += a[c] * w[j * (nh * vd) + c];
-                                        }
-                                        let d = (acc - b[j]).abs();
-                                        if d > md2 {
-                                            md2 = d;
-                                        }
-                                    }
-                                    eprintln!(
-                                        "[xing-graph] OPROJ fused-dequant vs HOST oracle: max_abs {md2:.4e} rel {:.4e}",
-                                        md2 as f64 / ref_rms.max(1e-12)
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("oproj") {
-                return Ok(());
-            }
-            // The out buffer must NOT alias the streams input. The kernel's
-            // thread (h,d) writes element (h,d) while EVERY thread (i,d)
-            // reads element (h,d), so in-place corrupts the row another head
-            // is still reading — measured as all-NaN streams on every replay.
-            // sout[i] is that staging buffer; the FFN branch below reads it.
-            dev.launch_hc_write_back_step(
-                &buffers.norm_buf[i],
-                as_rocm(scratch.post[i].as_ref())?,
-                as_rocm(scratch.comb[i].as_ref())?,
-                sin.as_ref(),
-                as_rocm(scratch.sout[i].as_ref())?,
-                hc,
-                hidden,
-            )?;
-
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("attn") {
-                return Ok(());
-            }
-            // HOST ORACLE for the attention write-back. Placed HERE on purpose:
-            // `post`/`comb` are overwritten by the FFN's gate call moments
-            // later, so an oracle further down compares the attention
-            // write-back against the FFN's gates and reports garbage (it
-            // reported rel 4.5 that way before this note existed).
-            //   out[h*hidden+d] = post[h]*y[d] + sum_i comb[h*hc+i]*s[i*hidden+d]
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                let sv = as_rocm(scratch.sin[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
-                let pv = as_rocm(scratch.post[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                let cv = as_rocm(scratch.comb[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                let ov = as_rocm(scratch.sout[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                if let (Ok(sinv), Ok(nb), Ok(postv), Ok(combv), Ok(soutv)) = (sv, nb, pv, cv, ov) {
-                    let (mut md, mut rr) = (0.0f32, 0.0f64);
-                    for d in 0..hidden {
-                        for h in 0..hc {
-                            let mut acc = postv[h] * nb[d];
-                            for k in 0..hc {
-                                acc += combv[h * hc + k] * sinv[k * hidden + d];
-                            }
-                            let diff = (acc - soutv[h * hidden + d]).abs();
-                            if diff > md {
-                                md = diff;
-                            }
-                            rr += (acc as f64) * (acc as f64);
-                        }
-                    }
-                    rr = (rr / (hc * hidden) as f64).sqrt();
-                    let rg = (soutv.iter().map(|x| x * x).sum::<f32>() / soutv.len().max(1) as f32)
-                        .sqrt();
-                    let rms = |v: &Vec<f32>| {
-                        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
-                    };
-                    eprintln!(
-                        "[xing-graph] WB inputs rms: sin {:.4e} nb {:.4e} post {:?} comb {:.4e} sout {:.4e}",
-                        rms(&sinv),
-                        rms(&nb),
-                        &postv[..hc.min(postv.len())],
-                        rms(&combv),
-                        rg
-                    );
-                    eprintln!(
-                        "[xing-graph] ATTN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                        md as f64 / rr.max(1e-12)
-                    );
-                }
-            }
-            // ── ffn hc ──
-            // Reads the stream the attention write-back just produced.
-            dev.rms_norm_into(
-                sout.as_ref(),
-                &**layer.ffn_hc.input_norm.weight.storage(),
-                layer.ffn_hc.input_norm.eps,
-                as_rocm(scratch.hcn[i].as_ref())?,
-                &Shape::new(vec![batch, flat]),
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-            linear_into(
-                &dev,
-                scratch.hcn[i].as_ref(),
-                &scratch.hc_fn_ffn[i],
-                as_rocm(scratch.proj[i].as_ref())?,
-                act,
-            )?;
-            let (iters, geps, cmin, cmax) = layer.ffn_hc.gate_consts();
-            dev.mhc_gates_launch_into(
-                as_rocm(scratch.proj[i].as_ref())?,
-                // The FFN branch's OWN bias/scale, matching eager's
-                // `self.ffn_hc.gates_d2d` — not the attention branch's.
-                scratch.hc_base_ffn[i].as_ref(),
-                scratch.hc_scale_ffn[i].as_ref(),
-                as_rocm(scratch.pre[i].as_ref())?,
-                as_rocm(scratch.post[i].as_ref())?,
-                as_rocm(scratch.comb[i].as_ref())?,
-                batch,
-                hc,
-                iters,
-                geps,
-                cmin,
-                cmax,
-            )?;
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                // Same warmup caveat as above: the FFN proj reads a stream
-                // built on a stale KV arena.
-                if let Some(b) = scratch.proj.first() {
-                    if let Ok(st) = as_rocm(b.as_ref()) {
-                        if let Ok(v) = st.to_cpu_vec_f32() {
-                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
-                                .sqrt();
-                            eprintln!(
-                                "[xing-graph] WARMFFN proj rms {r:.4e} head {:?}",
-                                &v[..6.min(v.len())]
-                            );
-                        }
-                    }
-                }
-                if let Some(b) = scratch.comb.first() {
-                    if let Ok(st) = as_rocm(b.as_ref()) {
-                        if let Ok(v) = st.to_cpu_vec_f32() {
-                            let rows: Vec<f32> = (0..hc)
-                                .map(|h| (0..hc).map(|i| v[h * hc + i]).sum())
-                                .collect();
-                            eprintln!("[xing-graph] WARMFFN comb rowsums {rows:?}");
-                        }
-                    }
-                }
-                if let Some(b) = scratch.post.first() {
-                    if let Ok(st) = as_rocm(b.as_ref()) {
-                        if let Ok(v) = st.to_cpu_vec_f32() {
-                            eprintln!("[xing-graph] WARMFFN post {v:?}");
-                        }
-                    }
-                }
-                if let Some(b) = scratch.col.first() {
-                    if let Ok(st) = as_rocm(b.as_ref()) {
-                        if let Ok(v) = st.to_cpu_vec_f32() {
-                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
-                                .sqrt();
-                            eprintln!(
-                                "[xing-graph] WARMFFN ffn_in n {} rms {r:.4e} head {:?}",
-                                v.len(),
-                                &v[..4.min(v.len())]
-                            );
-                        }
-                    }
-                }
-            }
-            // The FFN branch reads the stream the ATTENTION write-back just
-            // produced (`sout[i]`), not the layer input (`sin[i]`) — a replace-all
-            // had flattened both collapses onto `sin`, which the near-zero `post`
-            // gate of layer 0 hid until layer 1's larger gate exposed it.
-            dev.launch_hc_collapse_step(
-                sout.as_ref(),
-                as_rocm(scratch.pre[i].as_ref())?,
-                as_rocm(scratch.col[i].as_ref())?,
-                hc,
-                hidden,
-            )?;
-            dev.rms_norm_into(
-                as_rocm(scratch.col[i].as_ref())?,
-                &**layer.ffn_norm.weight.storage(),
-                layer.ffn_norm.eps,
-                as_rocm(scratch.col[i].as_ref())?,
-                &h_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-
-            // ── FFN branch: dense SwiGLU or noaux_tc MoE ──
-            if let Some(ref mlp) = layer.mlp {
-                linear_into(
-                    &dev,
-                    scratch.col[i].as_ref(),
-                    mlp.w1.weight(),
-                    &buffers.gate_buf[i],
-                    act,
-                )?;
-                linear_into(
-                    &dev,
-                    scratch.col[i].as_ref(),
-                    mlp.w3.weight(),
-                    &buffers.up_buf[i],
-                    act,
-                )?;
-                dev.silu_mul_into(
-                    &buffers.gate_buf[i],
-                    &buffers.up_buf[i],
-                    &buffers.activated_buf[i],
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(
-                    &dev,
-                    &buffers.activated_buf[i],
-                    mlp.w2.weight(),
-                    &buffers.norm_buf[i],
-                    act,
-                )?;
-            } else if let Some(ref moe) = layer.moe {
-                linear_into(
-                    &dev,
-                    as_rocm(scratch.col[i].as_ref())?,
-                    moe.gate.weight(),
-                    &buffers.moe_gate_logits[i],
-                    act,
-                )?;
-                let bias = moe.correction_bias_dev.as_ref().and_then(|b| {
-                    b.storage()
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                });
-                dev.moe_route_topk_on_device(
-                    &buffers.moe_gate_logits[i],
-                    bias,
-                    &buffers.moe_route_tokens,
-                    &buffers.moe_route_experts,
-                    &buffers.moe_route_weights,
-                    batch,
-                    cfg.n_routed_experts,
-                    moe.num_experts_per_tok,
-                    2,    // sigmoid + e_score_correction_bias (noaux_tc)
-                    true, // xing4_0.expert_weights_norm
-                )
-                .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
-
-                // Snapshot this layer's routing before the next layer
-                // overwrites the shared buffers.
-                {
-                    let n = batch * moe.num_experts_per_tok;
-                    let e = as_rocm(scratch.route_experts_snap[i].as_ref())?;
-                    dev.copy_slice_into(e, &buffers.moe_route_experts, 0, n)?;
-                    let w = as_rocm(scratch.route_weights_snap[i].as_ref())?;
-                    dev.copy_slice_into(w, &buffers.moe_route_weights, 0, n)?;
-                }
-                // HOST ORACLE for the noaux_tc routing, at the first MoE
-                // layer. Independent of the device kernel: sigmoid the gate
-                // logits, select the top-k on (sigmoid + correction bias),
-                // and normalise the selected sigmoid scores. If the graph
-                // picks different experts than eager, nothing downstream can
-                // agree - and layers 2..39 are all moe+shared, so this is the
-                // first thing to check once layer 0 is oracle-verified.
-                if i == 2 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                    let _ =
-                        grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                    let gl = as_rocm(&buffers.moe_gate_logits[i]).and_then(|s| s.to_cpu_vec_f32());
-                    let bs = match bias {
-                        Some(b) => match as_rocm(b) {
-                            Ok(r) => r.to_cpu_vec_f32().ok(),
-                            Err(_) => None,
-                        },
-                        None => None,
-                    };
-                    // u32, NOT f32: reading it with to_cpu_vec_f32 reports
-                    // zeros and looks exactly like a routing bug.
-                    let de = as_rocm(&buffers.moe_route_experts).and_then(|s| s.to_cpu_vec_u32());
-                    let dw = as_rocm(&buffers.moe_route_weights).and_then(|s| s.to_cpu_vec_f32());
-                    eprintln!(
-                        "[xing-graph] ROUTING probe L2: logits_ok {} bias_ok {} experts_ok {:?} w_ok {}",
-                        gl.is_ok(),
-                        bs.is_some(),
-                        de.as_ref().map(|v| &v[..4.min(v.len())]),
-                        dw.is_ok()
-                    );
-                    if let (Ok(gl), Some(bs), Ok(de), Ok(dw)) = (gl, bs, de, dw) {
-                        let ne = gl.len();
-                        let sig: Vec<f32> = gl.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
-                        let mut order: Vec<usize> = (0..ne).collect();
-                        order.sort_by(|a, b| {
-                            (sig[*b] + bs[*b])
-                                .partial_cmp(&(sig[*a] + bs[*a]))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        let sel: Vec<usize> = order
-                            .iter()
-                            .take(moe.num_experts_per_tok)
-                            .copied()
-                            .collect();
-                        let sum: f32 = sel.iter().map(|j| sig[*j]).sum();
-                        let dev_sel: Vec<usize> = de
-                            .iter()
-                            .take(moe.num_experts_per_tok)
-                            .map(|v| *v as usize)
-                            .collect();
-                        let _ = &dev_sel;
-                        let devs: Vec<f32> =
-                            dw.iter().take(moe.num_experts_per_tok).copied().collect();
-                        let same_set = sel.iter().filter(|j| dev_sel.contains(j)).count();
-                        eprintln!(
-                            "[xing-graph] ROUTING oracle: dev_experts {dev_sel:?} dev_w {:?} | host_experts {sel:?} host_w {:?} | overlap {same_set}/{}",
-                            devs.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>(),
-                            sel.iter()
-                                .map(|j| format!("{:.4}", sig[*j] / sum))
-                                .collect::<Vec<_>>(),
-                            moe.num_experts_per_tok
-                        );
-                    }
-                }
-                // Arm 1 — native K-quant (zero extra VRAM): PEEK the pointer
-                // arrays prewarmed at pool build; a miss must not upload
-                // inside the capture bracket.
-                let kq = crate::shared_moe::peek_kq_native(&moe.charon_cache);
-                // Arm 2 — WhiteCrow stacks (budget-gated). PEEK, never ensure:
-                // a miss here must not convert (D2H inside the capture
-                // bracket poisons it).
-                let wc = crate::shared_moe::peek_whitecrow_stacks(&moe.charon_cache);
-                if let Some(kq) = kq {
-                    let g_ptrs = kq
-                        .gate_ptrs
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                        .ok_or_else(|| {
-                            grim_core::error::Error::Backend("kq gate ptrs not RocmStorage".into())
-                        })?;
-                    let u_ptrs = kq
-                        .up_ptrs
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                        .ok_or_else(|| {
-                            grim_core::error::Error::Backend("kq up ptrs not RocmStorage".into())
-                        })?;
-                    let d_ptrs = kq
-                        .down_ptrs
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                        .ok_or_else(|| {
-                            grim_core::error::Error::Backend("kq down ptrs not RocmStorage".into())
-                        })?;
-                    let col_r = as_rocm(scratch.col[i].as_ref())?;
-                    dev.moe_fused_dispatch_kq_native_into(
-                        col_r,
-                        g_ptrs,
-                        u_ptrs,
-                        d_ptrs,
-                        &buffers.moe_route_tokens,
-                        &buffers.moe_route_experts,
-                        &buffers.moe_route_weights,
-                        batch * moe.num_experts_per_tok,
-                        &buffers.moe_out[i],
-                        hidden,
-                        cfg.moe_intermediate_size,
-                        moe.routed_scaling_factor,
-                        kq.gate_bytes / cfg.moe_intermediate_size as u64,
-                        kq.down_bytes / hidden as u64,
-                        i32::from(kq.down_q4k),
-                    )?;
-                } else if let Some(wc) = wc {
-                    let g_wc = wc
-                        .gate
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                        .ok_or_else(|| {
-                            grim_core::error::Error::Backend("wc gate not RocmStorage".into())
-                        })?;
-                    let u_wc = wc
-                        .up
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                        .ok_or_else(|| {
-                            grim_core::error::Error::Backend("wc up not RocmStorage".into())
-                        })?;
-                    let d_wc = wc
-                        .down
-                        .as_any()
-                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                        .ok_or_else(|| {
-                            grim_core::error::Error::Backend("wc down not RocmStorage".into())
-                        })?;
-                    let col_r = as_rocm(scratch.col[i].as_ref())?;
-                    dev.moe_fused_dispatch_whitecrow_grouped_into(
-                        col_r,
-                        g_wc,
-                        u_wc,
-                        d_wc,
-                        &buffers.moe_route_tokens,
-                        &buffers.moe_route_experts,
-                        &buffers.moe_route_weights,
-                        batch * moe.num_experts_per_tok,
-                        &buffers.moe_out[i],
-                        hidden,
-                        cfg.moe_intermediate_size,
-                        moe.routed_scaling_factor,
-                        wc.gate_stride,
-                        wc.down_stride,
-                    )?;
-                } else {
-                    let experts: Vec<crate::shared_moe::MoeExpert> = moe
-                        .experts
-                        .iter()
-                        .map(|e| crate::shared_moe::MoeExpert {
-                            gate: e.w1.clone(),
-                            up: e.w3.clone(),
-                            down: e.w2.clone(),
-                        })
-                        .collect();
-                    let (_, _, _, g, u, d) = crate::shared_moe::ensure_charon_scratch(
-                        dev.ordinal(),
-                        batch,
-                        moe.num_experts_per_tok,
-                        &experts,
-                        &moe.charon_cache,
-                    )?;
-                    let col_r = as_rocm(scratch.col[i].as_ref())?;
-                    dev.moe_fused_dispatch_resident_routing_into(
-                        col_r,
-                        g.as_ref(),
-                        u.as_ref(),
-                        d.as_ref(),
-                        &buffers.moe_route_tokens,
-                        &buffers.moe_route_experts,
-                        &buffers.moe_route_weights,
-                        batch * moe.num_experts_per_tok,
-                        &buffers.moe_out[i],
-                        hidden,
-                        cfg.moe_intermediate_size,
-                        moe.routed_scaling_factor,
-                    )?;
-                }
-                // Shared expert (dense SwiGLU at the shared width) added on top.
-                if let Some(ref shared) = moe.shared_experts {
-                    linear_into(
-                        &dev,
-                        scratch.col[i].as_ref(),
-                        shared.w1.weight(),
-                        as_rocm(scratch.shg[i].as_ref())?,
-                        act,
-                    )?;
-                    linear_into(
-                        &dev,
-                        scratch.col[i].as_ref(),
-                        shared.w3.weight(),
-                        as_rocm(scratch.shu[i].as_ref())?,
-                        act,
-                    )?;
-                    dev.silu_mul_into(
-                        scratch.shg[i].as_ref(),
-                        scratch.shu[i].as_ref(),
-                        as_rocm(scratch.sha[i].as_ref())?,
-                    )
-                    .map_err(grim_core::error::Error::Tensor)?;
-                    linear_into(
-                        &dev,
-                        scratch.sha[i].as_ref(),
-                        shared.w2.weight(),
-                        as_rocm(scratch.sho[i].as_ref())?,
-                        act,
-                    )?;
-                    add_graph(
-                        &buffers.moe_out[i],
-                        scratch.sho[i].as_ref(),
-                        &buffers.norm_buf[i],
-                        &dev,
-                    )?;
-                } else {
-                    publish_into(&dev, &buffers.norm_buf[i], &buffers.moe_out[i])?;
-                }
-            } else {
-                return Err(grim_core::error::Error::Backend(format!(
-                    "xing40 graph: layer {i} has neither mlp nor moe"
-                )));
-            }
-
-            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("ffn") {
-                return Ok(());
-            }
-            // HOST ORACLE for the dense FFN's w2 GEMV — the last unverified
-            // link in layer 0. Every other stage is now either bit-identical
-            // to eager or checked against a host oracle, but this one feeds
-            // norm_buf straight into the FFN write-back.
-            //   out[j] = sum_c activated[c] * w2[j, c]
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                if let Some(mlp) = &layer.mlp {
-                    let _ =
-                        grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                    let act = as_rocm(&buffers.activated_buf[i]).and_then(|s| s.to_cpu_vec_f32());
-                    let w = mlp.w2.weight().to_vec_f32();
-                    let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
-                    if let (Ok(act), Ok(w), Ok(nb)) = (act, w, nb) {
-                        let k = act.len();
-                        let n_out = 512.min(hidden);
-                        let (mut md, mut rr) = (0.0f32, 0.0f64);
-                        for jx in 0..n_out {
-                            let mut acc = 0.0f32;
-                            for c in 0..k {
-                                acc += act[c] * w[jx * k + c];
-                            }
-                            let d = (acc - nb[jx]).abs();
-                            if d > md {
-                                md = d;
-                            }
-                            rr += (acc as f64) * (acc as f64);
-                        }
-                        rr = (rr / n_out as f64).sqrt();
-                        let rg =
-                            (nb[..n_out].iter().map(|x| x * x).sum::<f32>() / n_out as f32).sqrt();
-                        eprintln!(
-                            "[xing-graph] DENSE W2 vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                            md as f64 / rr.max(1e-12)
-                        );
-                    }
-                }
-            }
-            // ── ffn write-back: streams carry to the next layer ──
-            let dst: &GBox = if i + 1 < n_layers {
-                &scratch.sin[i + 1]
-            } else {
-                &scratch.sin[0] // last layer publishes into the seed slot
-            };
-            dev.launch_hc_write_back_step(
-                &buffers.norm_buf[i],
-                as_rocm(scratch.post[i].as_ref())?,
-                as_rocm(scratch.comb[i].as_ref())?,
-                sout.as_ref(),
-                as_rocm(dst.as_ref())?,
-                hc,
-                hidden,
-            )?;
-            // HOST ORACLE for the FFN write-back, i.e. sin[1] — the value the
-            // per-layer ratio table has tracked since the first session (graph
-            // 3.9997e-3 vs eager 4.03218e-3). Same formula as the attention
-            // write-back, over sout[i] and the FFN's own gates.
-            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
-                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-                let sv = as_rocm(scratch.sout[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
-                let pv = as_rocm(scratch.post[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                let cv = as_rocm(scratch.comb[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                let ov = as_rocm(scratch.sin[1].as_ref()).and_then(|s| s.to_cpu_vec_f32());
-                if let (Ok(sinv), Ok(nb), Ok(postv), Ok(combv), Ok(outv)) = (sv, nb, pv, cv, ov) {
-                    let (mut md, mut rr) = (0.0f32, 0.0f64);
-                    for d in 0..hidden {
-                        for h in 0..hc {
-                            let mut acc = postv[h] * nb[d];
-                            for k2 in 0..hc {
-                                acc += combv[h * hc + k2] * sinv[k2 * hidden + d];
-                            }
-                            let diff = (acc - outv[h * hidden + d]).abs();
-                            if diff > md {
-                                md = diff;
-                            }
-                            rr += (acc as f64) * (acc as f64);
-                        }
-                    }
-                    rr = (rr / (hc * hidden) as f64).sqrt();
-                    let rg =
-                        (outv.iter().map(|x| x * x).sum::<f32>() / outv.len().max(1) as f32).sqrt();
-                    let rms = |v: &Vec<f32>| {
-                        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
-                    };
-                    eprintln!(
-                        "[xing-graph] FFNWB inputs rms: sout {:.4e} nb {:.4e} post {:?} comb {:.4e} sin1 {:.4e}",
-                        rms(&sinv),
-                        rms(&nb),
-                        &postv[..hc.min(postv.len())],
-                        rms(&combv),
-                        rg
-                    );
-                    eprintln!(
-                        "[xing-graph] FFN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                        md as f64 / rr.max(1e-12)
-                    );
-                }
-            }
         }
+        graph.emitter = emitter;
         if cap_layers < self.layers.len() {
             return Ok(());
         }
 
-        // Head: mean the final streams, output_norm, lm_head.
-        dev.launch_hc_mean_step(
-            scratch.sin[0].as_ref(),
-            as_rocm(scratch.meaned.as_ref())?,
-            hc,
-            hidden,
-        )?;
-        dev.rms_norm_into(
-            scratch.meaned.as_ref(),
-            &**self.norm.weight.storage(),
-            self.norm.eps,
-            as_rocm(scratch.meaned.as_ref())?,
-            &h_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
-        linear_into(
-            &dev,
-            scratch.meaned.as_ref(),
-            self.output.weight(),
-            &buffers.head_output,
-            &buffers.act_q81_buf[0],
-        )?;
+        // Take the emitter for the tail: the block needs `&mut graph.emitter`
+        // while the live `buffers` reborrow of `graph.buffers` is in scope.
+        let mut tail_emitter = graph.emitter.take();
+        if tail_emitter.is_some() && capturing {
+            let ord = dev.ordinal() as u8;
+            let layer_last = last_emitted_node(&tail_emitter);
+            // The head GEMM consumes what the NORM writes, so it must DEPEND on
+            // the NORM node — chaining both off the last layer's node left two
+            // sinks and told a scheduler it may run the head before the norm.
+            // (Llama's emitter reassigns `emit_last` from its NORM emit; this
+            // one ignored the returned index.)
+            let norm_node = grim_backend_rocm::decode_graph_buffers::emit_node_into(
+                &mut tail_emitter,
+                grim_backend_rocm::task_graph::op::NORM,
+                [hidden as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[(
+                    {
+                        let r = scratch.meaned.as_ref().as_any();
+                        r.downcast_ref::<grim_backend_rocm::RocmStorage>()
+                            .map(|s| s.device_ptr_u64().unwrap_or(0))
+                            .unwrap_or(0)
+                    },
+                    {
+                        let r = scratch.meaned.as_ref().as_any();
+                        r.downcast_ref::<grim_backend_rocm::RocmStorage>()
+                            .map(|s| s.bytes() as u64)
+                            .unwrap_or(0)
+                    },
+                    grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                )],
+                &[layer_last],
+                ord,
+            );
+            let _ = grim_backend_rocm::decode_graph_buffers::emit_node_into(
+                &mut tail_emitter,
+                grim_backend_rocm::task_graph::op::GEMM,
+                gemm_params(
+                    gemm_quant_param(self.output.weight()),
+                    self.cfg.vocab_size as u32,
+                ),
+                &[(
+                    buffers.head_output.device_ptr_u64().unwrap_or(0),
+                    buffers.head_output.bytes() as u64,
+                    grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                )],
+                &[norm_node],
+                ord,
+            );
+        }
+
+        self.head_xing(graph, scratch, &dev, hc)?;
+        graph.emitter = tail_emitter;
+
+        Ok(())
+    }
+
+    /// M2 interpreter (Xing40): per-node dispatch through the same launchers
+    /// capture records. ELEMENTWISE -> embedding gather + hc stream seed;
+    /// ATTENTION -> the layer body; GEMM / MOE_DISPATCH / NORM are SERVED by
+    /// the layer bodies and the head stage. FALLBACK in the IR invokes the
+    /// fallback contract: the whole step through the ordinary launcher path.
+    fn forward_interpret_ir(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        let Some(ir) = graph.buffers.emitted_task_graph.clone() else {
+            return Err(grim_core::error::Error::Backend(
+                "interpret: no published task graph; capture first".into(),
+            ));
+        };
+        let dev = dev_for_xing40(self)?;
+        if ir
+            .caps
+            .opcodes
+            .contains(&grim_backend_rocm::task_graph::op::FALLBACK)
+        {
+            return self.forward_capture(graph, token_id);
+        }
+        let pos = graph.buffers.current_pos;
+        graph
+            .buffers
+            .write_pos_all_segments(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        let mut scratch_guard = self
+            .graph_scratch
+            .get()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("xing40 graph scratch missing".into())
+            })?
+            .lock()
+            .map_err(|_| {
+                grim_core::error::Error::Backend("xing40 graph scratch poisoned".into())
+            })?;
+        let scratch = &mut *scratch_guard;
+        let hc = scratch.hc;
+        let flat = scratch.flat;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        let stream = graph.stream;
+        // Interpret must not RE-emit: dispatch runs with a dead emitter.
+        let mut no_emit: Option<grim_backend_rocm::task_graph::TaskGraphBuilder> = None;
+        let mut next_layer = 0usize;
+        let n_layers = self.layers.len();
+        let trace = std::env::var_os("GRIM_IR_TRACE").is_some();
+        grim_backend_rocm::task_graph_exec::execute(&ir, |_idx, node| {
+            match node.opcode {
+                grim_backend_rocm::task_graph::op::ELEMENTWISE => {
+                    // Feed THIS step's token, exactly as `forward_replay` does
+                    // — the gather reads `token_ids_dev` and capture is the
+                    // only thing that had ever written it. Without this the
+                    // interpreter re-embedded whatever token the last capture
+                    // recorded: bit-exact on step 0, wrong on every step after.
+                    // Placed AFTER `write_pos_all_segments` on purpose; hoisting
+                    // it above that write faults the interpret arm (see the
+                    // Llama interpreter's note).
+                    crate::lfm2_graph::write_embedding_to_buffer(
+                        &dev,
+                        &graph.buffers.token_ids_dev,
+                        token_id,
+                    )?;
+                    let w_emb =
+                        dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+                    dev.launch_embedding_gather_dev_idx(
+                        w_emb,
+                        &graph.buffers.layer_input[0],
+                        &graph.buffers.token_ids_dev,
+                        hidden,
+                        batch * hidden,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("interpret embed: {e}"))
+                    })?;
+                    for h in 0..hc {
+                        dev.write_cols(
+                            scratch.sin[0].as_mut(),
+                            flat,
+                            h * hidden,
+                            &graph.buffers.layer_input[0],
+                            batch,
+                            hidden,
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("interpret hc seed: {e}"))
+                        })?;
+                    }
+                    let dst = as_rocm(scratch.sin0_snap[0].as_ref())?;
+                    dev.copy_slice_into(dst, scratch.sin[0].as_ref(), 0, flat)?;
+                    Ok(())
+                }
+                grim_backend_rocm::task_graph::op::ATTENTION => {
+                    let i = next_layer;
+                    next_layer += 1;
+                    if i >= n_layers {
+                        return Err(grim_core::error::Error::Backend(format!(
+                            "interpret: IR has more ATTENTION nodes ({}) than layers ({n_layers})",
+                            i + 1
+                        )));
+                    }
+                    self.launch_layer_body(
+                        i,
+                        &self.layers[i],
+                        &mut no_emit,
+                        false,
+                        &mut graph.buffers,
+                        scratch,
+                        &dev,
+                        stream,
+                        hc,
+                        flat,
+                    )?;
+                    Ok(())
+                }
+                grim_backend_rocm::task_graph::op::GEMM
+                | grim_backend_rocm::task_graph::op::MOE_DISPATCH
+                | grim_backend_rocm::task_graph::op::NORM => Ok(()),
+                other => Err(grim_core::error::Error::Backend(format!(
+                    "interpret: Xing40 cannot dispatch opcode {other} per node"
+                ))),
+            }?;
+            // Same attribution aid as the Llama interpreter: a device fault is
+            // reported asynchronously, so a node boundary is only a location if
+            // the queue is drained at it.
+            if trace {
+                dev.synchronize();
+            }
+            Ok(())
+        })?;
+        if next_layer != n_layers {
+            return Err(grim_core::error::Error::Backend(format!(
+                "interpret: dispatched {next_layer} layers but the model has {n_layers} \
+                 — the IR does not describe this model's walk"
+            )));
+        }
+        self.head_xing(graph, scratch, &dev, hc)?;
+        // Same seam `forward_replay` closes: no D2H may race these launches.
+        dev.synchronize();
         Ok(())
     }
 
@@ -9480,9 +11976,12 @@ impl DecodeGraphModel for Xing40 {
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
             eprintln!("[xing-graph] GRAPHFEED pos {pos} token {token_id}");
         }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
         graph
             .buffers
-            .write_pos_async(&dev, pos, graph.stream)
+            .write_pos_all_segments(pos)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
@@ -10404,6 +12903,7 @@ impl DecodeGraphModel for Xing40 {
                         k_scales_dev: None,
                         v_scales_dev: None,
                         gdl_state: None,
+                        device_ordinal: 0,
                         _anchor: std::marker::PhantomData,
                     }));
                 }

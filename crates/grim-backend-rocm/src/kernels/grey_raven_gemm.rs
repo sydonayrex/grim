@@ -102,6 +102,114 @@ extern "C" __global__ void grim_grey_raven_gemm(
     }
 }
 
+// GreyRaven v2 production GEMM:
+// - #1: Dual N-tile (16x32 output tile per wave, two 16x16 N-tiles sharing one
+//       Bfrag load per K-window) + load batching of both N-tiles' A-fragments
+//       and sidx words before issuing V_SWMMAC_F32_16X16X32_FP8_FP8.
+// - #2: 2x K-window unroll in the main loop to keep 4 A-fragments and 2 B-fragments
+//       in flight per wave step.
+// Preserves the exact per-lane SWMMAC accumulation order of v1 (0 bit diffs).
+extern "C" __global__ void __launch_bounds__(32) grim_grey_raven_gemm_v2(
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ Bfrag,
+    float*               __restrict__ Y,
+    int M, int N, int K,
+    int n_tiles,
+    int n_windows,
+    int m_tiles)
+{
+    const int tileN0 = blockIdx.x * 2;
+    const int tileN1 = tileN0 + 1;
+    const int tileM  = blockIdx.y;
+    const int lane   = threadIdx.x;
+    if (lane >= 32 || tileN0 >= n_tiles) return;
+
+    const bool valid_n1 = (tileN1 < n_tiles);
+    const int half = (lane >= 16) ? 1 : 0;
+    const int lmod = lane & 15;
+
+    gg_v8f c0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    gg_v8f c1 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const unsigned char* w_row0 = W + (long long)tileN0 * n_windows * 260;
+    const unsigned char* w_row1 = W + (long long)(valid_n1 ? tileN1 : tileN0) * n_windows * 260;
+    const unsigned char* b_row  = Bfrag + (long long)tileM * n_windows * 512;
+
+    int w = 0;
+    for (; w + 1 < n_windows; w += 2) {
+        const unsigned char* s0_w0 = w_row0 + (long long)(w + 0) * 260;
+        const unsigned char* s1_w0 = w_row1 + (long long)(w + 0) * 260;
+        const unsigned char* s0_w1 = w_row0 + (long long)(w + 1) * 260;
+        const unsigned char* s1_w1 = w_row1 + (long long)(w + 1) * 260;
+
+        gg_v2i a0_w0, a1_w0, a0_w1, a1_w1;
+        unsigned int sidx0_w0, sidx1_w0, sidx0_w1, sidx1_w1;
+        gg_v4i b_w0, b_w1;
+
+        __builtin_memcpy(&b_w0, b_row + (long long)(w + 0) * 512 + lane * 16, 16);
+        __builtin_memcpy(&a0_w0, s0_w0 + lane * 8, 8);
+        __builtin_memcpy(&sidx0_w0, s0_w0 + 256, 4);
+        __builtin_memcpy(&a1_w0, s1_w0 + lane * 8, 8);
+        __builtin_memcpy(&sidx1_w0, s1_w0 + 256, 4);
+
+        __builtin_memcpy(&b_w1, b_row + (long long)(w + 1) * 512 + lane * 16, 16);
+        __builtin_memcpy(&a0_w1, s0_w1 + lane * 8, 8);
+        __builtin_memcpy(&sidx0_w1, s0_w1 + 256, 4);
+        __builtin_memcpy(&a1_w1, s1_w1 + lane * 8, 8);
+        __builtin_memcpy(&sidx1_w1, s1_w1 + 256, 4);
+
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a0_w0, b_w0, c0, sidx0_w0);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a1_w0, b_w0, c1, sidx1_w0);
+        }
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a0_w1, b_w1, c0, sidx0_w1);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a1_w1, b_w1, c1, sidx1_w1);
+        }
+    }
+
+    for (; w < n_windows; w++) {
+        const unsigned char* s0 = w_row0 + (long long)w * 260;
+        const unsigned char* s1 = w_row1 + (long long)w * 260;
+        gg_v2i a0, a1;
+        unsigned int sidx0, sidx1;
+        gg_v4i b_frag;
+
+        __builtin_memcpy(&b_frag, b_row + (long long)w * 512 + lane * 16, 16);
+        __builtin_memcpy(&a0, s0 + lane * 8, 8);
+        __builtin_memcpy(&sidx0, s0 + 256, 4);
+        __builtin_memcpy(&a1, s1 + lane * 8, 8);
+        __builtin_memcpy(&sidx1, s1 + 256, 4);
+
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a0, b_frag, c0, sidx0);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a1, b_frag, c1, sidx1);
+        }
+    }
+
+    float cacc0[8], cacc1[8];
+    __builtin_memcpy(cacc0, &c0, 32);
+    __builtin_memcpy(cacc1, &c1, 32);
+
+    const int m = tileM * 16 + lmod;
+    if (m < M) {
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const int n0 = tileN0 * 16 + half * 8 + s;
+            if (n0 < N)
+                Y[(long long)m * N + n0] = cacc0[s];
+        }
+        if (valid_n1) {
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                const int n1 = tileN1 * 16 + half * 8 + s;
+                if (n1 < N)
+                    Y[(long long)m * N + n1] = cacc1[s];
+            }
+        }
+    }
+}
+
 // B-prologue: quantize X into fragment-ordered FP8 once per (M-tile, window).
 //
 // The main kernel above gathers + encodes B per (N-tile, M-tile, window),

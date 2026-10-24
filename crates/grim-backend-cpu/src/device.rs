@@ -609,7 +609,7 @@ impl CoreTensorOps for CpuDevice {
             }
         };
         match scheme {
-            KQuantScheme::Q4K | KQuantScheme::IQ3S => {}
+            KQuantScheme::Q4K | KQuantScheme::IQ3S | KQuantScheme::Q6K | KQuantScheme::Q5K => {}
             other => {
                 return Err(Error::Unimplemented(format!(
                     "embedding_packed: no CPU gather for {other:?}"
@@ -653,6 +653,12 @@ impl CoreTensorOps for CpuDevice {
                 })?,
                 KQuantScheme::IQ3S => grim_quant::dequant_iq3s(row, dim).map_err(|e| {
                     Error::Backend(format!("embedding_packed IQ3S dequant: {e}"))
+                })?,
+                KQuantScheme::Q6K => grim_quant::dequant_q6k(row, dim).map_err(|e| {
+                    Error::Backend(format!("embedding_packed Q6K dequant: {e}"))
+                })?,
+                KQuantScheme::Q5K => grim_quant::dequant_q5k(row, dim).map_err(|e| {
+                    Error::Backend(format!("embedding_packed Q5K dequant: {e}"))
                 })?,
                 _ => unreachable!("scheme gate above"),
             };
@@ -2707,6 +2713,7 @@ impl BackendStorage for CpuStorage {
             },
             Storage::Block(block_type) => match block_type {
                 grim_tensor::dtype::BlockDtype::Q4_0 => grim_quant::dequant_q4_0(raw, n),
+                grim_tensor::dtype::BlockDtype::Q4_1 => grim_quant::dequant_q4_1(raw, n),
                 grim_tensor::dtype::BlockDtype::Fp4 => grim_quant::dequant_fp4(raw, n),
                 grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(raw, n),
                 grim_tensor::dtype::BlockDtype::Fp8 => grim_quant::dequant_fp8(raw, n),
@@ -3575,6 +3582,19 @@ mod tests {
                 KQuantScheme::IQ3S,
                 grim_quant::quant_iq3s as fn(&[f32]) -> grim_tensor::error::Result<Vec<u8>>,
                 grim_quant::dequant_iq3s as fn(&[u8], usize) -> grim_tensor::error::Result<Vec<f32>>,
+            ),
+            // Q6K and Q5K are the schemes Gemma 4's per-layer embedding table
+            // ships in: the table is 2.3 GB packed against 11.3 GB inflated,
+            // so the packed gather is what keeps the family loadable.
+            (
+                KQuantScheme::Q6K,
+                grim_quant::quant_q6k as fn(&[f32]) -> grim_tensor::error::Result<Vec<u8>>,
+                grim_quant::dequant_q6k as fn(&[u8], usize) -> grim_tensor::error::Result<Vec<f32>>,
+            ),
+            (
+                KQuantScheme::Q5K,
+                grim_quant::quant_q5k as fn(&[f32]) -> grim_tensor::error::Result<Vec<u8>>,
+                grim_quant::dequant_q5k as fn(&[u8], usize) -> grim_tensor::error::Result<Vec<f32>>,
             ),
         ] {
             let mut packed = Vec::new();

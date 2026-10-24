@@ -44,7 +44,13 @@ impl RocmDevice {
             && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::Q3K));
         let is_iq3s = dt.arith == ArithType::F32
             && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::IQ3S));
-        if !is_f32_native && !is_q4k && !is_q3k && !is_iq3s {
+        // IQ2_S packed vocab (256/82 geometry): same kernel the eager
+        // embedding_packed path uses (core_tensor_ops.rs). Without this arm a
+        // model whose token embedding ships as IQ2_S refuses INSIDE the
+        // capture bracket and the whole decode step falls back to eager.
+        let is_iq2s = dt.arith == ArithType::F32
+            && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::IQ2S));
+        if !is_f32_native && !is_q4k && !is_q3k && !is_iq3s && !is_iq2s {
             return Err(Error::Unimplemented(
                 "embedding_gather_dev_idx: F32 native, Q4_K or Q3_K tables only".into(),
             ));
@@ -64,6 +70,37 @@ impl RocmDevice {
         let mut i = i_ptr;
         let mut d = dim as i32;
         let mut t = total as i32;
+        if is_iq2s {
+            const IQ2S_BLOCK: usize = 256;
+            const IQ2S_BLOCK_BYTES: usize = 82;
+            if dim == 0 || dim % IQ2S_BLOCK != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: IQ2_S dim {dim} must be a non-zero multiple of {IQ2S_BLOCK}"
+                )));
+            }
+            let iq2s_row_bytes = (dim / IQ2S_BLOCK) * IQ2S_BLOCK_BYTES;
+            if iq2s_row_bytes == 0 || weight.bytes % iq2s_row_bytes != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: IQ2_S table of {} B is not a whole number of \
+                     {iq2s_row_bytes}-B rows",
+                    weight.bytes
+                )));
+            }
+            let mut iq2s_rows = (weight.bytes / iq2s_row_bytes) as i32;
+            return self.launch_compute_kernel(
+                "grim_embedding_iq2s_gather",
+                grid,
+                block,
+                &mut [
+                    arg(&mut w),
+                    arg(&mut o),
+                    arg(&mut i),
+                    arg(&mut d),
+                    arg(&mut t),
+                    arg(&mut iq2s_rows),
+                ],
+            );
+        }
         if is_iq3s {
             // IQ3_S: same 256/110 geometry as Q3_K; the packed-gather kernel
             // already exists (grim_embedding_iq3s_gather, iq_dequant.rs).

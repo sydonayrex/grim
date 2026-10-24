@@ -180,6 +180,103 @@ extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3_blocked
         }
     }
 }
+
+// WhiteRaven-blocked v2:
+// - #1: Batches frag_a, frag_b0, and frag_b1 loads before issuing mma_sync,
+//       and unrolls 2x along K (kb, kb+1) so 6 fragments (2x A, 4x B) are loaded
+//       ahead of the 4 WMMA instructions per loop step.
+// Preserves the exact per-lane WMMA accumulation order of v1 (0 bit diffs).
+extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3_blocked_v2(
+    const float8_t* __restrict__ A,
+    const float8_t* __restrict__ Bb,
+    float* __restrict__ C,
+    int M, int N, int K) {
+
+    const int tile_row = blockIdx.y;
+    const int tile_col_base = blockIdx.x * 2;
+
+    if (tile_row * 16 >= M || tile_col_base * 16 >= N) return;
+
+    const int row_base = tile_row * 16;
+    const int col_base = tile_col_base * 16;
+    const bool valid_col1 = ((tile_col_base + 1) * 16 < N);
+    const int KB = K >> 4;
+    const int tile_col1 = valid_col1 ? (tile_col_base + 1) : tile_col_base;
+
+    fragment<accumulator, 16, 16, 16, float> frag_c0;
+    fragment<accumulator, 16, 16, 16, float> frag_c1;
+    fill_fragment(frag_c0, 0.0f);
+    fill_fragment(frag_c1, 0.0f);
+
+    __shared__ float c_out[16 * 16];
+
+    const float8_t* a_row = A + (long long)row_base * K;
+    const float8_t* b0_base = Bb + (long long)tile_col_base * KB * 256;
+    const float8_t* b1_base = Bb + (long long)tile_col1 * KB * 256;
+
+    int kb = 0;
+    for (; kb + 1 < KB; kb += 2) {
+        fragment<matrix_a, 16, 16, 16, float8_t, row_major> frag_a_0;
+        fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b0_0;
+        fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b1_0;
+        fragment<matrix_a, 16, 16, 16, float8_t, row_major> frag_a_1;
+        fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b0_1;
+        fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b1_1;
+
+        load_matrix_sync(frag_a_0,  a_row + (kb + 0) * 16, K);
+        load_matrix_sync(frag_b0_0, b0_base + (long long)(kb + 0) * 256, 16);
+        load_matrix_sync(frag_b1_0, b1_base + (long long)(kb + 0) * 256, 16);
+
+        load_matrix_sync(frag_a_1,  a_row + (kb + 1) * 16, K);
+        load_matrix_sync(frag_b0_1, b0_base + (long long)(kb + 1) * 256, 16);
+        load_matrix_sync(frag_b1_1, b1_base + (long long)(kb + 1) * 256, 16);
+
+        mma_sync(frag_c0, frag_a_0, frag_b0_0, frag_c0);
+        if (valid_col1) {
+            mma_sync(frag_c1, frag_a_0, frag_b1_0, frag_c1);
+        }
+        mma_sync(frag_c0, frag_a_1, frag_b0_1, frag_c0);
+        if (valid_col1) {
+            mma_sync(frag_c1, frag_a_1, frag_b1_1, frag_c1);
+        }
+    }
+
+    for (; kb < KB; ++kb) {
+        fragment<matrix_a, 16, 16, 16, float8_t, row_major> frag_a;
+        fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b0;
+        fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b1;
+
+        load_matrix_sync(frag_a,  a_row + kb * 16, K);
+        load_matrix_sync(frag_b0, b0_base + (long long)kb * 256, 16);
+        load_matrix_sync(frag_b1, b1_base + (long long)kb * 256, 16);
+
+        mma_sync(frag_c0, frag_a, frag_b0, frag_c0);
+        if (valid_col1) {
+            mma_sync(frag_c1, frag_a, frag_b1, frag_c1);
+        }
+    }
+
+    float* c0_ptr = C + (long long)row_base * N + col_base;
+    store_matrix_sync(c_out, frag_c0, 16, layout_t::mem_row_major);
+    __builtin_amdgcn_wave_barrier();
+    for (int idx = threadIdx.x; idx < 256; idx += 32) {
+        int i = idx / 16;
+        int j = idx % 16;
+        if (row_base + i < M && col_base + j < N) c0_ptr[(long long)i * N + j] = c_out[idx];
+    }
+
+    if (valid_col1) {
+        float* c1_ptr = C + (long long)row_base * N + (col_base + 16);
+        store_matrix_sync(c_out, frag_c1, 16, layout_t::mem_row_major);
+        __builtin_amdgcn_wave_barrier();
+        for (int idx = threadIdx.x; idx < 256; idx += 32) {
+            int i = idx / 16;
+            int j = idx % 16;
+            if (row_base + i < M && col_base + 16 + j < N)
+                c1_ptr[(long long)i * N + j] = c_out[idx];
+        }
+    }
+}
 // WhiteRaven act prologue: quantize an F32 activation [M, K] to FP8 E4M3
 // codes padded to whole 16-row tiles ([16*ceil(M/16), K], pad rows = +0.0).
 // This is what makes the blocked GEMM capture-safe: the host-side conversion
@@ -306,9 +403,12 @@ mod self_tests {
         // The win over the old kernel is that A is staged once and reused; two
         // mma_sync calls must share one A load -- per entry point. Scoped to
         // each entry because the blocked twin repeats the same structure.
-        let (old, blocked) = KERNEL_SOURCE
-            .split_once("grim_wmma_gemm_fp8_e4m3_blocked")
+        let (old, rest) = KERNEL_SOURCE
+            .split_once("grim_wmma_gemm_fp8_e4m3_blocked(")
             .expect("blocked entry must exist");
+        let (blocked, _v2) = rest
+            .split_once("grim_wmma_gemm_fp8_e4m3_blocked_v2(")
+            .unwrap_or((rest, ""));
         for (name, src) in [("row-major", old), ("blocked", blocked)] {
             assert_eq!(
                 src.matches("load_matrix_sync(frag_a").count(),

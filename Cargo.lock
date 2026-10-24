@@ -2798,6 +2798,7 @@ dependencies = [
  "grim-backend-cpu",
  "grim-backend-rocm",
  "grim-core",
+ "grim-engine",
  "grim-format",
  "grim-memory",
  "grim-models-vision",

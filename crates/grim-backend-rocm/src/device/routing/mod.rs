@@ -72,6 +72,7 @@ impl RocmDevice {
                 "[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull=false"
             );
         }
+        let mut no_staged: *mut std::ffi::c_void = std::ptr::null_mut();
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",
             crate::HipDim3::new(1, 1, 1),
@@ -84,6 +85,57 @@ impl RocmDevice {
                 arg(&mut stop_ptr),
                 arg(&mut limit),
                 arg(&mut res),
+                // M4 staged prologue off: a null staged array with count 0 leaves
+                // the pre-existing contract (host-published head) untouched.
+                arg(&mut no_staged),
+                arg(&mut 0u32),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    /// M4: launch the wave with its descriptors taken from the device-side
+    /// `staged` array instead of the host publishing `head`. The wave's prologue
+    /// uploads `staged_count` descriptors and repoints tail/head, so the whole
+    /// step's enqueue + dispatch is ONE launch.
+    ///
+    /// `resident` is forced to 0: the prologue resets `tail`, which a parking
+    /// wave depends on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scythe_persistent_dispatch_staged(
+        &self,
+        slots: &dyn BackendStorage,
+        capacity: u32,
+        tail: &dyn BackendStorage,
+        head: &dyn BackendStorage,
+        stop: &dyn BackendStorage,
+        max_tasks: u32,
+        staged: &dyn BackendStorage,
+        staged_count: u32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut slots_ptr = dev_ptr(as_rocm(slots)?)?;
+        let mut tail_ptr = dev_ptr(as_rocm(tail)?)?;
+        let mut head_ptr = dev_ptr(as_rocm(head)?)?;
+        let mut stop_ptr = dev_ptr(as_rocm(stop)?)?;
+        let mut staged_ptr = dev_ptr(as_rocm(staged)?)?;
+        let mut cap = capacity;
+        let mut limit = max_tasks;
+        let mut count = staged_count;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        self.launch_compute_kernel(
+            "grim_scythe_persistent_dispatch",
+            crate::HipDim3::new(1, 1, 1),
+            crate::HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut slots_ptr),
+                arg(&mut cap),
+                arg(&mut tail_ptr),
+                arg(&mut head_ptr),
+                arg(&mut stop_ptr),
+                arg(&mut limit),
+                arg(&mut 0u32), // resident = 0 (the staged prologue resets tail)
+                arg(&mut staged_ptr),
+                arg(&mut count),
             ],
         )?;
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
@@ -116,6 +168,7 @@ impl RocmDevice {
                 !stream.is_null()
             );
         }
+        let mut no_staged: *mut std::ffi::c_void = std::ptr::null_mut();
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",
             crate::HipDim3::new(1, 1, 1),
@@ -128,6 +181,8 @@ impl RocmDevice {
                 arg(&mut stop_ptr),
                 arg(&mut limit),
                 arg(&mut res),
+                arg(&mut no_staged),
+                arg(&mut 0u32),
             ],
         )?;
         Ok(Box::new(RocmHandle::new(Some(stream))))

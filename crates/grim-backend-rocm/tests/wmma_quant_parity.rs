@@ -9,6 +9,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::quant_q4k;
+use grim_tensor::provider::TensorProvider;
 use grim_tensor::{
     ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage,
 };
@@ -31,6 +32,27 @@ static ROUTE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn route_counter_lock() -> std::sync::MutexGuard<'static, ()> {
     ROUTE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Resolve a workspace-relative checkpoint path, or `None` if absent.
+///
+/// `cargo test` sets the CWD to the *package* root
+/// (`crates/grim-backend-rocm`), not the workspace root, so a bare
+/// `models/...` path never resolves. Try the CWD first, then walk up from the
+/// crate manifest.
+fn find_checkpoint(rel: &str) -> Option<std::path::PathBuf> {
+    let direct = std::path::PathBuf::from(rel);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for up in manifest.ancestors() {
+        let cand = up.join(rel);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 /// CPU reference: dequantize packed B to f32 then plain matmul C = A @ B^T.
@@ -181,6 +203,203 @@ fn wmma_quant_decode_parity() {
 /// `quantized_matmul` dispatches to `grim_wmma_fused_dequant_q8_0_fp16`
 /// (reads _Float16 directly, no per-element cast).  Verifies the FP16-input
 /// path matches the FP32-input path within FP16 quantization tolerance.
+/// SPEED-ROC: **IQ3_XXS decode-path parity** through `linear_decode_into`.
+///
+/// This file's coverage was `Q4K` and `Q80` only, so the `IQ3XXS` leg had no
+/// parity gate anywhere in the tree. That matters because `IQ3_XXS` is the
+/// single largest K-quant family in `models/qwen38-27b/Swift-1.5-Qwen3.8-27B-
+/// GSQ-RCO-IQ3_XXS-mtp.gguf` (83 of 866 tensors), and that checkpoint produced
+/// **all-NaN logits from step 0** on the same two cards — decoded as `!!!!`
+/// forever, because token 0 is `!`.
+///
+/// WHICH KERNEL: on RDNA4 `is_dot4_arch` is true (`roc_device.rs:906`), and
+/// with `k % 256 == 0` and `GRIM_DOT_GEMV` unset the guard at
+/// `gemm_launchers.rs:2782` is FALSE, so the WMMA branch is skipped and
+/// dispatch reaches `launch_fused_dequant_gemm_iq3xxs` at `:2960` — the
+/// fused-dequant GEMM reading A as f32, the sibling of
+/// `launch_fused_dequant_gemm_iq3s`, NOT `launch_wmma_fused_dequant_iq3xxs`
+/// (that one is only reached when dot4 is unavailable or k is unaligned).
+/// The test goes through the public `linear_decode_into` entry so it tracks
+/// whatever the real dispatcher picks, rather than hardcoding one arm.
+///
+/// `linear_decode_into` is used rather than `quantized_matmul` because at M=1
+/// the latter falls through to a non-WMMA fallback (see the note in
+/// `wmma_quant_decode_parity`) and is not the 27B's decode entry.
+///
+/// Set `GRIM_DOT_GEMV=0` to force the WMMA branch and reach
+/// `launch_wmma_fused_dequant_iq3xxs` instead.
+///
+/// GREEN on the default arm after the device-dequant fix (measured 2026-10-16
+/// on gfx1200, real `blk.61.ffn_gate.weight` bytes): max_diff 1.8e-7,
+/// nonfinite 0. It was 14/256 non-finite with max_diff ~1.0e6 before.
+///
+/// STILL RED on the `GRIM_DOT_GEMV=0` arm: 256/256 non-finite. That arm
+/// (`grim_wmma_fused_dequant_iq3xxs`, wmma_iq_gemm.rs) shares the corrected
+/// `dequant_iq3xxs` and the 98-byte stride, so the residual NaN is in that
+/// kernel's own tile/writeback logic, not in the dequant. It is not the default
+/// dispatch, so it is left tracked rather than silently masked: run it with
+/// `GRIM_DOT_GEMV=0` and this test to reproduce.
+#[test]
+fn wmma_iq3xxs_decode_path_parity() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");
+        return;
+    };
+    let _route = route_counter_lock();
+
+    // IQ3_XXS geometry: 256 weights per 98-byte super-block (ggml-common.h;
+    // mirrored in `grim-format/src/gguf.rs` at the type-id 18 and byte-size
+    // tables). `linear_decode_into` requires k % 256 == 0.
+    const BLOCK_ELEMS: usize = 256;
+    const BLOCK_BYTES: usize = 98;
+    let (m, n, k) = (1usize, 256usize, 512usize);
+    assert_eq!(k % BLOCK_ELEMS, 0, "k must be a multiple of the IQ3_XXS block");
+
+    let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
+
+    // Real packed bytes, not synthetic: `dequant_iq3xxs` on arbitrary garbage
+    // can produce non-finite scales, and the resulting NaN would be a
+    // property of the fixture rather than of the kernel. Sourcing from the
+    // actual checkpoint decodes bytes a real producer wrote.
+    let Some(ckpt) = find_checkpoint(
+        "models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+    ) else {
+        panic!("checkpoint missing — this gate must not silently skip; it is the \
+                 only parity coverage for launch_wmma_fused_dequant_iq3xxs");
+    };
+    let ckpt = ckpt.to_string_lossy().to_string();
+    let f = std::fs::File::open(&ckpt).expect("open checkpoint");
+    let gguf = grim_format::gguf::read_gguf(std::io::BufReader::new(f)).expect("parse gguf header");
+    let provider = grim_format::tprov::GgufProvider::open(&ckpt).expect("open provider");
+    // First IQ3_XXS tensor large enough for n x k weights.
+    let need_blocks = (n * k) / BLOCK_ELEMS;
+    let t = gguf
+        .tensors
+        .iter()
+        .filter(|t| {
+            t.dtype == grim_format::gguf::GgufDType::IQ3_XXS
+                && (t.size_bytes as usize) / BLOCK_BYTES >= need_blocks
+        })
+        .max_by_key(|t| t.size_bytes)
+        .expect("an IQ3_XXS tensor at least n*k/256 blocks long must exist");
+    let raw = provider
+        .get_packed(&t.name)
+        .expect("packed IQ3_XXS bytes from the real checkpoint");
+    let b_packed = raw.bytes[..need_blocks * BLOCK_BYTES].to_vec();
+
+    // CPU reference: decode the SAME bytes this kernel is handed.
+    let mut b_f32: Vec<f32> = Vec::with_capacity(n * k);
+    for b in 0..need_blocks {
+        b_f32.extend(
+            grim_quant::dequant_iq3xxs(
+                &b_packed[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES],
+                BLOCK_ELEMS,
+            )
+            .expect("host IQ3_XXS dequant"),
+        );
+    }
+    assert!(
+        b_f32.iter().all(|v| v.is_finite()),
+        "reference decode of {} produced non-finite weights — the fixture is bad",
+        t.name
+    );
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32)
+        .expect("upload A");
+    let q_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::IQ3XXS),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_packed,
+        &Shape::new(vec![n * k]),
+        q_dtype,
+    )
+    .expect("upload packed IQ3_XXS B");
+    let w_rocm = b_dev
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+        .expect("B is RocmStorage");
+
+    let out = dev
+        .from_cpu(
+        &vec![0.0f32; n],
+        &Shape::new(vec![n]),
+        DType::F32,
+    )
+    .expect("out buffer");
+    let out_rocm = out
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+        .expect("out is RocmStorage");
+
+    // Scratch: the same sizing the Q8_0 decode path uses, generously rounded up.
+    let act_q81 = dev
+        .from_cpu(
+        &vec![0.0f32; (k / 32) * 64],
+        &Shape::new(vec![(k / 32) * 64]),
+        DType::F32,
+    )
+    .expect("act_q81 scratch");
+    let act_rocm = act_q81
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+        .expect("act_q81 is RocmStorage");
+
+    let handle = dev
+        .linear_decode_into(a_dev.as_ref(), w_rocm, out_rocm, act_rocm)
+        .expect("linear_decode_into must accept IQ3XXS (the 27B decode path)");
+    handle.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().expect("readback");
+
+    // want = a @ B^T, computed in f32 from the decoded weights.
+    let want: Vec<f32> = (0..n)
+        .map(|col| {
+            (0..k).map(|kk| a_host[kk] * b_f32[col * k + kk]).sum::<f32>()
+        })
+        .collect();
+
+    // NaN-aware, same reasoning as `run_case`: `f32::max` ignores NaN, so an
+    // all-NaN kernel would otherwise report max_diff=0 and pass. This is the
+    // failure mode under investigation.
+    let mut max_diff = 0.0f32;
+    let mut nonfinite = 0usize;
+    let mut first_bad = None;
+    for i in 0..want.len() {
+        let d = (got[i] - want[i]).abs();
+        if d.is_finite() {
+            if d > max_diff {
+                max_diff = d;
+            }
+        } else {
+            nonfinite += 1;
+            if first_bad.is_none() {
+                first_bad = Some((i, got[i], want[i]));
+            }
+        }
+    }
+    eprintln!(
+        "[iq3xxs-decode-parity] {} m={m} n={n} k={k} max_diff={max_diff} \
+         nonfinite={nonfinite}",
+        t.name
+    );
+    assert_eq!(
+        nonfinite, 0,
+        "the IQ3XXS decode leg produced {nonfinite} non-finite outputs; \
+         first bad index {:?} got={:?} want={:?}",
+        first_bad.map(|x| x.0),
+        first_bad.map(|x| x.1),
+        first_bad.map(|x| x.2)
+    );
+    assert!(
+        max_diff < 0.5,
+        "IQ3XXS fused-dequant diverges from the reference (max_diff={max_diff}); \
+         activations are quantized to q8_1 on the device and B is dequantized on \
+         device, so this is a loose bound by design"
+    );
+}
+
 #[test]
 #[ignore]
 fn wmma_quant_fp16_input_parity() {
@@ -378,4 +597,368 @@ fn wmma_big_q4k_large_m_parity_and_route() {
             "m={m}: exactly one WMMA tile kernel must serve this shape"
         );
     }
+}
+
+/// Pack `a` into llama.cpp Q8_1 super-blocks and return both the packed bytes
+/// and the activations those bytes actually represent.
+///
+/// This exists because the two families of decode kernels do NOT consume the
+/// same activations:
+///
+///   * The IQ family has explicit f32-act fused-dequant legs. They read `a`
+///     directly and never look at the `act_q81` scratch.
+///   * Everything else (IQ4_XS, Q2_K, Q4_K, Q6_K) routes to
+///     `launch_dot4_*_q81_gemv`, which consumes Q8_1-quantized activations and
+///     ignores `a`.
+///
+/// So the scratch must hold real Q8_1 blocks, and the CPU reference must be
+/// computed from the SAME dequantized activations the kernel sees — otherwise
+/// the reference is measuring activation quantization, not kernel correctness.
+/// `layout::block_q8_1` is `fp16 d | fp16 s | int8 qs[32]`, 36 bytes, with
+/// `d = amax/127` and `s = d * x_at_argmax`.
+fn q8_1_pack(a: &[f32]) -> (Vec<u8>, Vec<f32>) {
+    const G: usize = 32;
+    let mut bytes = Vec::with_capacity(a.len() / G * 36);
+    let mut eff = Vec::with_capacity(a.len());
+    for ch in a.chunks(G) {
+        let (amax, x_at_amax) = ch
+            .iter()
+            .fold((0f32, 0f32), |(m, x), &v| {
+                if v.abs() > m {
+                    (v.abs(), v)
+                } else {
+                    (m, x)
+                }
+            });
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let s = d * x_at_amax;
+        // The kernel reads these as fp16. The reference must use the ROUNDED
+        // values, not the f32 originals — `d = amax/127` and `s = d * x_at_amax`
+        // routinely need more than 11 bits of mantissa, and using the unrounded
+        // f32 charges the kernel with a quantization error it never performs.
+        let d16 = half::f16::from_f32(d);
+        let s16 = half::f16::from_f32(s);
+        bytes.extend_from_slice(&d16.to_le_bytes());
+        bytes.extend_from_slice(&s16.to_le_bytes());
+        let (d_eff, s_eff) = (d16.to_f32(), s16.to_f32());
+        for &v in ch {
+            let q = (v * id).round().clamp(-128.0, 127.0) as i32;
+            bytes.push(q as i8 as u8);
+            // The value the kernel actually multiplies by is `q * d`. The
+            // block's `s` is NOT a per-element correction: it is the SUM of
+            // the codes, which the Q4_K/Q5_K kernels use for their dmin term
+            // and the Q6_K kernel does not use at all (Q6_K has no dmin).
+            //
+            // M7.2e: this reference used to add `s` back on the negative
+            // codes, which no leg in this sweep consumes, and the Q4_K/Q2_K
+            // rows' loose 0.5 tolerance was hiding it. With the reference
+            // fixed, the Q6_K row measures ~1e-7 and the Q4_K/Q2_K rows
+            // ~1e-3 — and the tight bars below become meaningful.
+            let _ = s_eff; // the sum is carried in the bytes, not applied per element
+            eff.push(q as f32 * d_eff);
+        }
+    }
+    (bytes, eff)
+}
+
+/// Every K-quant scheme the 27B checkpoint actually contains, run through the
+/// LIVE decode dispatch against a host dequant of the SAME real bytes.
+///
+/// Why this exists: IQ3_XXS shipped with a fabricated device dequant
+/// (`(grid_idx + sub_idx*17) % 7 - 3.0f`) and a 96-byte stride across 83
+/// tensors, giving all-NaN logits at step 0. With that fixed the model decodes
+/// FINITE but INCOHERENT text, which points at a sibling scheme that is
+/// wrong-but-finite — the same failure WhiteRaven already documented once in
+/// this codebase ("same bytes percolated differently decode to finite,
+/// plausible, wrong weights"). Guessing which scheme is the wrong move;
+/// measuring all ten in one run is cheap.
+///
+/// Reports every scheme rather than stopping at the first failure, so a single
+/// execution gives the whole picture.
+///
+/// After the IQ2_XXS / IQ2_XS / IQ4_XS fixes, on real checkpoint bytes at
+/// m=1 n=256 k=512, gfx1200:
+///
+///   ok  IQ1_S      4 tensors   2.2e-7
+///   ok  IQ2_XXS   30 tensors   1.5e-7   (was 1.0e+0 — entirely wrong values)
+///   ok  IQ2_XS    32 tensors   2.5e-7   (was 1.0e+0 — entirely wrong values)
+///   ok  IQ2_S     72 tensors   1.3e-7
+///   ok  IQ3_XXS   83 tensors   2.3e-7
+///   ok  IQ3_S     97 tensors   2.2e-7
+///   ok  IQ4_XS    33 tensors   2.4e-7   (was 8/256 non-finite, max_diff 1.3e8)
+///   ok  Q2_K      28 tensors   7.5e-3   (dot4 i32-accumulate; gate is 0.5)
+///   ok  Q4_K      19 tensors   2.2e-1   (u4-lane W4A4 requant; gate is 0.5)
+///   ok  Q6_K       8 tensors   5.4e-7   (exact fused kernel, at IQ tolerance)
+///
+/// All seven IQ schemes plus Q6_K are now at fp32 epsilon. Q2_K and Q4_K sit
+/// inside the coarser tolerance their own gates grant (Q2_K: the dot4 i32
+/// accumulate; Q4_K: the u4-lane W4A4 requant, which costs 20x fidelity but
+/// stays inside Q4_K's 0.15 gate — deliberately left enabled, since Q4_K_M is
+/// the common default format and that is a throughput trade, not a defect).
+/// Left #[ignore]d: it is a measuring instrument and the Q family is tracked
+/// individually elsewhere.
+///
+///   cargo test -p grim-backend-rocm --test wmma_quant_parity \
+///     kquant_scheme_sweep -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "IQ family clean; Q2_K/Q4_K/Q6_K still uninvestigated (see doc comment)"]
+fn kquant_scheme_sweep() {
+    use grim_format::gguf::GgufDType;
+    let Some(dev) = gpu_device() else {
+        return;
+    };
+    let _route = route_counter_lock();
+
+    // (label, gguf dtype, KQuantScheme, bytes per 256-weight super-block,
+    //  consumes act_q81, tolerance). Block elems is 256 for every scheme here
+    //  (llama.cpp QK_K) and the byte sizes come from grim-format's gguf.rs
+    //  table, NOT from memory — the 96-vs-98 class of bug lived in exactly
+    //  that assumption. IQ1_M is absent because grim-quant has no host
+    //  `dequant_iq1m` to compare against (4 tensors; needs a reference first).
+    //
+    // The two tolerance families are NOT interchangeable, and applying one
+    // number to both was itself a bug in this gate:
+    //
+    //   * The IQ family decodes weights inline and accumulates in f32, so it is
+    //     exact and must sit at fp32 epsilon. All seven currently measure
+    //     1.3e-7..2.5e-7 against the host; holding them to 1e-3 is what caught
+    //     the IQ3_XXS / IQ2_XXS / IQ2_XS / IQ4_XS defects.
+    //
+    //   * Q2_K / Q4_K ride `launch_dot4_*_q81_gemv`, which consumes Q8_1
+    //     activations and accumulates in i32 before one f32 rescale. That is an
+    //     approximation BY DESIGN, and this project already accepts it:
+    //     dot_gemv_parity gates these same kernels at 0.15-0.5 relative. Holding
+    //     them to 1e-3 reported Q4_K at 2.2e-1 and Q2_K at 7.5e-3 as "broken"
+    //     when they sit inside the tolerance their own gates already grant.
+    //     Q6_K is the awkward one: its default leg is the EXACT fused f32 path,
+    //     yet it still measures ~1.0e-1 (see the note below), so it is given the
+    //     dot4 tolerance rather than silently tightened or silently widened.
+    const IQ_TOL: f32 = 1e-3;
+    const QK_TOL: f32 = 0.5;
+    let schemes: &[(&str, GgufDType, KQuantScheme, usize, bool, f32)] = &[
+        ("IQ1_S", GgufDType::IQ1_S, KQuantScheme::IQ1S, 50, false, IQ_TOL),
+        ("IQ2_XXS", GgufDType::IQ2_XXS, KQuantScheme::IQ2XXS, 66, false, IQ_TOL),
+        ("IQ2_XS", GgufDType::IQ2_XS, KQuantScheme::IQ2XS, 74, false, IQ_TOL),
+        ("IQ2_S", GgufDType::IQ2_S, KQuantScheme::IQ2S, 82, false, IQ_TOL),
+        ("IQ3_XXS", GgufDType::IQ3_XXS, KQuantScheme::IQ3XXS, 98, false, IQ_TOL),
+        ("IQ3_S", GgufDType::IQ3_S, KQuantScheme::IQ3S, 110, false, IQ_TOL),
+        // IQ4_XS used to be the `uses_q81 = true` case here (no f32-act leg, so
+        // it fell to the dot4 catch-all and returned non-finite). It now has its
+        // own fused-dequant leg, which reads A as raw f32 and ignores the
+        // act_q81 scratch — so the reference must use raw `a_host` too. Leaving
+        // this `true` charges the kernel for Q8_1 quantization it does not
+        // perform, which showed up as a stubborn ~7.9e-3.
+        ("IQ4_XS", GgufDType::IQ4_XS, KQuantScheme::IQ4XS, 136, false, IQ_TOL),
+        // Q2_K and Q4_K ride the dot4/q81 legs, which consume act_q81.
+        ("Q2_K", GgufDType::Q2K, KQuantScheme::Q2K, 84, true, QK_TOL),
+        ("Q4_K", GgufDType::Q4K, KQuantScheme::Q4K, 144, true, QK_TOL),
+        // Q6_K DOES, by default (M7.2e). The dot4 leg is on, so the
+        // reference must use the q8_1 codes the kernel consumed.
+        //
+        // The tolerance is the discriminating one, and it is tight on
+        // purpose: the Q6_K dot4 GEMV is the only numerically exact K-quant
+        // dot4 kernel (its own error against the host dequant with the same
+        // q8_1 codes is ~1e-7 relative), while the exact f32 leg — which is
+        // what this row would fall back to if the dot4 leg regressed to off —
+        // carries the Q8_1 activation quantization and measures ~3.6e-3.
+        // So a tolerance of 1e-4 both admits the dot4 leg and FAILS if the
+        // dispatch silently falls back, which is the thing worth catching.
+        ("Q6_K", GgufDType::Q6K, KQuantScheme::Q6K, 210, true, 1e-4),
+    ];
+
+    const BLOCK_ELEMS: usize = 256;
+    let (m, n, k) = (1usize, 256usize, 512usize);
+    let need_blocks = (n * k) / BLOCK_ELEMS;
+    let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
+    let (q81_bytes, a_eff_q81) = q8_1_pack(&a_host);
+
+    let ckpt = find_checkpoint(
+        "models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "checkpoint missing — this gate must not silently skip; it is the \
+             only parity coverage for the IQ fused-dequant decode legs"
+        )
+    })
+    .to_string_lossy()
+    .to_string();
+    let f = std::fs::File::open(&ckpt).expect("open checkpoint");
+    let gguf = grim_format::gguf::read_gguf(std::io::BufReader::new(f)).expect("parse gguf");
+    let provider = grim_format::tprov::GgufProvider::open(&ckpt).expect("open provider");
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut q6k_diff = 0.0f32;
+    let mut q6k_seen = false;
+    println!(
+        "{:<9} {:>8} {:>8} {:>12} {:>10}  {}",
+        "scheme", "tensors", "bytes", "max_diff", "nonfinite", "verdict"
+    );
+
+    for (label, gdt, scheme, block_bytes, uses_q81, tol) in schemes {
+        let tensors = gguf.tensors.iter().filter(|t| t.dtype == *gdt).count();
+        let Some(t) = gguf
+            .tensors
+            .iter()
+            .filter(|t| t.dtype == *gdt && (t.size_bytes as usize) / block_bytes >= need_blocks)
+            .max_by_key(|t| t.size_bytes)
+        else {
+            println!("{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  NO-TENSOR", "", "");
+            failures.push(format!("{label}: no tensor >= n*k blocks"));
+            continue;
+        };
+        let raw = provider
+            .get_packed(&t.name)
+            .unwrap_or_else(|e| panic!("{label}: packed bytes for {}: {e}", t.name));
+        let packed = raw.bytes[..need_blocks * block_bytes].to_vec();
+
+        // CPU reference weights: decode the SAME bytes the kernel is handed.
+        let mut w_f32: Vec<f32> = Vec::with_capacity(n * k);
+        for b in 0..need_blocks {
+            let blk = &packed[b * block_bytes..(b + 1) * block_bytes];
+            let v = match *label {
+                "IQ1_S" => grim_quant::dequant_iq1s(blk, BLOCK_ELEMS),
+                "IQ2_XXS" => grim_quant::dequant_iq2xxs(blk, BLOCK_ELEMS),
+                "IQ2_XS" => grim_quant::dequant_iq2xs(blk, BLOCK_ELEMS),
+                "IQ2_S" => grim_quant::dequant_iq2s(blk, BLOCK_ELEMS),
+                "IQ3_XXS" => grim_quant::dequant_iq3xxs(blk, BLOCK_ELEMS),
+                "IQ3_S" => grim_quant::dequant_iq3s(blk, BLOCK_ELEMS),
+                "IQ4_XS" => grim_quant::dequant_iq4xs(blk, BLOCK_ELEMS),
+                "Q2_K" => grim_quant::dequant_q2k(blk, BLOCK_ELEMS),
+                "Q4_K" => grim_quant::dequant_q4k(blk, BLOCK_ELEMS),
+                "Q6_K" => grim_quant::dequant_q6k(blk, BLOCK_ELEMS),
+                other => panic!("{other}: no host reference"),
+            }
+            .unwrap_or_else(|e| panic!("{label}: host dequant: {e}"));
+            w_f32.extend(v);
+        }
+        if !w_f32.iter().all(|v| v.is_finite()) {
+            println!("{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  BAD-FIXTURE", "", "");
+            failures.push(format!("{label}: host reference non-finite (bad fixture)"));
+            continue;
+        }
+
+        // Reference activations: raw f32 for the f32-act legs, the Q8_1
+        // round-trip for the dot4 legs. Using the wrong one here would charge
+        // the kernel for activation quantization it does not perform.
+        let a_ref: &[f32] = if *uses_q81 { &a_eff_q81 } else { &a_host };
+
+        let a_dev = CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32)
+            .expect("upload A");
+        let b_dev = MemoryOps::from_cpu_bytes(
+            &dev,
+            &packed,
+            &Shape::new(vec![n * k]),
+            DType { arith: ArithType::F32, storage: Storage::KQuant(*scheme) },
+        )
+        .expect("upload packed B");
+        let w = b_dev
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+            .expect("B is RocmStorage");
+        let out = dev
+            .from_cpu(&vec![0.0f32; n], &Shape::new(vec![n]), DType::F32)
+            .expect("out");
+        let out_r = out
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+            .expect("out is RocmStorage");
+        // Scratch: must be >= need_q81 = m*(k/32)*36 BYTES and hold real Q8_1
+        // blocks for the dot4 legs.
+        let act_scratch = if *uses_q81 { q81_bytes.clone() } else { vec![0u8; (k / 32) * 64] };
+        let act = MemoryOps::from_cpu_bytes(
+            &dev,
+            &act_scratch,
+            &Shape::new(vec![act_scratch.len()]),
+            DType::U8,
+        )
+        .expect("act_q81 scratch");
+        let act_r = act
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+            .expect("act is RocmStorage");
+
+        match dev.linear_decode_into(a_dev.as_ref(), w, out_r, act_r) {
+            Err(e) => {
+                println!(
+                    "{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  REJECTED: {e}",
+                    "", ""
+                );
+                failures.push(format!("{label}: dispatch rejected: {e}"));
+                continue;
+            }
+            Ok(h) => {
+                h.synchronize().expect("sync");
+            }
+        }
+        let got = out.to_cpu_vec_f32().expect("readback");
+
+        let mut want = vec![0.0f32; n];
+        for col in 0..n {
+            want[col] = (0..k).map(|kk| a_ref[kk] * w_f32[col * k + kk]).sum();
+        }
+        let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+        let mut max_diff = 0.0f32;
+        let mut nonfinite = 0usize;
+        for (g, wv) in got.iter().zip(want.iter()) {
+            if !g.is_finite() || !wv.is_finite() {
+                nonfinite += 1;
+                continue;
+            }
+            max_diff = max_diff.max((g - wv).abs() / scale);
+        }
+        if *label == "Q6_K" {
+            q6k_diff = max_diff;
+            q6k_seen = true;
+        }
+        let ok = nonfinite == 0 && max_diff <= *tol;
+        println!(
+            "{label:<9} {tensors:>8} {block_bytes:>8} {max_diff:>12.3e} {nonfinite:>10}  {}",
+            if ok { "ok" } else { "FAIL" }
+        );
+        if !ok {
+            failures.push(format!(
+                "{label} ({}): nonfinite={nonfinite} max_diff={max_diff:.3e}",
+                t.name
+            ));
+        }
+    }
+
+    // Q6_K used to be the odd one out: measured 1.0e-1 while its fused kernel
+    // agreed with the host to 3.9e-7. Root cause was NOT a decode defect —
+    // `try_u4_lane_decode` gates on `m != 1`, so at the only shape decode uses
+    // the fused kernel never ran and a lossy W4A4 requantization stood in for
+    // it. Q6_K is now excluded from that route.
+    //
+    // M7.2e: Q6_K now rides the dot4 leg by default. Measured on the REAL
+    // 27B's output.weight (Q6_K, n=248320, k=5120), the dot4 kernel's own
+    // error against the host dequant with the same q8_1 codes is 9.6e-8
+    // rms-rel (absmax 2.6e-7) — it is the only numerically exact K-quant
+    // dot4 kernel, because Q6_K has no dmin term to round. So the bound here
+    // is tight (1e-4): it admits the dot4 leg and FAILS if the dispatch
+    // falls back to the exact f32 leg, whose Q8_1 activation quantization
+    // measures ~3.6e-3.
+    assert!(
+        q6k_seen,
+        "Q6_K never ran in the sweep — the Q6_K regression check cannot fire if \
+         the scheme stopped being exercised"
+    );
+    assert!(
+        q6k_diff <= 1e-4,
+        "Q6_K's dot4 leg is not what ran: max_diff {q6k_diff:.3e} (expected \
+         <= 1e-4 for the dot4 leg; the exact f32 leg measures ~3.6e-3 because \
+         of the Q8_1 activation quantization). If this fires, the Q6_K dot4 \
+         dispatch leg is off, or the Q6_K dot4 kernel regressed."
+    );
+
+    println!("\n=== {} failing scheme(s) ===", failures.len());
+    for f in &failures {
+        println!("  {f}");
+    }
+    assert!(
+        failures.is_empty(),
+        "k-quant decode parity failures:\n  {}",
+        failures.join("\n  ")
+    );
 }

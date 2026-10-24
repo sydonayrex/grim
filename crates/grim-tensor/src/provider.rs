@@ -113,6 +113,14 @@ pub fn shard_raw_tensor(
             "shard_raw_tensor: world_size must be > 0 (got {world_size})"
         )));
     }
+    // A ONE-SHARD sharding is the identity: the shard IS the whole tensor.
+    // Returning it unchanged is what the caller asked for, and refusing a
+    // QUANTIZED tensor below (its byte layout cannot be sliced) would reject
+    // every packed weight in a single-device load — the refusal is about
+    // SLICING, and a one-shard load slices nothing.
+    if world_size == 1 {
+        return Ok(raw);
+    }
     if dim != 0 && dim != 1 {
         return Err(Error::Shape(format!(
             "shard_raw_tensor: dim must be 0 or 1 (got {dim})"

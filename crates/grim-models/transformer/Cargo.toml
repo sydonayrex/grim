@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 default = []
 
 [dev-dependencies]
+# Dev-only cycle (engine depends on this crate): the M2 oracle loads REAL
+# checkpoints through the engine's GGUF loader, which lives there.
+grim-engine = { workspace = true }
 grim-format = { workspace = true }
 serde_json = { workspace = true }
 temp-env = "0.3"

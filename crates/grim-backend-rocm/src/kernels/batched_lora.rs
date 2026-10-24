@@ -394,6 +394,8 @@ pub fn batched_lora_dispatched_device(
         let bytes = std::mem::size_of_val(y_host);
         if bytes > 0 {
             check_hip("dispatched batched_lora D2H copy", unsafe {
+                // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                crate::memory::storage::count_blocking_d2h();
                 hipMemcpy(
                     y_host.as_mut_ptr() as *mut std::ffi::c_void,
                     y_ptr,
@@ -690,6 +692,8 @@ pub fn batched_lora_group_device(
         let bytes = std::mem::size_of_val(y_host);
         if bytes > 0 {
             check_hip("batched_lora D2H copy", unsafe {
+                // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                crate::memory::storage::count_blocking_d2h();
                 hipMemcpy(
                     y_host.as_mut_ptr() as *mut std::ffi::c_void,
                     y_ptr,

@@ -4,6 +4,1033 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
+static const unsigned long long IQ2S_GRID[1024] = {
+    0x0808080808080808ULL,
+    0x080808080808082bULL,
+    0x0808080808081919ULL,
+    0x0808080808082b08ULL,
+    0x0808080808082b2bULL,
+    0x0808080808190819ULL,
+    0x0808080808191908ULL,
+    0x080808080819192bULL,
+    0x0808080808192b19ULL,
+    0x08080808082b0808ULL,
+    0x08080808082b082bULL,
+    0x08080808082b1919ULL,
+    0x08080808082b2b08ULL,
+    0x0808080819080819ULL,
+    0x0808080819081908ULL,
+    0x080808081908192bULL,
+    0x0808080819082b19ULL,
+    0x0808080819190808ULL,
+    0x080808081919082bULL,
+    0x0808080819191919ULL,
+    0x0808080819192b08ULL,
+    0x08080808192b0819ULL,
+    0x08080808192b1908ULL,
+    0x08080808192b192bULL,
+    0x08080808192b2b19ULL,
+    0x080808082b080808ULL,
+    0x080808082b08082bULL,
+    0x080808082b081919ULL,
+    0x080808082b082b08ULL,
+    0x080808082b190819ULL,
+    0x080808082b191908ULL,
+    0x080808082b2b0808ULL,
+    0x080808082b2b1919ULL,
+    0x080808082b2b2b2bULL,
+    0x0808081908080819ULL,
+    0x0808081908081908ULL,
+    0x080808190808192bULL,
+    0x0808081908082b19ULL,
+    0x0808081908190808ULL,
+    0x080808190819082bULL,
+    0x0808081908191919ULL,
+    0x0808081908192b08ULL,
+    0x08080819082b0819ULL,
+    0x08080819082b1908ULL,
+    0x0808081919080808ULL,
+    0x080808191908082bULL,
+    0x0808081919081919ULL,
+    0x0808081919082b08ULL,
+    0x0808081919190819ULL,
+    0x0808081919191908ULL,
+    0x080808191919192bULL,
+    0x0808081919192b19ULL,
+    0x08080819192b0808ULL,
+    0x08080819192b1919ULL,
+    0x08080819192b2b08ULL,
+    0x080808192b080819ULL,
+    0x080808192b081908ULL,
+    0x080808192b190808ULL,
+    0x080808192b19082bULL,
+    0x080808192b191919ULL,
+    0x080808192b2b0819ULL,
+    0x080808192b2b1908ULL,
+    0x0808082b08080808ULL,
+    0x0808082b0808082bULL,
+    0x0808082b08081919ULL,
+    0x0808082b08082b08ULL,
+    0x0808082b08190819ULL,
+    0x0808082b08191908ULL,
+    0x0808082b082b0808ULL,
+    0x0808082b082b2b2bULL,
+    0x0808082b19080819ULL,
+    0x0808082b19081908ULL,
+    0x0808082b1908192bULL,
+    0x0808082b19082b19ULL,
+    0x0808082b19190808ULL,
+    0x0808082b19191919ULL,
+    0x0808082b2b080808ULL,
+    0x0808082b2b081919ULL,
+    0x0808082b2b082b2bULL,
+    0x0808082b2b191908ULL,
+    0x0808082b2b2b082bULL,
+    0x0808190808080819ULL,
+    0x0808190808081908ULL,
+    0x080819080808192bULL,
+    0x0808190808082b19ULL,
+    0x0808190808190808ULL,
+    0x080819080819082bULL,
+    0x0808190808191919ULL,
+    0x0808190808192b08ULL,
+    0x08081908082b0819ULL,
+    0x08081908082b1908ULL,
+    0x08081908082b192bULL,
+    0x08081908082b2b19ULL,
+    0x0808190819080808ULL,
+    0x080819081908082bULL,
+    0x0808190819081919ULL,
+    0x0808190819082b08ULL,
+    0x0808190819082b2bULL,
+    0x0808190819190819ULL,
+    0x0808190819191908ULL,
+    0x080819081919192bULL,
+    0x0808190819192b19ULL,
+    0x08081908192b0808ULL,
+    0x08081908192b082bULL,
+    0x08081908192b1919ULL,
+    0x080819082b080819ULL,
+    0x080819082b081908ULL,
+    0x080819082b08192bULL,
+    0x080819082b082b19ULL,
+    0x080819082b190808ULL,
+    0x080819082b191919ULL,
+    0x080819082b192b08ULL,
+    0x080819082b2b0819ULL,
+    0x080819082b2b1908ULL,
+    0x0808191908080808ULL,
+    0x080819190808082bULL,
+    0x0808191908081919ULL,
+    0x0808191908082b08ULL,
+    0x0808191908082b2bULL,
+    0x0808191908190819ULL,
+    0x0808191908191908ULL,
+    0x080819190819192bULL,
+    0x0808191908192b19ULL,
+    0x08081919082b0808ULL,
+    0x08081919082b1919ULL,
+    0x08081919082b2b08ULL,
+    0x0808191919080819ULL,
+    0x0808191919081908ULL,
+    0x080819191908192bULL,
+    0x0808191919082b19ULL,
+    0x0808191919190808ULL,
+    0x080819191919082bULL,
+    0x0808191919191919ULL,
+    0x0808191919192b08ULL,
+    0x08081919192b0819ULL,
+    0x08081919192b1908ULL,
+    0x080819192b080808ULL,
+    0x080819192b08082bULL,
+    0x080819192b081919ULL,
+    0x080819192b082b08ULL,
+    0x080819192b190819ULL,
+    0x080819192b191908ULL,
+    0x080819192b2b0808ULL,
+    0x0808192b08080819ULL,
+    0x0808192b08081908ULL,
+    0x0808192b0808192bULL,
+    0x0808192b08082b19ULL,
+    0x0808192b08190808ULL,
+    0x0808192b08191919ULL,
+    0x0808192b19080808ULL,
+    0x0808192b19081919ULL,
+    0x0808192b19082b08ULL,
+    0x0808192b19190819ULL,
+    0x0808192b19191908ULL,
+    0x0808192b192b0808ULL,
+    0x0808192b2b080819ULL,
+    0x0808192b2b081908ULL,
+    0x0808192b2b190808ULL,
+    0x08082b0808080808ULL,
+    0x08082b080808082bULL,
+    0x08082b0808081919ULL,
+    0x08082b0808082b08ULL,
+    0x08082b0808190819ULL,
+    0x08082b0808191908ULL,
+    0x08082b080819192bULL,
+    0x08082b0808192b19ULL,
+    0x08082b08082b0808ULL,
+    0x08082b08082b1919ULL,
+    0x08082b08082b2b2bULL,
+    0x08082b0819080819ULL,
+    0x08082b0819081908ULL,
+    0x08082b081908192bULL,
+    0x08082b0819082b19ULL,
+    0x08082b0819190808ULL,
+    0x08082b081919082bULL,
+    0x08082b0819191919ULL,
+    0x08082b0819192b08ULL,
+    0x08082b08192b0819ULL,
+    0x08082b08192b1908ULL,
+    0x08082b082b080808ULL,
+    0x08082b082b081919ULL,
+    0x08082b082b191908ULL,
+    0x08082b082b2b2b2bULL,
+    0x08082b1908080819ULL,
+    0x08082b1908081908ULL,
+    0x08082b1908190808ULL,
+    0x08082b190819082bULL,
+    0x08082b1908191919ULL,
+    0x08082b1908192b08ULL,
+    0x08082b19082b0819ULL,
+    0x08082b1919080808ULL,
+    0x08082b1919081919ULL,
+    0x08082b1919082b08ULL,
+    0x08082b1919190819ULL,
+    0x08082b1919191908ULL,
+    0x08082b19192b0808ULL,
+    0x08082b192b080819ULL,
+    0x08082b192b190808ULL,
+    0x08082b2b08080808ULL,
+    0x08082b2b08190819ULL,
+    0x08082b2b08191908ULL,
+    0x08082b2b082b082bULL,
+    0x08082b2b082b2b08ULL,
+    0x08082b2b082b2b2bULL,
+    0x08082b2b19190808ULL,
+    0x08082b2b2b192b19ULL,
+    0x0819080808080819ULL,
+    0x0819080808081908ULL,
+    0x081908080808192bULL,
+    0x0819080808082b19ULL,
+    0x0819080808190808ULL,
+    0x081908080819082bULL,
+    0x0819080808191919ULL,
+    0x0819080808192b08ULL,
+    0x08190808082b0819ULL,
+    0x08190808082b1908ULL,
+    0x08190808082b192bULL,
+    0x0819080819080808ULL,
+    0x081908081908082bULL,
+    0x0819080819081919ULL,
+    0x0819080819082b08ULL,
+    0x0819080819190819ULL,
+    0x0819080819191908ULL,
+    0x081908081919192bULL,
+    0x0819080819192b19ULL,
+    0x08190808192b0808ULL,
+    0x08190808192b082bULL,
+    0x08190808192b1919ULL,
+    0x08190808192b2b08ULL,
+    0x081908082b080819ULL,
+    0x081908082b081908ULL,
+    0x081908082b08192bULL,
+    0x081908082b190808ULL,
+    0x081908082b191919ULL,
+    0x081908082b192b08ULL,
+    0x081908082b2b0819ULL,
+    0x081908082b2b1908ULL,
+    0x0819081908080808ULL,
+    0x081908190808082bULL,
+    0x0819081908081919ULL,
+    0x0819081908082b08ULL,
+    0x0819081908082b2bULL,
+    0x0819081908190819ULL,
+    0x0819081908191908ULL,
+    0x081908190819192bULL,
+    0x0819081908192b19ULL,
+    0x08190819082b0808ULL,
+    0x08190819082b082bULL,
+    0x08190819082b1919ULL,
+    0x08190819082b2b08ULL,
+    0x0819081919080819ULL,
+    0x0819081919081908ULL,
+    0x081908191908192bULL,
+    0x0819081919082b19ULL,
+    0x0819081919190808ULL,
+    0x081908191919082bULL,
+    0x0819081919191919ULL,
+    0x0819081919192b08ULL,
+    0x08190819192b0819ULL,
+    0x08190819192b1908ULL,
+    0x081908192b080808ULL,
+    0x081908192b08082bULL,
+    0x081908192b081919ULL,
+    0x081908192b082b08ULL,
+    0x081908192b190819ULL,
+    0x081908192b191908ULL,
+    0x0819082b08080819ULL,
+    0x0819082b08081908ULL,
+    0x0819082b08082b19ULL,
+    0x0819082b08190808ULL,
+    0x0819082b08191919ULL,
+    0x0819082b082b0819ULL,
+    0x0819082b082b1908ULL,
+    0x0819082b19080808ULL,
+    0x0819082b19081919ULL,
+    0x0819082b19190819ULL,
+    0x0819082b19191908ULL,
+    0x0819082b2b080819ULL,
+    0x0819082b2b081908ULL,
+    0x0819082b2b190808ULL,
+    0x0819190808080808ULL,
+    0x081919080808082bULL,
+    0x0819190808081919ULL,
+    0x0819190808082b08ULL,
+    0x0819190808190819ULL,
+    0x0819190808191908ULL,
+    0x081919080819192bULL,
+    0x0819190808192b19ULL,
+    0x08191908082b0808ULL,
+    0x08191908082b1919ULL,
+    0x08191908082b2b08ULL,
+    0x0819190819080819ULL,
+    0x0819190819081908ULL,
+    0x081919081908192bULL,
+    0x0819190819082b19ULL,
+    0x0819190819190808ULL,
+    0x081919081919082bULL,
+    0x0819190819191919ULL,
+    0x0819190819192b08ULL,
+    0x08191908192b0819ULL,
+    0x08191908192b1908ULL,
+    0x081919082b080808ULL,
+    0x081919082b08082bULL,
+    0x081919082b081919ULL,
+    0x081919082b082b08ULL,
+    0x081919082b190819ULL,
+    0x081919082b191908ULL,
+    0x081919082b2b0808ULL,
+    0x0819191908080819ULL,
+    0x0819191908081908ULL,
+    0x081919190808192bULL,
+    0x0819191908082b19ULL,
+    0x0819191908190808ULL,
+    0x081919190819082bULL,
+    0x0819191908191919ULL,
+    0x0819191908192b08ULL,
+    0x08191919082b0819ULL,
+    0x08191919082b1908ULL,
+    0x0819191919080808ULL,
+    0x081919191908082bULL,
+    0x0819191919081919ULL,
+    0x0819191919082b08ULL,
+    0x0819191919190819ULL,
+    0x0819191919191908ULL,
+    0x08191919192b0808ULL,
+    0x081919192b080819ULL,
+    0x081919192b081908ULL,
+    0x081919192b190808ULL,
+    0x0819192b08080808ULL,
+    0x0819192b08081919ULL,
+    0x0819192b08082b08ULL,
+    0x0819192b08190819ULL,
+    0x0819192b08191908ULL,
+    0x0819192b082b0808ULL,
+    0x0819192b19080819ULL,
+    0x0819192b19081908ULL,
+    0x0819192b19190808ULL,
+    0x0819192b2b080808ULL,
+    0x0819192b2b2b2b2bULL,
+    0x08192b0808080819ULL,
+    0x08192b0808081908ULL,
+    0x08192b080808192bULL,
+    0x08192b0808082b19ULL,
+    0x08192b0808190808ULL,
+    0x08192b0808191919ULL,
+    0x08192b0808192b08ULL,
+    0x08192b08082b0819ULL,
+    0x08192b0819080808ULL,
+    0x08192b081908082bULL,
+    0x08192b0819081919ULL,
+    0x08192b0819082b08ULL,
+    0x08192b0819190819ULL,
+    0x08192b0819191908ULL,
+    0x08192b08192b0808ULL,
+    0x08192b082b080819ULL,
+    0x08192b082b081908ULL,
+    0x08192b1908080808ULL,
+    0x08192b190808082bULL,
+    0x08192b1908081919ULL,
+    0x08192b1908082b08ULL,
+    0x08192b1908190819ULL,
+    0x08192b1908191908ULL,
+    0x08192b19082b0808ULL,
+    0x08192b1919080819ULL,
+    0x08192b1919081908ULL,
+    0x08192b1919190808ULL,
+    0x08192b19192b2b19ULL,
+    0x08192b192b2b082bULL,
+    0x08192b2b08081908ULL,
+    0x08192b2b08190808ULL,
+    0x08192b2b19080808ULL,
+    0x08192b2b1919192bULL,
+    0x082b080808080808ULL,
+    0x082b08080808082bULL,
+    0x082b080808081919ULL,
+    0x082b080808082b08ULL,
+    0x082b080808190819ULL,
+    0x082b080808191908ULL,
+    0x082b08080819192bULL,
+    0x082b080808192b19ULL,
+    0x082b0808082b0808ULL,
+    0x082b0808082b1919ULL,
+    0x082b0808082b2b2bULL,
+    0x082b080819080819ULL,
+    0x082b080819081908ULL,
+    0x082b080819190808ULL,
+    0x082b08081919082bULL,
+    0x082b080819191919ULL,
+    0x082b0808192b1908ULL,
+    0x082b08082b080808ULL,
+    0x082b08082b082b2bULL,
+    0x082b08082b191908ULL,
+    0x082b08082b2b2b2bULL,
+    0x082b081908080819ULL,
+    0x082b081908081908ULL,
+    0x082b081908190808ULL,
+    0x082b08190819082bULL,
+    0x082b081908191919ULL,
+    0x082b0819082b0819ULL,
+    0x082b081919080808ULL,
+    0x082b08191908082bULL,
+    0x082b081919081919ULL,
+    0x082b081919190819ULL,
+    0x082b081919191908ULL,
+    0x082b0819192b0808ULL,
+    0x082b08192b080819ULL,
+    0x082b08192b081908ULL,
+    0x082b08192b190808ULL,
+    0x082b082b08080808ULL,
+    0x082b082b08082b2bULL,
+    0x082b082b082b082bULL,
+    0x082b082b082b2b08ULL,
+    0x082b082b082b2b2bULL,
+    0x082b082b19081908ULL,
+    0x082b082b19190808ULL,
+    0x082b082b2b082b08ULL,
+    0x082b082b2b082b2bULL,
+    0x082b082b2b2b2b08ULL,
+    0x082b190808080819ULL,
+    0x082b190808081908ULL,
+    0x082b19080808192bULL,
+    0x082b190808082b19ULL,
+    0x082b190808190808ULL,
+    0x082b190808191919ULL,
+    0x082b190808192b08ULL,
+    0x082b1908082b0819ULL,
+    0x082b1908082b1908ULL,
+    0x082b190819080808ULL,
+    0x082b19081908082bULL,
+    0x082b190819081919ULL,
+    0x082b190819082b08ULL,
+    0x082b190819190819ULL,
+    0x082b190819191908ULL,
+    0x082b1908192b0808ULL,
+    0x082b19082b080819ULL,
+    0x082b19082b081908ULL,
+    0x082b19082b190808ULL,
+    0x082b191908080808ULL,
+    0x082b191908081919ULL,
+    0x082b191908082b08ULL,
+    0x082b191908190819ULL,
+    0x082b191908191908ULL,
+    0x082b1919082b0808ULL,
+    0x082b191919080819ULL,
+    0x082b191919081908ULL,
+    0x082b191919190808ULL,
+    0x082b1919192b192bULL,
+    0x082b19192b080808ULL,
+    0x082b192b08080819ULL,
+    0x082b192b08081908ULL,
+    0x082b192b08190808ULL,
+    0x082b192b19080808ULL,
+    0x082b192b19192b19ULL,
+    0x082b2b0808080808ULL,
+    0x082b2b0808081919ULL,
+    0x082b2b0808190819ULL,
+    0x082b2b0808191908ULL,
+    0x082b2b0819080819ULL,
+    0x082b2b0819081908ULL,
+    0x082b2b0819190808ULL,
+    0x082b2b082b082b2bULL,
+    0x082b2b082b2b2b2bULL,
+    0x082b2b1908080819ULL,
+    0x082b2b1908081908ULL,
+    0x082b2b1908190808ULL,
+    0x082b2b192b191919ULL,
+    0x082b2b2b08082b2bULL,
+    0x082b2b2b082b082bULL,
+    0x082b2b2b192b1908ULL,
+    0x082b2b2b2b082b08ULL,
+    0x082b2b2b2b082b2bULL,
+    0x1908080808080819ULL,
+    0x1908080808081908ULL,
+    0x190808080808192bULL,
+    0x1908080808082b19ULL,
+    0x1908080808190808ULL,
+    0x190808080819082bULL,
+    0x1908080808191919ULL,
+    0x1908080808192b08ULL,
+    0x1908080808192b2bULL,
+    0x19080808082b0819ULL,
+    0x19080808082b1908ULL,
+    0x19080808082b192bULL,
+    0x1908080819080808ULL,
+    0x190808081908082bULL,
+    0x1908080819081919ULL,
+    0x1908080819082b08ULL,
+    0x1908080819082b2bULL,
+    0x1908080819190819ULL,
+    0x1908080819191908ULL,
+    0x190808081919192bULL,
+    0x1908080819192b19ULL,
+    0x19080808192b0808ULL,
+    0x19080808192b082bULL,
+    0x19080808192b1919ULL,
+    0x190808082b080819ULL,
+    0x190808082b081908ULL,
+    0x190808082b190808ULL,
+    0x190808082b191919ULL,
+    0x190808082b192b08ULL,
+    0x190808082b2b0819ULL,
+    0x190808082b2b1908ULL,
+    0x1908081908080808ULL,
+    0x190808190808082bULL,
+    0x1908081908081919ULL,
+    0x1908081908082b08ULL,
+    0x1908081908190819ULL,
+    0x1908081908191908ULL,
+    0x190808190819192bULL,
+    0x1908081908192b19ULL,
+    0x19080819082b0808ULL,
+    0x19080819082b082bULL,
+    0x19080819082b1919ULL,
+    0x1908081919080819ULL,
+    0x1908081919081908ULL,
+    0x190808191908192bULL,
+    0x1908081919082b19ULL,
+    0x1908081919190808ULL,
+    0x190808191919082bULL,
+    0x1908081919191919ULL,
+    0x1908081919192b08ULL,
+    0x19080819192b0819ULL,
+    0x19080819192b1908ULL,
+    0x190808192b080808ULL,
+    0x190808192b08082bULL,
+    0x190808192b081919ULL,
+    0x190808192b082b08ULL,
+    0x190808192b190819ULL,
+    0x190808192b191908ULL,
+    0x190808192b2b0808ULL,
+    0x1908082b08080819ULL,
+    0x1908082b08081908ULL,
+    0x1908082b08190808ULL,
+    0x1908082b0819082bULL,
+    0x1908082b08191919ULL,
+    0x1908082b08192b08ULL,
+    0x1908082b082b1908ULL,
+    0x1908082b19080808ULL,
+    0x1908082b19081919ULL,
+    0x1908082b19082b08ULL,
+    0x1908082b19190819ULL,
+    0x1908082b19191908ULL,
+    0x1908082b192b0808ULL,
+    0x1908082b2b080819ULL,
+    0x1908082b2b081908ULL,
+    0x1908190808080808ULL,
+    0x190819080808082bULL,
+    0x1908190808081919ULL,
+    0x1908190808082b08ULL,
+    0x1908190808082b2bULL,
+    0x1908190808190819ULL,
+    0x1908190808191908ULL,
+    0x190819080819192bULL,
+    0x1908190808192b19ULL,
+    0x19081908082b0808ULL,
+    0x19081908082b082bULL,
+    0x19081908082b1919ULL,
+    0x19081908082b2b08ULL,
+    0x1908190819080819ULL,
+    0x1908190819081908ULL,
+    0x190819081908192bULL,
+    0x1908190819082b19ULL,
+    0x1908190819190808ULL,
+    0x190819081919082bULL,
+    0x1908190819191919ULL,
+    0x1908190819192b08ULL,
+    0x19081908192b0819ULL,
+    0x19081908192b1908ULL,
+    0x190819082b080808ULL,
+    0x190819082b08082bULL,
+    0x190819082b081919ULL,
+    0x190819082b082b08ULL,
+    0x190819082b190819ULL,
+    0x190819082b191908ULL,
+    0x190819082b2b0808ULL,
+    0x1908191908080819ULL,
+    0x1908191908081908ULL,
+    0x190819190808192bULL,
+    0x1908191908082b19ULL,
+    0x1908191908190808ULL,
+    0x190819190819082bULL,
+    0x1908191908191919ULL,
+    0x1908191908192b08ULL,
+    0x19081919082b0819ULL,
+    0x19081919082b1908ULL,
+    0x1908191919080808ULL,
+    0x190819191908082bULL,
+    0x1908191919081919ULL,
+    0x1908191919082b08ULL,
+    0x1908191919190819ULL,
+    0x1908191919191908ULL,
+    0x19081919192b0808ULL,
+    0x19081919192b2b2bULL,
+    0x190819192b080819ULL,
+    0x190819192b081908ULL,
+    0x190819192b190808ULL,
+    0x1908192b08080808ULL,
+    0x1908192b0808082bULL,
+    0x1908192b08081919ULL,
+    0x1908192b08082b08ULL,
+    0x1908192b08190819ULL,
+    0x1908192b08191908ULL,
+    0x1908192b082b0808ULL,
+    0x1908192b19080819ULL,
+    0x1908192b19081908ULL,
+    0x1908192b19190808ULL,
+    0x1908192b2b080808ULL,
+    0x1908192b2b2b1919ULL,
+    0x19082b0808080819ULL,
+    0x19082b0808081908ULL,
+    0x19082b0808082b19ULL,
+    0x19082b0808190808ULL,
+    0x19082b080819082bULL,
+    0x19082b0808191919ULL,
+    0x19082b0808192b08ULL,
+    0x19082b08082b0819ULL,
+    0x19082b08082b1908ULL,
+    0x19082b0819080808ULL,
+    0x19082b081908082bULL,
+    0x19082b0819081919ULL,
+    0x19082b0819082b08ULL,
+    0x19082b0819190819ULL,
+    0x19082b0819191908ULL,
+    0x19082b08192b0808ULL,
+    0x19082b082b081908ULL,
+    0x19082b082b190808ULL,
+    0x19082b1908080808ULL,
+    0x19082b190808082bULL,
+    0x19082b1908081919ULL,
+    0x19082b1908082b08ULL,
+    0x19082b1908190819ULL,
+    0x19082b1908191908ULL,
+    0x19082b19082b0808ULL,
+    0x19082b1919080819ULL,
+    0x19082b1919081908ULL,
+    0x19082b1919190808ULL,
+    0x19082b192b080808ULL,
+    0x19082b192b19192bULL,
+    0x19082b2b08080819ULL,
+    0x19082b2b08081908ULL,
+    0x19082b2b08190808ULL,
+    0x19082b2b19080808ULL,
+    0x1919080808080808ULL,
+    0x191908080808082bULL,
+    0x1919080808081919ULL,
+    0x1919080808082b08ULL,
+    0x1919080808190819ULL,
+    0x1919080808191908ULL,
+    0x191908080819192bULL,
+    0x1919080808192b19ULL,
+    0x19190808082b0808ULL,
+    0x19190808082b082bULL,
+    0x19190808082b1919ULL,
+    0x19190808082b2b08ULL,
+    0x1919080819080819ULL,
+    0x1919080819081908ULL,
+    0x191908081908192bULL,
+    0x1919080819082b19ULL,
+    0x1919080819190808ULL,
+    0x191908081919082bULL,
+    0x1919080819191919ULL,
+    0x1919080819192b08ULL,
+    0x19190808192b0819ULL,
+    0x19190808192b1908ULL,
+    0x191908082b080808ULL,
+    0x191908082b08082bULL,
+    0x191908082b081919ULL,
+    0x191908082b082b08ULL,
+    0x191908082b190819ULL,
+    0x191908082b191908ULL,
+    0x1919081908080819ULL,
+    0x1919081908081908ULL,
+    0x191908190808192bULL,
+    0x1919081908082b19ULL,
+    0x1919081908190808ULL,
+    0x191908190819082bULL,
+    0x1919081908191919ULL,
+    0x1919081908192b08ULL,
+    0x19190819082b0819ULL,
+    0x19190819082b1908ULL,
+    0x1919081919080808ULL,
+    0x191908191908082bULL,
+    0x1919081919081919ULL,
+    0x1919081919082b08ULL,
+    0x1919081919190819ULL,
+    0x1919081919191908ULL,
+    0x19190819192b0808ULL,
+    0x191908192b080819ULL,
+    0x191908192b081908ULL,
+    0x191908192b190808ULL,
+    0x1919082b08080808ULL,
+    0x1919082b08081919ULL,
+    0x1919082b08082b08ULL,
+    0x1919082b08190819ULL,
+    0x1919082b08191908ULL,
+    0x1919082b082b0808ULL,
+    0x1919082b19080819ULL,
+    0x1919082b19081908ULL,
+    0x1919082b19190808ULL,
+    0x1919082b192b2b19ULL,
+    0x1919082b2b080808ULL,
+    0x1919190808080819ULL,
+    0x1919190808081908ULL,
+    0x191919080808192bULL,
+    0x1919190808082b19ULL,
+    0x1919190808190808ULL,
+    0x191919080819082bULL,
+    0x1919190808191919ULL,
+    0x1919190808192b08ULL,
+    0x19191908082b0819ULL,
+    0x19191908082b1908ULL,
+    0x1919190819080808ULL,
+    0x191919081908082bULL,
+    0x1919190819081919ULL,
+    0x1919190819082b08ULL,
+    0x1919190819190819ULL,
+    0x1919190819191908ULL,
+    0x19191908192b0808ULL,
+    0x191919082b080819ULL,
+    0x191919082b081908ULL,
+    0x191919082b190808ULL,
+    0x1919191908080808ULL,
+    0x191919190808082bULL,
+    0x1919191908081919ULL,
+    0x1919191908082b08ULL,
+    0x1919191908190819ULL,
+    0x1919191908191908ULL,
+    0x19191919082b0808ULL,
+    0x1919191919080819ULL,
+    0x1919191919081908ULL,
+    0x1919191919190808ULL,
+    0x191919192b080808ULL,
+    0x1919192b08080819ULL,
+    0x1919192b08081908ULL,
+    0x1919192b08190808ULL,
+    0x1919192b082b192bULL,
+    0x1919192b19080808ULL,
+    0x19192b0808080808ULL,
+    0x19192b080808082bULL,
+    0x19192b0808081919ULL,
+    0x19192b0808082b08ULL,
+    0x19192b0808190819ULL,
+    0x19192b0808191908ULL,
+    0x19192b08082b0808ULL,
+    0x19192b0819080819ULL,
+    0x19192b0819081908ULL,
+    0x19192b0819190808ULL,
+    0x19192b0819192b2bULL,
+    0x19192b082b080808ULL,
+    0x19192b1908080819ULL,
+    0x19192b1908081908ULL,
+    0x19192b1908190808ULL,
+    0x19192b1919080808ULL,
+    0x19192b2b08080808ULL,
+    0x19192b2b08192b19ULL,
+    0x19192b2b2b081919ULL,
+    0x19192b2b2b2b2b08ULL,
+    0x192b080808080819ULL,
+    0x192b080808081908ULL,
+    0x192b08080808192bULL,
+    0x192b080808190808ULL,
+    0x192b08080819082bULL,
+    0x192b080808191919ULL,
+    0x192b080808192b08ULL,
+    0x192b0808082b0819ULL,
+    0x192b0808082b1908ULL,
+    0x192b080819080808ULL,
+    0x192b080819081919ULL,
+    0x192b080819082b08ULL,
+    0x192b080819190819ULL,
+    0x192b080819191908ULL,
+    0x192b0808192b0808ULL,
+    0x192b08082b081908ULL,
+    0x192b08082b190808ULL,
+    0x192b081908080808ULL,
+    0x192b08190808082bULL,
+    0x192b081908081919ULL,
+    0x192b081908082b08ULL,
+    0x192b081908190819ULL,
+    0x192b081908191908ULL,
+    0x192b0819082b0808ULL,
+    0x192b081919080819ULL,
+    0x192b081919081908ULL,
+    0x192b081919190808ULL,
+    0x192b08192b080808ULL,
+    0x192b08192b192b19ULL,
+    0x192b082b08081908ULL,
+    0x192b082b08190808ULL,
+    0x192b082b19080808ULL,
+    0x192b082b1919192bULL,
+    0x192b082b2b2b0819ULL,
+    0x192b190808080808ULL,
+    0x192b190808081919ULL,
+    0x192b190808082b08ULL,
+    0x192b190808190819ULL,
+    0x192b190808191908ULL,
+    0x192b1908082b0808ULL,
+    0x192b190819080819ULL,
+    0x192b190819081908ULL,
+    0x192b190819190808ULL,
+    0x192b19082b080808ULL,
+    0x192b191908080819ULL,
+    0x192b191908081908ULL,
+    0x192b191908190808ULL,
+    0x192b191919080808ULL,
+    0x192b191919082b2bULL,
+    0x192b1919192b2b08ULL,
+    0x192b19192b19082bULL,
+    0x192b192b08080808ULL,
+    0x192b192b2b191908ULL,
+    0x192b2b0808080819ULL,
+    0x192b2b0808081908ULL,
+    0x192b2b0808190808ULL,
+    0x192b2b08192b1919ULL,
+    0x192b2b082b192b08ULL,
+    0x192b2b1908080808ULL,
+    0x192b2b19082b2b2bULL,
+    0x192b2b2b1908082bULL,
+    0x192b2b2b2b2b0819ULL,
+    0x2b08080808080808ULL,
+    0x2b0808080808082bULL,
+    0x2b08080808081919ULL,
+    0x2b08080808082b08ULL,
+    0x2b08080808190819ULL,
+    0x2b08080808191908ULL,
+    0x2b08080808192b19ULL,
+    0x2b080808082b0808ULL,
+    0x2b080808082b1919ULL,
+    0x2b08080819080819ULL,
+    0x2b08080819081908ULL,
+    0x2b08080819190808ULL,
+    0x2b0808081919082bULL,
+    0x2b08080819191919ULL,
+    0x2b08080819192b08ULL,
+    0x2b080808192b0819ULL,
+    0x2b0808082b080808ULL,
+    0x2b0808082b081919ULL,
+    0x2b0808082b190819ULL,
+    0x2b0808082b191908ULL,
+    0x2b08081908080819ULL,
+    0x2b08081908081908ULL,
+    0x2b08081908082b19ULL,
+    0x2b08081908190808ULL,
+    0x2b0808190819082bULL,
+    0x2b08081908191919ULL,
+    0x2b08081908192b08ULL,
+    0x2b080819082b0819ULL,
+    0x2b080819082b1908ULL,
+    0x2b08081919080808ULL,
+    0x2b0808191908082bULL,
+    0x2b08081919081919ULL,
+    0x2b08081919082b08ULL,
+    0x2b08081919190819ULL,
+    0x2b08081919191908ULL,
+    0x2b0808192b080819ULL,
+    0x2b0808192b081908ULL,
+    0x2b0808192b190808ULL,
+    0x2b0808192b2b2b19ULL,
+    0x2b08082b08080808ULL,
+    0x2b08082b08081919ULL,
+    0x2b08082b08082b2bULL,
+    0x2b08082b08190819ULL,
+    0x2b08082b08191908ULL,
+    0x2b08082b19080819ULL,
+    0x2b08082b19081908ULL,
+    0x2b08082b19190808ULL,
+    0x2b08190808080819ULL,
+    0x2b08190808081908ULL,
+    0x2b0819080808192bULL,
+    0x2b08190808082b19ULL,
+    0x2b08190808190808ULL,
+    0x2b0819080819082bULL,
+    0x2b08190808191919ULL,
+    0x2b08190808192b08ULL,
+    0x2b081908082b0819ULL,
+    0x2b08190819080808ULL,
+    0x2b0819081908082bULL,
+    0x2b08190819081919ULL,
+    0x2b08190819082b08ULL,
+    0x2b08190819190819ULL,
+    0x2b08190819191908ULL,
+    0x2b081908192b0808ULL,
+    0x2b0819082b080819ULL,
+    0x2b0819082b081908ULL,
+    0x2b0819082b190808ULL,
+    0x2b08191908080808ULL,
+    0x2b0819190808082bULL,
+    0x2b08191908081919ULL,
+    0x2b08191908082b08ULL,
+    0x2b08191908190819ULL,
+    0x2b08191908191908ULL,
+    0x2b081919082b0808ULL,
+    0x2b08191919080819ULL,
+    0x2b08191919081908ULL,
+    0x2b08191919190808ULL,
+    0x2b0819192b080808ULL,
+    0x2b0819192b082b2bULL,
+    0x2b08192b08080819ULL,
+    0x2b08192b08081908ULL,
+    0x2b08192b08190808ULL,
+    0x2b08192b082b2b19ULL,
+    0x2b08192b19080808ULL,
+    0x2b082b0808080808ULL,
+    0x2b082b0808081919ULL,
+    0x2b082b0808190819ULL,
+    0x2b082b0808191908ULL,
+    0x2b082b0819080819ULL,
+    0x2b082b0819081908ULL,
+    0x2b082b0819190808ULL,
+    0x2b082b082b2b082bULL,
+    0x2b082b1908080819ULL,
+    0x2b082b1908081908ULL,
+    0x2b082b1919080808ULL,
+    0x2b082b19192b1919ULL,
+    0x2b082b2b082b082bULL,
+    0x2b082b2b19192b08ULL,
+    0x2b082b2b19192b2bULL,
+    0x2b082b2b2b08082bULL,
+    0x2b082b2b2b2b082bULL,
+    0x2b19080808080819ULL,
+    0x2b19080808081908ULL,
+    0x2b19080808082b19ULL,
+    0x2b19080808190808ULL,
+    0x2b1908080819082bULL,
+    0x2b19080808191919ULL,
+    0x2b19080808192b08ULL,
+    0x2b190808082b1908ULL,
+    0x2b19080819080808ULL,
+    0x2b1908081908082bULL,
+    0x2b19080819081919ULL,
+    0x2b19080819082b08ULL,
+    0x2b19080819190819ULL,
+    0x2b19080819191908ULL,
+    0x2b190808192b0808ULL,
+    0x2b1908082b080819ULL,
+    0x2b1908082b081908ULL,
+    0x2b1908082b190808ULL,
+    0x2b19081908080808ULL,
+    0x2b19081908081919ULL,
+    0x2b19081908190819ULL,
+    0x2b19081908191908ULL,
+    0x2b19081919080819ULL,
+    0x2b19081919081908ULL,
+    0x2b19081919190808ULL,
+    0x2b19081919192b2bULL,
+    0x2b19082b08080819ULL,
+    0x2b19082b08081908ULL,
+    0x2b19082b08190808ULL,
+    0x2b19082b19080808ULL,
+    0x2b19082b2b2b192bULL,
+    0x2b19190808080808ULL,
+    0x2b1919080808082bULL,
+    0x2b19190808081919ULL,
+    0x2b19190808082b08ULL,
+    0x2b19190808190819ULL,
+    0x2b19190808191908ULL,
+    0x2b191908082b0808ULL,
+    0x2b19190819080819ULL,
+    0x2b19190819081908ULL,
+    0x2b19190819190808ULL,
+    0x2b1919082b080808ULL,
+    0x2b1919082b19192bULL,
+    0x2b19191908080819ULL,
+    0x2b19191908081908ULL,
+    0x2b19191908190808ULL,
+    0x2b19191919080808ULL,
+    0x2b1919192b192b08ULL,
+    0x2b1919192b2b0819ULL,
+    0x2b19192b08080808ULL,
+    0x2b19192b1908192bULL,
+    0x2b19192b192b1908ULL,
+    0x2b192b0808080819ULL,
+    0x2b192b0808081908ULL,
+    0x2b192b0808190808ULL,
+    0x2b192b08082b192bULL,
+    0x2b192b0819080808ULL,
+    0x2b192b082b2b2b19ULL,
+    0x2b192b1908080808ULL,
+    0x2b192b1919082b19ULL,
+    0x2b192b191919082bULL,
+    0x2b192b2b2b190808ULL,
+    0x2b2b080808080808ULL,
+    0x2b2b080808081919ULL,
+    0x2b2b080808082b2bULL,
+    0x2b2b080808191908ULL,
+    0x2b2b0808082b082bULL,
+    0x2b2b0808082b2b2bULL,
+    0x2b2b080819080819ULL,
+    0x2b2b080819081908ULL,
+    0x2b2b080819190808ULL,
+    0x2b2b08082b2b082bULL,
+    0x2b2b08082b2b2b2bULL,
+    0x2b2b081919080808ULL,
+    0x2b2b0819192b1919ULL,
+    0x2b2b082b0808082bULL,
+    0x2b2b082b08082b2bULL,
+    0x2b2b082b082b082bULL,
+    0x2b2b082b082b2b08ULL,
+    0x2b2b082b082b2b2bULL,
+    0x2b2b082b2b08082bULL,
+    0x2b2b082b2b082b08ULL,
+    0x2b2b082b2b082b2bULL,
+    0x2b2b082b2b2b2b08ULL,
+    0x2b2b190808080819ULL,
+    0x2b2b190808081908ULL,
+    0x2b2b190808190808ULL,
+    0x2b2b190819080808ULL,
+    0x2b2b19082b082b19ULL,
+    0x2b2b19082b2b1908ULL,
+    0x2b2b191908080808ULL,
+    0x2b2b191908192b19ULL,
+    0x2b2b192b19190819ULL,
+    0x2b2b2b0808082b2bULL,
+    0x2b2b2b08082b2b08ULL,
+    0x2b2b2b082b2b082bULL,
+    0x2b2b2b1919191908ULL,
+    0x2b2b2b192b08192bULL,
+    0x2b2b2b2b08082b08ULL,
+    0x2b2b2b2b08082b2bULL,
+    0x2b2b2b2b082b0808ULL,
+    0x2b2b2b2b082b082bULL,
+    0x2b2b2b2b082b2b08ULL,
+    0x2b2b2b2b2b082b08ULL,
+    0x2b2b2b2b2b2b2b2bULL,
+};
+
 static const unsigned char IQ3S_GRID_B[512][4] = {
     {1,1,1,1},
     {3,1,1,1},
@@ -523,63 +1550,140 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
 
     // block_q2_XXS: 66 bytes per 256 weights.
     // Layout: d(f16,2) + qs(32) + signs(32) = 66.
+    // block_iq2_xxs: **66** bytes per 256 weights (ggml-common.h; matches
+    // grim-format's gguf.rs type-id-16 byte size and wmma_routing's row).
+    //   d(f16,2) @0 | qs[64] @2
+    //
+    // There is no separate signs field: the whole 64-byte qs is eight 8-byte
+    // groups, each an `aux8[0..4]` of grid indices plus an `aux32_1` whose top
+    // 4 bits carry the scale and whose low 28 bits carry four 7-bit sign
+    // patterns. The previous version invented a grid as
+    // `(grid_idx + in_sb%8) % 4 - 1.5f`, read signs one bit per weight out of a
+    // `blk + 34` field that does not exist in this layout, and ignored the
+    // per-32 sub-scale entirely — so all 30 IQ2_XXS tensors in the 27B decoded
+    // to finite, entirely wrong weights (~1.0 relative error), which is what
+    // left the model finite but incoherent after IQ3_XXS was fixed.
+    //
+    // Now mirrors `grim_quant::dequant_iq2xxs` and charon.rs's iq2xxs arm.
     __device__ inline float dequant_iq2xxs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 34;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * val * sign_val;
+        int ib32 = in_sb / 32;              // 0..7
+        int l = (in_sb % 32) / 8;           // 0..3
+        int j = in_sb % 8;                   // 0..7
+        const unsigned char* aux8 = qs + 8 * ib32;
+        unsigned int aux32 = (unsigned int)aux8[4]
+                           | ((unsigned int)aux8[5] << 8)
+                           | ((unsigned int)aux8[6] << 16)
+                           | ((unsigned int)aux8[7] << 24);
+        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.25f;
+        unsigned long long gv = IQ2XXS_GRID[aux8[l]];
+        unsigned int signs = KSIGNS_IQ2XS[(aux32 >> (7 * l)) & 127];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
-    // block_q2_XS: 74 bytes per 256 weights.
-    // Layout: d(f16,2) + qs(32) + scales(8) + signs(32) = 74.
+    // block_iq2_xs: **74** bytes per 256 weights (ggml-common.h; matches
+    // grim-format's gguf.rs type-id-17 byte size).
+    //   d(f16,2) @0 | qs[64] @2 | scales[8] @66
+    //
+    // qs is 32 little-endian uint16_t, each `grid_idx = q & 511` plus a 7-bit
+    // sign-pattern index in `q >> 9`. scales is ONE BYTE PER 32 WEIGHTS (not
+    // the old `*0.125 + 0.5` per-16 sub-scale, and not at offset 34): the low
+    // nibble scales l 0/1, the high nibble l 2/3, as `d * (0.5 + nib) * 0.25`.
+    // The old body also read a `signs` field at blk+42 that this layout does
+    // not have and invented the same `(idx + i%8) % 4 - 1.5` grid as IQ2_XXS,
+    // so all 32 IQ2_XS tensors decoded to finite, entirely wrong weights.
+    //
+    // Now mirrors `grim_quant::dequant_iq2xs` and charon.rs's iq2xs arm.
     __device__ inline float dequant_iq2xs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 34;
-        const unsigned char* signs = blk + 42;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        const unsigned char* scales = blk + 66;
+        int ib32 = in_sb / 32;              // 0..7
+        int l = (in_sb % 32) / 8;           // 0..3
+        int j = in_sb % 8;                   // 0..7
+        unsigned char sc_byte = scales[ib32];
+        float db = d * (0.5f + (float)((l < 2) ? (sc_byte & 0x0F) : (sc_byte >> 4))) * 0.25f;
+        int q_off = (ib32 * 4 + l) * 2;
+        unsigned int q_val = (unsigned int)qs[q_off] | ((unsigned int)qs[q_off + 1] << 8);
+        unsigned long long gv = IQ2XS_GRID[q_val & 511];
+        unsigned int signs = KSIGNS_IQ2XS[q_val >> 9];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
-    // block_q2_S: 82 bytes per 256 weights.
-    // Layout: d(f16,2) + qs(48) + scales(8) + signs(24) = 82.
+// block_q2_S: 82 bytes per 256 weights.
+    // Layout: d(f16,2) + qs(64) + qh(8) + scales(8) = 82.
+    // qs: [32 bytes grid low bits, 32 bytes signs]
     __device__ inline float dequant_iq2s(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 50;
-        const unsigned char* signs = blk + 58;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        const unsigned char* qh = blk + 66;
+        const unsigned char* scales = blk + 74;
+        const unsigned char* signs = blk + 34; // qs + 32
+
+        int ib32 = in_sb >> 5;          // 0..7 (groups of 32)
+        int in32 = in_sb & 31;
+        int l = in32 >> 3;              // 0..3 (groups of 8)
+        int j = in32 & 7;               // 0..7 within group of 8
+
+        unsigned char sc_byte = scales[ib32];
+        float nib = (float)((l >= 2) ? (sc_byte >> 4) : (sc_byte & 0x0F));
+        float db = d * (0.5f + nib) * 0.25f;
+
+        int qs_val = (int)qs[ib32 * 4 + l];
+        int qh_val = (int)qh[ib32];
+        int idx = qs_val | (((qh_val << (8 - 2 * l))) & 0x300);
+
+        unsigned long long packed = IQ2S_GRID[idx];
+        float g = (float)((packed >> (8 * j)) & 0xFFULL);
+        float sign_val = (signs[ib32 * 4 + l] & (1 << j)) ? -1.0f : 1.0f;
+        return db * g * sign_val;
     }
 
     // ===================== IQ3 variants =====================
 
-    // block_q3_XXS: 96 bytes per 256 weights.
-    // Layout: d(f16,2) + qs(64) + signs(30) = 96.
+    // block_iq3_xxs: **98** bytes per 256 weights (ggml-common.h; mirrored by
+    // `grim-format`'s byte-size table and by `wmma_routing`'s dispatch row).
+    //   d(f16,2) @0 | qs[64] @2 | scales+signs[32] @66
+    //
+    // This was a STUB. It read a 96-byte block (so every row after the first
+    // and every super-block past the first started 2 bytes early), took the
+    // scale from the right offset but then ignored it (`* 0.25f`), invented a
+    // value grid as `(grid_idx + sub_idx*17) % 7 - 3.0f` — arithmetic on a byte
+    // index, not an IQ codebook — and read signs one bit per weight instead of
+    // the 7-bit-per-sub-block KMASK pattern. The 27B Qwen3.8 checkpoint carries
+    // 83 IQ3_XXS tensors, and this kernel served every one of them, so its
+    // logits were non-finite from step 0 (`!!!!`, token 0 is `!`). No parity
+    // gate covered IQ3_XXS, which is how that survived.
+    //
+    // Now mirrors `grim_quant::dequant_iq3xxs` and the charon.rs fmt==2 arm
+    // exactly: per 32-weight sub-block, `db = d * (0.5 + aux>>28) * 0.5`, a
+    // 7-bit sign-pattern index into KSIGNS_IQ2XS, and a grid byte from
+    // IQ3XXS_GRID whose four little-endian bytes are the first four weights
+    // (or the second four, for j >= 4).
     __device__ inline float dequant_iq3xxs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 66;
-        int grid_idx = qs[in_sb / 8];
-        int sub_idx = in_sb % 8;
-        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
-        int sign_byte_idx = (in_sb / 8);
-        if (sign_byte_idx >= 30) sign_byte_idx = 29;
-        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * base_val * 0.25f * sign_val;
+        const unsigned char* ss = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned int aux = (unsigned int)ss[4 * ib32]
+                         | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                         | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                         | ((unsigned int)ss[4 * ib32 + 3] << 24);
+        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+        unsigned int gv = (j < 4) ? IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]]
+                                  : IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+        int jj = (j < 4) ? j : j - 4;
+        float g = (float)((gv >> (8 * jj)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
     // block_q3_S layout, mirroring grim_quant::dequant_iq3s exactly:
@@ -843,6 +1947,45 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ2_XXS forward GEMM (bit-identical; the qs/signs
+    // byte loads and the `d` load move out of the 8-weight group).
+    __global__ void grim_fused_dequant_gemm_iq2xxs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2xxs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 66;
+        const unsigned char* row_b_ptr = B_iq2xxs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 66;
+            const int k0 = sb_idx * 256;
+            // The per-block loop and the hoisted `a_row`/`blk` are what this
+            // kernel exists for; the DECODE delegates to the helper, which is
+            // the single source of truth. This body used to inline its own copy
+            // with a fabricated `(grid_idx + j) % 4 - 1.5f` grid and a
+            // `blk + 34` signs field the IQ2_XXS layout does not have — which
+            // is why fixing `dequant_iq2xxs` alone changed nothing here: this
+            // is the leg `launch_fused_dequant_gemm_iq2xxs` actually launches.
+            for (int g = 0; g < 32; ++g) {
+                const int base = k0 + g * 8;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    acc += a_row[base + j] * dequant_iq2xxs(blk, g * 8 + j);
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq2xxs(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq2xxs,
@@ -889,6 +2032,43 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq2xs(row_b_ptr + sb_idx * 74, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ2_XS forward GEMM (bit-identical). The 16-weight
+    // scale is hoisted to the outer loop; the qs/signs bytes and `d` to the
+    // 8-weight group.
+    __global__ void grim_fused_dequant_gemm_iq2xs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2xs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 74;
+        const unsigned char* row_b_ptr = B_iq2xs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 74;
+            const int k0 = sb_idx * 256;
+            // Same story as the IQ2_XXS grouped leg above: the inlined decode
+            // was a stub (fabricated grid, per-16 `*0.125+0.5` sub-scale at the
+            // wrong offset 34, and a `blk + 42` signs field this layout lacks),
+            // so `dequant_iq2xs` is now the only decode in the file.
+            for (int g = 0; g < 32; ++g) {
+                const int base = k0 + g * 8;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    acc += a_row[base + j] * dequant_iq2xs(blk, g * 8 + j);
+                }
+            }
         }
         C[row * N + col] = acc;
     }
@@ -943,6 +2123,111 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ2_S forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq2s` (same values, same ascending order:
+    // ib32, l, j IS in_sb ascending), with the scale nibble, the 10-bit grid
+    // index math and the 8-byte grid entry hoisted out of each 8-weight group.
+    __global__ void grim_fused_dequant_gemm_iq2s_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 82;
+        const unsigned char* row_b_ptr = B_iq2s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 82;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* signs = blk + 34;
+            const unsigned char* qh = blk + 66;
+            const unsigned char* scales = blk + 74;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const unsigned char sc_byte = scales[ib32];
+                const int qh_val = (int)qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const float nib = (float)((l >= 2) ? (sc_byte >> 4) : (sc_byte & 0x0F));
+                    const float db = d * (0.5f + nib) * 0.25f;
+                    const int grid_idx = (int)qs[ib32 * 4 + l]
+                        | (((qh_val << (8 - 2 * l))) & 0x300);
+                    const unsigned long long packed = IQ2S_GRID[grid_idx];
+                    const unsigned char sg = signs[ib32 * 4 + l];
+                    const int base = k0 + ib32 * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float g = (float)((packed >> (8 * j)) & 0xFFULL);
+                        const float sign_val = (sg & (1 << j)) ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (db * g * sign_val);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
+    // res0-T1: codebook-cache LDS variant of the IQ2_S grouped kernel
+    // (8 KB grid staged in __shared__ — still well under the 64 KB LDS
+    // budget at 256 threads/block; see the IQ3XXS LDS note above).
+    __global__ void grim_fused_dequant_gemm_iq2s_grouped_lds(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq2s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        __shared__ unsigned long long s_grid[1024];
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) s_grid[i] = IQ2S_GRID[i];
+        __syncthreads();
+
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 82;
+        const unsigned char* row_b_ptr = B_iq2s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 82;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* signs = blk + 34;
+            const unsigned char* qh = blk + 66;
+            const unsigned char* scales = blk + 74;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const unsigned char sc_byte = scales[ib32];
+                const int qh_val = (int)qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const float nib = (float)((l >= 2) ? (sc_byte >> 4) : (sc_byte & 0x0F));
+                    const float db = d * (0.5f + nib) * 0.25f;
+                    const int grid_idx = (int)qs[ib32 * 4 + l]
+                        | (((qh_val << (8 - 2 * l))) & 0x300);
+                    const unsigned long long packed = s_grid[grid_idx];
+                    const unsigned char sg = signs[ib32 * 4 + l];
+                    const int base = k0 + ib32 * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float g = (float)((packed >> (8 * j)) & 0xFFULL);
+                        const float sign_val = (sg & (1 << j)) ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (db * g * sign_val);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq2s(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq2s,
@@ -980,15 +2265,132 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         const int row = (int)(idx / N);
         const int col = (int)(idx % N);
         const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 96;
+        const int row_bytes = blocks_per_row * 98;  // IQ3_XXS is 98 B/256, not 96
         const unsigned char* row_b_ptr = B_iq3xxs + col * row_bytes;
         float acc = 0.0f;
         for (int k = 0; k < K; ++k) {
             float a_val = A[row * K + k];
             int sb_idx = k / 256;
             int in_sb = k % 256;
-            float w_val = dequant_iq3xxs(row_b_ptr + sb_idx * 96, in_sb);
+            float w_val = dequant_iq3xxs(row_b_ptr + sb_idx * 98, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ3_XXS forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq3xxs` (same values, same ascending
+    // accumulation order: ib32, l, j IS in_sb ascending), with the block
+    // header, the aux/db math, the sign-table load and the two grid loads
+    // hoisted out of each 8-weight group where they are constant.
+    __global__ void grim_fused_dequant_gemm_iq3xxs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq3xxs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 98;
+        const unsigned char* row_b_ptr = B_iq3xxs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 98;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* ss = blk + 66;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const unsigned int aux = (unsigned int)ss[4 * ib32]
+                                       | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                                       | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                                       | ((unsigned int)ss[4 * ib32 + 3] << 24);
+                const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                for (int l = 0; l < 4; ++l) {
+                    const unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+                    const unsigned int g_lo = IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]];
+                    const unsigned int g_hi = IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+                    const int base = k0 + ib32 * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const unsigned int gv = (j < 4) ? g_lo : g_hi;
+                        const int jj = (j < 4) ? j : j - 4;
+                        const float g = (float)((gv >> (8 * jj)) & 0xFF);
+                        const float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (db * g * sign);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
+    // res0-T1: codebook-cache LDS variant of the IQ3_XXS grouped kernel.
+    // The first pass (VQ-LLM's "codebook cache", HPCA '25) stages the two
+    // hot tables in __shared__ once per block, cooperatively: every thread
+    // in the block reads the SAME 256-entry grid and 128-entry sign table,
+    // so the per-access L1/L2 latency chain each thread pays serially over
+    // K/8 groups becomes an LDS hit after one preload. The math, the index
+    // expressions and the accumulation order are IDENTICAL to
+    // `grim_fused_dequant_gemm_iq3xxs_grouped`, so the pair is byte-identical
+    // by construction; parity: tests/m1_decode_regime_probe.rs
+    // (iq_lds_codebook_ab), which drives BOTH sides through launchers.
+    __global__ void grim_fused_dequant_gemm_iq3xxs_grouped_lds(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq3xxs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        __shared__ unsigned int s_grid[256];
+        __shared__ unsigned int s_signs[128];
+        // Block-size-agnostic cooperative preload (the launch sweep runs
+        // block sizes other than 256; a tid<N guard under-loads there).
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) s_grid[i] = IQ3XXS_GRID[i];
+        for (int i = threadIdx.x; i < 128; i += blockDim.x) s_signs[i] = KSIGNS_IQ2XS[i];
+        __syncthreads();
+
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 98;
+        const unsigned char* row_b_ptr = B_iq3xxs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 98;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* ss = blk + 66;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const unsigned int aux = (unsigned int)ss[4 * ib32]
+                                       | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                                       | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                                       | ((unsigned int)ss[4 * ib32 + 3] << 24);
+                const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                for (int l = 0; l < 4; ++l) {
+                    const unsigned int signs = s_signs[(aux >> (7 * l)) & 127];
+                    const unsigned int g_lo = s_grid[qs[ib32 * 8 + 2 * l]];
+                    const unsigned int g_hi = s_grid[qs[ib32 * 8 + 2 * l + 1]];
+                    const int base = k0 + ib32 * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const unsigned int gv = (j < 4) ? g_lo : g_hi;
+                        const int jj = (j < 4) ? j : j - 4;
+                        const float g = (float)((gv >> (8 * jj)) & 0xFF);
+                        const float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+                        acc += a_row[base + j] * (db * g * sign);
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }
@@ -1005,13 +2407,13 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
         const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 96;
+        const int row_bytes = blocks_per_row * 98;  // IQ3_XXS is 98 B/256, not 96
         int sb_idx = k_idx / 256;
         int in_sb = k_idx % 256;
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
-            float w_val = dequant_iq3xxs(B_iq3xxs + n * row_bytes + sb_idx * 96, in_sb);
+            float w_val = dequant_iq3xxs(B_iq3xxs + n * row_bytes + sb_idx * 98, in_sb);
             acc += dy_val * w_val;
         }
         dX[row * K + k_idx] = acc;
@@ -1109,6 +2511,62 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
+    // D2-2: group-hoisted IQ3_S forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq3s` (same values, same ascending order:
+    // t, l, m IS in_sb ascending), with d, the scale nibble, the grid-row
+    // index math and the two grid byte loads hoisted out of each 8-weight
+    // group. IQ3_S is the most common format in the 27B manifest (98 tensors).
+    __global__ void grim_fused_dequant_gemm_iq3s_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq3s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 110;
+        const unsigned char* row_b_ptr = B_iq3s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 110;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* qh = blk + 66;
+            const unsigned char* signs = blk + 74;
+            const unsigned char* scales = blk + 106;
+            for (int t = 0; t < 8; ++t) {
+                const int kk = t / 2; // 64-weight group -> scale byte
+                const unsigned char sc = scales[kk];
+                const float db = d * (1.0f + 2.0f * (float)((t % 2 == 0) ? (sc & 0xF) : (sc >> 4)));
+                for (int l = 0; l < 4; ++l) {
+                    // Grid rows are [512][4] bytes: hoist the two ROW POINTERS
+                    // (their 9-bit indices are constant across the 8 group
+                    // members) and index the row inside the unrolled loop.
+                    const unsigned char* g_lo = IQ3S_GRID_B[qs[t * 8 + 2 * l]
+                        | ((((int)qh[t] >> (2 * l)) & 1) << 8)];
+                    const unsigned char* g_hi = IQ3S_GRID_B[qs[t * 8 + 2 * l + 1]
+                        | ((((int)qh[t] >> (2 * l + 1)) & 1) << 8)];
+                    const unsigned char sg = signs[t * 4 + l];
+                    const int base = k0 + t * 32 + l * 8;
+                    #pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        const unsigned char g = (m < 4) ? g_lo[m] : g_hi[m - 4];
+                        const float gv = (float)(signed char)g;
+                        const float sign = ((sg >> m) & 1) ? -1.0f : 1.0f;
+                        acc += a_row[base + m] * (db * gv * sign);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_iq3s(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_iq3s,
@@ -1131,6 +2589,73 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             acc += dy_val * w_val;
         }
         dX[row * K + k_idx] = acc;
+    }
+
+    // res0-T1: codebook-cache LDS variant of the IQ3_S grouped kernel
+    // (2 KB grid staged in __shared__; see the IQ3XXS LDS note above for the
+    // mechanism and the byte-identity argument).
+    __global__ void grim_fused_dequant_gemm_iq3s_grouped_lds(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq3s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        // Rows are packed as u32 words, not byte arrays: a [512][4] byte
+        // layout makes every inner-loop access an LDS BYTE read (the n=17408
+        // A/B measured 0.77x for exactly that), while a word read with the
+        // byte selected in-register stays on ds_read_b32.
+        __shared__ unsigned int s_grid32[512];
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            s_grid32[i] = (unsigned int)IQ3S_GRID_B[i][0]
+                        | ((unsigned int)IQ3S_GRID_B[i][1] << 8)
+                        | ((unsigned int)IQ3S_GRID_B[i][2] << 16)
+                        | ((unsigned int)IQ3S_GRID_B[i][3] << 24);
+        }
+        __syncthreads();
+
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 110;
+        const unsigned char* row_b_ptr = B_iq3s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 110;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned char* qh = blk + 66;
+            const unsigned char* signs = blk + 74;
+            const unsigned char* scales = blk + 106;
+            for (int t = 0; t < 8; ++t) {
+                const int kk = t / 2;
+                const unsigned char sc = scales[kk];
+                const float db = d * (1.0f + 2.0f * (float)((t % 2 == 0) ? (sc & 0xF) : (sc >> 4)));
+                for (int l = 0; l < 4; ++l) {
+                    const unsigned int w_lo = s_grid32[qs[t * 8 + 2 * l]
+                        | ((((int)qh[t] >> (2 * l)) & 1) << 8)];
+                    const unsigned int w_hi = s_grid32[qs[t * 8 + 2 * l + 1]
+                        | ((((int)qh[t] >> (2 * l + 1)) & 1) << 8)];
+                    const unsigned char sg = signs[t * 4 + l];
+                    const int base = k0 + t * 32 + l * 8;
+                    #pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        const unsigned int wv = (m < 4) ? w_lo : w_hi;
+                        const int mm = (m < 4) ? m : m - 4;
+                        const signed char g =
+                            (signed char)((wv >> (8 * mm)) & 0xFFu);
+                        const float gv = (float)g;
+                        const float sign = ((sg >> m) & 1) ? -1.0f : 1.0f;
+                        acc += a_row[base + m] * (db * gv * sign);
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
     }
 
     __global__ void grim_fused_dequant_gemm_iq1s(
@@ -1156,6 +2681,122 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             acc += a_val * w_val;
         }
         C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ1_S forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq1s` (same per-weight values, same ascending
+    // accumulation order: ib, l, j IS in_sb ascending), but the grid-index
+    // math and the 2048-entry IQ1S_GRID load are hoisted out of the inner
+    // 8-weight group, where idx/dl/delta are CONSTANT: within one group only
+    // `j` (which byte of the grid entry) and the delta bit vary. The scalar
+    // kernel paid ~1 dependent global load + ~15 ALU ops PER WEIGHT (measured:
+    // grid 17408x256, no LDS, ~5 ms for 17.4 MB = ~1% of card peak, so it was
+    // ALU/latency bound, not bandwidth bound); this pays them once per 8.
+    __global__ void grim_fused_dequant_gemm_iq1s_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq1s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 50;
+        const unsigned char* row_b_ptr = B_iq1s + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 50;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* qs = blk + 2;
+            const unsigned short* qh = (const unsigned short*)(blk + 34);
+            for (int ib = 0; ib < 8; ++ib) {
+                const unsigned short qh_ib = qh[ib];
+                const float dl = d * (2.0f * (float)((qh_ib >> 12) & 7) + 1.0f);
+                const float delta = (qh_ib & 0x8000) ? -0.125f : 0.125f;
+                for (int l = 0; l < 4; ++l) {
+                    const int grid_idx =
+                        qs[ib * 4 + l] | ((((int)(qh_ib >> (3 * l)) & 7)) << 8);
+                    const unsigned long long g = IQ1S_GRID[grid_idx];
+                    const int base = k0 + ib * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const signed char grid_j = (signed char)((g >> (8 * j)) & 0xff);
+                        const float w = dl * ((float)grid_j + delta);
+                        acc += a_row[base + j] * w;
+                    }
+                }
+            }
+        }
+        C[row * N + col] = acc;
+    }
+
+    // PROMPT TILING (D3-B follow-up): the grouped kernel has no reuse across
+    // prompt rows — every output element re-reads (and re-dequantizes) its
+    // weight row, so prompt processing is LINEAR in prompt length at ~63
+    // ms/token while one pass over the weight set would be ~30 ms for the WHOLE
+    // prompt. This kernel stages a dequantized weight tile in LDS once per
+    // 256-weight super-block and reuses it across TILE_M prompt rows: weight
+    // traffic and dequant work drop by TILE_M.
+    //
+    // Layout: grid (ceil(N/TILE_N), ceil(M/TILE_M)), block TILE_M*TILE_N = 256
+    // threads (8 waves of 32 — RDNA wave32 discipline). Thread t owns exactly
+    // one output (row = t/TILE_N, col = t%TILE_N).
+    //
+    // Bit-identical to the grouped/scalar kernels: identical dequant values and
+    // the same ascending accumulation order (sb, then kk = k ascending), so the
+    // parity gate can demand worst abs 0.0.
+    #define GRIM_IQ1S_TILE_M 16
+    #define GRIM_IQ1S_TILE_N 16
+    __global__ void grim_fused_dequant_gemm_iq1s_tiled(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq1s,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        __shared__ float ws[GRIM_IQ1S_TILE_N][256];
+        const int TILE_M = GRIM_IQ1S_TILE_M;
+        const int TILE_N = GRIM_IQ1S_TILE_N;
+        const int m0 = blockIdx.y * TILE_M;
+        const int n0 = blockIdx.x * TILE_N;
+        const int tid = threadIdx.x;
+        const int row = tid / TILE_N;
+        const int col = tid % TILE_N;
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 50;
+        const int gm = m0 + row;
+        const bool row_live = gm < M;
+        float acc = 0.0f;
+        for (int sb = 0; sb < blocks_per_row; ++sb) {
+            // Cooperative dequant of TILE_N columns x 256 weights into LDS.
+            for (int i = tid; i < TILE_N * 256; i += TILE_M * TILE_N) {
+                const int c = i >> 8;
+                const int kk = i & 255;
+                const int gn = n0 + c;
+                if (gn < N) {
+                    ws[c][kk] = dequant_iq1s(B_iq1s + gn * row_bytes + sb * 50, kk);
+                } else {
+                    ws[c][kk] = 0.0f;
+                }
+            }
+            __syncthreads();
+            if (row_live) {
+                const float* a_row = A + (unsigned long long)gm * K + sb * 256;
+                #pragma unroll 8
+                for (int kk = 0; kk < 256; ++kk) {
+                    acc += a_row[kk] * ws[col][kk];
+                }
+            }
+            __syncthreads();
+        }
+        const int gn = n0 + col;
+        if (row_live && gn < N) {
+            C[(unsigned long long)gm * N + gn] = acc;
+        }
     }
 
     __global__ void grim_fused_dequant_backward_gemm_iq1s(
@@ -1203,6 +2844,73 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq1m(row_b_ptr + sb_idx * 56, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ1_M forward GEMM. Bit-identical to
+    // `grim_fused_dequant_gemm_iq1m`: the 4-short scale unpack, d/dl1/dl2, the
+    // four grid indices, the four deltas and the grid ENTRY are all constant
+    // within one 8-weight group (fixed ib, l), so they are hoisted there.
+    __global__ void grim_fused_dequant_gemm_iq1m_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq1m,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 56;
+        const unsigned char* row_b_ptr = B_iq1m + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 56;
+            const int k0 = sb_idx * 256;
+            const unsigned char* qs = blk;
+            const unsigned char* qh = blk + 32;
+            const unsigned char* sc = blk + 48;
+            const unsigned short sc0 = ((const unsigned short*)sc)[0];
+            const unsigned short sc1 = ((const unsigned short*)sc)[1];
+            const unsigned short sc2 = ((const unsigned short*)sc)[2];
+            const unsigned short sc3 = ((const unsigned short*)sc)[3];
+            const unsigned short scale_bits = (unsigned short)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0)
+                | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+            const float d = fp16_to_float_device(scale_bits);
+            for (int ib = 0; ib < 8; ++ib) {
+                const int half = ib % 2;
+                const unsigned short scv = ((const unsigned short*)sc)[ib / 2];
+                const float dl1 = d * (2.0f * (float)((scv >> (6 * half)) & 7) + 1.0f);
+                const float dl2 = d * (2.0f * (float)((scv >> (6 * half + 3)) & 7) + 1.0f);
+                const unsigned char qh0 = qh[ib * 2];
+                const unsigned char qh1 = qh[ib * 2 + 1];
+                const int idxs[4] = {
+                    qs[ib * 4 + 0] | (((int)qh0 << 8) & 0x700),
+                    qs[ib * 4 + 1] | (((int)qh0 << 4) & 0x700),
+                    qs[ib * 4 + 2] | (((int)qh1 << 8) & 0x700),
+                    qs[ib * 4 + 3] | (((int)qh1 << 4) & 0x700),
+                };
+                const float delta[4] = {
+                    (qh0 & 0x08) ? -0.125f : 0.125f,
+                    (qh0 & 0x80) ? -0.125f : 0.125f,
+                    (qh1 & 0x08) ? -0.125f : 0.125f,
+                    (qh1 & 0x80) ? -0.125f : 0.125f,
+                };
+                for (int l = 0; l < 4; ++l) {
+                    const float dl = (l < 2) ? dl1 : dl2;
+                    const unsigned long long g = IQ1S_GRID[idxs[l]];
+                    const int base = k0 + ib * 32 + l * 8;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const signed char grid_j = (signed char)((g >> (8 * j)) & 0xff);
+                        acc += a_row[base + j] * (dl * ((float)grid_j + delta[l]));
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }
@@ -1305,6 +3013,63 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
             int in_sb = k % 256;
             float w_val = dequant_iq4xs(row_b_ptr + sb_idx * 136, in_sb);
             acc += a_val * w_val;
+        }
+        C[row * N + col] = acc;
+    }
+
+    // D2-2: group-hoisted IQ4_XS forward GEMM (bit-identical; the scales_h/ls
+    // math and `dl` move out of the 32-weight group, the quant byte out of the
+    // 16-weight half).
+    __global__ void grim_fused_dequant_gemm_iq4xs_grouped(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_iq4xs,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
+        if (idx >= total) return;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 136;
+        const unsigned char* row_b_ptr = B_iq4xs + col * row_bytes;
+        const float* a_row = A + (unsigned long long)row * K;
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+        };
+        float acc = 0.0f;
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+            const unsigned char* blk = row_b_ptr + sb_idx * 136;
+            const int k0 = sb_idx * 256;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* sc_h = blk + 2;
+            const unsigned char* sc_l = blk + 4;
+            const unsigned char* qs = blk + 8;
+            const unsigned int scales_h =
+                (unsigned int)sc_h[0] | ((unsigned int)sc_h[1] << 8);
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = (int)((sc_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                             | (((int)((scales_h >> (2 * ib)) & 3)) << 4);
+                const float dl = d * (float)(ls - 32);
+                // The scalar path reads qb = qs[ib*16 + (j & 15)] and selects
+                // the nibble by (j < 16): the first 16 weights take the LOW
+                // nibble of bytes 0..15, the second 16 the HIGH nibble of the
+                // SAME bytes. Reproduce exactly — the byte index varies per j,
+                // only the nibble selector is fixed per half.
+                #pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int base = k0 + ib * 32 + half * 16;
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const unsigned char qb = qs[ib * 16 + j];
+                        const unsigned char nib =
+                            (half == 0) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+                        acc += a_row[base + j] * (dl * kvalues_iq4nl[nib]);
+                    }
+                }
+            }
         }
         C[row * N + col] = acc;
     }

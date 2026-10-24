@@ -46,6 +46,12 @@ pub mod quantization;
 pub mod rccl;
 pub mod rocm_detect;
 pub mod scythe2_placement;
+pub mod task_graph;
+pub mod task_graph_exec;
+pub mod scythe_task_descriptors;
+pub use crate::scythe_task_descriptors::{
+    MoETaskDescriptor, MoeQuantMode, ScytheTaskDescriptor, moe_quant_mode,
+};
 pub mod speculative;
 pub mod trace;
 
@@ -78,16 +84,18 @@ pub use crate::device::handles::{
     HIP_MEM_ADVISE_UNSET_COARSE_GRAIN, HIP_MEM_ADVISE_UNSET_PREFERRED_LOCATION,
     HIP_MEM_ADVISE_UNSET_READ_MOSTLY, HipDim3, HipErrorT, HipGraphKernelNodeParams,
     HipGraphMemcpyNodeParams, HipMemcpyKind, HiprtcProgram, RocmDeviceProps, RocmHandle,
-    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipEventCreate, hipEventDestroy,
-    hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
+    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipErrorNotReady, hipEventCreate,
+    hipEventDestroy, hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync,
+    hipGetDeviceCount,
     hipGetDeviceProperties, hipGraphAddKernelNode, hipGraphCreate, hipGraphDestroy,
     hipGraphExecDestroy, hipGraphExecKernelNodeSetParams, hipGraphExtendFromGlobalStream,
     hipGraphInstantiate, hipGraphLaunch, hipGraphUpload, hipHostFree, hipHostMalloc, hipMalloc,
     hipMallocManaged, hipMemAdvise, hipMemGetInfo, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync,
     hipMemset, hipMemsetAsync, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
     hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate,
-    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize,
-    hipStreamWaitEvent, hipSuccess, hiprtcAddNameExpression, hiprtcCompileProgram,
+    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamEndCapture, hipStreamQuery,
+    hipStreamSynchronize, hipStreamWaitEvent, hipSuccess, hiprtcAddNameExpression,
+    hiprtcCompileProgram,
     hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
     hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
@@ -143,6 +151,7 @@ pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
+pub use crate::memory::storage::{blocking_d2h_count, reset_blocking_d2h_count};
 pub use crate::memory::view::RocmStorageView;
 
 pub use crate::device::helpers::{
@@ -156,7 +165,7 @@ pub use crate::device::util::{
     dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch,
     prefill_in_flight, raw_set_device, set_prefill_in_flight, warp_rows_launch,
 };
-pub use crate::peer_access::enumerate_devices;
+pub use crate::peer_access::{enable_peer_access, enumerate_devices, p2p_memcpy_async};
 
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.
@@ -189,10 +198,12 @@ pub use fusion::{
 
 pub use kernels::qkv_attention::{
     BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, KvRingPolicy, launch_bump_i32,
-    launch_bump_i32_slots, launch_kv_append, launch_kv_append_batch, launch_kv_append_i8,
+    launch_bump_i32_slots, launch_clamp_layer_total, launch_kv_append, launch_kv_append_batch, launch_kv_append_i4,
+    launch_kv_append_i8,
     launch_kv_quantize_rows_i2, launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8,
     launch_paged_attention,
     launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_dev_batch,
+    launch_qkv_attention_dev_batch_i4,
     launch_qkv_attention_dev_batch_i8, launch_qkv_attention_wmma, launch_tree_attention,
     f16_kv_explicitly_disabled, parse_f16_kv_env, parse_kv_arena_env,
 };

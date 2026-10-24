@@ -83,12 +83,44 @@ fn reference_q80(a: &[f32], b_packed: &[u8], m: usize, n: usize, k: usize) -> Ve
     c
 }
 
+/// NaN-aware max absolute error.
+///
+/// `f32::max` IGNORES NaN (IEEE-754 maxNum semantics), so folding with it
+/// reported `0.0` for a kernel that emitted NaN on *every* element. That is
+/// exactly how a broken dequant rode a tolerance gate green: the diff was
+/// never computed, it was silently dropped. `wmma_quant_parity` fixed this in
+/// `041cb708` ("wmma_quant_parity: max_diff was NaN-blind"); this shared
+/// helper was never given the same treatment and still had the blind fold.
+///
+/// Any non-finite value (NaN or ±Inf) on EITHER side now returns `INFINITY`,
+/// so every existing `assert!(diff < tol)` fails loudly and every
+/// `eprintln!` prints `inf` — no call site needs to change. The offending
+/// index is reported once so a NaN halfway through a big tensor is
+/// identifiable rather than just "somewhere in there".
 fn max_diff(want: &[f32], got: &[f32]) -> f32 {
     assert_eq!(want.len(), got.len(), "length mismatch");
-    want.iter()
-        .zip(got.iter())
-        .map(|(w, g)| (w - g).abs())
-        .fold(0.0f32, f32::max)
+    let mut max_diff = 0.0f32;
+    let mut nonfinite: Option<(usize, f32, f32)> = None;
+    for (i, (&w, &g)) in want.iter().zip(got.iter()).enumerate() {
+        if !w.is_finite() || !g.is_finite() {
+            if nonfinite.is_none() {
+                nonfinite = Some((i, w, g));
+            }
+            continue;
+        }
+        let d = (w - g).abs();
+        if d > max_diff {
+            max_diff = d;
+        }
+    }
+    if let Some((i, w, g)) = nonfinite {
+        eprintln!(
+            "[max_diff] non-finite output at index {i}: want={w} got={g} \
+             (max_diff=inf — a NaN/Inf here is a kernel bug, not tolerance noise)"
+        );
+        return f32::INFINITY;
+    }
+    max_diff
 }
 
 type Q80Pair = (
@@ -134,7 +166,6 @@ fn run_quant_matmul(
 /// PASSED: dot2 GEMV matches the fp32 CPU reference within fp16-activation
 /// quantization tolerance at the LFM2.5 decode shapes.
 #[test]
-#[ignore]
 fn dot2_q80_parity_vs_cpu() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -230,7 +261,6 @@ fn pack_q80(w: &[f32], rows: usize, k: usize) -> Vec<u8> {
 /// QKV weight blob must reproduce the three separate GEMV outputs (sliced back
 /// into q/k/v) within 1e-4 — same kernel, same math, only launch grouping differs.
 #[test]
-#[ignore]
 fn fused_qkv_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -345,7 +375,6 @@ fn fused_qkv_gemv_parity() {
 /// PASSED: dot2 and WMMA paths compute the same GEMM — outputs agree within
 /// the combined quantization tolerance.
 #[test]
-#[ignore]
 fn dot2_matches_wmma() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -377,7 +406,6 @@ fn dot2_matches_wmma() {
 /// the existing host-position `grim_rope` kernel at max_diff ≤ 1e-6 (fp32 identical
 /// math). Random q [1, heads*steps, head_dim] at base positions B ∈ {0, 17, 500}.
 #[test]
-#[ignore]
 fn rope_dev_base_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -438,7 +466,6 @@ fn rope_dev_base_parity() {
 /// SPEED-DOT (Phase 4.5a): `dot4_q4k_q81_gemv` (sudot4 + nibble unpack + two-dot decomposition)
 /// matches the CPU reference within quantization tolerance.
 #[test]
-#[ignore]
 fn dot4_q4k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -515,7 +542,6 @@ fn dot4_q4k_gemv_parity() {
 
 /// SPEED-DOT: Q5_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
-#[ignore]
 fn dot4_q5k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -591,7 +617,6 @@ fn dot4_q5k_gemv_parity() {
 
 /// SPEED-DOT: Q6_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
-#[ignore]
 fn dot4_q6k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -667,7 +692,6 @@ fn dot4_q6k_gemv_parity() {
 
 /// SPEED-DOT-FUSED (Phase 4c): `launch_fused_gate_up_dot4` matches CPU reference.
 #[test]
-#[ignore]
 fn fused_gate_up_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -775,7 +799,6 @@ fn fused_gate_up_gemv_parity() {
 
 /// SPEED-DOT-OPFUSE (Phase 4a): `rmsnorm_rope` matches unfused RMSNorm then RoPE.
 #[test]
-#[ignore]
 fn rmsnorm_rope_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -857,7 +880,6 @@ fn rmsnorm_rope_parity() {
 
 /// SPEED-DOT-OPFUSE (Phase 4d): `grim_silu_mul_quant_q8_1` parity test.
 #[test]
-#[ignore]
 fn silu_mul_quant_q81_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1042,7 +1064,6 @@ fn fp8_e4m3_to_f32_host(val: u8) -> f32 {
 /// E4M3 in-register) must match a CPU reference that performs the identical
 /// E4M3 quantization + dequantization.
 #[test]
-#[ignore]
 fn dot4_fp8_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1130,7 +1151,6 @@ fn dot4_fp8_gemv_parity() {
 /// the CPU dequant reference. Fixture encodes grim's Q2_K layout (84 bytes /
 /// 256 weights) and the CPU side mirrors the kernel's Q8_1 activation quant.
 #[test]
-#[ignore]
 fn dot4_q2k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1241,7 +1261,6 @@ fn dot4_q2k_gemv_parity() {
 /// must match the CPU dequant reference. Fixture encodes grim's Q3_K layout
 /// (110 bytes / 256 weights, llama.cpp spec).
 #[test]
-#[ignore]
 fn dot4_q3k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1343,7 +1362,6 @@ fn dot4_q3k_gemv_parity() {
 /// Verifies the two-dot algebraic zero-point formulation and native dot8 accumulation
 /// against the CPU dequantization oracle.
 #[test]
-#[ignore]
 fn dot8_w4a4_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1724,8 +1742,14 @@ fn dot8_w4a4_gemv_parity_multi_row() {
 /// the kernel was given — plus a bit-mirror of the device's activation
 /// quantizer. A wrong codebook or lane geometry shows up as O(amax) error,
 /// not tolerance noise.
+///
+/// Un-ignored: this is the only parity test exercising `grim_dot8_w4a4_gemv`
+/// with real `repack_to_u4_lanes` triples — the exact path the CityCrow
+/// GSQ-RCO 27B takes, where it produced all-NaN logits at step 0. The
+/// shared `max_diff` was also NaN-blind (folded with `f32::max`), so even
+/// when run this test would have reported `max_diff=0` on an all-NaN device
+/// buffer. Both are fixed; the test now runs and its diff means something.
 #[test]
-#[ignore]
 fn citycrow_sudot8_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1880,7 +1904,6 @@ fn citycrow_sudot8_gemv_parity() {
 
 /// Phase 4.5b: W4A4 GEMV against real model weights from Qwen3-4B OSTQuant layout.
 #[test]
-#[ignore]
 fn dot8_w4a4_qwen3_model_tensor_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2044,7 +2067,6 @@ fn dot8_w4a4_qwen3_model_tensor_parity() {
 }
 
 #[test]
-#[ignore]
 fn dot8_w4a4_safetensors_loader_e2e() {
     if std::env::var("GRIM_RUN_GPU_TEST").unwrap_or_default() != "1" {
         eprintln!("skipping dot8_w4a4_safetensors_loader_e2e (GRIM_RUN_GPU_TEST!=1)");
@@ -2127,7 +2149,6 @@ fn dot8_w4a4_safetensors_loader_e2e() {
 /// Phase 4.5d: BF16 × BF16 dot2 GEMV (V_DOT2_F32_BF16, dot12-insts on RDNA3/4).
 /// Tests launch_dot2_bf16_gemv and end-to-end matmul dispatch against the CPU reference.
 #[test]
-#[ignore]
 fn dot2_bf16_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2262,7 +2283,6 @@ fn dot2_bf16_gemv_parity() {
 /// executes on the APU and matches the CPU reference — i.e. that RDNA2 gets the
 /// same dot4 speedup RDNA3/4 do, not the scalar fallback. Skipped if no APU.
 #[test]
-#[ignore]
 fn dot4_q4k_gemv_parity_on_rdna2_apu() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -2361,7 +2381,6 @@ fn gpu_device_rdna2() -> Option<RocmDevice> {
 /// for every arch with no `is_dot4_arch` guard, so the APU already takes the dot4
 /// path. This test proves it matches the CPU reference on the gfx1036.
 #[test]
-#[ignore]
 fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -2448,7 +2467,6 @@ fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
 /// This gate pins the fast kernel to the CPU dequant-matmul reference at a
 /// multi-superblock shape before it is allowed near production dispatch.
 #[test]
-#[ignore]
 fn dot4_q4k_gemv_fast_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2529,7 +2547,6 @@ fn dot4_q4k_gemv_fast_parity() {
 /// quantization error (Q4_K then u4 group-128) that decode would actually
 /// inherit, not just the requantizer's own round-trip.
 #[test]
-#[ignore]
 fn decode_w4a4_requant_parity_vs_original_f32() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2640,7 +2657,6 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
 /// WhiteCrow requant path needs n=256 k=512 and produced exact zeros. Same
 /// synthetic packing as dot8_w4a4_gemv_parity, at the bigger shape.
 #[test]
-#[ignore]
 fn dot8_w4a4_gemv_parity_n256_k512() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2805,7 +2821,6 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
 /// graph decoded with 192 wrongly-rotated dims per head while prefill (eager)
 /// was correct.
 #[test]
-#[ignore]
 fn rope_dev_base_partial_rotary_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2907,7 +2922,6 @@ fn rope_dev_base_partial_rotary_parity() {
 /// AQ-aware residual — not the format noise — blows up. Tolerance admits
 /// f32 association order only.
 #[test]
-#[ignore]
 fn w4a4_gemv_matches_aq_aware_reference() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {

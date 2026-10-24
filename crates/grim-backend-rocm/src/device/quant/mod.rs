@@ -467,55 +467,103 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                // Q6_K's dot4 GEMV is not bit-exact at production shapes: the
-                // Xing4.0-29B lm_head oracle (real output.weight, k=3584)
-                // measures rel 3.2e-3 / max_abs 1.5 at m=1, while the WMMA /
-                // fused-dequant path agrees with the host dequant at 3.9e-7.
-                // The k=256 arch probes use synthetic fixtures and cannot see
-                // this (the skew grows with k), so Q6_K skips the dot4 leg
-                // here. Same treatment as the IQ3_S fused WMMA GEMM.
+                // M7.2e: the Q6_K dot4 leg is ON by default. The reason it
+                // was off ("not bit-exact at production shapes: rel 3.2e-3 /
+                // max_abs 1.5 on the Xing4.0-29B lm_head") is REFUTED by
+                // measurement on the REAL 27B tensors.
                 //
-                // Env-toggleable, because "the oracle got better" is not the
-                // same claim as "the model got better". GRIM_Q6K_DOT4=1
-                // restores the leg so both can be A/B'd in ONE binary. That
-                // A/B is what decides whether this is a production fix: step 0
-                // of the Xing4.0 run is a PREFILL at m=46, which never took
-                // this leg (it is gated on m == 1), so only decode steps can
-                // move — and an unchanged decode step means the head was
-                // never the remaining defect.
-                let q6k_dot4_ok = matches!(
+                // The cited number was a RELATIVE error whose denominator is
+                // a near-zero logit: a 27B's logits are O(1) and most of a
+                // 248320-row head's outputs land near zero, so dividing by
+                // |logit| explodes. Measured on the real Q4_K_M 27B's
+                // output.weight (Q6_K, n=248320, k=5120) with the real
+                // bytes, comparing the dot4 kernel against the host dequant
+                // dotted with the SAME q8_1 codes the kernel consumed:
+                //
+                //   A. the kernel's OWN error   Q6_K 9.6e-8 rms-rel (absmax
+                //      2.6e-7)   Q5_K 1.2e-3   Q4_K 1.3e-3
+                //   B. vs the f32-activation oracle
+                //      Q6_K 3.6e-3   Q5_K 3.7e-3   Q4_K 3.9e-3
+                //
+                // So the Q6_K dot4 kernel is the ONLY numerically exact
+                // K-quant dot4 kernel: Q6_K has no dmin term, so it never
+                // rounds the q8_1 block's stored f16 sum the way the Q4_K and
+                // Q5_K kernels do. And the production error (B) is the Q8_1
+                // ACTIVATION quantization, which the Q5_K leg (131 of the
+                // 27B's tensors) and the Q4_K leg already carry by default at
+                // the same magnitude.
+                //
+                // What it buys, on the real lm_head shape (n=248320,
+                // k=5120, 1.04 GB of weights): the dot4 GEMV runs at 78.5
+                // GB/s against the exact path's 4.9 GB/s — the exact path
+                // spends ~213 ms per token on this ONE tensor, the dot4 leg
+                // ~13 ms.
+                //
+                // The escape hatch is now an opt-OUT (GRIM_Q6K_DOT4=0) so
+                // both can still be A/B'd in ONE binary, and "the oracle got
+                // better" is not the same claim as "the model got better".
+                //
+                // The LM HEAD is excluded from the leg
+                // (`kquant_dot4_ok_for`): the head's output IS the token, and
+                // the measured top-1 margin (0.0096 .. 0.497 over eight real
+                // hidden states) is often smaller than the leg's logit error
+                // (0.028). Inside a body tensor that error is diluted over
+                // 64 layers; in the head it is the answer.
+                let q6k_dot4_ok = !matches!(
                     std::env::var("GRIM_Q6K_DOT4").as_deref(),
-                    Ok("1" | "true" | "on")
+                    Ok("0" | "false" | "off")
                 );
-                if q6k_dot4_ok && (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0
+                if q6k_dot4_ok
+                    && (is_rdna2 || is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
                 {
-                    let q81_bytes = (k / 32) * 36 * m;
-                    let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
-                    let need_alloc = match buf_guard.as_ref() {
-                        Some(s) => s.bytes < q81_bytes,
-                        None => true,
-                    };
-                    if need_alloc {
-                        *buf_guard = Some(RocmStorage::alloc_gpu(
-                            &shape,
-                            DType {
-                                arith: ArithType::U8,
-                                storage: DTypeStorage::Native,
-                            },
-                            &self.allocator,
-                            self.ordinal,
-                        )?);
-                    }
-                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
-                    if a_prequant {
-                        drop(buf_guard);
-                        self.launch_dot4_q6k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if crate::device::quant::kquant_dot4_ok_for(n) {
+                        // Body tensor: dot4 with Q8_1 activations (fast, Q8_1 act
+                        // error is acceptable inside the body — diluted over 64 layers).
+                        let q81_bytes = (k / 32) * 36 * m;
+                        let shape = Shape::new(vec![q81_bytes]);
+                        let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                        let need_alloc = match buf_guard.as_ref() {
+                            Some(s) => s.bytes < q81_bytes,
+                            None => true,
+                        };
+                        if need_alloc {
+                            *buf_guard = Some(RocmStorage::alloc_gpu(
+                                &shape,
+                                DType {
+                                    arith: ArithType::U8,
+                                    storage: DTypeStorage::Native,
+                                },
+                                &self.allocator,
+                                self.ordinal,
+                            )?);
+                        }
+                        let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                        if a_prequant {
+                            drop(buf_guard);
+                            self.launch_dot4_q6k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                        } else {
+                            let act_q81 = buf_guard.as_ref().unwrap();
+                            let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                            fence_act_quant(self, q_stream);
+                            self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                        }
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
-                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
-                        fence_act_quant(self, q_stream);
-                        self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                        // LM HEAD (n >= 65536): dot4 with f32 activations (fast,
+                        // exact activations — head output IS the token, so no
+                        // Q8_1 quantization error allowed). Falls back to the
+                        // exact fused-dequant leg (~4.9 GB/s) when dot4 can't
+                        // run (m > 1, k % 256 != 0, etc.).
+                        self.launch_dot4_q6k_f32act_gemv_for_ab(
+                            a_storage,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
+                        )?;
                     }
                 } else if is_rdna34 && m >= 64 && n % 128 == 0 && k % 256 == 0 {
                     self.launch_wmma_big64x128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -614,6 +662,24 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if Self::tiled_quant_prompt_ok("q2k", m, n, k) {
+                    // M7.2a: the IQ recipe (the LDS-tiled prompt GEMM) for
+                    // Q2_K. The scalar kernel re-reads every weight block M
+                    // times; the tiled kernel stages a weight tile in LDS once
+                    // and reuses it across TILE_M rows. Measured at the 27B's
+                    // dominant shape (n=17408, k=5120): Q2_K at m=64 was
+                    // 6.90 ms (4.2 GB/s) on the scalar path where Q5_K/Q6_K
+                    // measure ~1.25 ms on the tiled one.
+                    //
+                    // Before the WMMA branch, for the same reason as Q3_K.
+                    self.launch_fused_dequant_gemm_q2k_tiled(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q2k(
                         a_storage,
@@ -624,7 +690,11 @@ impl QuantOps for RocmDevice {
                         k,
                     )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q2k(
+                    // M7.2g: the group-hoisted scalar GEMM — byte-identical to
+                    // `launch_fused_dequant_gemm_q2k`, 2.29x faster at m=1
+                    // (16.6 vs 38.0 ms at n=17408 k=5120). Used as the final
+                    // fallback when dot4 (m==1) and WMMA both decline.
+                    self.launch_fused_dequant_gemm_q2k_grouped_for_ab(
                         a_storage,
                         b_storage,
                         &out_storage,
@@ -715,6 +785,26 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if Self::tiled_quant_prompt_ok("q3k", m, n, k) {
+                    // M7.2a: the IQ recipe for Q3_K — see the Q2_K arm above.
+                    // Measured at the 27B's dominant shape: Q3_K at m=64 was
+                    // 7.81 ms (4.9 GB/s) on the scalar path.
+                    //
+                    // This branch comes BEFORE the WMMA one on purpose. The
+                    // 27B's profile measured the WMMA fused-dequant kernels
+                    // at 19.6 s of a run's 21.6 s of kernel time, and the
+                    // WMMA shape gate (n % 64 == 0, k % 16 == 0) is
+                    // satisfied at the prompt shapes — so WMMA was taking
+                    // these formats' prompt work and losing. The tiled route
+                    // is the recipe that was measured against it.
+                    self.launch_fused_dequant_gemm_q3k_tiled(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q3k(
                         a_storage,
@@ -725,7 +815,11 @@ impl QuantOps for RocmDevice {
                         k,
                     )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q3k(
+                    // M7.2g: the group-hoisted scalar GEMM — byte-identical to
+                    // `launch_fused_dequant_gemm_q3k`, 2.29x faster at m=1
+                    // (16.6 vs 38.0 ms at n=17408 k=5120). Used as the final
+                    // fallback when dot4 (m==1), u4 lanes, and WMMA all decline.
+                    self.launch_fused_dequant_gemm_q3k_grouped_for_ab(
                         a_storage,
                         b_storage,
                         &out_storage,
@@ -832,17 +926,56 @@ impl QuantOps for RocmDevice {
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq4xs,
-                    true,
-                    Self::launch_fused_dequant_gemm_iq4xs,
-                )?;
+                let is_rdna2 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                );
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if (is_rdna2 || self.is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq4xs_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq4xs_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq4xs,
+                        true,
+                        Self::launch_fused_dequant_gemm_iq4xs,
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::Q80) => {
                 // Q8_0 uses the fused dequant+GEMM kernel (34-byte blocks → F32), matching
@@ -2414,6 +2547,43 @@ fn wmma_quant_path_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) ->
 /// ONE switch, read by BOTH dispatch sites (the graph's `linear_decode_into`
 /// and eager's `quantized_matmul`). Two switches with different defaults is
 /// precisely how those two paths drifted apart in the first place.
+/// The LM head is the one tensor whose OUTPUT IS THE TOKEN, so it is the one
+/// tensor where a quantised activation is not an acceptable trade.
+///
+/// `n > 65536` is the existing convention for "this is the vocab-scale GEMV"
+/// (the Q4_K exact leg above uses the same test to recognise the head). The
+/// 27B's vocab is 248320 and the 9B's is 151936; no projection inside a model
+/// body reaches 65536 columns.
+pub(crate) const GRIM_VOCAB_HEAD_MIN_COLS: usize = 65_536;
+
+/// Whether a K-quant tensor may ride the Q8_1-activation dot4 leg.
+///
+/// M7.2e. The dot4 leg's kernel is exact (the Q6_K one agrees with the host
+/// dequant to 6.3e-7 when both consume the same q8_1 codes), but the leg
+/// QUANTISES THE ACTIVATION, and that quantization is worth ~3.6e-3 rms
+/// relative on the output. Inside a model body that error is diluted over
+/// 64 layers; in the LM head it lands directly in the logits, where the
+/// measured top-1 margin is often smaller than the logit error:
+///
+///   real 27B output.weight (Q6_K, n=248320, k=5120), exact leg vs dot4 leg:
+///     max|dlogit| 0.028 on logits of magnitude ~4.7
+///     top-1 margin 0.0096 .. 0.497 over 8 hidden states
+///     0/8 argmax flips, but one state had err/margin = 2.9
+///
+/// So the head keeps the exact path and the body may take the dot4 leg.
+/// This is the same trade `exact_decode_gemv` already makes for Q4_K, and
+/// the same one llama.cpp makes (it quantizes the lm_head activation to
+/// Q8_0 as well) — grim is choosing to be exact where it is cheap to be.
+pub(crate) fn kquant_dot4_ok_for(n: usize) -> bool {
+    n < GRIM_VOCAB_HEAD_MIN_COLS
+}
+
+pub(crate) fn decode_w4a4_enabled() -> bool {
+    std::env::var("GRIM_DECODE_W4A4")
+        .map(|v| v != "0" && v != "false" && v != "off")
+        .unwrap_or(true)
+}
+
 pub(crate) fn exact_decode_gemv() -> bool {
     static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EXACT.get_or_init(|| {
@@ -2422,6 +2592,26 @@ pub(crate) fn exact_decode_gemv() -> bool {
             Ok("0" | "false" | "off")
         )
     })
+}
+
+#[cfg(test)]
+mod kquant_dot4_head_gate_tests {
+    use super::kquant_dot4_ok_for;
+
+    /// The head carve-out is a boundary, and a boundary is exactly the kind
+    /// of thing that is off by one in a way nothing else notices: a head that
+    /// silently took the dot4 leg would put a 0.6% logit error straight into
+    /// the token, and a body tensor that took the exact leg would just be
+    /// slow. Both ends are pinned here.
+    #[test]
+    fn the_vocab_head_is_excluded_and_the_body_is_not() {
+        assert!(!kquant_dot4_ok_for(65_536), "the head must stay exact");
+        assert!(!kquant_dot4_ok_for(248_320), "the 27B's vocab must stay exact");
+        assert!(!kquant_dot4_ok_for(151_936), "the 9B's vocab must stay exact");
+        assert!(kquant_dot4_ok_for(65_535), "the body below the head must not");
+        assert!(kquant_dot4_ok_for(17_408), "a 27B projection must not");
+        assert!(kquant_dot4_ok_for(1_024), "a small tensor must not");
+    }
 }
 
 #[cfg(test)]

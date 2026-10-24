@@ -764,8 +764,18 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITECROW_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
+        }
         self.launch_compute_kernel(
-            "grim_dot8_w4a4_gemv",
+            if v2 { "grim_dot8_w4a4_gemv_v2" } else { "grim_dot8_w4a4_gemv" },
             grid_dim,
             block_dim,
             &mut [
@@ -968,6 +978,8 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("wna16 header: no device ptr".into()))?;
         check_hip("wna16 header D2H", unsafe {
+            // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+            crate::memory::storage::count_blocking_d2h();
             hipMemcpyAsync(
                 pinned.as_mut_ptr() as *mut c_void,
                 ptr as *const c_void,

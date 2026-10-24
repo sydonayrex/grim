@@ -141,6 +141,8 @@ impl Laguna {
         let router_kind = RouterKind::SigmoidTopKWithBias;
 
         let spec = MoESpec {
+
+     renorm: true,
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
             router_kind,

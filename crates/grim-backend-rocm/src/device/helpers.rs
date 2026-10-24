@@ -106,9 +106,13 @@ pub fn memcpy_with_xnack_fallback(
                 return hipMemcpy(dst, src, count, kind);
             }
             let status = hipMemcpyAsync(dst, src, count, kind, stream);
-            let _ = hipStreamSynchronize(stream);
+            let sync_status = hipStreamSynchronize(stream);
             let _ = hipStreamDestroy(stream);
-            status
+            if status != hipSuccess {
+                status
+            } else {
+                sync_status
+            }
         }
     } else {
         unsafe { hipMemcpy(dst, src, count, kind) }

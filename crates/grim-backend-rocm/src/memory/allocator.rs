@@ -499,6 +499,13 @@ impl RocmCachingAllocator {
                         unsafe {
                             let _ = hipFree(s.base as *mut c_void);
                         }
+                        // A slab release IS a real driver free: the counter's
+                        // contract is "real driver calls since start", and
+                        // `empty_cache_releases_pooled_buffers` asserts on it.
+                        // Without this the count only moved for pool-class
+                        // buffers, so a device whose small allocations all went
+                        // to slabs reported "released nothing" while hipFreeing.
+                        self.free_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 *slabs = keep;

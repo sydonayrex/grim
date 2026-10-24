@@ -148,7 +148,6 @@ const DEVIANT_PASSTHROUGHS: &[&str] = &[
     "exaone4",
     "exaone_moe",
     "gemma3",
-    "gemma4",
     "gemma4_assistant",
     "gemma_embedding",
     "glm4",
@@ -217,7 +216,6 @@ const DEVIANT_PASSTHROUGHS: &[&str] = &[
 const KNOWN_ORPHANS: &[&str] = &[
     "ernie45_moe",
     "gemma3",
-    "gemma4",
     "lfm2moe",
     "minicpm3",
     "phi3",

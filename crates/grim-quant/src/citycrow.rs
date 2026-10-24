@@ -66,6 +66,23 @@ pub const CITYCROW_GROUP: usize = 128;
 /// (four bits each, low nibble first).
 pub const CITYCROW_WORDS_PER_GROUP: usize = CITYCROW_GROUP / 8;
 
+/// The VRAM a [`repack_to_u4_lanes`] blob occupies once resident on the device:
+/// [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros] — 24 B of
+/// length prefixes, one nibble per weight, one bf16 scale and one u8 zero per
+/// group. Convert-on-load (grim-backend-rocm `from_cpu_bytes`) swaps this in
+/// for the packed 2.25 bpw bytes, so every VRAM budget must charge THIS size
+/// for a GsqRco3p5 weight, not the packed one — charging packed is how the 27B
+/// planner concluded 10.4 GB of weights fit and then spilled 18.5 GB of lanes
+/// to host RAM.
+///
+/// Mirrors `DType::expected_bytes` for `Storage::W4A4OstQuant`; a test pins
+/// the two together.
+pub fn resident_blob_bytes(elem_count: usize) -> u64 {
+    let group = CITYCROW_GROUP.max(1) as u64;
+    let e = elem_count as u64;
+    24 + e.div_ceil(2) + e.div_ceil(group) * 3
+}
+
 /// Bumped whenever the repack changes meaning, so a cached conversion can
 /// never be served for different bytes. Mirrors `OSTQUANT_ENCODER_VERSION`.
 pub const CITYCROW_ENCODER_VERSION: u32 = 1;

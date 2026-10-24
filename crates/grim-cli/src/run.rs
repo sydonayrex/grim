@@ -503,12 +503,16 @@ fn try_graph_decode_step(
         );
         return None;
     }
+    unsafe {
+        let _ = grim_backend_rocm::hipDeviceSynchronize();
+    }
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
 
     // Diagnostic: dump the replayed graph's own logits — the Sampled path
     // below never materializes them, so a diverging replay is invisible
     // (steps 2+ print no logprobs). GRIM_DEBUG_TOPLOGITS=1 enables.
     if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+        let _guard = grim_backend_rocm::device::util::DeviceGuard::set(0);
         // Localize the first NaN: scan each layer's graph-owned input buffer
         // (post-replay, stream synced by read paths below... sync first).
         unsafe {
@@ -624,9 +628,10 @@ fn try_graph_decode_step(
         // coincidence — a future split of graph/sampler streams would
         // silently race. On miss (kernel not yet pre-resolved), sync the
         // graph stream once and take the ambient path (one-time cost).
-        if let Device::Rocm(ordinal) = device {
-            let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
-            let stream = g.stream;
+        if let Device::Rocm(_) = device {
+            let logits_ord = g.logits_device_storage().device_ordinal();
+            let dev = grim_backend_rocm::RocmDevice::shared(logits_ord);
+            let stream = dev.active_stream();
             let gate = sampling_params;
             match grim_backend_rocm::sample_logits_on_device_with_penalty_at_stream(
                 &dev,
@@ -655,8 +660,9 @@ fn try_graph_decode_step(
                 }
             }
         }
+        let logits_device = Device::Rocm(g.logits_device_storage().device_ordinal());
         if let Ok(tok) = sample_storage_on_rocm(
-            device,
+            &logits_device,
             g.logits_device_storage(),
             sampling_params,
             seed,
@@ -1412,7 +1418,35 @@ pub async fn cmd_run(
     // Generation loop
     let mut decode_total_us: u64 = 0;
     let mut decode_count: u64 = 0;
+    // GRIM_PHASE_TRACE=1: the phase-level wall-clock breakdown of the decode
+    // window (experiment (c) of plans/PLAN-m1-decode-regime-experiments.md).
+    //
+    // The plan's open item was the ~12 s CONSTANT inside the 27B's reported
+    // per-token number: a constant that size is a ONE-TIME cost landing
+    // inside the averaged window, not per-token work, and until it is named
+    // "606 ms/token" is an average over an unexplained constant. The
+    // per-step (path, duration) list is what identifies it: a constant shows
+    // up as a few steps that are orders of magnitude above the steady state.
+    let phase_trace_on = std::env::var_os("GRIM_PHASE_TRACE").is_some();
+    let phase_window_start = std::time::Instant::now();
+    let mut phase_steps: Vec<(u64, &'static str)> = Vec::new();
+    // res0-addendum (HybridAgents): a compute budget counted in FORWARD PASSES
+    // (prefill + every decode step) rather than emitted tokens. A draft/verify
+    // or any multi-forward primitive spends passes without emitting tokens, so
+    // a token cap cannot bound compute; this can. GRIM_MAX_FORWARD_PASSES=N.
+    let max_forward_passes: Option<usize> = std::env::var("GRIM_MAX_FORWARD_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut forward_passes = 0usize;
     while generated < max_tokens {
+        if let Some(budget) = max_forward_passes {
+            if forward_passes >= budget {
+                eprintln!(
+                    "[grim] Forward-pass budget {budget} reached ({generated} tokens generated); stopping."
+                );
+                break;
+            }
+        }
         // Prefill on first pass to populate KV caches; decode one token at a time after.
         // HIGH-3: save first_pass before input_ids block mutates it to avoid wrong positions.
         let is_prefill = first_pass;
@@ -1523,7 +1557,10 @@ pub async fn cmd_run(
                 allow_gpu_sample,
                 &history,
                 Some(&session as &dyn grim_core::session::SessionT),
-                tokens.len() as u32,
+                // Fix off-by-one: `tokens` contains the prompt plus the unscheduled token
+                // being decoded in this step. The eager cache only contains tokens forwarded
+                // so far (`tokens.len() - 1`). Passing `tokens.len()` read unwritten tail rows!
+                tokens.len().saturating_sub(1) as u32,
                 &mut ctx_exhausted,
                 &mut graph_just_captured,
             )
@@ -1550,16 +1587,25 @@ pub async fn cmd_run(
         }
         let next_token = match graph_hit {
             Some(GraphDecodeResult::Sampled(tok)) => {
+                // A graph replay IS one forward pass — count it like eager.
+                forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                if phase_trace_on {
+                    phase_steps.push((step_us, "graph-sampled"));
+                }
                 step_timing!(step_us, "graph-sampled");
                 tok
             }
             Some(GraphDecodeResult::Logits(logits)) => {
+                forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                if phase_trace_on {
+                    phase_steps.push((step_us, "graph-logits"));
+                }
                 step_timing!(step_us, "graph-logits");
                 let logits_vec = logits.to_vec_f32()?;
                 let last_start = logits_vec.len().saturating_sub(vocab);
@@ -1629,18 +1675,28 @@ pub async fn cmd_run(
                             positions_tensor,
                             &[],
                         );
+                        forward_passes += 1;
                         let _ = handle.join();
                         out
                     })?
                 } else {
-                    CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?
+                    let out =
+                        CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
+                    forward_passes += 1;
+                    out
                 };
                 let step_us = step_start.elapsed().as_micros() as u64;
                 if !is_prefill {
                     decode_total_us += step_us;
                     decode_count += 1;
+                    if phase_trace_on {
+                        phase_steps.push((step_us, "eager"));
+                    }
                     step_timing!(step_us, "eager");
                 } else {
+                    if phase_trace_on {
+                        phase_steps.push((step_us, "prefill"));
+                    }
                     step_timing!(step_us, "prefill");
                 }
 
@@ -1835,6 +1891,69 @@ pub async fn cmd_run(
             tps,
             bw_str
         );
+    }
+    // GRIM_PHASE_TRACE=1: name the constant. The reported average is
+    // total/count; if the window also holds a one-time cost (the graph
+    // capture's eager warmup, the prefill tail, the lane prewarm) the average
+    // is that cost smeared over every token. The steady state is the
+    // MEDIAN step; the excess is everything above median*n.
+    if phase_trace_on && !phase_steps.is_empty() {
+        let mut durs: Vec<u64> = phase_steps.iter().map(|(us, _)| *us).collect();
+        durs.sort_unstable();
+        let n = durs.len();
+        let p50 = durs[n / 2];
+        let p90 = durs[((n as f64 * 0.9) as usize).min(n - 1)];
+        let max = durs[n - 1];
+        let sum: u64 = durs.iter().sum();
+        let steady = p50 as u64 * n as u64;
+        let excess = sum.saturating_sub(steady);
+        eprintln!(
+            "[phase-trace] window={:.3}s steps={n} p50={:.1}ms p90={:.1}ms max={:.1}ms",
+            phase_window_start.elapsed().as_secs_f64(),
+            p50 as f64 / 1000.0,
+            p90 as f64 / 1000.0,
+            max as f64 / 1000.0
+        );
+        eprintln!(
+            "[phase-trace] step_sum={:.3}s  steady(median*n)={:.3}s  EXCESS={:.3}s ({:.1}% of the window)",
+            sum as f64 / 1e6,
+            steady as f64 / 1e6,
+            excess as f64 / 1e6,
+            excess as f64 / 1e6 / (phase_window_start.elapsed().as_secs_f64().max(1e-9)) * 100.0
+        );
+        // The slowest steps, with their path: the constant is NAMED by which
+        // path carried it.
+        let mut by_cost: Vec<(u64, &'static str)> = phase_steps.clone();
+        by_cost.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut shown = 0usize;
+        for (us, path) in &by_cost {
+            if shown >= 6 {
+                break;
+            }
+            eprintln!(
+                "[phase-trace] slow step #{shown}: {:.1} ms  path={path}",
+                *us as f64 / 1000.0
+            );
+            shown += 1;
+        }
+        // Per-path totals.
+        let mut paths: Vec<(&'static str, u64, u64)> = Vec::new();
+        for (us, path) in &phase_steps {
+            match paths.iter_mut().find(|(p, _, _)| p == path) {
+                Some((_, tot, cnt)) => {
+                    *tot += us;
+                    *cnt += 1;
+                }
+                None => paths.push((path, *us, 1)),
+            }
+        }
+        for (path, tot, cnt) in &paths {
+            eprintln!(
+                "[phase-trace] path {path:<14} n={cnt:<5} total={:.3}s  mean={:.2}ms",
+                *tot as f64 / 1e6,
+                *tot as f64 / 1e3 / (*cnt).max(1) as f64
+            );
+        }
     }
     // B3: operator-visible graph status (PLAN-reduce-d2h-h2d).
     if matches!(device, Device::Rocm(_)) {

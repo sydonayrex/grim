@@ -1036,6 +1036,100 @@ impl TensorNamingRegistry {
                     "output_norm.weight".to_string(),
                 );
             }
+            ModelArchitecture::Gemma4 => {
+                // Gemma 4 (HF `model.language_model.*`, GGUF root + `blk.{i}.*`).
+                // The per-layer ("per layer input") embedding tables are the
+                // parts that do not exist in any earlier family:
+                //   `embed_tokens_per_layer`  -> `per_layer_token_embd`
+                //   `per_layer_model_projection` -> `per_layer_model_proj`
+                //   `per_layer_projection_norm`  -> `per_layer_proj_norm`
+                // and each block carries a `per_layer_input_gate` /
+                // `per_layer_projection` pair plus a `layer_scalar`.
+                map.insert(
+                    "model.embed_tokens_per_layer.weight".to_string(),
+                    "per_layer_token_embd.weight".to_string(),
+                );
+                map.insert(
+                    "model.per_layer_model_projection.weight".to_string(),
+                    "per_layer_model_proj.weight".to_string(),
+                );
+                map.insert(
+                    "model.per_layer_projection_norm.weight".to_string(),
+                    "per_layer_proj_norm.weight".to_string(),
+                );
+                for i in 0..num_layers {
+                    let hf_p = format!("model.layers.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}post_attention_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}pre_feedforward_layernorm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_feedforward_layernorm.weight"),
+                        format!("{gg_p}post_ffw_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_per_layer_input_norm.weight"),
+                        format!("{gg_p}post_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}per_layer_input_gate.weight"),
+                        format!("{gg_p}inp_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}per_layer_projection.weight"),
+                        format!("{gg_p}proj.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}layer_scalar.weight"),
+                        format!("{gg_p}layer_output_scale.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_proj.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_proj.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.v_proj.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.o_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_norm.weight"),
+                        format!("{gg_p}attn_q_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_norm.weight"),
+                        format!("{gg_p}attn_k_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.up_proj.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.down_proj.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                }
+            }
             ModelArchitecture::Laguna => {
                 for i in 0..num_layers {
                     let hf_p = format!("model.layers.{i}.");
@@ -1593,6 +1687,49 @@ mod tests {
             ModalityHint::AudioVocoder
         );
         assert_eq!(ModelArchitecture::DiT.modality(), ModalityHint::Diffusion);
+    }
+
+    /// Gemma 4's GGUF tensor names, checked against llama.cpp's own name
+    /// table (`old/repo/llama.cpp-master/src/llama-arch.cpp:430-561`).
+    ///
+    /// The per-layer ("per layer input") tensors are the ones a family gets
+    /// wrong: llama.cpp names them `post_norm`, `inp_gate` and `proj`, NOT
+    /// `per_layer_post_norm` / `per_layer_inp_gate` / `per_layer_proj`, and a
+    /// wrong name is a missing weight at load time.
+    #[test]
+    fn gemma4_tensor_names_match_the_reference() {
+        let remap = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Gemma4, 2);
+        let expect = [
+            ("model.embed_tokens.weight", "token_embd.weight"),
+            ("model.embed_tokens_per_layer.weight", "per_layer_token_embd.weight"),
+            ("model.per_layer_model_projection.weight", "per_layer_model_proj.weight"),
+            ("model.per_layer_projection_norm.weight", "per_layer_proj_norm.weight"),
+            ("model.norm.weight", "output_norm.weight"),
+            ("model.layers.1.input_layernorm.weight", "blk.1.attn_norm.weight"),
+            ("model.layers.1.post_attention_layernorm.weight", "blk.1.post_attention_norm.weight"),
+            ("model.layers.1.pre_feedforward_layernorm.weight", "blk.1.ffn_norm.weight"),
+            ("model.layers.1.post_feedforward_layernorm.weight", "blk.1.post_ffw_norm.weight"),
+            ("model.layers.1.post_per_layer_input_norm.weight", "blk.1.post_norm.weight"),
+            ("model.layers.1.per_layer_input_gate.weight", "blk.1.inp_gate.weight"),
+            ("model.layers.1.per_layer_projection.weight", "blk.1.proj.weight"),
+            ("model.layers.1.layer_scalar.weight", "blk.1.layer_output_scale.weight"),
+            ("model.layers.1.self_attn.q_proj.weight", "blk.1.attn_q.weight"),
+            ("model.layers.1.self_attn.k_proj.weight", "blk.1.attn_k.weight"),
+            ("model.layers.1.self_attn.v_proj.weight", "blk.1.attn_v.weight"),
+            ("model.layers.1.self_attn.o_proj.weight", "blk.1.attn_output.weight"),
+            ("model.layers.1.self_attn.q_norm.weight", "blk.1.attn_q_norm.weight"),
+            ("model.layers.1.self_attn.k_norm.weight", "blk.1.attn_k_norm.weight"),
+            ("model.layers.1.mlp.gate_proj.weight", "blk.1.ffn_gate.weight"),
+            ("model.layers.1.mlp.up_proj.weight", "blk.1.ffn_up.weight"),
+            ("model.layers.1.mlp.down_proj.weight", "blk.1.ffn_down.weight"),
+        ];
+        for (hf, gguf) in expect {
+            assert_eq!(
+                remap.get(hf).map(|s| s.as_str()),
+                Some(gguf),
+                "{hf} must map to {gguf}"
+            );
+        }
     }
 
     #[test]

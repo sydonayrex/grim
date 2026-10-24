@@ -26,8 +26,9 @@
 //! Gated: `GRIM_GPU_TEST=1` + a real ROCm device.
 
 use grim_backend_rocm::RocmDevice;
-use grim_models_transformer::qwen35::{Qwen35Block, Qwen35Config, Qwen35LayerCache};
-use grim_nn::modules::{Linear, RmsNorm, pick_device_for_storage_device};
+use grim_models_transformer::decode_graph::DecodeGraphModel;
+use grim_models_transformer::qwen35::{Qwen35, Qwen35Block, Qwen35Config, Qwen35LayerCache};
+use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 
 /// Process-global KV-format env vars; the f16 and int8 decode gates both set
@@ -713,6 +714,67 @@ fn qwen35_i4_kv_decode_matches_f32() {
 ///     codes' row (the off-by-a-factor bug this gate was written for);
 ///   * the dequantized codes must be within HALF a code step of the f32 row,
 ///     i.e. the quantizer round-trips the values it was handed.
+/// int4's whole reason to exist is memory: at a fixed context it must cost
+/// HALF of int8 and a QUARTER of f16.
+///
+/// It did not. `kv_arena_dtype` gives Int4 the same U8 element as Int8, and the
+/// arena shape was expressed in (row, nkv, head_dim) ELEMENTS, so int4
+/// allocated one byte per element — exactly int8's footprint — while writing
+/// only two codes per byte. Choosing int4 therefore saved nothing over int8 and
+/// cost 10x its perplexity. This gate reads the LIVE arena's byte size off the
+/// real layer cache, so it measures the allocation rather than the intention.
+#[test]
+fn qwen35_int4_kv_arena_is_a_quarter_of_f16_and_half_of_int8() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let arena_bytes = |format: &str| -> usize {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let _ = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            cache.current_pos += 1;
+        }
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        let k = cache.k_device.as_ref().expect("k arena");
+        let v = cache.v_device.as_ref().expect("v arena");
+        let bytes = |s: &dyn grim_tensor::backend::BackendStorage| -> usize {
+            s.shape().elem_count() * s.dtype().expected_bytes(1)
+        };
+        bytes(k.as_ref()) + bytes(v.as_ref())
+    };
+
+    let f16_b = arena_bytes("f16");
+    let i8_b = arena_bytes("int8");
+    let i4_b = arena_bytes("int4");
+    eprintln!("[kv-arena-bytes] f16={f16_b} int8={i8_b} int4={i4_b}");
+    assert!(f16_b > 0 && i8_b > 0 && i4_b > 0, "an arena allocated nothing");
+    assert_eq!(i8_b * 2, f16_b, "int8 must be half of f16 ({i8_b} vs {f16_b})");
+    assert_eq!(
+        i4_b * 2,
+        i8_b,
+        "int4 must be half of int8 ({i4_b} vs {i8_b}) — it is 2 codes per byte, \
+         and while this held it bought nothing over int8"
+    );
+}
+
 #[test]
 fn qwen35_i8_kv_arena_rows_match_f32_within_code_step() {
     let Some((device, dev)) = gpu_device() else {
@@ -1339,5 +1401,73 @@ fn qwen35_i2v4_kv_decode_matches_f32_within_budget() {
     assert!(
         !identical,
         "int2v4 produced byte-identical output to f32: the format is not reaching the arena"
+    );
+}
+
+/// Build a tiny Qwen35 model with one attention block, for graph-capture tests.
+fn build_model(device: &Device, dev: Option<&RocmDevice>, c: &Qwen35Config) -> Qwen35 {
+    let mk = |data: Vec<f32>, shape: Shape| -> Tensor {
+        match dev {
+            Some(d) => to_dev(d, &data, shape, device),
+            None => grim_backend_cpu::cpu_tensor(data, shape),
+        }
+    };
+    let lin = |data: Vec<f32>, shape: Shape| -> Linear {
+        Linear::from_tensor(mk(data, shape), None)
+    };
+    let vocab = 128_usize;
+    Qwen35 {
+        cfg: c.clone(),
+        device: device.clone(),
+        tok_embeddings: Embedding {
+            weight: mk(w(12, vocab * HIDDEN), Shape::new(vec![vocab, HIDDEN])),
+        },
+        blocks: vec![build_block(device, dev)],
+        output_norm: RmsNorm::new(mk(ws(13, HIDDEN, 1.0), Shape::new(vec![HIDDEN])), 1e-6),
+        output: lin(w(14, HIDDEN * vocab), Shape::new(vec![HIDDEN, vocab])),
+    }
+}
+
+/// The graph pool's int4 arena must be HALF of int8 one. The pool narrowed the
+/// f32 arena's shape with `kv_arena_dtype` and kept the element count, which
+/// gives 1 byte/element for every packed format — the same defect the eager
+/// arena had, one layer over.
+#[test]
+fn graph_int4_kv_arena_is_half_of_int8() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let arena_bytes = |format: &str| -> usize {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let model = build_model(&device, Some(dev.as_ref()), &c);
+        let graph = model
+            .get_or_create_decode_graph(128, 1)
+            .expect("graph capture");
+        let bytes = graph
+            .buffers
+            .k_arena
+            .iter()
+            .chain(graph.buffers.v_arena.iter())
+            .map(|a| a.bytes())
+            .sum();
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        bytes
+    };
+
+    let i8_b = arena_bytes("int8");
+    let i4_b = arena_bytes("int4");
+    eprintln!("[graph-kv-arena-bytes] int8={i8_b} int4={i4_b}");
+    assert!(i8_b > 0 && i4_b > 0, "an arena allocated nothing");
+    assert_eq!(
+        i4_b * 2,
+        i8_b,
+        "graph int4 arena must be half of int8 ({i4_b} vs {i8_b})"
     );
 }

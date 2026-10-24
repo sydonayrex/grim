@@ -4,15 +4,25 @@
 
 // (import removed: unused after split)
 
+#[cfg(feature = "training")]
+use std::ffi::c_void;
+
 use grim_tensor::backend::BackendStorage;
 use grim_tensor::dtype::DType;
+#[cfg(feature = "training")]
+use grim_tensor::error::Error;
 use grim_tensor::error::Result;
 use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
 #[cfg(feature = "training")]
 use crate::device::roc_device::CharonBackwardResult;
 use crate::device::roc_device::RocmDevice;
-// (import removed: unused after split)
+#[cfg(feature = "training")]
+use crate::memory::storage::RocmStorage;
+#[cfg(feature = "training")]
+use crate::{
+    HipDim3, arg, check_hip, hipFreeAsync, hipMemsetAsync, upload_device_buffer,
+};
 use crate::{as_rocm, dev_ptr};
 impl RocmDevice {
     /// Device launcher for the FP32 Charon MoE backward kernel (`grim_moe_fused_grouped_backward`).

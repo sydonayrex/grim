@@ -188,4 +188,26 @@ impl RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
+
+    /// Ensure `act_q81_buf` has at least `q81_bytes` allocated on device.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_act_q81(&self, q81_bytes: usize) -> Result<()> {
+        let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+        let need_alloc = match buf_guard.as_ref() {
+            Some(s) => s.bytes < q81_bytes,
+            None => true,
+        };
+        if need_alloc {
+            *buf_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        Ok(())
+    }
 }
