@@ -1333,6 +1333,27 @@ impl RocmDevice {
         )
     }
 
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q2_K GEMV v2 (`grim_dot4_q2k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q2k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv_sub_v2",
+        )
+    }
+
     /// The STOCK Q2_K dot4 kernel, for A/B and as the parity oracle's
     /// counterpart. It is NOT what the default dispatch runs.
     pub fn launch_dot4_q2k_q81_gemv_stock_for_ab(
@@ -1364,6 +1385,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q2K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub = *SUB.get_or_init(|| {
             !matches!(
@@ -1378,7 +1406,9 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        let kernel_name = if sub {
+        let kernel_name = if sub && sub_v2 {
+            "grim_dot4_q2k_q81_gemv_sub_v2"
+        } else if sub {
             "grim_dot4_q2k_q81_gemv_sub"
         } else if fast {
             "grim_dot4_q2k_q81_gemv_fast"
@@ -1507,6 +1537,27 @@ impl RocmDevice {
         )
     }
 
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane IQ4_XS GEMV v2 (`grim_dot4_iq4xs_q81_gemv_sub_v2`).
+    pub fn launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub_v2",
+        )
+    }
+
     pub(crate) fn launch_dot4_iq4xs_q81_gemv(
         &self,
         act_q81: &RocmStorage,
@@ -1516,6 +1567,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ4XS_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub = *SUB.get_or_init(|| {
             !matches!(
@@ -1530,7 +1588,9 @@ impl RocmDevice {
             m,
             n,
             k,
-            if sub {
+            if sub && sub_v2 {
+                "grim_dot4_iq4xs_q81_gemv_sub_v2"
+            } else if sub {
                 "grim_dot4_iq4xs_q81_gemv_sub"
             } else {
                 "grim_dot4_iq4xs_q81_gemv_fast"
@@ -1629,6 +1689,27 @@ impl RocmDevice {
         )
     }
 
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q3_K GEMV v2 (`grim_dot4_q3k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q3k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_sub_v2",
+        )
+    }
+
     /// The STOCK Q3_K dot4 kernel (per-byte magnitude loads), kept as the
     /// fast kernel's byte-identity oracle and A/B counterpart. NOT what the
     /// default dispatch runs once the word-wide-mask variant is live.
@@ -1661,6 +1742,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub = *SUB.get_or_init(|| {
             !matches!(
@@ -1675,7 +1763,9 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        let kernel_name = if sub {
+        let kernel_name = if sub && sub_v2 {
+            "grim_dot4_q3k_q81_gemv_sub_v2"
+        } else if sub {
             "grim_dot4_q3k_q81_gemv_sub"
         } else if fast {
             "grim_dot4_q3k_q81_gemv_fast"
@@ -1801,6 +1891,13 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q4K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub = *SUB.get_or_init(|| {
             !matches!(
@@ -1808,7 +1905,9 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        let (kernel_name, cols_per_block): (&str, u32) = if sub {
+        let (kernel_name, cols_per_block): (&str, u32) = if sub && sub_v2 {
+            ("grim_dot4_q4k_q81_gemv_sub_v2", 4)
+        } else if sub {
             ("grim_dot4_q4k_q81_gemv_sub", 4)
         } else if fast {
             ("grim_dot4_q4k_q81_gemv_fast", 2)
@@ -1879,12 +1978,25 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q5K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub = *SUB.get_or_init(|| {
             !matches!(std::env::var("GRIM_Q5K_SUB").as_deref(), Ok("0" | "false" | "off"))
         });
         self.launch_dot4_q5k_q81_gemv_named(
-            if sub { "grim_dot4_q5k_q81_gemv_sub" } else { "grim_dot4_q5k_q81_gemv" },
+            if sub && sub_v2 {
+                "grim_dot4_q5k_q81_gemv_sub_v2"
+            } else if sub {
+                "grim_dot4_q5k_q81_gemv_sub"
+            } else {
+                "grim_dot4_q5k_q81_gemv"
+            },
             act_q81,
             b_storage,
             out_storage,
@@ -1931,6 +2043,27 @@ impl RocmDevice {
     ) -> Result<*mut c_void> {
         self.launch_dot4_q5k_q81_gemv_named(
             "grim_dot4_q5k_q81_gemv_sub",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q5_K GEMV v2 (`grim_dot4_q5k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q5k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv_sub_v2",
             act_q81,
             b_storage,
             out_storage,
@@ -2166,6 +2299,48 @@ impl RocmDevice {
         )
     }
 
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q4_K GEMV v2 (`grim_dot4_q4k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q4k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub_v2: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub_v2: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub_v2: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_sub_v2",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// M7.2c: the RETAINED ORACLE for the Q6_K group hoist. Not on any
     /// dispatch path; only the parity gate launches it.
     pub fn launch_dot4_q6k_q81_gemv_ref_for_ab(
@@ -2237,12 +2412,25 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q6K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub = *SUB.get_or_init(|| {
             !matches!(std::env::var("GRIM_Q6K_SUB").as_deref(), Ok("0" | "false" | "off"))
         });
         self.launch_dot4_q6k_q81_gemv_named(
-            if sub { "grim_dot4_q6k_q81_gemv_sub" } else { "grim_dot4_q6k_q81_gemv" },
+            if sub && sub_v2 {
+                "grim_dot4_q6k_q81_gemv_sub_v2"
+            } else if sub {
+                "grim_dot4_q6k_q81_gemv_sub"
+            } else {
+                "grim_dot4_q6k_q81_gemv"
+            },
             act_q81,
             b_storage,
             out_storage,
@@ -2263,6 +2451,19 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
         self.launch_dot4_q6k_q81_gemv_named("grim_dot4_q6k_q81_gemv_sub", act_q81, b_storage, out_storage, m, n, k)
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q6_K GEMV v2 (`grim_dot4_q6k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q6k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q6k_q81_gemv_named("grim_dot4_q6k_q81_gemv_sub_v2", act_q81, b_storage, out_storage, m, n, k)
     }
 
     fn launch_dot4_q6k_q81_gemv_named(

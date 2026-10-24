@@ -397,30 +397,30 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
         fn(&RocmDevice, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, usize, usize, usize) -> Result<*mut std::ffi::c_void, String>,
     ) = match scheme_name {
         "q4k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         "q5k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         // Q2_K: "new" is the word-wide-mask variant (the default through the
         // launcher), "ref" is the stock 4-byte-load kernel. Both are driven
         // through launchers so the grid is the dispatch's own.
         "q2k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         "iq4xs" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         "q3k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         _ => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
     };
@@ -543,7 +543,7 @@ fn iq4xs_dot4_vs_grouped_speed_ab() -> Result<(), String> {
         };
         let bytes = (n * row_bytes) as f64;
         let t_dot4 = time_it(&|| {
-            dev.launch_dot4_iq4xs_q81_gemv_sub_for_ab(a_r, b_r, o_r, m, n, k)
+            dev.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(a_r, b_r, o_r, m, n, k)
                 .map_err(|e| e.to_string())
         });
         let t_grouped = time_it(&|| {
@@ -730,5 +730,215 @@ fn q2k_sub_lane_parity_and_speed() -> Result<(), String> {
         |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_for_ab(a, b, o, m, n, k),
         |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k),
         |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
+}
+
+/// Step 2.2 (#1 + #2) A/B gate across all K-quant schemes:
+/// 1. First verifies `_sub_v2` is BIT-IDENTICAL to `_sub` AND within 1e-4 of
+///    the retained GPU oracle (`_ref` / `_stock`) AND within 2e-2 of the host
+///    `dequant_*` dot `dequant_q81` oracle across all boundary shapes before timing.
+/// 2. Then runs a direct A/B benchmark between `_sub` (`sub_v1`) and `_sub_v2`
+///    (both warm and cold 4x-rotated >200 MB DRAM).
+fn sub_v2_parity_then_ab(
+    name: &str,
+    blk: usize,
+    quant: fn(&[f32]) -> grim_tensor::Result<Vec<u8>>,
+    dequant: fn(&[u8], usize) -> grim_tensor::Result<Vec<f32>>,
+    oracle: GemvFn,
+    sub_v1: GemvFn,
+    sub_v2: GemvFn,
+) -> Result<(), String> {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    const ROT: usize = 4;
+    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+
+    for &(n, k, m, timed) in &[
+        (64usize, 256usize, 1usize, false),
+        (68, 1024, 1, false),
+        (68, 4096, 4, false),
+        (67, 5120, 1, false),
+        (17408, 5120, 1, true),
+        (5120, 17408, 1, true),
+    ] {
+        let row_bytes = (k / 256) * blk;
+        let mut rng = Lcg(0xC0FFEE ^ (n * 31 + k) as u64);
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let mut bq = vec![0u8; n * row_bytes];
+        for col in 0..n {
+            let w: Vec<f32> = (0..k).map(|_| rng.next_f32()).collect();
+            let p = quant(&w).map_err(|e| e.to_string())?;
+            bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
+        }
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let q81_len = m * (k / 32) * 36;
+        let q81 = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
+            .map_err(|e| e.to_string())?;
+        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81.as_ref()).unwrap(), m, k)
+            .map_err(|e| e.to_string())?;
+
+        let copies = if timed { ROT } else { 1 };
+        let b_sts: Vec<_> = (0..copies)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty.clone()))
+            .collect::<grim_tensor::Result<_>>()
+            .map_err(|e| e.to_string())?;
+        let o_ref = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o_sub = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o_v2  = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_r = as_rocm(q81.as_ref()).unwrap();
+        let b_rs: Vec<_> = b_sts.iter().map(|b| as_rocm(b.as_ref()).unwrap()).collect();
+        let (or_, os_, ov2_) = (
+            as_rocm(o_ref.as_ref()).unwrap(),
+            as_rocm(o_sub.as_ref()).unwrap(),
+            as_rocm(o_v2.as_ref()).unwrap(),
+        );
+
+        oracle(&dev, a_r, b_rs[0], or_, m, n, k).map_err(|e| e.to_string())?;
+        sub_v1(&dev, a_r, b_rs[0], os_, m, n, k).map_err(|e| e.to_string())?;
+        sub_v2(&dev, a_r, b_rs[0], ov2_, m, n, k).map_err(|e| e.to_string())?;
+        dev.synchronize();
+
+        let (r_ref, r_sub, r_v2) = (f32_vec(&o_ref)?, f32_vec(&o_sub)?, f32_vec(&o_v2)?);
+        let bit_diffs = r_sub.iter().zip(&r_v2).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(
+            bit_diffs, 0,
+            "{name} sub_v2 is NOT bit-identical to sub at n={n} k={k} m={m} ({bit_diffs} diffs)"
+        );
+
+        let scale = r_ref.iter().fold(0f32, |x, v| x.max(v.abs())).max(1e-6);
+        let worst_vs_ref = r_ref.iter().zip(&r_v2).fold(0f32, |x, (p, q)| x.max((p - q).abs())) / scale;
+        assert!(worst_vs_ref < 1e-4, "{name} sub_v2 vs ref worst rel-to-max {worst_vs_ref:.3e}");
+
+        if !timed {
+            let q81_host = bytes_of(&q81)?;
+            let a_deq = dequant_q81(&q81_host, m * k);
+            let mut worst_deq = 0f32;
+            for row in 0..m {
+                for col in 0..n {
+                    let w = dequant(&bq[col * row_bytes..(col + 1) * row_bytes], k)
+                        .map_err(|e| e.to_string())?;
+                    let mut acc = 0f32;
+                    for kk in 0..k {
+                        acc += a_deq[row * k + kk] * w[kk];
+                    }
+                    let got = r_v2[row * n + col];
+                    worst_deq = worst_deq.max((got - acc).abs() / acc.abs().max(1e-3));
+                }
+            }
+            println!(
+                "{name:<5} sub_v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to sub_v1, vs_ref={worst_vs_ref:.3e}, vs_host_dequant={worst_deq:.3e}"
+            );
+            assert!(worst_deq <= 2e-2, "{name} sub_v2 vs host dequant {worst_deq:.3e}");
+        } else {
+            println!(
+                "{name:<5} sub_v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to sub_v1, vs_ref={worst_vs_ref:.3e}"
+            );
+            let time = |f: GemvFn, rotate: bool| {
+                for i in 0..ROT {
+                    f(&dev, a_r, b_rs[i], ov2_, m, n, k).unwrap();
+                }
+                dev.synchronize();
+                let iters = 48;
+                let t0 = std::time::Instant::now();
+                for i in 0..iters {
+                    let b = if rotate { b_rs[i % ROT] } else { b_rs[0] };
+                    f(&dev, a_r, b, ov2_, m, n, k).unwrap();
+                }
+                dev.synchronize();
+                t0.elapsed().as_secs_f64() / iters as f64
+            };
+            let gb = (n * row_bytes) as f64 / 1e9;
+            for (label, rot) in [("warm", false), ("cold", true)] {
+                let t_v1 = time(sub_v1, rot);
+                let t_v2 = time(sub_v2, rot);
+                println!(
+                    "{name:<5} A/B {label:<4} n={n:<5} k={k:<5}: sub_v1 {:.1} us ({:.1} GB/s)  sub_v2 {:.1} us ({:.1} GB/s)  {:.3}x",
+                    t_v1 * 1e6, gb / t_v1, t_v2 * 1e6, gb / t_v2, t_v1 / t_v2
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn q4k_sub_v2_parity_then_ab() -> Result<(), String> {
+    sub_v2_parity_then_ab(
+        "q4k",
+        144,
+        grim_quant::quant_q4k,
+        grim_quant::dequant_q4k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q5k_sub_v2_parity_then_ab() -> Result<(), String> {
+    sub_v2_parity_then_ab(
+        "q5k",
+        176,
+        grim_quant::quant_q5k,
+        grim_quant::dequant_q5k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q6k_sub_v2_parity_then_ab() -> Result<(), String> {
+    sub_v2_parity_then_ab(
+        "q6k",
+        210,
+        grim_quant::quant_q6k,
+        grim_quant::dequant_q6k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q3k_sub_v2_parity_then_ab() -> Result<(), String> {
+    sub_v2_parity_then_ab(
+        "q3k",
+        110,
+        grim_quant::quant_q3k,
+        grim_quant::dequant_q3k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q2k_sub_v2_parity_then_ab() -> Result<(), String> {
+    sub_v2_parity_then_ab(
+        "q2k",
+        84,
+        grim_quant::quant_q2k,
+        grim_quant::dequant_q2k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn iq4xs_sub_v2_parity_then_ab() -> Result<(), String> {
+    sub_v2_parity_then_ab(
+        "iq4xs",
+        136,
+        grim_quant::quant_iq4xs,
+        grim_quant::dequant_iq4xs,
+        |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
     )
 }
