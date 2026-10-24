@@ -1430,7 +1430,23 @@ pub async fn cmd_run(
     let phase_trace_on = std::env::var_os("GRIM_PHASE_TRACE").is_some();
     let phase_window_start = std::time::Instant::now();
     let mut phase_steps: Vec<(u64, &'static str)> = Vec::new();
+    // res0-addendum (HybridAgents): a compute budget counted in FORWARD PASSES
+    // (prefill + every decode step) rather than emitted tokens. A draft/verify
+    // or any multi-forward primitive spends passes without emitting tokens, so
+    // a token cap cannot bound compute; this can. GRIM_MAX_FORWARD_PASSES=N.
+    let max_forward_passes: Option<usize> = std::env::var("GRIM_MAX_FORWARD_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut forward_passes = 0usize;
     while generated < max_tokens {
+        if let Some(budget) = max_forward_passes {
+            if forward_passes >= budget {
+                eprintln!(
+                    "[grim] Forward-pass budget {budget} reached ({generated} tokens generated); stopping."
+                );
+                break;
+            }
+        }
         // Prefill on first pass to populate KV caches; decode one token at a time after.
         // HIGH-3: save first_pass before input_ids block mutates it to avoid wrong positions.
         let is_prefill = first_pass;
@@ -1571,6 +1587,8 @@ pub async fn cmd_run(
         }
         let next_token = match graph_hit {
             Some(GraphDecodeResult::Sampled(tok)) => {
+                // A graph replay IS one forward pass — count it like eager.
+                forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
@@ -1581,6 +1599,7 @@ pub async fn cmd_run(
                 tok
             }
             Some(GraphDecodeResult::Logits(logits)) => {
+                forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
@@ -1656,11 +1675,15 @@ pub async fn cmd_run(
                             positions_tensor,
                             &[],
                         );
+                        forward_passes += 1;
                         let _ = handle.join();
                         out
                     })?
                 } else {
-                    CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?
+                    let out =
+                        CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
+                    forward_passes += 1;
+                    out
                 };
                 let step_us = step_start.elapsed().as_micros() as u64;
                 if !is_prefill {
