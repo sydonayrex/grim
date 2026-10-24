@@ -2971,6 +2971,99 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITECROW_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot8_w4a4_gemv_named(
+            if v2 { "grim_dot8_w4a4_gemv_v2" } else { "grim_dot8_w4a4_gemv" },
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot8_w4a4_gemv_v1_for_ab(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot8_w4a4_gemv_named(
+            "grim_dot8_w4a4_gemv",
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot8_w4a4_gemv_v2_for_ab(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot8_w4a4_gemv_named(
+            "grim_dot8_w4a4_gemv_v2",
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_dot8_w4a4_gemv_named(
+        &self,
+        kernel: &str,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         let a_codes_ptr = a_codes
             .device_ptr
             .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: a_codes has no device ptr".into()))?;
@@ -3014,8 +3107,11 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
+        if kernel == "grim_dot8_w4a4_gemv_v2" {
+            crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
+        }
         self.launch_compute_kernel(
-            "grim_dot8_w4a4_gemv",
+            kernel,
             grid_dim,
             block_dim,
             &mut [
@@ -3151,6 +3247,28 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_TREE_PIE_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            self.launch_tree_pie_gemv_v2_for_ab(act_f16, b_storage, out_storage, n, k)
+        } else {
+            self.launch_tree_pie_gemv_v1_for_ab(act_f16, b_storage, out_storage, n, k)
+        }
+    }
+
+    pub fn launch_tree_pie_gemv_v1_for_ab(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         if k % 32 != 0 {
             return Err(Error::Backend(format!(
                 "tree_pie_gemv: K={k} must be a multiple of 32 (TreePie packs 32 values per 5 words)"
@@ -3177,6 +3295,53 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_tree_pie_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_tree_pie_gemv_v2_for_ab(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "tree_pie_gemv: K={k} must be a multiple of 32 (TreePie packs 32 values per 5 words)"
+            )));
+        }
+        if n == 0 {
+            return Err(Error::Backend("tree_pie_gemv: N must be > 0".into()));
+        }
+        let a_ptr = act_f16
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: act_f16 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        crate::device::compute::kernel_infra::record_kernel_route("grim_tree_pie_gemv");
+        self.launch_compute_kernel(
+            "grim_tree_pie_gemv_v2",
             grid_dim,
             block_dim,
             &mut [
@@ -3275,6 +3440,36 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // Note: Benchmark shows ScrubJay v1 achieves higher bandwidth (~300-330 GB/s)
+        // due to lower VGPR footprint in the 16-way codebook lookup loop. Default is v1;
+        // set GRIM_SCRUB_JAY_V2=1 to enable the 4-column batched v2.
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            matches!(
+                std::env::var("GRIM_SCRUB_JAY_V2").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        });
+        if v2 {
+            self.launch_scrub_jay_gemv_v2_for_ab(a_storage, b_sel, b_idx, b_sgn, b_scl, out_storage, pre_scale, n, k)
+        } else {
+            self.launch_scrub_jay_gemv_v1_for_ab(a_storage, b_sel, b_idx, b_sgn, b_scl, out_storage, pre_scale, n, k)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scrub_jay_gemv_v1_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_sel: &RocmStorage,
+        b_idx: &RocmStorage,
+        b_sgn: &RocmStorage,
+        b_scl: &RocmStorage,
+        out_storage: &RocmStorage,
+        pre_scale: f32,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         if k % 8 != 0 {
             return Err(Error::Backend(format!(
                 "scrub_jay_gemv: K={k} must be a multiple of 8 (ScrubJay blocks are 8 values)"
@@ -3314,6 +3509,75 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_scrub_jay_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut selp),
+                arg(&mut idxp),
+                arg(&mut sgnp),
+                arg(&mut sclp),
+                arg(&mut pre),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scrub_jay_gemv_v2_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_sel: &RocmStorage,
+        b_idx: &RocmStorage,
+        b_sgn: &RocmStorage,
+        b_scl: &RocmStorage,
+        out_storage: &RocmStorage,
+        pre_scale: f32,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 8 != 0 {
+            return Err(Error::Backend(format!(
+                "scrub_jay_gemv: K={k} must be a multiple of 8 (ScrubJay blocks are 8 values)"
+            )));
+        }
+        if n == 0 {
+            return Err(Error::Backend("scrub_jay_gemv: N must be > 0".into()));
+        }
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: a has no device ptr".into()))?;
+        let sel_ptr = b_sel
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sel has no device ptr".into()))?;
+        let idx_ptr = b_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_idx has no device ptr".into()))?;
+        let sgn_ptr = b_sgn
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sgn has no device ptr".into()))?;
+        let scl_ptr = b_scl
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_scl has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut selp = sel_ptr;
+        let mut idxp = idx_ptr;
+        let mut sgnp = sgn_ptr;
+        let mut sclp = scl_ptr;
+        let mut pre = pre_scale;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        crate::device::compute::kernel_infra::record_kernel_route("grim_scrub_jay_gemv");
+        self.launch_compute_kernel(
+            "grim_scrub_jay_gemv_v2",
             grid_dim,
             block_dim,
             &mut [

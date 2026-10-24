@@ -1383,6 +1383,32 @@ impl RocmDevice {
         n_tiles: usize,
         n_windows: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_GREY_RAVEN_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            self.launch_grey_raven_gemm_v2_for_ab(w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows)
+        } else {
+            self.launch_grey_raven_gemm_v1_for_ab(w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_grey_raven_gemm_v1_for_ab(
+        &self,
+        w_blob: &RocmStorage,
+        b_frag: &RocmStorage,
+        y_out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        n_tiles: usize,
+        n_windows: usize,
+    ) -> Result<*mut c_void> {
         let want_bytes = n_tiles
             .checked_mul(n_windows)
             .and_then(|t| t.checked_mul(260))
@@ -1418,6 +1444,70 @@ impl RocmDevice {
         let mut mt = m_tiles as i32;
         self.launch_compute_kernel(
             "grim_grey_raven_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut w),
+                arg(&mut bb),
+                arg(&mut yy),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut nt),
+                arg(&mut nw),
+                arg(&mut mt),
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_grey_raven_gemm_v2_for_ab(
+        &self,
+        w_blob: &RocmStorage,
+        b_frag: &RocmStorage,
+        y_out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        n_tiles: usize,
+        n_windows: usize,
+    ) -> Result<*mut c_void> {
+        let want_bytes = n_tiles
+            .checked_mul(n_windows)
+            .and_then(|t| t.checked_mul(260))
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: tile geometry overflows".into()))?;
+        if w_blob.bytes != want_bytes {
+            return Err(Error::Backend(format!(
+                "grey_raven_gemm: HW blob is {} bytes, need {} ({} N-tiles x {} K-windows x 260) -- truncated upload or wrong tensor",
+                w_blob.bytes, want_bytes, n_tiles, n_windows
+            )));
+        }
+        let wptr = w_blob
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: w has no device ptr".into()))?;
+        let bptr = b_frag.device_ptr.ok_or_else(|| {
+            Error::Backend(
+                "grey_raven_gemm: b_frag has no device ptr (run the prologue first)".into(),
+            )
+        })?;
+        let yptr = y_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: y has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n_tiles.div_ceil(2) as u32, m.div_ceil(16) as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let m_tiles = m.div_ceil(16);
+        let mut w = wptr;
+        let mut bb = bptr;
+        let mut yy = yptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut nt = n_tiles as i32;
+        let mut nw = n_windows as i32;
+        let mut mt = m_tiles as i32;
+        crate::device::compute::kernel_infra::record_kernel_route("grim_grey_raven_gemm");
+        self.launch_compute_kernel(
+            "grim_grey_raven_gemm_v2",
             grid_dim,
             block_dim,
             &mut [
@@ -1860,6 +1950,54 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITE_RAVEN_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            self.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a, b_blocked, out, m, n, k)
+        } else {
+            self.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a, b_blocked, out, m, n, k)
+        }
+    }
+
+    pub fn launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(
+        &self,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_gemm_fp8_e4m3_blocked_named("grim_wmma_gemm_fp8_e4m3_blocked", a, b_blocked, out, m, n, k)
+    }
+
+    pub fn launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(
+        &self,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_gemm_fp8_e4m3_blocked_named("grim_wmma_gemm_fp8_e4m3_blocked_v2", a, b_blocked, out, m, n, k)
+    }
+
+    fn launch_wmma_gemm_fp8_e4m3_blocked_named(
+        &self,
+        kernel: &str,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         const TILE_M: usize = 16;
         const N_TILES_PER_BLOCK: usize = 2;
         let n_per_block = TILE_M * N_TILES_PER_BLOCK;
@@ -1916,8 +2054,11 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
+        if kernel == "grim_wmma_gemm_fp8_e4m3_blocked_v2" {
+            crate::device::compute::kernel_infra::record_kernel_route("grim_wmma_gemm_fp8_e4m3_blocked");
+        }
         self.launch_compute_kernel(
-            "grim_wmma_gemm_fp8_e4m3_blocked",
+            kernel,
             grid_dim,
             block_dim,
             &mut [

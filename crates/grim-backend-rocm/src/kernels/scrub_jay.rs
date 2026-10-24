@@ -100,6 +100,110 @@ extern "C" __global__ void grim_scrub_jay_gemv(
     if (lane == 0) C[col] = facc;
 }
 
+// ScrubJay v2 decode GEMV:
+// - #1: 4 columns per wave (blockIdx.x * 4), batching B_sel, B_sgn, B_scl, and
+//       B_idx loads across all 4 columns before codebook lookup and FMA.
+// - #2: 64-bit uint2 vector loads for the 8 per-block B_idx bytes (1 load instead of 8)
+//       and 128-bit float4 vector loads for activations shared across all 4 columns.
+// Preserves the exact per-lane blk and j accumulation order of v1 (0 bit diffs).
+extern "C" __global__ void __launch_bounds__(32) grim_scrub_jay_gemv_v2(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_sel,
+    const unsigned char* __restrict__ B_idx,
+    const unsigned char* __restrict__ B_sgn,
+    const float* __restrict__ B_scl,
+    float pre,
+    float* __restrict__ C,
+    int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int lane     = threadIdx.x;
+    if (col_base >= N) return;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int n_blocks    = K / GRIM_SJ_BLOCK;
+
+    const unsigned char* sel_cols[4];
+    const unsigned char* sgn_cols[4];
+    const float*         scl_cols[4];
+    const uint2*         idx_cols[4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int col = col_base + ((c < active_cols) ? c : 0);
+        sel_cols[c] = B_sel + (long long)col * n_blocks;
+        sgn_cols[c] = B_sgn + (long long)col * n_blocks;
+        scl_cols[c] = B_scl + (long long)col * n_blocks;
+        idx_cols[c] = (const uint2*)(B_idx + (long long)col * K);
+    }
+
+    const float4* a_v4 = (const float4*)A;
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_blocks; blk += 32) {
+        const float4 av0 = a_v4[blk * 2 + 0];
+        const float4 av1 = a_v4[blk * 2 + 1];
+        const float a_blk[8] = {
+            av0.x, av0.y, av0.z, av0.w,
+            av1.x, av1.y, av1.z, av1.w
+        };
+
+        unsigned char sel_c[4];
+        unsigned char sgn_c[4];
+        float         scl_c[4];
+        uint2         idx_c[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            sel_c[c] = sel_cols[c][blk];
+            sgn_c[c] = sgn_cols[c][blk];
+            scl_c[c] = scl_cols[c][blk];
+            idx_c[c] = idx_cols[c][blk];
+        }
+
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            if (c >= active_cols) break;
+            const int sel = (int)sel_c[c];
+            const unsigned sgn = (unsigned)sgn_c[c];
+            const float scl = scl_c[c] * pre;
+            const signed char* book = GRIM_SCRUB_JAY_CB + sel * 16;
+
+            const unsigned idx_lo = idx_c[c].x;
+            const unsigned idx_hi = idx_c[c].y;
+            const unsigned char b_idx[8] = {
+                (unsigned char)(idx_lo & 0xFFu),
+                (unsigned char)((idx_lo >> 8) & 0xFFu),
+                (unsigned char)((idx_lo >> 16) & 0xFFu),
+                (unsigned char)((idx_lo >> 24) & 0xFFu),
+                (unsigned char)(idx_hi & 0xFFu),
+                (unsigned char)((idx_hi >> 8) & 0xFFu),
+                (unsigned char)((idx_hi >> 16) & 0xFFu),
+                (unsigned char)((idx_hi >> 24) & 0xFFu)
+            };
+
+            float bacc = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < GRIM_SJ_BLOCK; j++) {
+                float w = (float)book[b_idx[j]];
+                if (sgn & (1u << j)) w = -w;
+                bacc += a_blk[j] * (w * scl);
+            }
+            facc[c] += bacc;
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[c] += __shfl_xor(facc[c], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < active_cols; c++)
+            C[col_base + c] = facc[c];
+    }
+}
+
 // Values per ScrubJay block.
 #define GRIM_SJ_BLOCK 8
 /// Values per launch group: one wave (32 lanes) x 4 values.

@@ -4953,6 +4953,159 @@ extern "C" __global__ void grim_dot8_w4a4_gemv(
     }
 }
 
+// WhiteCrow / CityCrow v2:
+// - #1: 4-column load batching before __builtin_amdgcn_sudot8 compute.
+// - #2: 4x K-group unroll (g + 0, 32, 64, 96) + 128-bit uint4 vector loads
+//       for activations and 64-bit uint2 vector loads for weights (8-byte
+//       alignment safe for framed OSTQuant blobs at offset +8).
+// Preserves the exact per-lane group accumulation order of v1 (0 bit diffs).
+extern "C" __global__ void __launch_bounds__(32) grim_dot8_w4a4_gemv_v2(
+    const unsigned int* __restrict__ A_codes,
+    const float* __restrict__ A_scales,
+    const int* __restrict__ A_sums,
+    const unsigned int* __restrict__ B_qweight,
+    const unsigned short* __restrict__ B_scales,
+    const unsigned char* __restrict__ B_zeros,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_groups = K / 128;
+    const unsigned int* a_codes_row = A_codes + (long long)row * n_groups * 16;
+    const float* a_scales_row = A_scales + (long long)row * n_groups;
+    const int* a_sums_row = A_sums + (long long)row * n_groups;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int words_per_col = K / 8;
+
+    const unsigned int* b_cols[4];
+    const unsigned short* b_scales_col[4];
+    const unsigned char* b_zeros_col[4];
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int col = col_base + ((j < active_cols) ? j : 0);
+        b_cols[j] = B_qweight + (long long)col * words_per_col;
+        b_scales_col[j] = B_scales + (long long)col * n_groups;
+        b_zeros_col[j] = B_zeros + (long long)col * n_groups;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    int g = lane;
+    for (; g + 96 < n_groups; g += 128) {
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int gu = g + u * 32;
+            const float d_a = a_scales_row[gu];
+            const int sum_qa = a_sums_row[gu];
+            const uint4* a_v4 = (const uint4*)(a_codes_row + gu * 16);
+            const uint4 av0 = a_v4[0];
+            const uint4 av1 = a_v4[1];
+            const uint4 av2 = a_v4[2];
+            const uint4 av3 = a_v4[3];
+            const unsigned int aw[16] = {
+                av0.x, av0.y, av0.z, av0.w,
+                av1.x, av1.y, av1.z, av1.w,
+                av2.x, av2.y, av2.z, av2.w,
+                av3.x, av3.y, av3.z, av3.w
+            };
+
+            unsigned short b_sc_raw[4];
+            unsigned char b_zr_raw[4];
+            uint2 bv[4][8];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                b_sc_raw[j] = b_scales_col[j][gu];
+                b_zr_raw[j] = b_zeros_col[j][gu];
+                const uint2* b_v2 = (const uint2*)(b_cols[j] + gu * 16);
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    bv[j][v] = b_v2[v];
+                }
+            }
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j >= active_cols) break;
+                const float d_b = grim_bf16_to_float(b_sc_raw[j]);
+                const int z_b = (int)b_zr_raw[j];
+                int iacc = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 0], false, bv[j][v].x, iacc, false);
+                    iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 1], false, bv[j][v].y, iacc, false);
+                }
+                facc[j] += d_a * d_b * (float)(iacc - z_b * sum_qa);
+            }
+        }
+    }
+
+    for (; g < n_groups; g += 32) {
+        const float d_a = a_scales_row[g];
+        const int sum_qa = a_sums_row[g];
+        const uint4* a_v4 = (const uint4*)(a_codes_row + g * 16);
+        const uint4 av0 = a_v4[0];
+        const uint4 av1 = a_v4[1];
+        const uint4 av2 = a_v4[2];
+        const uint4 av3 = a_v4[3];
+        const unsigned int aw[16] = {
+            av0.x, av0.y, av0.z, av0.w,
+            av1.x, av1.y, av1.z, av1.w,
+            av2.x, av2.y, av2.z, av2.w,
+            av3.x, av3.y, av3.z, av3.w
+        };
+
+        unsigned short b_sc_raw[4];
+        unsigned char b_zr_raw[4];
+        uint2 bv[4][8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            b_sc_raw[j] = b_scales_col[j][g];
+            b_zr_raw[j] = b_zeros_col[j][g];
+            const uint2* b_v2 = (const uint2*)(b_cols[j] + g * 16);
+            #pragma unroll
+            for (int v = 0; v < 8; v++) {
+                bv[j][v] = b_v2[v];
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d_b = grim_bf16_to_float(b_sc_raw[j]);
+            const int z_b = (int)b_zr_raw[j];
+            int iacc = 0;
+            #pragma unroll
+            for (int v = 0; v < 8; v++) {
+                iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 0], false, bv[j][v].x, iacc, false);
+                iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 1], false, bv[j][v].y, iacc, false);
+            }
+            facc[j] += d_a * d_b * (float)(iacc - z_b * sum_qa);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc[j] += __shfl_xor(facc[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 #endif // __gfx1200__ || __gfx1201__
 
 // ForestRaven decode/prefill GEMV: F32 activations quantized in-register
