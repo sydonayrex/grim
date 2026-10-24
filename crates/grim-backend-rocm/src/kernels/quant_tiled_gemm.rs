@@ -63,7 +63,7 @@ pub const IQ_Q80_TILED_KERNEL_SOURCE: &str = r#"
                         float* __restrict__ dX,                                        \
                         int M, int N, int K)                                           \
     {                                                                                  \
-        __shared__ float sW[64][64];                                                   \
+        __shared__ float sW[64][65];                                                   \
         __shared__ float sY[4][64];                                                    \
         const int k0 = blockIdx.x * 64;                                                \
         const int row0 = blockIdx.y * 4;                                               \

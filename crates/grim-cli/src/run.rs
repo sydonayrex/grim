@@ -512,6 +512,7 @@ fn try_graph_decode_step(
     // below never materializes them, so a diverging replay is invisible
     // (steps 2+ print no logprobs). GRIM_DEBUG_TOPLOGITS=1 enables.
     if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+        let _guard = grim_backend_rocm::device::util::DeviceGuard::set(0);
         // Localize the first NaN: scan each layer's graph-owned input buffer
         // (post-replay, stream synced by read paths below... sync first).
         unsafe {

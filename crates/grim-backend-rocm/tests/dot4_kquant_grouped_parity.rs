@@ -397,30 +397,30 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
         fn(&RocmDevice, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, usize, usize, usize) -> Result<*mut std::ffi::c_void, String>,
     ) = match scheme_name {
         "q4k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         "q5k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         // Q2_K: "new" is the word-wide-mask variant (the default through the
         // launcher), "ref" is the stock 4-byte-load kernel. Both are driven
         // through launchers so the grid is the dispatch's own.
         "q2k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         "iq4xs" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         "q3k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
         _ => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
             |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
         ),
     };
@@ -543,7 +543,7 @@ fn iq4xs_dot4_vs_grouped_speed_ab() -> Result<(), String> {
         };
         let bytes = (n * row_bytes) as f64;
         let t_dot4 = time_it(&|| {
-            dev.launch_dot4_iq4xs_q81_gemv_for_ab(a_r, b_r, o_r, m, n, k)
+            dev.launch_dot4_iq4xs_q81_gemv_sub_for_ab(a_r, b_r, o_r, m, n, k)
                 .map_err(|e| e.to_string())
         });
         let t_grouped = time_it(&|| {
@@ -563,4 +563,172 @@ fn iq4xs_dot4_vs_grouped_speed_ab() -> Result<(), String> {
         time_shape(n)?;
     }
     Ok(())
+}
+
+type GemvFn = fn(
+    &RocmDevice,
+    &grim_backend_rocm::RocmStorage,
+    &grim_backend_rocm::RocmStorage,
+    &grim_backend_rocm::RocmStorage,
+    usize,
+    usize,
+    usize,
+) -> grim_tensor::Result<*mut std::ffi::c_void>;
+
+/// Step 2.1 A/B: sub-block-per-lane kernels vs the retained oracle
+/// (tolerance: float association differs) + bandwidth.
+///
+/// Bandwidth is reported twice: WARM (same weights every launch, so the
+/// 32 MB Infinity Cache serves part of a 61-73 MB tensor) and COLD (launches
+/// rotate across `ROT` weight copies totalling > 240 MB, so every launch
+/// streams from DRAM). Only COLD is comparable to the DRAM spec peak.
+fn sub_lane_ab(name: &str, blk: usize, quant: fn(&[f32]) -> grim_tensor::Result<Vec<u8>>, stock: GemvFn, oracle: GemvFn, sub: GemvFn) -> Result<(), String> {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    const ROT: usize = 4;
+    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    for &(n, k, m, timed) in &[
+        (64usize, 256usize, 1usize, false),
+        (68, 1024, 1, false),
+        (68, 4096, 4, false),
+        (67, 5120, 1, false),
+        (17408, 5120, 1, true),
+        (5120, 17408, 1, true),
+    ] {
+        let row_bytes = (k / 256) * blk;
+        let mut rng = Lcg(0xC0FFEE ^ (n * 31 + k) as u64);
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let mut bq = vec![0u8; n * row_bytes];
+        for col in 0..n {
+            let w: Vec<f32> = (0..k).map(|_| rng.next_f32()).collect();
+            let p = quant(&w).map_err(|e| e.to_string())?;
+            bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
+        }
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let q81_len = m * (k / 32) * 36;
+        let q81 = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
+            .map_err(|e| e.to_string())?;
+        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81.as_ref()).unwrap(), m, k)
+            .map_err(|e| e.to_string())?;
+        let copies = if timed { ROT } else { 1 };
+        let b_sts: Vec<_> = (0..copies)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty.clone()))
+            .collect::<grim_tensor::Result<_>>()
+            .map_err(|e| e.to_string())?;
+        let o_ref = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o_new = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_r = as_rocm(q81.as_ref()).unwrap();
+        let b_rs: Vec<_> = b_sts.iter().map(|b| as_rocm(b.as_ref()).unwrap()).collect();
+        let (or_, on_) = (as_rocm(o_ref.as_ref()).unwrap(), as_rocm(o_new.as_ref()).unwrap());
+        oracle(&dev, a_r, b_rs[0], or_, m, n, k).map_err(|e| e.to_string())?;
+        sub(&dev, a_r, b_rs[0], on_, m, n, k).map_err(|e| e.to_string())?;
+        dev.synchronize();
+        let (r, s) = (f32_vec(&o_ref)?, f32_vec(&o_new)?);
+        let scale = r.iter().fold(0f32, |x, v| x.max(v.abs())).max(1e-6);
+        let worst = r.iter().zip(&s).fold(0f32, |x, (p, q)| x.max((p - q).abs())) / scale;
+        println!("{name} sub n={n} k={k} m={m}: worst rel-to-max {worst:.3e}");
+        assert!(worst < 1e-4, "{name} sub n={n} k={k} m={m}: worst rel-to-max {worst:.3e}");
+        if timed {
+            let time = |f: GemvFn, rotate: bool| {
+                for i in 0..ROT {
+                    f(&dev, a_r, b_rs[i], on_, m, n, k).unwrap();
+                }
+                dev.synchronize();
+                let iters = 48;
+                let t0 = std::time::Instant::now();
+                for i in 0..iters {
+                    let b = if rotate { b_rs[i % ROT] } else { b_rs[0] };
+                    f(&dev, a_r, b, on_, m, n, k).unwrap();
+                }
+                dev.synchronize();
+                t0.elapsed().as_secs_f64() / iters as f64
+            };
+            let gb = (n * row_bytes) as f64 / 1e9;
+            for (label, rot) in [("warm", false), ("cold", true)] {
+                let ts = time(stock, rot);
+                let tn = time(sub, rot);
+                println!(
+                    "{name} {label} n={n} k={k}: stock {:.1} us ({:.1} GB/s)  sub {:.1} us ({:.1} GB/s)  {:.2}x",
+                    ts * 1e6, gb / ts, tn * 1e6, gb / tn, ts / tn
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn q5k_sub_lane_parity_and_speed() -> Result<(), String> {
+    sub_lane_ab(
+        "q5k",
+        176,
+        grim_quant::quant_q5k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q6k_sub_lane_parity_and_speed() -> Result<(), String> {
+    sub_lane_ab(
+        "q6k",
+        210,
+        grim_quant::quant_q6k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q4k_sub_lane_parity_and_speed() -> Result<(), String> {
+    sub_lane_ab(
+        "q4k",
+        144,
+        grim_quant::quant_q4k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q3k_sub_lane_parity_and_speed() -> Result<(), String> {
+    sub_lane_ab(
+        "q3k",
+        110,
+        grim_quant::quant_q3k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn iq4xs_sub_lane_parity_and_speed() -> Result<(), String> {
+    sub_lane_ab(
+        "iq4xs",
+        136,
+        grim_quant::quant_iq4xs,
+        |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
+}
+
+#[test]
+fn q2k_sub_lane_parity_and_speed() -> Result<(), String> {
+    sub_lane_ab(
+        "q2k",
+        84,
+        grim_quant::quant_q2k,
+        |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
+    )
 }

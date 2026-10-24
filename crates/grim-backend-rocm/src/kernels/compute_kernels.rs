@@ -1754,11 +1754,11 @@ __device__ inline float dequant_fp8_e4m3(uint8_t byte) {
     int mant = byte & 0x07;
     float f;
     if (exp == 0) {
-        // subnormal: 2^(-6) * (mant / 8)
-        f = (mant / 8.0f) * 0.015625f;
+        // subnormal: 2^(-6) * (mant / 8) = mant * 2^(-9)
+        f = (float)mant * 0x1p-9f;
     } else {
-        // normal: 2^(exp - 7) * (1 + mant / 8)
-        f = (1.0f + mant / 8.0f) * powf(2.0f, (float)(exp - 7));
+        // normal: 2^(exp - 7) * (1 + mant / 8) = (8 + mant) * 2^(exp - 10)
+        f = (float)(8 + mant) * __builtin_bit_cast(float, (unsigned int)(exp - 10 + 127) << 23);
     }
     return sign ? -f : f;
 }

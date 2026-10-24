@@ -82,10 +82,8 @@ impl FusedGateUpWeights {
 
 /// Fused Q4_K Gate+Up weight blob for a local tensor-parallel shard.
 ///
-/// Q4_K dot4 kernels are not valid on RDNA3/RDNA4 because their scale
-/// shuffle is architecture-specific. This blob therefore feeds the existing
-/// view-safe Q4_K fused-dequant/WMMA path rather than enabling the unsafe
-/// dot4 route.
+/// Feeds the view-safe Q4_K fused-dequant/WMMA path. (Note: Q4_K dot4
+/// is verified functional on RDNA3/4 via tests/dot4_q4k_arch_probe.rs).
 pub struct FusedGateUpQ4KWeights {
     pub storage: RocmStorage,
     pub n_gate: usize,

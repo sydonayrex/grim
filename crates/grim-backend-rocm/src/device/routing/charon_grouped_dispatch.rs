@@ -10,6 +10,7 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
 #[cfg(feature = "training")]
+#[allow(unused_imports)]
 use crate::device::roc_device::CharonBackwardResult;
 use crate::device::roc_device::{CharonForwardStash, RocmDevice};
 use crate::memory::storage::RocmStorage;

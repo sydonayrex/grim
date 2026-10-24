@@ -5,18 +5,18 @@ pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
     __device__ inline float fp16_to_float_device(unsigned short h) {
-        unsigned int sign = (h >> 15) & 1;
-        unsigned int exp  = (h >> 10) & 0x1f;
-        unsigned int mant = h & 0x3ff;
-        if (exp == 0) {
-            if (mant == 0) return sign ? -0.0f : 0.0f;
-            float res = (float)mant / 1024.0f * 0.00006103515625f;
-            return sign ? -res : res;
-        } else if (exp == 31) {
-            return sign ? -1.0f/0.0f : 1.0f/0.0f;
+        unsigned int sign = ((unsigned int)h >> 15) & 1u;
+        unsigned int exp  = ((unsigned int)h >> 10) & 0x1Fu;
+        unsigned int mant = (unsigned int)h & 0x3FFu;
+        unsigned int bits;
+        if (exp == 0u) {
+            bits = (sign << 31) | __builtin_bit_cast(unsigned int, (float)mant * 0x1p-24f);
+        } else if (exp == 31u) {
+            bits = (sign << 31) | 0x7F800000u | (mant << 13);
+        } else {
+            bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
         }
-        float res = (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)exp - 15.0f);
-        return sign ? -res : res;
+        return __builtin_bit_cast(float, bits);
     }
 
     __device__ inline unsigned short f32_to_fp16_bits_device(float f) {
@@ -72,9 +72,9 @@ extern "C" {
         }
         float res;
         if (exp != 0) {
-            res = (1.0f + (float)mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
+            res = (float)(8 + mant) * __builtin_bit_cast(float, (unsigned int)(exp - 10 + 127) << 23);
         } else {
-            res = (float)mant / 512.0f;
+            res = (float)mant * 0x1p-9f;
         }
         return sign ? -res : res;
     }
@@ -83,14 +83,11 @@ extern "C" {
         int sign = (code >> 3) & 1;
         int exp = (code >> 1) & 3;
         int mant = code & 1;
-        float base_val = 0.0f;
-        if (exp == 0) {
-            base_val = (float)mant * 0.5f;
-        } else {
-            base_val = (1.0f + (float)mant * 0.5f) * powf(2.0f, (float)exp - 1.0f);
-        }
+        float base_val = (exp == 0) ? (float)mant * 0.5f
+                                    : (float)(2 + mant) * __builtin_bit_cast(float, (unsigned int)(exp - 2 + 127) << 23);
         if (sign) base_val = -base_val;
-        float scale = powf(2.0f, (float)shared_exp - 127.0f);
+        float scale = (shared_exp == 0) ? 0x1p-127f
+                                        : __builtin_bit_cast(float, (unsigned int)shared_exp << 23);
         return base_val * scale;
     }
 
@@ -129,18 +126,14 @@ extern "C" {
 
     __device__ inline float nutcracker_to_float_hip(unsigned char code, unsigned char scale_byte) {
         int sel = scale_byte & NUTCRACKER_SEL_MASK;
-        float scale = powf(2.0f, (float)(scale_byte >> NUTCRACKER_SEL_BITS) - (float)NUTCRACKER_SCALE_BIAS);
+        float scale = __builtin_bit_cast(float, ((unsigned int)(scale_byte >> NUTCRACKER_SEL_BITS) + 96u) << 23);
         if ((code & 0x7) == 0) {
             return nutcracker_special_value_hip(sel) * scale;
         }
         int exp = (code >> 1) & 3;
         int mant = code & 1;
-        float base_val;
-        if (exp == 0) {
-            base_val = (float)mant * 0.5f;
-        } else {
-            base_val = (1.0f + (float)mant * 0.5f) * powf(2.0f, (float)exp - 1.0f);
-        }
+        float base_val = (exp == 0) ? (float)mant * 0.5f
+                                    : (float)(2 + mant) * __builtin_bit_cast(float, (unsigned int)(exp - 2 + 127) << 23);
         if (code & 0x8) base_val = -base_val;
         return base_val * scale;
     }

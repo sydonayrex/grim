@@ -132,9 +132,7 @@ impl RocmDevice {
         // GEMV instead grows the grid by M (grid_y = M), so the extra passes are
         // L2-served while the per-tensor slice (<= 28 MB here) stays resident.
         // `dot8_w4a4_gemv_parity_multi_row` pins that M > 1 is correct.
-        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
         if m <= lane_gemm_max_m()
             && w4a4_decode
             && k % 128 == 0
@@ -603,9 +601,7 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::dtype::KQuantScheme,
     ) -> Result<Option<*mut c_void>> {
-        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
         if !w4a4_decode
             || k % 128 != 0
             || crate::quantization::w4a4_ostquant_supported(
@@ -649,9 +645,7 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::dtype::KQuantScheme,
     ) -> Result<Option<*mut c_void>> {
-        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
         // Q5K is excluded from the u4-lane GEMV at M=1. ROOT CAUSE (measured,
         // not hypothesized): there is NO functional bug in either stage. The
         // lane kernel is bit-exact against an activation-quant-aware host

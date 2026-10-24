@@ -357,7 +357,7 @@ extern "C" {
         float* __restrict__ dX,            // [M, K]
         int M, int N, int K)
     {
-        __shared__ float sW[64][64];  // [n_local][k_local] — 16 KB
+        __shared__ float sW[64][65];  // [n_local][k_local] — 16 KB + bank padding
         __shared__ float sY[4][64];   // [row][n_local] — 1 KB
 
         const int k0 = blockIdx.x * 64;

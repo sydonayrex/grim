@@ -926,17 +926,56 @@ impl QuantOps for RocmDevice {
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq4xs,
-                    true,
-                    Self::launch_fused_dequant_gemm_iq4xs,
-                )?;
+                let is_rdna2 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                );
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if (is_rdna2 || self.is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq4xs_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq4xs_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq4xs,
+                        true,
+                        Self::launch_fused_dequant_gemm_iq4xs,
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::Q80) => {
                 // Q8_0 uses the fused dequant+GEMM kernel (34-byte blocks → F32), matching
@@ -2537,6 +2576,12 @@ pub(crate) const GRIM_VOCAB_HEAD_MIN_COLS: usize = 65_536;
 /// Q8_0 as well) — grim is choosing to be exact where it is cheap to be.
 pub(crate) fn kquant_dot4_ok_for(n: usize) -> bool {
     n < GRIM_VOCAB_HEAD_MIN_COLS
+}
+
+pub(crate) fn decode_w4a4_enabled() -> bool {
+    std::env::var("GRIM_DECODE_W4A4")
+        .map(|v| v != "0" && v != "false" && v != "off")
+        .unwrap_or(true)
 }
 
 pub(crate) fn exact_decode_gemv() -> bool {

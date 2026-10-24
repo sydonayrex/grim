@@ -3410,6 +3410,7 @@ mod tests {
         d0.copy_slice_into(&src, host.as_ref(), 0, n).unwrap();
         // `hipEventCreate` is the only event constructor grim declares.
         let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
+        let _ev_guard = crate::device::util::DeviceGuard::set(0);
         assert_eq!(
             unsafe { crate::hipEventCreate(&mut ev) },
             crate::hipSuccess,

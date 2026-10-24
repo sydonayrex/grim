@@ -415,12 +415,18 @@ fn metrix_target_iq3xxs_lds() -> Result<(), String> {
     for _ in 0..3 {
         dev.launch_fused_dequant_gemm_iq3xxs_lds_for_ab(a_r, w_r, o_r, m, n, K)
             .map_err(|e| format!("launch: {e}"))?;
+        dev.launch_fused_dequant_gemm_iq3xxs_stock_for_ab(a_r, w_r, o_r, m, n, K)
+            .map_err(|e| format!("launch: {e}"))?;
     }
     for _ in 0..5 {
+        // BOTH arms per iteration so metrix can compare LDS vs stock under
+        // the same counter pass.
         dev.launch_fused_dequant_gemm_iq3xxs_lds_for_ab(a_r, w_r, o_r, m, n, K)
+            .map_err(|e| format!("launch: {e}"))?;
+        dev.launch_fused_dequant_gemm_iq3xxs_stock_for_ab(a_r, w_r, o_r, m, n, K)
             .map_err(|e| format!("launch: {e}"))?;
     }
     dev.synchronize();
-    println!("metrix target: 8 iq3xxs LDS launches done");
+    println!("metrix target: 16 iq3xxs launches (8 LDS + 8 stock) done");
     Ok(())
 }

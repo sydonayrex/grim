@@ -65,17 +65,31 @@ __global__ void grim_flash_decode_stage1(
 
         // Compute dot product Q . K[j] across threads in block
         float local_prod = (d < head_dim) ? (s_q[d] * k_tensor[kv_base + d]) : 0.0f;
-        s_dot[threadIdx.x] = local_prod;
+        // In-wave reduction via butterfly shuffle
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            local_prod += __shfl_xor(local_prod, off);
+        }
+        const int wave_id = threadIdx.x >> 5;
+        const int lane_id = threadIdx.x & 31;
+        if (lane_id == 0) {
+            s_dot[wave_id] = local_prod;
+        }
         __syncthreads();
 
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                s_dot[threadIdx.x] += s_dot[threadIdx.x + stride];
+        if (threadIdx.x < 32) {
+            const int num_waves = blockDim.x >> 5;
+            float wave_sum = (threadIdx.x < num_waves) ? s_dot[threadIdx.x] : 0.0f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                wave_sum += __shfl_xor(wave_sum, off);
             }
-            __syncthreads();
+            if (threadIdx.x == 0) {
+                s_dot[0] = wave_sum;
+            }
         }
-        float score = s_dot[0] * inv_sqrt_d;
         __syncthreads();
+        float score = s_dot[0] * inv_sqrt_d;
 
         // Online softmax update
         float new_max = max(running_max, score);

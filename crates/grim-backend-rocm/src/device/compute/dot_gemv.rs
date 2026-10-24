@@ -30,7 +30,7 @@ impl RocmDevice {
         let n_q_blocks = k / 32;
         let total_blocks = (n_q_blocks * m) as u32;
         let grid_dim = HipDim3::new(total_blocks, 1, 1);
-        let block_dim = HipDim3::new(256, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
         let mut sptr = src_ptr;
         let mut dptr = dst_ptr;
         let mut kk = k as i32;
@@ -1301,7 +1301,36 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv_fast",
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q2_K GEMV (`grim_dot4_q2k_q81_gemv_sub`).
+    pub fn launch_dot4_q2k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv_sub",
+        )
     }
 
     /// The STOCK Q2_K dot4 kernel, for A/B and as the parity oracle's
@@ -1335,19 +1364,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // The word-wide-mask unpack variant reads the four 2-bit codes of a
-        // 4-weight group with ONE 32-bit load instead of four 1-byte loads.
-        // It is bit-identical to the stock kernel by construction (the mask
-        // 0x03030303 keeps each byte's own 2-bit field for every shift in
-        // {0,2,4,6}), and the grid mapping, the accumulation order and the
-        // arithmetic are unchanged.
-        //
-        // GRIM_Q2K_DOT4_FAST=0 keeps the stock kernel reachable as an escape
-        // hatch. The parity gate
-        // (tests/dot4_kquant_grouped_parity.rs, q2k row) goes through THIS
-        // launcher, not the kernel directly, so it sees the grid the dispatch
-        // uses — the Q4_K lesson (a gate that called the kernel with its own
-        // grid stayed green while the launcher fed it half the columns).
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q2K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let fast = *FAST.get_or_init(|| {
             !matches!(
@@ -1355,7 +1378,9 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        let kernel_name = if fast {
+        let kernel_name = if sub {
+            "grim_dot4_q2k_q81_gemv_sub"
+        } else if fast {
             "grim_dot4_q2k_q81_gemv_fast"
         } else {
             "grim_dot4_q2k_q81_gemv"
@@ -1461,6 +1486,58 @@ impl RocmDevice {
         )
     }
 
+    /// Step 2.1 A/B: sub-block-per-lane IQ4_XS GEMV (`grim_dot4_iq4xs_q81_gemv_sub`).
+    pub fn launch_dot4_iq4xs_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub",
+        )
+    }
+
+    pub(crate) fn launch_dot4_iq4xs_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ4XS_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            if sub {
+                "grim_dot4_iq4xs_q81_gemv_sub"
+            } else {
+                "grim_dot4_iq4xs_q81_gemv_fast"
+            },
+        )
+    }
+
     fn launch_dot4_iq4xs_q81_gemv_with(
         &self,
         act_q81: &RocmStorage,
@@ -1520,7 +1597,36 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_fast",
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q3_K GEMV (`grim_dot4_q3k_q81_gemv_sub`).
+    pub fn launch_dot4_q3k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_sub",
+        )
     }
 
     /// The STOCK Q3_K dot4 kernel (per-byte magnitude loads), kept as the
@@ -1555,12 +1661,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // The word-wide-mask variant reads the four 2-bit magnitude codes of
-        // a 4-weight group with ONE 32-bit load instead of four 1-byte loads
-        // (bit-identical for every shift in {0,2,4,6}); the sign plane keeps
-        // its per-byte loads. GRIM_Q3K_DOT4_FAST=0 keeps the stock kernel as
-        // an escape hatch. The parity gate (tests/dot4_kquant_grouped_parity.rs,
-        // q3k row) drives BOTH sides through launchers.
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let fast = *FAST.get_or_init(|| {
             !matches!(
@@ -1568,7 +1675,9 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        let kernel_name = if fast {
+        let kernel_name = if sub {
+            "grim_dot4_q3k_q81_gemv_sub"
+        } else if fast {
             "grim_dot4_q3k_q81_gemv_fast"
         } else {
             "grim_dot4_q3k_q81_gemv"
@@ -1692,26 +1801,20 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        let kernel_name = if fast {
-            "grim_dot4_q4k_q81_gemv_fast"
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q4K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let (kernel_name, cols_per_block): (&str, u32) = if sub {
+            ("grim_dot4_q4k_q81_gemv_sub", 4)
+        } else if fast {
+            ("grim_dot4_q4k_q81_gemv_fast", 2)
         } else {
-            "grim_dot4_q4k_q81_gemv"
+            ("grim_dot4_q4k_q81_gemv", 4)
         };
-        // The grid must follow the kernel that is actually launched. The two
-        // variants cover a different number of output columns per block --
-        // the stock kernel does `col_base = blockIdx.x * 4`, the fast one
-        // `blockIdx.x * 2` -- so a grid sized for the stock kernel launched
-        // against the fast one covers only half the columns and leaves the
-        // rest of C never written.
-        //
-        // That is not a subtle numerical bug, it is why the fast variant
-        // measured 1.0 relative error on gfx1200: the unwritten half of the
-        // output reads as whatever was in the buffer, not as a slightly wrong
-        // number. The grid used to be computed as `n.div_ceil(4)` before the
-        // kernel was chosen, so GRIM_DOT4_FAST=1 silently halved the output.
-        // A test that only checked the columns the kernel did write would
-        // never have seen it; dot4_q4k_arch_probe checks all of them.
-        let cols_per_block: u32 = if fast { 2 } else { 4 };
         let grid_x = (n as u32).div_ceil(cols_per_block);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
@@ -1752,9 +1855,21 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
     }
 
+    /// Dispatch entry. Step 2.1: defaults to the sub-block-per-lane kernel
+    /// (`grim_dot4_q5k_q81_gemv_sub`, 4-8x the stock kernel on gfx1200,
+    /// tolerance-gated by `q5k_sub_lane_parity_and_speed`).
+    /// `GRIM_Q5K_SUB=0` restores the stock kernel.
     pub(crate) fn launch_dot4_q5k_q81_gemv(
         &self,
         act_q81: &RocmStorage,
@@ -1764,8 +1879,12 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(std::env::var("GRIM_Q5K_SUB").as_deref(), Ok("0" | "false" | "off"))
+        });
         self.launch_dot4_q5k_q81_gemv_named(
-            "grim_dot4_q5k_q81_gemv",
+            if sub { "grim_dot4_q5k_q81_gemv_sub" } else { "grim_dot4_q5k_q81_gemv" },
             act_q81,
             b_storage,
             out_storage,
@@ -1790,6 +1909,28 @@ impl RocmDevice {
     ) -> Result<*mut c_void> {
         self.launch_dot4_q5k_q81_gemv_named(
             "grim_dot4_q5k_q81_gemv_ref",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q5_K GEMV (`grim_dot4_q5k_q81_gemv_sub`).
+    /// Same grid/block as the stock kernel. Not on a dispatch path until measured.
+    pub fn launch_dot4_q5k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv_sub",
             act_q81,
             b_storage,
             out_storage,
@@ -1983,6 +2124,48 @@ impl RocmDevice {
         )
     }
 
+    /// Step 2.1 A/B: sub-block-per-lane Q4_K GEMV (`grim_dot4_q4k_q81_gemv_sub`).
+    pub fn launch_dot4_q4k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_sub",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// M7.2c: the RETAINED ORACLE for the Q6_K group hoist. Not on any
     /// dispatch path; only the parity gate launches it.
     pub fn launch_dot4_q6k_q81_gemv_ref_for_ab(
@@ -2042,11 +2225,49 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q6k_q81_gemv_named("grim_dot4_q6k_q81_gemv", act_q81, b_storage, out_storage, m, n, k)
     }
 
     pub(crate) fn launch_dot4_q6k_q81_gemv(
         &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(std::env::var("GRIM_Q6K_SUB").as_deref(), Ok("0" | "false" | "off"))
+        });
+        self.launch_dot4_q6k_q81_gemv_named(
+            if sub { "grim_dot4_q6k_q81_gemv_sub" } else { "grim_dot4_q6k_q81_gemv" },
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q6_K GEMV (`grim_dot4_q6k_q81_gemv_sub`).
+    pub fn launch_dot4_q6k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q6k_q81_gemv_named("grim_dot4_q6k_q81_gemv_sub", act_q81, b_storage, out_storage, m, n, k)
+    }
+
+    fn launch_dot4_q6k_q81_gemv_named(
+        &self,
+        kernel_name: &str,
         act_q81: &RocmStorage,
         b_storage: &RocmStorage,
         out_storage: &RocmStorage,
@@ -2073,7 +2294,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q6k_q81_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
