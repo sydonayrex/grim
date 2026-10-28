@@ -5383,7 +5383,6 @@ pub fn launch_qkv_attention_dev_batch_i4(
     )
 }
 
-
 /// Item 3 launcher: `grim_bump_i32`. Increments `*past_dev += steps`. Single
 /// thread; the mutable `past_dev` pointer is a graph input so each replay bumps
 /// the live counter.

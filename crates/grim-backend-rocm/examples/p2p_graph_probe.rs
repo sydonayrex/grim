@@ -12,11 +12,11 @@
 //! Prints the result so the caller can see whether the kernel actually ran on
 //! device 1 (dst == 2.0) or the process died with a page fault.
 
-use grim_backend_rocm::{
-    DeviceGuard, RocmDevice, RocmStorage, hipGraphDestroy, hipGraphExecDestroy, hipGraphInstantiate,
-    hipGraphLaunch, hipStreamBeginCapture, hipStreamEndCapture,
-};
 use grim_backend_rocm::{BackendStorage, MemoryOps};
+use grim_backend_rocm::{
+    DeviceGuard, RocmDevice, RocmStorage, hipGraphDestroy, hipGraphExecDestroy,
+    hipGraphInstantiate, hipGraphLaunch, hipStreamBeginCapture, hipStreamEndCapture,
+};
 use grim_tensor::{CoreTensorOps, DType, Shape};
 
 fn alloc(dev: &RocmDevice, n: usize) -> RocmStorage {
@@ -79,7 +79,13 @@ fn main() {
     {
         let _g = DeviceGuard::set(0);
         let r = unsafe {
-            hipGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+            hipGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         assert_eq!(r, grim_backend_rocm::hipSuccess, "instantiate: {r}");
     }

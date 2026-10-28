@@ -135,7 +135,8 @@ impl Gemma4Config {
     /// `n_layer_kv_from_start = n_layer_all - n_kv_shared_layers`
     /// (`src/models/gemma4.cpp:10`).
     pub fn n_layer_kv_from_start(&self) -> usize {
-        self.num_hidden_layers.saturating_sub(self.num_kv_shared_layers)
+        self.num_hidden_layers
+            .saturating_sub(self.num_kv_shared_layers)
     }
 
     /// The attention kind of block `il`. Defaults to sliding when the checkpoint
@@ -173,10 +174,13 @@ impl Gemma4Config {
         if il < start || start < 2 {
             return None;
         }
-        Some(start - match self.layer_type(il) {
-            Gemma4LayerType::Sliding => 2,
-            Gemma4LayerType::Full => 1,
-        })
+        Some(
+            start
+                - match self.layer_type(il) {
+                    Gemma4LayerType::Sliding => 2,
+                    Gemma4LayerType::Full => 1,
+                },
+        )
     }
 
     /// Number of rotary pairs of the full-attention "proportional" rope.
@@ -383,8 +387,16 @@ impl Gemma4Block {
             .meta("weight")
             .and_then(|m| m.shape.first().copied())
             .unwrap_or(num_kv_heads * head_dim);
-        let num_heads = if head_dim > 0 { q_dim / head_dim } else { num_heads };
-        let num_kv_heads = if head_dim > 0 { kv_dim / head_dim } else { num_kv_heads };
+        let num_heads = if head_dim > 0 {
+            q_dim / head_dim
+        } else {
+            num_heads
+        };
+        let num_kv_heads = if head_dim > 0 {
+            kv_dim / head_dim
+        } else {
+            num_kv_heads
+        };
 
         let wq = Linear::load_shape(&attn_ws.scoped("q_proj"), [cfg.hidden_size, q_dim])?;
         let wk = Linear::load_shape(&attn_ws.scoped("k_proj"), [cfg.hidden_size, kv_dim])?;
@@ -468,7 +480,10 @@ impl Gemma4Block {
         // checkpoint still carries the bare `layer_scalar`. Asking for only the
         // first finds nothing in the safetensors file and the block silently
         // loses its output scale.
-        let out_scale = match ws.meta("layer_scalar.weight").or_else(|| ws.meta("layer_scalar")) {
+        let out_scale = match ws
+            .meta("layer_scalar.weight")
+            .or_else(|| ws.meta("layer_scalar"))
+        {
             Some(_) => {
                 let t = ws
                     .get_unconstrained("layer_scalar.weight")
@@ -795,7 +810,6 @@ impl PerLayerInputs {
     }
 }
 
-
 /// Re-index the per-layer embedding from `[tokens, n_layers * width]` to
 /// layer-major `[n_layers][tokens][width]`.
 ///
@@ -866,8 +880,11 @@ impl Gemma4 {
         let (per_layer_tok_embd, per_layer_model_proj, per_layer_proj_norm) =
             if cfg.n_embd_per_layer > 0 {
                 let width = cfg.n_embd_per_layer * cfg.num_hidden_layers;
-                let embd =
-                    Embedding::load(&root.scoped("embed_tokens_per_layer"), cfg.vocab_size, width)?;
+                let embd = Embedding::load(
+                    &root.scoped("embed_tokens_per_layer"),
+                    cfg.vocab_size,
+                    width,
+                )?;
                 let proj = Linear::load_shape(
                     &root.scoped("per_layer_model_projection"),
                     [cfg.hidden_size, width],
@@ -892,10 +909,9 @@ impl Gemma4 {
         // Gemma 4 ties the output head to the token embedding
         // (`src/models/gemma4.cpp:49-55`).
         let output = match ws.scoped("lm_head").meta("weight") {
-            Some(_) => Linear::load_shape(
-                &ws.scoped("lm_head"),
-                [cfg.vocab_size, cfg.hidden_size],
-            )?,
+            Some(_) => {
+                Linear::load_shape(&ws.scoped("lm_head"), [cfg.vocab_size, cfg.hidden_size])?
+            }
             None => Linear::from_tensor(tok_embeddings.weight.clone(), None),
         };
 
@@ -995,7 +1011,9 @@ impl CausalLm for Gemma4 {
 
         // The token embedding is scaled by sqrt(hidden_size)
         // (`src/models/gemma4.cpp:164`).
-        let mut h = self.tok_embeddings.forward(&ids, tokens, self.cfg.hidden_size)?;
+        let mut h = self
+            .tok_embeddings
+            .forward(&ids, tokens, self.cfg.hidden_size)?;
         h = grim_nn::modules::mul_scalar_on_device(&h, (self.cfg.hidden_size as f32).sqrt())?;
 
         let per_layer = self.build_per_layer_inputs(&h, &ids, tokens)?;
@@ -1160,7 +1178,6 @@ mod tests {
             }
         }
     }
-
 
     /// The per-layer embedding is re-indexed to layer-major, so block `l` takes
     /// the columns `l * width .. (l + 1) * width` of every token row.

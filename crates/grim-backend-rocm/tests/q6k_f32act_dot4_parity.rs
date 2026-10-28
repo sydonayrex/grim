@@ -76,8 +76,8 @@ fn q6k_f32act_parity(k: usize, n: usize) -> Result<(), String> {
 
     let mut bq = vec![0u8; n * row_bytes];
     for col in 0..n {
-        let packed = grim_quant::quant_q6k(&b[col * k..(col + 1) * k])
-            .map_err(|e| format!("quant: {e}"))?;
+        let packed =
+            grim_quant::quant_q6k(&b[col * k..(col + 1) * k]).map_err(|e| format!("quant: {e}"))?;
         assert_eq!(packed.len(), row_bytes, "Q6_K row length");
         bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
     }
@@ -124,9 +124,7 @@ fn q6k_f32act_parity(k: usize, n: usize) -> Result<(), String> {
         "Q6_K f32act kernel produced all-zero output at k={k} n={n} — the parity \
          comparison would have been vacuous"
     );
-    println!(
-        "q6k f32act k={k:<6} n={n:<6} worst relative error {worst:.3e}"
-    );
+    println!("q6k f32act k={k:<6} n={n:<6} worst relative error {worst:.3e}");
     assert!(
         worst <= 1e-5,
         "Q6_K f32act GEMV disagrees with the dequant oracle by {worst:.3e} on {}",
@@ -173,8 +171,8 @@ fn q6k_f32act_speed_ab_head() -> Result<(), String> {
         .map_err(|e| format!("a h2d: {e}"))?;
     let mut bq = vec![0u8; n * row_bytes];
     for col in 0..n {
-        let packed = grim_quant::quant_q6k(&b[col * k..(col + 1) * k])
-            .map_err(|e| format!("quant: {e}"))?;
+        let packed =
+            grim_quant::quant_q6k(&b[col * k..(col + 1) * k]).map_err(|e| format!("quant: {e}"))?;
         bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
     }
     let b_st = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
@@ -204,8 +202,8 @@ fn q6k_f32act_speed_ab_head() -> Result<(), String> {
     let o_exact = as_rocm(out_exact.as_ref()).unwrap();
 
     // Warm-up
-        dev.launch_dot4_q6k_f32act_gemv_for_ab(a_r, b_r, o_f32act, 1, n, k)
-            .unwrap();
+    dev.launch_dot4_q6k_f32act_gemv_for_ab(a_r, b_r, o_f32act, 1, n, k)
+        .unwrap();
     dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k)
         .unwrap();
     dev.synchronize();
@@ -221,10 +219,12 @@ fn q6k_f32act_speed_ab_head() -> Result<(), String> {
     }
 
     let t_f32act = time_it(&dev, || {
-        dev.launch_dot4_q6k_f32act_gemv_for_ab(a_r, b_r, o_f32act, 1, n, k).unwrap();
+        dev.launch_dot4_q6k_f32act_gemv_for_ab(a_r, b_r, o_f32act, 1, n, k)
+            .unwrap();
     });
     let t_exact = time_it(&dev, || {
-        dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k).unwrap();
+        dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k)
+            .unwrap();
     });
 
     let bytes = (n * row_bytes) as f64;
@@ -245,6 +245,9 @@ fn q6k_f32act_speed_ab_head() -> Result<(), String> {
         max_abs_diff = max_abs_diff.max((got_f32act[col] - got_exact[col]).abs());
     }
     println!("q6k f32act vs exact max|abs diff| at n={n}: {max_abs_diff:.3e}");
-    assert!(max_abs_diff <= 0.1, "f32act and exact disagree by {max_abs_diff:.3e}");
+    assert!(
+        max_abs_diff <= 0.1,
+        "f32act and exact disagree by {max_abs_diff:.3e}"
+    );
     Ok(())
 }

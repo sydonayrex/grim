@@ -414,10 +414,31 @@ impl Lfm2 {
         let mut emit_last: u32 = u32::MAX;
         let emitting = graph.emitter.is_some() && graph.capturing;
         if emitting {
-            let seg0 = graph.segments.first().map(|s| s.device).unwrap_or(dev.ordinal());
+            let seg0 = graph
+                .segments
+                .first()
+                .map(|s| s.device)
+                .unwrap_or(dev.ordinal());
             emit_last = graph.emit_node(
                 grim_backend_rocm::task_graph::op::ELEMENTWISE,
-                [hidden as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [
+                    hidden as u32,
+                    batch as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
                 &[
                     (
                         graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0),
@@ -573,11 +594,7 @@ impl Lfm2 {
                     }
                     None => (
                         [0u32; 16],
-                        (
-                            0u64,
-                            0u64,
-                            grim_backend_rocm::task_graph::arg_role::SCRATCH,
-                        ),
+                        (0u64, 0u64, grim_backend_rocm::task_graph::arg_role::SCRATCH),
                     ),
                 };
                 emit_last = graph.emit_node(
@@ -659,11 +676,7 @@ impl Lfm2 {
                 ),
                 None => (
                     [0u32; 16],
-                    (
-                        0u64,
-                        0u64,
-                        grim_backend_rocm::task_graph::arg_role::SCRATCH,
-                    ),
+                    (0u64, 0u64, grim_backend_rocm::task_graph::arg_role::SCRATCH),
                 ),
             };
             let _ = graph.emit_node(

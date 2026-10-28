@@ -9,8 +9,8 @@
 //! Run: HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm
 //!      --test dot4_q4k_dmmv_ab -- --nocapture --test-threads=1
 
-use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::as_rocm;
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
 use std::panic;
 
@@ -71,9 +71,8 @@ fn run_case(m: usize, n: usize, check_gate: bool) -> Result<(), String> {
                 a_q81[base + 1] = ((bits >> 8) & 0xFF) as u8;
                 let mut sum = 0i32;
                 for j in 0..32 {
-                    let code = ((a[row * K + blk * 32 + j] / d)
-                        .round()
-                        .clamp(-127.0, 127.0) as i8) as u8;
+                    let code =
+                        ((a[row * K + blk * 32 + j] / d).round().clamp(-127.0, 127.0) as i8) as u8;
                     a_q81[base + 4 + j] = code;
                     sum += code as i8 as i32;
                 }
@@ -191,26 +190,32 @@ fn run_case(m: usize, n: usize, check_gate: bool) -> Result<(), String> {
                 got_rows[0], got_rows[n], got_dmmv[0], got_dmmv[n]
             );
         } else {
-            eprintln!("[dmmv-gate] per-row diffs: {per_row:?}  dmmv[0][0]={}", got_dmmv[0]);
+            eprintln!(
+                "[dmmv-gate] per-row diffs: {per_row:?}  dmmv[0][0]={}",
+                got_dmmv[0]
+            );
         }
         for r in 0..m {
             for rr in 0..m {
-                let same = (0..4).all(|c| {
-                    got_rows[r * n + c].to_bits() == got_dmmv[rr * n + c].to_bits()
-                });
+                let same =
+                    (0..4).all(|c| got_rows[r * n + c].to_bits() == got_dmmv[rr * n + c].to_bits());
                 if same {
                     eprintln!("[dmmv-gate] dmmv row {rr} matches single-row row {r}");
                 }
             }
         }
         assert_eq!(
-            differing, 0,
+            differing,
+            0,
             "q4k DMMV is not byte-identical to the single-row launches at M={m} n={n}: \
              {differing}/{} differ, first {first:?}",
             got_rows.len(),
             first = first
         );
-        println!("q4k dmmv M={m} n={n}: BYTE-IDENTICAL to {} single-row launches", m);
+        println!(
+            "q4k dmmv M={m} n={n}: BYTE-IDENTICAL to {} single-row launches",
+            m
+        );
     }
 
     // A/B: dmmv(1 launch) vs M fast launches.

@@ -25,8 +25,8 @@
 //! `HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 \
 //!  cargo test -p grim-cli --test llama_q41_task_graph -- --nocapture --test-threads=1`
 
-use grim_models_transformer::decode_graph::DecodeGraphModel;
 use grim_models_transformer::Llama;
+use grim_models_transformer::decode_graph::DecodeGraphModel;
 use grim_tensor::{CoreTensorOps, Device, Shape, Tensor};
 
 /// The named condition-1 proof vehicle, relative to the workspace root.
@@ -86,7 +86,10 @@ fn tensor_on(dev: &Device, data: Vec<f32>, shape: Shape) -> Tensor {
 fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
     let scale = a
         .iter()
-        .fold(0.0f32, |m, x| if x.is_finite() { m.max(x.abs()) } else { m })
+        .fold(
+            0.0f32,
+            |m, x| if x.is_finite() { m.max(x.abs()) } else { m },
+        )
         .max(1e-6);
     let mut worst = (0.0f32, 0usize, 0.0f32);
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -102,7 +105,10 @@ fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
 
 #[test]
 fn llama_q41_loads_emits_and_replays_like_eager() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the Llama Q4_1 task-graph gate");
         return;
     }
@@ -180,7 +186,11 @@ fn llama_q41_loads_emits_and_replays_like_eager() {
         1 + LAYERS * 2 + 2,
         "node count (1 embed + {LAYERS} x (attn + ffn) + norm + head): {ops:?}"
     );
-    assert_eq!(ops[0], op::ELEMENTWISE, "first node is the embedding gather");
+    assert_eq!(
+        ops[0],
+        op::ELEMENTWISE,
+        "first node is the embedding gather"
+    );
     for li in 0..LAYERS {
         assert_eq!(ops[1 + li * 2], op::ATTENTION, "layer {li} block op");
         assert_eq!(ops[2 + li * 2], op::GEMM, "layer {li} FFN op");
@@ -213,55 +223,110 @@ fn llama_q41_loads_emits_and_replays_like_eager() {
         .reset_for_replay()
         .expect("reset replay state");
 
-    eprintln!("[addr-scan] token_ids_dev = 0x{:x}", graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0));
-    eprintln!("[addr-scan] pos_dev = 0x{:x}", graph.buffers.pos_dev.device_ptr_u64().unwrap_or(0));
-    eprintln!("[addr-scan] head_input = 0x{:x}", graph.buffers.head_input.device_ptr_u64().unwrap_or(0));
-    eprintln!("[addr-scan] head_output = 0x{:x}", graph.buffers.head_output.device_ptr_u64().unwrap_or(0));
+    eprintln!(
+        "[addr-scan] token_ids_dev = 0x{:x}",
+        graph.buffers.token_ids_dev.device_ptr_u64().unwrap_or(0)
+    );
+    eprintln!(
+        "[addr-scan] pos_dev = 0x{:x}",
+        graph.buffers.pos_dev.device_ptr_u64().unwrap_or(0)
+    );
+    eprintln!(
+        "[addr-scan] head_input = 0x{:x}",
+        graph.buffers.head_input.device_ptr_u64().unwrap_or(0)
+    );
+    eprintln!(
+        "[addr-scan] head_output = 0x{:x}",
+        graph.buffers.head_output.device_ptr_u64().unwrap_or(0)
+    );
     for (i, b) in graph.buffers.layer_input.iter().enumerate() {
-        eprintln!("[addr-scan] layer_input[{i}] = 0x{:x} len={}", b.device_ptr_u64().unwrap_or(0), b.bytes());
+        eprintln!(
+            "[addr-scan] layer_input[{i}] = 0x{:x} len={}",
+            b.device_ptr_u64().unwrap_or(0),
+            b.bytes()
+        );
     }
     for (i, b) in graph.buffers.norm_buf.iter().enumerate() {
-        eprintln!("[addr-scan] norm_buf[{i}] = 0x{:x} len={}", b.device_ptr_u64().unwrap_or(0), b.bytes());
+        eprintln!(
+            "[addr-scan] norm_buf[{i}] = 0x{:x} len={}",
+            b.device_ptr_u64().unwrap_or(0),
+            b.bytes()
+        );
     }
     for (i, b) in graph.buffers.k_arena.iter().enumerate() {
-        eprintln!("[addr-scan] k_arena[{i}] = 0x{:x} len={}", b.device_ptr_u64().unwrap_or(0), b.bytes());
+        eprintln!(
+            "[addr-scan] k_arena[{i}] = 0x{:x} len={}",
+            b.device_ptr_u64().unwrap_or(0),
+            b.bytes()
+        );
     }
     for (i, b) in graph.buffers.v_arena.iter().enumerate() {
-        eprintln!("[addr-scan] v_arena[{i}] = 0x{:x} len={}", b.device_ptr_u64().unwrap_or(0), b.bytes());
+        eprintln!(
+            "[addr-scan] v_arena[{i}] = 0x{:x} len={}",
+            b.device_ptr_u64().unwrap_or(0),
+            b.bytes()
+        );
     }
     for (i, b) in graph.buffers.act_q81_buf.iter().enumerate() {
-        eprintln!("[addr-scan] act_q81_buf[{i}] = 0x{:x} len={}", b.device_ptr_u64().unwrap_or(0), b.bytes());
+        eprintln!(
+            "[addr-scan] act_q81_buf[{i}] = 0x{:x} len={}",
+            b.device_ptr_u64().unwrap_or(0),
+            b.bytes()
+        );
     }
     let llama_ref: Option<&Llama> = lm.as_any().downcast_ref::<Llama>().or_else(|| {
-        lm.as_any().downcast_ref::<grim_models_transformer::smollm2::SmolLm2>().map(|s| &s.inner)
+        lm.as_any()
+            .downcast_ref::<grim_models_transformer::smollm2::SmolLm2>()
+            .map(|s| &s.inner)
     });
     if let Some(l) = llama_ref {
         let t_s = l.tok_embeddings.weight.storage();
-        let rocm_s = t_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>();
-        eprintln!("[addr-scan] tok_embeddings.weight = 0x{:x} bytes={}", rocm_s.and_then(|s| s.device_ptr_u64()).unwrap_or(0), rocm_s.map(|s| s.bytes()).unwrap_or(0));
+        let rocm_s = t_s
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>();
+        eprintln!(
+            "[addr-scan] tok_embeddings.weight = 0x{:x} bytes={}",
+            rocm_s.and_then(|s| s.device_ptr_u64()).unwrap_or(0),
+            rocm_s.map(|s| s.bytes()).unwrap_or(0)
+        );
         let o_s = l.output.weight().storage();
-        let rocm_o = o_s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>();
-        eprintln!("[addr-scan] output.weight = 0x{:x} bytes={}", rocm_o.and_then(|s| s.device_ptr_u64()).unwrap_or(0), rocm_o.map(|s| s.bytes()).unwrap_or(0));
+        let rocm_o = o_s
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>();
+        eprintln!(
+            "[addr-scan] output.weight = 0x{:x} bytes={}",
+            rocm_o.and_then(|s| s.device_ptr_u64()).unwrap_or(0),
+            rocm_o.map(|s| s.bytes()).unwrap_or(0)
+        );
         for (i, layer) in l.layers.iter().enumerate() {
             let pr = |name: &str, t: &grim_tensor::Tensor| {
                 let s = t.storage();
                 let rocm = s.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>();
                 if let Some(r) = rocm {
                     let ptr = r.device_ptr_u64().unwrap_or(0);
-                    eprintln!("[addr-scan] L{i}.{name} = 0x{:x}..0x{:x} ({} B)", ptr, ptr + r.bytes() as u64, r.bytes());
+                    eprintln!(
+                        "[addr-scan] L{i}.{name} = 0x{:x}..0x{:x} ({} B)",
+                        ptr,
+                        ptr + r.bytes() as u64,
+                        r.bytes()
+                    );
                 }
             };
             pr("wq", layer.wq.weight());
             pr("wk", layer.wk.weight());
             pr("wv", layer.wv.weight());
             pr("wo", layer.wo.weight());
-            if let Some(wg) = &layer.w_gate { pr("w_gate", wg.weight()); }
-            if let Some(wu) = &layer.w_up { pr("w_up", wu.weight()); }
-            if let Some(wd) = &layer.w_down { pr("w_down", wd.weight()); }
+            if let Some(wg) = &layer.w_gate {
+                pr("w_gate", wg.weight());
+            }
+            if let Some(wu) = &layer.w_up {
+                pr("w_up", wu.weight());
+            }
+            if let Some(wd) = &layer.w_down {
+                pr("w_down", wd.weight());
+            }
         }
-
     }
-
 
     // ── Gate 3: replay tracks eager.
     let mut got = Vec::new();
@@ -286,11 +351,7 @@ fn llama_q41_loads_emits_and_replays_like_eager() {
             v.iter()
                 .enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                    if x > bv {
-                        (i, x)
-                    } else {
-                        (bi, bv)
-                    }
+                    if x > bv { (i, x) } else { (bi, bv) }
                 })
         };
         let (ea, ev) = argmax(a);

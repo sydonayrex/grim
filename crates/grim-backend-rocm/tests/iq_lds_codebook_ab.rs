@@ -10,8 +10,8 @@
 //! Run: HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm
 //!      --test iq_lds_codebook_ab -- --nocapture --test-threads=1
 
-use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::as_rocm;
 use grim_tensor::{ArithType, BackendStorage, DType, KQuantScheme, MemoryOps, Shape, Storage};
 use std::panic;
 
@@ -135,7 +135,8 @@ fn run_case(
         }
     }
     assert_eq!(
-        differing, 0,
+        differing,
+        0,
         "{scheme_name} LDS variant is not byte-identical to the production grouped kernel at \
          n={n}: {differing}/{} differ, first {first:?}",
         got_stock.len(),
@@ -198,12 +199,7 @@ fn run_case(
 #[test]
 fn iq_lds_codebook_ab() -> Result<(), String> {
     for n in [4096usize, 17408usize] {
-        run_case(
-            "iq3xxs",
-            KQuantScheme::IQ3XXS,
-            grim_quant::quant_iq3xxs,
-            n,
-        )?;
+        run_case("iq3xxs", KQuantScheme::IQ3XXS, grim_quant::quant_iq3xxs, n)?;
         run_case("iq3s", KQuantScheme::IQ3S, grim_quant::quant_iq3s, n)?;
         run_case("iq2s", KQuantScheme::IQ2S, grim_quant::quant_iq2s, n)?;
     }
@@ -223,7 +219,13 @@ fn iq_lds_block_sweep() -> Result<(), String> {
     };
     let m = 1usize;
     let n = 4096usize;
-    let cases: [(KQuantScheme, &str, &str, &str, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>); 3] = [
+    let cases: [(
+        KQuantScheme,
+        &str,
+        &str,
+        &str,
+        fn(&[f32]) -> grim_tensor::Result<Vec<u8>>,
+    ); 3] = [
         (
             KQuantScheme::IQ3XXS,
             "iq3xxs",
@@ -256,7 +258,9 @@ fn iq_lds_block_sweep() -> Result<(), String> {
             sseed ^= sseed << 5;
             sseed
         };
-        let vals: Vec<f32> = (0..n * K).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+        let vals: Vec<f32> = (0..n * K)
+            .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+            .collect();
         let packed = quant(&vals).map_err(|e| format!("quant: {e}"))?;
         let w_st = MemoryOps::from_cpu_bytes(
             &dev,
@@ -297,20 +301,38 @@ fn iq_lds_block_sweep() -> Result<(), String> {
         let out_ref = mk_out()?;
         match name {
             "iq3xxs" => dev
-                .launch_fused_dequant_gemm_iq3xxs_stock_for_ab(a_r, w_r, as_rocm(out_ref.as_ref()).unwrap(), m, n, K)
+                .launch_fused_dequant_gemm_iq3xxs_stock_for_ab(
+                    a_r,
+                    w_r,
+                    as_rocm(out_ref.as_ref()).unwrap(),
+                    m,
+                    n,
+                    K,
+                )
                 .map_err(|e| e.to_string())?,
             "iq3s" => dev
-                .launch_fused_dequant_gemm_iq3s_stock_for_ab(a_r, w_r, as_rocm(out_ref.as_ref()).unwrap(), m, n, K)
+                .launch_fused_dequant_gemm_iq3s_stock_for_ab(
+                    a_r,
+                    w_r,
+                    as_rocm(out_ref.as_ref()).unwrap(),
+                    m,
+                    n,
+                    K,
+                )
                 .map_err(|e| e.to_string())?,
             _ => dev
-                .launch_fused_dequant_gemm_iq2s_stock_for_ab(a_r, w_r, as_rocm(out_ref.as_ref()).unwrap(), m, n, K)
+                .launch_fused_dequant_gemm_iq2s_stock_for_ab(
+                    a_r,
+                    w_r,
+                    as_rocm(out_ref.as_ref()).unwrap(),
+                    m,
+                    n,
+                    K,
+                )
                 .map_err(|e| e.to_string())?,
         };
         dev.synchronize();
-        let ref_bits: Vec<u32> = f32_vec(&out_ref)?
-            .iter()
-            .map(|f| f.to_bits())
-            .collect();
+        let ref_bits: Vec<u32> = f32_vec(&out_ref)?.iter().map(|f| f.to_bits()).collect();
 
         for kernel in [lds_kernel, stock_kernel] {
             let mut line = format!("{name} {kernel}:");
@@ -334,10 +356,20 @@ fn iq_lds_block_sweep() -> Result<(), String> {
                     .iter()
                     .zip(ref_bits.iter())
                     .all(|(x, y)| x.to_bits() == *y);
-                assert!(same, "{name} {kernel} bs={bs}: NOT byte-identical to the 256-thread reference");
+                assert!(
+                    same,
+                    "{name} {kernel} bs={bs}: NOT byte-identical to the 256-thread reference"
+                );
                 for _ in 0..3 {
                     dev.launch_fused_deq_gemm_simple_block_for_ab(
-                        kernel, a_r, w_r, as_rocm(out.as_ref()).unwrap(), m, n, K, bs,
+                        kernel,
+                        a_r,
+                        w_r,
+                        as_rocm(out.as_ref()).unwrap(),
+                        m,
+                        n,
+                        K,
+                        bs,
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -345,7 +377,14 @@ fn iq_lds_block_sweep() -> Result<(), String> {
                 let t0 = std::time::Instant::now();
                 for _ in 0..50 {
                     dev.launch_fused_deq_gemm_simple_block_for_ab(
-                        kernel, a_r, w_r, as_rocm(out.as_ref()).unwrap(), m, n, K, bs,
+                        kernel,
+                        a_r,
+                        w_r,
+                        as_rocm(out.as_ref()).unwrap(),
+                        m,
+                        n,
+                        K,
+                        bs,
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -377,7 +416,9 @@ fn metrix_target_iq3xxs_lds() -> Result<(), String> {
         sseed ^= sseed << 5;
         sseed
     };
-    let vals: Vec<f32> = (0..n * K).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+    let vals: Vec<f32> = (0..n * K)
+        .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+        .collect();
     let packed = grim_quant::quant_iq3xxs(&vals).map_err(|e| format!("quant: {e}"))?;
     let w_st = MemoryOps::from_cpu_bytes(
         &dev,

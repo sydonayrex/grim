@@ -10,8 +10,8 @@
 //! Run: HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm
 //!      --test wmma_i8_probe -- --nocapture --test-threads=1
 
-use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::as_rocm;
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
 use std::panic;
 
@@ -167,25 +167,32 @@ fn run(m: usize, n: usize, k: usize, check_exact: bool) -> Result<(), String> {
                 }
             }
         }
-        assert_eq!(bad, 0, "iu8 mtile not bit-identical at {m}x{n}x{k}: {bad} differ");
+        assert_eq!(
+            bad, 0,
+            "iu8 mtile not bit-identical at {m}x{n}x{k}: {bad} differ"
+        );
     }
 
     // Rate: 5 warmup + 30 timed, both variants.
     let time = |mtile: bool| -> f64 {
         for _ in 0..5 {
             if mtile {
-                dev.launch_wmma_gemm_iu8_mtile_for_ab(a_r, b_r, d_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_iu8_mtile_for_ab(a_r, b_r, d_r, m, n, k)
+                    .unwrap();
             } else {
-                dev.launch_wmma_gemm_iu8_for_ab(a_r, b_r, d_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_iu8_for_ab(a_r, b_r, d_r, m, n, k)
+                    .unwrap();
             }
         }
         dev.synchronize();
         let t0 = std::time::Instant::now();
         for _ in 0..30 {
             if mtile {
-                dev.launch_wmma_gemm_iu8_mtile_for_ab(a_r, b_r, d_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_iu8_mtile_for_ab(a_r, b_r, d_r, m, n, k)
+                    .unwrap();
             } else {
-                dev.launch_wmma_gemm_iu8_for_ab(a_r, b_r, d_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_iu8_for_ab(a_r, b_r, d_r, m, n, k)
+                    .unwrap();
             }
         }
         dev.synchronize();

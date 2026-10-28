@@ -212,9 +212,44 @@ fn resolve_tp_ordinal() -> Result<(Option<usize>, Option<Vec<usize>>)> {
     Ok((Some(my_ordinal), Some(all_ordinals)))
 }
 
+/// Sort discrete ROCm devices by measured effective DRAM bandwidth descending.
+/// Pure helper for testability and ordinal fallback on invalid measurements.
+pub fn sort_devices_by_bandwidth(devices: &mut [Device], caps: &[(usize, f32)]) {
+    if devices.len() < 2 {
+        return;
+    }
+    let mut bws = Vec::with_capacity(devices.len());
+    for d in devices.iter() {
+        if let Device::Rocm(ord) = d {
+            let bw = caps
+                .iter()
+                .find(|(o, _)| o == ord)
+                .map(|(_, b)| *b)
+                .unwrap_or(0.0);
+            if !(bw > 0.0 && bw.is_finite()) {
+                eprintln!("[placement] WARNING: bandwidth unmeasured, keeping ordinal order");
+                return;
+            }
+            bws.push((bw, d.clone()));
+        } else {
+            return;
+        }
+    }
+    // Stable sort descending by bandwidth
+    bws.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, (_, dev)) in bws.into_iter().enumerate() {
+        devices[i] = dev;
+    }
+}
+
 /// Resolve discrete ROCm GPUs (honoring `GRIM_GPUS` and taking only dedicated GPUs 0 and 1,
 /// strictly excluding integrated APU devices).
 pub fn resolve_discrete_rocm_devices(fallback: &Device) -> Vec<Device> {
+    static CACHED_SORTED: std::sync::OnceLock<Vec<Device>> = std::sync::OnceLock::new();
+    if let Some(cached) = CACHED_SORTED.get() {
+        return cached.clone();
+    }
+
     if let Ok(val) = std::env::var("GRIM_GPUS") {
         let explicit: Vec<Device> = val
             .split(',')
@@ -222,17 +257,32 @@ pub fn resolve_discrete_rocm_devices(fallback: &Device) -> Vec<Device> {
             .map(Device::Rocm)
             .collect();
         if !explicit.is_empty() {
+            let _ = CACHED_SORTED.set(explicit.clone());
             return explicit;
         }
     }
 
     if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-        let discrete: Vec<Device> = rocm_devices
+        let mut discrete: Vec<Device> = rocm_devices
             .iter()
             .take(2)
             .map(|d| Device::Rocm(d.ordinal()))
             .collect();
         if !discrete.is_empty() && !fallback.is_cpu() {
+            if matches!(
+                std::env::var("GRIM_PLACE_FASTEST_PRIMARY").as_deref(),
+                Ok("1" | "true" | "on")
+            ) && discrete.len() >= 2
+            {
+                let profiler = grim_backend_rocm::CapabilityProfiler::new();
+                let caps_snapshot = profiler.capabilities();
+                let caps: Vec<(usize, f32)> = caps_snapshot
+                    .iter()
+                    .map(|c| (c.ordinal, c.dram_bandwidth_gbps * (1.0 - c.throttle_pct)))
+                    .collect();
+                sort_devices_by_bandwidth(&mut discrete, &caps);
+            }
+            let _ = CACHED_SORTED.set(discrete.clone());
             return discrete;
         }
     }
@@ -1301,9 +1351,9 @@ fn gemma4_config_from_hf(config: &SafetensorsConfig) -> Gemma4Config {
         num_hidden_layers: n_layers,
         num_attention_heads: config.num_attention_heads.unwrap_or(8),
         num_key_value_heads: config.num_key_value_heads.unwrap_or(1),
-        num_key_value_heads_full: config.num_global_key_value_heads.unwrap_or_else(|| {
-            config.num_key_value_heads.unwrap_or(1)
-        }),
+        num_key_value_heads_full: config
+            .num_global_key_value_heads
+            .unwrap_or_else(|| config.num_key_value_heads.unwrap_or(1)),
         head_dim: head_dim_swa,
         head_dim_full,
         intermediate_size: config.intermediate_size.unwrap_or(config.hidden_size * 4),
@@ -1333,7 +1383,12 @@ fn load_model_from_config(
     let arch_str = config
         .model_type
         .clone()
-        .or_else(|| config.architectures.clone().and_then(|a| a.first().cloned()))
+        .or_else(|| {
+            config
+                .architectures
+                .clone()
+                .and_then(|a| a.first().cloned())
+        })
         .ok_or_else(|| Error::Config("config.json missing model_type or architectures".into()))?;
     let model_arch = ModelArchitecture::from_str(&arch_str);
 
@@ -1344,7 +1399,6 @@ fn load_model_from_config(
     let vocab_size = config.vocab_size;
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
-
 
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
     // Qwen3.5/3.8 ships a multi-token-prediction head as a trailing layer and
@@ -1358,8 +1412,10 @@ fn load_model_from_config(
     // the reference never applies, immediately before the output projection.
     // Detected structurally from the `nextn.*` tensors rather than hardcoded, so
     // it follows the checkpoint instead of a magic 64.
-    let num_layers =
-        qwen35_forward_layer_count(provider.tensor_names().iter().map(|s| s.as_str()), num_layers);
+    let num_layers = qwen35_forward_layer_count(
+        provider.tensor_names().iter().map(|s| s.as_str()),
+        num_layers,
+    );
     let num_heads = config.num_attention_heads.unwrap_or(32);
     let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
     let head_dim = config
@@ -1429,9 +1485,10 @@ fn load_model_from_config(
     // checkpoint also carries a vision and an audio tower), so the provider
     // rewrites the text-model names.
     let gemma4_provider = if model_arch == ModelArchitecture::Gemma4 {
-        Some(RemappingTensorProvider::new(provider, |name: &str| -> String {
-            gemma4_safetensors_name(name)
-        }))
+        Some(RemappingTensorProvider::new(
+            provider,
+            |name: &str| -> String { gemma4_safetensors_name(name) },
+        ))
     } else {
         None
     };
@@ -1605,6 +1662,7 @@ fn load_model_from_config(
             } else {
                 tp
             };
+            let qwen_primary = devices.first().cloned().unwrap_or_else(|| device.clone());
             let qwen35_cfg = Qwen35Config {
                 vocab_size,
                 hidden_size,
@@ -1637,7 +1695,7 @@ fn load_model_from_config(
                 devices,
             };
             log::info!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
-            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, qwen_tp)?;
+            let m = Qwen35::load_tp(qwen_primary, &ws, qwen35_cfg, qwen_tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -1720,7 +1778,7 @@ fn load_model_from_config(
                     beta_fast: 32.0,
                     beta_slow: 1.0,
                     attention_factor: 1.277_258_9,
-            rope_mscale: None,
+                    rope_mscale: None,
                 }),
             };
             log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -3067,8 +3125,8 @@ fn load_model_from_config(
                 // This arm is the safetensors/config.json path - yarn comes from the HF `rope_scaling` block (mirrors qwen35moe arms above).
                 // The GGUF path reads the dotted metadata keys via `parse_yarn_scaling_gguf` instead.
                 yarn: parse_yarn_scaling(&config.rope_scaling),
-            norm_kind: norm_kind_for(model_arch),
-..Default::default()
+                norm_kind: norm_kind_for(model_arch),
+                ..Default::default()
             };
             log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
@@ -3182,8 +3240,8 @@ fn load_model_from_config(
 
                 partial_rotary_factor: 1.0,
                 yarn: None,
-            norm_kind: norm_kind_for(model_arch),
-..Default::default()
+                norm_kind: norm_kind_for(model_arch),
+                ..Default::default()
             };
             let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -3211,7 +3269,10 @@ fn load_model_with_providers(
 
     let lookup = GgufMetadataLookup(provider);
     if std::env::var_os("GRIM_LOADER_TRACE").is_some() {
-        eprintln!("[loader-trace] arch_str={arch_str:?} -> {:?}", ModelArchitecture::from_str(arch_str));
+        eprintln!(
+            "[loader-trace] arch_str={arch_str:?} -> {:?}",
+            ModelArchitecture::from_str(arch_str)
+        );
     }
     let mut model_arch = ModelArchitecture::from_str(arch_str);
     if model_arch == ModelArchitecture::Llama {
@@ -3602,6 +3663,10 @@ fn load_model_with_providers(
             } else {
                 tp
             };
+            let qwen_primary = qwen_devices
+                .first()
+                .cloned()
+                .unwrap_or_else(|| device.clone());
             let qwen35_cfg = Qwen35Config {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -3671,7 +3736,7 @@ fn load_model_with_providers(
                 "[grim] Loading Qwen3.5/3.8 model with config: {:?}",
                 qwen35_cfg
             );
-            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, qwen_tp)?;
+            let m = Qwen35::load_tp(qwen_primary, &ws, qwen35_cfg, qwen_tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -3751,7 +3816,7 @@ fn load_model_with_providers(
                     beta_fast: 32.0,
                     beta_slow: 1.0,
                     attention_factor: 1.277_258_9,
-            rope_mscale: None,
+                    rope_mscale: None,
                 }),
             };
             log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -4541,13 +4606,12 @@ fn load_model_with_providers(
             // attention logit is ~2x off.
             let rope_yarn = match lookup.get_str("xing4_0.rope.scaling.type") {
                 Some(t) if t.eq_ignore_ascii_case("yarn") => {
-                    let factor = lookup
-                        .get_f32("xing4_0.rope.scaling.factor")
-                        .unwrap_or(8.0);
+                    let factor = lookup.get_f32("xing4_0.rope.scaling.factor").unwrap_or(8.0);
                     if factor > 0.0 {
                         let original_max_pos = lookup
                             .get_u32("xing4_0.rope.scaling.original_context_length")
-                            .unwrap_or(4096) as usize;
+                            .unwrap_or(4096)
+                            as usize;
                         let beta_fast = lookup
                             .get_f32("xing4_0.rope.scaling.yarn_beta_fast")
                             .unwrap_or(32.0);
@@ -5346,8 +5410,8 @@ fn load_model_with_providers(
 
                 partial_rotary_factor: 1.0,
                 yarn: parse_yarn_scaling_gguf(&lookup),
-            norm_kind: norm_kind_for(model_arch),
-..Default::default()
+                norm_kind: norm_kind_for(model_arch),
+                ..Default::default()
             };
             log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
@@ -5370,8 +5434,7 @@ fn load_model_with_providers(
                     m.layers.len()
                 );
                 for layer in m.layers.iter_mut() {
-                    *layer =
-                        std::mem::replace(layer, layer.clone()).with_parallel_residual();
+                    *layer = std::mem::replace(layer, layer.clone()).with_parallel_residual();
                 }
             }
             // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
@@ -5943,7 +6006,10 @@ mod tests {
             self.f32s.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
         fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
-            self.bools.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            self.bools
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         }
     }
 
@@ -6076,8 +6142,8 @@ mod tests {
     ///   * block 2 is DOUBLE WIDE (its FFN is 2x the others) - the rule that
     ///     fires at the KV-share boundary.
     #[test]
-    fn gemma4_safetensors_path_loads_and_runs() -> std::result::Result<(), Box<dyn std::error::Error>>
-    {
+    fn gemma4_safetensors_path_loads_and_runs()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
 
         use grim_tensor::CoreTensorOps;
@@ -6136,13 +6202,22 @@ mod tests {
             add(format!("{p}input_layernorm.weight"), vec![hidden]);
             add(format!("{p}post_attention_layernorm.weight"), vec![hidden]);
             add(format!("{p}pre_feedforward_layernorm.weight"), vec![hidden]);
-            add(format!("{p}post_feedforward_layernorm.weight"), vec![hidden]);
+            add(
+                format!("{p}post_feedforward_layernorm.weight"),
+                vec![hidden],
+            );
             add(format!("{p}post_per_layer_input_norm.weight"), vec![hidden]);
             // The checkpoint's own name: NO ".weight" suffix (the GGUF
             // conversion adds one; the safetensors file does not have it).
             add(format!("{p}layer_scalar"), vec![1]);
-            add(format!("{p}per_layer_input_gate.weight"), vec![n_pl, hidden]);
-            add(format!("{p}per_layer_projection.weight"), vec![hidden, n_pl]);
+            add(
+                format!("{p}per_layer_input_gate.weight"),
+                vec![n_pl, hidden],
+            );
+            add(
+                format!("{p}per_layer_projection.weight"),
+                vec![hidden, n_pl],
+            );
             add(format!("{p}self_attn.q_proj.weight"), vec![q_dim, hidden]);
             add(format!("{p}self_attn.k_proj.weight"), vec![kv_dim, hidden]);
             add(format!("{p}self_attn.v_proj.weight"), vec![kv_dim, hidden]);
@@ -6258,8 +6333,7 @@ mod tests {
             grim_tensor::dtype::QuantProvenance::default(),
             Device::Cpu,
         );
-        let logits =
-            CausalLm::forward(&*model, &mut *session, &ids, &pos, &[]).expect("forward");
+        let logits = CausalLm::forward(&*model, &mut *session, &ids, &pos, &[]).expect("forward");
         assert_eq!(logits.shape().dims(), &[3, vocab], "the logits' shape");
         let lv = logits.to_vec_f32().expect("logits");
         assert!(
@@ -6335,7 +6409,10 @@ mod tests {
         );
         push(
             "model.per_layer_model_projection.weight",
-            vec![cfg.n_embd_per_layer * cfg.num_hidden_layers, cfg.hidden_size],
+            vec![
+                cfg.n_embd_per_layer * cfg.num_hidden_layers,
+                cfg.hidden_size,
+            ],
         );
         push(
             "model.per_layer_projection_norm.weight",
@@ -6896,5 +6973,26 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("GRIM_PLUGINS_DIR") };
         }
+    }
+
+    #[test]
+    fn test_sort_devices_by_bandwidth_pure() {
+        let mut devices = vec![Device::Rocm(0), Device::Rocm(1)];
+        // Ordinal 1 is faster (576 GB/s) than Ordinal 0 (288 GB/s)
+        let caps = vec![(0, 288.0f32), (1, 576.0f32)];
+        sort_devices_by_bandwidth(&mut devices, &caps);
+        assert_eq!(devices, vec![Device::Rocm(1), Device::Rocm(0)]);
+
+        // Equal bandwidth keeps original order
+        let mut devices_equal = vec![Device::Rocm(0), Device::Rocm(1)];
+        let caps_equal = vec![(0, 500.0f32), (1, 500.0f32)];
+        sort_devices_by_bandwidth(&mut devices_equal, &caps_equal);
+        assert_eq!(devices_equal, vec![Device::Rocm(0), Device::Rocm(1)]);
+
+        // Zero or non-finite bandwidth warns and preserves ordinal order
+        let mut devices_zero = vec![Device::Rocm(0), Device::Rocm(1)];
+        let caps_zero = vec![(0, 0.0f32), (1, 500.0f32)];
+        sort_devices_by_bandwidth(&mut devices_zero, &caps_zero);
+        assert_eq!(devices_zero, vec![Device::Rocm(0), Device::Rocm(1)]);
     }
 }

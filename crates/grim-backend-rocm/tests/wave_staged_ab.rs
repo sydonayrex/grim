@@ -32,7 +32,7 @@
 use std::time::Instant;
 
 use grim_backend_rocm::kernels::task_ring::wave_launch_count;
-use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
+use grim_backend_rocm::task_graph::{TaskGraphBuilder, arg_role, op};
 use grim_backend_rocm::{BackendStorage, RocmDevice};
 use grim_tensor::dtype::DType;
 use grim_tensor::{CoreTensorOps, Shape};
@@ -114,10 +114,9 @@ fn the_staged_set_beats_the_launchers_per_op_launches_when_it_is_a_set() {
             );
         }
         let graph = gb.finish();
-        let ctx =
-            grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
-                .expect("ring context")
-                .expect("ring binds the adds");
+        let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+            .expect("ring context")
+            .expect("ring binds the adds");
         assert_eq!(
             ctx.plan().adds().len(),
             set_size,
@@ -186,4 +185,3 @@ fn the_staged_set_beats_the_launchers_per_op_launches_when_it_is_a_set() {
          same work with more parallelism, so the gap does not close."
     );
 }
-

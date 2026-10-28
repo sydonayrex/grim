@@ -69,7 +69,10 @@ struct Entry {
 
 #[test]
 fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the model-zoo IR coverage gate");
         return;
     }
@@ -135,9 +138,7 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
                     .downcast_ref::<grim_models_transformer::Xing40>()
                     .map(|m| m as &dyn DecodeGraphModel)
             })
-            .or_else(|| {
-                grim_models_transformer::llama_wrapper_graph_model(lm.as_any())
-            })
+            .or_else(|| grim_models_transformer::llama_wrapper_graph_model(lm.as_any()))
             .unwrap_or_else(|| panic!("{}: no decode-graph model", e.label));
         let mut graph = graph_model
             .get_or_create_decode_graph(64, 1)
@@ -156,11 +157,7 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
             .as_ref()
             .unwrap_or_else(|| panic!("{}: capture published no task graph", e.label));
         let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
-        assert!(
-            !ir.nodes.is_empty(),
-            "{}: no task graph emitted",
-            e.label
-        );
+        assert!(!ir.nodes.is_empty(), "{}: no task graph emitted", e.label);
         if !e.allow_fallback {
             assert!(
                 !ops.contains(&grim_backend_rocm::task_graph::op::FALLBACK),
@@ -210,7 +207,10 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
         // CORRECT predicate.
         let ready = grim_backend_rocm::task_graph::ring_ready(&ir.caps);
         let ring: std::collections::BTreeSet<u32> =
-            grim_backend_rocm::task_graph_exec::RING_OPCODES.iter().copied().collect();
+            grim_backend_rocm::task_graph_exec::RING_OPCODES
+                .iter()
+                .copied()
+                .collect();
         let mut expect_missing = ir.caps.opcodes.clone();
         expect_missing.remove(&grim_backend_rocm::task_graph::op::FALLBACK);
         for r in &ring {
@@ -239,8 +239,12 @@ fn every_zoo_emitter_publishes_a_derived_ready_task_graph() {
         );
         eprintln!(
             "[zoo] {}: nodes={} opcodes={:?} missing={:?}",
-            e.label, ir.nodes.len(),
-            { let v: Vec<u32> = ir.caps.opcodes.iter().copied().collect(); v },
+            e.label,
+            ir.nodes.len(),
+            {
+                let v: Vec<u32> = ir.caps.opcodes.iter().copied().collect();
+                v
+            },
             ready.missing
         );
 

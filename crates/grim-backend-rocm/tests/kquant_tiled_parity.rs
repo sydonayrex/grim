@@ -29,11 +29,7 @@
 //! grim-backend-rocm --features "gpu-test-shims" --test kquant_tiled_parity --
 //! -- --ignored --test-threads=1`
 
-#![cfg(all(
-    feature = "q3k",
-    feature = "q2k",
-    feature = "gpu-test-shims"
-))]
+#![cfg(all(feature = "q3k", feature = "q2k", feature = "gpu-test-shims"))]
 
 use grim_backend_rocm::device::q4k_test_shim;
 use grim_backend_rocm::{RocmCachingAllocator, RocmDevice, RocmStorage};
@@ -264,9 +260,7 @@ fn compare_backward(
                 // The backward entry is the forward name with `backward`
                 // spliced in: `grim_fused_dequant_gemm_q3k` ->
                 // `grim_fused_dequant_backward_gemm_q3k`.
-                &format!(
-                    "grim_fused_dequant_backward_gemm_{tag}"
-                ),
+                &format!("grim_fused_dequant_backward_gemm_{tag}"),
                 &dy,
                 &b,
                 &out,

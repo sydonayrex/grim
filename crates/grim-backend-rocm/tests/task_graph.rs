@@ -2,7 +2,7 @@
 //! contract (condition 2 — nodes carry HANDLES, not inline pointers, and the
 //! table is wide enough for the 7-buffer fused launchers).
 
-use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
+use grim_backend_rocm::task_graph::{TaskGraphBuilder, arg_role, op};
 
 #[test]
 fn capability_set_is_derived_from_the_nodes() {
@@ -10,8 +10,22 @@ fn capability_set_is_derived_from_the_nodes() {
     let w = b.push_arg(10, 4096, arg_role::WEIGHT);
     let x = b.push_arg(20, 1024, arg_role::ACT_IN);
     let y = b.push_arg(30, 1024, arg_role::ACT_OUT);
-    let a = b.push(op::GEMM, [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[w, x, y], &[], 0, 0);
-    let c = b.push(op::ATTENTION, [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[y], &[a], 0, 0);
+    let a = b.push(
+        op::GEMM,
+        [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[w, x, y],
+        &[],
+        0,
+        0,
+    );
+    let c = b.push(
+        op::ATTENTION,
+        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[y],
+        &[a],
+        0,
+        0,
+    );
     let g = b.finish();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.sinks, vec![c], "the node with no dependents is the sink");
@@ -23,7 +37,10 @@ fn capability_set_is_derived_from_the_nodes() {
     assert_eq!(g.caps.max_fan_in, 1);
     assert_eq!(g.caps.devices, [0].into_iter().collect());
     // Condition 3 groundwork: GEMM quant modes are derived from params[0].
-    assert!(g.caps.quant_modes.contains(&1), "GEMM params[0] is the quant mode");
+    assert!(
+        g.caps.quant_modes.contains(&1),
+        "GEMM params[0] is the quant mode"
+    );
 }
 
 #[test]
@@ -156,7 +173,10 @@ fn ring_ready_is_derived_from_the_capability_set() {
     let mut caps = grim_backend_rocm::task_graph::CapabilitySet::default();
     caps.opcodes.insert(unconverted);
     let r = ring_ready(&caps);
-    assert!(!r.full, "a ring that does not implement this opcode cannot be full");
+    assert!(
+        !r.full,
+        "a ring that does not implement this opcode cannot be full"
+    );
     assert_eq!(r.missing, vec![unconverted]);
     assert!(!r.reason.is_empty());
 

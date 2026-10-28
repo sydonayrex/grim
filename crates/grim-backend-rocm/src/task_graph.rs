@@ -181,8 +181,10 @@ pub struct RingReadiness {
 /// rather than failing. `RING_OPCODES` — the one hand-maintained input, the
 /// opcodes the ring implements — lives in [`crate::task_graph_exec`].
 pub fn ring_ready(caps: &CapabilitySet) -> RingReadiness {
-    let ring: std::collections::BTreeSet<OpCode> =
-        crate::task_graph_exec::RING_OPCODES.iter().copied().collect();
+    let ring: std::collections::BTreeSet<OpCode> = crate::task_graph_exec::RING_OPCODES
+        .iter()
+        .copied()
+        .collect();
     let missing: Vec<OpCode> = caps
         .opcodes
         .iter()
@@ -208,8 +210,7 @@ pub fn ring_ready(caps: &CapabilitySet) -> RingReadiness {
     }
 }
 
-#[derive(Default)]
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub struct TaskGraphBuilder {
     nodes: Vec<TaskNode>,
     arg_table: Vec<ArgEntry>,

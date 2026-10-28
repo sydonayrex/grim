@@ -62,10 +62,16 @@ fn qwen35_packed_graph_replay_matches_eager() {
         for (step, tok) in TOKENS.iter().enumerate() {
             let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
             let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
-            let out = CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
-                .expect("eager forward")
-                .to_vec_f32()
-                .expect("eager readback");
+            let out = CausalLm::forward(
+                &model,
+                session.as_mut(),
+                &ids,
+                &pos,
+                &[] as &[AdapterHandle],
+            )
+            .expect("eager forward")
+            .to_vec_f32()
+            .expect("eager readback");
             eager_logits.push(out);
         }
 
@@ -137,9 +143,7 @@ fn qwen35_packed_graph_replay_matches_eager() {
         // format-change gate (3e-1) with printed headroom.
         for (step, (a, b)) in eager_logits.iter().zip(graph_logits.iter()).enumerate() {
             let (e, at, abs) = worst_scaled(a, b);
-            eprintln!(
-                "[{format}-graph-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})"
-            );
+            eprintln!("[{format}-graph-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
             assert!(
                 e <= 1e-1,
                 "{format} step {step}: graph replay diverges from eager: worst {e:.3e} at {at} \
@@ -244,10 +248,16 @@ fn qwen35_layer_split_model_replays_like_eager() {
         let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
         let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
         eager.push(
-            CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
-                .expect("eager forward")
-                .to_vec_f32()
-                .expect("readback"),
+            CausalLm::forward(
+                &model,
+                session.as_mut(),
+                &ids,
+                &pos,
+                &[] as &[AdapterHandle],
+            )
+            .expect("eager forward")
+            .to_vec_f32()
+            .expect("readback"),
         );
     }
 
@@ -279,9 +289,7 @@ fn qwen35_layer_split_model_replays_like_eager() {
 
     let mut got = Vec::new();
     for tok in TOKENS {
-        model
-            .forward_replay(&mut graph, tok)
-            .expect("replay");
+        model.forward_replay(&mut graph, tok).expect("replay");
         got.push(graph.read_logits_f32().expect("readback"));
         graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
     }
@@ -398,7 +406,10 @@ fn qwen35_graph_matches_eager_with_two_attention_layers_per_step() {
 
     let is_attn = |i: usize| (i + 1) % 2 == 0;
     let n_attn: usize = (0..4).filter(|&i| is_attn(i)).count();
-    assert_eq!(n_attn, 2, "gate model must hold exactly two attention layers");
+    assert_eq!(
+        n_attn, 2,
+        "gate model must hold exactly two attention layers"
+    );
 
     // Eager reference.
     let mut session = model.new_session();
@@ -406,10 +417,16 @@ fn qwen35_graph_matches_eager_with_two_attention_layers_per_step() {
     for (step, tok) in TOKENS.iter().enumerate() {
         let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
         let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
-        let out = CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
-            .expect("eager forward")
-            .to_vec_f32()
-            .expect("eager readback");
+        let out = CausalLm::forward(
+            &model,
+            session.as_mut(),
+            &ids,
+            &pos,
+            &[] as &[AdapterHandle],
+        )
+        .expect("eager forward")
+        .to_vec_f32()
+        .expect("eager readback");
         eager_logits.push(out);
     }
 
@@ -428,18 +445,14 @@ fn qwen35_graph_matches_eager_with_two_attention_layers_per_step() {
 
     let mut graph_logits = Vec::new();
     for tok in TOKENS {
-        model
-            .forward_replay(&mut graph, tok)
-            .expect("graph replay");
+        model.forward_replay(&mut graph, tok).expect("graph replay");
         graph_logits.push(graph.read_logits_f32().expect("graph logit readback"));
         graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
     }
 
     for (step, (a, b)) in eager_logits.iter().zip(graph_logits.iter()).enumerate() {
         let (e, at, abs) = worst_scaled(a, b);
-        eprintln!(
-            "[a0-two-attn-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})"
-        );
+        eprintln!("[a0-two-attn-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
         assert!(
             e <= 1e-1,
             "A0 step {step}: graph replay diverges from eager with two attention \
@@ -483,12 +496,24 @@ fn qwen35_split_model_seed_families_run_on_their_own_devices() {
     let mut session = model.new_session();
     let ids = dev_tensor(dev.as_ref(), &device, &[TOKENS[0] as f32]);
     let pos = dev_tensor(dev.as_ref(), &device, &[0.0f32]);
-    let _ = CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
-        .expect("eager prefill");
+    let _ = CausalLm::forward(
+        &model,
+        session.as_mut(),
+        &ids,
+        &pos,
+        &[] as &[AdapterHandle],
+    )
+    .expect("eager prefill");
 
-    let srcs = model.eager_kv_seed_sources(session.as_ref(), 1).expect("kv seeds");
-    let conv = model.eager_conv_device_seed_sources(session.as_ref()).expect("conv seeds");
-    let kda = model.eager_kda_seed_sources(session.as_ref()).expect("kda seeds");
+    let srcs = model
+        .eager_kv_seed_sources(session.as_ref(), 1)
+        .expect("kv seeds");
+    let conv = model
+        .eager_conv_device_seed_sources(session.as_ref())
+        .expect("conv seeds");
+    let kda = model
+        .eager_kda_seed_sources(session.as_ref())
+        .expect("kda seeds");
 
     // The production seed path (run.rs macros) must succeed against a split
     // placement: every family copies on the right device context now.
@@ -577,10 +602,16 @@ fn qwen35_graph_serves_curdvk_eviction_like_eager() {
         let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
         let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
         eager.push(
-            CausalLm::forward(&model, session.as_mut(), &ids, &pos, &[] as &[AdapterHandle])
-                .expect("eager curdkv forward")
-                .to_vec_f32()
-                .expect("eager readback"),
+            CausalLm::forward(
+                &model,
+                session.as_mut(),
+                &ids,
+                &pos,
+                &[] as &[AdapterHandle],
+            )
+            .expect("eager curdkv forward")
+            .to_vec_f32()
+            .expect("eager readback"),
         );
     }
 
@@ -664,7 +695,10 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
     let model = Qwen35::load(device.clone(), &ws, cfg).expect("load emit model");
 
     let mut graph = model.get_or_create_decode_graph(16, 1).expect("graph");
-    assert!(graph.buffers.emitted_task_graph.is_none(), "no IR before capture");
+    assert!(
+        graph.buffers.emitted_task_graph.is_none(),
+        "no IR before capture"
+    );
 
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
@@ -704,13 +738,26 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
     // node, then the final norm and the head.
     use grim_backend_rocm::task_graph::op;
     let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
-    eprintln!("[struct] the first 12 opcodes: {:?}", &ops[..12.min(ops.len())]);
+    eprintln!(
+        "[struct] the first 12 opcodes: {:?}",
+        &ops[..12.min(ops.len())]
+    );
     for (i, n) in ir.nodes.iter().take(6).enumerate() {
-        eprintln!("[struct] node {i}: opcode={} n_args={} n_deps={} deps={:?} dev={}",
-            n.opcode, n.n_args, n.n_deps, &n.deps[..n.n_deps as usize], n.device);
+        eprintln!(
+            "[struct] node {i}: opcode={} n_args={} n_deps={} deps={:?} dev={}",
+            n.opcode,
+            n.n_args,
+            n.n_deps,
+            &n.deps[..n.n_deps as usize],
+            n.device
+        );
     }
     eprintln!("[struct] total nodes: {}", ops.len());
-    assert_eq!(ops[0], op::ELEMENTWISE, "first node is the embedding gather");
+    assert_eq!(
+        ops[0],
+        op::ELEMENTWISE,
+        "first node is the embedding gather"
+    );
 
     // The attention layers' launches: the nodes between a layer's start and
     // the next layer's start. The block's FIRST launch is the norm, and its
@@ -1015,9 +1062,7 @@ fn the_ring_handoff_matches_a6_and_removes_a_host_sync_per_token() {
             b[at]
         );
     }
-    eprintln!(
-        "[m6-handoff] worst A6-vs-A6 {control_worst:.3e}, A6-vs-handoff {handoff_worst:.3e}"
-    );
+    eprintln!("[m6-handoff] worst A6-vs-A6 {control_worst:.3e}, A6-vs-handoff {handoff_worst:.3e}");
     assert!(
         handoff_worst <= control_worst.max(1e-1),
         "the handoff must not diverge more than two A6 runs do from each other \
@@ -1058,18 +1103,16 @@ fn the_qwen35_ring_walk_matches_the_launcher_path() {
     let provider = synth_weights_hybrid(4, 2);
     let ws = WeightSource::root(&provider, device.clone());
     let model = Qwen35::load(device.clone(), &ws, cfg).expect("load hybrid qwen35");
-    let n_attn = model
-        .blocks
-        .iter()
-        .filter(|b| b.is_full_attention)
-        .count();
+    let n_attn = model.blocks.iter().filter(|b| b.is_full_attention).count();
     let n_recurrent = model.blocks.len() - n_attn;
-    assert_eq!((n_attn, n_recurrent), (2, 2), "the hybrid must have both kinds");
+    assert_eq!(
+        (n_attn, n_recurrent),
+        (2, 2),
+        "the hybrid must have both kinds"
+    );
 
     // ---- Arm A: the launcher path (the captured graph, replayed). ----
-    let mut graph = model
-        .get_or_create_decode_graph(16, 1)
-        .expect("capturable");
+    let mut graph = model.get_or_create_decode_graph(16, 1).expect("capturable");
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
     graph.begin_capture().expect("begin capture");
@@ -1087,7 +1130,9 @@ fn the_qwen35_ring_walk_matches_the_launcher_path() {
 
     let mut launcher_logits = Vec::new();
     for tok in TOKENS {
-        model.forward_replay(&mut graph, tok).expect("launcher replay");
+        model
+            .forward_replay(&mut graph, tok)
+            .expect("launcher replay");
         launcher_logits.push(graph.read_logits_f32().expect("readback"));
         graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
     }
@@ -1289,9 +1334,7 @@ fn the_iq4nl_row_is_on_the_coverage_axis() {
     let model = Qwen35::load(device.clone(), &ws, cfg).expect("load iq4nl qwen35");
 
     // ── The captured graph (the reference) and the IR it publishes.
-    let mut graph = model
-        .get_or_create_decode_graph(16, 1)
-        .expect("capturable");
+    let mut graph = model.get_or_create_decode_graph(16, 1).expect("capturable");
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
     graph.begin_capture().expect("begin capture");
@@ -1354,7 +1397,9 @@ fn the_iq4nl_row_is_on_the_coverage_axis() {
     }
     for (step, (a, b)) in replay_logits.iter().zip(walk_logits.iter()).enumerate() {
         let (e, at, abs) = worst_scaled(a, b);
-        eprintln!("[iq4nl-row] step {step}: the walk vs the graph replay, worst {e:.3e} at {at} (abs {abs:.3e})");
+        eprintln!(
+            "[iq4nl-row] step {step}: the walk vs the graph replay, worst {e:.3e} at {at} (abs {abs:.3e})"
+        );
         assert!(
             e <= 1e-4,
             "the IQ4_NL model's walk diverges from the captured graph at step {step}: \

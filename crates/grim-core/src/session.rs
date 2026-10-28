@@ -104,6 +104,12 @@ pub trait SessionT: Send {
         1
     }
     fn set_last_accepted_tokens(&mut self, _n: usize) {}
+
+    /// Hint to skip output LM head projection (useful for intermediate prefill chunks).
+    fn skip_output_projection(&self) -> bool {
+        false
+    }
+    fn set_skip_output_projection(&mut self, _skip: bool) {}
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -124,6 +130,8 @@ pub struct Inner {
     pub request_rng: Option<SimpleRng>,
     /// Last speculative accept count from decode_one.
     pub last_accepted_tokens: usize,
+    /// Hint to skip output LM head projection on non-terminal prefill chunks.
+    pub skip_output_projection: bool,
 }
 
 impl Inner {
@@ -137,6 +145,7 @@ impl Inner {
             model_state: None,
             request_rng: None,
             last_accepted_tokens: 1,
+            skip_output_projection: false,
         }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
@@ -149,6 +158,7 @@ impl Inner {
             model_state: None,
             request_rng: None,
             last_accepted_tokens: 1,
+            skip_output_projection: false,
         }
     }
 }
@@ -247,6 +257,12 @@ impl SessionT for Inner {
     fn set_last_accepted_tokens(&mut self, n: usize) {
         self.last_accepted_tokens = n;
     }
+    fn skip_output_projection(&self) -> bool {
+        self.skip_output_projection
+    }
+    fn set_skip_output_projection(&mut self, skip: bool) {
+        self.skip_output_projection = skip;
+    }
 }
 
 /// Node representing a single execution step in the static computation graph (§4.3)
@@ -337,6 +353,34 @@ impl Inner {
 /// The `Session::new` name is kept stable for call sites even though the runtime handle lives.
 pub struct Session;
 
+/// RAII guard that temporarily enables `skip_output_projection` on a `SessionT`,
+/// restoring the prior setting upon Drop.
+pub struct SkipOutputProjectionGuard<'a> {
+    session: &'a mut dyn SessionT,
+    prev_state: bool,
+}
+
+impl<'a> SkipOutputProjectionGuard<'a> {
+    pub fn new(session: &'a mut dyn SessionT, skip: bool) -> Self {
+        let prev_state = session.skip_output_projection();
+        session.set_skip_output_projection(skip);
+        Self {
+            session,
+            prev_state,
+        }
+    }
+
+    pub fn current_skip(&self) -> bool {
+        self.session.skip_output_projection()
+    }
+}
+
+impl<'a> Drop for SkipOutputProjectionGuard<'a> {
+    fn drop(&mut self) {
+        self.session.set_skip_output_projection(self.prev_state);
+    }
+}
+
 impl Session {
     // Deliberate alias design: `Session` is a stable name and `new` returns the
     // `Inner` handle type on purpose, so silence new_ret_no_self here.
@@ -347,5 +391,30 @@ impl Session {
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Inner {
         Inner::with_kv(device, kv)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skip_output_guard_resets_flag() {
+        let mut session = Inner::new(Device::Cpu);
+        assert!(!session.skip_output_projection());
+
+        {
+            let guard = SkipOutputProjectionGuard::new(&mut session, true);
+            assert!(guard.current_skip());
+        }
+        assert!(!session.skip_output_projection());
+
+        // Test nested or true-to-false restoration
+        session.set_skip_output_projection(true);
+        {
+            let guard = SkipOutputProjectionGuard::new(&mut session, false);
+            assert!(!guard.current_skip());
+        }
+        assert!(session.skip_output_projection());
     }
 }

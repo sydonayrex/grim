@@ -198,6 +198,19 @@ impl RocmCachingAllocator {
                     let _ = crate::hipEventDestroy(entry.event);
                 }
             }
+            if let Some(val) = std::env::var("GRIM_POISON_ALLOC").ok() {
+                let byte = if val == "nan" || val == "0xff" || val == "255" {
+                    0xff
+                } else if let Ok(parsed) = val.parse::<u8>() {
+                    parsed
+                } else {
+                    0x00
+                };
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                unsafe {
+                    let _ = crate::hipMemset(entry.ptr as *mut c_void, byte as i32, cls);
+                }
+            }
             return Ok(entry.ptr as *mut c_void);
         }
 
@@ -205,7 +218,9 @@ impl RocmCachingAllocator {
         // Pin this allocator's ordinal - a pool miss from a drifted thread must not materialise.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
+        crate::device::util::report_rocm_progress("hipMalloc:in-flight");
         let res = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
+        crate::device::util::report_rocm_progress("hipMalloc:done");
         if res.is_err() {
             if std::env::var_os("GRIM_ALLOC_TRACE").is_some() {
                 eprintln!(

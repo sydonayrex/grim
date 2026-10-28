@@ -54,6 +54,7 @@ impl RocmDevice {
             usize,
             usize,
         ) -> Result<*mut c_void>,
+        format_tag_hint: Option<&str>,
     ) -> Result<()> {
         let is_rdna34 = self.is_rdna34;
         // GRIM_WMMA=0 forces the scalar dequant-GEMM for every format. The
@@ -78,6 +79,21 @@ impl RocmDevice {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // Prefill dequant + rocBLAS F16 GEMM for large M (default ON for M >= 4 unless explicitly disabled).
+        let prefill_dequant_on = match std::env::var("GRIM_PREFILL_DEQUANT_GEMM").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        };
+        let prefill_dequant_min_m: usize = std::env::var("GRIM_PREFILL_DEQUANT_MIN_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        if prefill_dequant_on && m >= prefill_dequant_min_m {
+            if let Some(format_tag) = format_tag_hint {
+                self.launch_iq_prefill_dequant_rocblas_f16(a, b, out, m, n, k, format_tag)?;
+                return Ok(());
+            }
+        }
         if allow_wmma && is_rdna34 && m <= wmma_m_max && !wmma_off {
             wmma_method(self, a, b, out, m, n, k)?;
         } else {

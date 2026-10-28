@@ -82,8 +82,7 @@ impl Olmoe {
             use crate::moe_block::MoESpec;
             use grim_nn::moe::RouterKind;
             let spec = MoESpec {
-
-     renorm: false,
+                renorm: false,
                 num_experts: cfg.num_experts,
                 top_k: cfg.num_experts_per_tok,
                 router_kind: RouterKind::SoftmaxTopK,

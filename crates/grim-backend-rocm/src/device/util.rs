@@ -1,7 +1,9 @@
 //! Module-level utilities used by the `RocmDevice` impl blocks. None of [see: `linear_launch`, `as_rocm`, `dev_ptr`, `arg`]
 
 use std::ffi::{CString, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -10,6 +12,69 @@ use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::{ArithType, BackendStorage, Error, Result};
 
 use crate::{RocmStorage, hipGetDeviceProperties};
+
+// ======== Progress Watchdog ========
+static WATCHDOG_STARTED: OnceLock<()> = OnceLock::new();
+static LAST_PROGRESS_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_OP_DESC: std::sync::RwLock<&'static str> = std::sync::RwLock::new("idle");
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Notify the ROCm progress watchdog of an active operation or successful completion.
+pub fn report_rocm_progress(op: &'static str) {
+    LAST_PROGRESS_MS.store(current_epoch_ms(), Ordering::Release);
+    if let Ok(mut desc) = LAST_OP_DESC.write() {
+        *desc = op;
+    }
+}
+
+/// Ensure the background watchdog thread is running.
+/// Configurable via `GRIM_WATCHDOG_TIMEOUT_SECS` (default 30s).
+pub fn ensure_rocm_watchdog_started() {
+    WATCHDOG_STARTED.get_or_init(|| {
+        let timeout_secs: u64 = std::env::var("GRIM_WATCHDOG_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        if timeout_secs == 0 {
+            return;
+        }
+
+        report_rocm_progress("startup");
+
+        std::thread::Builder::new()
+            .name("grim-rocm-watchdog".into())
+            .spawn(move || {
+                let interval = Duration::from_millis(1000);
+                let timeout_ms = timeout_secs * 1000;
+                loop {
+                    std::thread::sleep(interval);
+                    let last = LAST_PROGRESS_MS.load(Ordering::Acquire);
+                    let now = current_epoch_ms();
+                    if last > 0 && now.saturating_sub(last) > timeout_ms {
+                        let op = LAST_OP_DESC.read().map(|g| *g).unwrap_or("unknown");
+                        eprintln!(
+                            "\n=======================================================\n\
+                             [ROCM WATCHDOG TIMEOUT] No progress detected for {} seconds!\n\
+                             Last recorded in-flight ROCm operation: {:?}\n\
+                             A kernel or runtime call has stalled or deadlocked.\n\
+                             =======================================================\n",
+                            timeout_secs, op
+                        );
+                        // Loud preflight/deadlock exit
+                        std::process::exit(101);
+                    }
+                }
+            })
+            .expect("failed to spawn rocm watchdog thread");
+    });
+}
 
 /// Returns true if GRIM_DEBUG is set (e.g. GRIM_DEBUG=1, true, or any non-empty non-zero value).
 pub fn is_debug_enabled() -> bool {
@@ -166,6 +231,43 @@ impl Drop for DeviceGuard {
     }
 }
 
+/// Query the PCI bus id string (e.g. "0000:03:00.0") for a ROCm ordinal via HIP.
+pub fn get_device_pci_bus_id(ordinal: usize) -> Option<String> {
+    let mut buf = [0i8; 64];
+    let ret = unsafe {
+        crate::device::handles::hipDeviceGetPCIBusId(buf.as_mut_ptr(), 64, ordinal as i32)
+    };
+    if ret == 0 {
+        let c_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        c_str.to_str().ok().map(|s| s.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Map a ROCm device ordinal to its Linux DRM sysfs card name (e.g. "card1")
+/// by resolving the DRM device symlinks to PCI slot numbers.
+pub fn get_device_sysfs_card(ordinal: usize) -> Option<String> {
+    let pci = get_device_pci_bus_id(ordinal)?;
+    let pci_lower = pci.to_lowercase();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.starts_with("card") && !name_str.contains('-') {
+                let dev_link = entry.path().join("device");
+                if let Ok(target) = std::fs::read_link(&dev_link) {
+                    let target_str = target.to_string_lossy().to_lowercase();
+                    if target_str.contains(&pci_lower) {
+                        return Some(name_str.into_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── Context-drift watch (gguf_multigpu_context_plan.md WI-M1/M2) ────────────
 
 /// Process-wide latch set by the engine for the duration of a prefill pass.
@@ -176,6 +278,14 @@ static PREFILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// the engine around `drive_prefill`; cheap enough to leave permanently wired.
 pub fn set_prefill_in_flight(on: bool) {
     PREFILL_IN_FLIGHT.store(on, Ordering::SeqCst);
+    if !on {
+        // Drop transient prefill scratch buffers across all probed ROCm devices
+        if let Ok(devs) = crate::RocmDevice::probe() {
+            for d in devs {
+                d.release_prefill_scratch();
+            }
+        }
+    }
 }
 
 /// Current state of the drift-watch latch.

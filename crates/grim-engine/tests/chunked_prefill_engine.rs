@@ -240,3 +240,65 @@ fn chunked_prefill_preempt_resume_processes_remainder_exactly_once() {
     assert_single_copy(&engine, &out, "tick 4");
     assert_eq!(pos(&engine), 121);
 }
+
+#[test]
+fn concurrent_chunked_prefill_and_mid_chunk_cancel_test() {
+    let cfg = EngineConfig {
+        max_batched_tokens: 100,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::new(cfg);
+    engine.register_model("small", small_llama());
+    engine.scheduler.chunked_prefill_size = 50;
+
+    // 1. Enqueue two concurrent requests: req 1 (80 tokens) and req 2 (80 tokens)
+    let prompt1: Vec<u32> = (0..80).map(|i| 10 + (i % 50)).collect();
+    let prompt2: Vec<u32> = (0..80).map(|i| 20 + (i % 50)).collect();
+
+    engine
+        .enqueue_request(grim_scheduler::Request {
+            id: 1,
+            prompt_tokens: 80,
+            input_ids: Some(prompt1),
+            max_new_tokens: 4,
+            ..Default::default()
+        })
+        .expect("enqueue req 1");
+
+    engine
+        .enqueue_request(grim_scheduler::Request {
+            id: 2,
+            prompt_tokens: 80,
+            input_ids: Some(prompt2),
+            max_new_tokens: 4,
+            ..Default::default()
+        })
+        .expect("enqueue req 2");
+
+    // Tick 1: Prefills first chunk of requests
+    let out1 = engine.tick().expect("tick 1 concurrent");
+    assert!(!out1.prefill_ids.is_empty(), "must prefill requests");
+
+    // Cancel req 1 mid-prefill
+    engine.finish_request(1);
+
+    // Verify session guard cleanliness: session for req 1 must not linger or have skip_output_projection stuck on
+    assert!(
+        engine.sessions.get(&1).is_none(),
+        "req 1 must be cleaned up"
+    );
+
+    // Now tick through req 2 completion and transition to decode
+    for _ in 0..5 {
+        let out = engine.tick().expect("tick continuation");
+        if out.decode_ids.contains(&2) {
+            // Req 2 transitioned to decode cleanly
+            let s2 = engine.sessions.get(&2).expect("req 2 session");
+            assert!(
+                !s2.skip_output_projection(),
+                "req 2 decode must have skip_output_projection=false"
+            );
+            break;
+        }
+    }
+}

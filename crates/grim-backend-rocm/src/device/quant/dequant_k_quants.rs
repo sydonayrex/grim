@@ -887,12 +887,12 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = a
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q3k_tiled: a has no device ptr".into()))?;
-        let b_ptr = b
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q3k_tiled: b has no device ptr".into()))?;
+        let a_ptr = a.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q3k_tiled: a has no device ptr".into())
+        })?;
+        let b_ptr = b.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q3k_tiled: b has no device ptr".into())
+        })?;
         let out_ptr = out.device_ptr.ok_or_else(|| {
             Error::Backend("fused_dequant_gemm_q3k_tiled: out has no device ptr".into())
         })?;
@@ -929,12 +929,12 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = a
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q2k_tiled: a has no device ptr".into()))?;
-        let b_ptr = b
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q2k_tiled: b has no device ptr".into()))?;
+        let a_ptr = a.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q2k_tiled: a has no device ptr".into())
+        })?;
+        let b_ptr = b.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q2k_tiled: b has no device ptr".into())
+        })?;
         let out_ptr = out.device_ptr.ok_or_else(|| {
             Error::Backend("fused_dequant_gemm_q2k_tiled: out has no device ptr".into())
         })?;

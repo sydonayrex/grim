@@ -775,7 +775,11 @@ impl RocmDevice {
             crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
         }
         self.launch_compute_kernel(
-            if v2 { "grim_dot8_w4a4_gemv_v2" } else { "grim_dot8_w4a4_gemv" },
+            if v2 {
+                "grim_dot8_w4a4_gemv_v2"
+            } else {
+                "grim_dot8_w4a4_gemv"
+            },
             grid_dim,
             block_dim,
             &mut [

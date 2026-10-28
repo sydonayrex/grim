@@ -53,7 +53,12 @@ fn candidate_lib_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
             dirs.push(p);
         }
     }
-    for fixed in ["/opt/rocm/lib", "/usr/lib/rocm/lib"] {
+    for fixed in [
+        "/opt/rocm/lib",
+        "/usr/lib/rocm/lib",
+        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/core/lib",
+        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/lib",
+    ] {
         let p = PathBuf::from(fixed);
         if p.is_dir() {
             dirs.push(p);
@@ -111,7 +116,12 @@ fn candidate_include_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
     };
     push_env(&mut dirs, "ROCM_INCLUDE_PATH");
     push_env(&mut dirs, "ROCM_PATH");
-    for fixed in ["/opt/rocm/include", "/usr/include/rocm"] {
+    for fixed in [
+        "/opt/rocm/include",
+        "/usr/include/rocm",
+        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/core/include",
+        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/include",
+    ] {
         let p = PathBuf::from(fixed);
         if p.is_dir() {
             dirs.push(p);

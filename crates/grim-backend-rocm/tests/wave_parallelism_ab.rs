@@ -44,7 +44,7 @@
 
 use std::time::Instant;
 
-use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
+use grim_backend_rocm::task_graph::{TaskGraphBuilder, arg_role, op};
 use grim_backend_rocm::{BackendStorage, RocmDevice};
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::{CoreTensorOps, Shape};
@@ -202,7 +202,9 @@ fn measure_kda(
     };
     let conv_in: Vec<f32> = (0..channels).map(|_| rnd() as f32 * 0.5).collect();
     let conv_w: Vec<f32> = (0..channels * ks).map(|_| rnd() as f32 * 0.2).collect();
-    let conv_state: Vec<f32> = (0..channels * (ks - 1)).map(|_| rnd() as f32 * 0.1).collect();
+    let conv_state: Vec<f32> = (0..channels * (ks - 1))
+        .map(|_| rnd() as f32 * 0.1)
+        .collect();
     let alpha: Vec<f32> = (0..nv).map(|_| rnd() as f32 * 0.3).collect();
     let beta: Vec<f32> = (0..nv).map(|_| rnd() as f32 * 0.3).collect();
     let dt_bias: Vec<f32> = (0..nv).map(|_| rnd() as f32 * 0.3).collect();
@@ -255,11 +257,14 @@ fn measure_kda(
     let h_desc = gb.push_arg(kda_dev, 144, arg_role::WEIGHT);
     gb.push(op::RECURRENT, [0; 16], &[h_desc], &[], 0, 0);
     let graph = gb.finish();
-    let ctx =
-        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(dev, &graph)
-            .expect("ring context")
-            .expect("ring binds the recurrent node");
-    assert_eq!(ctx.plan().recurrences().len(), 1, "the RECURRENT node must bind");
+    let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(dev, &graph)
+        .expect("ring context")
+        .expect("ring binds the recurrent node");
+    assert_eq!(
+        ctx.plan().recurrences().len(),
+        1,
+        "the RECURRENT node must bind"
+    );
 
     // The standalone launcher's buffers (separate copies, same inputs).
     let (cs_ref_s, _) = f32_dev(dev, &conv_state);

@@ -166,8 +166,32 @@ pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
 
     // Prefer a measured result when the optional calibration backend is available;
     // the static row is deliberately retained for GPU-less/ROCm installations and calibration failures.
-    let (tflops_fp16, tflops_fp8, dram_gbps) = calibrate_capability(ordinal, &host_cap.gcn)
-        .unwrap_or_else(|| arch_tflops_table(&host_cap.gcn));
+    let (tflops_fp16, tflops_fp8, dram_gbps, source_str) =
+        match calibrate_capability(ordinal, &host_cap.gcn) {
+            Some((f16, f8, bw)) => (f16, f8, bw, "measured"),
+            None => {
+                let (f16, f8, bw) = arch_tflops_table(&host_cap.gcn);
+                (f16, f8, bw, "table")
+            }
+        };
+    static LOGGED: [std::sync::atomic::AtomicBool; 8] = [
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+    ];
+    let already_logged = if ordinal < LOGGED.len() {
+        LOGGED[ordinal].swap(true, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        false
+    };
+    if std::env::var_os("GRIM_PLACEMENT_TRACE").is_some() && !already_logged {
+        eprintln!("[scythe2] capability ordinal={ordinal} bw={dram_gbps:.0} source={source_str}");
+    }
 
     // Throttle percentage via HIP attribute.
     let throttle_pct = query_throttle_pct(ordinal);
@@ -574,8 +598,11 @@ pub fn free_device_memory(ordinal: usize) -> Option<u64> {
     if total == 0 { None } else { Some(free) }
 }
 
-/// Query `(free_bytes, total_bytes)` VRAM via `hipMemGetInfo`. [see: `(0, 0)`]
-pub fn vram_info(ordinal: usize) -> (u64, u64) {
+/// Query `(raw_free_bytes, quantized_free_bytes, total_bytes)` VRAM via sysfs or `hipMemGetInfo`.
+pub fn vram_info_detailed(ordinal: usize) -> (u64, u64, u64) {
+    if let Some((raw_free, quantized_free, total)) = sysfs_vram_info_detailed(ordinal) {
+        return (raw_free, quantized_free, total);
+    }
     let mut free: usize = 0;
     let mut total: usize = 0;
     let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
@@ -583,10 +610,55 @@ pub fn vram_info(ordinal: usize) -> (u64, u64) {
         use crate::device::handles::hipMemGetInfo;
         let status = hipMemGetInfo(&mut free, &mut total);
         if status != 0 {
-            return (0, 0);
+            return (0, 0, 0);
         }
     }
-    (free as u64, total as u64)
+    let raw_free = free as u64;
+    let step = 256 * 1024 * 1024;
+    let quantized_free = (raw_free / step) * step;
+    (raw_free, quantized_free, total as u64)
+}
+
+/// Query `(free_bytes, total_bytes)` VRAM via sysfs or `hipMemGetInfo`.
+/// On Linux with amdgpu, `hipMemGetInfo` can return stale or driver-reserved numbers,
+/// while `/sys/class/drm/card*/device/mem_info_vram_used` gives real HW usage.
+pub fn vram_info(ordinal: usize) -> (u64, u64) {
+    let (_raw, quantized, total) = vram_info_detailed(ordinal);
+    (quantized, total)
+}
+
+fn sysfs_vram_info_detailed(ordinal: usize) -> Option<(u64, u64, u64)> {
+    // Determine target gfx arch for this ordinal using the existing runtime helper
+    let target_arch = crate::device::util::detect_gpu_arch(ordinal as i32);
+    if target_arch.is_empty() {
+        return None;
+    }
+
+    // In dual-GPU setup:
+    // Ordinal 0 is gfx1201 (9070 XT, PCI 03:00.0, sysfs card1)
+    // Ordinal 1 is gfx1200 (9060 XT, PCI 0a:00.0, sysfs card0)
+    let card_idx = match (ordinal, target_arch.as_str()) {
+        (0, "gfx1201") => 1,
+        (1, "gfx1200") => 0,
+        (o, _) => o, // Fallback identity
+    };
+
+    let used_path = format!("/sys/class/drm/card{card_idx}/device/mem_info_vram_used");
+    let total_path = format!("/sys/class/drm/card{card_idx}/device/mem_info_vram_total");
+    if let (Ok(u_str), Ok(t_str)) = (
+        std::fs::read_to_string(used_path),
+        std::fs::read_to_string(total_path),
+    ) {
+        if let (Ok(used), Ok(total)) = (u_str.trim().parse::<u64>(), t_str.trim().parse::<u64>()) {
+            let free = total.saturating_sub(used);
+            // Coarse 256 MiB step quantization on probed free VRAM to prevent run-to-run
+            // desktop/display driver noise (~50-100 MB) from oscillating layer placement.
+            let step = 256 * 1024 * 1024;
+            let quantized_free = (free / step) * step;
+            return Some((free, quantized_free, total));
+        }
+    }
+    None
 }
 
 // ── ROCm SMI (rsmi) dynamic load — compute utilization ──────────────────────

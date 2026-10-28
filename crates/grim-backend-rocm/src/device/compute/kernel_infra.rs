@@ -436,6 +436,7 @@ impl RocmDevice {
             );
         }
         let args_ptr = args.as_mut_ptr();
+        crate::device::util::report_rocm_progress("hipModuleLaunchKernel:in-flight");
         check_hip("hipModuleLaunchKernel (stream)", unsafe {
             hipModuleLaunchKernel(
                 cached_func,
@@ -451,6 +452,7 @@ impl RocmDevice {
                 std::ptr::null_mut(),
             )
         })?;
+        crate::device::util::report_rocm_progress("hipModuleLaunchKernel:done");
         Ok(stream)
     }
 

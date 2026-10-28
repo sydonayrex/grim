@@ -48,7 +48,7 @@
 use std::time::Instant;
 
 use grim_backend_rocm::kernels::task_ring::TaskRingPlan;
-use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
+use grim_backend_rocm::task_graph::{TaskGraphBuilder, arg_role, op};
 use grim_backend_rocm::{BackendStorage, RocmDevice, as_rocm};
 use grim_tensor::dtype::DType;
 use grim_tensor::{CoreTensorOps, Shape};
@@ -199,11 +199,10 @@ fn the_candidate_arms_are_measured_against_the_launcher() {
         // launcher's launch, and M7.1e measured the staged path converging
         // to ~1.9× as the set grows. So the staged path is the BEST case for
         // the wave, and this measures it at the arms' real shapes.
-        let mut res_ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(
-            &dev, &graph,
-        )
-        .expect("ring context")
-        .expect("ring binds the add");
+        let mut res_ctx =
+            grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+                .expect("ring context")
+                .expect("ring binds the add");
         res_ctx.launch_resident(&dev).expect("launch resident wave");
         for _ in 0..WARMUP {
             res_ctx

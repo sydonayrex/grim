@@ -347,6 +347,10 @@ pub struct RocmDevice {
     pub(crate) reduce_partials_buf: RwLock<Option<RocmStorage>>,
     pub(crate) reduce_out_buf: RwLock<Option<RocmStorage>>,
     pub(crate) reduce_argmax_idxs_buf: Mutex<Option<RocmStorage>>,
+    /// SPEED-ROC-PREFILL: Dedicated transient scratch for IQ dequant to F16 + rocBLAS prefill GEMM.
+    /// Allocated lazily on first prefill call with M >= 32, dropped when prefill finishes.
+    pub(crate) prefill_iq_weight_f16_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) prefill_act_f16_buf: Mutex<Option<RocmStorage>>,
 }
 
 // SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
@@ -513,6 +517,7 @@ impl RocmDevice {
 
     /// Create a new ROCm device instance and initialize its handle caches and stream pool. [see: `RocmDevice::try_new`, `hipSetDevice`]
     pub fn new(ordinal: usize) -> Self {
+        crate::device::util::ensure_rocm_watchdog_started();
         match Self::try_new(ordinal) {
             Ok(dev) => dev,
             Err(e) => {
@@ -564,6 +569,16 @@ impl RocmDevice {
             let mut h: RocblasHandle = RocblasHandle(std::ptr::null_mut());
             let status = rocblas_create_handle(&mut h);
             if status == rocblas_status_success {
+                if std::env::var_os("GRIM_ROCBLAS_DETERMINISTIC").is_some() {
+                    let atomics_mode = crate::rocblas_atomics_not_allowed;
+                    let a_status = crate::rocblas_set_atomics_mode(h, atomics_mode);
+                    if a_status != crate::rocblas_status_success {
+                        eprintln!(
+                            "[grim-backend-rocm] warning: rocblas_set_atomics_mode returned {}",
+                            a_status
+                        );
+                    }
+                }
                 handle_cache = Some(h);
             }
         }
@@ -987,12 +1002,24 @@ impl RocmDevice {
             reduce_partials_buf: RwLock::new(None),
             reduce_out_buf: RwLock::new(None),
             reduce_argmax_idxs_buf: Mutex::new(None),
+            prefill_iq_weight_f16_buf: Mutex::new(None),
+            prefill_act_f16_buf: Mutex::new(None),
         }
     }
 
     /// Release all pooled device buffers back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
         self.allocator.empty_cache();
+    }
+
+    /// Explicitly release transient prefill scratch buffers (called when prefill finishes).
+    pub fn release_prefill_scratch(&self) {
+        if let Ok(mut g) = self.prefill_iq_weight_f16_buf.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.prefill_act_f16_buf.lock() {
+            *g = None;
+        }
     }
 
     /// Return the GCN target architecture string (e.g. "gfx1036", "gfx1100").
@@ -2436,6 +2463,16 @@ impl RocmDevice {
                 status = rocblas_create_handle(&mut h);
             }
             if status == rocblas_status_success {
+                if std::env::var_os("GRIM_ROCBLAS_DETERMINISTIC").is_some() {
+                    let atomics_mode = crate::rocblas_atomics_not_allowed;
+                    let a_status = crate::rocblas_set_atomics_mode(h, atomics_mode);
+                    if a_status != crate::rocblas_status_success {
+                        eprintln!(
+                            "[grim-backend-rocm] warning: rocblas_set_atomics_mode returned {}",
+                            a_status
+                        );
+                    }
+                }
                 *cache = Some(h);
                 return Ok(h);
             }

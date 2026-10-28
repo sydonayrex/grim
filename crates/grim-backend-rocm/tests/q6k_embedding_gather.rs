@@ -46,11 +46,7 @@ fn synth_table(vocab: usize, dim: usize) -> Vec<f32> {
         .map(|i| {
             let t = i as f32;
             let v = (t * 0.017).sin() * 2.5 + (t * 0.0031).cos() * 0.5;
-            if i % 977 == 0 {
-                0.0
-            } else {
-                v
-            }
+            if i % 977 == 0 { 0.0 } else { v }
         })
         .collect()
 }
@@ -157,12 +153,7 @@ fn q6k_embedding_gather_bounds_checks_the_token_id() {
     // entry directly is not reachable from here, so instead assert the host
     // refuses the same id - the two must agree on the boundary.
     let out_shape = Shape::new(vec![1, dim]);
-    let res = dev.embedding_packed(
-        packed_dev.as_ref(),
-        &[vocab as u32],
-        &out_shape,
-        dim,
-    );
+    let res = dev.embedding_packed(packed_dev.as_ref(), &[vocab as u32], &out_shape, dim);
     assert!(
         res.is_err(),
         "an out-of-range token id must be refused, not read past the table"

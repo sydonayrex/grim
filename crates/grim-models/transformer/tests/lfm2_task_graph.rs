@@ -40,13 +40,12 @@ use grim_tensor::Device;
 fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
     let scale = a
         .iter()
-        .fold(0.0f32, |m, x| {
-            if x.is_finite() {
-                m.max(x.abs())
-            } else {
-                m
-            }
-        })
+        .fold(
+            0.0f32,
+            |m, x| {
+                if x.is_finite() { m.max(x.abs()) } else { m }
+            },
+        )
         .max(1e-6);
     let mut worst = (0.0f32, 0usize, 0.0f32);
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -62,10 +61,12 @@ fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
     worst
 }
 
-
 #[test]
 fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the LFM2 task-graph gate");
         return;
     }
@@ -87,8 +88,9 @@ fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
         path.display()
     );
     let device = Device::Rocm(0);
-    let lm = grim_engine::model_loader::load_model_from_gguf(&path.to_string_lossy(), device.clone())
-        .expect("load the LFM2 checkpoint");
+    let lm =
+        grim_engine::model_loader::load_model_from_gguf(&path.to_string_lossy(), device.clone())
+            .expect("load the LFM2 checkpoint");
     let model = lm
         .as_any()
         .downcast_ref::<grim_models_transformer::Lfm2>()
@@ -258,7 +260,9 @@ fn the_lfm2_publishes_a_task_graph_and_its_walk_matches_the_replay() {
     }
     for (step, (a, b)) in replay_logits.iter().zip(walk_logits.iter()).enumerate() {
         let (e, at, abs) = worst_scaled(a, b);
-        eprintln!("[lfm2-ir] step {step}: the walk vs the graph replay, worst {e:.3e} at {at} (abs {abs:.3e})");
+        eprintln!(
+            "[lfm2-ir] step {step}: the walk vs the graph replay, worst {e:.3e} at {at} (abs {abs:.3e})"
+        );
         assert!(
             e == 0.0,
             "the LFM2's walk diverges from the captured graph at step {step}: worst {e:.3e} at {at}"

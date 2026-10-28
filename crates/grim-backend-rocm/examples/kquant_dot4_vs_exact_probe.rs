@@ -69,22 +69,19 @@ fn main() {
         std::process::exit(2);
     });
     let scheme = args.get(2).cloned().unwrap_or_else(|| "q6k".into());
-    let n: usize = args
-        .get(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4096);
+    let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4096);
     let k: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5120);
 
-    let (bpb, dequant): (usize, fn(&[u8], usize) -> grim_tensor::Result<Vec<f32>>) = match scheme.as_str()
-    {
-        "q4k" => (144, grim_quant::dequant_q4k),
-        "q5k" => (176, grim_quant::dequant_q5k),
-        "q6k" => (210, grim_quant::dequant_q6k),
-        other => {
-            eprintln!("unknown scheme {other}");
-            std::process::exit(2);
-        }
-    };
+    let (bpb, dequant): (usize, fn(&[u8], usize) -> grim_tensor::Result<Vec<f32>>) =
+        match scheme.as_str() {
+            "q4k" => (144, grim_quant::dequant_q4k),
+            "q5k" => (176, grim_quant::dequant_q5k),
+            "q6k" => (210, grim_quant::dequant_q6k),
+            other => {
+                eprintln!("unknown scheme {other}");
+                std::process::exit(2);
+            }
+        };
     let row_bytes = (k / 256) * bpb;
 
     let bytes = std::fs::read(&path).expect("read weights");
@@ -137,8 +134,8 @@ fn main() {
         .expect("q81 d2h");
     let act_q81 = dequant_q81(&q81_bytes, k);
 
-    let b_st = MemoryOps::from_cpu_bytes(&dev, bytes, &Shape::new(vec![n * k]), u8ty)
-        .expect("b h2d");
+    let b_st =
+        MemoryOps::from_cpu_bytes(&dev, bytes, &Shape::new(vec![n * k]), u8ty).expect("b h2d");
     let mk_out = || {
         MemoryOps::alloc_storage(
             &dev,
@@ -162,39 +159,39 @@ fn main() {
     // measures the compile, not the GEMV.
     for _ in 0..2 {
         match scheme.as_str() {
-        "q4k" => {
-            dev.launch_dot4_q4k_q81_gemv_for_ab(
-                as_rocm(q81_st.as_ref()).unwrap(),
-                b_r,
-                o_dot4,
-                1,
-                n,
-                k,
-            )
-            .expect("dot4 q4k");
-        }
-        "q5k" => {
-            dev.launch_dot4_q5k_q81_gemv_for_ab(
-                as_rocm(q81_st.as_ref()).unwrap(),
-                b_r,
-                o_dot4,
-                1,
-                n,
-                k,
-            )
-            .expect("dot4 q5k");
-        }
-        _ => {
-            dev.launch_dot4_q6k_q81_gemv_for_ab(
-                as_rocm(q81_st.as_ref()).unwrap(),
-                b_r,
-                o_dot4,
-                1,
-                n,
-                k,
-            )
-            .expect("dot4 q6k");
-        }
+            "q4k" => {
+                dev.launch_dot4_q4k_q81_gemv_for_ab(
+                    as_rocm(q81_st.as_ref()).unwrap(),
+                    b_r,
+                    o_dot4,
+                    1,
+                    n,
+                    k,
+                )
+                .expect("dot4 q4k");
+            }
+            "q5k" => {
+                dev.launch_dot4_q5k_q81_gemv_for_ab(
+                    as_rocm(q81_st.as_ref()).unwrap(),
+                    b_r,
+                    o_dot4,
+                    1,
+                    n,
+                    k,
+                )
+                .expect("dot4 q5k");
+            }
+            _ => {
+                dev.launch_dot4_q6k_q81_gemv_for_ab(
+                    as_rocm(q81_st.as_ref()).unwrap(),
+                    b_r,
+                    o_dot4,
+                    1,
+                    n,
+                    k,
+                )
+                .expect("dot4 q6k");
+            }
         }
     }
     dev.synchronize();
@@ -202,37 +199,76 @@ fn main() {
     let iters = 10;
     for _ in 0..iters {
         match scheme.as_str() {
-        "q4k" => { dev.launch_dot4_q4k_q81_gemv_for_ab(as_rocm(q81_st.as_ref()).unwrap(), b_r, o_dot4, 1, n, k).expect("d"); }
-        "q5k" => { dev.launch_dot4_q5k_q81_gemv_for_ab(as_rocm(q81_st.as_ref()).unwrap(), b_r, o_dot4, 1, n, k).expect("d"); }
-        _ => { dev.launch_dot4_q6k_q81_gemv_for_ab(as_rocm(q81_st.as_ref()).unwrap(), b_r, o_dot4, 1, n, k).expect("d"); }
+            "q4k" => {
+                dev.launch_dot4_q4k_q81_gemv_for_ab(
+                    as_rocm(q81_st.as_ref()).unwrap(),
+                    b_r,
+                    o_dot4,
+                    1,
+                    n,
+                    k,
+                )
+                .expect("d");
+            }
+            "q5k" => {
+                dev.launch_dot4_q5k_q81_gemv_for_ab(
+                    as_rocm(q81_st.as_ref()).unwrap(),
+                    b_r,
+                    o_dot4,
+                    1,
+                    n,
+                    k,
+                )
+                .expect("d");
+            }
+            _ => {
+                dev.launch_dot4_q6k_q81_gemv_for_ab(
+                    as_rocm(q81_st.as_ref()).unwrap(),
+                    b_r,
+                    o_dot4,
+                    1,
+                    n,
+                    k,
+                )
+                .expect("d");
+            }
         }
     }
     dev.synchronize();
     let t_dot4 = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
     for _ in 0..2 {
-    match scheme.as_str() {
-        "q4k" => {
-            dev.launch_fused_dequant_gemm_q4k_for_ab(a_r, b_r, o_exact, 1, n, k)
-                .expect("exact q4k");
+        match scheme.as_str() {
+            "q4k" => {
+                dev.launch_fused_dequant_gemm_q4k_for_ab(a_r, b_r, o_exact, 1, n, k)
+                    .expect("exact q4k");
+            }
+            "q5k" => {
+                dev.launch_fused_dequant_gemm_q5k_for_ab(a_r, b_r, o_exact, 1, n, k)
+                    .expect("exact q5k");
+            }
+            _ => {
+                dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k)
+                    .expect("exact q6k");
+            }
         }
-        "q5k" => {
-            dev.launch_fused_dequant_gemm_q5k_for_ab(a_r, b_r, o_exact, 1, n, k)
-                .expect("exact q5k");
-        }
-        _ => {
-            dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k)
-                .expect("exact q6k");
-        }
-    }
     }
     dev.synchronize();
     let t0 = Instant::now();
     for _ in 0..iters {
         match scheme.as_str() {
-        "q4k" => { dev.launch_fused_dequant_gemm_q4k_for_ab(a_r, b_r, o_exact, 1, n, k).expect("e"); }
-        "q5k" => { dev.launch_fused_dequant_gemm_q5k_for_ab(a_r, b_r, o_exact, 1, n, k).expect("e"); }
-        _ => { dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k).expect("e"); }
+            "q4k" => {
+                dev.launch_fused_dequant_gemm_q4k_for_ab(a_r, b_r, o_exact, 1, n, k)
+                    .expect("e");
+            }
+            "q5k" => {
+                dev.launch_fused_dequant_gemm_q5k_for_ab(a_r, b_r, o_exact, 1, n, k)
+                    .expect("e");
+            }
+            _ => {
+                dev.launch_fused_dequant_gemm_q6k_for_ab(a_r, b_r, o_exact, 1, n, k)
+                    .expect("e");
+            }
         }
     }
     dev.synchronize();
@@ -246,7 +282,9 @@ fn main() {
         .unwrap()
         .copy_to_host()
         .expect("d2h exact");
-    let g = |b: &[u8], i: usize| f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    let g = |b: &[u8], i: usize| {
+        f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    };
 
     // The host oracle, per column.
     let mut a_kernel = 0.0f64; // dot4 vs oracle(q81 codes)
@@ -291,15 +329,18 @@ fn main() {
     let rms_rel = |sq: f64| (sq / n as f64).sqrt() / rms;
     println!(
         "    A. kernel's own error   dot4 vs host-dequant(q81 codes): rms-rel {:.3e}  absmax {:.3e}",
-        rms_rel(a_sq), a_absmax
+        rms_rel(a_sq),
+        a_absmax
     );
     println!(
         "    B. + activation quant   dot4 vs host-dequant(f32 act)  : rms-rel {:.3e}  absmax {:.3e}",
-        rms_rel(b_sq), b_absmax
+        rms_rel(b_sq),
+        b_absmax
     );
     println!(
         "    C. summation order      exact vs host-dequant(f32 act) : rms-rel {:.3e}  absmax {:.3e}",
-        rms_rel(c_sq), c_absmax
+        rms_rel(c_sq),
+        c_absmax
     );
     println!(
         "    (logit magnitude max {mag:.3e})   dot4 {t_dot4:.3} ms ({:.1} GB/s)  exact {t_exact:.3} ms ({:.1} GB/s)",

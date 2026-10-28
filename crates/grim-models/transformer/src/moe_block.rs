@@ -11,7 +11,6 @@ use crate::model::LlamaConfig;
 /// Per-architecture routing configuration that distinguishes MoE families.
 #[derive(Debug, Clone)]
 pub struct MoESpec {
-
     /// Total number of experts (`expert_count`).
     pub num_experts: usize,
     /// Experts activated per token (`expert_used_count` / top-k).
@@ -286,8 +285,7 @@ mod tests {
             world_size: 1,
         };
         let spec = MoESpec {
-
-     renorm: true,
+            renorm: true,
             num_experts,
             top_k,
             router_kind: RouterKind::SoftmaxTopK,

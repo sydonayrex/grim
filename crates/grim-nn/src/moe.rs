@@ -694,7 +694,8 @@ impl ExpertBank {
             // the .grim said GSQ while the runtime served sibling IQ3_S).
             static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
                 std::sync::OnceLock::new();
-            let seen_set = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let seen_set =
+                SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
             {
                 let mut seen = seen_set.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{name}:{:?}", raw.dtype);
@@ -961,7 +962,8 @@ impl NonGatedExpertBank {
             // the .grim said GSQ while the runtime served sibling IQ3_S).
             static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
                 std::sync::OnceLock::new();
-            let seen_set = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let seen_set =
+                SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
             {
                 let mut seen = seen_set.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{name}:{:?}", raw.dtype);
@@ -3385,12 +3387,27 @@ mod tests {
         let mut m = build_synthetic(RouterKind::SoftmaxTopK, None, None);
         m.router.renorm = false;
         let (idx, w) = m.router.route(&token()).unwrap();
-        assert_eq!(idx[0], vec![0, 2], "selection is independent of the renorm policy");
+        assert_eq!(
+            idx[0],
+            vec![0, 2],
+            "selection is independent of the renorm policy"
+        );
 
-        let z = m.router.gate_logits(&token()).unwrap().to_vec_f32().unwrap();
+        let z = m
+            .router
+            .gate_logits(&token())
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         let probs = softmax(&z);
-        assert!((w[0][0] - probs[0]).abs() < 1e-5, "weight is the gathered global prob");
-        assert!((w[0][1] - probs[2]).abs() < 1e-5, "weight is the gathered global prob");
+        assert!(
+            (w[0][0] - probs[0]).abs() < 1e-5,
+            "weight is the gathered global prob"
+        );
+        assert!(
+            (w[0][1] - probs[2]).abs() < 1e-5,
+            "weight is the gathered global prob"
+        );
 
         let sum: f32 = w[0].iter().sum();
         assert!(
@@ -3480,7 +3497,10 @@ mod tests {
         m2.router.renorm = false;
         let (_, w) = m2.router.route(&token()).unwrap();
         let sum: f32 = w[0].iter().sum();
-        assert!(sum < 1.0, "an absent expert_weights_norm leaves weights unnormalized");
+        assert!(
+            sum < 1.0,
+            "an absent expert_weights_norm leaves weights unnormalized"
+        );
     }
 
     #[test]

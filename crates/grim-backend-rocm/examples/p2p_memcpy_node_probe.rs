@@ -10,14 +10,21 @@
 //!
 //! Prints "peer-memcpy node: OK" (and verifies the bytes) or the failure.
 
+use grim_backend_rocm::{
+    BackendStorage, MemoryOps, hipGraphDestroy, hipGraphExecDestroy, hipGraphInstantiate,
+    hipGraphLaunch, hipStreamBeginCapture, hipStreamEndCapture,
+};
 use grim_backend_rocm::{DeviceGuard, RocmDevice, RocmStorage};
-use grim_backend_rocm::{BackendStorage, MemoryOps, hipGraphDestroy, hipGraphExecDestroy,
-    hipGraphInstantiate, hipGraphLaunch, hipStreamBeginCapture, hipStreamEndCapture};
 use grim_tensor::{CoreTensorOps, DType, Shape};
 
 fn alloc(dev: &RocmDevice, n: usize) -> RocmStorage {
-    RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &dev.allocator_handle(), dev.ordinal())
-        .expect("alloc")
+    RocmStorage::alloc_gpu(
+        &Shape::new(vec![n]),
+        DType::F32,
+        &dev.allocator_handle(),
+        dev.ordinal(),
+    )
+    .expect("alloc")
 }
 
 fn main() {
@@ -31,11 +38,17 @@ fn main() {
     let src = alloc(&d0, n);
     let dst = alloc(&d1, n);
     let want: Vec<f32> = (0..n).map(|i| i as f32 * 0.25).collect();
-    let host = d0.from_cpu(&want, &Shape::new(vec![n]), DType::F32).expect("host");
-    d0.copy_slice_into(&src, host.as_ref(), 0, n).expect("fill src");
+    let host = d0
+        .from_cpu(&want, &Shape::new(vec![n]), DType::F32)
+        .expect("host");
+    d0.copy_slice_into(&src, host.as_ref(), 0, n)
+        .expect("fill src");
     let zeros = vec![0.0f32; n];
-    let z = d1.from_cpu(&zeros, &Shape::new(vec![n]), DType::F32).expect("zeros");
-    d1.copy_slice_into(&dst, z.as_ref(), 0, n).expect("zero dst");
+    let z = d1
+        .from_cpu(&zeros, &Shape::new(vec![n]), DType::F32)
+        .expect("zeros");
+    d1.copy_slice_into(&dst, z.as_ref(), 0, n)
+        .expect("zero dst");
     d0.synchronize();
     d1.synchronize();
 
@@ -61,7 +74,11 @@ fn main() {
                 println!("peer copy REJECTED inside capture: {e}");
                 let mut g: *mut std::ffi::c_void = std::ptr::null_mut();
                 let _ = unsafe { hipStreamEndCapture(stream1, &mut g) };
-                if !g.is_null() { unsafe { let _ = hipGraphDestroy(g); } }
+                if !g.is_null() {
+                    unsafe {
+                        let _ = hipGraphDestroy(g);
+                    }
+                }
                 return;
             }
         }
@@ -73,33 +90,53 @@ fn main() {
         }
         let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
         let r = unsafe {
-            hipGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+            hipGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if r != grim_backend_rocm::hipSuccess {
             println!("peer-memcpy node: INSTANTIATE FAILED ({r})");
-            unsafe { let _ = hipGraphDestroy(graph); }
+            unsafe {
+                let _ = hipGraphDestroy(graph);
+            }
             return;
         }
         // Poison the destination so a no-op replay cannot pass.
         let poison = vec![7.0f32; n];
-        let p = d1.from_cpu(&poison, &Shape::new(vec![n]), DType::F32).expect("poison");
-        d1.copy_slice_into(&dst, p.as_ref(), 0, n).expect("poison dst");
+        let p = d1
+            .from_cpu(&poison, &Shape::new(vec![n]), DType::F32)
+            .expect("poison");
+        d1.copy_slice_into(&dst, p.as_ref(), 0, n)
+            .expect("poison dst");
         d1.synchronize();
 
         let r = unsafe { hipGraphLaunch(exec, stream1) };
         if r != grim_backend_rocm::hipSuccess {
             println!("peer-memcpy node: LAUNCH FAILED ({r})");
-            unsafe { let _ = hipGraphExecDestroy(exec); let _ = hipGraphDestroy(graph); }
+            unsafe {
+                let _ = hipGraphExecDestroy(exec);
+                let _ = hipGraphDestroy(graph);
+            }
             return;
         }
         let _ = unsafe { grim_backend_rocm::hipDeviceSynchronize() };
-        unsafe { let _ = hipGraphExecDestroy(exec); let _ = hipGraphDestroy(graph); }
+        unsafe {
+            let _ = hipGraphExecDestroy(exec);
+            let _ = hipGraphDestroy(graph);
+        }
     }
     let got = dst.to_cpu_vec_f32().expect("readback");
     if got == want {
         println!("peer-memcpy node: OK (bytes verified, {n} elements)");
     } else {
         let bad = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
-        println!("peer-memcpy node: REPLAYED WRONG at {bad}: {} vs {}", got[bad], want[bad]);
+        println!(
+            "peer-memcpy node: REPLAYED WRONG at {bad}: {} vs {}",
+            got[bad], want[bad]
+        );
     }
 }

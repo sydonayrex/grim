@@ -87,8 +87,8 @@ fn check(dev: &RocmDevice, m: usize, n: usize, k: usize, label: &str) -> f32 {
 
     // Host reference: the CPU's OWN packed GEMM - the path the CPU forward
     // takes, and the one that matches llama.cpp byte for byte on the E4B.
-    let want_all = grim_quant::gemm_iq4nl_packed(&a_host, &w_packed, m, n, k)
-        .expect("host gemm_iq4nl_packed");
+    let want_all =
+        grim_quant::gemm_iq4nl_packed(&a_host, &w_packed, m, n, k).expect("host gemm_iq4nl_packed");
     // The error is F32 ACCUMULATION noise over K terms, so it scales with the
     // magnitude of the SUM, not with each output's own value. Normalising by
     // the output's own value turns a cancelling output (whose true value is

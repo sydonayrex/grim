@@ -129,7 +129,11 @@ fn probe_arm(model_path: &str, tokens: &[u32], arm: &str) -> (f64, Vec<f32>, Vec
         prefix.iter().map(|&t| t as f32).collect(),
         Shape::new(vec![1, n]),
     );
-    let positions = tensor_on(&dev, (0..n).map(|p| p as f32).collect(), Shape::new(vec![1, n]));
+    let positions = tensor_on(
+        &dev,
+        (0..n).map(|p| p as f32).collect(),
+        Shape::new(vec![1, n]),
+    );
     let mut sess = model.new_session();
     let logits = model
         .forward(&mut *sess, &ids, &positions, &[])
@@ -138,13 +142,18 @@ fn probe_arm(model_path: &str, tokens: &[u32], arm: &str) -> (f64, Vec<f32>, Vec
     let vocab = all.len() / n.max(1);
     let step0 = log_softmax(&all[..vocab]);
     let lastrow = log_softmax(&all[(n - 1) * vocab..n * vocab]);
-    let row_argmaxes = (0..n).map(|i| argmax(&all[i * vocab..(i + 1) * vocab]) as u32).collect();
+    let row_argmaxes = (0..n)
+        .map(|i| argmax(&all[i * vocab..(i + 1) * vocab]) as u32)
+        .collect();
     (ppl as f64, step0, lastrow, row_argmaxes)
 }
 
 #[test]
 fn kv_arena_ppl_gate() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the KV-arena PPL gate");
         return;
     }
@@ -306,7 +315,10 @@ fn kv_arena_ppl_gate() {
                 .partial_cmp(&logp_f32[x])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let rank = order.iter().position(|&i| i == next_id).unwrap_or(usize::MAX);
+        let rank = order
+            .iter()
+            .position(|&i| i == next_id)
+            .unwrap_or(usize::MAX);
         let dec = |id: usize| -> String { tokenizer.decode(&[id as u32]) };
         eprintln!(
             "[diag] step0 argmax id={a} ({:?}) logp={:.3} | actual next id={next_id} ({:?}) \
@@ -361,14 +373,26 @@ fn kv_arena_ppl_gate() {
             .zip(&sel_f16)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max),
-        if baseline_is_ood { " (OOD baseline)" } else { "" }
+        if baseline_is_ood {
+            " (OOD baseline)"
+        } else {
+            ""
+        }
     );
     eprintln!(
         "[kv-arena-argmax] arm={arm} row0: f32={argmax_f32} arm={argmax_f16} {} | \
          row{}: f32={argmax_last_f32} arm={argmax_last_arm} {}",
-        if argmax_f32 == argmax_f16 { "same" } else { "MOVED" },
+        if argmax_f32 == argmax_f16 {
+            "same"
+        } else {
+            "MOVED"
+        },
         PROBE_LEN - 1,
-        if argmax_last_f32 == argmax_last_arm { "same" } else { "MOVED" },
+        if argmax_last_f32 == argmax_last_arm {
+            "same"
+        } else {
+            "MOVED"
+        },
     );
     // When row 0 moved, say how far apart the two candidates were IN THE
     // REFERENCE ARM: a sub-nat gap is a near-tie that any rounding can flip,
@@ -435,7 +459,10 @@ fn top_k_indices(v: &[f32], k: usize) -> Vec<usize> {
 /// smallest possible check of the eval path.
 #[test]
 fn eval_forward_predicts_a_known_prompt() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         return;
     }
     let model_path = workspace_path(
@@ -480,10 +507,20 @@ fn eval_forward_predicts_a_known_prompt() {
         };
         for n in [63usize, 64] {
             let ctx = &all_ids[..n];
-            let t_ids = tensor_on(&dev, ctx.iter().map(|&t| t as f32).collect(), Shape::new(vec![1, n]));
-            let t_pos = tensor_on(&dev, (0..n).map(|p| p as f32).collect(), Shape::new(vec![1, n]));
+            let t_ids = tensor_on(
+                &dev,
+                ctx.iter().map(|&t| t as f32).collect(),
+                Shape::new(vec![1, n]),
+            );
+            let t_pos = tensor_on(
+                &dev,
+                (0..n).map(|p| p as f32).collect(),
+                Shape::new(vec![1, n]),
+            );
             let mut sess = model.new_session();
-            let logits = model.forward(&mut *sess, &t_ids, &t_pos, &[]).expect("forward");
+            let logits = model
+                .forward(&mut *sess, &t_ids, &t_pos, &[])
+                .expect("forward");
             let all = logits.to_vec_f32().expect("logits d2h");
             let vocab = all.len() / n;
             let mut line = String::new();
@@ -503,7 +540,11 @@ fn eval_forward_predicts_a_known_prompt() {
             ids.iter().map(|&t| t as f32).collect(),
             Shape::new(vec![1, n]),
         );
-        let t_pos = tensor_on(&dev, (0..n).map(|p| p as f32).collect(), Shape::new(vec![1, n]));
+        let t_pos = tensor_on(
+            &dev,
+            (0..n).map(|p| p as f32).collect(),
+            Shape::new(vec![1, n]),
+        );
         let mut sess = model.new_session();
         let logits = model
             .forward(&mut *sess, &t_ids, &t_pos, &[])

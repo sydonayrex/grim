@@ -66,7 +66,10 @@ fn tensor_on(dev: &Device, data: Vec<f32>, shape: Shape) -> Tensor {
 fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
     let scale = a
         .iter()
-        .fold(0.0f32, |m, x| if x.is_finite() { m.max(x.abs()) } else { m })
+        .fold(
+            0.0f32,
+            |m, x| if x.is_finite() { m.max(x.abs()) } else { m },
+        )
         .max(1e-6);
     let mut worst = (0.0f32, 0usize, 0.0f32);
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -82,7 +85,10 @@ fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
 
 #[test]
 fn xing40_moe_loads_emits_and_replays_like_eager() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the Xing40 MoE task-graph gate");
         return;
     }
@@ -126,7 +132,10 @@ fn xing40_moe_loads_emits_and_replays_like_eager() {
     let mut graph = graph_model
         .get_or_create_decode_graph(GRAPH_CTX, 1)
         .expect("graph pool alloc");
-    assert!(graph.buffers.emitted_task_graph.is_none(), "no IR before capture");
+    assert!(
+        graph.buffers.emitted_task_graph.is_none(),
+        "no IR before capture"
+    );
     for _ in 0..2 {
         let _ = graph_model.forward_capture(&mut graph, TOKENS[0]);
     }
@@ -145,7 +154,11 @@ fn xing40_moe_loads_emits_and_replays_like_eager() {
         .expect("capture must publish the emitted task graph");
     use grim_backend_rocm::task_graph::op;
     let ops: Vec<u32> = ir.nodes.iter().map(|n| n.opcode).collect();
-    assert_eq!(ops[0], op::ELEMENTWISE, "first node is the embedding gather");
+    assert_eq!(
+        ops[0],
+        op::ELEMENTWISE,
+        "first node is the embedding gather"
+    );
     let ffn_ops = &ops[1..ops.len() - 2];
     let mut layers = 0usize;
     let mut moe_layers = 0usize;
@@ -198,8 +211,10 @@ fn xing40_moe_loads_emits_and_replays_like_eager() {
     // moment M5 added MOE_DISPATCH/ATTENTION/NORM/ELEMENTWISE — the Xing4.0 IR is
     // now fully covered, so the honest expectation is `full: true` with an empty
     // missing set. Hardcoding either direction fails on a correct predicate.
-    let ring: std::collections::BTreeSet<u32> =
-        grim_backend_rocm::task_graph_exec::RING_OPCODES.iter().copied().collect();
+    let ring: std::collections::BTreeSet<u32> = grim_backend_rocm::task_graph_exec::RING_OPCODES
+        .iter()
+        .copied()
+        .collect();
     let mut expect_missing = ir.caps.opcodes.clone();
     expect_missing.remove(&op::FALLBACK);
     for r in &ring {
@@ -237,9 +252,7 @@ fn xing40_moe_loads_emits_and_replays_like_eager() {
         let logits = graph.read_logits_f32().expect("graph logits readback");
         assert!(logits.iter().all(|x| x.is_finite()), "replay logits finite");
         let (worst, at, abs) = worst_scaled(&eager[step], &logits);
-        eprintln!(
-            "[xing40-parity] step {step}: worst {worst:.3e} at {at} (abs {abs:.3e})"
-        );
+        eprintln!("[xing40-parity] step {step}: worst {worst:.3e} at {at} (abs {abs:.3e})");
         assert!(
             worst <= 1e-1,
             "step {step}: replay diverges from eager: worst rel {worst:.3e} at {at}"

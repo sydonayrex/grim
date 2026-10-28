@@ -11,6 +11,13 @@ pub type Rocblstatus = i32;
 #[allow(non_upper_case_globals)]
 pub const rocblas_status_success: Rocblstatus = 0;
 
+/// rocBLAS atomics mode control.
+pub type RocblasAtomicsMode = i32;
+#[allow(non_upper_case_globals)]
+pub const rocblas_atomics_not_allowed: RocblasAtomicsMode = 0;
+#[allow(non_upper_case_globals)]
+pub const rocblas_atomics_allowed: RocblasAtomicsMode = 1;
+
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RocblasOperation {
@@ -36,6 +43,14 @@ unsafe extern "C" {
     pub fn rocblas_create_handle(handle: *mut RocblasHandle) -> Rocblstatus;
     pub fn rocblas_destroy_handle(handle: RocblasHandle) -> Rocblstatus;
     pub fn rocblas_set_stream(handle: RocblasHandle, stream: *mut c_void) -> Rocblstatus;
+    pub fn rocblas_set_atomics_mode(
+        handle: RocblasHandle,
+        atomics_mode: RocblasAtomicsMode,
+    ) -> Rocblstatus;
+    pub fn rocblas_get_atomics_mode(
+        handle: RocblasHandle,
+        atomics_mode: *mut RocblasAtomicsMode,
+    ) -> Rocblstatus;
 
     /// Special-case FP32 GEMM (16 args). Used by the FP32-only [see: `RocmDevice::matmul`, `gemm_ex`]
     pub fn rocblas_sgemm(

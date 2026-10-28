@@ -1263,11 +1263,22 @@ impl Qwen35Block {
                             let mut host_bytes = vec![0u8; n_bytes];
                             unsafe {
                                 if let Some(p) = rocm.device_ptr_u64() {
-                                    grim_backend_rocm::hipMemcpy(host_bytes.as_mut_ptr() as *mut std::ffi::c_void, p as *const std::ffi::c_void, n_bytes, grim_backend_rocm::HipMemcpyKind::DeviceToHost);
-                                    let k_u16: &[u16] = std::slice::from_raw_parts(host_bytes.as_ptr() as *const u16, n_bytes / 2);
+                                    grim_backend_rocm::hipMemcpy(
+                                        host_bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                                        p as *const std::ffi::c_void,
+                                        n_bytes,
+                                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                                    );
+                                    let k_u16: &[u16] = std::slice::from_raw_parts(
+                                        host_bytes.as_ptr() as *const u16,
+                                        n_bytes / 2,
+                                    );
                                     let r24_start = 24 * 1024;
                                     let r24_end = (25 * 1024).min(k_u16.len());
-                                    let nans = k_u16[r24_start..r24_end].iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
+                                    let nans = k_u16[r24_start..r24_end]
+                                        .iter()
+                                        .filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0)
+                                        .count();
                                     eprintln!(
                                         "[eager-scan layer {}] step pos=24: k_ptr=0x{:x} total_rows={} r24_nans={nans}/1024 first_val=0x{:04x}",
                                         self.layer_idx,
@@ -1309,8 +1320,7 @@ impl Qwen35Block {
                         self.num_kv_heads,
                         kv_arena_head_extent(fmt, self.head_dim),
                     ]);
-                    let row_extent =
-                        kv_arena_row_extent(fmt, self.num_kv_heads, self.head_dim);
+                    let row_extent = kv_arena_row_extent(fmt, self.num_kv_heads, self.head_dim);
                     let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
                     let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
                     if let Some(ref old_k) = cache.k_device {
@@ -1370,7 +1380,13 @@ impl Qwen35Block {
                 // gathered to the front; `current_pos` is reset to the retained
                 // count so the attention below reads exactly that prefix.
                 if evict.mode == EvictionMode::Curdkv {
-                    curdkv_compact_arena(&dev, &mut *cache, &evict, self.num_kv_heads, self.head_dim)?;
+                    curdkv_compact_arena(
+                        &dev,
+                        &mut *cache,
+                        &evict,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    )?;
                 }
 
                 // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
@@ -2370,8 +2386,56 @@ impl CausalLm for Qwen35 {
             h = grim_nn::modules::move_to_device(&h, self.output_norm.weight.device())?;
         }
 
-        let normed = self.output_norm.forward(&h)?;
-        let logits = self.output.forward(&normed)?;
+        // Slicing optimization: for causal generation prefill (seq_len > 1), only the
+        // last position's logits are needed unless GRIM_FULL_PREFILL_LOGITS=1 or scoring is active.
+        // Slicing normed [seq_len, hidden] to [1, hidden] before the LM head projection
+        // avoids allocating [seq_len, vocab] f32 (~993 KB per token, 2+ GB at M=2k) on dev1.
+        let full_logits = std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_some()
+            || std::env::var_os("GRIM_SCORE_FILE").is_some();
+        let skip_head = session.skip_output_projection();
+        // Reset skip flag on forward exit so intermediate chunk state never leaks
+        session.set_skip_output_projection(false);
+
+        let logits = if skip_head {
+            // For intermediate prefill chunks, skip output norm and LM head entirely.
+            // Return an empty tensor on the current device to satisfy the return type.
+            let empty_shape = grim_tensor::Shape::new(vec![0]);
+            grim_tensor::Tensor::new(
+                std::sync::Arc::from(
+                    grim_backend_cpu::CpuDevice::new()
+                        .alloc_storage(&empty_shape, grim_tensor::dtype::DType::F32)?,
+                ),
+                empty_shape,
+                grim_tensor::dtype::DType::F32,
+                grim_tensor::dtype::QuantProvenance::default(),
+                grim_tensor::Device::Cpu,
+            )
+        } else {
+            let normed = self.output_norm.forward(&h)?;
+            let head_in = if seq_len > 1 && !full_logits {
+                let dev = grim_nn::modules::pick_device_for_storage_device(normed.device());
+                let hidden = self.cfg.hidden_size;
+                let last_shape = grim_tensor::Shape::new(vec![1, hidden]);
+                let (last_row_storage, handle) = dev.narrow_rows(
+                    normed.storage().as_ref(),
+                    seq_len - 1,
+                    1,
+                    hidden,
+                    &last_shape,
+                )?;
+                let _ = handle;
+                grim_tensor::Tensor::new(
+                    std::sync::Arc::from(last_row_storage),
+                    last_shape,
+                    normed.dtype().clone(),
+                    normed.provenance().clone(),
+                    normed.device().clone(),
+                )
+            } else {
+                normed
+            };
+            self.output.forward(&head_in)?
+        };
         session.advance_pos(seq_len);
         Ok(logits)
     }
@@ -4355,16 +4419,36 @@ impl KvEvictionPolicy {
     /// Returns `None` for `Positional` mode (the existing contiguous ring
     /// layout already provides its ordering) and `Some(indices)` for `Curdkv`
     /// mode. CurDKV itself lives in [`Self::curdkv_indices`].
-    pub fn compute_retained(&self, n_tokens: usize, d: usize, k: &[f32], v: &[f32]) -> Option<Vec<usize>> {
+    pub fn compute_retained(
+        &self,
+        n_tokens: usize,
+        d: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<Vec<usize>> {
         match self.mode {
             EvictionMode::Positional => None,
-            EvictionMode::Curdkv => Some(Self::curdkv_indices(k, v, n_tokens, d, self.cap_rows.unwrap_or(n_tokens), self.sinks)),
+            EvictionMode::Curdkv => Some(Self::curdkv_indices(
+                k,
+                v,
+                n_tokens,
+                d,
+                self.cap_rows.unwrap_or(n_tokens),
+                self.sinks,
+            )),
         }
     }
 
     /// Wire-in shim around [`select_curdkv_indices`] used by the CuRD-KV
     /// eviction path. Exists so the policy carries its own call site.
-    pub fn curdkv_indices(k_group: &[f32], v_group: &[f32], n_tokens: usize, d: usize, budget: usize, sinks: usize) -> Vec<usize> {
+    pub fn curdkv_indices(
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+        budget: usize,
+        sinks: usize,
+    ) -> Vec<usize> {
         Self::select_curdkv_indices(k_group, v_group, n_tokens, d, budget, sinks)
     }
 }
@@ -4897,7 +4981,6 @@ pub(crate) fn kv_arena_row_extent(
     nkv * kv_arena_head_extent(format, head_dim)
 }
 
-
 /// Bytes one KV *element* costs in the dense arena, codes only, no scale
 /// sidecar — the unit the arena budget planner reserves in.
 pub(crate) fn kv_arena_bytes_per_kv_elem(format: grim_backend_rocm::KvArenaFormat) -> f64 {
@@ -5365,8 +5448,8 @@ fn plan_layer_devices(
                 )
             })
             .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
-        (c as f64 * kv_heads as f64 * head_dim as f64 * bpe * 2.0
-            + c as f64 * scales_per_row) as u64
+        (c as f64 * kv_heads as f64 * head_dim as f64 * bpe * 2.0 + c as f64 * scales_per_row)
+            as u64
     };
     // Phase 3: a fixed eviction capacity caps the arena BELOW the model's
     // advertised context, so the reservation must budget for the cap — that is
@@ -5494,7 +5577,11 @@ fn plan_layer_devices(
             _ => false,
         });
     let layer_bytes: Vec<u64> = (0..num_layers)
-        .map(|i| ws.pp("blk").pp(&i.to_string()).prefix_bytes_resident(convert_gsq_rco))
+        .map(|i| {
+            ws.pp("blk")
+                .pp(&i.to_string())
+                .prefix_bytes_resident(convert_gsq_rco)
+        })
         .collect();
 
     // Measured per-device capability, in `devices` order.
@@ -7417,7 +7504,11 @@ mod kv_eviction_tests {
         assert_eq!(b.cap_for(0), Some(8192));
         assert_eq!(b.cap_for(1), Some(4096));
         assert_eq!(b.cap_for(2), Some(2048));
-        assert_eq!(b.cap_for(7), Some(2048), "past the table reuses the last entry");
+        assert_eq!(
+            b.cap_for(7),
+            Some(2048),
+            "past the table reuses the last entry"
+        );
         assert_eq!(b.max_cap(), Some(8192));
         // A 0 entry is unlimited for that layer, and makes the model-wide
         // planning cap unlimited too (the worst case).
@@ -7469,7 +7560,11 @@ mod kv_eviction_tests {
         let v = k.clone();
         let sel = KvEvictionPolicy::select_curdkv_indices_residual(&k, &v, n, d, 6, 2, 2);
         assert_eq!(sel.len(), 6, "budget must be honored exactly: {sel:?}");
-        assert_eq!(&sel[..2], &[0, 1], "sinks must be the first survivors: {sel:?}");
+        assert_eq!(
+            &sel[..2],
+            &[0, 1],
+            "sinks must be the first survivors: {sel:?}"
+        );
         assert!(
             sel.contains(&10) && sel.contains(&11),
             "the newest `residual` rows must survive: {sel:?}"
@@ -7487,7 +7582,11 @@ mod kv_eviction_tests {
         let (n, d) = (8usize, 2);
         let k: Vec<f32> = (0..n * d).map(|i| i as f32).collect();
         let sel = KvEvictionPolicy::select_curdkv_indices_residual(&k, &k, n, d, 3, 1, 99);
-        assert_eq!(sel.len(), 3, "residual must not overshoot the budget: {sel:?}");
+        assert_eq!(
+            sel.len(),
+            3,
+            "residual must not overshoot the budget: {sel:?}"
+        );
         assert!(sel.windows(2).all(|w| w[0] < w[1]));
         let all = KvEvictionPolicy::select_curdkv_indices_residual(&k, &k, n, d, 8, 2, 2);
         assert_eq!(all, (0..8).collect::<Vec<_>>());

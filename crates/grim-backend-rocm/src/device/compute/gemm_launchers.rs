@@ -179,6 +179,184 @@ impl RocmDevice {
         Ok(stream)
     }
 
+    /// Launch rocBLAS F16 x F16 -> F32 GEMM directly on active stream.
+    /// Used for accelerated prefill dequant GEMM (A: f16, B: f16, C/D: f32, compute: f32).
+    pub(crate) fn launch_rocblas_gemm_f16_f32(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        use crate::device::rocblas::*;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let handle = self.get_rocblas_handle()?;
+        let stream = self.active_stream();
+        unsafe {
+            let _ = rocblas_set_stream(handle, stream);
+        }
+        let alpha: f32 = 1.0f32;
+        let beta: f32 = 0.0f32;
+        let a_ptr_void = a_storage.device_ptr_checked()? as *const c_void;
+        let b_ptr_void = b_storage.device_ptr_checked()? as *const c_void;
+        let out_ptr_void = out_storage.device_ptr_checked()? as *mut c_void;
+        let alpha_ptr = &alpha as *const f32 as *const c_void;
+        let beta_ptr = &beta as *const f32 as *const c_void;
+        unsafe {
+            // C = A @ B^T, B stored (N, K). transA=Trans, transB=NoTrans;
+            // m=N, n=M, k=K, A=b_ptr (lda=K), B=a_ptr (ldb=K), C=D=out (ldc/ldd=N).
+            let status = rocblas_gemm_ex(
+                handle,
+                RocblasOperation::Transpose,
+                RocblasOperation::None,
+                n as RocblasInt,
+                m as RocblasInt,
+                k as RocblasInt,
+                alpha_ptr,
+                b_ptr_void,
+                rocblas_datatype::f16_r,
+                k as RocblasInt,
+                a_ptr_void,
+                rocblas_datatype::f16_r,
+                k as RocblasInt,
+                beta_ptr,
+                out_ptr_void,
+                rocblas_datatype::f32_r,
+                n as RocblasInt,
+                out_ptr_void,
+                rocblas_datatype::f32_r,
+                n as RocblasInt,
+                rocblas_datatype::f32_r,
+                rocblas_gemm_algo::standard,
+                0 as RocblasInt,
+                ROCBLAS_GEMM_FLAGS_NONE,
+            );
+            if status != rocblas_status_success {
+                return Err(Error::Backend(format!(
+                    "rocblas_gemm_ex (f16,f16->f32) failed with code {status}"
+                )));
+            }
+        }
+        Ok(stream)
+    }
+
+    /// SPEED-ROC-PREFILL: Accelerated prefill GEMM for IQ-family weights (IQ4_NL, IQ4_XS, IQ3_S)
+    /// Dequantizes the packed weight once directly to F16 into transient prefill scratch,
+    /// converts activation A from F32 to F16 (or reuses F16 A), then executes rocBLAS gemm_ex
+    /// with mixed precision (A: F16, B: F16 -> C/D: F32).
+    pub(crate) fn launch_iq_prefill_dequant_rocblas_f16(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        format_tag: &str,
+    ) -> Result<()> {
+        let n_elements = n * k;
+        let weight_bytes = n_elements * 2; // F16 = 2 bytes per weight
+
+        // 1. Ensure transient weight F16 scratch buffer
+        let mut w_guard = self
+            .prefill_iq_weight_f16_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let need_w_alloc = match w_guard.as_ref() {
+            Some(s) => s.bytes < weight_bytes,
+            None => true,
+        };
+        if need_w_alloc {
+            let shape = Shape::new(vec![n_elements]);
+            *w_guard = Some(RocmStorage::alloc_gpu(
+                &shape,
+                DType {
+                    arith: ArithType::F16,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let w_f16 = w_guard.as_ref().unwrap();
+
+        // 2. Dequantize packed weight directly to F16
+        match format_tag {
+            "iq4nl" => {
+                let n_blocks = n_elements / 32;
+                self.launch_dequant_iq4nl_f16(b_storage, w_f16, n_blocks)?;
+            }
+            "iq4xs" => {
+                let n_blocks = n_elements / 256;
+                self.launch_dequant_iq4xs_f16(b_storage, w_f16, n_blocks)?;
+            }
+            "iq3s" => {
+                let n_blocks = n_elements / 256;
+                self.launch_dequant_iq3s_f16(b_storage, w_f16, n_blocks)?;
+            }
+            other => {
+                return Err(Error::Backend(format!(
+                    "launch_iq_prefill_dequant_rocblas_f16 unsupported format {other}"
+                )));
+            }
+        }
+
+        // 3. Prepare activation A in F16
+        let a_f16_storage = if Self::is_fp16_activation(a_storage) {
+            None
+        } else {
+            let a_elems = m * k;
+            let a_bytes = a_elems * 2;
+            let mut a_guard = self
+                .prefill_act_f16_buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let need_a_alloc = match a_guard.as_ref() {
+                Some(s) => s.bytes < a_bytes,
+                None => true,
+            };
+            if need_a_alloc {
+                let shape = Shape::new(vec![a_elems]);
+                *a_guard = Some(RocmStorage::alloc_gpu(
+                    &shape,
+                    DType {
+                        arith: ArithType::F16,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?);
+            }
+            let a_f16 = a_guard.as_ref().unwrap();
+            let mut sptr = a_storage
+                .device_ptr
+                .ok_or_else(|| Error::Backend("cvt A: src ptr".into()))?;
+            let mut dptr = a_f16
+                .device_ptr
+                .ok_or_else(|| Error::Backend("cvt A: dst ptr".into()))?;
+            let mut n_i = a_elems as i32;
+            let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+            self.launch_compute_kernel(
+                "grim_cvt_f32_f16",
+                HipDim3::new(1024, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut n_i)],
+            )?;
+            Some(a_guard)
+        };
+
+        let a_act = match &a_f16_storage {
+            Some(g) => g.as_ref().unwrap(),
+            None => a_storage,
+        };
+
+        // 4. Dispatch mixed-precision rocBLAS GEMM (A: F16, B: F16 -> C/D: F32)
+        self.launch_rocblas_gemm_f16_f32(a_act, w_f16, out_storage, m, n, k)?;
+        Ok(())
+    }
+
     /// Enqueues the JIT-compiled WMMA matrix-core GEMM kernel (WI-G).
     pub(crate) fn launch_wmma_gemm(
         &self,
@@ -793,8 +971,9 @@ impl RocmDevice {
     /// the old one. Every 9B prefill with m >= 64 was computed on stale
     /// activations, which is the whole of the "prefill collapse at 64 tokens".
     fn f32_activation_as_f16_ptr(&self, a: &RocmStorage, elems: usize) -> Result<u64> {
-        static F16_A: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Arc<RocmStorage>>>> =
-            OnceLock::new();
+        static F16_A: OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, Arc<RocmStorage>>>,
+        > = OnceLock::new();
         if a.dtype.arith != ArithType::F32 {
             return Err(Error::Backend("f32_activation_as_f16: A is not f32".into()));
         }
@@ -891,7 +1070,15 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q4k", a_storage, b_storage, out_storage, m, n, k)
+        self.launch_wmma_big64x128_fmt(
+            "grim_wmma_big64x128_q4k",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
     }
 
     /// A/B EXPERIMENT: 64x128 tile, 256 threads (8 waves: 2 row x 4 col quadrants).
@@ -1391,9 +1578,13 @@ impl RocmDevice {
             )
         });
         if v2 {
-            self.launch_grey_raven_gemm_v2_for_ab(w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows)
+            self.launch_grey_raven_gemm_v2_for_ab(
+                w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows,
+            )
         } else {
-            self.launch_grey_raven_gemm_v1_for_ab(w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows)
+            self.launch_grey_raven_gemm_v1_for_ab(
+                w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows,
+            )
         }
     }
 
@@ -1553,7 +1744,9 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("wmma_iu8: out has no device ptr".into()))?;
 
         if k % 16 != 0 {
-            return Err(Error::Backend(format!("wmma_iu8: K={k} must be divisible by 16")));
+            return Err(Error::Backend(format!(
+                "wmma_iu8: K={k} must be divisible by 16"
+            )));
         }
         let tile = 16usize;
         if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
@@ -1625,7 +1818,9 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("wmma_iu8_mtile: out has no device ptr".into()))?;
 
         if k % 16 != 0 {
-            return Err(Error::Backend(format!("wmma_iu8_mtile: K={k} must be divisible by 16")));
+            return Err(Error::Backend(format!(
+                "wmma_iu8_mtile: K={k} must be divisible by 16"
+            )));
         }
         let tile = 16usize;
         if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
@@ -1973,7 +2168,15 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_gemm_fp8_e4m3_blocked_named("grim_wmma_gemm_fp8_e4m3_blocked", a, b_blocked, out, m, n, k)
+        self.launch_wmma_gemm_fp8_e4m3_blocked_named(
+            "grim_wmma_gemm_fp8_e4m3_blocked",
+            a,
+            b_blocked,
+            out,
+            m,
+            n,
+            k,
+        )
     }
 
     pub fn launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(
@@ -1985,7 +2188,15 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_gemm_fp8_e4m3_blocked_named("grim_wmma_gemm_fp8_e4m3_blocked_v2", a, b_blocked, out, m, n, k)
+        self.launch_wmma_gemm_fp8_e4m3_blocked_named(
+            "grim_wmma_gemm_fp8_e4m3_blocked_v2",
+            a,
+            b_blocked,
+            out,
+            m,
+            n,
+            k,
+        )
     }
 
     fn launch_wmma_gemm_fp8_e4m3_blocked_named(
@@ -2055,7 +2266,9 @@ impl RocmDevice {
         let mut kk = k as i32;
 
         if kernel == "grim_wmma_gemm_fp8_e4m3_blocked_v2" {
-            crate::device::compute::kernel_infra::record_kernel_route("grim_wmma_gemm_fp8_e4m3_blocked");
+            crate::device::compute::kernel_infra::record_kernel_route(
+                "grim_wmma_gemm_fp8_e4m3_blocked",
+            );
         }
         self.launch_compute_kernel(
             kernel,
@@ -3101,23 +3314,30 @@ impl RocmDevice {
                 return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
-                // The IQ4_NL decode leg: the SCALAR fused dequant-GEMM, on the
-                // f32 activation (no q8_1 scratch needed).
-                //
-                // It must NOT ride the generic or-pattern's WMMA leg below.
-                // That leg is a fused dequant whose tile assumes the weight's
-                // 32-element blocks line up with the tile's K extent; IQ4_NL
-                // packs 32 weights in 18 BYTES, and the WMMA leg read the
-                // wrong bytes — the qwen35 hybrid with an IQ4_NL
-                // down-projection returned NaN logits on BOTH the graph and
-                // the walk (measured 2026-10-21). The same separation the
-                // GSQ-RCO arm above documents: a format whose blocks do not
-                // fill the tile gets its OWN leg, so a wrong-but-plausible
-                // decode is impossible.
                 let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
-                self.launch_fused_dequant_gemm_iq4nl(a_rocm, w, out, m, n, k)?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ4NL_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                // IQ4_NL fast dot4 decode: Q8_1 activation dot4 GEMV.
+                // Replaces 5.6 ms (dev0) and 11.8 ms (dev1) scalar fused GEMV with ~0.2 ms dot4 GEMV.
+                if self.is_dot4_arch && !dot_disabled && k % 32 == 0 {
+                    if act_q81.bytes < need_q81 {
+                        return Err(Error::Backend(format!(
+                            "linear_decode_into: act scratch {}B < {need_q81}B",
+                            act_q81.bytes
+                        )));
+                    }
+                    self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
+                    self.launch_dot4_iq4nl_q81_gemv(act_q81, w, out, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_iq4nl(a_rocm, w, out, m, n, k)?;
+                }
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
             DTypeStorage::KQuant(
@@ -3299,7 +3519,7 @@ impl RocmDevice {
                                 // exact activations). Falls back to exact
                                 // fused-dequant when dot4 can't run.
                                 self.launch_dot4_q6k_f32act_gemv_for_ab(
-                                    act_q81,
+                                    a_s,
                                     w,
                                     out,
                                     m,
@@ -3347,18 +3567,21 @@ impl RocmDevice {
                     KQuantScheme::IQ3XXS => {
                         self.launch_fused_dequant_gemm_iq3xxs(a_s, w, out, m, n, k)?
                     }
-                    // IQ4_XS must never reach the Q3_K catch-all below, for
-                    // exactly the reason IQ3_S is called out above — the
-                    // aliased layouts walk different offsets and read past the
-                    // block. IQ4_XS is 136 B/256 and its fused-dequant helper
-                    // (`dequant_iq4xs`, 6-bit scales_h/scales_l + the
-                    // kvalues_iq4nl codebook) was already correct; only the
-                    // dispatch was missing, so the 27B's 33 IQ4_XS tensors —
-                    // including `output.weight`, the LM head — were being
-                    // decoded by the Q3_K kernel and came back non-finite
-                    // (measured: 8/256 outputs non-finite, max_diff 1.3e8).
+                    // IQ4_XS fast dot4 decode: sub-block-per-lane v2 kernel with 4-column
+                    // load batching and pure VALU byte permute LUT.
                     KQuantScheme::IQ4XS => {
-                        self.launch_fused_dequant_gemm_iq4xs(a_s, w, out, m, n, k)?
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ4XS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        if self.is_dot4_arch && !dot_disabled && k % 256 == 0 {
+                            self.launch_dot4_iq4xs_q81_gemv(act_q81, w, out, m, n, k)?
+                        } else {
+                            self.launch_fused_dequant_gemm_iq4xs(a_s, w, out, m, n, k)?
+                        }
                     }
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };
