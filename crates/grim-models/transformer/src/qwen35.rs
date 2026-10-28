@@ -5391,6 +5391,27 @@ fn plan_layer_devices(
         return vec![devices[0].clone(); num_layers];
     }
 
+    // Explicit override via GRIM_SPLIT_LAYERS (e.g. "32,32" or "30,34")
+    if let Ok(split_env) = std::env::var("GRIM_SPLIT_LAYERS") {
+        let parts: Vec<usize> = split_env
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if parts.len() == devices.len() && parts.iter().sum::<usize>() == num_layers {
+            let mut manual_assignment = Vec::with_capacity(num_layers);
+            for (dev_idx, &count) in parts.iter().enumerate() {
+                for _ in 0..count {
+                    manual_assignment.push(devices[dev_idx].clone());
+                }
+            }
+            eprintln!(
+                "[qwen35] manual layer split via GRIM_SPLIT_LAYERS: {:?}",
+                parts
+            );
+            return manual_assignment;
+        }
+    }
+
     let round_robin = |i: usize| devices[i * devices.len() / num_layers.max(1)].clone();
 
     // Reserve the decode-graph KV arenas BEFORE handing out weight budget.
