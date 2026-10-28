@@ -116,8 +116,16 @@ fn answer_logprob(model_path: &str, prompt: &str, answer_id: u32) -> (f32, u32, 
     let n = tokens.len();
     let model = grim_engine::model_loader::load_model_from_gguf(model_path, dev.clone())
         .expect("load model");
-    let ids = tensor_on(&dev, tokens.iter().map(|&t| t as f32).collect(), Shape::new(vec![1, n]));
-    let positions = tensor_on(&dev, (0..n).map(|p| p as f32).collect(), Shape::new(vec![1, n]));
+    let ids = tensor_on(
+        &dev,
+        tokens.iter().map(|&t| t as f32).collect(),
+        Shape::new(vec![1, n]),
+    );
+    let positions = tensor_on(
+        &dev,
+        (0..n).map(|p| p as f32).collect(),
+        Shape::new(vec![1, n]),
+    );
     let mut sess = model.new_session();
     let logits = model
         .forward(&mut *sess, &ids, &positions, &[])
@@ -133,7 +141,10 @@ fn answer_logprob(model_path: &str, prompt: &str, answer_id: u32) -> (f32, u32, 
 
 #[test]
 fn kv_int4_retrieval_gate() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the int4 retrieval gate");
         return;
     }

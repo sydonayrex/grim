@@ -162,6 +162,15 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
+                let allow_managed = matches!(
+                    std::env::var("GRIM_ROCM_MANAGED_FALLBACK").as_deref(),
+                    Ok("allow" | "1" | "true" | "on")
+                );
+                if !allow_managed {
+                    return Err(Error::Backend(format!(
+                        "GRIM_ROCM_MANAGED_FALLBACK=deny (default): allocation of {bytes} bytes on rocm:{ordinal} denied: {vram_error}"
+                    )));
+                }
                 let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
@@ -470,6 +479,15 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
+                let allow_managed = matches!(
+                    std::env::var("GRIM_ROCM_MANAGED_FALLBACK").as_deref(),
+                    Ok("allow" | "1" | "true" | "on")
+                );
+                if !allow_managed {
+                    return Err(Error::Backend(format!(
+                        "GRIM_ROCM_MANAGED_FALLBACK=deny (default): allocation of {bytes} bytes on rocm:{ordinal} denied: {vram_error}"
+                    )));
+                }
                 let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {

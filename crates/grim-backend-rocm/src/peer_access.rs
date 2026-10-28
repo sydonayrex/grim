@@ -4,9 +4,9 @@
 use std::borrow::Cow;
 use std::ffi::c_void;
 
-use grim_tensor::error::{Error, Result};
-use grim_tensor::backend::BackendStorage;
 use grim_tensor::MemoryOps;
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::error::{Error, Result};
 
 use crate::device::helpers::check_hip;
 use crate::{HipErrorT, hipSuccess};
@@ -45,9 +45,7 @@ pub fn p2p_memcpy_async(
     if dst.is_null() || src.is_null() {
         return Err(Error::Backend("p2p_memcpy_async: null buffer".into()));
     }
-    let res = unsafe {
-        hipMemcpyPeerAsync(dst, dst_device, src, src_device, count, stream)
-    };
+    let res = unsafe { hipMemcpyPeerAsync(dst, dst_device, src, src_device, count, stream) };
     if res == hipSuccess {
         Ok(())
     } else {
@@ -62,8 +60,7 @@ pub fn p2p_memcpy_async(
 /// One per boundary per token: the host records an event after the copy and
 /// the consumer's stream waits on it. M6's handoff issues NONE of these — its
 /// completion is observed by the consumer's DEVICE.
-static BOUNDARY_HOST_SYNCS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static BOUNDARY_HOST_SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many host-visible boundary synchronisations this process has issued.
 pub fn boundary_host_sync_count() -> u64 {
@@ -89,6 +86,14 @@ pub fn boundary_host_sync_count() -> u64 {
 /// `GRIM_RING_HANDOFF=0` turns it OFF, which restores A6's host-issued peer
 /// copy + event for a bisect.
 pub fn ring_handoff_enabled() -> bool {
+    // When host bounce is active (broken PCIe atomics / P2P DMA across motherboard bridge),
+    // ring handoff device-polling is disabled; A6's ordered host-staged copy is used instead.
+    let host_bounce = std::env::var("GRIM_P2P_HOST_BOUNCE")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    if host_bounce {
+        return false;
+    }
     match std::env::var("GRIM_RING_HANDOFF") {
         Ok(v) => v != "0",
         Err(_) => true,
@@ -107,6 +112,18 @@ pub fn copy_boundary_ordered(
     dst_stream: *mut c_void,
     ev: *mut c_void,
 ) -> Result<()> {
+    copy_boundary_ordered_with_staging(src, dst, src_stream, dst_stream, ev, None)
+}
+
+/// Enqueue a peer copy `src -> dst` optionally using a caller-provided staging buffer.
+pub fn copy_boundary_ordered_with_staging(
+    src: &crate::RocmStorage,
+    dst: &crate::RocmStorage,
+    src_stream: *mut c_void,
+    dst_stream: *mut c_void,
+    ev: *mut c_void,
+    staging: Option<*mut c_void>,
+) -> Result<()> {
     // A6's boundary synchronisation is a HOST-VISIBLE one: the host records an
     // event and the consumer's stream waits on it, so the host is in the loop
     // at every boundary of every token. Counted so M6's gate can MEASURE the
@@ -121,22 +138,89 @@ pub fn copy_boundary_ordered(
     let d = dst
         .device_ptr_u64()
         .ok_or_else(|| Error::Backend("boundary dst has no ptr".into()))?;
-    let _guard = DeviceGuard::set(src_dev);
-    p2p_memcpy_async(
-        d as *mut c_void,
-        dst_dev,
-        s as *const c_void,
-        src_dev,
-        bytes,
-        src_stream,
-    )?;
-    // SAFETY: ev created via hipEventCreate; src_stream valid.
-    check_hip("hipEventRecord", unsafe { crate::hipEventRecord(ev, src_stream) })?;
-    let _guard = DeviceGuard::set(dst_dev);
-    // SAFETY: ev/dst_stream valid.
-    check_hip("hipStreamWaitEvent", unsafe {
-        crate::hipStreamWaitEvent(dst_stream, ev, 0)
-    })?;
+
+    // On motherboards where PCIe atomics or P2P routing across PCIe bridge/chipset is broken,
+    // direct hipMemcpyPeerAsync faults. Host staging through pinned RAM is 100% reliable.
+    let force_host_bounce = std::env::var("GRIM_P2P_HOST_BOUNCE")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true); // default to true for maximum stability across heterogeneous PCIe topologies
+
+    if force_host_bounce {
+        static BOUNDARY_PINNED: std::sync::Mutex<Option<crate::p2p_route::HostStagingBuffer>> =
+            std::sync::Mutex::new(None);
+
+        let staging_ptr = match staging {
+            Some(ptr) => ptr,
+            None => {
+                let mut guard = BOUNDARY_PINNED
+                    .lock()
+                    .map_err(|_| Error::Backend("boundary pinned mutex poisoned".into()))?;
+                let need_alloc = match guard.as_ref() {
+                    Some(buf) => buf.size() < bytes,
+                    None => true,
+                };
+                if need_alloc {
+                    let _g = DeviceGuard::set(src_dev);
+                    *guard = Some(crate::p2p_route::HostStagingBuffer::new(bytes.max(65536))?);
+                }
+                guard.as_ref().unwrap().as_device_ptr()
+            }
+        };
+
+        // 1. D2H on src_stream
+        {
+            let _guard = DeviceGuard::set(src_dev);
+            check_hip("copy_boundary: D2H", unsafe {
+                crate::hipMemcpyAsync(
+                    staging_ptr,
+                    s as *const c_void,
+                    bytes,
+                    crate::HipMemcpyKind::DeviceToHost,
+                    src_stream,
+                )
+            })?;
+            // Record event on src_stream when D2H completes
+            check_hip("copy_boundary: hipEventRecord", unsafe {
+                crate::hipEventRecord(ev, src_stream)
+            })?;
+        }
+
+        // 2. dst_stream waits for D2H to finish, then issues H2D
+        {
+            let _guard = DeviceGuard::set(dst_dev);
+            check_hip("copy_boundary: hipStreamWaitEvent", unsafe {
+                crate::hipStreamWaitEvent(dst_stream, ev, 0)
+            })?;
+            check_hip("copy_boundary: H2D", unsafe {
+                crate::hipMemcpyAsync(
+                    d as *mut c_void,
+                    staging_ptr,
+                    bytes,
+                    crate::HipMemcpyKind::HostToDevice,
+                    dst_stream,
+                )
+            })?;
+        }
+    } else {
+        let _guard = DeviceGuard::set(src_dev);
+        p2p_memcpy_async(
+            d as *mut c_void,
+            dst_dev,
+            s as *const c_void,
+            src_dev,
+            bytes,
+            src_stream,
+        )?;
+        // SAFETY: ev created via hipEventCreate; src_stream valid.
+        check_hip("hipEventRecord", unsafe {
+            crate::hipEventRecord(ev, src_stream)
+        })?;
+        let _guard = DeviceGuard::set(dst_dev);
+        // SAFETY: ev/dst_stream valid.
+        check_hip("hipStreamWaitEvent", unsafe {
+            crate::hipStreamWaitEvent(dst_stream, ev, 0)
+        })?;
+    }
     Ok(())
 }
 
@@ -424,7 +508,7 @@ impl BoundaryHandoff {
         dst: &crate::memory::storage::RocmStorage,
         elems: u32,
     ) -> Result<Self> {
-        use crate::task_graph::{arg_role, op, TaskGraphBuilder};
+        use crate::task_graph::{TaskGraphBuilder, arg_role, op};
 
         if elems == 0 {
             return Err(Error::Backend(
@@ -439,7 +523,9 @@ impl BoundaryHandoff {
             .ok_or_else(|| Error::Backend("boundary handoff: dst has no device ptr".into()))?;
 
         // A one-element u32 device buffer on the given device.
-        let u32_scalar = |dev: &crate::RocmDevice, v: u32| -> Result<Box<dyn grim_tensor::backend::BackendStorage>> {
+        let u32_scalar = |dev: &crate::RocmDevice,
+                          v: u32|
+         -> Result<Box<dyn grim_tensor::backend::BackendStorage>> {
             Ok(dev.from_cpu_bytes(
                 &v.to_ne_bytes(),
                 &grim_tensor::Shape::new(vec![1]),
@@ -449,13 +535,18 @@ impl BoundaryHandoff {
                 },
             )?)
         };
-        let ptr_of = |st: &Box<dyn grim_tensor::backend::BackendStorage>, what: &str| -> Result<u64> {
-            st.as_any()
-                .downcast_ref::<crate::memory::storage::RocmStorage>()
-                .ok_or_else(|| Error::Backend(format!("boundary handoff: {what} is not RocmStorage")))?
-                .device_ptr_u64()
-                .ok_or_else(|| Error::Backend(format!("boundary handoff: {what} has no device ptr")))
-        };
+        let ptr_of =
+            |st: &Box<dyn grim_tensor::backend::BackendStorage>, what: &str| -> Result<u64> {
+                st.as_any()
+                    .downcast_ref::<crate::memory::storage::RocmStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend(format!("boundary handoff: {what} is not RocmStorage"))
+                    })?
+                    .device_ptr_u64()
+                    .ok_or_else(|| {
+                        Error::Backend(format!("boundary handoff: {what} has no device ptr"))
+                    })
+            };
 
         // Where the consumer's wait kernel records what it observed, and the
         // consumer's "last seen" register: zero, so the producer's first
@@ -520,8 +611,13 @@ impl BoundaryHandoff {
     /// The wave lands in that stream's ORDER, so a caller that has already
     /// launched the producer's graph on the same stream gets the copy strictly
     /// after it. One host call; no host event.
-    pub fn launch_copy(&self, producer: &crate::RocmDevice, producer_stream: *mut c_void) -> Result<()> {
-        self.ring.launch_staged_on_stream(producer, producer_stream)?;
+    pub fn launch_copy(
+        &self,
+        producer: &crate::RocmDevice,
+        producer_stream: *mut c_void,
+    ) -> Result<()> {
+        self.ring
+            .launch_staged_on_stream(producer, producer_stream)?;
         Ok(())
     }
 
@@ -545,7 +641,9 @@ impl BoundaryHandoff {
             .as_any()
             .downcast_ref::<crate::memory::storage::RocmStorage>()
             .and_then(|r| r.device_ptr_u64())
-            .ok_or_else(|| Error::Backend("boundary handoff: last_seen has no device ptr".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("boundary handoff: last_seen has no device ptr".into())
+            })?;
         crate::kernels::task_ring::launch_scythe_wait_counter_on_stream(
             consumer,
             self.tail_ptr,
@@ -563,7 +661,9 @@ impl BoundaryHandoff {
             .observed
             .as_any()
             .downcast_ref::<crate::memory::storage::RocmStorage>()
-            .ok_or_else(|| Error::Backend("boundary handoff: observed is not RocmStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("boundary handoff: observed is not RocmStorage".into())
+            })?;
         Ok(r.to_cpu_vec_u32()?.first().copied().unwrap_or(0))
     }
 
@@ -572,7 +672,6 @@ impl BoundaryHandoff {
         Ok(self.ring.tail_value()?)
     }
 }
-
 
 #[cfg(test)]
 mod self_tests {

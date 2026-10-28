@@ -367,6 +367,67 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
+    /// Dequantize IQ4_NL packed bytes directly to __half (F16) for accelerated prefill rocBLAS GEMM.
+    /// Uses 64 threads per workgroup decoding 8 blocks (8 threads per 32-element block, 4 elements per thread)
+    /// to eliminate launch overhead across large weight matrices (e.g. 17408x5120).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq4nl_f16(
+        const unsigned char* __restrict__ packed,
+        __half* __restrict__ out,
+        int n_blocks)
+    {
+        const int tid = threadIdx.x;
+        const int block_in_wg = tid / 8;
+        const int b = blockIdx.x * 8 + block_in_wg;
+        if (b >= n_blocks) return;
+
+        const unsigned char* blk = packed + (size_t)b * 18;
+        __half* dst = out + (size_t)b * 32;
+        const int base = (tid % 8) * 4;
+        dst[base + 0] = __float2half(dequant_iq4nl_device(blk, base + 0));
+        dst[base + 1] = __float2half(dequant_iq4nl_device(blk, base + 1));
+        dst[base + 2] = __float2half(dequant_iq4nl_device(blk, base + 2));
+        dst[base + 3] = __float2half(dequant_iq4nl_device(blk, base + 3));
+    }
+
+    /// Dequantize IQ4_XS packed bytes directly to __half (F16) for accelerated prefill rocBLAS GEMM.
+    /// One 64-thread block per 256-element quant block; each thread decodes 4 elements.
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq4xs_f16(
+        const unsigned char* __restrict__ packed,
+        __half* __restrict__ out,
+        int n_blocks)
+    {
+        const int b = blockIdx.x;
+        if (b >= n_blocks) return;
+        const unsigned char* blk = packed + (size_t)b * 136;
+        __half* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        dst[base + 0] = __float2half(dequant_iq4xs_device(blk, base + 0));
+        dst[base + 1] = __float2half(dequant_iq4xs_device(blk, base + 1));
+        dst[base + 2] = __float2half(dequant_iq4xs_device(blk, base + 2));
+        dst[base + 3] = __float2half(dequant_iq4xs_device(blk, base + 3));
+    }
+
+    /// Dequantize IQ3_S packed bytes directly to __half (F16) for accelerated prefill rocBLAS GEMM.
+    /// One 64-thread block per 256-element quant block; each thread decodes 4 elements.
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq3s_f16(
+        const unsigned char* __restrict__ packed,
+        __half* __restrict__ out,
+        int n_blocks)
+    {
+        const int b = blockIdx.x;
+        if (b >= n_blocks) return;
+        const unsigned char* blk = packed + (size_t)b * 110;
+        __half* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        dst[base + 0] = __float2half(dequant_iq3s_device(blk, base + 0));
+        dst[base + 1] = __float2half(dequant_iq3s_device(blk, base + 1));
+        dst[base + 2] = __float2half(dequant_iq3s_device(blk, base + 2));
+        dst[base + 3] = __float2half(dequant_iq3s_device(blk, base + 3));
+    }
+
 }
 "#;
 
@@ -383,5 +444,8 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_dequant_iq3s"));
         assert!(KERNEL_SOURCE.contains("grim_dequant_iq4nl"));
         assert!(KERNEL_SOURCE.contains("grim_dequant_iq4xs"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_iq4nl_f16"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_iq4xs_f16"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_iq3s_f16"));
     }
 }

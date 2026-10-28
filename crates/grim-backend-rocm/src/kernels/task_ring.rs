@@ -37,11 +37,12 @@ use grim_tensor::{BackendStorage, MemoryOps, Shape};
 
 use crate::device::util::{arg, as_rocm, dev_ptr};
 use crate::scythe_task_descriptors::ScytheTaskDescriptor;
-use crate::task_graph::{arg_role, op, ArgEntry, TaskGraph};
+use crate::task_graph::{ArgEntry, TaskGraph, arg_role, op};
 
 /// Wave-side opcode for a row-major-B GEMM: B is `[N, K]`, `C = A @ B^T`.
 /// This is the `matmul_op` convention, which is what grim's dense linears use.
-const OP_ROW_GEMM: u32 = 2;/// Wave-side opcode for an RMS norm over the last axis (`eps` is fixed in the
+const OP_ROW_GEMM: u32 = 2;
+/// Wave-side opcode for an RMS norm over the last axis (`eps` is fixed in the
 /// kernel). Matches the arm in `scythe_persistent::KERNEL_SOURCE`.
 const OP_NORM: u32 = 4;
 /// Wave-side opcode for element-wise add: `out[i] = a[i] + b[i]` over `m*n`
@@ -120,7 +121,10 @@ pub const WAVE_OPCODES: &[(crate::task_graph::OpCode, u32)] = &[
 /// on its ordinary launcher (the fallback contract). Never a silent default: a
 /// node run by the wrong arm is a wrong result, not an error.
 pub fn wave_opcode(op: crate::task_graph::OpCode) -> Option<u32> {
-    WAVE_OPCODES.iter().find(|&&(o, _)| o == op).map(|&(_, w)| w)
+    WAVE_OPCODES
+        .iter()
+        .find(|&&(o, _)| o == op)
+        .map(|&(_, w)| w)
 }
 
 /// How many descriptors one staged array holds. 64 covers the largest in-tree
@@ -304,7 +308,11 @@ impl TaskRingPlan {
             // geometry and capability check. A node that fails its check is
             // absent from the plan and keeps running on its ordinary launcher.
             match node.opcode {
-                op::GEMM | op::NORM | op::ELEMENTWISE | op::ATTENTION | op::MOE_DISPATCH
+                op::GEMM
+                | op::NORM
+                | op::ELEMENTWISE
+                | op::ATTENTION
+                | op::MOE_DISPATCH
                 | op::PEER_COPY
                 | op::RECURRENT
                 | op::Q8_0_DOT4
@@ -343,12 +351,19 @@ impl TaskRingPlan {
                     // `desc->m`; `params[0]` carries it. A copy with no peer
                     // destination is NOT bound — it would be a local memcpy
                     // wearing a handoff's name.
-                    let (Some(src), Some(dst)) = (input, peer) else { continue };
+                    let (Some(src), Some(dst)) = (input, peer) else {
+                        continue;
+                    };
                     let elems = node.params[0];
                     if elems == 0 {
                         continue;
                     }
-                    peers.push(TaskRingPeer { elems, src, dst, ir_node: idx as u32 });
+                    peers.push(TaskRingPeer {
+                        elems,
+                        src,
+                        dst,
+                        ir_node: idx as u32,
+                    });
                 }
                 op::RECURRENT => {
                     // The KDA descriptor rides the node's WEIGHT operand — the
@@ -360,10 +375,15 @@ impl TaskRingPlan {
                     if kda_dev == 0 {
                         continue;
                     }
-                    recurrences.push(TaskRingRecurrent { kda_dev, ir_node: idx as u32 });
+                    recurrences.push(TaskRingRecurrent {
+                        kda_dev,
+                        ir_node: idx as u32,
+                    });
                 }
                 op::NORM => {
-                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
+                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else {
+                        continue;
+                    };
                     // `m`/`k` in params[2..4]. The wave's arm fixes `eps` at
                     // 1e-5, the Llama-family value: a model with a different
                     // epsilon is NOT bound here, because normalizing with the
@@ -373,10 +393,19 @@ impl TaskRingPlan {
                     if m == 0 || k == 0 {
                         continue;
                     }
-                    norms.push(TaskRingNorm { m, k, input: i, weight: w, output: o, ir_node: idx as u32 });
+                    norms.push(TaskRingNorm {
+                        m,
+                        k,
+                        input: i,
+                        weight: w,
+                        output: o,
+                        ir_node: idx as u32,
+                    });
                 }
                 op::ELEMENTWISE => {
-                    let (Some(a), Some(b), Some(o)) = (input, second_input, output) else { continue };
+                    let (Some(a), Some(b), Some(o)) = (input, second_input, output) else {
+                        continue;
+                    };
                     // OP_ADD: `out[i] = a[i] + b[i]` over `m*n` elements.
                     // params[0] = m, params[1] = n.
                     let m = node.params[0];
@@ -384,10 +413,19 @@ impl TaskRingPlan {
                     if m == 0 || n == 0 {
                         continue;
                     }
-                    adds.push(TaskRingAdd { m, n, input_a: a, input_b: b, output: o, ir_node: idx as u32 });
+                    adds.push(TaskRingAdd {
+                        m,
+                        n,
+                        input_a: a,
+                        input_b: b,
+                        output: o,
+                        ir_node: idx as u32,
+                    });
                 }
                 op::ATTENTION => {
-                    let (Some(q), Some(k), Some(o)) = (input, weight, output) else { continue };
+                    let (Some(q), Some(k), Some(o)) = (input, weight, output) else {
+                        continue;
+                    };
                     // OP_ATTN: input=q, weight=k, peer=v, output=out.
                     // The wave's arm has a hard 256 head_dim limit.
                     let seq_len = node.params[0];
@@ -400,15 +438,30 @@ impl TaskRingPlan {
                     let v = second_input.or_else(|| {
                         node.args[..node.n_args as usize].iter().find_map(|&h| {
                             ir.arg_table.get(h as usize).and_then(|e| {
-                                if e.role == arg_role::SCRATCH { Some(e.ptr) } else { None }
+                                if e.role == arg_role::SCRATCH {
+                                    Some(e.ptr)
+                                } else {
+                                    None
+                                }
                             })
                         })
                     });
                     let Some(v) = v else { continue };
-                    attns.push(TaskRingAttn { seq_len, num_heads, head_dim, q, k, v, output: o, ir_node: idx as u32 });
+                    attns.push(TaskRingAttn {
+                        seq_len,
+                        num_heads,
+                        head_dim,
+                        q,
+                        k,
+                        v,
+                        output: o,
+                        ir_node: idx as u32,
+                    });
                 }
                 op::MOE_DISPATCH => {
-                    let (Some(input), Some(output)) = (input, output) else { continue };
+                    let (Some(input), Some(output)) = (input, output) else {
+                        continue;
+                    };
                     // OP_MOE: the wave casts weight_ptr to moe_task_descriptor_t*.
                     // The descriptor must be staged on device. The routing
                     // schedule (token_ids, expert_ids, weights) is data-dependent.
@@ -436,7 +489,9 @@ impl TaskRingPlan {
                     let mut expert_ids = None;
                     let mut weights = None;
                     for &h in &node.args[..node.n_args as usize] {
-                        let Some(e) = ir.arg_table.get(h as usize) else { continue };
+                        let Some(e) = ir.arg_table.get(h as usize) else {
+                            continue;
+                        };
                         match e.role {
                             r if r == arg_role::WEIGHT => {
                                 if gate_w.is_none() {
@@ -460,17 +515,34 @@ impl TaskRingPlan {
                         }
                     }
                     let (Some(gw), Some(uw), Some(dw), Some(ti), Some(ei), Some(w)) =
-                        (gate_w, up_w, down_w, token_ids, expert_ids, weights) else { continue };
+                        (gate_w, up_w, down_w, token_ids, expert_ids, weights)
+                    else {
+                        continue;
+                    };
                     moes.push(TaskRingMoe {
-                        hidden, inter, num_tokens, block_size, num_experts, top_k,
-                        quant_mode, routed_scaling_factor: 1.0,
-                        gate_w: gw, up_w: uw, down_w: dw,
-                        token_ids: ti, expert_ids: ei, weights: w,
-                        input, output, ir_node: idx as u32,
+                        hidden,
+                        inter,
+                        num_tokens,
+                        block_size,
+                        num_experts,
+                        top_k,
+                        quant_mode,
+                        routed_scaling_factor: 1.0,
+                        gate_w: gw,
+                        up_w: uw,
+                        down_w: dw,
+                        token_ids: ti,
+                        expert_ids: ei,
+                        weights: w,
+                        input,
+                        output,
+                        ir_node: idx as u32,
                     });
                 }
                 op::GEMM => {
-                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
+                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else {
+                        continue;
+                    };
                     // GEMM: `n`/`k`/`m` in params[1..4], and a native weight
                     // (`params[0] == 0`) because the f32 arm cannot dequantize.
                     let n = node.params[1];
@@ -479,10 +551,21 @@ impl TaskRingPlan {
                     if m == 0 || n == 0 || k == 0 || node.params[0] != 0 {
                         continue;
                     }
-                    gemms.push(TaskRingGemm { m, n, k, input: i, weight: w, output: o, quant: node.params[0], ir_node: idx as u32 });
+                    gemms.push(TaskRingGemm {
+                        m,
+                        n,
+                        k,
+                        input: i,
+                        weight: w,
+                        output: o,
+                        quant: node.params[0],
+                        ir_node: idx as u32,
+                    });
                 }
                 op::Q8_0_DOT4 | op::Q8_0_DOT4_F32ACT => {
-                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else { continue };
+                    let (Some(i), Some(w), Some(o)) = (input, weight, output) else {
+                        continue;
+                    };
                     // The Q8_0 dot4 GEMV: `n`/`k`/`m` in params[1..4], exactly
                     // like the f32 GEMM's geometry, and params[0] carries the
                     // weight's QuantFormat (which must be Q8_0 — the arm reads
@@ -518,13 +601,27 @@ impl TaskRingPlan {
                 _ => {}
             }
         }
-        Self { gemms, norms, adds, attns, moes, peers, recurrences, q8_dot4s }
+        Self {
+            gemms,
+            norms,
+            adds,
+            attns,
+            moes,
+            peers,
+            recurrences,
+            q8_dot4s,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.gemms.is_empty() && self.norms.is_empty() && self.adds.is_empty()
-            && self.attns.is_empty() && self.moes.is_empty() && self.peers.is_empty()
-            && self.recurrences.is_empty() && self.q8_dot4s.is_empty()
+        self.gemms.is_empty()
+            && self.norms.is_empty()
+            && self.adds.is_empty()
+            && self.attns.is_empty()
+            && self.moes.is_empty()
+            && self.peers.is_empty()
+            && self.recurrences.is_empty()
+            && self.q8_dot4s.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -563,8 +660,13 @@ impl TaskRingPlan {
     /// The ring's whole dispatch set for one step — what the launch-count
     /// assertion measures.
     pub fn step_len(&self) -> usize {
-        self.gemms.len() + self.norms.len() + self.adds.len() + self.attns.len()
-            + self.moes.len() + self.peers.len() + self.recurrences.len()
+        self.gemms.len()
+            + self.norms.len()
+            + self.adds.len()
+            + self.attns.len()
+            + self.moes.len()
+            + self.peers.len()
+            + self.recurrences.len()
             + self.q8_dot4s.len()
     }
 
@@ -959,11 +1061,7 @@ impl TaskRingContext {
                 0,
                 0,
             )?;
-            crate::kernels::qkv_attention::launch_scythe_publish_head(
-                dev,
-                scratch_head_ptr,
-                0,
-            )?;
+            crate::kernels::qkv_attention::launch_scythe_publish_head(dev, scratch_head_ptr, 0)?;
         }
 
         // Stage AFTER the ring exists so the caller gets a fully formed context
@@ -1033,7 +1131,11 @@ impl TaskRingContext {
             g.output,
             0,
         )?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1043,7 +1145,11 @@ impl TaskRingContext {
     /// The activation is Q8_1 and the weight is Q8_0 (the arm reads packed
     /// blocks), and the geometry is the launcher's: `m` rows of the
     /// activation, `n` output columns, `k` the reduction width.
-    pub fn enqueue_q8_dot4(&self, dev: &crate::RocmDevice, g: &TaskRingQ8Dot4) -> crate::Result<()> {
+    pub fn enqueue_q8_dot4(
+        &self,
+        dev: &crate::RocmDevice,
+        g: &TaskRingQ8Dot4,
+    ) -> crate::Result<()> {
         let head_value = self.next_head.fetch_add(1, Ordering::Relaxed);
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
@@ -1054,7 +1160,11 @@ impl TaskRingContext {
             dev,
             &**self.slots,
             slot,
-            if g.f32_act { OP_Q8_0_DOT4_F32ACT } else { OP_Q8_0_DOT4 },
+            if g.f32_act {
+                OP_Q8_0_DOT4_F32ACT
+            } else {
+                OP_Q8_0_DOT4
+            },
             g.m,
             g.n,
             g.k,
@@ -1063,7 +1173,11 @@ impl TaskRingContext {
             g.output,
             0,
         )?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1097,7 +1211,11 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1126,7 +1244,11 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1155,7 +1277,11 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1170,7 +1296,7 @@ impl TaskRingContext {
     /// The wave's arm only supports MOE_QUANT_FP32; a quantized MoE is NOT
     /// bound (see `from_graph`).
     pub fn enqueue_moe(&self, dev: &crate::RocmDevice, m: &TaskRingMoe) -> crate::Result<()> {
-        use crate::scythe_task_descriptors::{moe_quant_mode, MoETaskDescriptor};
+        use crate::scythe_task_descriptors::{MoETaskDescriptor, moe_quant_mode};
         // Stage the MoETaskDescriptor on device. The wave casts weight_ptr to
         // moe_task_descriptor_t*, so the descriptor must be in device memory.
         let desc = MoETaskDescriptor {
@@ -1209,7 +1335,11 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1221,7 +1351,11 @@ impl TaskRingContext {
     /// handoff between segment *k* and segment *k+1* never leaves the GPU and the
     /// host-side event between their graph launches is not needed. `desc->m`
     /// carries the element count.
-    pub fn enqueue_peer_copy(&self, dev: &crate::RocmDevice, p: &TaskRingPeer) -> crate::Result<()> {
+    pub fn enqueue_peer_copy(
+        &self,
+        dev: &crate::RocmDevice,
+        p: &TaskRingPeer,
+    ) -> crate::Result<()> {
         let head_value = self.next_head.fetch_add(1, Ordering::Relaxed);
         let slot = (head_value as u64 % self.capacity as u64) as usize;
         self.last_slot.store(slot, Ordering::Relaxed);
@@ -1241,7 +1375,11 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1658,7 +1796,9 @@ impl TaskRingContext {
             })?;
         // This wait's OWN word (M7.1b) — one word per wait, so the
         // end-of-step verification checks every wait and not just the last.
-        let idx = self.wait_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let idx = self
+            .wait_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let observed_ptr = base_ptr + (idx as u64) * 4;
         crate::kernels::task_ring::launch_scythe_wait_descriptor(
             dev,
@@ -1683,19 +1823,17 @@ impl TaskRingContext {
     /// so it is ordered before the wait kernels the step launches on that
     /// same stream. It costs one launch per step, not one per wait.
     pub fn begin_step_waits(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
-        self.wait_count.store(0, std::sync::atomic::Ordering::Release);
+        self.wait_count
+            .store(0, std::sync::atomic::Ordering::Release);
         let ptr = as_rocm(self.wait_observed.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| {
                 crate::Error::Backend("task ring wait scratch has no device ptr".into())
             })? as *mut std::ffi::c_void;
-        let bytes = as_rocm(self.wait_observed.as_ref())?
-            .bytes()
-            .max(4);
+        let bytes = as_rocm(self.wait_observed.as_ref())?.bytes().max(4);
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let res = unsafe {
-            crate::device::handles::hipMemsetAsync(ptr, 0, bytes, dev.active_stream())
-        };
+        let res =
+            unsafe { crate::device::handles::hipMemsetAsync(ptr, 0, bytes, dev.active_stream()) };
         if res != crate::hipSuccess {
             return Err(crate::Error::Backend(format!(
                 "task ring: zeroing the wait observations failed ({res})"
@@ -1860,7 +1998,11 @@ impl TaskRingContext {
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
-        crate::kernels::qkv_attention::launch_scythe_publish_head_async(dev, head_ptr, head_value + 1)?;
+        crate::kernels::qkv_attention::launch_scythe_publish_head_async(
+            dev,
+            head_ptr,
+            head_value + 1,
+        )?;
         self.drain(dev)?;
         Ok(())
     }
@@ -1870,14 +2012,20 @@ impl TaskRingContext {
     /// Unlike `enqueue_moe` which stages descriptors on the host, this enqueues
     /// an on-device descriptor construction and atomic ring slot claim without
     /// host round-trip, executing via Event-Tensor on-device triggering.
-    pub fn enqueue_dynamic_moe(&self, dev: &crate::RocmDevice, m: &TaskRingMoe) -> crate::Result<()> {
+    pub fn enqueue_dynamic_moe(
+        &self,
+        dev: &crate::RocmDevice,
+        m: &TaskRingMoe,
+    ) -> crate::Result<()> {
         use crate::scythe_task_descriptors::moe_quant_mode;
         let head_ptr = as_rocm(self.head.as_ref())?
             .device_ptr_u64()
             .ok_or_else(|| crate::Error::Backend("task ring head has no device ptr".into()))?;
         let desc_staging_ptr = as_rocm(self.desc_staging.as_ref())?
             .device_ptr_u64()
-            .ok_or_else(|| crate::Error::Backend("task ring desc_staging has no device ptr".into()))?;
+            .ok_or_else(|| {
+                crate::Error::Backend("task ring desc_staging has no device ptr".into())
+            })?;
 
         crate::kernels::qkv_attention::launch_scythe_enqueue_dynamic_moe(
             dev,
@@ -1908,9 +2056,10 @@ impl TaskRingContext {
 
     /// ONE launch for the WHOLE staged set (a contiguous GEMM run).
     pub fn launch(&self, dev: &crate::RocmDevice) -> crate::Result<()> {
-        let staged = self.staged.as_deref().ok_or_else(|| {
-            crate::Error::Backend("task ring context has no staged array".into())
-        })?;
+        let staged = self
+            .staged
+            .as_deref()
+            .ok_or_else(|| crate::Error::Backend("task ring context has no staged array".into()))?;
         launch_task_ring(
             dev,
             &**self.slots,
@@ -1939,9 +2088,10 @@ impl TaskRingContext {
         dev: &crate::RocmDevice,
         stream: *mut std::ffi::c_void,
     ) -> crate::Result<()> {
-        let staged = self.staged.as_deref().ok_or_else(|| {
-            crate::Error::Backend("task ring context has no staged array".into())
-        })?;
+        let staged = self
+            .staged
+            .as_deref()
+            .ok_or_else(|| crate::Error::Backend("task ring context has no staged array".into()))?;
         self.clear_stop_flag(dev)?;
         self.resolve_wave_kernel(dev)?;
         launch_task_ring_staged_on_stream(
@@ -1965,7 +2115,9 @@ impl TaskRingContext {
 /// compares its own timestamps against this one.
 pub fn host_now_ms() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    BASE.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Wave launches since process start. The M4 gate asserts this advances by
@@ -1981,7 +2133,6 @@ static WAVE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 /// process launched was accounted for, instead of discovering a leak as a hang
 /// in a later test.
 static WAVE_STOPS: AtomicU64 = AtomicU64::new(0);
-
 
 /// M6: wait (device-side) for a ring descriptor to complete.
 ///
@@ -2306,7 +2457,18 @@ pub fn launch_task_ring(
     staged: Option<&dyn BackendStorage>,
     staged_count: u32,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
-    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, false, None)
+    launch_task_ring_inner(
+        dev,
+        slots,
+        capacity,
+        tail,
+        head,
+        stop,
+        staged,
+        staged_count,
+        false,
+        None,
+    )
 }
 
 /// M6 step 3: launch the wave in RESIDENT mode.
@@ -2326,7 +2488,18 @@ pub fn launch_task_ring_resident(
     staged: Option<&dyn BackendStorage>,
     staged_count: u32,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
-    launch_task_ring_inner(dev, slots, capacity, tail, head, stop, staged, staged_count, true, None)
+    launch_task_ring_inner(
+        dev,
+        slots,
+        capacity,
+        tail,
+        head,
+        stop,
+        staged,
+        staged_count,
+        true,
+        None,
+    )
 }
 
 /// M6 step 3: launch a RESIDENT wave on an EXPLICIT stream.
@@ -2347,7 +2520,16 @@ pub fn launch_task_ring_resident_on_stream(
     stream: *mut std::ffi::c_void,
 ) -> crate::Result<Box<dyn grim_tensor::backend::ComputeHandle>> {
     launch_task_ring_inner(
-        dev, slots, capacity, tail, head, stop, staged, staged_count, true, Some(stream),
+        dev,
+        slots,
+        capacity,
+        tail,
+        head,
+        stop,
+        staged,
+        staged_count,
+        true,
+        Some(stream),
     )
 }
 
@@ -2372,9 +2554,8 @@ fn launch_task_ring_inner(
         None if staged_count == 0 => None,
         _ => {
             return Err(crate::Error::Backend(
-                "launch_task_ring: staged_count > 0 requires the staged descriptor array"
-                    .into(),
-            ))
+                "launch_task_ring: staged_count > 0 requires the staged descriptor array".into(),
+            ));
         }
     };
     if staged_count > capacity {

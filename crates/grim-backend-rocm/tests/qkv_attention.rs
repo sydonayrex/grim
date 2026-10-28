@@ -1830,7 +1830,6 @@ fn kv_append_ring_pins_sinks_and_cycles_newest() {
     }
 }
 
-
 /// WS-2b: the DECODE-GRAPH int8 kernels must agree with the eager f32 path.
 ///
 /// `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8` are the pair a
@@ -2001,7 +2000,10 @@ fn graph_i8_append_and_attend_match_eager_f32() {
     dev.synchronize();
 
     let got = out.to_cpu_vec_f32().unwrap();
-    assert!(got.iter().all(|x| x.is_finite()), "graph int8 attend non-finite");
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "graph int8 attend non-finite"
+    );
     let diff = max_abs_diff(&got, &want);
     let amax = v_data.iter().fold(0.0f32, |a, b| a.max(b.abs()));
     eprintln!("[graph-i8] max_abs_diff={diff:.6} v_amax={amax:.4}");
@@ -2086,7 +2088,10 @@ fn k2v4_append_quantize_parity() {
             for d in 0..hd {
                 let packed = bytes[r * row_bytes + kh * head_bytes + (d >> 2)];
                 let code = ((packed >> ((d & 3) * 2)) & 0x03) as i32;
-                assert!((0..=2).contains(&code), "2-bit code out of the 3 used levels: {code}");
+                assert!(
+                    (0..=2).contains(&code),
+                    "2-bit code out of the 3 used levels: {code}"
+                );
                 let got = (code - 1) as f32 * s;
                 let orig = src[r * stride + kh * hd + d];
                 amax = amax.max(orig.abs());
@@ -2159,11 +2164,31 @@ fn k2v4_attend_matches_host_oracle() {
         .unwrap();
     // K -> 2-bit, V -> 4-bit.
     grim_backend_rocm::launch_kv_quantize_rows_i2(
-        &dev, k_src.as_ref(), 0, &kcodes, 0, &kscales, 0, kv_len, stride, nkv, hd,
+        &dev,
+        k_src.as_ref(),
+        0,
+        &kcodes,
+        0,
+        &kscales,
+        0,
+        kv_len,
+        stride,
+        nkv,
+        hd,
     )
     .expect("i2 quantize");
     grim_backend_rocm::launch_kv_quantize_rows_i4(
-        &dev, v_src.as_ref(), 0, &vcodes, 0, &vscales, 0, kv_len, stride, nkv, hd,
+        &dev,
+        v_src.as_ref(),
+        0,
+        &vcodes,
+        0,
+        &vscales,
+        0,
+        kv_len,
+        stride,
+        nkv,
+        hd,
     )
     .expect("i4 quantize");
     dev.synchronize();
@@ -2398,8 +2423,13 @@ fn graph_i4_append_matches_eager_quantizer() {
         .unwrap();
     // Codes need RocmStorage directly: `CoreTensorOps::zeros` has no U8 path.
     let alloc = |n: usize, dt: DType| {
-        grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::from_slice(&[n]), dt, &dev.allocator_handle(), 0)
-            .unwrap()
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
     };
     let codes = alloc(rows * stride / 2, DType::U8); // 2 codes per byte
     let scales = alloc(rows * nkv, DType::F32); // one f32 per (row, kv head)
@@ -2492,8 +2522,13 @@ fn graph_i4_append_honours_the_ring() {
         .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
         .unwrap();
     let alloc = |n: usize, dt: DType| {
-        grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::from_slice(&[n]), dt, &dev.allocator_handle(), 0)
-            .unwrap()
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
     };
     // The slot holds `cap` rows: cap * stride/2 code bytes, cap * nkv scales.
     let codes = alloc(cap * stride / 2, DType::U8);
@@ -2587,7 +2622,6 @@ fn graph_i4_append_honours_the_ring() {
     );
 }
 
-
 /// Host twin of the i4 per-(row, kv_head) quantizer: amax scale, codes biased
 /// +7 packed two-per-byte (low nibble = even element), dequant `(code-7)/7*scale`.
 /// Used to build the exact expected attention input for the graph i4 pair.
@@ -2613,7 +2647,11 @@ fn host_dequant_i4(codes: &[u8], scale: f32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|i| {
             let packed = codes[i >> 1];
-            let code = if i & 1 == 0 { packed & 0x0f } else { (packed >> 4) & 0x0f };
+            let code = if i & 1 == 0 {
+                packed & 0x0f
+            } else {
+                (packed >> 4) & 0x0f
+            };
             ((code as f32 - 7.0) / 7.0) * scale
         })
         .collect()
@@ -2655,9 +2693,18 @@ fn graph_i4_append_and_attend_match_eager_f32() {
         want[h * hd..(h + 1) * hd].copy_from_slice(&v_deq[kvh * hd..(kvh + 1) * hd]);
     }
 
-    let u8dt = DType { arith: ArithType::U8, storage: grim_tensor::Storage::Native };
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
     let alloc = |n: usize, dt: DType| {
-        grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::from_slice(&[n]), dt, &dev.allocator_handle(), 0).unwrap()
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
     };
     // Codes are HALF width: stride/2 bytes per row.
     let codes = alloc(stride / 2, u8dt.clone());
@@ -2665,45 +2712,92 @@ fn graph_i4_append_and_attend_match_eager_f32() {
     let vcodes = alloc(stride / 2, u8dt.clone());
     let vscales = alloc(nkv, DType::F32);
 
-    let pos = dev.from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32).unwrap();
+    let pos = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
     let arena_slot_stride = stride / 2; // max_ctx = 1 row, in BYTES
     let scale_slot_stride = nkv;
     let ring = grim_backend_rocm::KvRingPolicy::UNLIMITED;
     for (data, c, s) in [(&k_data, &codes, &scales), (&v_data, &vcodes, &vscales)] {
-        let src = dev.from_cpu(data, &Shape::from_slice(&[1, stride]), DType::F32).unwrap();
+        let src = dev
+            .from_cpu(data, &Shape::from_slice(&[1, stride]), DType::F32)
+            .unwrap();
         grim_backend_rocm::launch_kv_append_i4(
-            &dev, src.as_ref(), pos.as_ref(), c, s, stride, nkv, hd, 1, 1,
-            arena_slot_stride, scale_slot_stride, ring,
+            &dev,
+            src.as_ref(),
+            pos.as_ref(),
+            c,
+            s,
+            stride,
+            nkv,
+            hd,
+            1,
+            1,
+            arena_slot_stride,
+            scale_slot_stride,
+            ring,
         )
         .expect("graph kv_append_i4");
     }
     dev.synchronize();
     let sc = scales.to_cpu_vec_f32().unwrap();
-    assert!(sc.iter().all(|s| s.is_finite() && *s > 0.0), "i4 scales bad: {sc:?}");
+    assert!(
+        sc.iter().all(|s| s.is_finite() && *s > 0.0),
+        "i4 scales bad: {sc:?}"
+    );
 
-    let q32 = dev.from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32).unwrap();
+    let q32 = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32)
+        .unwrap();
     let out = alloc(nh * hd, DType::F32);
     let head_buf = |n: usize| alloc(n, DType::F32);
     let (out_max, out_sum) = (head_buf(nh), head_buf(nh));
     let dummy = head_buf(1);
     grim_backend_rocm::launch_qkv_attention_dev_batch_i4(
-        &dev, q32.as_ref(), &codes, &scales, &vcodes, &vscales, &out, &out_max, &out_sum,
-        pos.as_ref(), nh as u32, nkv as u32, hd as u32, 1, 1,
-        1.0 / (hd as f32).sqrt(), 0, 0.0,
-        &dummy, 0, 0, &dummy, 0,
-        1, arena_slot_stride, scale_slot_stride, ring,
+        &dev,
+        q32.as_ref(),
+        &codes,
+        &scales,
+        &vcodes,
+        &vscales,
+        &out,
+        &out_max,
+        &out_sum,
+        pos.as_ref(),
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        1,
+        1,
+        1.0 / (hd as f32).sqrt(),
+        0,
+        0.0,
+        &dummy,
+        0,
+        0,
+        &dummy,
+        0,
+        1,
+        arena_slot_stride,
+        scale_slot_stride,
+        ring,
     )
     .expect("graph qkv_attention_dev_batch_i4");
     dev.synchronize();
 
     let got = out.to_cpu_vec_f32().unwrap();
-    assert!(got.iter().all(|x| x.is_finite()), "graph i4 attend non-finite");
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "graph i4 attend non-finite"
+    );
     let diff = max_abs_diff(&got, &want);
     let amax = v_data.iter().fold(0.0f32, |a, b| a.max(b.abs()));
     eprintln!("[graph-i4] max_abs_diff={diff:.6} v_amax={amax:.4}");
     // i4 rounding is |e| <= scale/14 <= amax/14 per element.
-    assert!(diff <= amax / 10.0 + 1e-6,
-        "graph i4 attend diverges from the exact oracle: {diff:.6} at amax {amax:.4}");
+    assert!(
+        diff <= amax / 10.0 + 1e-6,
+        "graph i4 attend diverges from the exact oracle: {diff:.6} at amax {amax:.4}"
+    );
 }
 
 /// T2.2: multi-row parity against the eager f32 reference fed the SAME i4
@@ -2746,24 +2840,48 @@ fn graph_i4_multirow_matches_eager_and_corruption_control() {
     // One query at abs position rows-1 → attends all `rows` keys.
     let want = reference_attention(&q_data, &k_deq, &v_deq, 1, nh, nkv, hd, rows, rows - 1);
 
-    let u8dt = DType { arith: ArithType::U8, storage: grim_tensor::Storage::Native };
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
     let alloc = |n: usize, dt: DType| {
-        grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::from_slice(&[n]), dt, &dev.allocator_handle(), 0).unwrap()
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
     };
     let codes = alloc(rows * stride / 2, u8dt.clone());
     let scales = alloc(rows * nkv, DType::F32);
     let vcodes = alloc(rows * stride / 2, u8dt.clone());
     let vscales = alloc(rows * nkv, DType::F32);
 
-    let pos_append = dev.from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32).unwrap();
+    let pos_append = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
     let ring = grim_backend_rocm::KvRingPolicy::UNLIMITED;
     let arena_slot_stride = rows * stride / 2; // BYTES per slot
     let scale_slot_stride = rows * nkv;
     for (data, c, s) in [(&k_data, &codes, &scales), (&v_data, &vcodes, &vscales)] {
-        let src = dev.from_cpu(data, &Shape::from_slice(&[rows, stride]), DType::F32).unwrap();
+        let src = dev
+            .from_cpu(data, &Shape::from_slice(&[rows, stride]), DType::F32)
+            .unwrap();
         grim_backend_rocm::launch_kv_append_i4(
-            &dev, src.as_ref(), pos_append.as_ref(), c, s, stride, nkv, hd, rows, 1,
-            arena_slot_stride, scale_slot_stride, ring,
+            &dev,
+            src.as_ref(),
+            pos_append.as_ref(),
+            c,
+            s,
+            stride,
+            nkv,
+            hd,
+            rows,
+            1,
+            arena_slot_stride,
+            scale_slot_stride,
+            ring,
         )
         .expect("graph kv_append_i4 rows");
         dev.synchronize();
@@ -2774,32 +2892,66 @@ fn graph_i4_multirow_matches_eager_and_corruption_control() {
     // not as a numeric cast. `(rows-1) as f32` would put 0x40E00000 in the
     // slot and the kernel would read a kv_seq_len of ~1e9.
     let pos_q = dev
-        .from_cpu(&[f32::from_bits((rows - 1) as u32)], &Shape::from_slice(&[1]), DType::F32)
+        .from_cpu(
+            &[f32::from_bits((rows - 1) as u32)],
+            &Shape::from_slice(&[1]),
+            DType::F32,
+        )
         .unwrap();
-    let q32 = dev.from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32).unwrap();
+    let q32 = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32)
+        .unwrap();
     let out = alloc(nh * hd, DType::F32);
     let head_buf = |n: usize| alloc(n, DType::F32);
     let (out_max, out_sum) = (head_buf(nh), head_buf(nh));
     let dummy = head_buf(1);
-    let attend = |codes: &grim_backend_rocm::RocmStorage, vcodes: &grim_backend_rocm::RocmStorage| {
+    let attend = |codes: &grim_backend_rocm::RocmStorage,
+                  vcodes: &grim_backend_rocm::RocmStorage| {
         grim_backend_rocm::launch_qkv_attention_dev_batch_i4(
-            &dev, q32.as_ref(), codes, &scales, vcodes, &vscales, &out, &out_max, &out_sum,
-            pos_q.as_ref(), nh as u32, nkv as u32, hd as u32, 1, 1,
-            1.0 / (hd as f32).sqrt(), 0, 0.0,
-            &dummy, 0, 0, &dummy, 0,
-            1, arena_slot_stride, scale_slot_stride, ring,
+            &dev,
+            q32.as_ref(),
+            codes,
+            &scales,
+            vcodes,
+            &vscales,
+            &out,
+            &out_max,
+            &out_sum,
+            pos_q.as_ref(),
+            nh as u32,
+            nkv as u32,
+            hd as u32,
+            1,
+            1,
+            1.0 / (hd as f32).sqrt(),
+            0,
+            0.0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            0,
+            1,
+            arena_slot_stride,
+            scale_slot_stride,
+            ring,
         )
         .expect("graph qkv_attention_dev_batch_i4 multirow");
         dev.synchronize();
         out.to_cpu_vec_f32().unwrap()
     };
     let got = attend(&codes, &vcodes);
-    assert!(got.iter().all(|x| x.is_finite()), "graph i4 multirow non-finite");
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "graph i4 multirow non-finite"
+    );
     let diff = max_abs_diff(&got, &want);
     let amax = v_data.iter().fold(0.0f32, |a, b| a.max(b.abs()));
     eprintln!("[graph-i4-multirow] max_abs_diff={diff:.6} v_amax={amax:.4}");
-    assert!(diff <= amax / 10.0 + 1e-6,
-        "graph i4 multirow diverges from the eager reference: {diff:.6} at amax {amax:.4}");
+    assert!(
+        diff <= amax / 10.0 + 1e-6,
+        "graph i4 multirow diverges from the eager reference: {diff:.6} at amax {amax:.4}"
+    );
 
     // Negative control: perturb one K element before quantization (row rows/2,
     // kv_head 0) and re-append into a fresh arena. A kernel that read nothing
@@ -2810,16 +2962,30 @@ fn graph_i4_multirow_matches_eager_and_corruption_control() {
     let codes_bad = alloc(rows * stride / 2, u8dt.clone());
     let scales_bad = alloc(rows * nkv, DType::F32);
     {
-        let src = dev.from_cpu(&k_bad, &Shape::from_slice(&[rows, stride]), DType::F32).unwrap();
+        let src = dev
+            .from_cpu(&k_bad, &Shape::from_slice(&[rows, stride]), DType::F32)
+            .unwrap();
         grim_backend_rocm::launch_kv_append_i4(
-            &dev, src.as_ref(), pos_append.as_ref(), &codes_bad, &scales_bad, stride, nkv, hd, rows, 1,
-            arena_slot_stride, scale_slot_stride, ring,
+            &dev,
+            src.as_ref(),
+            pos_append.as_ref(),
+            &codes_bad,
+            &scales_bad,
+            stride,
+            nkv,
+            hd,
+            rows,
+            1,
+            arena_slot_stride,
+            scale_slot_stride,
+            ring,
         )
         .expect("graph kv_append_i4 corrupt");
     }
     dev.synchronize();
     let got_bad = attend(&codes_bad, &vcodes);
-    assert!(max_abs_diff(&got, &got_bad) > 1e-4,
-        "perturbing a K element did not change the attention output — the kernel is not reading the arena");
+    assert!(
+        max_abs_diff(&got, &got_bad) > 1e-4,
+        "perturbing a K element did not change the attention output — the kernel is not reading the arena"
+    );
 }
-

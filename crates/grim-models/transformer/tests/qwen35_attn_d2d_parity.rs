@@ -765,8 +765,15 @@ fn qwen35_int4_kv_arena_is_a_quarter_of_f16_and_half_of_int8() {
     let i8_b = arena_bytes("int8");
     let i4_b = arena_bytes("int4");
     eprintln!("[kv-arena-bytes] f16={f16_b} int8={i8_b} int4={i4_b}");
-    assert!(f16_b > 0 && i8_b > 0 && i4_b > 0, "an arena allocated nothing");
-    assert_eq!(i8_b * 2, f16_b, "int8 must be half of f16 ({i8_b} vs {f16_b})");
+    assert!(
+        f16_b > 0 && i8_b > 0 && i4_b > 0,
+        "an arena allocated nothing"
+    );
+    assert_eq!(
+        i8_b * 2,
+        f16_b,
+        "int8 must be half of f16 ({i8_b} vs {f16_b})"
+    );
     assert_eq!(
         i4_b * 2,
         i8_b,
@@ -1412,9 +1419,8 @@ fn build_model(device: &Device, dev: Option<&RocmDevice>, c: &Qwen35Config) -> Q
             None => grim_backend_cpu::cpu_tensor(data, shape),
         }
     };
-    let lin = |data: Vec<f32>, shape: Shape| -> Linear {
-        Linear::from_tensor(mk(data, shape), None)
-    };
+    let lin =
+        |data: Vec<f32>, shape: Shape| -> Linear { Linear::from_tensor(mk(data, shape), None) };
     let vocab = 128_usize;
     Qwen35 {
         cfg: c.clone(),

@@ -35,7 +35,10 @@ include!("common/task_graph_parity_body.rs");
 
 #[test]
 fn task_graph_interpretation_matches_graph_replay() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the M2 oracle");
         return;
     }

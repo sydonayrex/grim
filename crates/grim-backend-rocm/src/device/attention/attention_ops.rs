@@ -934,13 +934,12 @@ impl AttentionOps for RocmDevice {
                     .map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
             }
         };
-        let storage =
-            RocmStorage::alloc_gpu(
-                &Shape::new(vec![seq_len, num_heads * head_dim]),
-                dtype_f32(),
-                &self.allocator,
-                self.ordinal,
-            )?;
+        let storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![seq_len, num_heads * head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut qptr = dev_ptr(as_rocm(q)?)?;
         let mut kptr = dev_ptr(as_rocm(k_codes)?)?;
@@ -1090,13 +1089,12 @@ impl AttentionOps for RocmDevice {
                     .map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
             }
         };
-        let storage =
-            RocmStorage::alloc_gpu(
-                &Shape::new(vec![seq_len, num_heads * head_dim]),
-                dtype_f32(),
-                &self.allocator,
-                self.ordinal,
-            )?;
+        let storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![seq_len, num_heads * head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut qptr = dev_ptr(as_rocm(q)?)?;
         let mut kptr = dev_ptr(as_rocm(k_codes)?)?;
@@ -1248,13 +1246,12 @@ impl AttentionOps for RocmDevice {
                     .map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
             }
         };
-        let storage =
-            RocmStorage::alloc_gpu(
-                &Shape::new(vec![seq_len, num_heads * head_dim]),
-                dtype_f32(),
-                &self.allocator,
-                self.ordinal,
-            )?;
+        let storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![seq_len, num_heads * head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut qptr = dev_ptr(as_rocm(q)?)?;
         let mut kptr = dev_ptr(as_rocm(k_codes)?)?;

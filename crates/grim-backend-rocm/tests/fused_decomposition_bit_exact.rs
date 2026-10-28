@@ -112,7 +112,9 @@ fn rand_f32(n: usize, seed: usize) -> Vec<f32> {
     let mut s = seed as u64 | 1;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) as f32 / u32::MAX as f32) - 0.5) * 0.4
         })
         .collect()
@@ -152,8 +154,16 @@ fn the_fused_and_split_paths_are_or_are_not_bit_identical() {
 
     // ── The FUSED path: one launch doing both. ──
     let fused_out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
-    dev.launch_dot4_q80_f32act_add_gemv(rocm(&a), rocm(&w), Some(rocm(&residual)), rocm(&fused_out), m, n, k)
-        .expect("fused dot4+add");
+    dev.launch_dot4_q80_f32act_add_gemv(
+        rocm(&a),
+        rocm(&w),
+        Some(rocm(&residual)),
+        rocm(&fused_out),
+        m,
+        n,
+        k,
+    )
+    .expect("fused dot4+add");
     let fused_vec = fused_out.to_cpu_vec_f32().expect("fused readback");
 
     // ── The COMPARISON. ──
@@ -219,7 +229,13 @@ fn the_fused_and_split_paths_are_or_are_not_bit_identical() {
         for _ in 0..5 {
             if fused {
                 dev.launch_dot4_q80_f32act_add_gemv(
-                    rocm(&a), rocm(&w), Some(rocm(&residual)), rocm(&fused_out), m, n, k,
+                    rocm(&a),
+                    rocm(&w),
+                    Some(rocm(&residual)),
+                    rocm(&fused_out),
+                    m,
+                    n,
+                    k,
                 )
                 .unwrap();
             } else {
@@ -234,7 +250,13 @@ fn the_fused_and_split_paths_are_or_are_not_bit_identical() {
         for _ in 0..BENCH_ITERS {
             if fused {
                 dev.launch_dot4_q80_f32act_add_gemv(
-                    rocm(&a), rocm(&w), Some(rocm(&residual)), rocm(&fused_out), m, n, k,
+                    rocm(&a),
+                    rocm(&w),
+                    Some(rocm(&residual)),
+                    rocm(&fused_out),
+                    m,
+                    n,
+                    k,
                 )
                 .unwrap();
             } else {

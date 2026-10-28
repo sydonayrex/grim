@@ -60,7 +60,9 @@ fn f32_vec(t: &Box<dyn BackendStorage>) -> Result<Vec<f32>, String> {
         .collect())
 }
 
-fn scheme(name: &str) -> (
+fn scheme(
+    name: &str,
+) -> (
     usize, // bytes per 256-weight super-block
     fn(&[f32]) -> grim_tensor::Result<Vec<u8>>,
     fn(&[u8], usize) -> grim_tensor::Result<Vec<f32>>,

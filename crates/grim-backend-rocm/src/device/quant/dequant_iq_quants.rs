@@ -135,6 +135,57 @@ impl RocmDevice {
         )
     }
 
+    /// Direct F16 dequantization of IQ4_NL for prefill rocBLAS GEMM.
+    /// Uses 64 threads per workgroup covering 8 blocks (256 elements).
+    pub(crate) fn launch_dequant_iq4nl_f16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        let grid_blocks = n_blocks.div_ceil(8);
+        self.launch_generic_dequant_with_grid(
+            "grim_dequant_iq4nl_f16",
+            packed_storage,
+            out_storage,
+            n_blocks,
+            grid_blocks,
+            64,
+        )
+    }
+
+    /// Direct F16 dequantization of IQ4_XS for prefill rocBLAS GEMM.
+    pub(crate) fn launch_dequant_iq4xs_f16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant(
+            "grim_dequant_iq4xs_f16",
+            packed_storage,
+            out_storage,
+            n_blocks,
+            IQ_SUPERBLOCK_THREADS,
+        )
+    }
+
+    /// Direct F16 dequantization of IQ3_S for prefill rocBLAS GEMM.
+    pub(crate) fn launch_dequant_iq3s_f16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant(
+            "grim_dequant_iq3s_f16",
+            packed_storage,
+            out_storage,
+            n_blocks,
+            IQ_SUPERBLOCK_THREADS,
+        )
+    }
+
     /// Generic helper for standalone dequant kernels that take (packed, out,
     /// n_blocks).
     ///
@@ -167,6 +218,42 @@ impl RocmDevice {
             .try_into()
             .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(threads_per_block, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_blk = n_blocks as i32;
+        self.launch_compute_kernel(
+            name,
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_blk)],
+        )
+    }
+
+    pub(crate) fn launch_generic_dequant_with_grid(
+        &self,
+        name: &str,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+        grid_x: usize,
+        threads_per_block: u32,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: packed has no device ptr", name)))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
+        if threads_per_block == 0 {
+            return Err(Error::Backend(format!(
+                "{name}: threads_per_block must be non-zero"
+            )));
+        }
+        let grid_u32: u32 = grid_x
+            .try_into()
+            .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_u32, 1, 1);
         let block_dim = HipDim3::new(threads_per_block, 1, 1);
         let mut packed = packed_ptr;
         let mut out = out_ptr;
@@ -648,11 +735,7 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
-        let grid = crate::HipDim3::new(
-            n.div_ceil(TILE_N) as u32,
-            m.div_ceil(TILE_M) as u32,
-            1,
-        );
+        let grid = crate::HipDim3::new(n.div_ceil(TILE_N) as u32, m.div_ceil(TILE_M) as u32, 1);
         let block = crate::HipDim3::new((TILE_M * TILE_N) as u32, 1, 1);
         self.launch_compute_kernel(
             "grim_fused_dequant_gemm_iq1s_tiled",
@@ -793,6 +876,19 @@ impl RocmDevice {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4nl", a, b, out, m, n, k, 1)
     }
 
+    /// Public A/B wrapper for the reference scalar fused IQ4_NL GEMV.
+    pub fn launch_fused_dequant_gemm_iq4nl_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq4nl(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_iq4nl(
         &self,
         dy: &RocmStorage,
@@ -887,7 +983,9 @@ impl RocmDevice {
 
 #[cfg(test)]
 mod iq1s_grouped_parity {
-    use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage};
+    use grim_tensor::{
+        ArithType, BackendStorage, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage,
+    };
 
     fn packed_iq3xxs(n: usize, k: usize) -> Vec<u8> {
         // block_iq3_xxs = d(2) + qs(64) + ss(32) = 98 B / 256 weights.
@@ -1009,7 +1107,11 @@ mod iq1s_grouped_parity {
             return;
         };
         for (scheme, blk_bytes, packer) in [
-            (KQuantScheme::IQ1S, 50usize, packed_iq1s as fn(usize, usize) -> Vec<u8>),
+            (
+                KQuantScheme::IQ1S,
+                50usize,
+                packed_iq1s as fn(usize, usize) -> Vec<u8>,
+            ),
             (KQuantScheme::IQ3XXS, 98usize, packed_iq3xxs),
             (KQuantScheme::IQ3S, 110usize, packed_iq3s),
             (KQuantScheme::IQ2S, 82usize, packed_iq2s),
@@ -1018,116 +1120,116 @@ mod iq1s_grouped_parity {
             (KQuantScheme::IQ4XS, 136usize, packed_iq4xs),
             (KQuantScheme::IQ1M, 56usize, packed_iq1m),
         ] {
-        let _ = blk_bytes;
-        let dt = DType {
-            arith: ArithType::F32,
-            storage: Storage::KQuant(scheme),
-        };
-        for (n, k) in [(64usize, 512usize), (256, 5120)] {
-            let bytes = packer(n, k);
-            let w_box = dev
-                .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), dt.clone())
-                .expect("packed weight");
-            let w = w_box
-                .as_any()
-                .downcast_ref::<crate::RocmStorage>()
-                .expect("RocmStorage");
-            let act: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.01).collect();
-            let a_box = dev
-                .from_cpu(&act, &Shape::new(vec![1, k]), DType::F32)
-                .expect("act");
-            let a = a_box
-                .as_any()
-                .downcast_ref::<crate::RocmStorage>()
-                .expect("RocmStorage");
-            let out_scalar_box = dev
-                .zeros(&Shape::new(vec![1, n]), DType::F32)
-                .expect("out alloc");
-            let out_grouped_box = dev
-                .zeros(&Shape::new(vec![1, n]), DType::F32)
-                .expect("out alloc");
-            let out_scalar = out_scalar_box
-                .as_any()
-                .downcast_ref::<crate::RocmStorage>()
-                .expect("RocmStorage");
-            let out_grouped = out_grouped_box
-                .as_any()
-                .downcast_ref::<crate::RocmStorage>()
-                .expect("RocmStorage");
-            match scheme {
-                KQuantScheme::IQ1S => {
-                    dev.launch_fused_dequant_gemm_iq1s_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq1s(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
+            let _ = blk_bytes;
+            let dt = DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(scheme),
+            };
+            for (n, k) in [(64usize, 512usize), (256, 5120)] {
+                let bytes = packer(n, k);
+                let w_box = dev
+                    .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), dt.clone())
+                    .expect("packed weight");
+                let w = w_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                let act: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.01).collect();
+                let a_box = dev
+                    .from_cpu(&act, &Shape::new(vec![1, k]), DType::F32)
+                    .expect("act");
+                let a = a_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                let out_scalar_box = dev
+                    .zeros(&Shape::new(vec![1, n]), DType::F32)
+                    .expect("out alloc");
+                let out_grouped_box = dev
+                    .zeros(&Shape::new(vec![1, n]), DType::F32)
+                    .expect("out alloc");
+                let out_scalar = out_scalar_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                let out_grouped = out_grouped_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                match scheme {
+                    KQuantScheme::IQ1S => {
+                        dev.launch_fused_dequant_gemm_iq1s_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq1s(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ3XXS => {
+                        dev.launch_fused_dequant_gemm_iq3xxs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq3xxs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ3S => {
+                        dev.launch_fused_dequant_gemm_iq3s_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq3s(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ2S => {
+                        dev.launch_fused_dequant_gemm_iq2s_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq2s(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ2XS => {
+                        dev.launch_fused_dequant_gemm_iq2xs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq2xs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ2XXS => {
+                        dev.launch_fused_dequant_gemm_iq2xxs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq2xxs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ4XS => {
+                        dev.launch_fused_dequant_gemm_iq4xs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq4xs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    _ => {
+                        dev.launch_fused_dequant_gemm_iq1m_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq1m(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
                 }
-                KQuantScheme::IQ3XXS => {
-                    dev.launch_fused_dequant_gemm_iq3xxs_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq3xxs(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
+                dev.synchronize();
+                let s = out_scalar.to_cpu_vec_f32().expect("scalar readback");
+                let g = out_grouped.to_cpu_vec_f32().expect("grouped readback");
+                assert_eq!(s.len(), g.len());
+                let mut worst = 0.0f32;
+                let mut worst_i = 0usize;
+                for (i, (x, y)) in s.iter().zip(g.iter()).enumerate() {
+                    let d = (x - y).abs();
+                    if d > worst {
+                        worst = d;
+                        worst_i = i;
+                    }
                 }
-                KQuantScheme::IQ3S => {
-                    dev.launch_fused_dequant_gemm_iq3s_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq3s(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
-                }
-                KQuantScheme::IQ2S => {
-                    dev.launch_fused_dequant_gemm_iq2s_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq2s(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
-                }
-                KQuantScheme::IQ2XS => {
-                    dev.launch_fused_dequant_gemm_iq2xs_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq2xs(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
-                }
-                KQuantScheme::IQ2XXS => {
-                    dev.launch_fused_dequant_gemm_iq2xxs_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq2xxs(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
-                }
-                KQuantScheme::IQ4XS => {
-                    dev.launch_fused_dequant_gemm_iq4xs_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq4xs(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
-                }
-                _ => {
-                    dev.launch_fused_dequant_gemm_iq1m_scalar(&a, &w, &out_scalar, 1, n, k)
-                        .expect("scalar launch");
-                    dev.launch_fused_dequant_gemm_iq1m(&a, &w, &out_grouped, 1, n, k)
-                        .expect("grouped launch");
-                }
-            }
-            dev.synchronize();
-            let s = out_scalar.to_cpu_vec_f32().expect("scalar readback");
-            let g = out_grouped.to_cpu_vec_f32().expect("grouped readback");
-            assert_eq!(s.len(), g.len());
-            let mut worst = 0.0f32;
-            let mut worst_i = 0usize;
-            for (i, (x, y)) in s.iter().zip(g.iter()).enumerate() {
-                let d = (x - y).abs();
-                if d > worst {
-                    worst = d;
-                    worst_i = i;
-                }
-            }
-            eprintln!(
-                "[iq-grouped-parity] {scheme:?} n={n} k={k}: worst abs {worst:.3e} at {worst_i}"
-            );
-            assert!(
-                worst <= 1e-6,
-                "grouped {scheme:?} GEMM diverges from the scalar kernel: worst {worst:.3e} at \
+                eprintln!(
+                    "[iq-grouped-parity] {scheme:?} n={n} k={k}: worst abs {worst:.3e} at {worst_i}"
+                );
+                assert!(
+                    worst <= 1e-6,
+                    "grouped {scheme:?} GEMM diverges from the scalar kernel: worst {worst:.3e} at \
                  {worst_i} (scalar {}, grouped {})",
-                s[worst_i],
-                g[worst_i]
-            );
-        }
+                    s[worst_i],
+                    g[worst_i]
+                );
+            }
         }
     }
 

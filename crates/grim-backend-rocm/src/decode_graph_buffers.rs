@@ -9,8 +9,8 @@
 //! alloc. All writes via async H2D or kernel launches. GEMM stays in
 //! rocBLAS per Rule 0 — this module owns buffers + graph, not math.
 
-use std::ffi::c_void;
 use crate::task_graph::TaskGraph as GrimTaskGraph;
+use std::ffi::c_void;
 use std::sync::Arc;
 
 use grim_tensor::BackendStorage;
@@ -203,7 +203,7 @@ pub struct DecodeGraphBuffers {
     pub sc_x: Vec<RocmStorage>,
     pub sc_bx: Vec<RocmStorage>,
     pub sc_sum: Vec<RocmStorage>,
-    pub sc_y: Vec<RocmStorage>,     // [batch, h_dim]
+    pub sc_y: Vec<RocmStorage>, // [batch, h_dim]
     /// The short-conv's causal state, ZEROED at allocation: a fresh session
     /// has no history, and the caching allocator hands out recycled blocks
     /// that still hold the previous owner's values.
@@ -755,11 +755,7 @@ impl DecodeGraphBuffers {
                     .device_ptr
                     .ok_or_else(|| Error::Backend("kv arena zero: no ptr".into()))?;
                 let res: crate::HipErrorT = unsafe {
-                    crate::device::handles::hipMemset(
-                        zp as *mut std::ffi::c_void,
-                        0,
-                        arena.bytes,
-                    )
+                    crate::device::handles::hipMemset(zp as *mut std::ffi::c_void, 0, arena.bytes)
                 };
                 if res != crate::hipSuccess {
                     return Err(Error::Backend(format!("zero kv arena: {res}")));
@@ -1212,7 +1208,11 @@ impl DecodeGraphBuffers {
     /// the same for every packed width: int8, int4 and int2v4 each store one
     /// scale per (row, kv head) per side. MUST run outside capture. Idempotent:
     /// a second call is a no-op.
-    pub fn allocate_packed_kv_scales(&mut self, _dev: &RocmDevice, num_kv_heads: usize) -> Result<()> {
+    pub fn allocate_packed_kv_scales(
+        &mut self,
+        _dev: &RocmDevice,
+        num_kv_heads: usize,
+    ) -> Result<()> {
         if !self.k_scale_arena.is_empty() {
             return Ok(());
         }
@@ -1224,7 +1224,11 @@ impl DecodeGraphBuffers {
         let rows = self.batch.max(1) * self.max_ctx;
         let shape = Shape::new(vec![rows, num_kv_heads]);
         for (i, arena) in self.k_arena.iter().enumerate() {
-            let ord = self.layer_devices.get(i).copied().unwrap_or(arena.device_ordinal());
+            let ord = self
+                .layer_devices
+                .get(i)
+                .copied()
+                .unwrap_or(arena.device_ordinal());
             let l_dev = RocmDevice::shared(ord);
             self.k_scale_arena.push(RocmStorage::alloc_gpu(
                 &shape,
@@ -1553,8 +1557,7 @@ impl DecodeGraphBuffers {
             let bytes = 4 * self.batch.max(1);
             let host_bytes =
                 unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, bytes) };
-            let (src_ptr, _pinned) =
-                crate::memory::pinned::stage_h2d_pinned(ord, host_bytes);
+            let (src_ptr, _pinned) = crate::memory::pinned::stage_h2d_pinned(ord, host_bytes);
             let res: crate::HipErrorT = unsafe {
                 hipMemcpyAsync(
                     dst,
@@ -1761,7 +1764,11 @@ impl DecodeGraphBuffers {
                             ))
                         })?;
                     let src_ord = src.device_ordinal;
-                    let dst_ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal) as i32;
+                    let dst_ord = self
+                        .layer_devices
+                        .get(layer_idx)
+                        .copied()
+                        .unwrap_or(dev.ordinal) as i32;
                     for (dst, bytes, what) in [
                         (d_ptr as *mut c_void, n_bytes, format!("codes {tag}")),
                         (
@@ -1777,14 +1784,13 @@ impl DecodeGraphBuffers {
                         };
                         if src_ord != dst_ord {
                             crate::peer_access::p2p_memcpy_async(
-                                dst,
-                                dst_ord,
-                                src_p,
-                                src_ord,
-                                bytes,
-                                stream,
+                                dst, dst_ord, src_p, src_ord, bytes, stream,
                             )
-                            .map_err(|e| Error::Backend(format!("seed_kv_arena: P2P copy {what} failed: {e}")))?;
+                            .map_err(|e| {
+                                Error::Backend(format!(
+                                    "seed_kv_arena: P2P copy {what} failed: {e}"
+                                ))
+                            })?;
                         } else {
                             let res: crate::HipErrorT = unsafe {
                                 crate::hipMemcpyAsync(
@@ -1811,24 +1817,18 @@ impl DecodeGraphBuffers {
                 if src_ord != dst_ord {
                     // Cross-device P2P copy
                     crate::peer_access::p2p_memcpy_async(
-                        dst_k,
-                        dst_ord,
-                        src_k,
-                        src_ord,
-                        n_bytes,
-                        stream,
+                        dst_k, dst_ord, src_k, src_ord, n_bytes, stream,
                     )
-                    .map_err(|e| Error::Backend(format!("seed_kv_arena: P2P copy K failed: {e}")))?;
+                    .map_err(|e| {
+                        Error::Backend(format!("seed_kv_arena: P2P copy K failed: {e}"))
+                    })?;
 
                     crate::peer_access::p2p_memcpy_async(
-                        dst_v,
-                        dst_ord,
-                        src_v,
-                        src_ord,
-                        n_bytes,
-                        stream,
+                        dst_v, dst_ord, src_v, src_ord, n_bytes, stream,
                     )
-                    .map_err(|e| Error::Backend(format!("seed_kv_arena: P2P copy V failed: {e}")))?;
+                    .map_err(|e| {
+                        Error::Backend(format!("seed_kv_arena: P2P copy V failed: {e}"))
+                    })?;
                 } else {
                     let res: crate::HipErrorT = unsafe {
                         crate::hipMemcpyAsync(
@@ -1895,43 +1895,85 @@ impl DecodeGraphBuffers {
                 check_hip("seed_kv_arena D2H eager_k", unsafe {
                     // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
                     crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(host_eager_k.as_mut_ptr() as *mut std::ffi::c_void, src_k, n_bytes, HipMemcpyKind::DeviceToHost)
+                    crate::hipMemcpy(
+                        host_eager_k.as_mut_ptr() as *mut std::ffi::c_void,
+                        src_k,
+                        n_bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
                 })?;
                 check_hip("seed_kv_arena D2H graph_k", unsafe {
                     // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
                     crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(host_graph_k.as_mut_ptr() as *mut std::ffi::c_void, dst_k, n_bytes, HipMemcpyKind::DeviceToHost)
+                    crate::hipMemcpy(
+                        host_graph_k.as_mut_ptr() as *mut std::ffi::c_void,
+                        dst_k,
+                        n_bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
                 })?;
                 check_hip("seed_kv_arena D2H eager_v", unsafe {
                     // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
                     crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(host_eager_v.as_mut_ptr() as *mut std::ffi::c_void, src_v, n_bytes, HipMemcpyKind::DeviceToHost)
+                    crate::hipMemcpy(
+                        host_eager_v.as_mut_ptr() as *mut std::ffi::c_void,
+                        src_v,
+                        n_bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
                 })?;
                 check_hip("seed_kv_arena D2H graph_v", unsafe {
                     // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
                     crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(host_graph_v.as_mut_ptr() as *mut std::ffi::c_void, dst_v, n_bytes, HipMemcpyKind::DeviceToHost)
+                    crate::hipMemcpy(
+                        host_graph_v.as_mut_ptr() as *mut std::ffi::c_void,
+                        dst_v,
+                        n_bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
                 })?;
-                    let k_diff = host_eager_k.iter().zip(host_graph_k.iter()).filter(|(a, b)| a != b).count();
-                    let v_diff = host_eager_v.iter().zip(host_graph_v.iter()).filter(|(a, b)| a != b).count();
-                    // Check for NaNs in rows 0..n_rows
-                    let k_u16: &[u16] = unsafe { std::slice::from_raw_parts(host_graph_k.as_ptr() as *const u16, n_bytes / 2) };
-                    let v_u16: &[u16] = unsafe { std::slice::from_raw_parts(host_graph_v.as_ptr() as *const u16, n_bytes / 2) };
-                    let k_nans = k_u16.iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
-                    let v_nans = v_u16.iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
-                    eprintln!(
-                        "[seed-verify] layer {layer_idx}: k_diff_bytes={k_diff}/{n_bytes}, v_diff_bytes={v_diff}/{n_bytes}, k_nans={k_nans}, v_nans={v_nans}"
-                    );
-                    if k_nans > 0 {
-                        for (idx, &val) in k_u16.iter().enumerate() {
-                            if (val & 0x7c00) == 0x7c00 && (val & 0x03ff) != 0 {
-                                let row = idx / 1024;
-                                let col = idx % 1024;
-                                eprintln!("[seed-nan-k] layer {layer_idx}: row={row} col={col} val=0x{val:04x}");
-                                if row > 0 { break; }
+                let k_diff = host_eager_k
+                    .iter()
+                    .zip(host_graph_k.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let v_diff = host_eager_v
+                    .iter()
+                    .zip(host_graph_v.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                // Check for NaNs in rows 0..n_rows
+                let k_u16: &[u16] = unsafe {
+                    std::slice::from_raw_parts(host_graph_k.as_ptr() as *const u16, n_bytes / 2)
+                };
+                let v_u16: &[u16] = unsafe {
+                    std::slice::from_raw_parts(host_graph_v.as_ptr() as *const u16, n_bytes / 2)
+                };
+                let k_nans = k_u16
+                    .iter()
+                    .filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0)
+                    .count();
+                let v_nans = v_u16
+                    .iter()
+                    .filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0)
+                    .count();
+                eprintln!(
+                    "[seed-verify] layer {layer_idx}: k_diff_bytes={k_diff}/{n_bytes}, v_diff_bytes={v_diff}/{n_bytes}, k_nans={k_nans}, v_nans={v_nans}"
+                );
+                if k_nans > 0 {
+                    for (idx, &val) in k_u16.iter().enumerate() {
+                        if (val & 0x7c00) == 0x7c00 && (val & 0x03ff) != 0 {
+                            let row = idx / 1024;
+                            let col = idx % 1024;
+                            eprintln!(
+                                "[seed-nan-k] layer {layer_idx}: row={row} col={col} val=0x{val:04x}"
+                            );
+                            if row > 0 {
+                                break;
                             }
                         }
                     }
+                }
                 continue;
             }
             if !(src.src_elem_bytes == 4 && arena_elem_bytes == 2) {
@@ -1997,7 +2039,11 @@ impl DecodeGraphBuffers {
             // layer_devices[i], and issuing the copy from the primary
             // device's context is the seeder fault class this task exists
             // for (hipMemcpyAsync on foreign-device pointers).
-            let ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal);
+            let ord = self
+                .layer_devices
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(dev.ordinal);
             let _guard = crate::device::util::DeviceGuard::set(ord as i32);
             let stream = crate::RocmDevice::shared(ord).active_stream();
             let Some(gdl) = self.gdl.get(layer_idx).and_then(|o| o.as_ref()) else {
@@ -2043,7 +2089,11 @@ impl DecodeGraphBuffers {
         for (layer_idx, seed) in per_layer.iter().enumerate() {
             let Some(sd) = seed else { continue };
             // A5: per-layer device context (see seed_gdl_state_from_eager).
-            let ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal);
+            let ord = self
+                .layer_devices
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(dev.ordinal);
             let _guard = crate::device::util::DeviceGuard::set(ord as i32);
             let stream = crate::RocmDevice::shared(ord).active_stream();
             if layer_idx >= self.sc_state.len() {
@@ -2090,7 +2140,11 @@ impl DecodeGraphBuffers {
             let Some(src) = src else { continue };
             let state_ptr = src.kda_state;
             // A5: per-layer device context (see seed_gdl_state_from_eager).
-            let ord = self.layer_devices.get(layer_idx).copied().unwrap_or(dev.ordinal);
+            let ord = self
+                .layer_devices
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(dev.ordinal);
             let _guard = crate::device::util::DeviceGuard::set(ord as i32);
             let stream = crate::RocmDevice::shared(ord).active_stream();
             let Some(kda) = self.kda.get(layer_idx).and_then(|o| o.as_ref()) else {
@@ -2364,6 +2418,10 @@ pub struct DecodeGraph {
     /// layers). Staged OUTSIDE capture — an H2D copy inside the capture bracket
     /// poisons the graph (measured: `hipMemcpyHostToDevice ... error code 906`).
     pub kda_desc_ptrs: Vec<Option<u64>>,
+    /// WI-4: per-boundary host staging buffer owned by this decode graph.
+    pub boundary_staging: Vec<Option<crate::p2p_route::HostStagingBuffer>>,
+    /// WI-0: per-segment timing event pairs (start, stop) under GRIM_SEGMENT_TIMING=1.
+    pub segment_timing_evs: Vec<(*mut std::ffi::c_void, *mut std::ffi::c_void)>,
     ordinal: usize,
 }
 
@@ -2425,6 +2483,8 @@ impl DecodeGraph {
             ring_context: None,
             kda_desc_ptrs: Vec::new(),
             boundary_handoffs: Vec::new(),
+            boundary_staging: Vec::new(),
+            segment_timing_evs: Vec::new(),
             ordinal: dev.ordinal,
         }
     }
@@ -2454,19 +2514,99 @@ impl DecodeGraph {
         // One event per boundary, created under a DeviceGuard on the PRODUCING
         // device (an event is a device-side object; hipStreamWaitEvent from
         // another device's stream must reference one from the producing side).
+        unsafe extern "C" {
+            fn hipEventCreateWithFlags(
+                event: *mut *mut std::ffi::c_void,
+                flags: u32,
+            ) -> crate::HipErrorT;
+        }
+        let disable_timing = matches!(
+            std::env::var("GRIM_BOUNDARY_DISABLE_TIMING").as_deref(),
+            Ok("1" | "true" | "on")
+        ) || std::env::var_os("GRIM_BOUNDARY_OWNED_STAGING").is_some();
         self.boundary_evs = self.segments[..self.segments.len().saturating_sub(1)]
             .iter()
             .map(|s| {
                 let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
                 let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
-                let res: crate::HipErrorT = unsafe { crate::hipEventCreate(&mut ev) };
+                let res: crate::HipErrorT = if disable_timing {
+                    unsafe { hipEventCreateWithFlags(&mut ev, 0x2) }
+                } else {
+                    unsafe { crate::hipEventCreate(&mut ev) }
+                };
                 if res != crate::hipSuccess {
-                    eprintln!("[decode-graph] hipEventCreate failed: {res}");
+                    eprintln!("[decode-graph] hipEventCreate/WithFlags failed: {res}");
                     return std::ptr::null_mut();
                 }
                 ev
             })
             .collect();
+
+        // WI-4: allocate graph-owned host staging buffers for each boundary.
+        // Enabled by default unless GRIM_BOUNDARY_OWNED_STAGING=0 is set, or if GRIM_BOUNDARY_OWNED_STAGING=1.
+        let use_owned_staging = match std::env::var("GRIM_BOUNDARY_OWNED_STAGING").as_deref() {
+            Ok("0" | "false" | "off") => false,
+            _ => true,
+        };
+        let n_boundaries = self.segments.len().saturating_sub(1);
+        self.boundary_staging = Vec::with_capacity(n_boundaries);
+        if use_owned_staging {
+            for k in 0..n_boundaries {
+                let bytes = self
+                    .buffers
+                    .boundary_out
+                    .get(k)
+                    .map(|b| b.bytes())
+                    .unwrap_or(0);
+                if bytes > 0 {
+                    let _guard =
+                        crate::device::util::DeviceGuard::set(self.segments[k].device as i32);
+                    match crate::p2p_route::HostStagingBuffer::with_flags(bytes, 0x1) {
+                        Ok(buf) => self.boundary_staging.push(Some(buf)),
+                        Err(e) => {
+                            eprintln!(
+                                "[decode-graph] boundary {k}: failed to allocate owned staging buffer ({e}); falling back to global"
+                            );
+                            self.boundary_staging.push(None);
+                        }
+                    }
+                } else {
+                    self.boundary_staging.push(None);
+                }
+            }
+        } else {
+            self.boundary_staging.resize_with(n_boundaries, || None);
+        }
+
+        // Clean up any previous timing events
+        for (start, stop) in self.segment_timing_evs.drain(..) {
+            if !start.is_null() {
+                unsafe {
+                    let _ = crate::hipEventDestroy(start);
+                }
+            }
+            if !stop.is_null() {
+                unsafe {
+                    let _ = crate::hipEventDestroy(stop);
+                }
+            }
+        }
+        if matches!(
+            std::env::var("GRIM_SEGMENT_TIMING").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            for s in &self.segments {
+                let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+                let mut start: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut stop: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    let _ = crate::hipEventCreate(&mut start);
+                    let _ = crate::hipEventCreate(&mut stop);
+                }
+                self.segment_timing_evs.push((start, stop));
+            }
+        }
+
         self.build_boundary_handoffs();
     }
 
@@ -2624,10 +2764,8 @@ impl DecodeGraph {
             let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
             let mut graph: *mut c_void = std::ptr::null_mut();
             // SAFETY: stream is under capture; graph out-ptr valid.
-            let res: crate::HipErrorT =
-                unsafe { hipStreamEndCapture(s.stream, &mut graph) };
-            crate::device::roc_device::RocmDevice::shared(s.device)
-                .set_capture_gate(false, None);
+            let res: crate::HipErrorT = unsafe { hipStreamEndCapture(s.stream, &mut graph) };
+            crate::device::roc_device::RocmDevice::shared(s.device).set_capture_gate(false, None);
             if res != crate::hipSuccess {
                 self.capturing = false;
                 return Err(Error::Backend(format!(
@@ -2963,7 +3101,9 @@ impl DecodeGraph {
             return self.replay();
         }
         if self.segments.iter().any(|s| s.exec.is_null()) {
-            return Err(Error::Backend("replay_chain: a segment is not captured".into()));
+            return Err(Error::Backend(
+                "replay_chain: a segment is not captured".into(),
+            ));
         }
         let handoffs = self.use_boundary_handoffs();
         for seg in 0..self.segments.len() {
@@ -2978,7 +3118,39 @@ impl DecodeGraph {
                     .expect("handoff presence checked");
                 h.launch_wait(&consumer, self.segments[seg].stream)?;
             }
+            if let Some(&(start_ev, _)) = self.segment_timing_evs.get(seg) {
+                if !start_ev.is_null() {
+                    let _guard =
+                        crate::device::util::DeviceGuard::set(self.segments[seg].device as i32);
+                    unsafe {
+                        let _ = crate::hipEventRecord(start_ev, self.segments[seg].stream);
+                    }
+                }
+            }
+            let host_launch_start = if std::env::var_os("GRIM_SEGMENT_TIMING").is_some() {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             self.replay_segment(seg)?;
+            if let Some(t0) = host_launch_start {
+                let launch_us = t0.elapsed().as_micros();
+                if seg == 0 {
+                    eprintln!(
+                        "[segment-launch] seg{seg}_host_launch={launch_us} us ({:.3} ms)",
+                        launch_us as f64 / 1000.0
+                    );
+                }
+            }
+            if let Some(&(_, stop_ev)) = self.segment_timing_evs.get(seg) {
+                if !stop_ev.is_null() {
+                    let _guard =
+                        crate::device::util::DeviceGuard::set(self.segments[seg].device as i32);
+                    unsafe {
+                        let _ = crate::hipEventRecord(stop_ev, self.segments[seg].stream);
+                    }
+                }
+            }
             if seg + 1 < self.segments.len() {
                 let s = &self.segments[seg];
                 let n = &self.segments[seg + 1];
@@ -3004,11 +3176,52 @@ impl DecodeGraph {
                     }
                     let src = &self.buffers.boundary_out[seg];
                     let dst = &self.buffers.layer_input[n.layers.start];
-                    crate::peer_access::copy_boundary_ordered(src, dst, s.stream, n.stream, ev)?;
+                    let staging_ptr = self
+                        .boundary_staging
+                        .get(seg)
+                        .and_then(|s| s.as_ref())
+                        .map(|s| s.as_device_ptr());
+                    crate::peer_access::copy_boundary_ordered_with_staging(
+                        src,
+                        dst,
+                        s.stream,
+                        n.stream,
+                        ev,
+                        staging_ptr,
+                    )?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Read per-segment elapsed milliseconds from recorded timing events.
+    /// Returns None if timing is disabled or events were not recorded/synchronized.
+    pub fn read_segment_timings(&self) -> Option<Vec<f32>> {
+        if self.segment_timing_evs.is_empty() {
+            return None;
+        }
+        let mut times = Vec::with_capacity(self.segment_timing_evs.len());
+        for (i, &(start, stop)) in self.segment_timing_evs.iter().enumerate() {
+            if start.is_null() || stop.is_null() {
+                return None;
+            }
+            let seg_dev = self
+                .segments
+                .get(i)
+                .map(|s| s.device)
+                .unwrap_or(self.ordinal);
+            let _guard = crate::device::util::DeviceGuard::set(seg_dev as i32);
+            let mut elapsed_ms = 0.0f32;
+            let rc = unsafe {
+                crate::device::handles::hipEventElapsedTime(&mut elapsed_ms, start, stop)
+            };
+            if rc != crate::hipSuccess {
+                return None;
+            }
+            times.push(elapsed_ms);
+        }
+        Some(times)
     }
 
     /// Spec §Scalar: update KV-position kernel args before replay.
@@ -3103,6 +3316,7 @@ impl Drop for DecodeGraph {
             }
             // Per-segment graphs + the boundary events (tasks A2/A4).
             for s in self.segments.iter_mut() {
+                let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
                 if !s.exec.is_null() {
                     let _ = hipGraphExecDestroy(s.exec);
                     s.exec = std::ptr::null_mut();
@@ -3112,11 +3326,39 @@ impl Drop for DecodeGraph {
                     s.graph = std::ptr::null_mut();
                 }
             }
-            for ev in self.boundary_evs.drain(..) {
+            for (seg_idx, ev) in self.boundary_evs.drain(..).enumerate() {
+                let dev_ord = self
+                    .segments
+                    .get(seg_idx)
+                    .map(|s| s.device)
+                    .unwrap_or(self.ordinal);
+                let _guard = crate::device::util::DeviceGuard::set(dev_ord as i32);
                 if !ev.is_null() {
                     let _ = crate::hipEventDestroy(ev);
                 }
             }
+            for (seg_idx, (start, stop)) in self.segment_timing_evs.drain(..).enumerate() {
+                let dev_ord = self
+                    .segments
+                    .get(seg_idx)
+                    .map(|s| s.device)
+                    .unwrap_or(self.ordinal);
+                let _guard = crate::device::util::DeviceGuard::set(dev_ord as i32);
+                if !start.is_null() {
+                    let _ = crate::hipEventDestroy(start);
+                }
+                if !stop.is_null() {
+                    let _ = crate::hipEventDestroy(stop);
+                }
+            }
+            // Sync segment streams before dropping owned staging buffers
+            for s in &self.segments {
+                if !s.stream.is_null() {
+                    let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+                    let _ = crate::device::handles::hipStreamSynchronize(s.stream);
+                }
+            }
+            self.boundary_staging.clear();
         }
     }
 }
@@ -3270,10 +3512,7 @@ mod tests {
 
     #[test]
     fn device_segments_are_maximal_contiguous_runs() {
-        assert_eq!(
-            device_segments(&[0, 0, 1, 1]),
-            vec![(0, 0..2), (1, 2..4)]
-        );
+        assert_eq!(device_segments(&[0, 0, 1, 1]), vec![(0, 0..2), (1, 2..4)]);
         // Single device: one segment covering everything.
         assert_eq!(device_segments(&[0, 0, 0]), vec![(0, 0..3)]);
         // Non-contiguous placement must NOT be silently merged — it yields more
@@ -3291,7 +3530,10 @@ mod tests {
         // is that segment k+1 starts where segment k ended (no gaps, no overlap).
         let segs = device_segments(&[0, 0, 1, 1, 1]);
         for w in segs.windows(2) {
-            assert_eq!(w[0].1.end, w[1].1.start, "segments must tile the layer range");
+            assert_eq!(
+                w[0].1.end, w[1].1.start,
+                "segments must tile the layer range"
+            );
         }
         assert_eq!(segs.first().unwrap().1.start, 0);
         assert_eq!(segs.last().unwrap().1.end, 5);
@@ -3317,10 +3559,22 @@ mod tests {
         let mut g = DecodeGraph::allocate(
             &dev,
             dev.active_stream(),
-            3, 64, 32, 8, 8, 128, 16, 64, 4, 1,
+            3,
+            64,
+            32,
+            8,
+            8,
+            128,
+            16,
+            64,
+            4,
+            1,
         )
         .expect("allocate");
-        assert!(g.segments.is_empty(), "no set_layer_devices call yet -> legacy path");
+        assert!(
+            g.segments.is_empty(),
+            "no set_layer_devices call yet -> legacy path"
+        );
         g.set_layer_devices(&[0, 0, 1]);
         assert_eq!(g.segments.len(), 2, "two device runs must yield two graphs");
         assert_eq!(g.segments[0].layers, 0..2);
@@ -3354,7 +3608,24 @@ mod tests {
             // (dev, layer_devices, num_layers, hidden, n_q, n_attn_out, n_k, n_v,
             //  inter, max_ctx, vocab, num_heads, batch, n_expert, top_k, sc_h_dim,
             //  sc_l_cache, latent_kv_dim) -- 18 params.
-            &dev, Some(&[0, 0, 1]), 3, 64, 32, 32, 8, 8, 128, 16, 64, 4, 1, 0, 0, 0, 0, 0,
+            &dev,
+            Some(&[0, 0, 1]),
+            3,
+            64,
+            32,
+            32,
+            8,
+            8,
+            128,
+            16,
+            64,
+            4,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         .expect("allocate");
         // Exactly one boundary (between layer 1 and layer 2).
@@ -3369,7 +3640,24 @@ mod tests {
         assert_eq!(buffers.layer_input[2].device_ordinal(), 1);
         // Same-device placement must produce no boundary buffers.
         let same = DecodeGraphBuffers::allocate_with_layer_devices(
-            &dev, Some(&[0, 0, 0]), 3, 64, 32, 32, 8, 8, 128, 16, 64, 4, 1, 0, 0, 0, 0, 0,
+            &dev,
+            Some(&[0, 0, 0]),
+            3,
+            64,
+            32,
+            32,
+            8,
+            8,
+            128,
+            16,
+            64,
+            4,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         .expect("allocate same-device");
         assert!(same.boundary_out.is_empty());
@@ -3406,7 +3694,9 @@ mod tests {
         let dst =
             RocmStorage::alloc_gpu(&Shape::new(vec![n]), dt.clone(), &d1.allocator, 1).unwrap();
         let want: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
-        let host = d0.from_cpu(&want, &Shape::new(vec![n]), dt.clone()).expect("from_cpu");
+        let host = d0
+            .from_cpu(&want, &Shape::new(vec![n]), dt.clone())
+            .expect("from_cpu");
         d0.copy_slice_into(&src, host.as_ref(), 0, n).unwrap();
         // `hipEventCreate` is the only event constructor grim declares.
         let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();

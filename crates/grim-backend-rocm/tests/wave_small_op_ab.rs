@@ -44,7 +44,7 @@
 
 use std::time::Instant;
 
-use grim_backend_rocm::task_graph::{arg_role, op, TaskGraphBuilder};
+use grim_backend_rocm::task_graph::{TaskGraphBuilder, arg_role, op};
 use grim_backend_rocm::{BackendStorage, RocmDevice};
 use grim_tensor::dtype::DType;
 use grim_tensor::{CoreTensorOps, Shape};
@@ -120,17 +120,24 @@ fn the_waves_per_op_cost_is_measured_against_the_launchers() {
         let h_a = gb.push_arg(a_ptr, (n * 4) as u64, arg_role::ACT_IN);
         let h_b = gb.push_arg(b_ptr, (n * 4) as u64, arg_role::ACT_IN);
         let h_o = gb.push_arg(o_ptr, (n * 4) as u64, arg_role::ACT_OUT);
-        gb.push(op::ELEMENTWISE, [n as u32, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[h_a, h_b, h_o], &[], 0, 0);
+        gb.push(
+            op::ELEMENTWISE,
+            [n as u32, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[h_a, h_b, h_o],
+            &[],
+            0,
+            0,
+        );
         let graph = gb.finish();
-        let ctx =
-            grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
-                .expect("ring context")
-                .expect("ring binds the add");
+        let ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+            .expect("ring context")
+            .expect("ring binds the add");
         assert_eq!(ctx.plan().adds().len(), 1, "the ADD node must bind");
 
         // Warm-up both arms.
         for _ in 0..WARMUP {
-            ctx.enqueue_add(&dev, &ctx.plan().adds()[0]).expect("enqueue add");
+            ctx.enqueue_add(&dev, &ctx.plan().adds()[0])
+                .expect("enqueue add");
             dev.synchronize();
             dev.add_into(rocm_of(&a_s), rocm_of(&b_s), rocm_of(&o_s))
                 .expect("standalone add");
@@ -140,7 +147,8 @@ fn the_waves_per_op_cost_is_measured_against_the_launchers() {
         // ── ONE op: the wave (write + publish + launch a wave + drain). ──
         let t0 = Instant::now();
         for _ in 0..ITERS {
-            ctx.enqueue_add(&dev, &ctx.plan().adds()[0]).expect("enqueue add");
+            ctx.enqueue_add(&dev, &ctx.plan().adds()[0])
+                .expect("enqueue add");
         }
         dev.synchronize();
         let one_wave_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -162,7 +170,8 @@ fn the_waves_per_op_cost_is_measured_against_the_launchers() {
         let t0 = Instant::now();
         for _ in 0..ITERS {
             for _ in 0..BATCH {
-                ctx.enqueue_add(&dev, &ctx.plan().adds()[0]).expect("enqueue add");
+                ctx.enqueue_add(&dev, &ctx.plan().adds()[0])
+                    .expect("enqueue add");
             }
         }
         dev.synchronize();
@@ -188,15 +197,16 @@ fn the_waves_per_op_cost_is_measured_against_the_launchers() {
         // The resident wave parks on the RING's own stream and picks up
         // whatever the ring is given next, so the batch is published to a
         // parked wave — one launch, many nodes.
-        let mut res_ctx = grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(
-            &dev, &graph,
-        )
-        .expect("ring context")
-        .expect("ring binds the add");
+        let mut res_ctx =
+            grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(&dev, &graph)
+                .expect("ring context")
+                .expect("ring binds the add");
         res_ctx.launch_resident(&dev).expect("launch resident wave");
         // Warm the parked wave up.
         for _ in 0..WARMUP {
-            res_ctx.enqueue_add(&dev, &res_ctx.plan().adds()[0]).expect("enqueue add");
+            res_ctx
+                .enqueue_add(&dev, &res_ctx.plan().adds()[0])
+                .expect("enqueue add");
             dev.synchronize();
         }
         // The parked wave drains asynchronously, so the batch is published and

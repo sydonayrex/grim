@@ -253,7 +253,11 @@ fn wmma_iq3xxs_decode_path_parity() {
     const BLOCK_ELEMS: usize = 256;
     const BLOCK_BYTES: usize = 98;
     let (m, n, k) = (1usize, 256usize, 512usize);
-    assert_eq!(k % BLOCK_ELEMS, 0, "k must be a multiple of the IQ3_XXS block");
+    assert_eq!(
+        k % BLOCK_ELEMS,
+        0,
+        "k must be a multiple of the IQ3_XXS block"
+    );
 
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
 
@@ -261,11 +265,13 @@ fn wmma_iq3xxs_decode_path_parity() {
     // can produce non-finite scales, and the resulting NaN would be a
     // property of the fixture rather than of the kernel. Sourcing from the
     // actual checkpoint decodes bytes a real producer wrote.
-    let Some(ckpt) = find_checkpoint(
-        "models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
-    ) else {
-        panic!("checkpoint missing — this gate must not silently skip; it is the \
-                 only parity coverage for launch_wmma_fused_dequant_iq3xxs");
+    let Some(ckpt) =
+        find_checkpoint("models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf")
+    else {
+        panic!(
+            "checkpoint missing — this gate must not silently skip; it is the \
+                 only parity coverage for launch_wmma_fused_dequant_iq3xxs"
+        );
     };
     let ckpt = ckpt.to_string_lossy().to_string();
     let f = std::fs::File::open(&ckpt).expect("open checkpoint");
@@ -310,25 +316,16 @@ fn wmma_iq3xxs_decode_path_parity() {
         arith: ArithType::F32,
         storage: Storage::KQuant(KQuantScheme::IQ3XXS),
     };
-    let b_dev = MemoryOps::from_cpu_bytes(
-        &dev,
-        &b_packed,
-        &Shape::new(vec![n * k]),
-        q_dtype,
-    )
-    .expect("upload packed IQ3_XXS B");
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![n * k]), q_dtype)
+        .expect("upload packed IQ3_XXS B");
     let w_rocm = b_dev
         .as_any()
         .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
         .expect("B is RocmStorage");
 
     let out = dev
-        .from_cpu(
-        &vec![0.0f32; n],
-        &Shape::new(vec![n]),
-        DType::F32,
-    )
-    .expect("out buffer");
+        .from_cpu(&vec![0.0f32; n], &Shape::new(vec![n]), DType::F32)
+        .expect("out buffer");
     let out_rocm = out
         .as_any()
         .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
@@ -337,11 +334,11 @@ fn wmma_iq3xxs_decode_path_parity() {
     // Scratch: the same sizing the Q8_0 decode path uses, generously rounded up.
     let act_q81 = dev
         .from_cpu(
-        &vec![0.0f32; (k / 32) * 64],
-        &Shape::new(vec![(k / 32) * 64]),
-        DType::F32,
-    )
-    .expect("act_q81 scratch");
+            &vec![0.0f32; (k / 32) * 64],
+            &Shape::new(vec![(k / 32) * 64]),
+            DType::F32,
+        )
+        .expect("act_q81 scratch");
     let act_rocm = act_q81
         .as_any()
         .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
@@ -356,7 +353,9 @@ fn wmma_iq3xxs_decode_path_parity() {
     // want = a @ B^T, computed in f32 from the decoded weights.
     let want: Vec<f32> = (0..n)
         .map(|col| {
-            (0..k).map(|kk| a_host[kk] * b_f32[col * k + kk]).sum::<f32>()
+            (0..k)
+                .map(|kk| a_host[kk] * b_f32[col * k + kk])
+                .sum::<f32>()
         })
         .collect();
 
@@ -385,7 +384,8 @@ fn wmma_iq3xxs_decode_path_parity() {
         t.name
     );
     assert_eq!(
-        nonfinite, 0,
+        nonfinite,
+        0,
         "the IQ3XXS decode leg produced {nonfinite} non-finite outputs; \
          first bad index {:?} got={:?} want={:?}",
         first_bad.map(|x| x.0),
@@ -621,15 +621,9 @@ fn q8_1_pack(a: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let mut bytes = Vec::with_capacity(a.len() / G * 36);
     let mut eff = Vec::with_capacity(a.len());
     for ch in a.chunks(G) {
-        let (amax, x_at_amax) = ch
-            .iter()
-            .fold((0f32, 0f32), |(m, x), &v| {
-                if v.abs() > m {
-                    (v.abs(), v)
-                } else {
-                    (m, x)
-                }
-            });
+        let (amax, x_at_amax) = ch.iter().fold((0f32, 0f32), |(m, x), &v| {
+            if v.abs() > m { (v.abs(), v) } else { (m, x) }
+        });
         let d = amax / 127.0;
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         let s = d * x_at_amax;
@@ -737,19 +731,68 @@ fn kquant_scheme_sweep() {
     const IQ_TOL: f32 = 1e-3;
     const QK_TOL: f32 = 0.5;
     let schemes: &[(&str, GgufDType, KQuantScheme, usize, bool, f32)] = &[
-        ("IQ1_S", GgufDType::IQ1_S, KQuantScheme::IQ1S, 50, false, IQ_TOL),
-        ("IQ2_XXS", GgufDType::IQ2_XXS, KQuantScheme::IQ2XXS, 66, false, IQ_TOL),
-        ("IQ2_XS", GgufDType::IQ2_XS, KQuantScheme::IQ2XS, 74, false, IQ_TOL),
-        ("IQ2_S", GgufDType::IQ2_S, KQuantScheme::IQ2S, 82, false, IQ_TOL),
-        ("IQ3_XXS", GgufDType::IQ3_XXS, KQuantScheme::IQ3XXS, 98, false, IQ_TOL),
-        ("IQ3_S", GgufDType::IQ3_S, KQuantScheme::IQ3S, 110, false, IQ_TOL),
+        (
+            "IQ1_S",
+            GgufDType::IQ1_S,
+            KQuantScheme::IQ1S,
+            50,
+            false,
+            IQ_TOL,
+        ),
+        (
+            "IQ2_XXS",
+            GgufDType::IQ2_XXS,
+            KQuantScheme::IQ2XXS,
+            66,
+            false,
+            IQ_TOL,
+        ),
+        (
+            "IQ2_XS",
+            GgufDType::IQ2_XS,
+            KQuantScheme::IQ2XS,
+            74,
+            false,
+            IQ_TOL,
+        ),
+        (
+            "IQ2_S",
+            GgufDType::IQ2_S,
+            KQuantScheme::IQ2S,
+            82,
+            false,
+            IQ_TOL,
+        ),
+        (
+            "IQ3_XXS",
+            GgufDType::IQ3_XXS,
+            KQuantScheme::IQ3XXS,
+            98,
+            false,
+            IQ_TOL,
+        ),
+        (
+            "IQ3_S",
+            GgufDType::IQ3_S,
+            KQuantScheme::IQ3S,
+            110,
+            false,
+            IQ_TOL,
+        ),
         // IQ4_XS used to be the `uses_q81 = true` case here (no f32-act leg, so
         // it fell to the dot4 catch-all and returned non-finite). It now has its
         // own fused-dequant leg, which reads A as raw f32 and ignores the
         // act_q81 scratch — so the reference must use raw `a_host` too. Leaving
         // this `true` charges the kernel for Q8_1 quantization it does not
         // perform, which showed up as a stubborn ~7.9e-3.
-        ("IQ4_XS", GgufDType::IQ4_XS, KQuantScheme::IQ4XS, 136, false, IQ_TOL),
+        (
+            "IQ4_XS",
+            GgufDType::IQ4_XS,
+            KQuantScheme::IQ4XS,
+            136,
+            false,
+            IQ_TOL,
+        ),
         // Q2_K and Q4_K ride the dot4/q81 legs, which consume act_q81.
         ("Q2_K", GgufDType::Q2K, KQuantScheme::Q2K, 84, true, QK_TOL),
         ("Q4_K", GgufDType::Q4K, KQuantScheme::Q4K, 144, true, QK_TOL),
@@ -773,17 +816,15 @@ fn kquant_scheme_sweep() {
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
     let (q81_bytes, a_eff_q81) = q8_1_pack(&a_host);
 
-    let ckpt = find_checkpoint(
-        "models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "checkpoint missing — this gate must not silently skip; it is the \
+    let ckpt = find_checkpoint("models/qwen38-27b/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf")
+        .unwrap_or_else(|| {
+            panic!(
+                "checkpoint missing — this gate must not silently skip; it is the \
              only parity coverage for the IQ fused-dequant decode legs"
-        )
-    })
-    .to_string_lossy()
-    .to_string();
+            )
+        })
+        .to_string_lossy()
+        .to_string();
     let f = std::fs::File::open(&ckpt).expect("open checkpoint");
     let gguf = grim_format::gguf::read_gguf(std::io::BufReader::new(f)).expect("parse gguf");
     let provider = grim_format::tprov::GgufProvider::open(&ckpt).expect("open provider");
@@ -804,7 +845,10 @@ fn kquant_scheme_sweep() {
             .filter(|t| t.dtype == *gdt && (t.size_bytes as usize) / block_bytes >= need_blocks)
             .max_by_key(|t| t.size_bytes)
         else {
-            println!("{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  NO-TENSOR", "", "");
+            println!(
+                "{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  NO-TENSOR",
+                "", ""
+            );
             failures.push(format!("{label}: no tensor >= n*k blocks"));
             continue;
         };
@@ -834,7 +878,10 @@ fn kquant_scheme_sweep() {
             w_f32.extend(v);
         }
         if !w_f32.iter().all(|v| v.is_finite()) {
-            println!("{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  BAD-FIXTURE", "", "");
+            println!(
+                "{label:<9} {tensors:>8} {block_bytes:>8} {:>12} {:>10}  BAD-FIXTURE",
+                "", ""
+            );
             failures.push(format!("{label}: host reference non-finite (bad fixture)"));
             continue;
         }
@@ -850,7 +897,10 @@ fn kquant_scheme_sweep() {
             &dev,
             &packed,
             &Shape::new(vec![n * k]),
-            DType { arith: ArithType::F32, storage: Storage::KQuant(*scheme) },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(*scheme),
+            },
         )
         .expect("upload packed B");
         let w = b_dev
@@ -866,7 +916,11 @@ fn kquant_scheme_sweep() {
             .expect("out is RocmStorage");
         // Scratch: must be >= need_q81 = m*(k/32)*36 BYTES and hold real Q8_1
         // blocks for the dot4 legs.
-        let act_scratch = if *uses_q81 { q81_bytes.clone() } else { vec![0u8; (k / 32) * 64] };
+        let act_scratch = if *uses_q81 {
+            q81_bytes.clone()
+        } else {
+            vec![0u8; (k / 32) * 64]
+        };
         let act = MemoryOps::from_cpu_bytes(
             &dev,
             &act_scratch,

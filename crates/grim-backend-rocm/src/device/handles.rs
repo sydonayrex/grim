@@ -45,9 +45,11 @@ unsafe impl Send for RocmHandle {}
 impl ComputeHandle for RocmHandle {
     fn synchronize(&self) -> Result<()> {
         if let Some(stream) = self.stream {
+            crate::device::util::report_rocm_progress("hipStreamSynchronize:in-flight");
             check_hip("hipStreamSynchronize", unsafe {
                 hipStreamSynchronize(stream)
             })?;
+            crate::device::util::report_rocm_progress("hipStreamSynchronize:done");
         }
         Ok(())
     }
@@ -140,6 +142,11 @@ unsafe extern "C" {
     pub fn hipGetLastError() -> HipErrorT;
     pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
     pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
+    pub fn hipDeviceGetPCIBusId(
+        pciBusId: *mut std::os::raw::c_char,
+        len: i32,
+        device: i32,
+    ) -> HipErrorT;
     pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT;
     pub fn hipDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> HipErrorT;
@@ -322,7 +329,10 @@ pub unsafe fn hipMemcpyAsync(
             kind, count, stream, dst, src
         );
     }
-    unsafe { raw_hipMemcpyAsync(dst, src, count, kind, stream) }
+    crate::device::util::report_rocm_progress("hipMemcpyAsync:in-flight");
+    let ret = unsafe { raw_hipMemcpyAsync(dst, src, count, kind, stream) };
+    crate::device::util::report_rocm_progress("hipMemcpyAsync:done");
+    ret
 }
 
 /// Asynchronous byte memset on a specific stream (capture-safe: no sync, no

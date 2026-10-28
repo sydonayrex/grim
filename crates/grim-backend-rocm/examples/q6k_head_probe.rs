@@ -23,12 +23,10 @@
 //! `HIP_VISIBLE_DEVICES=0 GRIM_GPU_TEST=1 cargo run --release \
 //!  -p grim-backend-rocm --example q6k_head_probe`
 
-use grim_backend_rocm::memory::storage::RocmStorage;
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::memory::storage::RocmStorage;
 use grim_tensor::provider::TensorProvider;
-use grim_tensor::{
-    ArithType, CoreTensorOps, DType, MemoryOps, QuantOps, Shape, Storage,
-};
+use grim_tensor::{ArithType, CoreTensorOps, DType, MemoryOps, QuantOps, Shape, Storage};
 use std::io::BufReader;
 
 /// Columns of the head to reference on the host.
@@ -37,7 +35,10 @@ const BLOCK_BYTES: usize = 210;
 const BLOCK_ELEMS: usize = 256;
 
 fn main() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1");
         return;
     }
@@ -69,12 +70,19 @@ fn main() {
         "[q6k-probe] tensor={} dims={:?} -> n={n} k={k} bytes={}",
         t.name, t.dims, t.size_bytes
     );
-    assert_eq!(k % BLOCK_ELEMS, 0, "k must be a whole number of super-blocks");
+    assert_eq!(
+        k % BLOCK_ELEMS,
+        0,
+        "k must be a whole number of super-blocks"
+    );
     let raw = provider.get_packed(&t.name).expect("packed bytes");
     let blocks_per_row = k / BLOCK_ELEMS;
     let row_bytes = blocks_per_row * BLOCK_BYTES;
     let need = REF_COLS * row_bytes;
-    assert!(raw.bytes.len() >= need, "checkpoint shorter than REF_COLS rows");
+    assert!(
+        raw.bytes.len() >= need,
+        "checkpoint shorter than REF_COLS rows"
+    );
     let packed = raw.bytes[..need].to_vec();
 
     // ── Host reference for the first REF_COLS rows.
@@ -121,8 +129,7 @@ fn main() {
 
     // ── Leg 1: the graph's leg (`linear_decode_into`).
     let out_shape = Shape::new(vec![1, n]);
-    let out = CoreTensorOps::from_cpu(&dev, &vec![0.0f32; n], &out_shape, DType::F32)
-        .expect("out");
+    let out = CoreTensorOps::from_cpu(&dev, &vec![0.0f32; n], &out_shape, DType::F32).expect("out");
     let out_r = out
         .as_any()
         .downcast_ref::<RocmStorage>()
@@ -142,7 +149,12 @@ fn main() {
         .linear_decode_into(a_dev.as_ref(), w_r, out_r, act_r)
         .expect("graph leg");
     h.synchronize().expect("sync");
-    report("graph  linear_decode_into", &out.to_cpu_vec_f32().expect("readback"), &want, scale);
+    report(
+        "graph  linear_decode_into",
+        &out.to_cpu_vec_f32().expect("readback"),
+        &want,
+        scale,
+    );
 
     // ── Leg 2: the eager leg (`quantized_matmul`).
     let (out2_s, h2) = dev

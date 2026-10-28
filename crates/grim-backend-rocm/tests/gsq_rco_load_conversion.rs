@@ -12,9 +12,9 @@
 //!    `KQuant(GsqRco3p5)` and keeps the lazy path.
 
 use grim_backend_rocm::{CoreTensorOps, MemoryOps, QuantOps, RocmDevice, RocmStorage};
+use grim_tensor::Shape;
 use grim_tensor::backend::{BackendStorage, ComputeHandle};
 use grim_tensor::dtype::{ArithType, DType, KQuantScheme, OstQuantConfig};
-use grim_tensor::Shape;
 
 fn gsq_dtype() -> DType {
     DType {

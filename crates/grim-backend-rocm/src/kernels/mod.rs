@@ -85,7 +85,7 @@ pub mod source_asm;
 pub mod tile_picker;
 pub mod wmma_big_gemm;
 pub mod wmma_fp8_gemm;
-pub mod wmma_i8_gemm;
 pub mod wmma_gemm;
+pub mod wmma_i8_gemm;
 pub mod wmma_iq_gemm;
 pub mod wmma_quantized_gemm;

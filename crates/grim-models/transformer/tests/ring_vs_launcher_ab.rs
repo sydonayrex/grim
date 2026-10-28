@@ -130,11 +130,15 @@ fn measure_arm(
     // ring is bound from, and it is the SAME IR both arms use.
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
     let _ = model.forward_capture(&mut graph, TOKENS[0]);
-    graph.begin_capture().map_err(|e| format!("begin capture: {e}"))?;
+    graph
+        .begin_capture()
+        .map_err(|e| format!("begin capture: {e}"))?;
     model
         .forward_capture(&mut graph, TOKENS[0])
         .map_err(|e| format!("capture: {e}"))?;
-    graph.end_capture().map_err(|e| format!("end capture: {e}"))?;
+    graph
+        .end_capture()
+        .map_err(|e| format!("end capture: {e}"))?;
     graph
         .buffers
         .reset_for_replay()
@@ -308,8 +312,8 @@ fn the_megakernel_and_the_wavefront_are_measured_on_the_same_model() {
 
     // ARM 1: the WAVEFRONT. Every launch goes through the model's own
     // launcher, one kernel launch at a time.
-    let wavefront = measure_arm("wavefront (per-kernel launcher)", &model, &dev, false)
-        .expect("wavefront arm");
+    let wavefront =
+        measure_arm("wavefront (per-kernel launcher)", &model, &dev, false).expect("wavefront arm");
 
     // ARM 2: the MEGAKERNEL arm. The SAME walk, with the recurrent step
     // executed by the ring's persistent wave.
@@ -399,11 +403,7 @@ fn the_megakernel_and_the_wavefront_are_measured_on_the_same_model() {
         .enumerate()
         .fold((0.0f32, 0usize), |(w, wi), (i, (a, b))| {
             let d = (a - b).abs();
-            if d > w {
-                (d, i)
-            } else {
-                (w, wi)
-            }
+            if d > w { (d, i) } else { (w, wi) }
         });
     eprintln!("[ab] control: the arms' logits differ by at most {worst:.3e} (at {at})");
     assert!(

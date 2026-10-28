@@ -14,9 +14,10 @@ use grim_tensor::{CoreTensorOps, MemoryOps, RawTensor};
 use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_gsq_rco_3p5,
-    dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl,
-    dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nutcracker, dequant_nvfp4,
-    dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q2_0, dequant_q80, dequant_iq1s, dequant_iq1_m,
+    dequant_iq1_m, dequant_iq1s, dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s,
+    dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_nf4,
+    dequant_nutcracker, dequant_nvfp4, dequant_q2_0, dequant_q2k, dequant_q3k, dequant_q4k,
+    dequant_q5k, dequant_q6k, dequant_q80,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -320,6 +321,51 @@ impl<'a> WeightSource<'a> {
                     grim_quant::citycrow::resident_blob_bytes(elems)
                 } else {
                     m.dtype.expected_bytes(elems) as u64
+                }
+            })
+            .sum()
+    }
+
+    /// Calculate lane bytes budgeted for u4-lane decoding (e.g. WhiteCrow GEMV).
+    /// For 2D linear weights in eligible K-quants (Q4K, Q5K, Q6K, Q3K, IQ3S, Q2K, IQ4NL, GsqRco3p5),
+    /// the u4-lane format allocates `n*(k/2) + n*(k/128)*2 + n*(k/128) + 1MB` slack.
+    pub fn prefix_bytes_u4_lanes(&self) -> u64 {
+        let prefix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}.", self.prefix.join("."))
+        };
+        self.tensors
+            .tensor_names()
+            .iter()
+            .filter(|n| n.starts_with(&prefix))
+            .filter_map(|n| self.tensors.meta(n).ok())
+            .map(|m| {
+                if m.shape.len() == 2 && m.shape[1] > 0 {
+                    let (n, k) = (m.shape[0], m.shape[1]);
+                    let is_eligible = match m.dtype.storage {
+                        grim_tensor::Storage::KQuant(s) => matches!(
+                            s,
+                            grim_tensor::KQuantScheme::Q4K
+                                | grim_tensor::KQuantScheme::Q5K
+                                | grim_tensor::KQuantScheme::Q6K
+                                | grim_tensor::KQuantScheme::Q3K
+                                | grim_tensor::KQuantScheme::IQ3S
+                                | grim_tensor::KQuantScheme::Q2K
+                                | grim_tensor::KQuantScheme::IQ4NL
+                                | grim_tensor::KQuantScheme::GsqRco3p5
+                        ),
+                        _ => false,
+                    };
+                    if is_eligible {
+                        let lane_bytes =
+                            n * (k / 2) + n * (k / 128) * 2 + n * (k / 128) + 1024 * 1024;
+                        lane_bytes as u64
+                    } else {
+                        0
+                    }
+                } else {
+                    0
                 }
             })
             .sum()
@@ -983,10 +1029,8 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             // back to the pruned dense model. The file loads as F32 weights;
             // the production SWMMAC kernel is still the probe, so GPU dispatch
             // refuses while host decode serves.
-            BlockDtype::Fp8Sparse24 => {
-                grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, n)
-                    .map_err(|e| Error::Unimplemented(e.to_string()))
-            }
+            BlockDtype::Fp8Sparse24 => grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, n)
+                .map_err(|e| Error::Unimplemented(e.to_string())),
         },
         Storage::ResidualPacked(_) => Err(Error::Unimplemented(
             "dequant_to_f32: ResidualPacked not yet supported".into(),

@@ -51,11 +51,11 @@
 //! (`dot4_gemv_floor_probe.rs`): that one measures the floor and the ceiling,
 //! this one attributes the time between them.
 
-use grim_backend_rocm::device::util::gpu_test_lock;
-use grim_backend_rocm::as_rocm;
-use grim_backend_rocm::memory::allocator::RocmCachingAllocator;
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::RocmStorage;
+use grim_backend_rocm::as_rocm;
+use grim_backend_rocm::device::util::gpu_test_lock;
+use grim_backend_rocm::memory::allocator::RocmCachingAllocator;
 use grim_tensor::error::Result;
 use grim_tensor::{ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage};
 use std::sync::Arc;
@@ -185,7 +185,11 @@ impl Harness {
     fn time(&self, dev: &RocmDevice, which: usize, rotate: bool, iters: usize) -> f64 {
         let start = std::time::Instant::now();
         for i in 0..iters {
-            let idx = if rotate { i % self.weights.len() } else { which };
+            let idx = if rotate {
+                i % self.weights.len()
+            } else {
+                which
+            };
             dev.linear_decode_into(self.act.as_ref(), self.w(idx), &self.out, &self.q81)
                 .expect("linear_decode_into");
         }
@@ -225,9 +229,7 @@ fn sweep_format(dev: &RocmDevice, scheme: KQuantScheme, ns: &[usize], copies: us
     let mut xs = Vec::new();
     let mut warm_ts = Vec::new();
     let mut cold_ts = Vec::new();
-    eprintln!(
-        "[regime-probe] === format {scheme:?}  k={K}  copies={copies} ==="
-    );
+    eprintln!("[regime-probe] === format {scheme:?}  k={K}  copies={copies} ===");
     eprintln!(
         "[regime-probe] {:>7} {:>9} {:>9} {:>9} {:>7} {:>8} {:>9} {:>9}",
         "n", "W_MB", "warm_us", "cold_us", "ratio", "d_us", "GBps_cold", "implied_x"
@@ -354,9 +356,7 @@ fn m1_decode_regime_compute_only_floor() {
     }
     // The 27B's dominant projection shape.
     let n = 17408usize;
-    eprintln!(
-        "[regime-probe] compute-only floor at the 27B dominant shape n={n} k={K}"
-    );
+    eprintln!("[regime-probe] compute-only floor at the 27B dominant shape n={n} k={K}");
     for scheme in [
         KQuantScheme::Q4K,
         KQuantScheme::Q5K,
@@ -478,8 +478,8 @@ fn iq4xs_decode_kernel_census() {
         .downcast_ref::<RocmStorage>()
         .expect("rocm weight storage");
     let a: Vec<f32> = (0..K).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
-    let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, K]), DType::F32)
-        .expect("upload act");
+    let a_st =
+        CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, K]), DType::F32).expect("upload act");
     let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
     for _ in 0..3 {
         dev.linear_decode_into(a_st.as_ref(), w_rocm, &out, &out)
@@ -517,13 +517,13 @@ fn iq_family_decode_census() {
     };
     let n = 4096usize;
     let alloc: Arc<RocmCachingAllocator> = dev.allocator_handle();
-    let cases: [(KQuantScheme, &str, usize, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>); 3] = [
-        (
-            KQuantScheme::IQ3XXS,
-            "iq3xxs",
-            98,
-            grim_quant::quant_iq3xxs,
-        ),
+    let cases: [(
+        KQuantScheme,
+        &str,
+        usize,
+        fn(&[f32]) -> grim_tensor::Result<Vec<u8>>,
+    ); 3] = [
+        (KQuantScheme::IQ3XXS, "iq3xxs", 98, grim_quant::quant_iq3xxs),
         (KQuantScheme::IQ3S, "iq3s", 110, grim_quant::quant_iq3s),
         (KQuantScheme::IQ2S, "iq2s", 100, grim_quant::quant_iq2s),
     ];
@@ -541,7 +541,10 @@ fn iq_family_decode_census() {
         let packed = quant(&vals).expect(name);
         let row_bytes = packed.len() / n;
         if row_bytes != (K / 256) * blk {
-            eprintln!("[census] {name}: row_bytes {row_bytes} != expected {}", (K / 256) * blk);
+            eprintln!(
+                "[census] {name}: row_bytes {row_bytes} != expected {}",
+                (K / 256) * blk
+            );
         }
         eprintln!(
             "[census] {name} n={n} k={K} row_bytes={row_bytes} weight_MB={:.2}",
@@ -638,7 +641,9 @@ fn m1_decode_launch_baseline() {
         sseed ^= sseed << 5;
         sseed
     };
-    let vals: Vec<f32> = (0..n * k).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+    let vals: Vec<f32> = (0..n * k)
+        .map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0)
+        .collect();
     let packed = grim_quant::quant_q5k(&vals).expect("quant_q5k");
     let w = MemoryOps::from_cpu_bytes(
         &dev,
@@ -652,32 +657,18 @@ fn m1_decode_launch_baseline() {
     .expect("upload");
     let w_rocm = w.as_any().downcast_ref::<RocmStorage>().expect("rocm");
     let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
-    let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, k]), DType::F32)
-        .expect("upload act");
+    let a_st =
+        CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, k]), DType::F32).expect("upload act");
     let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
     for _ in 0..3 {
-        dev.launch_dot4_q5k_q81_gemv_for_ab(
-            as_rocm(a_st.as_ref()).unwrap(),
-            w_rocm,
-            &out,
-            1,
-            n,
-            k,
-        )
-        .unwrap();
+        dev.launch_dot4_q5k_q81_gemv_for_ab(as_rocm(a_st.as_ref()).unwrap(), w_rocm, &out, 1, n, k)
+            .unwrap();
     }
     dev.synchronize();
     let t = std::time::Instant::now();
     for _ in 0..2000 {
-        dev.launch_dot4_q5k_q81_gemv_for_ab(
-            as_rocm(a_st.as_ref()).unwrap(),
-            w_rocm,
-            &out,
-            1,
-            n,
-            k,
-        )
-        .unwrap();
+        dev.launch_dot4_q5k_q81_gemv_for_ab(as_rocm(a_st.as_ref()).unwrap(), w_rocm, &out, 1, n, k)
+            .unwrap();
     }
     dev.synchronize();
     let us_min = t.elapsed().as_secs_f64() * 1e6 / 2000.0;

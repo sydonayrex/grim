@@ -20,12 +20,11 @@ use grim_tensor::Device;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_path = args.next().expect("usage: gemma4_ppl_probe <model> <text> [n_ctx]");
-    let text = args.next().expect("text file");
-    let n_ctx: usize = args
+    let model_path = args
         .next()
-        .map(|v| v.parse().unwrap())
-        .unwrap_or(512);
+        .expect("usage: gemma4_ppl_probe <model> <text> [n_ctx]");
+    let text = args.next().expect("text file");
+    let n_ctx: usize = args.next().map(|v| v.parse().unwrap()).unwrap_or(512);
 
     let text = std::fs::read_to_string(&text).expect("read text");
     let provider = grim_format::GgufProvider::open(&model_path).expect("open gguf");
@@ -62,7 +61,8 @@ fn main() {
     );
 
     let mut session = SessionInner::new(Device::Cpu);
-    let logits = CausalLm::forward(&*model, &mut session, &input, &positions, &[]).expect("forward");
+    let logits =
+        CausalLm::forward(&*model, &mut session, &input, &positions, &[]).expect("forward");
     let lv = logits.to_vec_f32().expect("logits");
     let vocab = lv.len() / feed.len();
 

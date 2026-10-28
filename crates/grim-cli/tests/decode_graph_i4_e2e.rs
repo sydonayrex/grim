@@ -79,9 +79,8 @@ fn run_decode(
         set_var("GRIM_DECODE_GRAPH", "0");
     }
 
-    let model =
-        grim_engine::model_loader::load_model_from_gguf(model_path, dev.clone())
-            .map_err(|e| e.to_string())?;
+    let model = grim_engine::model_loader::load_model_from_gguf(model_path, dev.clone())
+        .map_err(|e| e.to_string())?;
 
     // Prefill
     let ids = tensor_on(
@@ -111,11 +110,7 @@ fn run_decode(
             vec![tokens[tokens.len() - 1] as f32],
             Shape::new(vec![1, 1]),
         );
-        let step_pos = tensor_on(
-            &dev,
-            vec![next_pos as f32],
-            Shape::new(vec![1, 1]),
-        );
+        let step_pos = tensor_on(&dev, vec![next_pos as f32], Shape::new(vec![1, 1]));
         let step_logits = model
             .forward(&mut *sess, &step_ids, &step_pos, &[])
             .map_err(|e| e.to_string())?;
@@ -146,11 +141,7 @@ fn compare_logits(eager: &[Vec<f32>], graph: &[Vec<f32>]) -> f32 {
     );
     let mut worst = 0.0f32;
     for (step, (e_row, g_row)) in eager.iter().zip(graph.iter()).enumerate() {
-        assert_eq!(
-            e_row.len(),
-            g_row.len(),
-            "step {step}: vocab size differs"
-        );
+        assert_eq!(e_row.len(), g_row.len(), "step {step}: vocab size differs");
         // Top-16 of the eager row: the tokens that matter for generation.
         let mut indices: Vec<usize> = (0..e_row.len()).collect();
         indices.sort_by(|&a, &b| e_row[b].partial_cmp(&e_row[a]).unwrap());
@@ -167,7 +158,10 @@ fn compare_logits(eager: &[Vec<f32>], graph: &[Vec<f32>]) -> f32 {
 
 #[test]
 fn int4_graph_replay_matches_eager() {
-    if std::env::var("GRIM_GPU_TEST").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("GRIM_GPU_TEST")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run the int4 e2e graph gate");
         return;
     }
@@ -195,8 +189,7 @@ fn int4_graph_replay_matches_eager() {
     let decode_steps = 8;
 
     // Eager path: graph disabled.
-    let eager = run_decode(&model_path, prompt, decode_steps, false)
-        .expect("eager decode");
+    let eager = run_decode(&model_path, prompt, decode_steps, false).expect("eager decode");
     eprintln!("[eager] {} decode steps completed", eager.len());
 
     // Graph path: graph enabled, int4 arena.

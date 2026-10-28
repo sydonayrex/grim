@@ -47,6 +47,7 @@ pub const fn to_route_link(status: P2PStatus, bytes: u64, pcie_threshold_bytes: 
 
 /// Pinned host allocation for the host-bounce path.
 /// Allocated via `hipHostMalloc` on a running ROCm box; on a GPU-less box the constructor returns.
+#[derive(Debug)]
 pub struct HostStagingBuffer {
     ptr: *mut c_void,
     size: usize,
@@ -60,6 +61,11 @@ impl HostStagingBuffer {
     /// Allocate `size` bytes of pinned host memory.
     /// Returns `Err` if the runtime refuses the size (zero-byte or out-of-quota) or if the runtime.
     pub fn new(size: usize) -> Result<Self> {
+        Self::with_flags(size, 0)
+    }
+
+    /// Allocate `size` bytes of pinned host memory with explicit flags (e.g. `hipHostMallocPortable = 0x1`).
+    pub fn with_flags(size: usize, flags: u32) -> Result<Self> {
         if size == 0 {
             return Err(Error::Backend(
                 "HostStagingBuffer::new: size must be > 0".into(),
@@ -67,7 +73,7 @@ impl HostStagingBuffer {
         }
         let mut ptr: *mut c_void = std::ptr::null_mut();
         crate::device::helpers::check_hip("hipHostMalloc", unsafe {
-            hipHostMalloc(&mut ptr, size, 0)
+            hipHostMalloc(&mut ptr, size, flags)
         })?;
         Ok(Self { ptr, size })
     }

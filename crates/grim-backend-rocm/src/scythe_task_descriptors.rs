@@ -207,7 +207,6 @@ impl MoETaskDescriptor {
     }
 }
 
-
 // ── KDA / recurrent task descriptor + opcode OP_RECURRENT (M5) ───────────────
 // The generic `ScytheTaskDescriptor` (m/n/k + 4 pointers) cannot express the
 // qwen35 recurrent step: it is THREE kernels (short-conv causal step, batched

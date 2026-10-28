@@ -91,7 +91,13 @@ fn dequant_q81(packed: &[u8], len: usize) -> Vec<f32> {
 }
 
 /// bytes per 256-weight super-block, and the quant/dequant pair.
-fn scheme(name: &str) -> (usize, fn(&[f32]) -> grim_tensor::Result<Vec<u8>>, fn(&[u8], usize) -> grim_tensor::Result<Vec<f32>>) {
+fn scheme(
+    name: &str,
+) -> (
+    usize,
+    fn(&[f32]) -> grim_tensor::Result<Vec<u8>>,
+    fn(&[u8], usize) -> grim_tensor::Result<Vec<f32>>,
+) {
     match name {
         "q4k" => (144, grim_quant::quant_q4k, grim_quant::dequant_q4k),
         "q5k" => (176, grim_quant::quant_q5k, grim_quant::dequant_q5k),
@@ -294,7 +300,8 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
         );
     }
     assert_eq!(
-        nonzero, m * n,
+        nonzero,
+        m * n,
         "{scheme_name} grouped kernel produced all-zero output at k={k} n={n} m={m} — the parity \
          comparison would have been vacuous"
     );
@@ -393,39 +400,100 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
     let o_r = as_rocm(out_st.as_ref()).unwrap();
 
     let (new_fn, ref_fn): (
-        fn(&RocmDevice, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, usize, usize, usize) -> Result<*mut std::ffi::c_void, String>,
-        fn(&RocmDevice, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, usize, usize, usize) -> Result<*mut std::ffi::c_void, String>,
+        fn(
+            &RocmDevice,
+            &grim_backend_rocm::RocmStorage,
+            &grim_backend_rocm::RocmStorage,
+            &grim_backend_rocm::RocmStorage,
+            usize,
+            usize,
+            usize,
+        ) -> Result<*mut std::ffi::c_void, String>,
+        fn(
+            &RocmDevice,
+            &grim_backend_rocm::RocmStorage,
+            &grim_backend_rocm::RocmStorage,
+            &grim_backend_rocm::RocmStorage,
+            usize,
+            usize,
+            usize,
+        ) -> Result<*mut std::ffi::c_void, String>,
     ) = match scheme_name {
         "q4k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
-            |d, a, b, o, m, n, k| d.launch_dot4_q4k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q4k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q4k_q81_gemv_ref_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
         ),
         "q5k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
-            |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q5k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
         ),
         // Q2_K: "new" is the word-wide-mask variant (the default through the
         // launcher), "ref" is the stock 4-byte-load kernel. Both are driven
         // through launchers so the grid is the dispatch's own.
         "q2k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
-            |d, a, b, o, m, n, k| d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q2k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q2k_q81_gemv_stock_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
         ),
         "iq4xs" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
-            |d, a, b, o, m, n, k| d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_iq4xs_q81_gemv_stock_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
         ),
         "q3k" => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
-            |d, a, b, o, m, n, k| d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q3k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q3k_q81_gemv_stock_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
         ),
         _ => (
-            |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
-            |d, a, b, o, m, n, k| d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k).map_err(|e| e.to_string()),
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q6k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
+            |d, a, b, o, m, n, k| {
+                d.launch_dot4_q6k_q81_gemv_ref_for_ab(a, b, o, m, n, k)
+                    .map_err(|e| e.to_string())
+            },
         ),
     };
 
-    let time_it = |f: &dyn Fn(&RocmDevice, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, &grim_backend_rocm::RocmStorage, usize, usize, usize) -> Result<*mut std::ffi::c_void, String>| -> f64 {
+    let time_it = |f: &dyn Fn(
+        &RocmDevice,
+        &grim_backend_rocm::RocmStorage,
+        &grim_backend_rocm::RocmStorage,
+        &grim_backend_rocm::RocmStorage,
+        usize,
+        usize,
+        usize,
+    ) -> Result<*mut std::ffi::c_void, String>|
+     -> f64 {
         // warm-up
         for _ in 0..2 {
             f(&dev, a_r, b_r, o_r, m, n, k).unwrap();
@@ -582,14 +650,27 @@ type GemvFn = fn(
 /// 32 MB Infinity Cache serves part of a 61-73 MB tensor) and COLD (launches
 /// rotate across `ROT` weight copies totalling > 240 MB, so every launch
 /// streams from DRAM). Only COLD is comparable to the DRAM spec peak.
-fn sub_lane_ab(name: &str, blk: usize, quant: fn(&[f32]) -> grim_tensor::Result<Vec<u8>>, stock: GemvFn, oracle: GemvFn, sub: GemvFn) -> Result<(), String> {
+fn sub_lane_ab(
+    name: &str,
+    blk: usize,
+    quant: fn(&[f32]) -> grim_tensor::Result<Vec<u8>>,
+    stock: GemvFn,
+    oracle: GemvFn,
+    sub: GemvFn,
+) -> Result<(), String> {
     let Some(dev) = gpu_device() else {
         eprintln!("SKIP: GRIM_GPU_TEST unset");
         return Ok(());
     };
     const ROT: usize = 4;
-    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let u8ty = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
     for &(n, k, m, timed) in &[
         (64usize, 256usize, 1usize, false),
         (68, 1024, 1, false),
@@ -607,31 +688,56 @@ fn sub_lane_ab(name: &str, blk: usize, quant: fn(&[f32]) -> grim_tensor::Result<
             let p = quant(&w).map_err(|e| e.to_string())?;
             bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
         }
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
-            .map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let q81_len = m * (k / 32) * 36;
-        let q81 = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
-            .map_err(|e| e.to_string())?;
-        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81.as_ref()).unwrap(), m, k)
-            .map_err(|e| e.to_string())?;
+        let q81 = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; q81_len],
+            &Shape::new(vec![q81_len]),
+            u8ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        dev.launch_quantize_q8_1(
+            as_rocm(a_st.as_ref()).unwrap(),
+            as_rocm(q81.as_ref()).unwrap(),
+            m,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty.clone())
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o_ref = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o_new = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o_ref = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o_new = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(q81.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|b| as_rocm(b.as_ref()).unwrap()).collect();
-        let (or_, on_) = (as_rocm(o_ref.as_ref()).unwrap(), as_rocm(o_new.as_ref()).unwrap());
+        let (or_, on_) = (
+            as_rocm(o_ref.as_ref()).unwrap(),
+            as_rocm(o_new.as_ref()).unwrap(),
+        );
         oracle(&dev, a_r, b_rs[0], or_, m, n, k).map_err(|e| e.to_string())?;
         sub(&dev, a_r, b_rs[0], on_, m, n, k).map_err(|e| e.to_string())?;
         dev.synchronize();
         let (r, s) = (f32_vec(&o_ref)?, f32_vec(&o_new)?);
         let scale = r.iter().fold(0f32, |x, v| x.max(v.abs())).max(1e-6);
-        let worst = r.iter().zip(&s).fold(0f32, |x, (p, q)| x.max((p - q).abs())) / scale;
+        let worst = r
+            .iter()
+            .zip(&s)
+            .fold(0f32, |x, (p, q)| x.max((p - q).abs()))
+            / scale;
         println!("{name} sub n={n} k={k} m={m}: worst rel-to-max {worst:.3e}");
-        assert!(worst < 1e-4, "{name} sub n={n} k={k} m={m}: worst rel-to-max {worst:.3e}");
+        assert!(
+            worst < 1e-4,
+            "{name} sub n={n} k={k} m={m}: worst rel-to-max {worst:.3e}"
+        );
         if timed {
             let time = |f: GemvFn, rotate: bool| {
                 for i in 0..ROT {
@@ -653,7 +759,11 @@ fn sub_lane_ab(name: &str, blk: usize, quant: fn(&[f32]) -> grim_tensor::Result<
                 let tn = time(sub, rot);
                 println!(
                     "{name} {label} n={n} k={k}: stock {:.1} us ({:.1} GB/s)  sub {:.1} us ({:.1} GB/s)  {:.2}x",
-                    ts * 1e6, gb / ts, tn * 1e6, gb / tn, ts / tn
+                    ts * 1e6,
+                    gb / ts,
+                    tn * 1e6,
+                    gb / tn,
+                    ts / tn
                 );
             }
         }
@@ -753,8 +863,14 @@ fn sub_v2_parity_then_ab(
         return Ok(());
     };
     const ROT: usize = 4;
-    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let u8ty = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
 
     for &(n, k, m, timed) in &[
         (64usize, 256usize, 1usize, false),
@@ -773,22 +889,38 @@ fn sub_v2_parity_then_ab(
             let p = quant(&w).map_err(|e| e.to_string())?;
             bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
         }
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
-            .map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let q81_len = m * (k / 32) * 36;
-        let q81 = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
-            .map_err(|e| e.to_string())?;
-        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81.as_ref()).unwrap(), m, k)
-            .map_err(|e| e.to_string())?;
+        let q81 = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; q81_len],
+            &Shape::new(vec![q81_len]),
+            u8ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        dev.launch_quantize_q8_1(
+            as_rocm(a_st.as_ref()).unwrap(),
+            as_rocm(q81.as_ref()).unwrap(),
+            m,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
 
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty.clone())
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o_ref = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o_sub = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o_v2  = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o_ref = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o_sub = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o_v2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(q81.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|b| as_rocm(b.as_ref()).unwrap()).collect();
         let (or_, os_, ov2_) = (
@@ -803,15 +935,26 @@ fn sub_v2_parity_then_ab(
         dev.synchronize();
 
         let (r_ref, r_sub, r_v2) = (f32_vec(&o_ref)?, f32_vec(&o_sub)?, f32_vec(&o_v2)?);
-        let bit_diffs = r_sub.iter().zip(&r_v2).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let bit_diffs = r_sub
+            .iter()
+            .zip(&r_v2)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
         assert_eq!(
             bit_diffs, 0,
             "{name} sub_v2 is NOT bit-identical to sub at n={n} k={k} m={m} ({bit_diffs} diffs)"
         );
 
         let scale = r_ref.iter().fold(0f32, |x, v| x.max(v.abs())).max(1e-6);
-        let worst_vs_ref = r_ref.iter().zip(&r_v2).fold(0f32, |x, (p, q)| x.max((p - q).abs())) / scale;
-        assert!(worst_vs_ref < 1e-4, "{name} sub_v2 vs ref worst rel-to-max {worst_vs_ref:.3e}");
+        let worst_vs_ref = r_ref
+            .iter()
+            .zip(&r_v2)
+            .fold(0f32, |x, (p, q)| x.max((p - q).abs()))
+            / scale;
+        assert!(
+            worst_vs_ref < 1e-4,
+            "{name} sub_v2 vs ref worst rel-to-max {worst_vs_ref:.3e}"
+        );
 
         if !timed {
             let q81_host = bytes_of(&q81)?;
@@ -832,7 +975,10 @@ fn sub_v2_parity_then_ab(
             println!(
                 "{name:<5} sub_v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to sub_v1, vs_ref={worst_vs_ref:.3e}, vs_host_dequant={worst_deq:.3e}"
             );
-            assert!(worst_deq <= 2e-2, "{name} sub_v2 vs host dequant {worst_deq:.3e}");
+            assert!(
+                worst_deq <= 2e-2,
+                "{name} sub_v2 vs host dequant {worst_deq:.3e}"
+            );
         } else {
             println!(
                 "{name:<5} sub_v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to sub_v1, vs_ref={worst_vs_ref:.3e}"
@@ -857,7 +1003,11 @@ fn sub_v2_parity_then_ab(
                 let t_v2 = time(sub_v2, rot);
                 println!(
                     "{name:<5} A/B {label:<4} n={n:<5} k={k:<5}: sub_v1 {:.1} us ({:.1} GB/s)  sub_v2 {:.1} us ({:.1} GB/s)  {:.3}x",
-                    t_v1 * 1e6, gb / t_v1, t_v2 * 1e6, gb / t_v2, t_v1 / t_v2
+                    t_v1 * 1e6,
+                    gb / t_v1,
+                    t_v2 * 1e6,
+                    gb / t_v2,
+                    t_v1 / t_v2
                 );
             }
         }
@@ -956,8 +1106,14 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
         return Ok(());
     };
     const ROT: usize = 4;
-    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let u8ty = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
 
     let time_ab = |name: &str,
                    n: usize,
@@ -989,7 +1145,11 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
             let t2 = time(v2, rot);
             println!(
                 "{name:<10} A/B {label:<4} n={n:<5} k={k:<5}: v1 {:.1} us ({:.1} GB/s)  v2 {:.1} us ({:.1} GB/s)  {:.3}x",
-                t1 * 1e6, gb / t1, t2 * 1e6, gb / t2, t1 / t2
+                t1 * 1e6,
+                gb / t1,
+                t2 * 1e6,
+                gb / t2,
+                t1 / t2
             );
         }
     };
@@ -1007,23 +1167,38 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
         let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
         let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
         let b_bytes = f32_bytes(&b);
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, b_bytes, &Shape::new(vec![n * k]), f32ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(&dev, b_bytes, &Shape::new(vec![n * k]), f32ty.clone())
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
-        dev.launch_fp32_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
-        dev.launch_fp32_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_fp32_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_fp32_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "fp32_gemv_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "fp32_gemv_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("fp32       v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
         if timed {
             time_ab(
@@ -1057,22 +1232,38 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
         let b_bf16: Vec<u8> = (0..n * k)
             .flat_map(|_| half::bf16::from_f32(rng.next_f32()).to_le_bytes())
             .collect();
-        let a_st = MemoryOps::from_cpu_bytes(&dev, &a_bf16, &Shape::new(vec![a_bf16.len()]), u8ty.clone()).map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, &a_bf16, &Shape::new(vec![a_bf16.len()]), u8ty.clone())
+                .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &b_bf16, &Shape::new(vec![b_bf16.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &b_bf16,
+                    &Shape::new(vec![b_bf16.len()]),
+                    u8ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n * 2]), u8ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n * 2]), u8ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n * 2]), u8ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n * 2]), u8ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
-        dev.launch_dot2_bf16_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
-        dev.launch_dot2_bf16_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot2_bf16_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_dot2_bf16_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (bytes_of(&o1)?, bytes_of(&o2)?);
-        assert_eq!(v1_out, v2_out, "bf16_gemv_v2 not bit-identical at n={n} k={k} m={m}");
+        assert_eq!(
+            v1_out, v2_out,
+            "bf16_gemv_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("bf16       v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
         if timed {
             time_ab(
@@ -1103,23 +1294,43 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
         let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
         // Valid non-NaN E4M3 codes (avoid 0x7F and 0xFF)
         let b_fp8: Vec<u8> = (0..n * k).map(|i| ((i * 13 + 7) % 120) as u8).collect();
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![b_fp8.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &b_fp8,
+                    &Shape::new(vec![b_fp8.len()]),
+                    u8ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
-        dev.launch_dot4_fp8_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
-        dev.launch_dot4_fp8_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot4_fp8_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_dot4_fp8_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "fp8_gemv_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "fp8_gemv_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("fp8        v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
         if timed {
             time_ab(
@@ -1149,29 +1360,50 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
         let mut rng = Lcg(0xA11CE004 ^ (n * 31 + k) as u64);
         let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
         let w: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
-        let (codes, scales) = grim_quant::quant_forest_per_channel(&w, n, k).map_err(|e| e.to_string())?;
+        let (codes, scales) =
+            grim_quant::quant_forest_per_channel(&w, n, k).map_err(|e| e.to_string())?;
         let mut b_blob = Vec::with_capacity(16 + codes.len() + scales.len());
         b_blob.extend_from_slice(&(codes.len() as u64).to_le_bytes());
         b_blob.extend_from_slice(&codes);
         b_blob.extend_from_slice(&(scales.len() as u64).to_le_bytes());
         b_blob.extend_from_slice(&scales);
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &b_blob, &Shape::new(vec![b_blob.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &b_blob,
+                    &Shape::new(vec![b_blob.len()]),
+                    u8ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
-        dev.launch_dot4_forest_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
-        dev.launch_dot4_forest_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot4_forest_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_dot4_forest_gemv_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "forest_gemv_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "forest_gemv_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("forest     v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
         if timed {
             time_ab(
@@ -1207,36 +1439,77 @@ fn non_kquant_gemv_v2_parity_then_ab() -> Result<(), String> {
             let p = grim_quant::quant_q80(&w).map_err(|e| e.to_string())?;
             b_q80[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
         }
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let q81_len = m * (k / 32) * 36;
-        let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone()).map_err(|e| e.to_string())?;
-        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81_st.as_ref()).unwrap(), m, k).map_err(|e| e.to_string())?;
+        let q81_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; q81_len],
+            &Shape::new(vec![q81_len]),
+            u8ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        dev.launch_quantize_q8_1(
+            as_rocm(a_st.as_ref()).unwrap(),
+            as_rocm(q81_st.as_ref()).unwrap(),
+            m,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &b_q80, &Shape::new(vec![b_q80.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &b_q80,
+                    &Shape::new(vec![b_q80.len()]),
+                    u8ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_f32_r = as_rocm(a_st.as_ref()).unwrap();
         let a_q81_r = as_rocm(q81_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
 
-        dev.launch_dot4_q80_q81_gemv_v1_for_ab(a_q81_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
-        dev.launch_dot4_q80_q81_gemv_v2_for_ab(a_q81_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot4_q80_q81_gemv_v1_for_ab(a_q81_r, b_rs[0], o1_r, m, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_dot4_q80_q81_gemv_v2_for_ab(a_q81_r, b_rs[0], o2_r, m, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "q80_q81_gemv_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "q80_q81_gemv_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("q80_q81    v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
 
-        dev.launch_dot4_q80_f32act_gemv_v1_for_ab(a_f32_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
-        dev.launch_dot4_q80_f32act_gemv_v2_for_ab(a_f32_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot4_q80_f32act_gemv_v1_for_ab(a_f32_r, b_rs[0], o1_r, m, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_dot4_q80_f32act_gemv_v2_for_ab(a_f32_r, b_rs[0], o2_r, m, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_f32_out, v2_f32_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs_f32 = v1_f32_out.iter().zip(&v2_f32_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs_f32, 0, "q80_f32act_gemv_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs_f32 = v1_f32_out
+            .iter()
+            .zip(&v2_f32_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs_f32, 0,
+            "q80_f32act_gemv_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("q80_f32act v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
 
         if timed {
@@ -1309,7 +1582,10 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
     const ITERS: usize = 60;
     const ROT: usize = 4;
 
-    println!("\n=== Corvid Kernels v1 vs v2 Parity + A/B (device={}) ===", dev.gcn_arch());
+    println!(
+        "\n=== Corvid Kernels v1 vs v2 Parity + A/B (device={}) ===",
+        dev.gcn_arch()
+    );
     println!(
         "{:<16} {:<15} {:>10} {:>10} {:>8} | {:>10} {:>10} {:>8}",
         "Kernel", "Shape (NxKxM)", "Warm v1", "Warm v2", "Warm x", "Cold v1", "Cold v2", "Cold x"
@@ -1334,14 +1610,18 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         let (qw_bytes, sc_bytes, zr_bytes) =
             grim_quant::quant_ostquant_w4_group128(&w, n, k).map_err(|e| e.to_string())?;
 
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
-            .map_err(|e| e.to_string())?;
-        let act_codes = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups * 16]), u32ty.clone())
-            .map_err(|e| e.to_string())?;
-        let act_scales = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), f32ty.clone())
-            .map_err(|e| e.to_string())?;
-        let act_sums = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), u32ty.clone())
-            .map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let act_codes =
+            MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups * 16]), u32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let act_scales =
+            MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let act_sums =
+            MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), u32ty.clone())
+                .map_err(|e| e.to_string())?;
         let (ac_r, as_r, asum_r) = (
             as_rocm(act_codes.as_ref()).unwrap(),
             as_rocm(act_scales.as_ref()).unwrap(),
@@ -1352,20 +1632,43 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
 
         let copies = if timed { ROT } else { 1 };
         let b_qw_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &qw_bytes, &Shape::new(vec![n * words_per_col]), u32ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &qw_bytes,
+                    &Shape::new(vec![n * words_per_col]),
+                    u32ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
         let b_sc_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &sc_bytes, &Shape::new(vec![n * n_groups]), bf16ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &sc_bytes,
+                    &Shape::new(vec![n * n_groups]),
+                    bf16ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
         let b_zr_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &zr_bytes, &Shape::new(vec![n * n_groups]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    &zr_bytes,
+                    &Shape::new(vec![n * n_groups]),
+                    u8ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
 
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
 
         dev.launch_dot8_w4a4_gemv_v1_for_ab(
@@ -1396,38 +1699,63 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "whitecrow_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "whitecrow_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("whitecrow      v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
 
         if timed {
             let bytes = (n * row_bytes + m * (n_groups * 64 + n_groups * 8) + m * n * 4) as f64;
             for _ in 0..WARMUP {
                 dev.launch_dot8_w4a4_gemv_v1_for_ab(
-                    ac_r, as_r, asum_r,
+                    ac_r,
+                    as_r,
+                    asum_r,
                     as_rocm(b_qw_sts[0].as_ref()).unwrap(),
                     as_rocm(b_sc_sts[0].as_ref()).unwrap(),
                     as_rocm(b_zr_sts[0].as_ref()).unwrap(),
-                    o2_r, m, n, k,
-                ).unwrap();
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
                 dev.launch_dot8_w4a4_gemv_v2_for_ab(
-                    ac_r, as_r, asum_r,
+                    ac_r,
+                    as_r,
+                    asum_r,
                     as_rocm(b_qw_sts[0].as_ref()).unwrap(),
                     as_rocm(b_sc_sts[0].as_ref()).unwrap(),
                     as_rocm(b_zr_sts[0].as_ref()).unwrap(),
-                    o2_r, m, n, k,
-                ).unwrap();
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
                 dev.launch_dot8_w4a4_gemv_v1_for_ab(
-                    ac_r, as_r, asum_r,
+                    ac_r,
+                    as_r,
+                    asum_r,
                     as_rocm(b_qw_sts[0].as_ref()).unwrap(),
                     as_rocm(b_sc_sts[0].as_ref()).unwrap(),
                     as_rocm(b_zr_sts[0].as_ref()).unwrap(),
-                    o2_r, m, n, k,
-                ).unwrap();
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1435,12 +1763,18 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
                 dev.launch_dot8_w4a4_gemv_v2_for_ab(
-                    ac_r, as_r, asum_r,
+                    ac_r,
+                    as_r,
+                    asum_r,
                     as_rocm(b_qw_sts[0].as_ref()).unwrap(),
                     as_rocm(b_sc_sts[0].as_ref()).unwrap(),
                     as_rocm(b_zr_sts[0].as_ref()).unwrap(),
-                    o2_r, m, n, k,
-                ).unwrap();
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let w_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1449,12 +1783,18 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             for i in 0..ITERS {
                 let idx = i % ROT;
                 dev.launch_dot8_w4a4_gemv_v1_for_ab(
-                    ac_r, as_r, asum_r,
+                    ac_r,
+                    as_r,
+                    asum_r,
                     as_rocm(b_qw_sts[idx].as_ref()).unwrap(),
                     as_rocm(b_sc_sts[idx].as_ref()).unwrap(),
                     as_rocm(b_zr_sts[idx].as_ref()).unwrap(),
-                    o2_r, m, n, k,
-                ).unwrap();
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1463,12 +1803,18 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             for i in 0..ITERS {
                 let idx = i % ROT;
                 dev.launch_dot8_w4a4_gemv_v2_for_ab(
-                    ac_r, as_r, asum_r,
+                    ac_r,
+                    as_r,
+                    asum_r,
                     as_rocm(b_qw_sts[idx].as_ref()).unwrap(),
                     as_rocm(b_sc_sts[idx].as_ref()).unwrap(),
                     as_rocm(b_zr_sts[idx].as_ref()).unwrap(),
-                    o2_r, m, n, k,
-                ).unwrap();
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let c_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1477,8 +1823,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 "{:<16} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x",
                 "whitecrow",
                 format!("{n}x{k}x{m}"),
-                w_v1, w_v2, w_v2 / w_v1,
-                c_v1, c_v2, c_v2 / c_v1
+                w_v1,
+                w_v2,
+                w_v2 / w_v1,
+                c_v1,
+                c_v2,
+                c_v2 / c_v1
             );
         }
     }
@@ -1492,7 +1842,9 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         (5120, 17408, true),
     ] {
         let mut rng = Lcg(0xC0271D02 ^ (n * 31 + k) as u64);
-        let a_f16: Vec<u16> = (0..k).map(|_| half::f16::from_f32(rng.next_f32()).to_bits()).collect();
+        let a_f16: Vec<u16> = (0..k)
+            .map(|_| half::f16::from_f32(rng.next_f32()).to_bits())
+            .collect();
         let w_f32: Vec<f32> = (0..n * k).map(|_| rng.next_f32() * 6.0).collect();
         let packed_i32 = grim_quant::tree_pie::pack_tree_pie(&w_f32);
         let packed_bytes: &[u8] = unsafe {
@@ -1503,55 +1855,79 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, packed_bytes, &Shape::new(vec![packed_i32.len()]), u32ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    packed_bytes,
+                    &Shape::new(vec![packed_i32.len()]),
+                    u32ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
 
-        dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o1_r, n, k).map_err(|e| e.to_string())?;
-        dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k).map_err(|e| e.to_string())?;
+        dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o1_r, n, k)
+            .map_err(|e| e.to_string())?;
+        dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k)
+            .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "tree_pie_gemv_v2 not bit-identical at n={n} k={k}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "tree_pie_gemv_v2 not bit-identical at n={n} k={k}"
+        );
         println!("tree_pie       v2 parity n={n:<5} k={k:<5} m=1: bit-identical to v1 (0 diffs)");
 
         if timed {
             let row_bytes = (k / 32) * 20;
             let bytes = (n * row_bytes + k * 2 + n * 4) as f64;
             for _ in 0..WARMUP {
-                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o2_r, n, k).unwrap();
-                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k).unwrap();
+                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o2_r, n, k)
+                    .unwrap();
+                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o2_r, n, k).unwrap();
+                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o2_r, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k).unwrap();
+                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let w_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
             for i in 0..ITERS {
-                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[i % ROT], o2_r, n, k).unwrap();
+                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[i % ROT], o2_r, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
             for i in 0..ITERS {
-                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[i % ROT], o2_r, n, k).unwrap();
+                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[i % ROT], o2_r, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let c_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1560,8 +1936,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 "{:<16} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x",
                 "tree_pie",
                 format!("{n}x{k}x1"),
-                w_v1, w_v2, w_v2 / w_v1,
-                c_v1, c_v2, c_v2 / c_v1
+                w_v1,
+                w_v2,
+                w_v2 / w_v1,
+                c_v1,
+                c_v2,
+                c_v2 / c_v1
             );
         }
     }
@@ -1580,29 +1960,47 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         let sel: Vec<u8> = (0..n * nbc).map(|i| (i % 16) as u8).collect();
         let idx: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
         let sgn: Vec<u8> = (0..n * nbc).map(|i| ((i * 13 + 5) & 0xFF) as u8).collect();
-        let scl: Vec<f32> = (0..n * nbc).map(|_| rng.next_f32().abs() * 0.1 + 0.01).collect();
+        let scl: Vec<f32> = (0..n * nbc)
+            .map(|_| rng.next_f32().abs() * 0.1 + 0.01)
+            .collect();
 
-        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![k]), f32ty.clone())
-            .map_err(|e| e.to_string())?;
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let sel_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &sel, &Shape::new(vec![sel.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(&dev, &sel, &Shape::new(vec![sel.len()]), u8ty.clone())
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
         let idx_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &idx, &Shape::new(vec![idx.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(&dev, &idx, &Shape::new(vec![idx.len()]), u8ty.clone())
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
         let sgn_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, &sgn, &Shape::new(vec![sgn.len()]), u8ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(&dev, &sgn, &Shape::new(vec![sgn.len()]), u8ty.clone())
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
         let scl_sts: Vec<_> = (0..copies)
-            .map(|_| MemoryOps::from_cpu_bytes(&dev, f32_bytes(&scl), &Shape::new(vec![scl.len()]), f32ty.clone()))
+            .map(|_| {
+                MemoryOps::from_cpu_bytes(
+                    &dev,
+                    f32_bytes(&scl),
+                    &Shape::new(vec![scl.len()]),
+                    f32ty.clone(),
+                )
+            })
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
 
@@ -1612,20 +2010,35 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             as_rocm(idx_sts[0].as_ref()).unwrap(),
             as_rocm(sgn_sts[0].as_ref()).unwrap(),
             as_rocm(scl_sts[0].as_ref()).unwrap(),
-            o1_r, 1.0, n, k,
-        ).map_err(|e| e.to_string())?;
+            o1_r,
+            1.0,
+            n,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
         dev.launch_scrub_jay_gemv_v2_for_ab(
             a_r,
             as_rocm(sel_sts[0].as_ref()).unwrap(),
             as_rocm(idx_sts[0].as_ref()).unwrap(),
             as_rocm(sgn_sts[0].as_ref()).unwrap(),
             as_rocm(scl_sts[0].as_ref()).unwrap(),
-            o2_r, 1.0, n, k,
-        ).map_err(|e| e.to_string())?;
+            o2_r,
+            1.0,
+            n,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "scrub_jay_gemv_v2 not bit-identical at n={n} k={k}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "scrub_jay_gemv_v2 not bit-identical at n={n} k={k}"
+        );
         println!("scrub_jay      v2 parity n={n:<5} k={k:<5} m=1: bit-identical to v1 (0 diffs)");
 
         if timed {
@@ -1639,16 +2052,24 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                     as_rocm(idx_sts[0].as_ref()).unwrap(),
                     as_rocm(sgn_sts[0].as_ref()).unwrap(),
                     as_rocm(scl_sts[0].as_ref()).unwrap(),
-                    o2_r, 1.0, n, k,
-                ).unwrap();
+                    o2_r,
+                    1.0,
+                    n,
+                    k,
+                )
+                .unwrap();
                 dev.launch_scrub_jay_gemv_v2_for_ab(
                     a_r,
                     as_rocm(sel_sts[0].as_ref()).unwrap(),
                     as_rocm(idx_sts[0].as_ref()).unwrap(),
                     as_rocm(sgn_sts[0].as_ref()).unwrap(),
                     as_rocm(scl_sts[0].as_ref()).unwrap(),
-                    o2_r, 1.0, n, k,
-                ).unwrap();
+                    o2_r,
+                    1.0,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let t0 = std::time::Instant::now();
@@ -1659,8 +2080,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                     as_rocm(idx_sts[0].as_ref()).unwrap(),
                     as_rocm(sgn_sts[0].as_ref()).unwrap(),
                     as_rocm(scl_sts[0].as_ref()).unwrap(),
-                    o2_r, 1.0, n, k,
-                ).unwrap();
+                    o2_r,
+                    1.0,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1673,8 +2098,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                     as_rocm(idx_sts[0].as_ref()).unwrap(),
                     as_rocm(sgn_sts[0].as_ref()).unwrap(),
                     as_rocm(scl_sts[0].as_ref()).unwrap(),
-                    o2_r, 1.0, n, k,
-                ).unwrap();
+                    o2_r,
+                    1.0,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let w_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1688,8 +2117,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                     as_rocm(idx_sts[r].as_ref()).unwrap(),
                     as_rocm(sgn_sts[r].as_ref()).unwrap(),
                     as_rocm(scl_sts[r].as_ref()).unwrap(),
-                    o2_r, 1.0, n, k,
-                ).unwrap();
+                    o2_r,
+                    1.0,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1703,8 +2136,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                     as_rocm(idx_sts[r].as_ref()).unwrap(),
                     as_rocm(sgn_sts[r].as_ref()).unwrap(),
                     as_rocm(scl_sts[r].as_ref()).unwrap(),
-                    o2_r, 1.0, n, k,
-                ).unwrap();
+                    o2_r,
+                    1.0,
+                    n,
+                    k,
+                )
+                .unwrap();
             }
             dev.synchronize();
             let c_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1713,8 +2150,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 "{:<16} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x",
                 "scrub_jay",
                 format!("{n}x{k}x1"),
-                w_v1, w_v2, w_v2 / w_v1,
-                c_v1, c_v2, c_v2 / c_v1
+                w_v1,
+                w_v2,
+                w_v2 / w_v1,
+                c_v1,
+                c_v2,
+                c_v2 / c_v1
             );
         }
     }
@@ -1733,14 +2174,22 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         let b_frag_len = 1 * n_windows * 512;
         let w_blob = vec![0u8; w_bytes_len];
         let b_frag = vec![0u8; b_frag_len];
-        let w_st = MemoryOps::from_cpu_bytes(&dev, &w_blob, &Shape::new(vec![w_blob.len()]), u8ty.clone()).unwrap();
-        let b_st = MemoryOps::from_cpu_bytes(&dev, &b_frag, &Shape::new(vec![b_frag.len()]), u8ty.clone()).unwrap();
+        let w_st =
+            MemoryOps::from_cpu_bytes(&dev, &w_blob, &Shape::new(vec![w_blob.len()]), u8ty.clone())
+                .unwrap();
+        let b_st =
+            MemoryOps::from_cpu_bytes(&dev, &b_frag, &Shape::new(vec![b_frag.len()]), u8ty.clone())
+                .unwrap();
         let o_st = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).unwrap();
         let res = dev.launch_grey_raven_gemm_v1_for_ab(
             as_rocm(w_st.as_ref()).unwrap(),
             as_rocm(b_st.as_ref()).unwrap(),
             as_rocm(o_st.as_ref()).unwrap(),
-            m, n, k, n_tiles, n_windows,
+            m,
+            n,
+            k,
+            n_tiles,
+            n_windows,
         );
         match res {
             Ok(_) => {
@@ -1748,7 +2197,9 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 true
             }
             Err(e) => {
-                println!("grey_raven     SKIPPED: AQL dispatch rejected ({e}) - SWMMAC requires PCIe atomics not present on this device");
+                println!(
+                    "grey_raven     SKIPPED: AQL dispatch rejected ({e}) - SWMMAC requires PCIe atomics not present on this device"
+                );
                 false
             }
         }
@@ -1781,17 +2232,33 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 }
                 w_blob[base + 256..base + 260].copy_from_slice(&sidx_word.to_le_bytes());
             }
-            let b_frag: Vec<u8> = (0..b_frag_len).map(|i| (((i * 11 + 3) % 64) + 0x20) as u8).collect();
+            let b_frag: Vec<u8> = (0..b_frag_len)
+                .map(|i| (((i * 11 + 3) % 64) + 0x20) as u8)
+                .collect();
 
-            let b_st = MemoryOps::from_cpu_bytes(&dev, &b_frag, &Shape::new(vec![b_frag.len()]), u8ty.clone())
-                .map_err(|e| e.to_string())?;
+            let b_st = MemoryOps::from_cpu_bytes(
+                &dev,
+                &b_frag,
+                &Shape::new(vec![b_frag.len()]),
+                u8ty.clone(),
+            )
+            .map_err(|e| e.to_string())?;
             let copies = if timed { ROT } else { 1 };
             let w_sts: Vec<_> = (0..copies)
-                .map(|_| MemoryOps::from_cpu_bytes(&dev, &w_blob, &Shape::new(vec![w_blob.len()]), u8ty.clone()))
+                .map(|_| {
+                    MemoryOps::from_cpu_bytes(
+                        &dev,
+                        &w_blob,
+                        &Shape::new(vec![w_blob.len()]),
+                        u8ty.clone(),
+                    )
+                })
                 .collect::<grim_tensor::Result<_>>()
                 .map_err(|e| e.to_string())?;
-            let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
-            let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+            let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
+            let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
             let b_r = as_rocm(b_st.as_ref()).unwrap();
             let w_rs: Vec<_> = w_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
             let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
@@ -1802,41 +2269,82 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             dev.synchronize();
             let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-            let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-            assert_eq!(diffs, 0, "grey_raven_gemm_v2 not bit-identical at n={n} k={k} m={m}");
-            println!("grey_raven     v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
+            let diffs = v1_out
+                .iter()
+                .zip(&v2_out)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert_eq!(
+                diffs, 0,
+                "grey_raven_gemm_v2 not bit-identical at n={n} k={k} m={m}"
+            );
+            println!(
+                "grey_raven     v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)"
+            );
 
             if timed {
                 let bytes = (w_bytes_len + b_frag_len + m * n * 4) as f64;
                 for _ in 0..WARMUP {
-                    dev.launch_grey_raven_gemm_v1_for_ab(w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows).unwrap();
-                    dev.launch_grey_raven_gemm_v2_for_ab(w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows).unwrap();
+                    dev.launch_grey_raven_gemm_v1_for_ab(
+                        w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows,
+                    )
+                    .unwrap();
+                    dev.launch_grey_raven_gemm_v2_for_ab(
+                        w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows,
+                    )
+                    .unwrap();
                 }
                 dev.synchronize();
                 let t0 = std::time::Instant::now();
                 for _ in 0..ITERS {
-                    dev.launch_grey_raven_gemm_v1_for_ab(w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows).unwrap();
+                    dev.launch_grey_raven_gemm_v1_for_ab(
+                        w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows,
+                    )
+                    .unwrap();
                 }
                 dev.synchronize();
                 let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
                 let t0 = std::time::Instant::now();
                 for _ in 0..ITERS {
-                    dev.launch_grey_raven_gemm_v2_for_ab(w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows).unwrap();
+                    dev.launch_grey_raven_gemm_v2_for_ab(
+                        w_rs[0], b_r, o2_r, m, n, k, n_tiles, n_windows,
+                    )
+                    .unwrap();
                 }
                 dev.synchronize();
                 let w_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
                 let t0 = std::time::Instant::now();
                 for i in 0..ITERS {
-                    dev.launch_grey_raven_gemm_v1_for_ab(w_rs[i % ROT], b_r, o2_r, m, n, k, n_tiles, n_windows).unwrap();
+                    dev.launch_grey_raven_gemm_v1_for_ab(
+                        w_rs[i % ROT],
+                        b_r,
+                        o2_r,
+                        m,
+                        n,
+                        k,
+                        n_tiles,
+                        n_windows,
+                    )
+                    .unwrap();
                 }
                 dev.synchronize();
                 let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
                 let t0 = std::time::Instant::now();
                 for i in 0..ITERS {
-                    dev.launch_grey_raven_gemm_v2_for_ab(w_rs[i % ROT], b_r, o2_r, m, n, k, n_tiles, n_windows).unwrap();
+                    dev.launch_grey_raven_gemm_v2_for_ab(
+                        w_rs[i % ROT],
+                        b_r,
+                        o2_r,
+                        m,
+                        n,
+                        k,
+                        n_tiles,
+                        n_windows,
+                    )
+                    .unwrap();
                 }
                 dev.synchronize();
                 let c_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1845,8 +2353,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                     "{:<16} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x",
                     "grey_raven",
                     format!("{n}x{k}x{m}"),
-                    w_v1, w_v2, w_v2 / w_v1,
-                    c_v1, c_v2, c_v2 / c_v1
+                    w_v1,
+                    w_v2,
+                    w_v2 / w_v1,
+                    c_v1,
+                    c_v2,
+                    c_v2 / c_v1
                 );
             }
         }
@@ -1861,17 +2373,24 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         (17408, 5120, 16, true),
     ] {
         let m_pad = m.div_ceil(16) * 16;
-        let a_fp8: Vec<u8> = (0..m_pad * k).map(|i| (((i * 7 + 3) % 64) + 0x20) as u8).collect();
-        let b_fp8: Vec<u8> = (0..n * k).map(|i| (((i * 13 + 5) % 64) + 0x20) as u8).collect();
-        let a_st = MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![m_pad, k]), u8ty.clone())
-            .map_err(|e| e.to_string())?;
+        let a_fp8: Vec<u8> = (0..m_pad * k)
+            .map(|i| (((i * 7 + 3) % 64) + 0x20) as u8)
+            .collect();
+        let b_fp8: Vec<u8> = (0..n * k)
+            .map(|i| (((i * 13 + 5) % 64) + 0x20) as u8)
+            .collect();
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![m_pad, k]), u8ty.clone())
+                .map_err(|e| e.to_string())?;
         let copies = if timed { ROT } else { 1 };
         let b_sts: Vec<_> = (0..copies)
             .map(|_| MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![n, k]), u8ty.clone()))
             .collect::<grim_tensor::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m, n]), f32ty.clone()).map_err(|e| e.to_string())?;
-        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m, n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m, n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m, n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
         let a_r = as_rocm(a_st.as_ref()).unwrap();
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
@@ -1882,41 +2401,54 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         dev.synchronize();
         let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
-        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(diffs, 0, "white_raven_blocked_v2 not bit-identical at n={n} k={k} m={m}");
+        let diffs = v1_out
+            .iter()
+            .zip(&v2_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "white_raven_blocked_v2 not bit-identical at n={n} k={k} m={m}"
+        );
         println!("white_raven    v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
 
         if timed {
             let bytes = (n * k + m_pad * k + m * n * 4) as f64;
             for _ in 0..WARMUP {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap();
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+                    .unwrap();
+                dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let w_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
             for i in 0..ITERS {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
             for i in 0..ITERS {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k).unwrap();
+                dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k)
+                    .unwrap();
             }
             dev.synchronize();
             let c_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
@@ -1925,8 +2457,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
                 "{:<16} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x",
                 "white_raven",
                 format!("{n}x{k}x{m}"),
-                w_v1, w_v2, w_v2 / w_v1,
-                c_v1, c_v2, c_v2 / c_v1
+                w_v1,
+                w_v2,
+                w_v2 / w_v1,
+                c_v1,
+                c_v2,
+                c_v2 / c_v1
             );
         }
     }

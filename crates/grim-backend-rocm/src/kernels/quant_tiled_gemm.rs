@@ -203,7 +203,6 @@ GRIM_TILED_QUANT_FWD_BWD_GROUPED(grim_fused_dequant_gemm_q2k_tiled,
 }
 "#;
 
-
 /// M7.2f: the GROUPED tiling macro — the LDS-tiled recipe WITH the group
 /// hoist, which the plain macro cannot express.
 ///

@@ -199,8 +199,7 @@ impl Mellum {
         // Mellum2 uses a softmax router (no correction bias), no shared expert.
         // Every layer routes through the MoE FFN with 64 experts, 8 per token.
         let spec = MoESpec {
-
-     renorm: true,
+            renorm: true,
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
             router_kind: RouterKind::SoftmaxTopK,

@@ -20,9 +20,7 @@ use crate::device::roc_device::RocmDevice;
 #[cfg(feature = "training")]
 use crate::memory::storage::RocmStorage;
 #[cfg(feature = "training")]
-use crate::{
-    HipDim3, arg, check_hip, hipFreeAsync, hipMemsetAsync, upload_device_buffer,
-};
+use crate::{HipDim3, arg, check_hip, hipFreeAsync, hipMemsetAsync, upload_device_buffer};
 use crate::{as_rocm, dev_ptr};
 impl RocmDevice {
     /// Device launcher for the FP32 Charon MoE backward kernel (`grim_moe_fused_grouped_backward`).

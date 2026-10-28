@@ -89,7 +89,10 @@ impl GgufTokenizer {
             .iter()
             .zip(types)
             .filter(|(_, ty)| {
-                let t = ty.as_i32().or_else(|| ty.as_u32().map(|v| v as i32)).unwrap_or(1);
+                let t = ty
+                    .as_i32()
+                    .or_else(|| ty.as_u32().map(|v| v as i32))
+                    .unwrap_or(1);
                 matches!(t, 2 | 3 | 4)
             })
             .map(|(tok, _)| tok.clone())
@@ -1534,11 +1537,15 @@ pub fn render_chat_template(
     // minijinja's `context!` macro requires every referenced variable to be named, so we build the context conditionally: `tools`/`tool_choice` are only emitted when provided.
     // A template that never references `tools` simply ignores them; a template that does reference them.
     let empty_str = "";
+    let env_enable_thinking = std::env::var("GRIM_ENABLE_THINKING")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
     let ctx = minijinja::context! {
         messages => messages,
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
         eos_token => eos_token,
+        enable_thinking => env_enable_thinking,
         // A template that guards its tools block with `tools | length` fails on
         // an ABSENT variable under Lenient undefined ("cannot calculate length
         // of value of type none"), so a caller that passes no tools still
@@ -2495,7 +2502,16 @@ mod gemma4_tokenizer_tests {
     /// "first second" pairs llama.cpp reads from `tokenizer.ggml.merges`.
     fn gemma4_tokenizer() -> GgufTokenizer {
         let vocab = [
-            "<pad>", "<bos>", "The", "▁capital", "▁of", "▁France", "▁is", "a", "b", "▁ab",
+            "<pad>",
+            "<bos>",
+            "The",
+            "▁capital",
+            "▁of",
+            "▁France",
+            "▁is",
+            "a",
+            "b",
+            "▁ab",
         ];
         let tokens: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
         let mut token_to_id = HashMap::new();

@@ -69,13 +69,9 @@ fn big64x128_a16_memo_does_not_survive_a_rewrite_of_a() {
         arith: ArithType::F32,
         storage: Storage::KQuant(KQuantScheme::Q4K),
     };
-    let b_dev = MemoryOps::from_cpu_bytes(
-        &dev,
-        &b_packed,
-        &Shape::new(vec![b_packed.len()]),
-        q_dtype,
-    )
-    .expect("from_cpu_bytes q4k");
+    let b_dev =
+        MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype)
+            .expect("from_cpu_bytes q4k");
     let out = CoreTensorOps::zeros(&dev, &Shape::new(vec![m * n]), DType::F32).expect("zeros");
 
     let a_r = grim_backend_rocm::as_rocm(a_dev.as_ref()).unwrap();

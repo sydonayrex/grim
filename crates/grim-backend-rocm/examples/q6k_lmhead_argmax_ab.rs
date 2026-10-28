@@ -54,7 +54,11 @@ fn main() {
         bytes.len(),
         bytes.len() / 1_000_000
     );
-    assert_eq!(bytes.len() % row_bytes, 0, "head is not a whole number of rows");
+    assert_eq!(
+        bytes.len() % row_bytes,
+        0,
+        "head is not a whole number of rows"
+    );
 
     let dev = RocmDevice::try_new(0).expect("try_new");
     let f32ty = DType {
@@ -113,13 +117,8 @@ fn main() {
         .expect("q81 alloc");
 
         for _ in 0..1 {
-            dev.launch_quantize_q8_1(
-                h_r,
-                as_rocm(q81_st.as_ref()).unwrap(),
-                1,
-                k,
-            )
-            .expect("quantize");
+            dev.launch_quantize_q8_1(h_r, as_rocm(q81_st.as_ref()).unwrap(), 1, k)
+                .expect("quantize");
             dev.synchronize();
             dev.launch_fused_dequant_gemm_q6k_for_ab(
                 h_r,
