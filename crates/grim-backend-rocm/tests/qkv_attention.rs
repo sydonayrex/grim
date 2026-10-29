@@ -1943,6 +1943,202 @@ fn graph_whitecrow_multirow_matches_quantized_q_reference() {
     eprintln!("[graph-whitecrow] vs quantized-Q host reference: worst rel err = {worst:.6}");
 }
 
+/// Graph-form WhiteCrow SPLIT gate: `launch_qkv_attention_dev_batch_whitecrow_split`
+/// (split + merge pair, the graph-capturable token-parallel form) must agree
+/// with the serial `launch_qkv_attention_dev_batch_whitecrow` on the same
+/// arena. chunk_len=8 forces 8 chunks at rows=64, so the partial/merge
+/// handshake and the dead-chunk l=0 path are both exercised. The serial dev
+/// kernel is itself gated by `graph_whitecrow_multirow_matches_quantized_q_reference`.
+#[test]
+#[ignore]
+fn graph_whitecrow_split_matches_serial_dev_kernel() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (nh, nkv, hd, rows) = (4_usize, 2, 128, 64);
+    let stride = nkv * hd;
+    let mut seed = 0x9c9u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q_data: Vec<f32> = (0..(nh * hd)).map(|_| rand()).collect();
+    let k_data: Vec<f32> = (0..(rows * stride)).map(|_| rand()).collect();
+    let v_data: Vec<f32> = (0..(rows * stride)).map(|_| rand()).collect();
+
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let alloc = |n: usize, dt: DType| {
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
+    };
+    let arena_bytes = rows * nkv * (hd / 128) * 67;
+    let k_arena = alloc(arena_bytes, u8dt.clone());
+    let v_arena = alloc(arena_bytes, u8dt.clone());
+
+    let pos_append = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
+    let ring = grim_backend_rocm::KvRingPolicy::UNLIMITED;
+    let arena_slot_stride = arena_bytes;
+    for (data, dst) in [(&k_data, &k_arena), (&v_data, &v_arena)] {
+        let src = dev
+            .from_cpu(data, &Shape::from_slice(&[rows, stride]), DType::F32)
+            .unwrap();
+        grim_backend_rocm::launch_kv_append_whitecrow(
+            &dev,
+            src.as_ref(),
+            pos_append.as_ref(),
+            dst,
+            stride,
+            nkv,
+            hd,
+            rows,
+            1,
+            arena_slot_stride,
+            ring,
+        )
+        .expect("graph kv_append_whitecrow rows");
+        dev.synchronize();
+    }
+
+    let total_dev = dev
+        .from_cpu(
+            &[f32::from_bits((rows - 1) as u32)],
+            &Shape::from_slice(&[1]),
+            DType::F32,
+        )
+        .unwrap();
+    let q32 = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32)
+        .unwrap();
+    let out_max = alloc(nh, DType::F32);
+    let out_sum = alloc(nh, DType::F32);
+    let dummy = alloc(1, DType::F32);
+
+    // Serial reference.
+    let out_serial = alloc(nh * hd, DType::F32);
+    grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow(
+        &dev,
+        q32.as_ref(),
+        &k_arena,
+        &v_arena,
+        &out_serial,
+        &out_max,
+        &out_sum,
+        total_dev.as_ref(),
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        1,
+        1,
+        1.0 / (hd as f32).sqrt(),
+        0,
+        0.0,
+        &dummy,
+        0,
+        0,
+        &dummy,
+        0,
+        1,
+        arena_slot_stride,
+        ring,
+    )
+    .expect("serial dev whitecrow");
+    dev.synchronize();
+    let serial = out_serial.to_cpu_vec_f32().unwrap();
+
+    // Split run: chunk_len 8 -> 8 live chunks (rows=64).
+    let (chunk_len, max_chunks) = (8u32, 8u32);
+    let pm = alloc(max_chunks as usize * 1 * nh, DType::F32);
+    let pl = alloc(max_chunks as usize * 1 * nh, DType::F32);
+    let po = alloc(max_chunks as usize * 1 * nh * hd, DType::F32);
+    let out_split = alloc(nh * hd, DType::F32);
+    grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow_split(
+        &dev,
+        q32.as_ref(),
+        &k_arena,
+        &v_arena,
+        &pm,
+        &pl,
+        &po,
+        &out_split,
+        total_dev.as_ref(),
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        1,
+        1,
+        1.0 / (hd as f32).sqrt(),
+        0,
+        0.0,
+        &dummy,
+        0,
+        0,
+        &dummy,
+        0,
+        1,
+        arena_slot_stride,
+        ring,
+        chunk_len,
+    )
+    .expect("split dev whitecrow");
+    dev.synchronize();
+    let split = out_split.to_cpu_vec_f32().unwrap();
+
+    assert_eq!(serial.len(), split.len());
+    let mut worst = 0.0f32;
+    for (i, (&s, &p)) in serial.iter().zip(split.iter()).enumerate() {
+        let err = (s - p).abs();
+        if err > worst {
+            worst = err;
+        }
+        assert!(
+            err < 1e-4,
+            "split dev diverges from serial dev at {i}: serial {s} split {p} (err {err})"
+        );
+    }
+    eprintln!("[graph-whitecrow-split] split vs serial dev: max abs err = {worst:.3e}");
+    assert!(split.iter().all(|x| x.is_finite()), "split output non-finite");
+
+    // Cross-check against the quantized-Q host reference too (guards against
+    // BOTH kernels agreeing on the same wrong answer).
+    let quant_rows = |data: &[f32]| -> Vec<f32> {
+        let mut deq = vec![0.0f32; rows * stride];
+        for r in 0..rows {
+            for kh in 0..nkv {
+                let s0 = r * stride + kh * hd;
+                let packed = grim_quant::quant_whitecrow(&data[s0..s0 + hd]).unwrap();
+                deq[s0..s0 + hd].copy_from_slice(&grim_quant::dequant_whitecrow(&packed, hd).unwrap());
+            }
+        }
+        deq
+    };
+    let k_deq = quant_rows(&k_data);
+    let v_deq = quant_rows(&v_data);
+    let q_dq = grim_quant::quant_q_whitecrow_symmetric(&q_data);
+    let want = reference_attention(&q_dq, &k_deq, &v_deq, 1, nh, nkv, hd, rows, rows - 1);
+    let mut worst_ref = 0.0f32;
+    for (i, (&g, &w)) in split.iter().zip(want.iter()).enumerate() {
+        let rel = ((g - w) / g.abs().max(w.abs()).max(1e-6)).abs();
+        if rel > worst_ref {
+            worst_ref = rel;
+        }
+        assert!(rel < 0.02, "split dev diverges from host reference at {i}: rel {rel}");
+    }
+    eprintln!("[graph-whitecrow-split] vs quantized-Q host reference: worst rel err = {worst_ref:.6}");
+}
+
 /// Phase 3 int4: kv_len=1 must broadcast V rows.
 #[test]
 #[ignore]

@@ -211,6 +211,7 @@ pub use kernels::qkv_attention::{
     launch_qkv_attention_dev,
     launch_qkv_attention_dev_batch, launch_qkv_attention_dev_batch_i4,
     launch_qkv_attention_dev_batch_i8, launch_qkv_attention_dev_batch_whitecrow,
+    launch_qkv_attention_dev_batch_whitecrow_split,
     launch_qkv_attention_wmma, launch_tree_attention, parse_f16_kv_env, parse_kv_arena_env,
 };
 pub use kernels::tile_picker::run_install_tune;

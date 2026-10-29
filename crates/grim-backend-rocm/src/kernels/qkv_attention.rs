@@ -3785,6 +3785,304 @@ extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
     }
 }
 
+// ── Token-parallel (flash-decoding) split of the GRAPH WhiteCrow kernel ────
+//
+// `grim_qkv_attention_dev_whitecrow` serial-loops the whole live KV range in
+// one block per (query, head, slot) — the same bottleneck the paged split
+// removed (measured 3-154x there). This pair is the graph-capturable split:
+//
+//   * FIXED grid (seq_len, num_heads, batch*max_chunks) — nothing shape-
+//     dynamic is baked at capture except what the serial kernel already bakes.
+//   * The live chunk count is DERIVED ON DEVICE from total_dev[slot]+steps
+//     and the ring cap, so replays pick up growing contexts with no recapture.
+//   * Blocks whose chunk is beyond the live range STILL write their partial
+//     (l=0) — partials are never zeroed between replays, so every slot must
+//     be rewritten every replay for the merge to see fresh state.
+//
+// Partials layout (f32 scratch, per (slot,chunk), sized max_chunks):
+//   pm/pl: [slot*max_chunks+chunk][seq_len][num_heads]
+//   po:    [slot*max_chunks+chunk][seq_len][num_heads][head_dim]
+extern "C" __global__ void grim_qkv_attention_dev_whitecrow_split(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    float* __restrict__ partial_o,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,   // BYTES per slot arena region
+    int cap_rows,            // ring capacity in token rows; <= 0 = unlimited
+    int chunk_len,           // tokens per chunk (> 0)
+    int max_chunks           // fixed grid z extent per slot
+) {
+    const int slot = blockIdx.z / max_chunks;
+    const int chunk = blockIdx.z % max_chunks;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256 || head_dim % 128 != 0) {
+        // Mirror the serial kernel's fail-loud shape contract; the split
+        // partials would be garbage, so poison them for the merge to see.
+        const long long z = (long long)slot * max_chunks + chunk;
+        float* pmz = partial_m + (z * seq_len + i) * num_heads + h;
+        float* plz = partial_l + (z * seq_len + i) * num_heads + h;
+        if (lane_id == 0) { *pmz = nanf(""); *plz = 0.0f; }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    int n_live_chunks = (kv_seq_len + chunk_len - 1) / chunk_len;
+    if (n_live_chunks < 1) n_live_chunks = 1;
+    const int abs_i = kv_seq_len - 1;
+
+    const long long z = (long long)slot * max_chunks + chunk;
+    float* pmz = partial_m + (z * seq_len + i) * num_heads + h;
+    float* plz = partial_l + (z * seq_len + i) * num_heads + h;
+    float* poz = partial_o + ((z * seq_len + i) * num_heads + h) * head_dim;
+
+    // Dead chunk (beyond the live range): publish an EMPTY partial. l=0 is
+    // the merge's skip marker; po must still be rewritten because the buffer
+    // carries the previous replay's values.
+    if (chunk >= n_live_chunks) {
+        if (lane_id == 0) { *pmz = -1e30f; *plz = 0.0f; }
+        for (int c = 0; c < 8; ++c) {
+            int d = lane_id + c * wave_size;
+            if (d < head_dim) poz[d] = 0.0f;
+        }
+        return;
+    }
+
+    // This chunk's token range [c_lo, c_hi), clipped to the causal window.
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    int c_lo = chunk * chunk_len;
+    int c_hi = c_lo + chunk_len;
+    if (c_lo < lo) c_lo = lo;
+    if (c_hi > hi) c_hi = hi;
+    const int range_len = c_hi > c_lo ? c_hi - c_lo : 0;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = c_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int blocks_per_head = head_dim >> 7;
+    const int kv_stride_bytes = num_kv_heads * blocks_per_head * 67;
+    const long long slot_base = (long long)slot * arena_slot_stride;
+    const long long head_off = (long long)kv_head * blocks_per_head * 67;
+
+    const GrimWcQLane qlane = grim_whitecrow_quant_q_lane(q, q_offset, head_dim, lane_id);
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = j;
+        const long long row_base = slot_base + (long long)kv_idx * kv_stride_bytes + head_off;
+        float score = grim_whitecrow_qk_dot(k_tensor + head_off, row_base - head_off,
+                                            qlane, lane_id, wave_size)
+            * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+        const float mw = fmaxf(running_max, score);
+        const float scale_a = expf(running_max - mw);
+        const float scale_b = expf(score - mw);
+        running_sum = running_sum * scale_a + scale_b;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) {
+                float vv = grim_dequant_whitecrow(v_tensor + row_base, idx >> 7, idx & 127);
+                out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+            }
+        }
+        running_max = mw;
+    }
+
+    // Cross-wave merge within the block (same protocol as the serial kernel).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+
+    // Reconstruct the UNNORMALIZED wave-0 accumulator, then absorb the other
+    // waves with their LSE scales (identical algebra to the serial kernel's
+    // attn_reg reconstruction, minus the final normalization — the merge
+    // kernel owns that).
+    float part[8];
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        part[c] = 0.0f;
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                part[c] += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+        }
+    }
+    if (lane_id == 0) { *pmz = m_final; *plz = sum_final; }
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            poz[idx] = part[c];
+        }
+    }
+}
+
+// LSE merge of the split partials: grid (seq_len, num_heads, batch). The
+// live chunk count is derived on device from total_dev[slot]+steps and the
+// ring cap, exactly as in the split kernel, so the pair stays consistent
+// across replays with no host involvement. The tail (out, fuse_o epilogue)
+// mirrors `grim_qkv_attention_dev_whitecrow` exactly — including its
+// behavior of NEVER writing out_max/out_sum (those params are dropped here;
+// the buffers they name are sized [num_heads] and the serial kernel leaves
+// them untouched too).
+extern "C" __global__ void grim_qkv_attention_dev_whitecrow_merge(
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    const float* __restrict__ partial_o,
+    float* __restrict__ out,
+    int num_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    int batch,
+    int cap_rows,
+    int chunk_len,
+    int max_chunks
+) {
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int lane_id = tid % wave_size;
+
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    int n_live_chunks = (kv_seq_len + chunk_len - 1) / chunk_len;
+    if (n_live_chunks < 1) n_live_chunks = 1;
+
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+
+    float m_final = -1e30f;
+    for (int c = 0; c < n_live_chunks; ++c) {
+        const long long z = (long long)slot * max_chunks + c;
+        const float* pmc = partial_m + (z * seq_len + i) * num_heads + h;
+        const float* plc = partial_l + (z * seq_len + i) * num_heads + h;
+        if (*plc > 0.0f && *pmc > m_final) m_final = *pmc;
+    }
+    float sum_final = 0.0f;
+    float part[8];
+    #pragma unroll
+    for (int c8 = 0; c8 < 8; ++c8) part[c8] = 0.0f;
+    for (int c = 0; c < n_live_chunks; ++c) {
+        const long long z = (long long)slot * max_chunks + c;
+        const float* pmc = partial_m + (z * seq_len + i) * num_heads + h;
+        const float* plc = partial_l + (z * seq_len + i) * num_heads + h;
+        const float m = *pmc;
+        const float l = *plc;
+        if (l <= 0.0f) continue;
+        const float scale = expf(m - m_final);
+        sum_final += l * scale;
+        const float* poc = partial_o + ((z * seq_len + i) * num_heads + h) * head_dim;
+        #pragma unroll
+        for (int c8 = 0; c8 < 8; ++c8) {
+            int d = lane_id + c8 * wave_size;
+            if (d < head_dim) {
+                part[c8] += poc[d] * scale;
+            }
+        }
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int c8 = 0; c8 < 8; ++c8) attn_reg[c8] = part[c8] * inv_sum;
+
+    if (fuse_o == 0) {
+        for (int c8 = 0; c8 < 8; ++c8) {
+            int d = lane_id + c8 * wave_size;
+            if (d < head_dim) out[q_offset + d] = attn_reg[c8];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue (identical to the serial kernel).
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c8 = 0; c8 < 8; ++c8) {
+                int d = lane_id + c8 * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[c8] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
 // D1: clamp a per-layer KV total to the eviction ring's capacity. The eager
 // path resets `current_pos` to the retained count at the boundary (the host
 // CurDKV pass), which keeps the ring's absolute row sequence at
@@ -6902,6 +7200,217 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+/// Graph-capturable token-parallel split of [`launch_qkv_attention_dev_batch_whitecrow`].
+///
+/// Two launches, both with FIXED grids (capture-safe):
+///   1. `grim_qkv_attention_dev_whitecrow_split` — grid (seq_len, num_heads,
+///      batch*max_chunks). Each block computes an online-softmax partial over
+///      its token chunk and publishes pm/pl/po. Dead chunks (beyond the
+///      device-derived live range) publish l=0, and every partial slot is
+///      rewritten every launch — the scratch is never zeroed between replays.
+///   2. `grim_qkv_attention_dev_whitecrow_merge` — grid (seq_len, num_heads,
+///      batch). Derives the same live chunk count on device, LSE-combines,
+///      normalizes, and runs the serial kernel's exact out/fuse_o tail.
+///
+/// The live chunk count is derived from `total_dev[slot] + steps` and the
+/// ring cap inside BOTH kernels, so a captured pair tracks growing contexts
+/// with no recapture. `max_chunks` must be >= ceil(cap_rows-or-max_ctx /
+/// chunk_len) — the launcher derives it from the ring cap (or max_ctx when
+/// uncapped) and errors if the caller's scratch is too small.
+///
+/// Unlike the serial launcher, `out_max`/`out_sum` are NOT written (the
+/// serial dev WhiteCrow kernel never writes them either; the scratch the
+/// caller passes is accepted for signature symmetry only).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_dev_batch_whitecrow_split(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    partial_m: &dyn BackendStorage,
+    partial_l: &dyn BackendStorage,
+    partial_o: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+    chunk_len: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    const SPLIT: &str = "grim_qkv_attention_dev_whitecrow_split";
+    const MERGE: &str = "grim_qkv_attention_dev_whitecrow_merge";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{SPLIT}: head_dim {head_dim} exceeds kernel cap of 256"
+        )));
+    }
+    if head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "{SPLIT}: head_dim {head_dim} must be a multiple of 128 \
+             (WhiteCrow groups are 128 values)"
+        )));
+    }
+    if chunk_len == 0 {
+        return Err(crate::Error::Backend(format!("{SPLIT}: chunk_len must be > 0")));
+    }
+    let live_bound: usize = if ring.cap_rows > 0 {
+        ring.cap_rows.max(1) as usize
+    } else {
+        // Uncapped: the arena holds max_ctx rows; derive the bound from the
+        // slot stride the caller passes (bytes -> rows).
+        let bytes_per_row = (num_kv_heads * (head_dim / 128) * 67) as usize;
+        (arena_slot_stride / bytes_per_row.max(1)).max(1)
+    };
+    let max_chunks = live_bound.div_ceil(chunk_len as usize).max(1);
+
+    let ptr = |b: &dyn BackendStorage, what: &str| -> Result<u64, crate::Error> {
+        b.as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend(format!("{SPLIT}: {what} must be RocmStorage")))?
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend(format!("{SPLIT}: {what} has no device ptr")))
+    };
+    for (buf, what) in [(k_arena, "k_arena"), (v_arena, "v_arena")] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{SPLIT}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != ArithType::U8 {
+            return Err(crate::Error::Backend(format!(
+                "{SPLIT}: {what} must be U8, got {:?}",
+                r.dtype.arith
+            )));
+        }
+    }
+    let mut q_ptr = ptr(q, "q")?;
+    let mut k_ptr = ptr(k_arena, "k_arena")?;
+    let mut v_ptr = ptr(v_arena, "v_arena")?;
+    let mut pm_ptr = ptr(partial_m, "partial_m")?;
+    let mut pl_ptr = ptr(partial_l, "partial_l")?;
+    let mut po_ptr = ptr(partial_o, "partial_o")?;
+    let mut o_ptr = ptr(out, "out")?;
+    let mut tot_ptr = ptr(total_dev, "total_dev")?;
+    let mut opptr = ptr(o_proj_w, "o_proj_w")?;
+    let mut asl = ptr(alibi_slopes, "alibi_slopes")?;
+
+    // Scratch capacity check: pm/pl are [batch*max_chunks*seq_len*num_heads],
+    // po adds head_dim. The shapes are opaque here (1-D scratch), so the
+    // element count is checked against the worst case the pair will index.
+    let need_pm = batch * max_chunks * seq_len as usize * num_heads as usize;
+    for (buf, what, need) in [
+        (partial_m, "partial_m", need_pm),
+        (partial_l, "partial_l", need_pm),
+        (
+            partial_o,
+            "partial_o",
+            need_pm * head_dim as usize,
+        ),
+    ] {
+        let r = buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend(format!("{SPLIT}: {what} must be RocmStorage")))?;
+        let elems = r.shape().dims().iter().product::<usize>().max(1);
+        if elems < need {
+            return Err(crate::Error::Backend(format!(
+                "{SPLIT}: {what} too small: need {need} elems (batch={batch} max_chunks={max_chunks} \
+                 seq_len={seq_len} nh={num_heads} hd={head_dim}), have {elems}"
+            )));
+        }
+    }
+
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend(format!("{SPLIT}: arena_slot_stride exceeds i32::MAX"))
+    })?;
+    let mut cap_rows_i = ring.cap_rows;
+    let mut cl = chunk_len as i32;
+    let mut mc = max_chunks as i32;
+
+    // Argument order MUST match `grim_qkv_attention_dev_whitecrow_split`'s
+    // parameter list exactly.
+    dev.launch_compute_kernel(
+        SPLIT,
+        crate::HipDim3::new(sl as u32, nh as u32, (batch.max(1) * max_chunks) as u32),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut pm_ptr),
+            arg(&mut pl_ptr),
+            arg(&mut po_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut cl),
+            arg(&mut mc),
+        ],
+    )?;
+
+    // Argument order MUST match `grim_qkv_attention_dev_whitecrow_merge`'s
+    // parameter list exactly.
+    dev.launch_compute_kernel(
+        MERGE,
+        crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut pm_ptr),
+            arg(&mut pl_ptr),
+            arg(&mut po_ptr),
+            arg(&mut o_ptr),
+            arg(&mut nh),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut batch_i),
+            arg(&mut cap_rows_i),
+            arg(&mut cl),
+            arg(&mut mc),
         ],
     )
 }
