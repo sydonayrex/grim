@@ -1721,8 +1721,13 @@ fn whitecrow_dense_attention_matches_host_decode_reference() {
             v_dq.extend(grim_quant::dequant_whitecrow(bs, head_dim).expect("v dequant"));
         }
     }
+    // Q side: the sudot8 Q·K leg quantizes Q to the symmetric u4 group-128
+    // grid (`quant_q_whitecrow_symmetric` is the canonical mirror of the
+    // kernel's `grim_whitecrow_quant_q_lane`), so the tight reference uses
+    // the SAME quantized Q — gate 1 then isolates the device dot's algebra.
+    let q_dq = grim_quant::quant_q_whitecrow_symmetric(&q_data);
     let want = reference_attention(
-        &q_data,
+        &q_dq,
         &k_dq,
         &v_dq,
         seq_len,
@@ -1753,12 +1758,13 @@ fn whitecrow_dense_attention_matches_host_decode_reference() {
         "dense WhiteCrow attention diverged from host decode reference: worst rel err {worst:.6}"
     );
 
-    // Gate 2 (loose): end-to-end fidelity vs the ORIGINAL f32 KV — this
-    // measures the u4 group-128 affine grid, not the kernel. Metric is
-    // ABSOLUTE error: the output is a convex combination of V rows, so its
-    // error is bounded by the per-element grid error (~scale/2 with
-    // scale = range/15 ~ 0.13 here); a relative metric would blow up at
-    // output components that cross zero, which is noise, not signal.
+    // Gate 2 (loose): end-to-end fidelity vs the ORIGINAL f32 Q/KV — this
+    // measures the u4 group-128 grids (K/V affine + Q symmetric), not the
+    // kernel. Metric is ABSOLUTE error: the output is a convex combination
+    // of V rows, so its error is bounded by the per-element grid error; a
+    // relative metric would blow up at output components that cross zero,
+    // which is noise, not signal. The Q grid adds a score-side term on top
+    // of the K/V floor, hence the wider bound than the pre-sudot8 gate.
     let want_f32 = reference_attention(
         &q_data,
         &k_data,
@@ -1776,9 +1782,165 @@ fn whitecrow_dense_attention_matches_host_decode_reference() {
     }
     eprintln!("[whitecrow-dense] vs f32 reference: worst abs err = {worst_f:.4}");
     assert!(
-        worst_f < 0.1,
+        worst_f < 0.15,
         "dense WhiteCrow f32 fidelity too low: worst abs err {worst_f:.4}"
     );
+}
+
+/// Graph-form WhiteCrow attention gate: `launch_kv_append_whitecrow` +
+/// `launch_qkv_attention_dev_batch_whitecrow` (the pair the decode graph
+/// captures). The sudot8 Q·K rewrite touched this kernel directly, and no
+/// other test reaches it — without this gate the graph leg's dot would be
+/// unverified. Reference = same attention over the host WhiteCrow
+/// encode/decode of K/V (device append is bit-exact vs the host encoder,
+/// proven by `whitecrow_append_quantize_parity_bit_exact`) and the canonical
+/// symmetric-u4 Q (`quant_q_whitecrow_symmetric`).
+#[test]
+#[ignore]
+fn graph_whitecrow_multirow_matches_quantized_q_reference() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (nh, nkv, hd, rows) = (4_usize, 2, 128, 8);
+    let stride = nkv * hd;
+    let mut seed = 0x5b5u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q_data: Vec<f32> = (0..(nh * hd)).map(|_| rand()).collect();
+    let k_data: Vec<f32> = (0..(rows * stride)).map(|_| rand()).collect();
+    let v_data: Vec<f32> = (0..(rows * stride)).map(|_| rand()).collect();
+
+    // Host reference: production WhiteCrow K/V round-trip + symmetric-u4 Q.
+    let quant_rows = |data: &[f32]| -> Vec<f32> {
+        let mut deq = vec![0.0f32; rows * stride];
+        for r in 0..rows {
+            for kh in 0..nkv {
+                let s = r * stride + kh * hd;
+                let packed = grim_quant::quant_whitecrow(&data[s..s + hd]).unwrap();
+                let d = grim_quant::dequant_whitecrow(&packed, hd).unwrap();
+                deq[s..s + hd].copy_from_slice(&d);
+            }
+        }
+        deq
+    };
+    let k_deq = quant_rows(&k_data);
+    let v_deq = quant_rows(&v_data);
+    let q_dq = grim_quant::quant_q_whitecrow_symmetric(&q_data);
+    let want = reference_attention(&q_dq, &k_deq, &v_deq, 1, nh, nkv, hd, rows, rows - 1);
+
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let alloc = |n: usize, dt: DType| {
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
+    };
+    // One 67-byte block per (row, kv_head): head_dim/128 = 1 group.
+    let arena_bytes = rows * nkv * (hd / 128) * 67;
+    let k_arena = alloc(arena_bytes, u8dt.clone());
+    let v_arena = alloc(arena_bytes, u8dt.clone());
+
+    let pos_append = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
+    let ring = grim_backend_rocm::KvRingPolicy::UNLIMITED;
+    let arena_slot_stride = arena_bytes; // BYTES per slot (single slot)
+    for (data, dst) in [(&k_data, &k_arena), (&v_data, &v_arena)] {
+        let src = dev
+            .from_cpu(data, &Shape::from_slice(&[rows, stride]), DType::F32)
+            .unwrap();
+        grim_backend_rocm::launch_kv_append_whitecrow(
+            &dev,
+            src.as_ref(),
+            pos_append.as_ref(),
+            dst,
+            stride,
+            nkv,
+            hd,
+            rows,
+            1,
+            arena_slot_stride,
+            ring,
+        )
+        .expect("graph kv_append_whitecrow rows");
+        dev.synchronize();
+    }
+
+    // Query at the last live row: total = rows-1 carried in the f32 bit
+    // pattern (the kernel reads `const int*`), steps = 1 -> live = rows.
+    let total_dev = dev
+        .from_cpu(
+            &[f32::from_bits((rows - 1) as u32)],
+            &Shape::from_slice(&[1]),
+            DType::F32,
+        )
+        .unwrap();
+    let q32 = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32)
+        .unwrap();
+    let out = alloc(nh * hd, DType::F32);
+    let out_max = alloc(nh, DType::F32);
+    let out_sum = alloc(nh, DType::F32);
+    let dummy = alloc(1, DType::F32);
+    grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow(
+        &dev,
+        q32.as_ref(),
+        &k_arena,
+        &v_arena,
+        &out,
+        &out_max,
+        &out_sum,
+        total_dev.as_ref(),
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        1,
+        1,
+        1.0 / (hd as f32).sqrt(),
+        0,
+        0.0,
+        &dummy,
+        0,
+        0,
+        &dummy,
+        0,
+        1,
+        arena_slot_stride,
+        ring,
+    )
+    .expect("graph qkv_attention_dev_batch_whitecrow");
+    dev.synchronize();
+
+    let got = out.to_cpu_vec_f32().unwrap();
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "graph whitecrow attend non-finite"
+    );
+    assert_eq!(got.len(), want.len());
+    let mut worst = 0.0f32;
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        let denom = g.abs().max(w.abs()).max(1e-6);
+        let rel = ((g - w) / denom).abs();
+        if rel > worst {
+            worst = rel;
+        }
+        assert!(
+            rel < 0.02,
+            "graph whitecrow attend diverged at {i}: got {g} want {w} (rel {rel})"
+        );
+    }
+    eprintln!("[graph-whitecrow] vs quantized-Q host reference: worst rel err = {worst:.6}");
 }
 
 /// Phase 3 int4: kv_len=1 must broadcast V rows.

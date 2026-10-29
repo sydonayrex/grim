@@ -1827,6 +1827,155 @@ __device__ inline float dequant_kv_element(
     return 0.0f;
 }
 
+// ── WhiteCrow sudot8 Q·K helpers ───────────────────────────────────────────
+//
+// The Q·K dot against a WhiteCrow KV arena is ALU-bound in the per-value
+// dequant (measured 6.4-6.7x over an f32 baseline at every context length,
+// constant ratio -> per-value penalty, ~80000x above the DRAM floor). These
+// helpers replace the serial nibble-extract + per-value scale with the
+// hardware 8-lane u4 dot (`__builtin_amdgcn_sudot8`, the same mixed-sign
+// form proven in `grim_dot8_w4a4_gemv`):
+//
+//   sum_d q_d*k_d = qs*ks * ( iacc - z_k * sum_qa )
+//
+// Q is quantized to the arena's own u4 group-128 grid but SYMMETRICALLY
+// (codes -8..7, amax/7 scale), so the signed-flag operand is Q and the
+// unsigned operand is the row's WhiteCrow codes; the row's u8 zero folds
+// into the algebraic correction. Groups align because head_dim % 128 == 0
+// and both sides span the same 128 values.
+//
+// Lane partition (wave form): word w (8 values) = lane; group g = lane>>4.
+// Valid while total_words = (head_dim/128)*16 <= wave_size, which always
+// holds: head_dim <= 256 -> 32 words, wave_size >= 32. The 16-lane xor
+// reductions (offsets 1..8) stay inside one group's lanes.
+
+struct GrimWcQLane {
+    unsigned int word;  // 8 signed nibble codes, low nibble = lowest dim
+    float qs;           // group scale (amax/7)
+    int codes_sum;      // sum of this lane's 8 codes
+    int valid;          // lane owns a word
+};
+
+__device__ inline GrimWcQLane grim_whitecrow_quant_q_lane(
+    const float* __restrict__ q,
+    int q_offset,
+    int head_dim,
+    int lane)
+{
+    GrimWcQLane s;
+    s.word = 0u; s.qs = 0.0f; s.codes_sum = 0; s.valid = 0;
+    const int words_total = (head_dim >> 7) << 4;
+    if (lane >= words_total) return s;
+    s.valid = 1;
+    const int g = lane >> 4;
+    const int base = q_offset + g * 128 + (lane & 15) * 8;
+    float qv[8];
+    float amax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        qv[j] = q[base + j];
+        amax = fmaxf(amax, fabsf(qv[j]));
+    }
+    // Group amax across the 16 lanes owning group g.
+    #pragma unroll
+    for (int off = 1; off < 16; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
+    float qs = amax / 7.0f;
+    unsigned int w = 0u;
+    int csum = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        int c = (qs > 0.0f) ? (int)rintf(qv[j] / qs) : 0;
+        c = c < -8 ? -8 : (c > 7 ? 7 : c);
+        w |= ((unsigned int)(c & 0xF)) << (4 * j);
+        csum += c;
+    }
+    s.word = w; s.qs = qs; s.codes_sum = csum;
+    return s;
+}
+
+// Wave-uniform Q·K dot for one WhiteCrow K head row. `k_head` is the byte
+// address of this kv_head's first 67-byte block; `row_base` the row's byte
+// offset from it. Every lane must hold the GrimWcQLane returned by
+// grim_whitecrow_quant_q_lane with the SAME lane index. Byte-composed word
+// loads: 67-byte blocks are only 1-byte aligned at group granularity.
+__device__ inline float grim_whitecrow_qk_dot(
+    const unsigned char* __restrict__ k_head,
+    long long row_base,
+    const GrimWcQLane& s,
+    int lane,
+    int wave_size)
+{
+    float f = 0.0f;
+    if (s.valid) {
+        const int g = lane >> 4;
+        const unsigned char* blk = k_head + row_base + (long long)g * 67;
+        const unsigned char* p = blk + (lane & 15) * 4;
+        unsigned int kw = (unsigned int)p[0] | ((unsigned int)p[1] << 8)
+                        | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+        int iacc = __builtin_amdgcn_sudot8(true, s.word, false, kw, 0, false);
+        int csum = s.codes_sum;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            iacc += __shfl_xor(iacc, off);
+            csum += __shfl_xor(csum, off);
+        }
+        float ks = __uint_as_float((((unsigned int)blk[64] | ((unsigned int)blk[65] << 8)) << 16));
+        int zi = (int)blk[66];
+        f = s.qs * ks * (float)(iacc - zi * csum);
+    }
+    // Sum per-group partials across the wave (offsets >= 16 cross groups).
+    for (int off = 16; off < wave_size; off <<= 1) f += __shfl_xor(f, off);
+    return f;
+}
+
+// Scalar (per-thread) form for the paged kernel, whose score loop is uniform
+// across lanes: quantize this head's Q and dot one WhiteCrow row. The paged
+// format-9 layout groups over FLAT 128-value spans of the page buffer, so the
+// group base byte is ((elem_offset >> 7) + g) * 67 (elem_offset is a multiple
+// of 128: page_stride and head_dim both are).
+__device__ inline float grim_whitecrow_qk_dot_scalar(
+    const float* __restrict__ q,
+    int q_offset,
+    const unsigned char* __restrict__ data,
+    int elem_offset,
+    int head_dim)
+{
+    const int gph = head_dim >> 7;
+    float total = 0.0f;
+    for (int g = 0; g < gph; ++g) {
+        float amax = 0.0f;
+        for (int j = 0; j < 128; ++j) {
+            amax = fmaxf(amax, fabsf(q[q_offset + g * 128 + j]));
+        }
+        float qs = amax / 7.0f;
+        int csum = 0;
+        unsigned int qw[16];
+        for (int w = 0; w < 16; ++w) {
+            unsigned int word = 0u;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int c = (qs > 0.0f) ? (int)rintf(q[q_offset + g * 128 + w * 8 + j] / qs) : 0;
+                c = c < -8 ? -8 : (c > 7 ? 7 : c);
+                word |= ((unsigned int)(c & 0xF)) << (4 * j);
+                csum += c;
+            }
+            qw[w] = word;
+        }
+        const unsigned char* blk = data + (long long)((elem_offset >> 7) + g) * 67;
+        float ks = __uint_as_float((((unsigned int)blk[64] | ((unsigned int)blk[65] << 8)) << 16));
+        int zi = (int)blk[66];
+        int iacc = 0;
+        for (int w = 0; w < 16; ++w) {
+            const unsigned char* p = blk + w * 4;
+            unsigned int kw = (unsigned int)p[0] | ((unsigned int)p[1] << 8)
+                            | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+            iacc = __builtin_amdgcn_sudot8(true, qw[w], false, kw, iacc, false);
+        }
+        total += qs * ks * (float)(iacc - zi * csum);
+    }
+    return total;
+}
+
 extern "C" __global__ __launch_bounds__(256)
 void grim_qkv_attention_paged_quant(
     const float* __restrict__ q,
@@ -1894,11 +2043,20 @@ void grim_qkv_attention_paged_quant(
         const int elem_offset = physical_block * page_stride + (page_offset * num_kv_heads + kv_head) * head_dim;
 
         float score = 0.0f;
-        #pragma unroll
-        for (int dim = 0; dim < 256; ++dim) {
-            if (dim < head_dim) {
-                float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
-                score += q[q_offset + dim] * k_val;
+        // The paged format-9 arena groups over FLAT 128-value spans of the
+        // page buffer, which only aligns with per-head Q groups when
+        // head_dim % 128 == 0 (otherwise one K group mixes several heads'
+        // dims). The sudot8 dot requires that alignment; anything else keeps
+        // the per-element dequant with unquantized Q.
+        if (quant_format == 9 && (head_dim & 127) == 0) {
+            score = grim_whitecrow_qk_dot_scalar(q, q_offset, k_pages, elem_offset, head_dim);
+        } else {
+            #pragma unroll
+            for (int dim = 0; dim < 256; ++dim) {
+                if (dim < head_dim) {
+                    float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
+                    score += q[q_offset + dim] * k_val;
+                }
             }
         }
         score *= inv_sqrt_d;
@@ -3279,27 +3437,17 @@ extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
     const long long slot_base = (long long)slot * arena_slot_stride;
     const long long head_off = (long long)kv_head * blocks_per_head * 67;
 
-    float q_reg[8];
-    for (int c = 0; c < 8; ++c) {
-        int idx = lane_id + c * wave_size;
-        q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
-    }
+    // Q·K via the hardware u4 dot (same helper pair as the eager kernel, so
+    // eager and graph WhiteCrow agree by construction).
+    const GrimWcQLane qlane = grim_whitecrow_quant_q_lane(q, q_offset, head_dim, lane_id);
 
     for (int j = j_start; j < j_end; ++j) {
         const int kv_idx = lo + j;
         const long long row_base = slot_base + (long long)kv_idx * kv_stride_bytes + head_off;
-        float score = 0.0f;
-        for (int c = 0; c < 8; ++c) {
-            int idx = lane_id + c * wave_size;
-            if (idx < head_dim) {
-                score += q_reg[c]
-                    * grim_dequant_whitecrow(k_tensor + row_base, idx >> 7, idx & 127);
-            }
-        }
         // Wave-uniform total score (every lane holds the sum).
-        for (int off = wave_size / 2; off > 0; off >>= 1)
-            score += __shfl_xor(score, off);
-        score *= inv_sqrt_d;
+        float score = grim_whitecrow_qk_dot(k_tensor + head_off, row_base - head_off,
+                                            qlane, lane_id, wave_size)
+            * inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
@@ -3834,30 +3982,14 @@ extern "C" __global__ void grim_qkv_attention_whitecrow(
     const unsigned char* __restrict__ k_head = k_tensor + head_bytes;
     const unsigned char* __restrict__ v_head = v_tensor + head_bytes;
 
-    float q_reg[8];
-    #pragma unroll
-    for (int chunk = 0; chunk < 8; ++chunk) {
-        int dd = lane_id + chunk * wave_size;
-        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
-    }
+    // Q·K via the hardware u4 dot: quantize Q once per (i,h) block, then each
+    // token costs one sudot8 per word instead of a per-value dequant FMA.
+    const GrimWcQLane qlane = grim_whitecrow_quant_q_lane(q, q_offset, head_dim, lane_id);
 
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        float partial = 0.0f;
         const long long row_base = (long long)j * kv_stride_bytes;
-        #pragma unroll
-        for (int chunk = 0; chunk < 8; ++chunk) {
-            int dd = lane_id + chunk * wave_size;
-            if (dd < head_dim) {
-                float k_dq = grim_dequant_whitecrow(k_head + row_base, dd >> 7, dd & 127);
-                partial += q_reg[chunk] * k_dq;
-            }
-        }
-        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        #pragma unroll
-        for (int off = wave_size >> 1; off > 0; off >>= 1) {
-            partial += __shfl_xor_sync(shfl_mask, partial, off);
-        }
-        float score = partial * inv_sqrt_d;
+        float score = grim_whitecrow_qk_dot(k_head, row_base, qlane, lane_id, wave_size)
+            * inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }

@@ -270,6 +270,33 @@ pub fn quant_whitecrow(data: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Symmetric u4 group-128 quantization for the Q side of the WhiteCrow sudot8
+/// Q·K dot (`grim_whitecrow_quant_q_lane` in the ROCm backend).
+///
+/// Unlike the asymmetric KV encoder above, Q is quantized SYMMETRICALLY
+/// (codes -8..7, scale = amax/7, round-ties-even, mirroring the kernel's
+/// `rintf`): the hardware 8-lane u4 dot takes Q as its signed operand and K
+/// as the unsigned one. Returns the DEQUANTIZED values so attention
+/// references consume it directly. This is the single source of truth for
+/// the Q convention — device and test references must both match it.
+pub fn quant_q_whitecrow_symmetric(data: &[f32]) -> Vec<f32> {
+    const GROUP_SIZE: usize = 128;
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(GROUP_SIZE) {
+        let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let qs = amax / 7.0;
+        for &v in chunk {
+            let c = if qs > 0.0 {
+                (v / qs).round_ties_even() as i32
+            } else {
+                0
+            };
+            out.push(qs * c.clamp(-8, 7) as f32);
+        }
+    }
+    out
+}
+
 /// Dequantize interleaved WhiteCrow KV blocks (67 bytes per 128 values) to f32.
 pub fn dequant_whitecrow(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     if num_values == 0 {
