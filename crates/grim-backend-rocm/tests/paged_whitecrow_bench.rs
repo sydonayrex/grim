@@ -17,6 +17,7 @@
 
 use grim_backend_rocm::kernels::qkv_attention::{
     KvCacheQuantFormat, launch_paged_attention, launch_paged_attention_quant,
+    launch_paged_attention_quant_split,
 };
 use grim_backend_rocm::{BlockTableEntry, RocmDevice};
 use grim_tensor::CoreTensorOps;
@@ -45,6 +46,10 @@ struct Setup {
     v: Box<dyn grim_tensor::BackendStorage>,
     out: Box<dyn grim_tensor::BackendStorage>,
     max_blocks: u32,
+    // Split-arm partials, allocated lazily on first split run.
+    pm: Option<Box<dyn grim_tensor::BackendStorage>>,
+    pl: Option<Box<dyn grim_tensor::BackendStorage>>,
+    po: Option<Box<dyn grim_tensor::BackendStorage>>,
 }
 
 fn setup(dev: &RocmDevice, kv_seq_len: u32, whitecrow: bool) -> Setup {
@@ -86,7 +91,7 @@ fn setup(dev: &RocmDevice, kv_seq_len: u32, whitecrow: bool) -> Setup {
         )
     };
     let out = dev.zeros(&q_shape, DType::F32).unwrap();
-    Setup { q, table, k, v, out, max_blocks }
+    Setup { q, table, k, v, out, max_blocks, pm: None, pl: None, po: None }
 }
 
 fn run_whitecrow(dev: &RocmDevice, s: &mut Setup, kv_seq_len: u32) {
@@ -139,11 +144,49 @@ fn run_f32(dev: &RocmDevice, s: &mut Setup, kv_seq_len: u32) {
     .expect("launch f32");
 }
 
+fn run_whitecrow_split(dev: &RocmDevice, s: &mut Setup, kv_seq_len: u32, chunk_len: u32) {
+    let n_chunks = (kv_seq_len.div_ceil(chunk_len)) as usize;
+    if s.pm.is_none() {
+        s.pm = Some(dev.zeros(&Shape::new(vec![n_chunks * NUM_HEADS as usize]), DType::F32).unwrap());
+        s.pl = Some(dev.zeros(&Shape::new(vec![n_chunks * NUM_HEADS as usize]), DType::F32).unwrap());
+        s.po = Some(dev.zeros(&Shape::new(vec![n_chunks * NUM_HEADS as usize * HEAD_DIM as usize]), DType::F32).unwrap());
+    }
+    launch_paged_attention_quant_split(
+        dev,
+        s.q.as_ref(),
+        s.table.as_ref(),
+        s.k.as_ref(),
+        s.v.as_ref(),
+        s.pm.as_ref().unwrap().as_ref(),
+        s.pl.as_ref().unwrap().as_ref(),
+        s.po.as_ref().unwrap().as_ref(),
+        s.out.as_mut(),
+        1,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        s.max_blocks,
+        PAGE_SIZE,
+        kv_seq_len,
+        kv_seq_len - 1,
+        0i32,
+        KvCacheQuantFormat::WhiteCrow,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        chunk_len,
+    )
+    .expect("launch whitecrow split");
+}
+
 /// Returns (synced_us, k_bytes) for one config. iters syncs kept low (kernel is slow).
-fn bench(dev: &RocmDevice, kv_seq_len: u32, whitecrow: bool) -> f64 {
-    let mut s = setup(dev, kv_seq_len, whitecrow);
-    let mut run = || {
-        if whitecrow { run_whitecrow(dev, &mut s, kv_seq_len); } else { run_f32(dev, &mut s, kv_seq_len); }
+fn bench(dev: &RocmDevice, kv_seq_len: u32, arm: Arm) -> f64 {
+    let mut s = setup(dev, kv_seq_len, arm != Arm::F32);
+    let mut run = || match arm {
+        Arm::F32 => run_f32(dev, &mut s, kv_seq_len),
+        Arm::WhiteCrow => run_whitecrow(dev, &mut s, kv_seq_len),
+        Arm::WhiteCrowSplit => run_whitecrow_split(dev, &mut s, kv_seq_len, CHUNK_LEN),
     };
     // Warmup + sync.
     run();
@@ -156,6 +199,13 @@ fn bench(dev: &RocmDevice, kv_seq_len: u32, whitecrow: bool) -> f64 {
     t.elapsed().as_secs_f64() * 1e6 / iters as f64
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Arm { F32, WhiteCrow, WhiteCrowSplit }
+
+// 512 tokens per chunk: 128 chunks at 64K ctx (fills a 40-48 CU gfx1201
+// several waves deep) while keeping the partial buffers small.
+const CHUNK_LEN: u32 = 512;
+
 #[test]
 #[ignore = "roofline characterization — run manually with --ignored"]
 fn paged_whitecrow_qk_roofline_m1() {
@@ -165,26 +215,25 @@ fn paged_whitecrow_qk_roofline_m1() {
     // 262144 is ~5s x iters alone.
     let contexts = [1024u32, 4096, 16384, 65536];
 
-    eprintln!("\n=== paged Q·K roofline @ M=1 (head_dim={}, 1 workgroup) ===", HEAD_DIM);
+    eprintln!("\n=== paged Q·K roofline @ M=1 (head_dim={}, serial vs split chunk_len={CHUNK_LEN}) ===", HEAD_DIM);
     eprintln!(
-        "{:>8} {:>13} {:>13} {:>9} {:>11}",
-        "ctx", "whitecrow-us", "f32-us", "wc/f32", "WC-us/tok"
+        "{:>8} {:>13} {:>13} {:>9} {:>15} {:>11} {:>11}",
+        "ctx", "whitecrow-us", "f32-us", "wc/f32", "wc-split-us", "split/spd", "WC-us/tok"
     );
 
     for &ctx in &contexts {
-        let wc_us = bench(&dev, ctx, true);
-        let f32_us = bench(&dev, ctx, false);
-        let ratio = wc_us / f32_us;
+        let wc_us = bench(&dev, ctx, Arm::WhiteCrow);
+        let f32_us = bench(&dev, ctx, Arm::F32);
+        let split_us = bench(&dev, ctx, Arm::WhiteCrowSplit);
         eprintln!(
-            "{:>8} {:>13.1} {:>13.1} {:>9.2} {:>11.2}",
-            ctx, wc_us, f32_us, ratio, wc_us / ctx as f64
+            "{:>8} {:>13.1} {:>13.1} {:>9.2} {:>15.1} {:>10.2}x {:>11.2}",
+            ctx, wc_us, f32_us, wc_us / f32_us, split_us, wc_us / split_us, split_us / ctx as f64
         );
     }
 
     // Verdict.
     eprintln!("\n--- verdict ---");
-    eprintln!("WhiteCrow dequant-vs-f32 ratio per ctx (see table above).");
-    eprintln!("If ratio ≈ 1.0 → slowness is GENERIC (1-workgroup serial loop, not dequant).");
-    eprintln!("  → sudot8 targets the inner-loop compute, irrelevant to the real bottleneck. SKIP sudot8.");
-    eprintln!("If ratio >> 1.0 (e.g. >2x) → WhiteCrow dequant serial reads dominate. sudot8 WORTH building.");
+    eprintln!("split/spd = serial WhiteCrow / split WhiteCrow (>1 = split faster).");
+    eprintln!("The split moves the token range onto the grid (flash-decoding); its");
+    eprintln!("cost is the second merge launch + partial-buffer traffic.");
 }
