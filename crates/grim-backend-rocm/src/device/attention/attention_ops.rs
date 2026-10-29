@@ -1161,6 +1161,146 @@ impl AttentionOps for RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
+    /// WhiteCrow (u4 group-128) dense-arena attention: launches
+    /// `grim_qkv_attention_whitecrow`, which decodes the interleaved 67-byte
+    /// blocks inline (scale inside each block, no sidecar buffers). Contract
+    /// mirrors `qkv_attention_i4` minus the two scale arguments; head_dim is
+    /// further constrained to a multiple of 128 so WhiteCrow groups align to
+    /// head vectors (production Qwen: head_dim = 128, one 67 B block/head).
+    fn qkv_attention_whitecrow(
+        &self,
+        q: &dyn BackendStorage,
+        k_arena: &dyn BackendStorage,
+        v_arena: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        use grim_tensor::dtype::ArithType as AT;
+        let softcap: f32 = self.attn_logit_softcap();
+        let check = |s: &dyn BackendStorage, want: AT, what: &str| -> Result<()> {
+            let a = as_rocm(s)?;
+            if a.dtype.arith != want {
+                return Err(Error::Backend(format!(
+                    "qkv_attention_whitecrow: {what} must be {want:?}, got {:?}",
+                    a.dtype.arith
+                )));
+            }
+            if !a.device_ptr_is_valid() {
+                return Err(Error::Backend(format!(
+                    "qkv_attention_whitecrow: {what} lacks a valid device pointer"
+                )));
+            }
+            Ok(())
+        };
+        check(q, AT::F32, "q")?;
+        check(k_arena, AT::U8, "k_arena")?;
+        check(v_arena, AT::U8, "v_arena")?;
+
+        let dims = out_shape.dims();
+        let (seq_len, num_heads, head_dim) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else {
+            // The WhiteCrow arena's last axis is a head's BYTE count —
+            // (head_dim/128)*67 — not head_dim, so head_dim cannot be
+            // recovered from the arena shape (the 2-D fallback the i4 path
+            // uses would divide bytes by num_kv_heads and misread it).
+            return Err(Error::Shape(format!(
+                "qkv_attention_whitecrow: out_shape must be [seq, heads, dim] (the WhiteCrow \
+                 arena's byte-axis shape cannot yield head_dim), got {dims:?}"
+            )));
+        };
+        if num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(Error::Backend(
+                "qkv_attention_whitecrow: num_heads must be a positive multiple of num_kv_heads"
+                    .into(),
+            ));
+        }
+        if head_dim == 0 || head_dim > 256 || head_dim % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "qkv_attention_whitecrow: head_dim {head_dim} must be a multiple of 128 in \
+                 1..=256 (WhiteCrow groups are 128 values)"
+            )));
+        }
+        let window_lo_i: i32 = match window {
+            None => 0,
+            Some(w) => {
+                let abs_first = cache_offset as usize;
+                let win_lo = abs_first.saturating_sub(w.saturating_sub(1));
+                i32::try_from(win_lo)
+                    .map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
+            }
+        };
+        let storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![seq_len, num_heads * head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut qptr = dev_ptr(as_rocm(q)?)?;
+        let mut kptr = dev_ptr(as_rocm(k_arena)?)?;
+        let mut vptr = dev_ptr(as_rocm(v_arena)?)?;
+        let mut optr = dev_ptr(&storage)?;
+        let mut max_ptr: u64 = 0;
+        let mut sum_ptr: u64 = 0;
+        let mut nh = num_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut co = cache_offset as i32;
+        let mut isd = 1.0 / (head_dim as f32).sqrt();
+        let mut wlo = window_lo_i;
+        let mut sc = softcap;
+        let mut oproj_ptr: u64 = 0;
+        let mut odim: i32 = 0;
+        let mut fuseo: i32 = 0;
+        let mut alibi_ptr: u64 = 0;
+        let mut has_alibi: i32 = 0;
+
+        let grid = crate::HipDim3::new(seq_len as u32, num_heads as u32, 1);
+        let block_dim_x = if matches!(
+            self.props.wavefront_size,
+            crate::device::handles::WavefrontSize::W32
+        ) {
+            128
+        } else {
+            256
+        };
+        let block = crate::HipDim3::new(block_dim_x, 1, 1);
+        let stream = self.launch_compute_kernel(
+            "grim_qkv_attention_whitecrow",
+            grid,
+            block,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut max_ptr),
+                arg(&mut sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
+                arg(&mut wlo),
+                arg(&mut sc),
+                arg(&mut oproj_ptr),
+                arg(&mut odim),
+                arg(&mut fuseo),
+                arg(&mut alibi_ptr),
+                arg(&mut has_alibi),
+            ],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+
     /// WS-3A K2V4: mixed-width (2-bit K / 4-bit V) dense-arena attention.
     /// Same shape/window handling as `qkv_attention_i4`; the K side is packed
     /// four codes per byte, so `head_dim` must be a multiple of 4.

@@ -59,6 +59,18 @@ pub fn capture_fp8_pad_scratch() -> Option<&'static RocmStorage> {
     })
 }
 
+/// `DecodeGraphBuffers::kv_arena_bits` marker for the WhiteCrow (u4
+/// group-128 OSTQuant) arena.
+///
+/// WhiteCrow stores 4-bit codes, but `Some(4)` is taken by the int4 family
+/// (two codes per byte, `head_dim/2` byte strides, f32 scale sidecar) and the
+/// capture dispatch selects kernels from this value — so WhiteCrow records
+/// `67`, the BYTES of one group's block. 67 is the one width no other format
+/// can claim (int8 rows are `nkv*hd`, int4 `nkv*hd/2`, int2v4 `nkv*hd/4` at
+/// these geometries), and every consumer needs the block geometry anyway:
+/// a slot's byte extent is `max_ctx * nkv * (head_dim/128) * 67`.
+pub const KV_ARENA_BITS_WHITECROW: u32 = 67;
+
 /// Spec §Phase 1: owns all decode intermediates at fixed addresses.
 /// Allocated once at model load, never freed until unload.
 /// `batch` parameterizes all per-step slots as `[batch, dim]` so the same
@@ -143,7 +155,10 @@ pub struct DecodeGraphBuffers {
     /// the same policy the capture baked into the kernels.
     pub kv_ring: KvRingPolicy,
     /// Bits per KV code for the packed arenas this pool was built with: `None`
-    /// for f16/f32, `Some(8)`/`Some(4)`/`Some(2)` for int8/int4/int2v4. Set once
+    /// for f16/f32, `Some(8)`/`Some(4)`/`Some(2)` for int8/int4/int2v4, and
+    /// [`KV_ARENA_BITS_WHITECROW`] for WhiteCrow (4-bit codes in 67-byte
+    /// group-128 blocks — recorded as the block width so it cannot be
+    /// confused with the int4 family). Set once
     /// at allocation from the resolved `KvArenaFormat`; the capture dispatch
     /// reads it to pick the right device-total kernel pair.
     ///
@@ -1717,7 +1732,13 @@ impl DecodeGraphBuffers {
             // eager arenas come from the same format resolver, so a mismatch
             // means something reassigned the flag mid-run; fail loud rather
             // than quantize the prompt silently.
-            if arena_elem_bytes == 1 {
+            //
+            // WhiteCrow (`KV_ARENA_BITS_WHITECROW`) stores its bf16 scale +
+            // u8 zero INLINE in each 67-byte block: there is no f32 sidecar on
+            // either side, so its codes skip the sidecar block entirely and
+            // seed through the raw 1-byte/elem copy below (which also
+            // byte-compares eager vs graph).
+            if arena_elem_bytes == 1 && self.kv_arena_bits != Some(KV_ARENA_BITS_WHITECROW) {
                 if src.src_elem_bytes != 1 {
                     return Err(Error::Backend(format!(
                         "seed_kv_arena: layer {layer_idx} int8 graph arena but eager source is \

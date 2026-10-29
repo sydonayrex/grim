@@ -2692,6 +2692,13 @@ impl Qwen35Block {
             // too far. f32/f16 keep the element stride for the plain copy.
             let arena_slot_stride = match buffers.kv_arena_packed_width() {
                 Some(4) => buffers.max_ctx * (nkv * (hd / 2)),
+                // WhiteCrow: a slot's row-major block region in BYTES —
+                // `max_ctx * nkv * groups_per_head * 67`, the same geometry
+                // `kv_arena_head_extent` derives (div_ceil so a ragged head
+                // still covers its last partial group).
+                Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW) => {
+                    buffers.max_ctx * nkv * hd.div_ceil(128) * 67
+                }
                 _ => buffers.max_ctx * kv_stride,
             };
             let max_ctx = buffers.max_ctx;
@@ -2721,7 +2728,7 @@ impl Qwen35Block {
             // error here rather than a silent fallthrough to the 8-bit kernels.
             let packed_bits = buffers.kv_arena_packed_width();
             match packed_bits {
-                None | Some(8) | Some(4) => {}
+                None | Some(8) | Some(4) | Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW) => {}
                 Some(bits) => {
                     return Err(grim_core::error::Error::Backend(format!(
                         "graph KV append: no device-total kernel pair for {bits}-bit KV codes (eager fallback)"
@@ -2730,6 +2737,10 @@ impl Qwen35Block {
             }
             let arena_i8 = packed_bits == Some(8);
             let arena_i4 = packed_bits == Some(4);
+            // WhiteCrow records the BLOCK width (67 B / 128 values) rather
+            // than a code width, so it is matched against the marker const —
+            // never against `Some(4)`, which is the int4 family (sidecar).
+            let arena_whitecrow = packed_bits == Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW);
             // The i4 kernels' per-row and per-head code terms are PACKED BYTES
             // (`kv_stride/2`, `head_dim/2`), so the slot stride they receive
             // must be the arena's BYTE extent. `arena_slot_stride` is ALREADY
@@ -2815,6 +2826,34 @@ impl Qwen35Block {
                     )
                     .map_err(|e| {
                         grim_core::error::Error::Backend(format!("kv_append_i4 {tag}: {e}"))
+                    })?;
+                }
+            } else if arena_whitecrow {
+                // WhiteCrow: append + quantize in one node — the bf16 scale
+                // and u8 zero ride INLINE in each 67-byte block, so unlike
+                // i8/i4 there is no sidecar to fetch. `arena_slot_stride` is
+                // BYTES (the `KV_ARENA_BITS_WHITECROW` arm above); `kv_stride`
+                // stays in ELEMENTS — it is the f32 source row the quantizer
+                // reads, not the packed destination row.
+                for (src, dst, tag) in [
+                    (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], "k"),
+                    (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], "v"),
+                ] {
+                    grim_backend_rocm::launch_kv_append_whitecrow(
+                        dev,
+                        src,
+                        &buffers.layer_totals[layer_idx],
+                        dst,
+                        kv_stride,
+                        nkv,
+                        hd,
+                        steps,
+                        batch,
+                        arena_slot_stride,
+                        buffers.kv_ring,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("kv_append_whitecrow {tag}: {e}"))
                     })?;
                 }
             } else {
@@ -2941,6 +2980,40 @@ impl Qwen35Block {
                 )
                 .map_err(|e| {
                     grim_core::error::Error::Backend(format!("qkv_attention_dev_i4: {e}"))
+                })?;
+            } else if arena_whitecrow {
+                // WhiteCrow: the i4 argument list minus BOTH scale sidecars
+                // (inline in each block) —24 params, `arena_slot_stride` in
+                // BYTES. Same `steps`/`0`/`0.0` decode contract as the f32/i4
+                // arms: one query at the last live row, no window, no softcap.
+                grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    &buffers.v_arena[layer_idx],
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.layer_totals[layer_idx],
+                    nh as u32,
+                    nkv as u32,
+                    hd as u32,
+                    steps as u32,
+                    steps as u32,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    0.0,
+                    buffers.attn_dummy_for(dev.ordinal()),
+                    0,
+                    0,
+                    buffers.attn_dummy_for(dev.ordinal()),
+                    0,
+                    batch,
+                    arena_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("qkv_attention_dev_whitecrow: {e}"))
                 })?;
             } else {
                 grim_backend_rocm::launch_qkv_attention_dev_batch(
@@ -4071,6 +4144,11 @@ impl DecodeGraphModel for Qwen35 {
                 grim_backend_rocm::KvArenaFormat::Int8 => Some(8),
                 grim_backend_rocm::KvArenaFormat::Int4 => Some(4),
                 grim_backend_rocm::KvArenaFormat::Int2V4 => Some(2),
+                // WhiteCrow: the BLOCK width (67 B), not a code width — see
+                // `KV_ARENA_BITS_WHITECROW`.
+                grim_backend_rocm::KvArenaFormat::WhiteCrow => {
+                    Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW)
+                }
                 _ => None,
             };
             if kv_dt.arith != grim_tensor::ArithType::F32 {
@@ -4085,6 +4163,12 @@ impl DecodeGraphModel for Qwen35 {
                 let packed_factor: f64 = match fmt {
                     grim_backend_rocm::KvArenaFormat::Int4
                     | grim_backend_rocm::KvArenaFormat::Int2V4 => 0.5,
+                    // WhiteCrow: 67 bytes per 128 values. The base arena's
+                    // last dim is `nkv*hd` ELEMENTS (see the `n_k` passed at
+                    // allocation), so scaling by 67/128 lands exactly on the
+                    // block extent `nkv * (hd/128) * 67` — exact in f64
+                    // (power-of-two denominator) for every valid head_dim.
+                    grim_backend_rocm::KvArenaFormat::WhiteCrow => 67.0 / 128.0,
                     _ => 1.0,
                 };
                 for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
@@ -4113,7 +4197,12 @@ impl DecodeGraphModel for Qwen35 {
             }
             // Packed codes need their f32 scale sidecars before capture. One f32
             // per (row, kv head) per side — the same layout at every width.
-            if kv_dt.arith == grim_tensor::ArithType::U8 {
+            // WhiteCrow has NO sidecar (scale + zero are inline in each block),
+            // so allocating one here would leave a dead buffer the append never
+            // writes — skip it explicitly.
+            if kv_dt.arith == grim_tensor::ArithType::U8
+                && fmt != grim_backend_rocm::KvArenaFormat::WhiteCrow
+            {
                 let n_kv = self.cfg.num_kv_heads;
                 buffers.allocate_packed_kv_scales(&dev, n_kv).map_err(|e| {
                     grim_core::error::Error::Backend(format!("graph packed KV scales: {e}"))
@@ -4792,7 +4881,16 @@ impl DecodeGraphModel for Qwen35 {
 
             // int8 eager arenas hand the seeder their scale sidecars so the
             // graph's codes AND scales are copied bit-exact.
-            let eager_is_i8 = k_rocm.dtype().arith == grim_tensor::ArithType::U8;
+            //
+            // WhiteCrow arenas are U8 too, but their bf16 scale + u8 zero are
+            // INLINE in each 67-byte block — `k_scales_device` is None for
+            // them, so treating one as int8 would fail the sidecar lookup
+            // above with a misleading "int8 KV arena without a sidecar".
+            let eager_is_i8 = k_rocm.dtype().arith == grim_tensor::ArithType::U8
+                && !matches!(
+                    crate::qwen35::kv_arena_format_qwen(&self.device),
+                    grim_backend_rocm::KvArenaFormat::WhiteCrow
+                );
             let (ksc_ptr, vsc_ptr) = if eager_is_i8 {
                 let ks = cache
                     .k_scales_device

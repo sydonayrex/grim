@@ -1505,6 +1505,282 @@ fn int4_append_quantize_parity() {
     );
 }
 
+/// WhiteCrow (u4 group-128) append gate: `launch_kv_quantize_rows_whitecrow`
+/// must be BIT-IDENTICAL to the host `grim_quant::quant_whitecrow` — same
+/// 67-byte blocks (64 B u4 nibbles LE + 2 B LE bf16 scale + 1 B u8 zero),
+/// same block order (`g = row*nkv*gph + kh*gph + gi`, block at `g*67`), and
+/// the same truncating bf16 conversion. Bit-exactness is what lets the dense
+/// WhiteCrow attention kernel trust arena bytes decoded on-device with the
+/// production host decoder — no tolerance, any mismatch is a bug.
+///
+/// Rows 2/3 are all-positive / all-negative on purpose: they drive the affine
+/// `zero = round(-min/scale)` below 0 and above 15, exercising BOTH clamp
+/// branches on both sides of the comparison.
+#[test]
+#[ignore]
+fn whitecrow_append_quantize_parity_bit_exact() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    // head_dim MUST be a multiple of 128 so 128-value groups align to head
+    // vectors; 128 = one 67-byte block per head (the production Qwen case).
+    let (n_rows, nkv, head_dim) = (4_usize, 2_usize, 128_usize);
+    let stride = nkv * head_dim;
+    let groups_per_head = head_dim / 128;
+    let block = 67_usize;
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let src: Vec<f32> = (0..n_rows * stride)
+        .map(|i| {
+            let v = ((i * 37 % 191) as f32) / 191.0 * 6.0 - 3.0;
+            match i / stride {
+                // All-positive row: -min/scale < 0 -> zero clamps to 0.
+                2 => v.abs() + 0.1,
+                // All-negative row in [-3.0, -0.1]: -min/scale rounds above
+                // 15 -> zero clamps to 15.
+                3 => -(0.1 + (i * 7 % 29) as f32 / 29.0 * 2.9),
+                _ => v,
+            }
+        })
+        .collect();
+    let src_t = dev
+        .from_cpu(&src, &Shape::from_slice(&[n_rows, stride]), DType::F32)
+        .unwrap();
+    let dst_bytes = n_rows * nkv * groups_per_head * block;
+    let dst = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[dst_bytes]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+        &dev,
+        src_t.as_ref(),
+        0,
+        &dst,
+        0,
+        n_rows,
+        stride,
+        nkv,
+        head_dim,
+    )
+    .unwrap();
+    dev.synchronize();
+    let got = dst.copy_to_host().unwrap();
+    assert_eq!(got.len(), dst_bytes, "dst allocation size mismatch");
+
+    // Host reference: quantize each (row, kv_head) head vector as its own
+    // slice. `quant_whitecrow` chunks from index 0, which — head_dim % 128 == 0
+    // — are exactly the head's groups in order.
+    let mut expected = vec![0u8; dst_bytes];
+    for r in 0..n_rows {
+        for kh in 0..nkv {
+            let lo = r * stride + kh * head_dim;
+            let blocks = grim_quant::quant_whitecrow(&src[lo..lo + head_dim])
+                .expect("host quant_whitecrow");
+            assert_eq!(blocks.len(), groups_per_head * block);
+            let g0 = (r * nkv + kh) * groups_per_head;
+            expected[g0 * block..(g0 + groups_per_head) * block].copy_from_slice(&blocks);
+        }
+    }
+    if got != expected {
+        let first = got
+            .iter()
+            .zip(expected.iter())
+            .position(|(a, b)| a != b)
+            .expect("lengths equal but no diff?");
+        panic!(
+            "device WhiteCrow bytes differ from host quant_whitecrow: first mismatch \
+             at byte {first} (block {}, offset {}): got {:#04x}, want {:#04x}",
+            first / block,
+            first % block,
+            got[first],
+            expected[first],
+        );
+    }
+    eprintln!("[whitecrow-append] rows={n_rows} nkv={nkv} — device bytes bit-exact vs host");
+}
+
+/// Dense WhiteCrow attention gate: the GPU `qkv_attention_whitecrow` output
+/// must match a host reference that decodes the SAME 67-byte blocks with the
+/// production `grim_quant::dequant_whitecrow` and then runs plain f32
+/// attention. Because the device quantizer is bit-exact vs host (see
+/// `whitecrow_append_quantize_parity_bit_exact`), any divergence here is in
+/// the ATTENTION kernel's decode/softmax, not in the bytes — this pins the
+/// inline `scale * (nibble - zero)` decode, the bf16 scale widening, and the
+/// head-vector block addressing (`g = row*nkv*gph + kh*gph + gi` at `g*67`).
+/// head_dim must be 128 (one block per head); the f32-fidelity gate is
+/// second and deliberately loose — it measures the u4 grid, not the kernel.
+#[test]
+#[ignore]
+fn whitecrow_dense_attention_matches_host_decode_reference() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 128, 6);
+    let cache_offset = 0usize;
+    let stride = num_kv_heads * head_dim;
+    let groups_per_head = head_dim / 128;
+    let block = 67_usize;
+
+    let q_data: Vec<f32> = (0..seq_len * num_heads * head_dim)
+        .map(|i| (i as f32 * 0.13).sin())
+        .collect();
+    let k_data: Vec<f32> = (0..kv_seq_len * stride)
+        .map(|i| (i as f32 * 0.11).cos())
+        .collect();
+    let v_data: Vec<f32> = (0..kv_seq_len * stride)
+        .map(|i| (i as f32 * 0.07).sin())
+        .collect();
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+
+    // Device path: quantize K/V on-device, then attend over the byte arena.
+    let q32 = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    use grim_tensor::ArithType;
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let quant = |data: &[f32]| {
+        let up = dev
+            .from_cpu(data, &Shape::from_slice(&[kv_seq_len, stride]), DType::F32)
+            .unwrap();
+        let arena = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len * num_kv_heads * groups_per_head * block]),
+            u8dt.clone(),
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+            &dev,
+            up.as_ref(),
+            0,
+            &arena,
+            0,
+            kv_seq_len,
+            stride,
+            num_kv_heads,
+            head_dim,
+        )
+        .unwrap();
+        arena
+    };
+    let k_arena = quant(&k_data);
+    let v_arena = quant(&v_data);
+    dev.synchronize();
+    let (out, h) = dev
+        .qkv_attention_whitecrow(
+            q32.as_ref(),
+            &k_arena,
+            &v_arena,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset as u32,
+            None,
+            &out_shape,
+        )
+        .unwrap();
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+
+    // Host reference: re-quantize each head vector with the production host
+    // encoder (bit-exact vs the device, proven by the append gate), dequant
+    // with the production host decoder, then run the SAME `reference_attention`
+    // the f32 tests use. Layout per row: heads interleaved, so block
+    // g = row*nkv*gph + kh*gph + gi — reconstruct that layout from the
+    // per-head quantized slices.
+    let mut k_arena_host = vec![0u8; kv_seq_len * num_kv_heads * groups_per_head * block];
+    let mut v_arena_host = vec![0u8; kv_seq_len * num_kv_heads * groups_per_head * block];
+    for r in 0..kv_seq_len {
+        for kh in 0..num_kv_heads {
+            let lo = r * stride + kh * head_dim;
+            let kb = grim_quant::quant_whitecrow(&k_data[lo..lo + head_dim]).expect("k host");
+            let vb = grim_quant::quant_whitecrow(&v_data[lo..lo + head_dim]).expect("v host");
+            let g0 = (r * num_kv_heads + kh) * groups_per_head;
+            k_arena_host[g0 * block..(g0 + groups_per_head) * block].copy_from_slice(&kb);
+            v_arena_host[g0 * block..(g0 + groups_per_head) * block].copy_from_slice(&vb);
+        }
+    }
+    let mut k_dq = Vec::with_capacity(kv_seq_len * stride);
+    let mut v_dq = Vec::with_capacity(kv_seq_len * stride);
+    for r in 0..kv_seq_len {
+        for kh in 0..num_kv_heads {
+            let g0 = (r * num_kv_heads + kh) * groups_per_head;
+            let bs = &k_arena_host[g0 * block..(g0 + groups_per_head) * block];
+            k_dq.extend(grim_quant::dequant_whitecrow(bs, head_dim).expect("k dequant"));
+            let bs = &v_arena_host[g0 * block..(g0 + groups_per_head) * block];
+            v_dq.extend(grim_quant::dequant_whitecrow(bs, head_dim).expect("v dequant"));
+        }
+    }
+    let want = reference_attention(
+        &q_data,
+        &k_dq,
+        &v_dq,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
+
+    // Gate 1 (tight): device vs host decode. Identical bytes + identical
+    // decode math leave only expf/softmax reduction-order rounding.
+    assert_eq!(got.len(), want.len(), "output length mismatch");
+    let mut worst = 0.0f32;
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        let denom = g.abs().max(w.abs()).max(1e-6);
+        let rel = ((g - w) / denom).abs();
+        if rel > worst {
+            worst = rel;
+        }
+        if rel > 0.02 && !(g.is_finite()) {
+            panic!("non-finite output at {i}: got={g}");
+        }
+    }
+    eprintln!("[whitecrow-dense] vs host-decode reference: worst rel err = {worst:.6}");
+    assert!(
+        worst < 0.02,
+        "dense WhiteCrow attention diverged from host decode reference: worst rel err {worst:.6}"
+    );
+
+    // Gate 2 (loose): end-to-end fidelity vs the ORIGINAL f32 KV — this
+    // measures the u4 group-128 affine grid, not the kernel. Metric is
+    // ABSOLUTE error: the output is a convex combination of V rows, so its
+    // error is bounded by the per-element grid error (~scale/2 with
+    // scale = range/15 ~ 0.13 here); a relative metric would blow up at
+    // output components that cross zero, which is noise, not signal.
+    let want_f32 = reference_attention(
+        &q_data,
+        &k_data,
+        &v_data,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
+    let mut worst_f = 0.0f32;
+    for (&g, &w) in got.iter().zip(want_f32.iter()) {
+        worst_f = worst_f.max((g - w).abs());
+    }
+    eprintln!("[whitecrow-dense] vs f32 reference: worst abs err = {worst_f:.4}");
+    assert!(
+        worst_f < 0.1,
+        "dense WhiteCrow f32 fidelity too low: worst abs err {worst_f:.4}"
+    );
+}
+
 /// Phase 3 int4: kv_len=1 must broadcast V rows.
 #[test]
 #[ignore]

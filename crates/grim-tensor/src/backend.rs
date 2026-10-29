@@ -1087,6 +1087,31 @@ pub trait AttentionOps {
         ))
     }
 
+    /// WhiteCrow (u4 group-128) dense-arena attention. `k_arena`/`v_arena` are
+    /// interleaved 67-byte blocks (64 B LE u4 nibbles + 2 B LE bf16 scale +
+    /// 1 B u8 zero point) with the scale inline — there is NO scale sidecar,
+    /// which is why this takes no `k_scales`/`v_scales`. Same contract as
+    /// [`Self::qkv_attention_i4`] otherwise. head_dim must be a multiple of
+    /// 128 (WhiteCrow groups align to head vectors) and <= 256. Backends
+    /// without a WhiteCrow reader return `Unimplemented` and callers fall
+    /// back to the dense path.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_whitecrow(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_arena: &dyn BackendStorage,
+        _v_arena: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_whitecrow not implemented for this backend".into(),
+        ))
+    }
+
     /// Paged (block-table) attention over a QUANTIZED KV cache.
     ///
     /// Distinct from [`Self::qkv_attention_paged`], whose kernel reads page rows

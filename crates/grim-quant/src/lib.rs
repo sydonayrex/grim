@@ -204,7 +204,105 @@ pub fn quant_ostquant_w4_group128(
     Ok((qw, sc, zr))
 }
 
-/// GreyCrow u4 group-32 layout version.
+/// Quantize f32 values to interleaved WhiteCrow KV blocks (67 bytes per 128 values:
+/// 64 bytes u4 codes + 2 bytes bf16 scale + 1 byte u8 zero).
+pub fn quant_whitecrow(data: &[f32]) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    const GROUP_SIZE: usize = 128;
+    let n_groups = data.len().div_ceil(GROUP_SIZE);
+    let mut out = Vec::with_capacity(n_groups * 67);
+
+    let to_bf16 = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+    let from_bf16 = |bits: u16| -> f32 { f32::from_bits((bits as u32) << 16) };
+
+    for chunk in data.chunks(GROUP_SIZE) {
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for &v in chunk {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        if chunk.len() < GROUP_SIZE {
+            min = min.min(0.0);
+            max = max.max(0.0);
+        }
+        let d = ((max - min) / 15.0).max(1e-30);
+        let d_bf16 = from_bf16(to_bf16(d));
+        let mut zero = (-min / d_bf16).round();
+        if zero < 0.0 {
+            zero = 0.0;
+        }
+        if zero > 15.0 {
+            zero = 15.0;
+        }
+        let zero = zero as u8;
+
+        let mut codes = [0u8; 64];
+        for (i, &v) in chunk.iter().enumerate() {
+            let nib = ((v / d_bf16).round() as i32 + zero as i32).clamp(0, 15) as u8;
+            let byte_i = i >> 1;
+            if (i & 1) == 0 {
+                codes[byte_i] |= nib & 0x0F;
+            } else {
+                codes[byte_i] |= (nib & 0x0F) << 4;
+            }
+        }
+        // If partial group, remaining elements are 0.0
+        if chunk.len() < GROUP_SIZE {
+            let zero_nib = ((0.0f32 / d_bf16).round() as i32 + zero as i32).clamp(0, 15) as u8;
+            for i in chunk.len()..GROUP_SIZE {
+                let byte_i = i >> 1;
+                if (i & 1) == 0 {
+                    codes[byte_i] |= zero_nib & 0x0F;
+                } else {
+                    codes[byte_i] |= (zero_nib & 0x0F) << 4;
+                }
+            }
+        }
+
+        out.extend_from_slice(&codes);
+        let sc_bits = to_bf16(d_bf16);
+        out.extend_from_slice(&sc_bits.to_le_bytes());
+        out.push(zero);
+    }
+    Ok(out)
+}
+
+/// Dequantize interleaved WhiteCrow KV blocks (67 bytes per 128 values) to f32.
+pub fn dequant_whitecrow(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    const GROUP_SIZE: usize = 128;
+    let n_groups = num_values.div_ceil(GROUP_SIZE);
+    if data.len() < n_groups * 67 {
+        return Err(Error::Backend(format!(
+            "dequant_whitecrow: expected at least {} bytes, got {}",
+            n_groups * 67,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_values);
+    for g in 0..n_groups {
+        let blk = &data[g * 67..(g + 1) * 67];
+        let sc_bits = u16::from_le_bytes([blk[64], blk[65]]);
+        let sc = f32::from_bits((sc_bits as u32) << 16);
+        let zero = blk[66] as f32;
+        let count = (num_values - g * GROUP_SIZE).min(GROUP_SIZE);
+        for i in 0..count {
+            let b = blk[i >> 1];
+            let nib = if (i & 1) == 0 {
+                (b & 0x0F) as f32
+            } else {
+                ((b >> 4) & 0x0F) as f32
+            };
+            out.push(sc * (nib - zero));
+        }
+    }
+    Ok(out)
+}
 ///
 /// Bumped whenever the GreyCrow byte layout changes, and mixed into the
 /// on-disk cache key of any GreyCrow tensor cache, for the same reason as

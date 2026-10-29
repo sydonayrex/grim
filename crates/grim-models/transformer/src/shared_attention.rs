@@ -706,6 +706,84 @@ pub fn fused_or_scalar_attention_i2v4_arena(
     )
 }
 
+/// WhiteCrow (u4 group-128) dense-arena attention for a device-resident
+/// query. `k_arena`/`v_arena` hold interleaved 67-byte blocks with the scale
+/// inline, so unlike the i8/i4/i2v4 wrappers there are no scale arguments.
+/// The arena's byte geometry is fixed by `head_dim` (must be a multiple of
+/// 128), which the backend re-validates.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_whitecrow_arena_device(
+    q_st: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    // 3-D on purpose, same as the i8 wrapper: the packed arena's last axis
+    // is a head's BYTE count ((head_dim/128)*67), so the geometry must come
+    // from here — deriving head_dim from the arena shape would misread bytes
+    // as elements. `qkv_attention_whitecrow` flattens the returned storage.
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_whitecrow(
+        q_st,
+        k_arena,
+        v_arena,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// WhiteCrow (u4 group-128) dense-arena attention with a host-resident
+/// query: [`fused_or_scalar_attention_whitecrow_arena_device`] after
+/// uploading `q`. The upload is the only H2D here; K/V history (the
+/// interleaved 67-byte blocks) never leaves the device.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_whitecrow_arena(
+    q: &[f32],
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_whitecrow_arena_device(
+        q_st.as_ref(),
+        k_arena,
+        v_arena,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
 /// Paged attention entry point (WI-X2): operates on device-resident KV pages via block tables,
 /// avoiding full-history CPU-to-GPU re-uploading on decode steps.
 #[allow(clippy::too_many_arguments)]

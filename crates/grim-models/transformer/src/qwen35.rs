@@ -1403,6 +1403,25 @@ impl Qwen35Block {
                     cache.k_scales_device.as_ref(),
                     cache.v_scales_device.as_ref(),
                 ) {
+                    // WhiteCrow first: its 67-byte blocks carry the scale
+                    // INLINE, so k/v_scales_device are None and the arm must
+                    // intercept BEFORE the `_` f32 fallthrough — falling
+                    // through would hand the byte-arena to the f32 reader
+                    // and silently reinterpret quantized bytes as floats.
+                    _ if format == grim_backend_rocm::KvArenaFormat::WhiteCrow => {
+                        crate::shared_attention::fused_or_scalar_attention_whitecrow_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            v_dev.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
                     (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int2V4 => {
                         crate::shared_attention::fused_or_scalar_attention_i2v4_arena(
                             &q_all,
@@ -4101,6 +4120,24 @@ fn attention_layer_d2d(
         cache.k_scales_device.as_ref(),
         cache.v_scales_device.as_ref(),
     ) {
+        // WhiteCrow first (same rationale as the host-query dispatch): the
+        // scale lives INSIDE each 67-byte block, so scales are None and this
+        // arm must beat the `_` f32 fallthrough or the byte arena would be
+        // read as raw floats.
+        _ if format == grim_backend_rocm::KvArenaFormat::WhiteCrow => {
+            crate::shared_attention::fused_or_scalar_attention_whitecrow_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
         (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int2V4 => {
             crate::shared_attention::fused_or_scalar_attention_i2v4_arena_device(
                 q_rope.storage().as_ref(),
@@ -4322,6 +4359,12 @@ pub(crate) fn quantize_kv_block(
         F::NvFp4 => {
             let bytes = grim_quant::quant_nvfp4(data).map_err(|e| {
                 grim_core::error::Error::Backend(format!("quant_nvfp4 failed: {e}"))
+            })?;
+            Ok((bytes, 1.0))
+        }
+        F::WhiteCrow => {
+            let bytes = grim_quant::quant_whitecrow(data).map_err(|e| {
+                grim_core::error::Error::Backend(format!("quant_whitecrow failed: {e}"))
             })?;
             Ok((bytes, 1.0))
         }
@@ -4706,6 +4749,23 @@ pub(crate) fn curdkv_compact_arena(
     let (Some(k_dev), Some(v_dev)) = (cache.k_device.as_ref(), cache.v_device.as_ref()) else {
         return Ok(abs);
     };
+    // Storage truth, not the env: the leverage scores below are host f32s, so
+    // only F32/F16 arenas can be gathered. int8/int4 are already caught by the
+    // sidecar check above; WhiteCrow is the case that is NOT — it is byte-
+    // addressed (U8) like them but carries its bf16 scale + u8 zero INLINE in
+    // each 67-byte block, so it has no sidecar and sails past that check into
+    // the f32 D2H below, where the byte arena either reinterprets its codes as
+    // floats or fails late on the shape. Refuse it here, loud and early.
+    {
+        let arith = k_dev.dtype().arith;
+        if arith != grim_tensor::ArithType::F32 && arith != grim_tensor::ArithType::F16 {
+            return Err(grim_core::error::Error::Backend(format!(
+                "curdkv compaction: dense KV arena dtype {arith:?} is not F32/F16 (packed \
+                 formats such as WhiteCrow/int8/int4 store bytes, not f32 rows) and is not \
+                 supported yet"
+            )));
+        }
+    }
     // The one D2H on the eviction path, once per boundary: leverage scores are
     // a host computation over the live rows.
     let k_host = k_dev.to_cpu_vec_f32()?;
@@ -4945,7 +5005,11 @@ pub(crate) fn kv_arena_dtype_for(format: grim_backend_rocm::KvArenaFormat) -> DT
         // WS-3A: byte-addressed like int8/int4 so the arena allocates, but
         // `ensure_arena_format_supported` refuses it before any use — the
         // 2-bit-K kernels do not exist.
-        F::Int8 | F::Int4 | F::Int2V4 => DType {
+        //
+        // WhiteCrow is also byte-addressed: its arena is a sequence of
+        // interleaved 67-byte blocks (64 B u4 codes + 2 B bf16 scale + 1 B u8
+        // zero per 128 values), so the storage element is a U8 byte.
+        F::Int8 | F::Int4 | F::Int2V4 | F::WhiteCrow => DType {
             arith: ArithType::U8,
             storage: Storage::Native,
         },
@@ -4981,6 +5045,12 @@ pub(crate) fn kv_arena_head_extent(
         F::F32 | F::F16 | F::Int8 => head_dim,
         F::Int4 => head_dim / 2,
         F::Int2V4 => head_dim / 2,
+        // WhiteCrow: one 67-byte block per 128 values of the head vector, so a
+        // head costs `ceil(head_dim/128) * 67` bytes. The block boundaries align
+        // with head-vector starts exactly when `head_dim % 128 == 0` (the
+        // production Qwen head_dim = 128 case); the append/attention paths
+        // enforce that alignment rather than silently straddling heads.
+        F::WhiteCrow => (head_dim.div_ceil(128)) * 67,
     }
 }
 
@@ -5004,11 +5074,17 @@ pub(crate) fn kv_arena_bytes_per_kv_elem(format: grim_backend_rocm::KvArenaForma
         F::Int8 => 1.0,
         // Key 0.25, value 0.5; the reservation takes the wider side.
         F::Int4 | F::Int2V4 => 0.5,
+        // WhiteCrow: the amortized width of its interleaved blocks — 67 bytes
+        // per 128 values (u4 codes + inline bf16 scale + u8 zero).
+        F::WhiteCrow => 67.0 / 128.0,
     }
 }
 
 /// Scale-sidecar BYTES one token row costs: one f32 per (row, kv head) for K
 /// and again for V. Zero for the formats that store K/V directly.
+///
+/// WhiteCrow carries its scale/zero INLINE in the 67-byte blocks, so it also
+/// costs zero sidecar bytes.
 pub(crate) fn kv_arena_row_scale_bytes(
     format: grim_backend_rocm::KvArenaFormat,
     nkv: usize,
@@ -5016,7 +5092,7 @@ pub(crate) fn kv_arena_row_scale_bytes(
     use grim_backend_rocm::KvArenaFormat as F;
     match format {
         F::Int8 | F::Int4 | F::Int2V4 => nkv * 4 * 2,
-        F::F32 | F::F16 => 0,
+        F::F32 | F::F16 | F::WhiteCrow => 0,
     }
 }
 
@@ -5039,11 +5115,13 @@ pub(crate) fn ensure_arena_format_supported(device: &Device) -> Result<()> {
 }
 
 /// Per-(row, kv-head) f32 scales sidecar dtype for int8/int4 formats.
-/// `None` for F32/F16 (no sidecar).
+/// `None` for F32/F16 (no sidecar) and for WhiteCrow (scales ride inline in
+/// the 67-byte blocks).
 fn kv_arena_scale_dtype(device: &Device) -> Option<DType> {
     use grim_backend_rocm::KvArenaFormat as F;
     match kv_arena_format_qwen(device) {
         F::Int8 | F::Int4 | F::Int2V4 => Some(DType::F32),
+        F::WhiteCrow => None, // inline bf16 scale + u8 zero per 128-value block
         _ => None,
     }
 }
@@ -5087,6 +5165,49 @@ fn arena_append_kv_rows<'a>(
     let stride = nkv * head_dim;
     let kv_elems = n_tok_rows * stride;
     let format = kv_arena_format_qwen(device);
+    if matches!(format, F::WhiteCrow) {
+        // WhiteCrow: interleaved 67-byte blocks with INLINE bf16 scale + u8
+        // zero — no f32 sidecar, so `k_scales`/`v_scales` are unused here. One
+        // block per 128 values; `head_dim % 128 == 0` keeps groups aligned to
+        // head vectors. Byte offset of the append point is `row_off` token
+        // rows, each `nkv * (head_dim/128) * 67` bytes.
+        if head_dim % 128 != 0 {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "WhiteCrow KV append: head_dim {head_dim} must be a multiple of 128 \
+                 (got {}); per-128 groups cannot align to head vectors",
+                head_dim
+            )));
+        }
+        let ordinal = k_dst.device_ordinal() as usize;
+        let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let row_bytes = nkv * (head_dim / 128) * 67;
+        let dst_off = row_off * row_bytes;
+        grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+            rocm.as_ref(),
+            k_src,
+            0,
+            k_dst,
+            dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+            rocm.as_ref(),
+            v_src,
+            0,
+            v_dst,
+            dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        return Ok(());
+    }
     if !matches!(format, F::Int8 | F::Int4 | F::Int2V4) {
         let dst_off = row_off * stride;
         arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, 0, kv_elems)?;
@@ -5289,17 +5410,18 @@ fn kv_quant_format() -> Option<grim_tensor::PagedKvQuantFormat> {
         Ok("fp8" | "fp8_e4m3") => Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3),
         Ok("nutcracker" | "nutfp4" | "nut_fp4") => Some(grim_tensor::PagedKvQuantFormat::NutFp4),
         Ok("nvfp4" | "nv_fp4" | "fp4") => Some(grim_tensor::PagedKvQuantFormat::NvFp4),
+        Ok("whitecrow" | "w4a4" | "white_crow") => Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
+        Ok("off" | "none" | "f32" | "dense") => None,
         Ok(other) => {
-            // Fail loud rather than silently falling back to f32: a user who
-            // asked for quantized KV and got a 32 GB arena would otherwise see
-            // an OOM with no indication the setting was ignored.
+            // Fail loud rather than silently falling back: a user who
+            // asked for an unsupported format should see the warning.
             eprintln!(
                 "[qwen35] GRIM_KV_QUANT={other:?} is not a supported paged KV format \
-                 (int8 | fp8 | nutcracker | nvfp4); using the dense f32 arena"
+                 (whitecrow | int8 | fp8 | nutcracker | nvfp4); using default whitecrow"
             );
-            None
+            Some(grim_tensor::PagedKvQuantFormat::WhiteCrow)
         }
-        _ => None,
+        _ => Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
     }
 }
 
@@ -5318,9 +5440,11 @@ pub(crate) fn packed_kv_bytes(n_values: usize, fmt: grim_tensor::PagedKvQuantFor
         F::MxFp4 => n_values.div_ceil(32) * 17,
         F::MxFp8 => n_values.div_ceil(32) * 33,
         // WhiteCrow: per 128 values - 64 B u4 codes + 2 B bf16 scale + 1 B zero.
-        // The packed pool has no WhiteCrow KV decode leg yet, so the arena
-        // selection arm above refuses it before this size is ever needed; the
-        // arm exists so the enum stays exhaustively matched.
+        // `div_ceil` on the group count (not the total) keeps a ragged KV
+        // length correct: a partial group still costs its inline scale byte,
+        // exactly as the host encoder and the paged device kernels lay out.
+        // This is live, not vestigial — the paged WhiteCrow decode kernels
+        // read this layout (`shared_attention.rs` sizes the pool with it).
         F::WhiteCrow => n_values.div_ceil(128) * 67,
     }
 }
@@ -6421,26 +6545,20 @@ mod tests {
             ("fp8", Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3)),
             ("nutcracker", Some(grim_tensor::PagedKvQuantFormat::NutFp4)),
             ("nvfp4", Some(grim_tensor::PagedKvQuantFormat::NvFp4)),
+            ("whitecrow", Some(grim_tensor::PagedKvQuantFormat::WhiteCrow)),
+            ("off", None),
         ] {
             unsafe { std::env::set_var("GRIM_KV_QUANT", val) };
             assert_eq!(kv_quant_format(), expect, "GRIM_KV_QUANT={val}");
             unsafe { std::env::remove_var("GRIM_KV_QUANT") };
         }
-        // f16 is deliberately rejected: the dense arena's f16 reader is a
-        // different representation, and the f32<->f16 cast is unverified.
-        unsafe { std::env::set_var("GRIM_KV_QUANT", "f16") };
-        assert_eq!(
-            kv_quant_format(),
-            None,
-            "f16 must not select a paged format"
-        );
-        unsafe { std::env::set_var("GRIM_KV_QUANT", "bogus") };
-        assert_eq!(
-            kv_quant_format(),
-            None,
-            "unknown value must not select a format"
-        );
+        // Defaults to WhiteCrow when unset
         unsafe { std::env::remove_var("GRIM_KV_QUANT") };
+        assert_eq!(
+            kv_quant_format(),
+            Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
+            "unset GRIM_KV_QUANT must default to WhiteCrow"
+        );
     }
 
     /// Packed sizing must match the real host encoders byte for byte, or the

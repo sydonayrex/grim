@@ -16,6 +16,10 @@
 //!    parser but has NO capturable kernel pair; capture must REFUSE (eager
 //!    fallback), never run the 8-bit kernels over 4-codes-per-byte keys.
 //! 3. `qwen35_packed_graph_refusal_int4` — same for int4.
+//! 4. `qwen35_whitecrow_graph_replay_matches_eager` — WhiteCrow arena at
+//!    head_dim 128: the engagement proof is the 67-BLOCK width plus EMPTY
+//!    scale sidecars (its scale + zero are inline), and replay must match the
+//!    WhiteCrow eager path.
 //!
 //! Gated on `GRIM_GPU_TEST=1` + ROCm device. All three mutate process-global
 //! env, so they serialize on `KV_FORMAT_ENV_LOCK`.
@@ -156,6 +160,122 @@ fn qwen35_packed_graph_replay_matches_eager() {
         unsafe {
             std::env::set_var("GRIM_KV_ARENA", "f32");
         }
+    }
+}
+
+/// WhiteCrow (u4 group-128 OSTQuant) is the third format with a capturable
+/// kernel pair, and it differs from int8/int4 in two ways the engagement proof
+/// has to express rather than assume:
+///
+/// 1. Its arena records the BLOCK width — [`grim_backend_rocm::KV_ARENA_BITS_WHITECROW`],
+///    67 bytes per 128 values — not a code width. Matching it against
+///    `Some(4)` would hand the int4 pair an interleaved-block arena (the
+///    historical int2v4 mis-serve, one bit wider).
+/// 2. Its bf16 scale + u8 zero ride INLINE in each block, so the pool must
+///    allocate NO scale sidecars. The int8/int4 gate asserts sidecars exist;
+///    asserting that here would be asserting a DEAD buffer — the complementary
+///    proof (they are EMPTY) is what shows the allocator took the WhiteCrow
+///    arm of the sidecar skip.
+///
+/// The model is built at head_dim 128 because WhiteCrow's per-128 groups align
+/// to head vectors only when `head_dim % 128 == 0`; the shared synth geometry
+/// is 64 and would fail the append's loud check rather than test anything.
+#[test]
+fn qwen35_whitecrow_graph_replay_matches_eager() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "whitecrow");
+        std::env::remove_var("GRIM_KV_ARENA_ROWS");
+    }
+
+    let provider = synth_weights_hybrid_hd(1, 1, false, 128);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, tiny_cfg_hd(128)).expect("load tiny qwen35 hd128");
+
+    // ── Eager side: fresh session, one token per step.
+    let mut session = model.new_session();
+    let mut eager_logits = Vec::new();
+    for (step, tok) in TOKENS.iter().enumerate() {
+        let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
+        let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
+        let out = CausalLm::forward(
+            &model,
+            session.as_mut(),
+            &ids,
+            &pos,
+            &[] as &[AdapterHandle],
+        )
+        .expect("eager forward")
+        .to_vec_f32()
+        .expect("eager readback");
+        eager_logits.push(out);
+    }
+
+    // ── Graph pool: prove engagement before any number can mislead.
+    eprintln!("[STAGE] whitecrow: eager done, graph pool alloc");
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .unwrap_or_else(|e| panic!("whitecrow: graph pool alloc failed: {e}"));
+    assert_eq!(
+        graph.buffers.kv_arena_packed_width(),
+        Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW),
+        "whitecrow: pool must record the 67-byte BLOCK width, not a code width"
+    );
+    assert!(
+        graph.buffers.k_scale_arena.is_empty() && graph.buffers.v_scale_arena.is_empty(),
+        "whitecrow: scales are inline in the blocks, so the pool must allocate NO sidecars \
+         (a non-empty sidecar means the i8/i4 allocator arm ran)"
+    );
+
+    // ── Warmup (executes, state discarded), capture (records), replay.
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured, "whitecrow: capture must succeed");
+
+    let mut graph_logits = Vec::new();
+    for tok in TOKENS {
+        dev.reset_launch_count();
+        model
+            .forward_replay(&mut graph, tok)
+            .unwrap_or_else(|e| panic!("whitecrow: graph replay failed: {e}"));
+        assert_eq!(
+            dev.launch_count(),
+            0,
+            "whitecrow: replay must enqueue zero eager launches"
+        );
+        let logits = graph.read_logits_f32().expect("graph logit readback");
+        assert!(
+            logits.iter().all(|x| x.is_finite()),
+            "whitecrow: replay logits non-finite"
+        );
+        graph_logits.push(logits);
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+
+    // Same bar as the int8/int4 capture gate: both sides read the SAME WhiteCrow
+    // codes, so the divergence is attention reduction order only.
+    for (step, (a, b)) in eager_logits.iter().zip(graph_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[whitecrow-graph-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 1e-1,
+            "whitecrow step {step}: graph replay diverges from eager: worst {e:.3e} at {at} \
+             (eager {}, graph {})",
+            a[at],
+            b[at]
+        );
+    }
+
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
     }
 }
 

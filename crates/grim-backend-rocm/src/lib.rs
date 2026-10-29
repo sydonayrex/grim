@@ -182,9 +182,9 @@ pub use crate::device::roc_device::{
 
 pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
 pub use crate::decode_graph_buffers::{
-    DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
-    launch_attention, launch_attention_ring, launch_qkv_gemv, launch_qkv_gemv_ring,
-    write_embedding_to_buffer, write_embeddings_to_buffer_batch,
+    DecodeGraphBuffers, EagerKvSource, KV_ARENA_BITS_WHITECROW, check_layer_topology,
+    decode_graph_enabled, launch_attention, launch_attention_ring, launch_qkv_gemv,
+    launch_qkv_gemv_ring, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
 };
 pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::device::parallel_comm::{
@@ -204,10 +204,12 @@ pub use fusion::{
 pub use kernels::qkv_attention::{
     BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, KvRingPolicy, f16_kv_explicitly_disabled,
     launch_bump_i32, launch_bump_i32_slots, launch_clamp_layer_total, launch_kv_append,
-    launch_kv_append_batch, launch_kv_append_i4, launch_kv_append_i8, launch_kv_quantize_rows_i2,
-    launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8, launch_paged_attention,
-    launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_dev_batch,
-    launch_qkv_attention_dev_batch_i4, launch_qkv_attention_dev_batch_i8,
+    launch_kv_append_batch, launch_kv_append_i4, launch_kv_append_i8,
+    launch_kv_append_whitecrow, launch_kv_quantize_rows_i2,
+    launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8, launch_kv_quantize_rows_whitecrow,
+    launch_paged_attention, launch_paged_attention_quant, launch_qkv_attention_dev,
+    launch_qkv_attention_dev_batch, launch_qkv_attention_dev_batch_i4,
+    launch_qkv_attention_dev_batch_i8, launch_qkv_attention_dev_batch_whitecrow,
     launch_qkv_attention_wmma, launch_tree_attention, parse_f16_kv_env, parse_kv_arena_env,
 };
 pub use kernels::tile_picker::run_install_tune;

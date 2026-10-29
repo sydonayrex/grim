@@ -137,11 +137,24 @@ pub enum KvArenaFormat {
     /// entry point must refuse it rather than fall through (int2v4 and int8 are
     /// both byte-addressed, so a fallthrough would serve 2-bit codes as 8-bit).
     Int2V4,
+    /// WhiteCrow (u4 group-128 OSTQuant): unsigned 4-bit codes quantized over
+    /// **flat contiguous 128-value groups** of the arena (`grp = flat_idx/128`,
+    /// exactly the paged `dequant_kv_element(format=9)` grouping), each carrying
+    /// an inline bf16 scale + u8 zero — 67 bytes per 128 values.
+    ///
+    /// Unlike Int8/Int4/Int2V4, whose scale sidecars are per-(row, kv_head)
+    /// f32 vectors, WhiteCrow's scale/zero ride INSIDE the interleaved 67-byte
+    /// blocks in the arena itself; there is no separate f32 scale sidecar. The
+    /// per-element width is the non-uniform 67/128 ≈ 0.523 (codes + inline
+    /// scale/zero amortized over the group).
+    WhiteCrow,
 }
 
 impl KvArenaFormat {
     /// Bytes per stored element, excluding sidecars (scales ride separately).
     /// `Int2V4` is the average of its two widths: 2-bit K + 4-bit V.
+    /// `WhiteCrow` is the amortized width of its interleaved 67-byte blocks
+    /// (67 bytes per 128 values), since its scale/zero ride inline.
     pub fn bytes_per_elem(self) -> f32 {
         match self {
             KvArenaFormat::F32 => 4.0,
@@ -149,6 +162,7 @@ impl KvArenaFormat {
             KvArenaFormat::Int8 => 1.0,
             KvArenaFormat::Int4 => 0.5,
             KvArenaFormat::Int2V4 => 0.375,
+            KvArenaFormat::WhiteCrow => 67.0 / 128.0,
         }
     }
 
@@ -162,7 +176,8 @@ impl KvArenaFormat {
             | KvArenaFormat::F16
             | KvArenaFormat::Int8
             | KvArenaFormat::Int4
-            | KvArenaFormat::Int2V4 => true,
+            | KvArenaFormat::Int2V4
+            | KvArenaFormat::WhiteCrow => true,
         }
     }
 
@@ -176,7 +191,10 @@ impl KvArenaFormat {
     /// attention kernel is single-slot (no `batch`, no `slot_stride`, no device
     /// `total_dev`), so capture would bake a host scalar into the graph.
     pub fn graph_kernel_pair(self) -> bool {
-        matches!(self, KvArenaFormat::Int8 | KvArenaFormat::Int4)
+        matches!(
+            self,
+            KvArenaFormat::Int8 | KvArenaFormat::Int4 | KvArenaFormat::WhiteCrow
+        )
     }
 }
 
@@ -195,6 +213,8 @@ pub fn parse_kv_arena_env(v: &str) -> Option<KvArenaFormat> {
         // refuses it (`graph_kernel_pair` == false) instead of mis-serving;
         // the EAGER kernels for it exist (`has_device_kernels` == true).
         "int2v4" | "i2v4" | "k2v4" => Some(KvArenaFormat::Int2V4),
+        // WhiteCrow u4 group-128 OSTQuant (sudot8-friendly on RDNA3/4).
+        "whitecrow" | "w4a4" => Some(KvArenaFormat::WhiteCrow),
         _ => None,
     }
 }
@@ -1788,6 +1808,21 @@ __device__ inline float dequant_kv_element(
         int mant = nibble & 1;
         float val = (exp == 0) ? ((float)mant * 0.5f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
         return (sign ? -val : val) * blk_scale;
+    } else if (quant_format == 9) { // WhiteCrow (unsigned 4-bit group-128 OSTQuant)
+        // 67 bytes per 128 values: 64 code bytes + 2 bf16 scale bytes + 1 zero byte
+        int grp = idx / 128;
+        int in_grp = idx % 128;
+        const unsigned char* g = data + grp * 67;
+        unsigned short sc_bits = (unsigned short)g[64] | ((unsigned short)g[65] << 8);
+        unsigned int sc_u32 = ((unsigned int)sc_bits) << 16;
+        float grp_scale;
+        __builtin_memcpy(&grp_scale, &sc_u32, 4);
+        int grp_zero = (int)g[66];
+
+        int byte_idx = in_grp >> 1;
+        unsigned char b = g[byte_idx];
+        int nibble = (in_grp & 1) ? ((int)(b >> 4)) : ((int)(b & 0x0F));
+        return grp_scale * ((float)(nibble - grp_zero));
     }
     return 0.0f;
 }
@@ -2138,6 +2173,120 @@ extern "C" __global__ void grim_kv_append_i4(
     if ((tid & 1) == 0 && tid < head_dim) {
         unsigned char packed = (unsigned char)((q & 0x0f) | ((q_odd & 0x0f) << 4));
         codes[dst_base + (tid >> 1)] = packed;
+    }
+}
+
+// ── WhiteCrow (u4 group-128) GRAPH-form append ─────────────────────────────
+//
+// Device-side append + quantize for the dense WhiteCrow arena: the int4 twin
+// `grim_kv_append_i4`'s structure (device `past`, ring mapping, duplicate-skip)
+// fused with `grim_kv_quantize_rows_whitecrow`'s EXACT quantizer body, so the
+// graph path emits bit-identical bytes to the eager quantizer (pinned by
+// `whitecrow_graph_append_matches_eager_quantizer`).
+//
+// Differences vs grim_kv_append_i4:
+//   * one block per (slot, step, kv_head, GROUP) of 128 values — WhiteCrow
+//     groups are 128 values, so block = 128 and grid covers
+//     batch * steps * nkv * (head_dim/128).
+//   * NO scales sidecar: the bf16 scale + u8 zero ride inline in each 67-byte
+//     block; `arena_slot_stride` and the row stride are in BYTES.
+extern "C" __global__ void grim_kv_append_whitecrow(
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ dst,   // interleaved 67-byte blocks
+    int kv_stride,                     // elements (nkv * head_dim)
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,             // BYTES per slot arena region
+    int cap_rows,
+    int sink_rows) {
+    const int g = blockIdx.x;          // one 128-value group per block
+    const int groups_per_head = head_dim >> 7; // head_dim / 128
+    if (groups_per_head <= 0) return;
+    const int per_slot = steps * nkv_heads * groups_per_head;
+    const int total = batch * per_slot;
+    if (g >= total) return;
+    const int slot = g / per_slot;
+    const int r = g - slot * per_slot;
+    const int step = r / (nkv_heads * groups_per_head);
+    const int rem = r - step * nkv_heads * groups_per_head;
+    const int kh = rem / groups_per_head;
+    const int gi = rem - kh * groups_per_head;
+    const int past = past_dev[slot];
+    // Same ring mapping + duplicate-skip as grim_kv_append_i4: when the ring
+    // wraps mid-call, a later step lands on the same abs_row as an earlier
+    // one — only the LAST writer may keep it, so a stale earlier quantization
+    // cannot overwrite the newer row.
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    bool _keep = true;
+    for (int _j = step + 1; _j < steps; ++_j)
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) { _keep = false; break; }
+    if (!_keep) return;
+
+    const long long src_base = ((long long)slot * steps + step) * kv_stride
+                             + (long long)kh * head_dim + (long long)gi * 128;
+    // BYTES: a row holds nkv heads x groups_per_head x 67-byte blocks.
+    const long long row_bytes = (long long)nkv_heads * groups_per_head * 67;
+    const long long dst_base = (long long)slot * arena_slot_stride
+                             + (long long)abs_row * row_bytes
+                             + (long long)kh * groups_per_head * 67
+                             + (long long)gi * 67;
+    const int tid = threadIdx.x;        // 0..127, one per value
+
+    float v = k_rot[src_base + tid];
+
+    // Block-wide min/max reduction over the 128 values (identical to the
+    // eager quantizer so the grid is bit-identical).
+    __shared__ float s_min[128];
+    __shared__ float s_max[128];
+    s_min[tid] = v;
+    s_max[tid] = v;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float mn = s_min[0];
+    float mx = s_max[0];
+
+    // Affine grid: scale = (max-min)/15 (bf16-rounded, truncating to match the
+    // host `to_bf16`), zero = round(-min/scale) clamped to [0,15].
+    float d = fmaxf((mx - mn) / 15.0f, 1e-30f);
+    unsigned int dbits = __float_as_uint(d);
+    unsigned short sc16 = (unsigned short)(dbits >> 16);
+    float d_bf16 = __uint_as_float(((unsigned int)sc16) << 16);
+    float zero_f = __builtin_roundf(-mn / d_bf16);
+    zero_f = fminf(fmaxf(zero_f, 0.0f), 15.0f);
+    unsigned char zero = (unsigned char)zero_f;
+
+    // Each value -> a nibble in [0,15].
+    int nib = (int)__builtin_roundf(v / d_bf16) + (int)zero;
+    nib = nib < 0 ? 0 : (nib > 15 ? 15 : nib);
+
+    // Pack adjacent even/odd lanes into one byte (low nibble first), staged in
+    // shared memory so the writer can be ordered before the OR.
+    __shared__ unsigned char s_codes[64];
+    if ((tid & 1) == 0) {
+        s_codes[tid >> 1] = (unsigned char)(nib & 0x0F);
+    }
+    __syncthreads();
+    if ((tid & 1) == 1) {
+        s_codes[tid >> 1] |= (unsigned char)((nib & 0x0F) << 4);
+    }
+    __syncthreads();
+
+    // Emit 64 code bytes + 2 scale bytes (LE bf16) + 1 zero byte.
+    if (tid < 64) {
+        dst[dst_base + tid] = s_codes[tid];
+    } else if (tid == 64) {
+        dst[dst_base + 64] = (unsigned char)(sc16 & 0xFF);
+        dst[dst_base + 65] = (unsigned char)(sc16 >> 8);
+        dst[dst_base + 66] = zero;
     }
 }
 
@@ -3009,6 +3158,235 @@ extern "C" __global__ void grim_qkv_attention_dev_i4(
     }
 }
 
+// ── WhiteCrow (u4 group-128) dequant helper ────────────────────────────────
+//
+// Shared by BOTH WhiteCrow kernels below (graph `..._dev_whitecrow` and
+// eager `grim_qkv_attention_whitecrow`), so it MUST precede them in this
+// single translation unit — a definition after the first caller compiles to
+// "use of undeclared identifier" under hiprtc.
+//
+// Dequantize one value from a WhiteCrow head vector.
+//   base: byte address of the (row, kv_head) head's FIRST block
+//   gi:   group index within the head (0..head_dim/128)
+//   pos:  value position within the group (0..127)
+// Block layout (mirrors host `grim_quant::dequant_whitecrow`):
+//   64 B LE u4 nibbles, 2 B LE bf16 scale, 1 B u8 zero.
+//   dq = scale * (nibble - zero), bf16 widened to f32 by top-16-bits shift.
+__device__ inline float grim_dequant_whitecrow(
+    const unsigned char* __restrict__ base,
+    int gi,
+    int pos) {
+    const unsigned char* blk = base + (long long)gi * 67;
+    unsigned char packed = blk[pos >> 1];
+    int nib = (pos & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+    unsigned int lo = (unsigned int)blk[64];
+    unsigned int hi = (unsigned int)blk[65];
+    float sc = __uint_as_float((lo | (hi << 8)) << 16);
+    float z = (float)blk[66];
+    return sc * ((float)nib - z);
+}
+
+// ── WhiteCrow (u4 group-128) GRAPH-form attention ─────────────────────────
+//
+// Graph-capture sibling of `grim_qkv_attention_whitecrow`, structured like
+// `grim_qkv_attention_dev_i4`: device-driven KV length (`total_dev[slot] +
+// steps`), per-slot arenas (`slot * arena_slot_stride`, in BYTES), Phase-3
+// eviction ring (`cap_rows`), and the decode single-query-at-last-live-row
+// range. Differences vs the i4 graph kernel:
+//   * K/V are interleaved 67-byte WhiteCrow blocks (64 B LE u4 nibbles +
+//     2 B LE bf16 scale + 1 B u8 zero) — the scale is INLINE, so there are
+//     NO k_scales/v_scales/scale_slot_stride parameters at all.
+//   * decode via `grim_dequant_whitecrow` (same helper as the eager kernel,
+//     so eager and graph forms of WhiteCrow decode IDENTICALLY).
+//   * softcap uses tanhf (the eager family's correct Gemma-2 cap), not the
+//     graph family's softplus — softplus is identity for positive logits and
+//     caps nothing; keeping tanhf here means both WhiteCrow forms agree.
+// head_dim must be a multiple of 128 (groups align to head vectors) and
+// <= 256; anything else writes NaN (caught by the launcher check).
+extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,   // BYTES per slot arena region
+    int cap_rows             // ring capacity in token rows; <= 0 = unlimited
+) {
+    // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256 || head_dim % 128 != 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) out[q_offset + d] = nanf("");
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+    // Device-driven KV length (see grim_qkv_attention_dev_i4): live rows are
+    // `total_dev[slot] + steps`, clamped to the eviction ring's capacity —
+    // the contiguous prefix [0, min(live, cap_rows)).
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // WhiteCrow geometry: each (row, kv_head) head vector owns
+    // (head_dim/128)*67 bytes at block g = row*nkv*gph + kh*gph + gi.
+    // Slot arenas are byte-addressed (`arena_slot_stride` in bytes).
+    const int blocks_per_head = head_dim >> 7;
+    const int kv_stride_bytes = num_kv_heads * blocks_per_head * 67;
+    const long long slot_base = (long long)slot * arena_slot_stride;
+    const long long head_off = (long long)kv_head * blocks_per_head * 67;
+
+    float q_reg[8];
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
+    }
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = lo + j;
+        const long long row_base = slot_base + (long long)kv_idx * kv_stride_bytes + head_off;
+        float score = 0.0f;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) {
+                score += q_reg[c]
+                    * grim_dequant_whitecrow(k_tensor + row_base, idx >> 7, idx & 127);
+            }
+        }
+        // Wave-uniform total score (every lane holds the sum).
+        for (int off = wave_size / 2; off > 0; off >>= 1)
+            score += __shfl_xor(score, off);
+        score *= inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+        const float mw = fmaxf(running_max, score);
+        const float scale_a = expf(running_max - mw);
+        const float scale_b = expf(score - mw);
+        running_sum = running_sum * scale_a + scale_b;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) {
+                float vv = grim_dequant_whitecrow(v_tensor + row_base, idx >> 7, idx & 127);
+                out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+            }
+        }
+        running_max = mw;
+    }
+    // Publish per-wavefront partials (same protocol as dev_i4).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        attn_reg[c] = 0.0f;
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+            attn_reg[c] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue (identical to dev_i4).
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                int idx = lane_id + c * wave_size;
+                if (idx < head_dim) {
+                    partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
 // D1: clamp a per-layer KV total to the eviction ring's capacity. The eager
 // path resets `current_pos` to the retained count at the boundary (the host
 // CurDKV pass), which keeps the ring's absolute row sequence at
@@ -3280,6 +3658,310 @@ extern "C" __global__ void grim_kv_quantize_rows_i4(
     if ((tid & 1) == 0 && tid < head_dim) {
         unsigned char packed = (unsigned char)((q & 0x0f) | ((q_odd & 0x0f) << 4));
         codes[dst_base + (tid >> 1)] = packed;
+    }
+}
+
+// ── WhiteCrow (u4 group-128 OSTQuant) dense-arena quantizer ────────────────
+//
+// Mirrors `grim_quant::quant_whitecrow` EXACTLY (including its truncating
+// bf16 conversion) so the device bytes are bit-identical to the host encoder:
+// one 67-byte block per 128-value group of a head vector — 64 B u4 nibbles
+// (low nibble first) + 2 B little-endian bf16 scale + 1 B u8 zero — decoded as
+// `scale * (nibble - zero)`. Requires `head_dim % 128 == 0` so groups align to
+// head-vector starts (the production Qwen head_dim = 128 case: one group per
+// head). No f32 scale sidecar: the scale/zero ride inline.
+extern "C" __global__ void grim_kv_quantize_rows_whitecrow(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ dst,   // interleaved 67-byte blocks
+    int dst_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int g = blockIdx.x;                 // group index over the appended block
+    const int groups_per_head = head_dim >> 7; // head_dim / 128
+    if (groups_per_head <= 0) return;
+    const int total_groups = n_rows * nkv_heads * groups_per_head;
+    if (g >= total_groups) return;
+    const int vec = g / groups_per_head;       // (row, kv_head) head vector
+    const int gi  = g - vec * groups_per_head; // which group within the head
+    const int row = vec / nkv_heads;
+    const int kh  = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride
+                             + (long long)kh * head_dim + (long long)gi * 128;
+    const long long dst_base = (long long)dst_off + (long long)g * 67;
+    const int tid = threadIdx.x;               // 0..127, one per value
+
+    float v = src[src_base + tid];
+
+    // Block-wide min/max reduction over the 128 values.
+    __shared__ float s_min[128];
+    __shared__ float s_max[128];
+    s_min[tid] = v;
+    s_max[tid] = v;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float mn = s_min[0];
+    float mx = s_max[0];
+
+    // Affine grid: scale = (max-min)/15 (bf16-rounded, truncating to match the
+    // host `to_bf16`), zero = round(-min/scale) clamped to [0,15].
+    float d = fmaxf((mx - mn) / 15.0f, 1e-30f);
+    unsigned int dbits = __float_as_uint(d);
+    unsigned short sc16 = (unsigned short)(dbits >> 16);
+    float d_bf16 = __uint_as_float(((unsigned int)sc16) << 16);
+    float zero_f = __builtin_roundf(-mn / d_bf16);
+    zero_f = fminf(fmaxf(zero_f, 0.0f), 15.0f);
+    unsigned char zero = (unsigned char)zero_f;
+
+    // Each value -> a nibble in [0,15].
+    int nib = (int)__builtin_roundf(v / d_bf16) + (int)zero;
+    nib = nib < 0 ? 0 : (nib > 15 ? 15 : nib);
+
+    // Pack adjacent even/odd lanes into one byte (low nibble first), staged in
+    // shared memory so the writer can be ordered before the OR.
+    __shared__ unsigned char s_codes[64];
+    if ((tid & 1) == 0) {
+        s_codes[tid >> 1] = (unsigned char)(nib & 0x0F);
+    }
+    __syncthreads();
+    if ((tid & 1) == 1) {
+        s_codes[tid >> 1] |= (unsigned char)((nib & 0x0F) << 4);
+    }
+    __syncthreads();
+
+    // Emit 64 code bytes + 2 scale bytes (LE bf16) + 1 zero byte.
+    if (tid < 64) {
+        dst[dst_base + tid] = s_codes[tid];
+    } else if (tid == 64) {
+        dst[dst_base + 64] = (unsigned char)(sc16 & 0xFF);
+        dst[dst_base + 65] = (unsigned char)(sc16 >> 8);
+        dst[dst_base + 66] = zero;
+    }
+}
+
+// ── WhiteCrow (u4 group-128) dense-arena attention ─────────────────────────
+//
+// Eager sibling of `grim_qkv_attention_i4kv`: same wave-parallel softmax and
+// the same tanhf softcap, but the K/V sides decode INTERLEAVED 67-byte
+// WhiteCrow blocks inline — 64 B LE u4 nibbles + 2 B LE bf16 scale + 1 B u8
+// zero point (see `grim_kv_quantize_rows_whitecrow` above) — so there is no
+// scale sidecar and no separate codes buffer. Value decode mirrors the host
+// `grim_quant::dequant_whitecrow` via `grim_dequant_whitecrow` (defined
+// above the graph kernel, which is the first WhiteCrow kernel in this
+// translation unit that calls it).
+// head_dim must be a multiple of 128 (groups align to head vectors) and
+// <= 256; anything else writes NaN and returns (caught by the launcher check
+// and visible in any output rather than silently misreading bytes).
+
+extern "C" __global__ void grim_qkv_attention_whitecrow(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256 || head_dim % 128 != 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // WhiteCrow row stride: every (row, kv_head) head vector owns
+    // (head_dim/128) * 67 bytes, interleaved head-major (block
+    // g = row*nkv*gph + kh*gph + gi at byte g*67).
+    const int blocks_per_head = head_dim >> 7;
+    const long long kv_stride_bytes = (long long)num_kv_heads * blocks_per_head * 67;
+    const long long head_bytes = (long long)kv_head * blocks_per_head * 67;
+    const unsigned char* __restrict__ k_head = k_tensor + head_bytes;
+    const unsigned char* __restrict__ v_head = v_tensor + head_bytes;
+
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float partial = 0.0f;
+        const long long row_base = (long long)j * kv_stride_bytes;
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                float k_dq = grim_dequant_whitecrow(k_head + row_base, dd >> 7, dd & 127);
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_dq = grim_dequant_whitecrow(v_head + row_base, d >> 7, d & 127);
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
     }
 }
 
@@ -3977,8 +4659,12 @@ pub enum KvCacheQuantFormat {
     NutFp4 = 8,
     /// WhiteCrow: RDNA 3/4 native unsigned 4-bit group-128 OSTQuant layout
     /// (discriminant matches `grim_tensor::PagedKvQuantFormat::WhiteCrow`).
-    /// The paged-attention kernel has no WhiteCrow decode leg yet, so the
-    /// launcher refuses it loudly rather than misreading packed pages.
+    ///
+    /// 67 bytes per 128 values: 64 B u4 codes + 2 B bf16 scale + 1 B u8 zero,
+    /// decoded on device by the `quant_format == 9` arm of
+    /// `dequant_kv_element` as `scale * (nibble - zero)`. Like `NutFp4`, the
+    /// scale travels inline in the buffer, so the caller's per-tensor
+    /// `k_scale`/`v_scale` is ignored.
     WhiteCrow = 9,
 }
 
@@ -4001,12 +4687,13 @@ impl KvCacheQuantFormat {
             // Per-32 microscale groups with one inline E8M0 scale byte.
             Self::MxFp4 | Self::MxFp8 => (num_values + 31) / 32,
             Self::Int8 | Self::Int4 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp4E2M1 => 0,
-            // WhiteCrow: per 128 values - 64 B codes + 2 B scale + 1 B zero
-            // (the codes ride u32 words, so the arithmetic below collapses to
-            // num_values/2 + num_values/128*2 + num_values/128).
-            Self::WhiteCrow => (num_values + 127) / 128,
+            // WhiteCrow: per 128 values - 64 B codes + 2 B scale + 1 B zero = 67 bytes.
+            Self::WhiteCrow => (num_values + 127) / 128 * 3,
         };
-        let payload = (num_values * bits).div_ceil(8);
+        let payload = match self {
+            Self::WhiteCrow => ((num_values + 127) / 128) * 64,
+            _ => (num_values * bits).div_ceil(8),
+        };
         payload + groups
     }
 
@@ -4120,18 +4807,6 @@ pub fn launch_paged_attention_quant(
     let mut co = cache_offset as i32;
     let mut isd = inv_sqrt_d;
     let mut wl = window_lo;
-    // WhiteCrow pages have no kernel decode leg yet (the format exists so
-    // grim-memory's packed-pool producer can round-trip through the neutral
-    // enum). Refuse loudly: a silent fallthrough would make the kernel read
-    // OSTQuant u4 group-128 pages as whichever dense layout shares the
-    // discriminant - finite, plausible, wrong attention.
-    if quant_format == KvCacheQuantFormat::WhiteCrow {
-        return Err(crate::Error::Backend(
-            "launch_paged_attention_quant: WhiteCrow KV pages have no kernel decode leg yet; \
-             run with GRIM_PACKED_POOL=0 (dense KV) until the WhiteCrow leg lands"
-                .into(),
-        ));
-    }
     let mut qf = quant_format as i32;
     let mut ks = k_scale;
     let mut kb = k_bias;
@@ -4615,6 +5290,78 @@ pub fn launch_kv_quantize_rows_i2(
     )
 }
 
+/// WhiteCrow launcher: `grim_kv_quantize_rows_whitecrow`.
+/// Quantizes `n_rows` f32 token rows into interleaved 67-byte u4 group-128
+/// blocks (inline bf16 scale + u8 zero). NO f32 scale sidecar — the scales ride
+/// inline. `head_dim` must be a multiple of 128 so groups align to head vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_whitecrow(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    dst: &dyn BackendStorage,
+    dst_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_whitecrow: src must be F32".into(),
+        ));
+    }
+    let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: dst must be RocmStorage".into())
+    })?;
+    if dst_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_whitecrow: dst must be U8 (byte storage for 67B blocks)".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_whitecrow: head_dim {head_dim} must be a positive multiple of 128 \
+             so 128-value groups align to head vectors"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: src has no device ptr".into())
+    })?;
+    let mut dptr = dst_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: dst has no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut dst_off_i = dst_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let groups_per_head = head_dim / 128;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads * groups_per_head) as u32, 1, 1);
+    let block = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_whitecrow",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut dptr),
+            arg(&mut dst_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
 pub fn launch_kv_append_i8(
     dev: &crate::RocmDevice,
     k_rot: &dyn BackendStorage,
@@ -4804,6 +5551,98 @@ pub fn launch_kv_append_i4(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
+        ],
+    )
+}
+
+/// Graph launcher: `grim_kv_append_whitecrow`. Device-side append + quantize
+/// into the dense WhiteCrow arena — the sibling of [`launch_kv_append_i4`]
+/// minus the scale sidecar (the bf16 scale + u8 zero ride inline in each
+/// 67-byte block) and with WhiteCrow's group geometry: `arena_slot_stride` is
+/// in BYTES (`max_ctx * nkv * (head_dim/128) * 67`), `kv_stride` stays in
+/// ELEMENTS (`nkv * head_dim`) for the f32 source rows, and `head_dim` must be
+/// a positive multiple of 128 so groups align to head vectors.
+pub fn launch_kv_append_whitecrow(
+    dev: &crate::RocmDevice,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    dst: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_append_whitecrow: dst must be RocmStorage".into())
+    })?;
+    if dst_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_append_whitecrow: dst arena must be U8 (byte storage for 67B blocks)".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_whitecrow: head_dim {head_dim} must be a positive multiple of 128 \
+             so 128-value groups align to head vectors"
+        )));
+    }
+    if arena_slot_stride == 0 {
+        return Err(crate::Error::Backend(
+            "kv_append_whitecrow: arena_slot_stride must be non-zero BYTES".into(),
+        ));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_whitecrow")?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_whitecrow: past_dev must be RocmStorage".into())
+        })?;
+    let mut dst_ptr = dst_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_whitecrow: dst has no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_whitecrow: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend("kv_append_whitecrow: arena_slot_stride exceeds i32::MAX".into())
+    })?;
+    // One block per (slot, step, kv_head, group); block = 128 values.
+    let groups_per_head = head_dim / 128;
+    let grid = crate::HipDim3::new(
+        (batch.max(1) * steps * nkv_heads * groups_per_head) as u32,
+        1,
+        1,
+    );
+    let block = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_append_whitecrow",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut dst_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
             arg(&mut cap_rows_i),
             arg(&mut sink_rows_i),
         ],
@@ -5378,6 +6217,168 @@ pub fn launch_qkv_attention_dev_batch_i4(
             arg(&mut ksc_ptr),
             arg(&mut vsc_ptr),
             arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+/// Graph launcher for `grim_qkv_attention_dev_whitecrow`. Same contract as
+/// [`launch_qkv_attention_dev_batch_i4`] minus the scale sidecar (WhiteCrow's
+/// scale lives inside each 67-byte block) plus a head_dim % 128 check.
+/// `arena_slot_stride` is in BYTES (one slot's row-major block region).
+pub fn launch_qkv_attention_dev_batch_whitecrow(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cap_rows_i = ring.cap_rows;
+    const KERNEL: &str = "grim_qkv_attention_dev_whitecrow";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{KERNEL}: head_dim {head_dim} exceeds kernel cap of 256"
+        )));
+    }
+    if head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "{KERNEL}: head_dim {head_dim} must be a multiple of 128 \
+             (WhiteCrow groups are 128 values)"
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{KERNEL}: q must be RocmStorage")))?;
+    for (buf, what) in [(k_arena, "k_arena"), (v_arena, "v_arena")] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{KERNEL}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != ArithType::U8 {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} must be U8, got {:?}",
+                r.dtype.arith
+            )));
+        }
+        if !r.device_ptr_is_valid() {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} lacks a valid device pointer"
+            )));
+        }
+    }
+    fn dc<'a>(
+        b: &'a dyn BackendStorage,
+        what: &'static str,
+    ) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!(
+                "grim_qkv_attention_dev_whitecrow: {what} must be RocmStorage"
+            ))
+        })
+    }
+    let out_s = dc(out, "out")?;
+    let om_s = dc(out_max, "out_max")?;
+    let os_s = dc(out_sum, "out_sum")?;
+    let total_s = dc(total_dev, "total_dev")?;
+    let oproj_s = dc(o_proj_w, "o_proj_w")?;
+    let alibi_s = dc(alibi_slopes, "alibi_slopes")?;
+    let kq = dc(k_arena, "k_arena")?;
+    let vq = dc(v_arena, "v_arena")?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = kq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_arena has no ptr".into()))?;
+    let mut v_ptr = vq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_arena has no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi_slopes has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend(format!("{KERNEL}: arena_slot_stride exceeds i32::MAX"))
+    })?;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            // Argument order MUST match `grim_qkv_attention_dev_whitecrow`'s
+            // parameter list exactly (see the past-fault note on the i4
+            // launcher above: a reordered pointer shifts every later arg).
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
             arg(&mut cap_rows_i),
         ],
     )

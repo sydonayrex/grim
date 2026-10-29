@@ -135,8 +135,25 @@ pub fn synth_weights_hybrid(n: usize, interval: usize) -> SynthProvider {
 /// weight that arrives dequantized would report "native" and the row would
 /// stay unexercised.
 pub fn synth_weights_hybrid_with(n: usize, interval: usize, iq4nl_down: bool) -> SynthProvider {
-    let q_dim = HEADS * HEAD_DIM;
-    let kv_dim = KV_HEADS * HEAD_DIM;
+    synth_weights_hybrid_hd(n, interval, iq4nl_down, HEAD_DIM)
+}
+
+/// Head-dim-parameterized synthesizer (see [`synth_weights_hybrid_with`]).
+///
+/// WhiteCrow demands `head_dim % 128 == 0` — its 67-byte blocks hold one
+/// group of 128 values, and per-128 groups must align to head vectors — which
+/// the shared 64-wide geometry cannot satisfy. A WhiteCrow gate asks for 128
+/// HERE instead of moving [`HEAD_DIM`], which every other gate is tuned
+/// around. Weight shapes derive from the parameter, never from a second copy
+/// of the arithmetic that could drift from the loader's.
+pub fn synth_weights_hybrid_hd(
+    n: usize,
+    interval: usize,
+    iq4nl_down: bool,
+    head_dim: usize,
+) -> SynthProvider {
+    let q_dim = HEADS * head_dim;
+    let kv_dim = KV_HEADS * head_dim;
     let d_state = 128usize;
     let d_conv = 4usize;
     let dt_rank = 48usize;
@@ -206,6 +223,15 @@ pub fn tiny_cfg() -> Qwen35Config {
     c.num_layers = 1;
     c.intermediate_size = INTER;
     c.full_attention_interval = 1;
+    c
+}
+
+/// [`tiny_cfg`] with a wider head vector. WhiteCrow's per-128 grouping needs
+/// `head_dim % 128 == 0`, so its gates use 128 here while every other gate
+/// keeps the shared 64-wide geometry.
+pub fn tiny_cfg_hd(head_dim: usize) -> Qwen35Config {
+    let mut c = tiny_cfg();
+    c.head_dim = head_dim;
     c
 }
 
