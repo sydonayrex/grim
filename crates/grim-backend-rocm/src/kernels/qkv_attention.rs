@@ -2126,6 +2126,256 @@ void grim_qkv_attention_paged_quant(
 }
 
 
+// ── Token-parallel (flash-decoding) split of the paged quant kernel ────────
+//
+// The single-workgroup serial loop is the family's dominant bottleneck
+// (measured: even f32 runs ~2.8 us/token vs ~0.1 for a parallel kernel;
+// post-sudot8 WhiteCrow sits at 3.4-3.9 us/token). This split moves the
+// token range onto the GRID: block (i, h, c) computes an online-softmax
+// PARTIAL over token chunk c, and `grim_qkv_attention_paged_merge` combines
+// the partials with the standard LSE rescale. The inner-loop bodies (sudot8
+// Q·K for format 9, per-element dequant otherwise) are unchanged, so the
+// split inherits the sudot8 win and adds cross-CU parallelism on top.
+//
+// Partials layout (f32 device scratch, sized by the launcher):
+//   pm: [n_chunks, batch, num_heads]   running max per chunk
+//   pl: [n_chunks, batch, num_heads]   running sum per chunk
+//   po: [n_chunks, batch, num_heads, head_dim]  UNNORMALIZED accumulator
+// An empty chunk (window doesn't reach it) publishes l = 0, which the merge
+// skips — no separate zero-init pass needed as long as the launcher sizes
+// n_chunks from the SAME host-visible range the kernel clamps to.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_paged_quant_split(
+    const float* __restrict__ q,
+    const BlockTableEntry* __restrict__ block_tables,
+    const unsigned char* __restrict__ k_pages,
+    const unsigned char* __restrict__ v_pages,
+    float* __restrict__ partial_m,   // [n_chunks, batch, num_heads]
+    float* __restrict__ partial_l,   // [n_chunks, batch, num_heads]
+    float* __restrict__ partial_o,   // [n_chunks, batch, num_heads, head_dim]
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_blocks,
+    int page_size,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    int quant_format,
+    float k_scale,
+    float k_bias,
+    float v_scale,
+    float v_bias,
+    int chunk_len,   // tokens per chunk (> 0)
+    int n_chunks
+) {
+    const int batch_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    const int chunk = blockIdx.z;
+    if (chunk >= n_chunks) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (batch_idx * num_heads + h) * head_dim;
+    const int abs_i = cache_offset;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    // Same causal window as the serial kernel, sliced to this chunk.
+    const int range_lo = window_lo > 0 ? window_lo : 0;
+    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
+    int j_start = range_lo + chunk * chunk_len;
+    int j_end = j_start + chunk_len;
+    if (j_start < range_lo) j_start = range_lo;
+    if (j_end > range_hi) j_end = range_hi;
+
+    const int base = (j_end - j_start) / num_waves;
+    const int rem  = (j_end - j_start) % num_waves;
+    int w_start = j_start + wave_id * base + (wave_id < rem ? wave_id : rem);
+    int w_end   = w_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int page_stride = page_size * num_kv_heads * head_dim;
+
+    for (int j = w_start; j < w_end; ++j) {
+        const int page_idx = j / page_size;
+        const int page_offset = j % page_size;
+        if (page_idx >= max_blocks) continue;
+
+        const BlockTableEntry entry = block_tables[batch_idx * max_blocks + page_idx];
+        const int physical_block = entry.block_id;
+        const int elem_offset = physical_block * page_stride + (page_offset * num_kv_heads + kv_head) * head_dim;
+
+        float score = 0.0f;
+        if (quant_format == 9 && (head_dim & 127) == 0) {
+            score = grim_whitecrow_qk_dot_scalar(q, q_offset, k_pages, elem_offset, head_dim);
+        } else {
+            #pragma unroll
+            for (int dim = 0; dim < 256; ++dim) {
+                if (dim < head_dim) {
+                    float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
+                    score += q[q_offset + dim] * k_val;
+                }
+            }
+        }
+        score *= inv_sqrt_d;
+
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+                out_acc[chunk_i] = out_acc[chunk_i] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) {
+                float v_val = dequant_kv_element(v_pages, elem_offset + d, quant_format, v_scale, v_bias);
+                out_acc[chunk_i] += w * v_val;
+            }
+        }
+        running_sum += w;
+    }
+
+    // Cross-wave merge within this block (same protocol as the serial kernel).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+        int d = lane_id + chunk_i * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk_i];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id == 0) {
+        float m_final = s_max[0];
+        float sum_final = s_sum[0];
+        float acc_final[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) acc_final[chunk_i] = s_acc[0][d];
+        }
+        for (int w = 1; w < num_waves; ++w) {
+            float mw = s_max[w];
+            float uw = s_sum[w];
+            if (uw == 0.0f) continue;
+            if (sum_final == 0.0f) {
+                m_final = mw; sum_final = uw;
+                for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+                    int d = lane_id + chunk_i * wave_size;
+                    if (d < head_dim) acc_final[chunk_i] = s_acc[w][d];
+                }
+                continue;
+            }
+            float m_new = m_final > mw ? m_final : mw;
+            float scale_a = expf(m_final - m_new);
+            float scale_b = expf(mw - m_new);
+            sum_final = sum_final * scale_a + uw * scale_b;
+            for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+                int d = lane_id + chunk_i * wave_size;
+                if (d < head_dim) {
+                    acc_final[chunk_i] = acc_final[chunk_i] * scale_a + s_acc[w][d] * scale_b;
+                }
+            }
+            m_final = m_new;
+        }
+        // Publish the block partial UNNORMALIZED; the merge kernel does the
+        // final LSE combine + normalization.
+        float* pm = partial_m + ((long long)chunk * gridDim.x + batch_idx) * num_heads + h;
+        float* pl = partial_l + ((long long)chunk * gridDim.x + batch_idx) * num_heads + h;
+        float* po = partial_o
+            + (((long long)chunk * gridDim.x + batch_idx) * num_heads + h) * head_dim;
+        if (lane_id == 0) {
+            *pm = m_final;
+            *pl = sum_final;
+        }
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) {
+                po[d] = (sum_final > 0.0f) ? acc_final[chunk_i] : 0.0f;
+            }
+        }
+    }
+}
+
+// LSE merge of the split partials: grid (batch, num_heads), block (256).
+// Each thread owns strided head_dim slices; the m/l scalars are re-read per
+// thread (n_chunks is small, so this stays trivially cached).
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_paged_merge(
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    const float* __restrict__ partial_o,
+    float* __restrict__ out,
+    int num_heads,
+    int head_dim,
+    int n_chunks,
+    int batch
+) {
+    const int batch_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int lane_id = tid % wave_size;
+
+    const long long mh_base = (long long)batch_idx * num_heads + h;
+    const long long po_base = mh_base * head_dim;
+    const long long po_stride = (long long)batch * num_heads * head_dim;
+
+    float m_final = -1e30f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const long long ci = (long long)c * batch * num_heads;
+        if (partial_l[ci + mh_base] > 0.0f && partial_m[ci + mh_base] > m_final) {
+            m_final = partial_m[ci + mh_base];
+        }
+    }
+    float sum_final = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c = 0; c < n_chunks; ++c) {
+        const long long ci = (long long)c * batch * num_heads;
+        float m = partial_m[ci + mh_base];
+        float l = partial_l[ci + mh_base];
+        if (l <= 0.0f) continue;
+        const float scale = expf(m - m_final);
+        sum_final += l * scale;
+        const float* po_c = partial_o + (long long)c * po_stride + po_base;
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) {
+                acc[chunk_i] += po_c[d] * scale;
+            }
+        }
+    }
+    float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+    for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+        int d = lane_id + chunk_i * wave_size;
+        if (d < head_dim) {
+            out[po_base + d] = acc[chunk_i] * inv_sum;
+        }
+    }
+}
+
 // Phase 3 (KV eviction): map an ABSOLUTE token row to its arena row under a
 // fixed-capacity ring with pinned attention sinks.
 //
@@ -4969,6 +5219,146 @@ pub fn launch_paged_attention_quant(
             arg(&mut kb),
             arg(&mut vs),
             arg(&mut vb),
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Token-parallel (flash-decoding) split of [`launch_paged_attention_quant`]:
+/// two launches — `grim_qkv_attention_paged_quant_split` writes per-chunk
+/// online-softmax partials into caller-provided device scratch, then
+/// `grim_qkv_attention_paged_merge` LSE-combines and normalizes into `out`.
+///
+/// `chunk_len` is tokens per chunk; `n_chunks` is computed here from the same
+/// host-visible causal window the kernel clamps to, so empty chunks never
+/// occur (the merge still skips l==0 defensively). Partials must be sized:
+/// `pm`/`pl` = n_chunks*batch*num_heads f32, `po` = n_chunks*batch*num_heads*head_dim f32.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attention_quant_split(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    block_tables: &dyn BackendStorage,
+    k_pages: &dyn BackendStorage,
+    v_pages: &dyn BackendStorage,
+    partial_m: &dyn BackendStorage,
+    partial_l: &dyn BackendStorage,
+    partial_o: &dyn BackendStorage,
+    out: &mut dyn BackendStorage,
+    batch: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    max_blocks: u32,
+    page_size: u32,
+    kv_seq_len: u32,
+    cache_offset: u32,
+    window_lo: i32,
+    quant_format: KvCacheQuantFormat,
+    k_scale: f32,
+    k_bias: f32,
+    v_scale: f32,
+    v_bias: f32,
+    chunk_len: u32,
+) -> Result<(), crate::Error> {
+    if chunk_len == 0 {
+        return Err(crate::Error::Backend(
+            "paged split: chunk_len must be > 0".into(),
+        ));
+    }
+    let range_lo = window_lo.max(0) as u32;
+    let range_hi = (cache_offset + 1).min(kv_seq_len);
+    let range_len = range_hi.saturating_sub(range_lo);
+    if range_len == 0 {
+        return Err(crate::Error::Backend(
+            "paged split: empty causal window".into(),
+        ));
+    }
+    let n_chunks = range_len.div_ceil(chunk_len).max(1);
+
+    let ptr = |b: &dyn BackendStorage, what: &str| -> Result<u64, crate::Error> {
+        b.as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend(format!("{what} must be RocmStorage")))?
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend(format!("{what} has no device ptr")))
+    };
+    let mut qptr = ptr(q, "q")?;
+    let mut btptr = ptr(block_tables, "block_tables")?;
+    let mut kptr = ptr(k_pages, "k_pages")?;
+    let mut vptr = ptr(v_pages, "v_pages")?;
+    let mut pmptr = ptr(partial_m, "partial_m")?;
+    let mut plptr = ptr(partial_l, "partial_l")?;
+    let mut poptr = ptr(partial_o, "partial_o")?;
+    let mut optr = ptr(out, "out")?;
+
+    let wf = dev.wavefront_size() as u32;
+    let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut mb = max_blocks as i32;
+    let mut ps = page_size as i32;
+    let mut ksl = kv_seq_len as i32;
+    let mut co = cache_offset as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut qf = quant_format as i32;
+    let mut ks = k_scale;
+    let mut kb = k_bias;
+    let mut vs = v_scale;
+    let mut vb = v_bias;
+    let mut cl = chunk_len as i32;
+    let mut nc = n_chunks as i32;
+
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_paged_quant_split",
+        crate::HipDim3::new(batch, num_heads, n_chunks),
+        crate::HipDim3::new(wf * 4, 1, 1),
+        &mut [
+            arg(&mut qptr),
+            arg(&mut btptr),
+            arg(&mut kptr),
+            arg(&mut vptr),
+            arg(&mut pmptr),
+            arg(&mut plptr),
+            arg(&mut poptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut mb),
+            arg(&mut ps),
+            arg(&mut ksl),
+            arg(&mut co),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut qf),
+            arg(&mut ks),
+            arg(&mut kb),
+            arg(&mut vs),
+            arg(&mut vb),
+            arg(&mut cl),
+            arg(&mut nc),
+        ],
+    )?;
+
+    let mut nh_m = num_heads as i32;
+    let mut hd_m = head_dim as i32;
+    let mut nc_m = n_chunks as i32;
+    let mut bt_m = batch as i32;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_paged_merge",
+        crate::HipDim3::new(batch, num_heads, 1),
+        crate::HipDim3::new(wf * 4, 1, 1),
+        &mut [
+            arg(&mut pmptr),
+            arg(&mut plptr),
+            arg(&mut poptr),
+            arg(&mut optr),
+            arg(&mut nh_m),
+            arg(&mut hd_m),
+            arg(&mut nc_m),
+            arg(&mut bt_m),
         ],
     )?;
 
