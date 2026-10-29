@@ -72,6 +72,8 @@ impl HostStagingBuffer {
             ));
         }
         let mut ptr: *mut c_void = std::ptr::null_mut();
+        // HIP_GUARD_EXEMPT: hipHostMalloc allocates pinned host memory only — no device
+        // context is touched and the result does not depend on the thread's current device.
         crate::device::helpers::check_hip("hipHostMalloc", unsafe {
             hipHostMalloc(&mut ptr, size, flags)
         })?;

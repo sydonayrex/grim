@@ -45,6 +45,8 @@ pub fn p2p_memcpy_async(
     if dst.is_null() || src.is_null() {
         return Err(Error::Backend("p2p_memcpy_async: null buffer".into()));
     }
+    // HIP_GUARD_EXEMPT: hipMemcpyPeerAsync names both devices explicitly; the current
+    // thread's device selects nothing and the runtime acquires both contexts internally.
     let res = unsafe { hipMemcpyPeerAsync(dst, dst_device, src, src_device, count, stream) };
     if res == hipSuccess {
         Ok(())
