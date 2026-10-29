@@ -2982,39 +2982,82 @@ impl Qwen35Block {
                     grim_core::error::Error::Backend(format!("qkv_attention_dev_i4: {e}"))
                 })?;
             } else if arena_whitecrow {
-                // WhiteCrow: the i4 argument list minus BOTH scale sidecars
-                // (inline in each block) —24 params, `arena_slot_stride` in
-                // BYTES. Same `steps`/`0`/`0.0` decode contract as the f32/i4
-                // arms: one query at the last live row, no window, no softcap.
-                grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow(
-                    dev,
-                    &buffers.q_head_buf[layer_idx],
-                    &buffers.k_arena[layer_idx],
-                    &buffers.v_arena[layer_idx],
-                    &buffers.attn_out_buf[layer_idx],
-                    &buffers.attn_max_buf[layer_idx],
-                    &buffers.attn_sum_buf[layer_idx],
-                    &buffers.layer_totals[layer_idx],
-                    nh as u32,
-                    nkv as u32,
-                    hd as u32,
-                    steps as u32,
-                    steps as u32,
-                    1.0 / (hd as f32).sqrt(),
-                    0,
-                    0.0,
-                    buffers.attn_dummy_for(dev.ordinal()),
-                    0,
-                    0,
-                    buffers.attn_dummy_for(dev.ordinal()),
-                    0,
-                    batch,
-                    arena_slot_stride,
-                    buffers.kv_ring,
-                )
-                .map_err(|e| {
-                    grim_core::error::Error::Backend(format!("qkv_attention_dev_whitecrow: {e}"))
-                })?;
+                // Token-parallel split when the build allocated partial
+                // scratch (graph-capturable: fixed grids, device-derived live
+                // chunk count — see grim_qkv_attention_dev_whitecrow_split).
+                // Falls back to the serial kernel when the context couldn't
+                // fill two chunks (no scratch allocated).
+                if buffers.wc_split_chunk_len.is_some() {
+                    grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow_split(
+                        dev,
+                        &buffers.q_head_buf[layer_idx],
+                        &buffers.k_arena[layer_idx],
+                        &buffers.v_arena[layer_idx],
+                        &buffers.wc_split_pm[layer_idx],
+                        &buffers.wc_split_pl[layer_idx],
+                        &buffers.wc_split_po[layer_idx],
+                        &buffers.attn_out_buf[layer_idx],
+                        &buffers.layer_totals[layer_idx],
+                        nh as u32,
+                        nkv as u32,
+                        hd as u32,
+                        steps as u32,
+                        steps as u32,
+                        1.0 / (hd as f32).sqrt(),
+                        0,
+                        0.0,
+                        buffers.attn_dummy_for(dev.ordinal()),
+                        0,
+                        0,
+                        buffers.attn_dummy_for(dev.ordinal()),
+                        0,
+                        batch,
+                        arena_slot_stride,
+                        buffers.kv_ring,
+                        buffers.wc_split_chunk_len.unwrap(),
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!(
+                            "qkv_attention_dev_whitecrow_split: {e}"
+                        ))
+                    })?;
+                } else {
+                    // WhiteCrow: the i4 argument list minus BOTH scale sidecars
+                    // (inline in each block) —24 params, `arena_slot_stride` in
+                    // BYTES. Same `steps`/`0`/`0.0` decode contract as the f32/i4
+                    // arms: one query at the last live row, no window, no softcap.
+                    grim_backend_rocm::launch_qkv_attention_dev_batch_whitecrow(
+                        dev,
+                        &buffers.q_head_buf[layer_idx],
+                        &buffers.k_arena[layer_idx],
+                        &buffers.v_arena[layer_idx],
+                        &buffers.attn_out_buf[layer_idx],
+                        &buffers.attn_max_buf[layer_idx],
+                        &buffers.attn_sum_buf[layer_idx],
+                        &buffers.layer_totals[layer_idx],
+                        nh as u32,
+                        nkv as u32,
+                        hd as u32,
+                        steps as u32,
+                        steps as u32,
+                        1.0 / (hd as f32).sqrt(),
+                        0,
+                        0.0,
+                        buffers.attn_dummy_for(dev.ordinal()),
+                        0,
+                        0,
+                        buffers.attn_dummy_for(dev.ordinal()),
+                        0,
+                        batch,
+                        arena_slot_stride,
+                        buffers.kv_ring,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!(
+                            "qkv_attention_dev_whitecrow: {e}"
+                        ))
+                    })?;
+                }
             } else {
                 grim_backend_rocm::launch_qkv_attention_dev_batch(
                     dev,
@@ -4220,6 +4263,55 @@ impl DecodeGraphModel for Qwen35 {
                     max_ctx,
                     ctx
                 );
+            }
+
+            // WhiteCrow token-parallel split: allocate the per-layer partial
+            // scratch OUTSIDE capture so the pointers are stable across
+            // replays. chunk_len=512 is the bench-chosen point (measured 3x
+            // at 1K ctx to 154x at 64K over the serial kernel); chunks beyond
+            // the device-derived live range publish empty partials, so a
+            // fixed max_chunks = ceil(ctx/512) grid serves every context the
+            // arena can hold. Skipped when the context can't fill two chunks
+            // (the split would only add a second launch).
+            if fmt == grim_backend_rocm::KvArenaFormat::WhiteCrow {
+                const WC_SPLIT_CHUNK_LEN: u32 = 512;
+                let max_chunks = (ctx as u32).div_ceil(WC_SPLIT_CHUNK_LEN).max(1);
+                if max_chunks > 1 {
+                    // Graph attention capture uses steps = 1 (hardwired at
+                    // the capture site), so partials are sized exactly.
+                    let steps = 1usize;
+                    let hd = self.cfg.head_dim;
+                    let per_chunk = batch * steps * nh;
+                    let dt_f32 = grim_tensor::DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::Native,
+                    };
+                    let mut pm = Vec::with_capacity(buffers.layer_devices.len());
+                    let mut pl = Vec::with_capacity(buffers.layer_devices.len());
+                    let mut po = Vec::with_capacity(buffers.layer_devices.len());
+                    for &ord in &buffers.layer_devices {
+                        let l_dev = grim_backend_rocm::RocmDevice::shared(ord);
+                        let alloc = |elems: usize| -> Result<grim_backend_rocm::RocmStorage> {
+                            grim_backend_rocm::RocmStorage::alloc_gpu(
+                                &Shape::from_slice(&[elems]),
+                                dt_f32.clone(),
+                                &l_dev.allocator_handle(),
+                                ord,
+                            )
+                            .map_err(grim_core::error::Error::Tensor)
+                        };
+                        pm.push(alloc(max_chunks as usize * per_chunk)?);
+                        pl.push(alloc(max_chunks as usize * per_chunk)?);
+                        po.push(alloc(max_chunks as usize * per_chunk * hd)?);
+                    }
+                    buffers.wc_split_pm = pm;
+                    buffers.wc_split_pl = pl;
+                    buffers.wc_split_po = po;
+                    buffers.wc_split_chunk_len = Some(WC_SPLIT_CHUNK_LEN);
+                    eprintln!(
+                        "[qwen35] WhiteCrow split attention: {max_chunks} chunks x {WC_SPLIT_CHUNK_LEN} tokens/launch (graph)"
+                    );
+                }
             }
         }
 

@@ -279,6 +279,111 @@ fn qwen35_whitecrow_graph_replay_matches_eager() {
     }
 }
 
+/// WhiteCrow graph replay with the token-parallel SPLIT engaged: same
+/// contract as `qwen35_whitecrow_graph_replay_matches_eager`, but the graph
+/// pool is created at max_ctx 1024, which makes the build allocate the split
+/// partial scratch (2 chunks x 512 tokens) and the capture take the
+/// `launch_qkv_attention_dev_batch_whitecrow_split` arm. Engagement is
+/// asserted on `buffers.wc_split_chunk_len` BEFORE capture — without that
+/// proof a serial-arm pass would silently count as split coverage.
+#[test]
+fn qwen35_whitecrow_graph_split_replay_matches_eager() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "whitecrow");
+        std::env::remove_var("GRIM_KV_ARENA_ROWS");
+    }
+
+    let provider = synth_weights_hybrid_hd(1, 1, false, 128);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, tiny_cfg_hd(128)).expect("load tiny qwen35 hd128");
+
+    // ── Eager side: fresh session, one token per step.
+    let mut session = model.new_session();
+    let mut eager_logits = Vec::new();
+    for (step, tok) in TOKENS.iter().enumerate() {
+        let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
+        let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
+        let out = CausalLm::forward(
+            &model,
+            session.as_mut(),
+            &ids,
+            &pos,
+            &[] as &[AdapterHandle],
+        )
+        .expect("eager forward")
+        .to_vec_f32()
+        .expect("eager readback");
+        eager_logits.push(out);
+    }
+
+    // ── Graph pool at 1024 ctx: 2 chunks x 512 tokens -> split scratch.
+    eprintln!("[STAGE] whitecrow-split: eager done, graph pool alloc");
+    let mut graph = model
+        .get_or_create_decode_graph(1024, 1)
+        .unwrap_or_else(|e| panic!("whitecrow-split: graph pool alloc failed: {e}"));
+    assert_eq!(
+        graph.buffers.wc_split_chunk_len,
+        Some(512),
+        "whitecrow-split: pool must allocate the split partial scratch at ctx 1024"
+    );
+    assert_eq!(
+        graph.buffers.kv_arena_packed_width(),
+        Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW),
+        "whitecrow-split: pool must record the 67-byte BLOCK width"
+    );
+
+    // ── Warmup (executes, state discarded), capture (records), replay.
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured, "whitecrow-split: capture must succeed");
+
+    let mut graph_logits = Vec::new();
+    for tok in TOKENS {
+        dev.reset_launch_count();
+        model
+            .forward_replay(&mut graph, tok)
+            .unwrap_or_else(|e| panic!("whitecrow-split: graph replay failed: {e}"));
+        assert_eq!(
+            dev.launch_count(),
+            0,
+            "whitecrow-split: replay must enqueue zero eager launches"
+        );
+        let logits = graph.read_logits_f32().expect("graph logit readback");
+        assert!(
+            logits.iter().all(|x| x.is_finite()),
+            "whitecrow-split: replay logits non-finite"
+        );
+        graph_logits.push(logits);
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+
+    // Same bar as the serial WhiteCrow capture gate.
+    for (step, (a, b)) in eager_logits.iter().zip(graph_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[whitecrow-split-graph-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 1e-1,
+            "whitecrow-split step {step}: graph replay diverges from eager: worst {e:.3e} at {at} \
+             (eager {}, graph {})",
+            a[at],
+            b[at]
+        );
+    }
+
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+    }
+}
+
 /// int2v4 resolves through `parse_kv_arena_env` and has EAGER kernels, but no
 /// capturable pair. `get_or_create_decode_graph` must refuse — the historic
 /// bug ran the 8-bit launcher pair over a 4-codes-per-byte arena, silently.

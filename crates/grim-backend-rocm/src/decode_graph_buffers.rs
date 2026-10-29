@@ -251,6 +251,19 @@ pub struct DecodeGraphBuffers {
     /// KDA recurrent staging: per-layer alpha/beta/acc/state/conv_out buffers (`None` for non-KDA layers).
     /// Filled by [`DecodeGraphBuffers::allocate_kda_layer`] — never inside capture.
     pub kda: Vec<Option<KdaLayerBuffers>>,
+    /// WhiteCrow token-parallel split partials, per layer (empty = split not
+    /// in play: format not WhiteCrow, or the context too small to chunk).
+    /// Layout per (slot=0, chunk, row, head): pm/pl = [max_chunks*steps*nh],
+    /// po = [max_chunks*steps*nh*head_dim]. Allocated OUTSIDE capture (at the
+    /// graph build, right after the arena-format resolution) so the pointers
+    /// are stable across replays; both split kernels derive the live chunk
+    /// count on device, and every live partial slot is rewritten each launch,
+    /// so the buffers need no clearing between replays.
+    pub wc_split_pm: Vec<RocmStorage>,
+    pub wc_split_pl: Vec<RocmStorage>,
+    pub wc_split_po: Vec<RocmStorage>,
+    /// Tokens per chunk the partials were sized for (`None` = no split).
+    pub wc_split_chunk_len: Option<u32>,
     pub num_layers: usize,
     pub max_ctx: usize,
     pub batch: usize,
@@ -1109,6 +1122,10 @@ impl DecodeGraphBuffers {
             fused_qkv_out,
             gdl: (0..num_layers).map(|_| None).collect(),
             kda: (0..num_layers).map(|_| None).collect(),
+            wc_split_pm: Vec::new(),
+            wc_split_pl: Vec::new(),
+            wc_split_po: Vec::new(),
+            wc_split_chunk_len: None,
             moe_gate_logits,
             moe_out,
             moe_route_tokens,
