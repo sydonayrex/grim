@@ -1983,6 +1983,31 @@ impl Qwen35 {
         );
 
         let first_device = available_devices[0].clone();
+
+        // Plan BEFORE any weight is uploaded, then upload the embedding.
+        //
+        // `plan_layer_devices` reads live `vram_info` for each card's usable
+        // bytes and reserves `token_embd` on device 0 from that reading. It
+        // used to run while the embedding was already resident, so the table
+        // was subtracted TWICE — once implicitly, because `vram_info` had
+        // already dropped by the 4.74 GiB a 248320-row vocab dequantized to
+        // f32 occupies, and again explicitly by the reserve. Device 0 was
+        // thereby planned as if it had 9.5 GiB less headroom than it had, which
+        // is what skewed a dual-16 GiB 27B load off its natural 32/33 split and
+        // starved the card that also has to host the LM head, `pos_dev` and the
+        // decode graph.
+        let layer_devices = plan_layer_devices(
+            ws,
+            &available_devices,
+            cfg.num_layers,
+            cfg.max_seq_len,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.full_attention_interval,
+            cfg.vocab_size,
+            cfg.hidden_size,
+        );
+
         let tok_embeddings = Embedding::load(
             &ws.with_device(first_device.clone()).pp("token_embd"),
             cfg.vocab_size,
@@ -1997,18 +2022,6 @@ impl Qwen35 {
                 )
             })
         })?;
-
-        let layer_devices = plan_layer_devices(
-            ws,
-            &available_devices,
-            cfg.num_layers,
-            cfg.max_seq_len,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            cfg.full_attention_interval,
-            cfg.vocab_size,
-            cfg.hidden_size,
-        );
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -5414,109 +5427,11 @@ fn plan_layer_devices(
 
     let round_robin = |i: usize| devices[i * devices.len() / num_layers.max(1)].clone();
 
-    // Reserve the decode-graph KV arenas BEFORE handing out weight budget.
-    //
-    // The arenas are allocated at full context for every full-attention layer:
-    // `ctx * num_kv_heads * head_dim * bytes_per_elem` for K and again for V
-    // (2 with f16 arenas, 4 with f32). For this
-    // 27B Q4_K model at a 228k context that is ~1.87 GB per attention layer
-    // across 17 such layers = ~31.8 GB, which alone exceeds the 34 GB the pair
-    // has. Planning weights against the *whole* free budget therefore drives
-    // both cards to ~99% and leaves the arenas nowhere to go, which is what
-    // pushed the run into HIP managed memory. Reserving first lets weights and
-    // KV share the budget honestly, and makes an oversized context visible as a
-    // warning rather than a silent spill.
-    let num_attn_layers = (0..num_layers)
-        .filter(|i| (i + 1) % interval.max(1) == 0)
-        .count();
-
-    // Bound the arenas by the VRAM that can actually hold them, BEFORE
-    // reserving. The arena is sized from the model's context, and this 27B
-    // advertises 232k: 16 attention layers at that context reserve 30.4 GB,
-    // more than one 17.1 GB card holds. A reservation the device cannot hold is
-    // not a slow path, it is a guaranteed failure - the weights then have
-    // nowhere to go and the run dies at `vram_free=0.00` before the forward
-    // pass. Tests are pinned to 4k (GRIM_CONTEXT=4096), which is far smaller,
-    // but the bound holds whatever context is asked for.
-    let arena_budget: u64 = devices
-        .iter()
-        .map(|d| match d {
-            Device::Rocm(ord) => {
-                let (free, total) = grim_backend_rocm::vram_info(*ord);
-                if total == 0 { 0 } else { free }
-            }
-            _ => 0,
-        })
-        .sum();
-    let kv_per_attn = |c: usize| -> u64 {
-        // Bytes per KV element follow the dense arena representation (f16 halves
-        // the reservation vs f32; int8 codes are 1 B/elem plus an f32 scale
-        // per row per kv head for K and V); K and V share the representation.
-        // Conservative across devices: the max.
-        //
-        // The per-element figure comes from `kv_arena_bytes_per_kv_elem`, NOT
-        // from a table here: the table that used to live at this line said
-        // `_ => (4, 0)`, so int4 reserved as if it were f32 — eight times its
-        // own layout — and admission control could never trade int4's smaller
-        // footprint for a longer context.
-        let (bpe, scales_per_row) = devices
-            .iter()
-            .map(|d| {
-                let f = kv_arena_format_qwen(d);
-                (
-                    kv_arena_bytes_per_kv_elem(f),
-                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
-                )
-            })
-            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
-        (c as f64 * kv_heads as f64 * head_dim as f64 * bpe * 2.0 + c as f64 * scales_per_row)
-            as u64
-    };
-    // Phase 3: a fixed eviction capacity caps the arena BELOW the model's
-    // advertised context, so the reservation must budget for the cap — that is
-    // the whole point of eviction (262K ctx at a 64K-token arena).
-    let evict = kv_eviction_policy(devices.first().unwrap_or(&Device::Cpu));
-    let budget_ctx = evict.effective_ctx(ctx.max(1));
-    let (eff_ctx, kv_total) =
-        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, budget_ctx);
-    if eff_ctx < ctx {
-        // Report against the capped request so the message names what was asked
-        // for after eviction, not the full advertised context.
-        let (bpe_msg, spr_msg) = devices
-            .iter()
-            .map(|d| {
-                let f = kv_arena_format_qwen(d);
-                (
-                    kv_arena_bytes_per_kv_elem(f),
-                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
-                )
-            })
-            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
-        eprintln!(
-            "[qwen35] KV arena BOUNDED: requested ctx={ctx} needs {:.1} GB across \
-             {num_attn_layers} attention layers, but only {:.1} GB is free across {} \
-             device(s). Capping the arena at ctx={eff_ctx} ({:.1} GB). Set GRIM_CONTEXT \
-             explicitly (tests use 4096) to choose the context.",
-            (ctx as f64 * kv_heads as f64 * head_dim as f64 * bpe_msg * 2.0 + ctx as f64 * spr_msg)
-                * num_attn_layers as f64
-                / 1e9,
-            arena_budget as f64 / 1e9,
-            devices.len(),
-            kv_total as f64 / 1e9
-        );
-    } else if kv_total > 0 {
-        eprintln!(
-            "[qwen35] reserving KV arenas: ctx={eff_ctx}, kv_heads={kv_heads}, \
-             head_dim={head_dim}, attn_layers={num_attn_layers} \
-             -> {:.1} GB total ({:.0} MB, budget {:.1} GB)",
-            kv_total as f64 / 1e9,
-            kv_total as f64 / 1e6,
-            arena_budget as f64 / 1e9
-        );
-    }
-
     // Remaining plannable bytes per device, or None when VRAM is unknowable.
-    let kv_share = (kv_total as f64 / devices.len() as f64) as u64;
+    // Nothing is subtracted for KV here: the arenas are charged per attention
+    // layer, inside the per-layer cost the assigners walk (see below), so a
+    // 27/37 boundary charges the card with 10 attention layers more KV than the
+    // one with 6 instead of an even share that under-reserves the busier card.
     let per_device: Vec<Option<u64>> = devices
         .iter()
         .map(|d| match d {
@@ -5527,8 +5442,7 @@ fn plan_layer_devices(
                 if total == 0 {
                     return None;
                 }
-                let budget = ((free as f64) * VRAM_PLAN_FRACTION) as u64;
-                Some(budget.saturating_sub(kv_share.min(budget)))
+                Some(((free as f64) * VRAM_PLAN_FRACTION) as u64)
             }
             _ => None,
         })
@@ -5575,7 +5489,6 @@ fn plan_layer_devices(
         }
     }
 
-    let mut assignment = Vec::with_capacity(num_layers);
     // Size each block from checkpoint metadata before committing it.
     // Convert-on-load swaps every GSQ-RCO weight's resident bytes for its
     // W4A4OstQuant blob (~1.8x the packed size), so the split must be budgeted
@@ -5605,6 +5518,136 @@ fn plan_layer_devices(
         })
         .collect();
 
+    // Decode-graph workspace reserve. The captured decode graph allocates
+    // workspace and graph objects on every device that owns layers (~1.0 GiB
+    // measured post-prewarm on the 37-layer card of a 27B pair), and the
+    // planner used to charge none of it, which is what left that card at
+    // ~0 free and pushed it to eager. This is a reserve, not a derived
+    // number: only a GPU run validates it. Tunable via GRIM_GRAPH_RESERVE_MB
+    // (per device, MiB).
+    let graph_reserve_per_dev: u64 = std::env::var("GRIM_GRAPH_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1024)
+        .saturating_mul(1024 * 1024);
+    let graph_total = graph_reserve_per_dev.saturating_mul(devices.len() as u64);
+    // Routed per layer so a device holding more layers is charged more graph
+    // workspace, proportionally.
+    let graph_share_per_layer = if num_layers > 0 {
+        graph_total / num_layers as u64
+    } else {
+        0
+    };
+
+    // The decode-graph KV arenas are allocated at full context for every
+    // full-attention layer: `ctx * num_kv_heads * head_dim * bytes_per_elem`
+    // for K and again for V (2 with f16 arenas, 4 with f32). For this
+    // 27B Q4_K model at a 228k context that is ~1.87 GB per attention layer
+    // across 17 such layers = ~31.8 GB, which alone exceeds the 34 GB the pair
+    // has.
+    let num_attn_layers = (0..num_layers)
+        .filter(|i| (i + 1) % interval.max(1) == 0)
+        .count();
+
+    // Bound the arenas by the VRAM the weights ALSO need, not the raw free
+    // sum. The arena is sized from the model's context, and this 27B
+    // advertises 232k: 16 attention layers at that context reserve 30.4 GB
+    // against a raw free pool of 34 GB — "fits", unbounded — and then the
+    // 15.3 GB of layer weights plus the 4.74 GB f32 embedding are budgeted
+    // against the same 34 GB a second time. Same VRAM, counted twice over.
+    // A reservation the devices cannot hold alongside the weights is not a
+    // slow path, it is a guaranteed failure - the run dies at
+    // `vram_free=0.00` before the forward pass. Tests are pinned to 4k
+    // (GRIM_CONTEXT=4096), which is far smaller, but the bound holds whatever
+    // context is asked for.
+    let kv_per_attn = |c: usize| -> u64 {
+        // Bytes per KV element follow the dense arena representation (f16 halves
+        // the reservation vs f32; int8 codes are 1 B/elem plus an f32 scale
+        // per row per kv head for K and V); K and V share the representation.
+        // Conservative across devices: the max.
+        //
+        // The per-element figure comes from `kv_arena_bytes_per_kv_elem`, NOT
+        // from a table here: the table that used to live at this line said
+        // `_ => (4, 0)`, so int4 reserved as if it were f32 — eight times its
+        // own layout — and admission control could never trade int4's smaller
+        // footprint for a longer context.
+        let (bpe, scales_per_row) = devices
+            .iter()
+            .map(|d| {
+                let f = kv_arena_format_qwen(d);
+                (
+                    kv_arena_bytes_per_kv_elem(f),
+                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
+                )
+            })
+            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
+        (c as f64 * kv_heads as f64 * head_dim as f64 * bpe * 2.0 + c as f64 * scales_per_row)
+            as u64
+    };
+    let plannable_total: u64 = remaining.iter().sum();
+    let weights_total: u64 = layer_bytes.iter().sum();
+    let arena_budget: u64 = plannable_total
+        .saturating_sub(weights_total)
+        .saturating_sub(graph_total);
+    // Phase 3: a fixed eviction capacity caps the arena BELOW the model's
+    // advertised context, so the reservation must budget for the cap – that is
+    // the whole point of eviction (262K ctx at a 64K-token arena).
+    let evict = kv_eviction_policy(devices.first().unwrap_or(&Device::Cpu));
+    let budget_ctx = evict.effective_ctx(ctx.max(1));
+    let (eff_ctx, kv_total) =
+        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, budget_ctx);
+    if eff_ctx < ctx {
+        // Report against the capped request so the message names what was asked
+        // for after eviction, not the full advertised context.
+        let (bpe_msg, spr_msg) = devices
+            .iter()
+            .map(|d| {
+                let f = kv_arena_format_qwen(d);
+                (
+                    kv_arena_bytes_per_kv_elem(f),
+                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
+                )
+            })
+            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
+        eprintln!(
+            "[qwen35] KV arena BOUNDED: requested ctx={ctx} needs {:.1} GB across \
+             {num_attn_layers} attention layers, but only {:.1} GB is free across {} \
+             device(s). Capping the arena at ctx={eff_ctx} ({:.1} GB). Set GRIM_CONTEXT \
+             explicitly (tests use 4096) to choose the context.",
+            (ctx as f64 * kv_heads as f64 * head_dim as f64 * bpe_msg * 2.0 + ctx as f64 * spr_msg)
+                * num_attn_layers as f64
+                / 1e9,
+            arena_budget as f64 / 1e9,
+            devices.len(),
+            kv_total as f64 / 1e9
+        );
+    } else if kv_total > 0 {
+        eprintln!(
+            "[qwen35] reserving KV arenas: ctx={eff_ctx}, kv_heads={kv_heads}, \
+             head_dim={head_dim}, attn_layers={num_attn_layers} \
+             -> {:.1} GB total ({:.0} MB, budget {:.1} GB)",
+            kv_total as f64 / 1e9,
+            kv_total as f64 / 1e6,
+            arena_budget as f64 / 1e9
+        );
+    }
+
+    // Per-layer cost the assigners walk: resident weights + a graph-workspace
+    // share +, for each full-attention layer, its own KV arena at the bounded
+    // effective context. Routing KV through the layer that owns it (instead of
+    // an even `kv_total / devices` share) is what makes a 27/37 boundary
+    // reserve the 10-attention-layer card for 10 arenas, not 8. The assigners
+    // themselves are unchanged and their existing tests keep passing.
+    let kv_layer_bytes = kv_per_attn(eff_ctx);
+    let layer_cost = placement_layer_costs(
+        &layer_bytes,
+        interval,
+        kv_layer_bytes,
+        graph_share_per_layer,
+    );
+
+    let mut assignment = Vec::with_capacity(num_layers);
+
     // Measured per-device capability, in `devices` order.
     //
     // Gated rather than always-on: `CapabilityProfiler::new()` runs a rocBLAS
@@ -5629,7 +5672,7 @@ fn plan_layer_devices(
         };
     // Single-device preference FIRST: a model that fits one card must not be
     // split (see `single_device_fit` for the measurement).
-    if let Some(best) = single_device_fit(&layer_bytes, &remaining) {
+    if let Some(best) = single_device_fit(&layer_cost, &remaining) {
         eprintln!(
             "[qwen35] single-device fit: rocm:{} holds all {} layers ({:.2} GB of {:.2} GB \
              budget) — not splitting (a split would add a cross-device hop per forward)",
@@ -5638,12 +5681,12 @@ fn plan_layer_devices(
                 _ => usize::MAX,
             },
             num_layers,
-            layer_bytes.iter().sum::<u64>() as f64 / 1e9,
+            layer_cost.iter().sum::<u64>() as f64 / 1e9,
             remaining[best] as f64 / 1e9,
         );
         return vec![devices[best].clone(); num_layers];
     }
-    let (targets, unplaced) = assign_by_headroom(&layer_bytes, &mut remaining, &caps);
+    let (targets, unplaced) = assign_by_headroom(&layer_cost, &mut remaining, &caps);
     for t in targets {
         assignment.push(devices[t].clone());
     }
@@ -5697,9 +5740,10 @@ fn plan_layer_devices(
 /// Returns the chosen device index per layer plus the count of layers that did
 /// not fit anywhere (those are placed on device 0 and will fall back to managed
 /// memory). Pure function so placement can be unit-tested without a GPU.
-/// Single-device preference: if ONE device's remaining budget (after its KV
-/// arena share is reserved) can hold every layer, that device should take the
-/// whole model.
+/// Single-device preference: if ONE device's remaining budget can hold every
+/// layer — with each layer's cost already carrying its KV arena (when the
+/// layer is full-attention) and its graph-workspace share — that device
+/// should take the whole model.
 ///
 /// `assign_by_headroom` splits proportionally to headroom by design, so a model
 /// that fits one card is split anyway and pays a cross-device hop per forward
@@ -5718,6 +5762,33 @@ fn plan_layer_devices(
 /// capture that faults (`Memory access fault by GPU node-1`, reproduced when
 /// this helper first preferred the roomier card). A single-device layout is only
 /// safe when it is the primary's.
+/// Per-layer placement cost: resident weight bytes + a graph-workspace share
+/// + the layer's own KV arena when it is a full-attention layer
+/// (`(i + 1) % interval == 0`). KV follows the layer that owns it rather than
+/// an even per-device share, so a boundary that puts 10 attention layers on
+/// one card charges that card for 10 arenas, not `total / devices`. Pure so
+/// the routing is unit-testable without a GPU.
+fn placement_layer_costs(
+    layer_bytes: &[u64],
+    interval: usize,
+    kv_layer_bytes: u64,
+    graph_share_per_layer: u64,
+) -> Vec<u64> {
+    layer_bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let attn = if (i + 1) % interval.max(1) == 0 {
+                kv_layer_bytes
+            } else {
+                0
+            };
+            b.saturating_add(graph_share_per_layer)
+                .saturating_add(attn)
+        })
+        .collect()
+}
+
 fn single_device_fit(layer_bytes: &[u64], remaining: &[u64]) -> Option<usize> {
     // `GRIM_FORCE_SPLIT=1` opts out: the split path must stay exercisable (and
     // tested) even when a model fits one card, and the multi-GPU gates need a
@@ -6294,6 +6365,49 @@ mod tests {
         let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
         assert!(remaining.iter().all(|&r| r <= 500), "budgets must not wrap");
         let _ = unplaced;
+    }
+
+    /// KV and graph-workspace reserve must follow the LAYER, not an even
+    /// per-device share. A 64-layer model at interval 4 has 16 full-attention
+    /// layers; a 27/37 boundary puts 6 of them on one card and 10 on the other.
+    /// Charging `kv_total / devices` under-reserves the 10-arena card by 2
+    /// arenas; charging each attention layer its own arena inside the cost the
+    /// assigners walk cannot. The graph share must likewise land on every
+    /// layer, so a device holding more layers pays more graph workspace.
+    #[test]
+    fn kv_and_graph_reserve_follow_the_layer_not_an_even_share() {
+        let num_layers = 64;
+        let interval = 4;
+        let layer_bytes = vec![240_000_000u64; num_layers]; // 240 MB weights
+        let kv_layer_bytes = 1_870_000_000u64; // 1.87 GB arena at bounded ctx
+        let graph_share = 33_000_000u64; // ~2 GiB over 2 devices / 64 layers
+
+        let costs = placement_layer_costs(&layer_bytes, interval, kv_layer_bytes, graph_share);
+
+        // Attention layers carry the arena; the others do not.
+        for (i, &c) in costs.iter().enumerate() {
+            let is_attn = (i + 1) % interval == 0;
+            let expect = 240_000_000 + graph_share + if is_attn { kv_layer_bytes } else { 0 };
+            assert_eq!(c, expect, "layer {i} (attn={is_attn}) mis-charged");
+        }
+        // Total conservation: weights + graph + exactly num_attn arenas.
+        let num_attn = (0..num_layers).filter(|i| (i + 1) % interval == 0).count();
+        assert_eq!(num_attn, 16);
+        let total: u64 = costs.iter().sum();
+        assert_eq!(
+            total,
+            layer_bytes.iter().sum::<u64>() + graph_share * num_layers as u64
+                + kv_layer_bytes * num_attn as u64,
+            "reserve must be conserved, not created or lost"
+        );
+        // The discriminating scenario from the 27B: a device taking 10
+        // attention layers is charged 10 arenas even though its even share
+        // would have been 8.
+        let ten_attn_card: u64 = costs[27..].iter().sum();
+        assert!(
+            ten_attn_card > layer_bytes.iter().sum::<u64>() / 2,
+            "the 37-layer half must carry more than half the weight bytes"
+        );
     }
 
     /// `GRIM_KV_QUANT` must select the packed formats the paged kernel can

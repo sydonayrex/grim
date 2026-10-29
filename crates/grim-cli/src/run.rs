@@ -1229,128 +1229,16 @@ pub async fn cmd_run(
     }
 
     // One-shot inference path with generation loop.
-    let model: Box<dyn CausalLm> = if use_gguf {
-        eprintln!("[grim] Loading GGUF model: {}", model_path_str);
-        match load_model_from_gguf(&model_path_str, device.clone()) {
-            Ok(m) => {
-                eprintln!("[grim] GGUF model loaded successfully.");
-                if let Device::Rocm(o) = &device {
-                    let (free, total) = grim_backend_rocm::vram_info(*o);
-                    eprintln!(
-                        "[vram] after load: free {:.2} GiB / total {:.2} GiB",
-                        free as f64 / (1 << 30) as f64,
-                        total as f64 / (1 << 30) as f64
-                    );
-                }
-                m
-            }
-            Err(e) => {
-                eprintln!(
-                    "[grim] ERROR: failed to load GGUF model '{}': {}",
-                    model_path_str, e
-                );
-                return Err(e);
-            }
-        }
-    } else if use_grim {
-        eprintln!("[grim] Loading GRIM model: {}", model_path_str);
-        match load_model_from_grim(&model_path_str, device.clone()) {
-            Ok(m) => {
-                eprintln!("[grim] GRIM model loaded successfully.");
-                m
-            }
-            Err(e) => {
-                eprintln!(
-                    "[grim] ERROR: failed to load GRIM model '{}': {}",
-                    model_path_str, e
-                );
-                return Err(e);
-            }
-        }
-    } else if use_safetensors {
-        eprintln!("[grim] Loading safetensors model: {}", model_path_str);
-        match load_model_from_safetensors(&model_path_str, device.clone()) {
-            Ok(m) => {
-                eprintln!("[grim] safetensors model loaded successfully.");
-                m
-            }
-            Err(e) => {
-                eprintln!(
-                    "[grim] ERROR: failed to load safetensors model '{}': {}",
-                    model_path_str, e
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // Fail loudly — never generate from a toy model.
-        return Err(grim_core::error::Error::Config(format!(
-            "Model '{}' is not a valid .gguf, .grim, or .safetensors file or could not be found.\n\
-             Run 'grim pull <name>' to download a model, or provide an\n\
-             explicit path to a .gguf, .grim, or .safetensors file.",
-            model_path_str
-        )));
-    };
-
-    // Speculative decoding: if --draft-model was provided, wrap the base model.
-    // Full DSpark (markov+confidence scheduling) is wired in the HTTP engine path;
-    // CLI one-shot uses plain autoregressive + pre-loaded draft for future extension.
-    // ponytail: plain wrapper — add DSpark when CLI speculation throughput is measured.
-    // One-file speculative loading: fall back to an embedded MTP sidecar
-    // when --draft-model was not given.
-    let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
-    let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
-        let dev = model.device().clone();
-        match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
-            Ok(eagle3) => {
-                eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
-                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
-                // ponytail: plain for now; swap to with_dspark when markov/confidence CLI path added
-                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
-            }
-            Err(_) => match grim_engine::model_loader::load_from_path(d_path) {
-                Ok(_draft_raw) => {
-                    eprintln!(
-                        "[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)"
-                    );
-                    Box::new(grim_speculative::SpeculativeCausalLm::plain(model))
-                        as Box<dyn CausalLm>
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model"
-                    );
-                    model
-                }
-            },
-        }
-    } else {
-        model
-    };
-
-    // Prewarm u4 lane weights at model load time BEFORE any requests/prefill.
-    // Eliminates memory contention and peak VRAM spikes during prefill, and gives
-    // short prompts the fast ~141 ms decode rate from token one.
-    let prewarm_opt_out = matches!(
-        std::env::var("GRIM_PREWARM").as_deref(),
-        Ok("0" | "false" | "off")
-    );
-    if !prewarm_opt_out {
-        if let Some(gm) = resolve_graph_model(&*model) {
-            let t0 = std::time::Instant::now();
-            let r = gm.prewarm_lane_weights();
-            if std::env::var("GRIM_PREWARM_TRACE").is_ok()
-                || std::env::var("GRIM_PLACEMENT_TRACE").is_ok()
-            {
-                eprintln!(
-                    "[prewarm-load] lane weights {:?} ok={:?}",
-                    t0.elapsed(),
-                    r.is_ok()
-                );
-            }
-        }
-    }
-
+    //
+    // The tokenizer load, prompt tokenization, and the dynamic KV policy below
+    // all run BEFORE the model is loaded, deliberately: the placement planner
+    // inside `load_model_from_gguf` reads live free VRAM to reserve KV arenas
+    // and split layers, and the policy sets GRIM_KV_ARENA / GRIM_KV_CACHE_LEN
+    // from a VRAM probe. Probing after the load (the old order) addressed VRAM
+    // the planner had already committed, so the two disagreed about how much
+    // arena the cards could hold. Probing pre-load sees exactly the free VRAM
+    // the planner sees, so they agree. None of this touches the model object,
+    // which is why it can precede the load.
     let tokenizer = load_run_tokenizer(
         path_obj,
         &model_path_str,
@@ -1489,27 +1377,12 @@ pub async fn cmd_run(
         prompt.bytes().map(|b| b as u32 % 512).collect()
     };
 
-    // Determine vocab size — fall back to tokenizer vocab length if model
-    // config type is unknown (GPT2, Gemma, DeepSeek, etc.)
-    let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
-        cfg.vocab_size as usize
-    } else if let Some(cfg) = model
-        .config()
-        .as_any()
-        .downcast_ref::<grim_models_mamba::MambaConfig>()
-    {
-        cfg.vocab_size as usize
-    } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
-        cfg.vocab_size as usize
-    } else if let Some(tok) = &tokenizer {
-        tok.tokens.len()
-    } else {
-        512
-    };
-
     // Dynamic KV policy & preflight sizing:
     // If GRIM_KV_CACHE_LEN or GRIM_KV_ARENA are not explicitly fixed, derive optimal
-    // format and capacity from post-load/prewarm free VRAM across both cards.
+    // format and capacity from PRE-LOAD free VRAM across both cards — the same
+    // reading the placement planner inside the load uses to reserve arenas, so
+    // the two agree instead of the policy addressing VRAM the planner already
+    // committed.
     let max_thinking: usize = std::env::var("GRIM_MAX_THINK_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1596,6 +1469,146 @@ pub async fn cmd_run(
             );
         }
     }
+
+    let model: Box<dyn CausalLm> = if use_gguf {
+        eprintln!("[grim] Loading GGUF model: {}", model_path_str);
+        match load_model_from_gguf(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] GGUF model loaded successfully.");
+                if let Device::Rocm(o) = &device {
+                    let (free, total) = grim_backend_rocm::vram_info(*o);
+                    eprintln!(
+                        "[vram] after load: free {:.2} GiB / total {:.2} GiB",
+                        free as f64 / (1 << 30) as f64,
+                        total as f64 / (1 << 30) as f64
+                    );
+                }
+                m
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim] ERROR: failed to load GGUF model '{}': {}",
+                    model_path_str, e
+                );
+                return Err(e);
+            }
+        }
+    } else if use_grim {
+        eprintln!("[grim] Loading GRIM model: {}", model_path_str);
+        match load_model_from_grim(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] GRIM model loaded successfully.");
+                m
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim] ERROR: failed to load GRIM model '{}': {}",
+                    model_path_str, e
+                );
+                return Err(e);
+            }
+        }
+    } else if use_safetensors {
+        eprintln!("[grim] Loading safetensors model: {}", model_path_str);
+        match load_model_from_safetensors(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] safetensors model loaded successfully.");
+                m
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim] ERROR: failed to load safetensors model '{}': {}",
+                    model_path_str, e
+                );
+                return Err(e);
+            }
+        }
+    } else {
+        // Fail loudly — never generate from a toy model.
+        return Err(grim_core::error::Error::Config(format!(
+            "Model '{}' is not a valid .gguf, .grim, or .safetensors file or could not be found.\n\
+             Run 'grim pull <name>' to download a model, or provide an\n\
+             explicit path to a .gguf, .grim, or .safetensors file.",
+            model_path_str
+        )));
+    };
+
+    // Speculative decoding: if --draft-model was provided, wrap the base model.
+    // Full DSpark (markov+confidence scheduling) is wired in the HTTP engine path;
+    // CLI one-shot uses plain autoregressive + pre-loaded draft for future extension.
+    // ponytail: plain wrapper — add DSpark when CLI speculation throughput is measured.
+    // One-file speculative loading: fall back to an embedded MTP sidecar
+    // when --draft-model was not given.
+    let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
+    let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
+        let dev = model.device().clone();
+        match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
+            Ok(eagle3) => {
+                eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
+                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
+                // ponytail: plain for now; swap to with_dspark when markov/confidence CLI path added
+                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+            }
+            Err(_) => match grim_engine::model_loader::load_from_path(d_path) {
+                Ok(_draft_raw) => {
+                    eprintln!(
+                        "[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)"
+                    );
+                    Box::new(grim_speculative::SpeculativeCausalLm::plain(model))
+                        as Box<dyn CausalLm>
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model"
+                    );
+                    model
+                }
+            },
+        }
+    } else {
+        model
+    };
+
+    // Prewarm u4 lane weights at model load time BEFORE any requests/prefill.
+    // Eliminates memory contention and peak VRAM spikes during prefill, and gives
+    // short prompts the fast ~141 ms decode rate from token one.
+    let prewarm_opt_out = matches!(
+        std::env::var("GRIM_PREWARM").as_deref(),
+        Ok("0" | "false" | "off")
+    );
+    if !prewarm_opt_out {
+        if let Some(gm) = resolve_graph_model(&*model) {
+            let t0 = std::time::Instant::now();
+            let r = gm.prewarm_lane_weights();
+            if std::env::var("GRIM_PREWARM_TRACE").is_ok()
+                || std::env::var("GRIM_PLACEMENT_TRACE").is_ok()
+            {
+                eprintln!(
+                    "[prewarm-load] lane weights {:?} ok={:?}",
+                    t0.elapsed(),
+                    r.is_ok()
+                );
+            }
+        }
+    }
+
+    // Determine vocab size — fall back to tokenizer vocab length if model
+    // config type is unknown (GPT2, Gemma, DeepSeek, etc.)
+    let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
+        cfg.vocab_size as usize
+    } else if let Some(cfg) = model
+        .config()
+        .as_any()
+        .downcast_ref::<grim_models_mamba::MambaConfig>()
+    {
+        cfg.vocab_size as usize
+    } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
+        cfg.vocab_size as usize
+    } else if let Some(tok) = &tokenizer {
+        tok.tokens.len()
+    } else {
+        512
+    };
 
     // Emit diffable JSON startup config banner
     emit_startup_config_banner(&*model, &device, tokens.len(), max_tokens);
