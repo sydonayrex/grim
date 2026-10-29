@@ -3121,6 +3121,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v3 = *V3.get_or_init(|| {
+            matches!(
+                std::env::var("GRIM_WHITECROW_V3").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        });
         static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v2 = *V2.get_or_init(|| {
             !matches!(
@@ -3129,7 +3136,9 @@ impl RocmDevice {
             )
         });
         self.launch_dot8_w4a4_gemv_named(
-            if v2 {
+            if v3 {
+                "grim_dot8_w4a4_gemv_v3"
+            } else if v2 {
                 "grim_dot8_w4a4_gemv_v2"
             } else {
                 "grim_dot8_w4a4_gemv"
@@ -3203,6 +3212,34 @@ impl RocmDevice {
         )
     }
 
+    pub fn launch_dot8_w4a4_gemv_v3_for_ab(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot8_w4a4_gemv_named(
+            "grim_dot8_w4a4_gemv_v3",
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_dot8_w4a4_gemv_named(
         &self,
@@ -3246,9 +3283,17 @@ impl RocmDevice {
             )));
         }
 
-        let grid_x = (n as u32).div_ceil(4);
+        let grid_x = if kernel == "grim_dot8_w4a4_gemv_v3" {
+            (n as u32).div_ceil(16)
+        } else {
+            (n as u32).div_ceil(4)
+        };
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = if kernel == "grim_dot8_w4a4_gemv_v3" {
+            HipDim3::new(128, 1, 1)
+        } else {
+            HipDim3::new(32, 1, 1)
+        };
 
         let mut a_c = a_codes_ptr;
         let mut a_s = a_scales_ptr;
@@ -3261,7 +3306,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
-        if kernel == "grim_dot8_w4a4_gemv_v2" {
+        if kernel == "grim_dot8_w4a4_gemv_v2" || kernel == "grim_dot8_w4a4_gemv_v3" {
             crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
         }
         self.launch_compute_kernel(

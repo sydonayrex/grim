@@ -749,9 +749,31 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("ostquant gemv: out has no device ptr".into()))?;
 
-        let grid_x = (n as u32).div_ceil(4);
+        static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v3 = *V3.get_or_init(|| {
+            matches!(
+                std::env::var("GRIM_WHITECROW_V3").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        });
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITECROW_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let grid_x = if v3 {
+            (n as u32).div_ceil(16)
+        } else {
+            (n as u32).div_ceil(4)
+        };
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = if v3 {
+            HipDim3::new(128, 1, 1)
+        } else {
+            HipDim3::new(32, 1, 1)
+        };
 
         let mut a_c = a_codes_ptr;
         let mut a_s = a_scales_ptr;
@@ -764,18 +786,13 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
-        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v2 = *V2.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_WHITECROW_V2").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
-        if v2 {
+        if v2 || v3 {
             crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
         }
         self.launch_compute_kernel(
-            if v2 {
+            if v3 {
+                "grim_dot8_w4a4_gemv_v3"
+            } else if v2 {
                 "grim_dot8_w4a4_gemv_v2"
             } else {
                 "grim_dot8_w4a4_gemv"

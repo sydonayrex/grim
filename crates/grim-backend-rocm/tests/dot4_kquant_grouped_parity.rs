@@ -1587,8 +1587,8 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         dev.gcn_arch()
     );
     println!(
-        "{:<16} {:<15} {:>10} {:>10} {:>8} | {:>10} {:>10} {:>8}",
-        "Kernel", "Shape (NxKxM)", "Warm v1", "Warm v2", "Warm x", "Cold v1", "Cold v2", "Cold x"
+        "{:<16} {:<15} {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7}",
+        "Kernel", "Shape (NxKxM)", "W v1", "W v2", "W v3", "C v1", "C v2", "C v3"
     );
     println!("{}", "-".repeat(98));
 
@@ -1669,7 +1669,13 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
             .map_err(|e| e.to_string())?;
-        let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
+        let o3 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let (o1_r, o2_r, o3_r) = (
+            as_rocm(o1.as_ref()).unwrap(),
+            as_rocm(o2.as_ref()).unwrap(),
+            as_rocm(o3.as_ref()).unwrap(),
+        );
 
         dev.launch_dot8_w4a4_gemv_v1_for_ab(
             ac_r,
@@ -1697,8 +1703,21 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             k,
         )
         .map_err(|e| e.to_string())?;
+        dev.launch_dot8_w4a4_gemv_v3_for_ab(
+            ac_r,
+            as_r,
+            asum_r,
+            as_rocm(b_qw_sts[0].as_ref()).unwrap(),
+            as_rocm(b_sc_sts[0].as_ref()).unwrap(),
+            as_rocm(b_zr_sts[0].as_ref()).unwrap(),
+            o3_r,
+            m,
+            n,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
         dev.synchronize();
-        let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+        let (v1_out, v2_out, v3_out) = (f32_vec(&o1)?, f32_vec(&o2)?, f32_vec(&o3)?);
         let diffs = v1_out
             .iter()
             .zip(&v2_out)
@@ -1709,6 +1728,16 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             "whitecrow_v2 not bit-identical at n={n} k={k} m={m}"
         );
         println!("whitecrow      v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
+        let diffs3 = v1_out
+            .iter()
+            .zip(&v3_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            diffs3, 0,
+            "whitecrow_v3 not bit-identical to v1 at n={n} k={k} m={m}"
+        );
+        println!("whitecrow      v3 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
 
         if timed {
             let bytes = (n * row_bytes + m * (n_groups * 64 + n_groups * 8) + m * n * 4) as f64;
@@ -1780,6 +1809,25 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             let w_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
             let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                dev.launch_dot8_w4a4_gemv_v3_for_ab(
+                    ac_r,
+                    as_r,
+                    asum_r,
+                    as_rocm(b_qw_sts[0].as_ref()).unwrap(),
+                    as_rocm(b_sc_sts[0].as_ref()).unwrap(),
+                    as_rocm(b_zr_sts[0].as_ref()).unwrap(),
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
+            }
+            dev.synchronize();
+            let w_v3 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+            let t0 = std::time::Instant::now();
             for i in 0..ITERS {
                 let idx = i % ROT;
                 dev.launch_dot8_w4a4_gemv_v1_for_ab(
@@ -1819,16 +1867,36 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             dev.synchronize();
             let c_v2 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
 
+            let t0 = std::time::Instant::now();
+            for i in 0..ITERS {
+                let idx = i % ROT;
+                dev.launch_dot8_w4a4_gemv_v3_for_ab(
+                    ac_r,
+                    as_r,
+                    asum_r,
+                    as_rocm(b_qw_sts[idx].as_ref()).unwrap(),
+                    as_rocm(b_sc_sts[idx].as_ref()).unwrap(),
+                    as_rocm(b_zr_sts[idx].as_ref()).unwrap(),
+                    o2_r,
+                    m,
+                    n,
+                    k,
+                )
+                .unwrap();
+            }
+            dev.synchronize();
+            let c_v3 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
             println!(
-                "{:<16} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>7.3}x",
+                "{:<16} {:<15} {:>7.1} {:>7.1} {:>7.1} | {:>7.1} {:>7.1} {:>7.1}",
                 "whitecrow",
                 format!("{n}x{k}x{m}"),
                 w_v1,
                 w_v2,
-                w_v2 / w_v1,
+                w_v3,
                 c_v1,
                 c_v2,
-                c_v2 / c_v1
+                c_v3
             );
         }
     }
