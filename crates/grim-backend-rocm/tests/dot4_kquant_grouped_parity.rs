@@ -2918,6 +2918,96 @@ fn corvid_w4a4_true_cold_ab() -> Result<(), String> {
         }
         dev.synchronize();
 
+        // ── FLOOR: empty kernel under the SAME launch->sync pattern ──────
+        let floor_iters = 60;
+        let mut floor_us = Vec::with_capacity(floor_iters);
+        for _ in 0..floor_iters {
+            let t = std::time::Instant::now();
+            dev.launch_empty_probe().map_err(|e| e.to_string())?;
+            dev.synchronize();
+            floor_us.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        floor_us.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let floor_med = floor_us[floor_iters / 2];
+        // Batched floor: 16 back-to-back empties, one sync.
+        let t = std::time::Instant::now();
+        for _ in 0..16 {
+            dev.launch_empty_probe().map_err(|e| e.to_string())?;
+        }
+        dev.synchronize();
+        let floor_batched_us = t.elapsed().as_secs_f64() * 1e6 / 16.0;
+
+        // ── CEILING: read-only streaming over the SAME rotating qw copies,
+        //    timed under the SAME single-launch and batched-16 patterns ──
+        let qw_words = n * words_per_col;
+        let qw_bytes_total = (qw_words * 4) as f64;
+        let probe_out = MemoryOps::alloc_storage(&dev, &Shape::new(vec![4]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let mut ceil_single = Vec::with_capacity(ITERS);
+        for it in 0..ITERS {
+            let t = std::time::Instant::now();
+            dev.launch_stream_read_probe(
+                as_rocm(qw_c[it % COPIES].as_ref()).unwrap(),
+                as_rocm(probe_out.as_ref()).unwrap(),
+                qw_words,
+            )
+            .map_err(|e| e.to_string())?;
+            dev.synchronize();
+            ceil_single.push(qw_bytes_total / t.elapsed().as_secs_f64() / 1e9);
+        }
+        ceil_single.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let mut ceil_batched = Vec::new();
+        for _ in 0..SWEEPS {
+            let t = std::time::Instant::now();
+            for it in 0..16 {
+                dev.launch_stream_read_probe(
+                    as_rocm(qw_c[it % COPIES].as_ref()).unwrap(),
+                    as_rocm(probe_out.as_ref()).unwrap(),
+                    qw_words,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            dev.synchronize();
+            ceil_batched.push(qw_bytes_total * 16.0 / t.elapsed().as_secs_f64() / 1e9);
+        }
+        ceil_batched.sort_by(|x, y| x.partial_cmp(y).unwrap());
+
+        // ── v5 BATCHED: 16 back-to-back GEMVs across the rotating copies,
+        //    one sync — launch overhead amortized, weights still DRAM ────
+        let mut v5_batched = Vec::new();
+        for _ in 0..SWEEPS {
+            let t = std::time::Instant::now();
+            for it in 0..16 {
+                dev.launch_dot8_w4a4_gemv_v5_for_ab(
+                    ac_r, as_r, asum_r,
+                    as_rocm(qw_c[it % COPIES].as_ref()).unwrap(),
+                    as_rocm(sc_c[it % COPIES].as_ref()).unwrap(),
+                    as_rocm(zr_c[it % COPIES].as_ref()).unwrap(),
+                    o4, m, n, k,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            dev.synchronize();
+            v5_batched.push(bytes * 16.0 / t.elapsed().as_secs_f64() / 1e9);
+        }
+        v5_batched.sort_by(|x, y| x.partial_cmp(y).unwrap());
+
+        println!("--- harness calibration (n={n} k={k}) ---");
+        println!(
+            "  floor:      empty kernel  {:.2} us/call (single median)   {:.2} us/call (batched16)",
+            floor_med, floor_batched_us
+        );
+        println!(
+            "  ceiling:    stream-read {:.1} MB qw  {:.1} GB/s (single median)  {:.1} GB/s (batched16 median-of-sweeps)",
+            qw_bytes_total / 1e6,
+            ceil_single[ITERS / 2],
+            ceil_batched[SWEEPS / 2]
+        );
+        println!(
+            "  v5 batched16: {:.1} GB/s (median-of-sweeps)  <- compare against the batched ceiling",
+            v5_batched[SWEEPS / 2]
+        );
+
         println!("\n=== true-cold W4A4 GEMV  n={n} k={k}  ({:.1} MB/weight x {COPIES} copies, median of {ITERS} iters x {SWEEPS} sweeps) ===", bytes / 1e6);
         for (name, f) in &kernels {
             let mut medians = Vec::new();

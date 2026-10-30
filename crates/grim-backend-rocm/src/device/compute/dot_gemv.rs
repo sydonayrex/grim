@@ -3352,6 +3352,46 @@ impl RocmDevice {
         )
     }
 
+    /// Harness probe: empty kernel (launch+sync floor). See
+    /// grim_empty_probe in kernels/dot_gemv.rs.
+    pub fn launch_empty_probe(&self) -> Result<()> {
+        self.launch_compute_kernel(
+            "grim_empty_probe",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(32, 1, 1),
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    /// Harness probe: read-only DRAM streaming ceiling over `words` u32 of
+    /// `src` (4 x uint4 per thread, coalesced). See grim_stream_read_probe.
+    pub fn launch_stream_read_probe(
+        &self,
+        src: &RocmStorage,
+        out: &RocmStorage,
+        words: usize,
+    ) -> Result<()> {
+        let src_ptr = src
+            .device_ptr
+            .ok_or_else(|| Error::Backend("stream_read_probe: src has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("stream_read_probe: out has no device ptr".into()))?;
+        let mut sp = src_ptr;
+        let mut op = out_ptr;
+        let mut w = words as i64;
+        let threads: u32 = 256;
+        let blocks = (words as u64).div_ceil((threads * 16) as u64) as u32;
+        self.launch_compute_kernel(
+            "grim_stream_read_probe",
+            HipDim3::new(blocks, 1, 1),
+            HipDim3::new(threads, 1, 1),
+            &mut [arg(&mut sp), arg(&mut op), arg(&mut w)],
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_dot8_w4a4_gemv_named(
         &self,

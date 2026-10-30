@@ -5551,6 +5551,37 @@ extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_v5(
 }
 #endif // __gfx1200__ || __gfx1201__
 
+// Harness probes for the true-cold W4A4 A/B (corvid_w4a4_true_cold_ab):
+// an EMPTY kernel gives the launch+sync floor of the per-iteration timing
+// pattern, and a read-only streaming kernel over the same rotating weight
+// copies gives the machine's DRAM ceiling under the identical pattern.
+// With both, a kernel's GB/s can be judged against a measured ceiling
+// instead of an assumed one.
+extern "C" __global__ void grim_empty_probe() {}
+
+// Reads `words` u32 as 4 x uint4 per thread (64 B, coalesced across the
+// block) and folds them into a checksum that can never fire its publish
+// branch, so the loads are live but nothing is written.
+extern "C" __global__ void grim_stream_read_probe(
+    const unsigned int* __restrict__ src,
+    float* __restrict__ out,
+    long long words)
+{
+    const long long i0 = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 16;
+    float acc = 0.0f;
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        const long long idx = i0 + v * 4;
+        if (idx < words) {
+            const uint4 w = *(const uint4*)(src + idx);
+            acc += (float)((w.x ^ w.y ^ w.z ^ w.w) & 0xFFFF);
+        }
+    }
+    if (acc == 1.0e38f) {
+        out[0] = acc;   // never taken; defeats dead-code elimination
+    }
+}
+
 // ForestRaven decode/prefill GEMV: F32 activations quantized in-register
 // (per-32-block absmax, full-fp32 scale) against per-row absmax INT8 weights
 // in the framed blob ([u64 codes_len][codes N*K][u64 scales_len][scales N]).
