@@ -2537,3 +2537,272 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
 
     Ok(())
 }
+
+/// v4 (interleaved records, uint4 loads, one-stream sidecars, predicated
+/// 4-group structure, LDS A staging) vs v3: BIT-EXACT on identical weights.
+/// The v4 layout is produced by `grim_quant::interleave_w4a4_ostquant`, which
+/// rearranges the classic triple's bytes without re-quantizing, so the two
+/// kernels consume the same code/scale/zero VALUES and — per-lane ascending
+/// group order preserved — must agree bit for bit. Includes the NG=136
+/// shape (K=17408), which exercises the predicated tail the old fast-loop
+/// condition `g + 96 < n_groups` handled with a scalar loop.
+#[test]
+#[ignore = "requires AMD GPU; run with GRIM_RUN_GPU_TEST=1 HIP_VISIBLE_DEVICES=1"]
+fn corvid_w4a4_v4_bit_exact_and_ab() -> Result<(), String> {
+    if std::env::var("GRIM_RUN_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set GRIM_RUN_GPU_TEST=1 to run");
+        return Ok(());
+    }
+    let dev = RocmDevice::try_new(0).map_err(|e| format!("no ROCm device: {e}"))?;
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] dot8_w4a4_gemv_v4 requires RDNA4 (gfx1200/gfx1201)");
+        return Ok(());
+    }
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
+    let bf16ty = DType {
+        arith: ArithType::BF16,
+        storage: Storage::Native,
+    };
+    let u32ty = DType {
+        arith: ArithType::U32,
+        storage: Storage::Native,
+    };
+    let u8ty = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
+
+    for &(n, k, m, timed) in &[
+        (48usize, 2048usize, 1usize, false),   // 3 col16 blocks, NG=16
+        (67, 512, 1, false),                   // partial final col16 block
+        (64, 17408, 1, false),                 // NG=136: predicated tail path
+        (17408, 5120, 1, true),
+        (5120, 17408, 1, true),
+    ] {
+        let n_groups = k / 128;
+        let words_per_col = k / 8;
+        let mut rng = Lcg(0xC0271D02 ^ (n * 31 + k) as u64);
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
+        let (qw_bytes, sc_bytes, zr_bytes) =
+            grim_quant::quant_ostquant_w4_group128(&w, n, k).map_err(|e| e.to_string())?;
+        let inter = grim_quant::interleave_w4a4_ostquant(&qw_bytes, &sc_bytes, &zr_bytes, n, k)
+            .map_err(|e| e.to_string())?;
+        let spans = n_groups.div_ceil(32);
+        let cnt_last = n_groups - (spans - 1) * 32;
+        assert_eq!(
+            inter.len(),
+            n * ((spans - 1) * 2176 + cnt_last * 68),
+            "lane-contiguous plane layout byte count"
+        );
+
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let act_codes =
+            MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups * 16]), u32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let act_scales =
+            MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), f32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let act_sums =
+            MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), u32ty.clone())
+                .map_err(|e| e.to_string())?;
+        let (ac_r, as_r, asum_r) = (
+            as_rocm(act_codes.as_ref()).unwrap(),
+            as_rocm(act_scales.as_ref()).unwrap(),
+            as_rocm(act_sums.as_ref()).unwrap(),
+        );
+        dev.launch_quantize_u4_group128(as_rocm(a_st.as_ref()).unwrap(), ac_r, as_r, asum_r, m, k)
+            .map_err(|e| e.to_string())?;
+
+        let b_qw_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &qw_bytes,
+            &Shape::new(vec![n * words_per_col]),
+            u32ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        let b_sc_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &sc_bytes,
+            &Shape::new(vec![n * n_groups]),
+            bf16ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        let b_zr_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &zr_bytes,
+            &Shape::new(vec![n * n_groups]),
+            u8ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        let b_inter_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &inter,
+            &Shape::new(vec![inter.len()]),
+            u8ty.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let o3 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let o4 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+
+        dev.launch_dot8_w4a4_gemv_v3_for_ab(
+            ac_r,
+            as_r,
+            asum_r,
+            as_rocm(b_qw_st.as_ref()).unwrap(),
+            as_rocm(b_sc_st.as_ref()).unwrap(),
+            as_rocm(b_zr_st.as_ref()).unwrap(),
+            as_rocm(o3.as_ref()).unwrap(),
+            m,
+            n,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
+        let o5 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        dev.launch_dot8_w4a4_gemv_v4_for_ab(
+            ac_r,
+            as_r,
+            asum_r,
+            as_rocm(b_inter_st.as_ref()).unwrap(),
+            as_rocm(o4.as_ref()).unwrap(),
+            m,
+            n,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
+        dev.launch_dot8_w4a4_gemv_v5_for_ab(
+            ac_r,
+            as_r,
+            asum_r,
+            as_rocm(b_qw_st.as_ref()).unwrap(),
+            as_rocm(b_sc_st.as_ref()).unwrap(),
+            as_rocm(b_zr_st.as_ref()).unwrap(),
+            as_rocm(o5.as_ref()).unwrap(),
+            m,
+            n,
+            k,
+        )
+        .map_err(|e| e.to_string())?;
+        dev.synchronize();
+        let v3_out = f32_vec(&o3)?;
+        let v4_out = f32_vec(&o4)?;
+        let v5_out = f32_vec(&o5)?;
+        let diffs = v3_out
+            .iter()
+            .zip(&v4_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(diffs, 0, "whitecrow_v4 not bit-identical at n={n} k={k} m={m}");
+        println!("whitecrow      v4 parity n={n:<5} k={k:<5} m={m}: bit-identical to v3 (0 diffs)");
+        let diffs5 = v3_out
+            .iter()
+            .zip(&v5_out)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(diffs5, 0, "whitecrow_v5 not bit-identical at n={n} k={k} m={m}");
+        println!("whitecrow      v5 parity n={n:<5} k={k:<5} m={m}: bit-identical to v3 (0 diffs)");
+
+        if timed {
+            const WARMUP: usize = 10;
+            const ITERS: usize = 60;
+            let row_bytes = words_per_col * 4 + n_groups * 2 + n_groups;
+            let bytes = (n * row_bytes + m * (n_groups * 64 + n_groups * 8) + m * n * 4) as f64;
+            // COLD: one launch per kernel over the freshly-uploaded weights
+            // (L2/DRAM cold for B; JIT is already warm from the parity runs).
+            let cold = |f: &mut dyn FnMut()| {
+                let t = std::time::Instant::now();
+                f();
+                dev.synchronize();
+                bytes / t.elapsed().as_secs_f64() / 1e9
+            };
+            let c3 = cold(&mut || {
+                dev.launch_dot8_w4a4_gemv_v3_for_ab(ac_r, as_r, asum_r, as_rocm(b_qw_st.as_ref()).unwrap(), as_rocm(b_sc_st.as_ref()).unwrap(), as_rocm(b_zr_st.as_ref()).unwrap(), as_rocm(o3.as_ref()).unwrap(), m, n, k).unwrap();
+            });
+            let c5 = cold(&mut || {
+                dev.launch_dot8_w4a4_gemv_v5_for_ab(ac_r, as_r, asum_r, as_rocm(b_qw_st.as_ref()).unwrap(), as_rocm(b_sc_st.as_ref()).unwrap(), as_rocm(b_zr_st.as_ref()).unwrap(), as_rocm(o5.as_ref()).unwrap(), m, n, k).unwrap();
+            });
+            let c4 = cold(&mut || {
+                dev.launch_dot8_w4a4_gemv_v4_for_ab(ac_r, as_r, asum_r, as_rocm(b_inter_st.as_ref()).unwrap(), as_rocm(o4.as_ref()).unwrap(), m, n, k).unwrap();
+            });
+            println!(
+                "whitecrow COLD  n={n:<5} k={k:<5} m={m}: v3 {c3:>7.1} GB/s   v5 {c5:>7.1} GB/s   v4 {c4:>7.1} GB/s"
+            );
+            let mut t3 = std::time::Duration::ZERO;
+            let mut t4 = std::time::Duration::ZERO;
+            let mut t5d = std::time::Duration::ZERO;
+            for it in 0..(WARMUP + ITERS) {
+                let t = std::time::Instant::now();
+                dev.launch_dot8_w4a4_gemv_v3_for_ab(
+                    ac_r,
+                    as_r,
+                    asum_r,
+                    as_rocm(b_qw_st.as_ref()).unwrap(),
+                    as_rocm(b_sc_st.as_ref()).unwrap(),
+                    as_rocm(b_zr_st.as_ref()).unwrap(),
+                    as_rocm(o3.as_ref()).unwrap(),
+                    m,
+                    n,
+                    k,
+                )
+                .map_err(|e| e.to_string())?;
+                dev.synchronize();
+                if it >= WARMUP {
+                    t3 += t.elapsed();
+                }
+                let t = std::time::Instant::now();
+                dev.launch_dot8_w4a4_gemv_v5_for_ab(
+                    ac_r,
+                    as_r,
+                    asum_r,
+                    as_rocm(b_qw_st.as_ref()).unwrap(),
+                    as_rocm(b_sc_st.as_ref()).unwrap(),
+                    as_rocm(b_zr_st.as_ref()).unwrap(),
+                    as_rocm(o5.as_ref()).unwrap(),
+                    m,
+                    n,
+                    k,
+                )
+                .map_err(|e| e.to_string())?;
+                dev.synchronize();
+                if it >= WARMUP {
+                    t5d += t.elapsed();
+                }
+                let t4i = std::time::Instant::now();
+                dev.launch_dot8_w4a4_gemv_v4_for_ab(
+                    ac_r,
+                    as_r,
+                    asum_r,
+                    as_rocm(b_inter_st.as_ref()).unwrap(),
+                    as_rocm(o4.as_ref()).unwrap(),
+                    m,
+                    n,
+                    k,
+                )
+                .map_err(|e| e.to_string())?;
+                dev.synchronize();
+                if it >= WARMUP {
+                    t4 += t4i.elapsed();
+                }
+            }
+            let w3 = bytes / t3.as_secs_f64() * ITERS as f64 / 1e9;
+            let w4 = bytes / t4.as_secs_f64() * ITERS as f64 / 1e9;
+            let w5 = bytes / t5d.as_secs_f64() * ITERS as f64 / 1e9;
+            println!(
+                "whitecrow WARM  n={n:<5} k={k:<5} m={m}: v3 {w3:>7.1}  v5 {w5:>7.1} ({:>2.2}x)  v4 {w4:>7.1} ({:>2.2}x)",
+                w5 / w3,
+                w4 / w3
+            );
+        }
+    }
+
+    Ok(())
+}

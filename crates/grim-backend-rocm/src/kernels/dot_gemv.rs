@@ -5311,6 +5311,244 @@ extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_v3(
         }
     }
 }
+// WhiteCrow / CityCrow v4 — LANE-CONTIGUOUS plane layout (review item 1
+// done right; the first attempt interleaved 1072 B records whose index was
+// lane-DEPENDENT, so one load touched 32 distinct records at 1072 B stride —
+// worse than v3's 64 B lane stride — and measured 0.85-0.97x).
+//
+// Layout, per (column, 32-group span):
+//   codes:   [v:4][lane:32][16 B] — lane l's group words {4v..4v+3}; one
+//            b128 load reads 512 contiguous bytes across the wave
+//   sidecar: [lane:32][4 B] = [u16 bf16 scale][u8 zero][u8 pad]
+//   span bytes: 32*64 + 32*4 = 2176; partial last span: cnt*68 (cnt <= 32);
+//   column bytes: (spans-1)*2176 + cnt_last*68 (no group padding — the last
+//   span is sized exactly and predication skips its absent lanes).
+//
+// Item 2: scale+zero ride in ONE 4 B word per (column, lane) — one stream.
+// Item 3: predicated spans, no scalar tail, no idle lanes. Item 5: b128
+// loads (4 codes + 1 sidecar word per group/column vs v3's 8 uint2 + 2).
+// Item 4: A stays global (L2-resident); the LDS variant measured a
+// regression. Per-lane group order is unchanged (l, l+32, ... ascending),
+// so the gate is bit-exactness vs v3/v5.
+extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_v4(
+    const unsigned int* __restrict__ A_codes,
+    const float* __restrict__ A_scales,
+    const int* __restrict__ A_sums,
+    const unsigned char* __restrict__ B_planes,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave    = threadIdx.x >> 5;         // 0..3 -> column sub-block
+    const int lane    = threadIdx.x & 31;         // wave-local lane 0..31
+    const int col_base = blockIdx.x * 16;
+    const int row      = blockIdx.y;
+    if (row >= M) return;
+
+    const int n_groups = K / 128;
+    const unsigned int* a_codes_row = A_codes + (long long)row * n_groups * 16;
+    const float* a_scales_row = A_scales + (long long)row * n_groups;
+    const int* a_sums_row = A_sums + (long long)row * n_groups;
+
+    const int my_store_lo = col_base + wave * 4;
+    const int my_store_cnt = max(0, min(4, N - my_store_lo));
+    if (my_store_cnt <= 0) return;
+
+    // Span geometry (see layout comment above).
+    const int spans = (n_groups + 31) / 32;
+    const int cnt_last = n_groups - (spans - 1) * 32;
+    const long long col_bytes = (long long)(spans - 1) * 2176 + (long long)cnt_last * 68;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Per-lane ascending group order: lane l owns groups {l, l+32, l+64, ...}
+    // — exactly v3/v5's set and order, one group per span.
+    for (int span = 0; span < spans; ++span) {
+        const int g = span * 32 + lane;
+        if (g >= n_groups) break;   // only the last span is partial
+        // Only the LAST span is partial; its planes and sidecars are sized
+        // by cnt, not by the full 32-lane stride.
+        const int cnt = (span == spans - 1) ? cnt_last : 32;
+        const float d_a = a_scales_row[g];
+        const int sum_qa = a_sums_row[g];
+        const uint4* av4 = (const uint4*)(a_codes_row + g * 16);
+        const uint4 a0 = av4[0];
+        const uint4 a1 = av4[1];
+        const uint4 a2 = av4[2];
+        const uint4 a3 = av4[3];
+        const unsigned int aw[16] = {
+            a0.x, a0.y, a0.z, a0.w,
+            a1.x, a1.y, a1.z, a1.w,
+            a2.x, a2.y, a2.z, a2.w,
+            a3.x, a3.y, a3.z, a3.w
+        };
+        const long long span_base0 = (long long)my_store_lo * col_bytes + (long long)span * 2176;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= my_store_cnt) break;
+            // This column's span record; plane v holds lane l's words
+            // {4v..4v+3} — one b128 per plane, 512 contiguous bytes across
+            // the wave.
+            const unsigned char* rec = B_planes + span_base0 + (long long)j * col_bytes;
+            const uint4* pv = (const uint4*)rec;
+            const uint4 p0 = pv[0 * cnt + lane];
+            const uint4 p1 = pv[1 * cnt + lane];
+            const uint4 p2 = pv[2 * cnt + lane];
+            const uint4 p3 = pv[3 * cnt + lane];
+            const unsigned int bw[16] = {
+                p0.x, p0.y, p0.z, p0.w,
+                p1.x, p1.y, p1.z, p1.w,
+                p2.x, p2.y, p2.z, p2.w,
+                p3.x, p3.y, p3.z, p3.w
+            };
+            // One sidecar word: [u16 scale][u8 zero][u8 pad].
+            const unsigned int scz = *(const unsigned int*)(rec + cnt * 64 + lane * 4);
+            const float d_b = grim_bf16_to_float((unsigned short)(scz & 0xFFFF));
+            const int z_b = (int)((scz >> 16) & 0xFF);
+            int iacc = 0;
+            #pragma unroll
+            for (int v = 0; v < 8; v++) {
+                iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 0], false, bw[v * 2 + 0], iacc, false);
+                iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 1], false, bw[v * 2 + 1], iacc, false);
+            }
+            facc[j] += d_a * d_b * (float)(iacc - z_b * sum_qa);
+        }
+    }
+
+    // Per-wave butterfly (verbatim v2/v3 line).
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc[j] += __shfl_xor(facc[j], off);
+        }
+    }
+
+    if (lane == 0 && my_store_cnt > 0) {
+        #pragma unroll
+        for (int j = 0; j < my_store_cnt; j++) {
+            C[(long long)row * N + my_store_lo + j] = facc[j];
+        }
+    }
+}
+
+// WhiteCrow / CityCrow v5 = v3 with the review item 3 fix ONLY: the scalar
+// tail loop (`for (; g < n_groups; g += 32)`, up to 24 idle lanes on the last
+// <128 groups and no unroll) is replaced by the same predicated 4-group
+// structure the fast loop uses. Layout, loads, and per-lane group order are
+// byte-for-byte v3's, so the gate is bit-exactness vs v3 — and the layout
+// experiments (v4: interleaved records + LDS A staging) measured 0.85-0.97x
+// vs v3 on this instruction-bound kernel, so they are NOT shipped; see the
+// v4 kernel below for the evidence.
+extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_v5(
+    const unsigned int* __restrict__ A_codes,
+    const float* __restrict__ A_scales,
+    const int* __restrict__ A_sums,
+    const unsigned int* __restrict__ B_qweight,
+    const unsigned short* __restrict__ B_scales,
+    const unsigned char* __restrict__ B_zeros,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave    = threadIdx.x >> 5;         // 0..3
+    const int lane    = threadIdx.x & 31;         // wave-local lane 0..31
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row      = blockIdx.y;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_groups = K / 128;
+    const unsigned int* a_codes_row = A_codes + (long long)row * n_groups * 16;
+    const float* a_scales_row = A_scales + (long long)row * n_groups;
+    const int* a_sums_row = A_sums + (long long)row * n_groups;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int words_per_col = K / 8;
+
+    const unsigned int* b_cols[4];
+    const unsigned short* b_scales_col[4];
+    const unsigned char* b_zeros_col[4];
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int col = col_base + ((j < active_cols) ? j : 0);
+        b_cols[j] = B_qweight + (long long)col * words_per_col;
+        b_scales_col[j] = B_scales + (long long)col * n_groups;
+        b_zeros_col[j] = B_zeros + (long long)col * n_groups;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // v5: ONE predicated loop replaces v3's fast loop + scalar tail. Same
+    // per-lane ascending group order and the same uint2 loads — only the
+    // tail's scalar iterations become full-width predicated steps, so no
+    // lane ever idles on the last <128 groups and the unroll covers them.
+    for (int g = lane; g < n_groups; g += 128) {
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int gu = g + u * 32;
+            if (gu >= n_groups) break;   // ascending: later u only larger
+            const float d_a = a_scales_row[gu];
+            const int sum_qa = a_sums_row[gu];
+            const uint4* a_v4 = (const uint4*)(a_codes_row + gu * 16);
+            const uint4 av0 = a_v4[0];
+            const uint4 av1 = a_v4[1];
+            const uint4 av2 = a_v4[2];
+            const uint4 av3 = a_v4[3];
+            const unsigned int aw[16] = {
+                av0.x, av0.y, av0.z, av0.w,
+                av1.x, av1.y, av1.z, av1.w,
+                av2.x, av2.y, av2.z, av2.w,
+                av3.x, av3.y, av3.z, av3.w
+            };
+
+            unsigned short b_sc_raw[4];
+            unsigned char b_zr_raw[4];
+            uint2 bv[4][8];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                b_sc_raw[j] = b_scales_col[j][gu];
+                b_zr_raw[j] = b_zeros_col[j][gu];
+                const uint2* b_v2 = (const uint2*)(b_cols[j] + gu * 16);
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    bv[j][v] = b_v2[v];
+                }
+            }
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j >= active_cols) break;
+                const float d_b = grim_bf16_to_float(b_sc_raw[j]);
+                const int z_b = (int)b_zr_raw[j];
+                int iacc = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 0], false, bv[j][v].x, iacc, false);
+                    iacc = __builtin_amdgcn_sudot8(true, aw[v * 2 + 1], false, bv[j][v].y, iacc, false);
+                }
+                facc[j] += d_a * d_b * (float)(iacc - z_b * sum_qa);
+            }
+        }
+    }
+
+
+    // Per-wave butterfly: default width = warpSize(32) segments the block into
+    // 4 waves, so each wave reduces its own 4 columns (verbatim v2 line).
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc[j] += __shfl_xor(facc[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
 #endif // __gfx1200__ || __gfx1201__
 
 // ForestRaven decode/prefill GEMV: F32 activations quantized in-register
