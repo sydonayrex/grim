@@ -282,7 +282,7 @@ fn qwen35_whitecrow_graph_replay_matches_eager() {
 /// WhiteCrow graph replay with the token-parallel SPLIT engaged: same
 /// contract as `qwen35_whitecrow_graph_replay_matches_eager`, but the graph
 /// pool is created at max_ctx 1024, which makes the build allocate the split
-/// partial scratch (2 chunks x 512 tokens) and the capture take the
+/// partial scratch (8 chunks x 128 tokens) and the capture take the
 /// `launch_qkv_attention_dev_batch_whitecrow_split` arm. Engagement is
 /// asserted on `buffers.wc_split_chunk_len` BEFORE capture — without that
 /// proof a serial-arm pass would silently count as split coverage.
@@ -327,7 +327,7 @@ fn qwen35_whitecrow_graph_split_replay_matches_eager() {
         .unwrap_or_else(|e| panic!("whitecrow-split: graph pool alloc failed: {e}"));
     assert_eq!(
         graph.buffers.wc_split_chunk_len,
-        Some(512),
+        Some(128),
         "whitecrow-split: pool must allocate the split partial scratch at ctx 1024"
     );
     assert_eq!(
