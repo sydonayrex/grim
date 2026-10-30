@@ -186,7 +186,7 @@ fn bench(dev: &RocmDevice, kv_seq_len: u32, arm: Arm) -> f64 {
     let mut run = || match arm {
         Arm::F32 => run_f32(dev, &mut s, kv_seq_len),
         Arm::WhiteCrow => run_whitecrow(dev, &mut s, kv_seq_len),
-        Arm::WhiteCrowSplit => run_whitecrow_split(dev, &mut s, kv_seq_len, CHUNK_LEN),
+        Arm::WhiteCrowSplit => run_whitecrow_split(dev, &mut s, kv_seq_len, chunk_len()),
     };
     // Warmup + sync.
     run();
@@ -204,7 +204,13 @@ enum Arm { F32, WhiteCrow, WhiteCrowSplit }
 
 // 512 tokens per chunk: 128 chunks at 64K ctx (fills a 40-48 CU gfx1201
 // several waves deep) while keeping the partial buffers small.
-const CHUNK_LEN: u32 = 512;
+// GRIM_CHUNK_LEN overrides for the sweep (128/256/512/1024).
+fn chunk_len() -> u32 {
+    std::env::var("GRIM_CHUNK_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
 
 #[test]
 #[ignore = "roofline characterization — run manually with --ignored"]
@@ -215,10 +221,20 @@ fn paged_whitecrow_qk_roofline_m1() {
     // 262144 is ~5s x iters alone.
     let contexts = [1024u32, 4096, 16384, 65536];
 
-    eprintln!("\n=== paged Q·K roofline @ M=1 (head_dim={}, serial vs split chunk_len={CHUNK_LEN}) ===", HEAD_DIM);
+    eprintln!(
+        "\n=== paged Q·K roofline @ M=1 (head_dim={}, serial vs split chunk_len={}) ===",
+        HEAD_DIM,
+        chunk_len()
+    );
     eprintln!(
         "{:>8} {:>13} {:>13} {:>9} {:>15} {:>11} {:>11}",
-        "ctx", "whitecrow-us", "f32-us", "wc/f32", "wc-split-us", "split/spd", "WC-us/tok"
+        "ctx",
+        "whitecrow_us",
+        "f32_us",
+        "wc/f32",
+        "wc_split_us",
+        "split/spd",
+        "WC_us/tok"
     );
 
     for &ctx in &contexts {

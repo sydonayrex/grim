@@ -4301,7 +4301,11 @@ impl DecodeGraphModel for Qwen35 {
             // arena can hold. Skipped when the context can't fill two chunks
             // (the split would only add a second launch).
             if fmt == grim_backend_rocm::KvArenaFormat::WhiteCrow {
-                const WC_SPLIT_CHUNK_LEN: u32 = 512;
+                // Sweep (paged_whitecrow_bench, GRIM_CHUNK_LEN): 128 wins at
+                // every context up to 16K (350 us @1K vs 1799 at 512); 256 is
+                // marginally better only at 64K (1219 vs 1298 us). Default 128;
+                // the partial-buffer cost of more chunks is tiny.
+                const WC_SPLIT_CHUNK_LEN: u32 = 128;
                 let max_chunks = (ctx as u32).div_ceil(WC_SPLIT_CHUNK_LEN).max(1);
                 if max_chunks > 1 {
                     // Graph attention capture uses steps = 1 (hardwired at
