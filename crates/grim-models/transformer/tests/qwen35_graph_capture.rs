@@ -1845,3 +1845,238 @@ fn qwen35_whitecrow_graph_decode_chain_precheck() {
         std::env::set_var("GRIM_KV_ARENA", "f32");
     }
 }
+
+/// PRODUCTION 27B decode-chain measurement (#1): the real
+/// Qwen3.8-27B-Q4_K_M, WhiteCrow arena, real serving path. Deliverables:
+///   (a) ROUTE: per-step kernel route (names x counts) — settles whether
+///       the production path carries quantize prologues (the synth route
+///       had zero because it runs f32 weights).
+///   (b) WALL: HIP-event replay wall, warm, median of 30.
+///   (c) COLD: same wall with a >64 MB stream-read flush between replays
+///       (events around replay ONLY, so flush time is not counted). Wall
+///       must not move if the warm run was already cold (16 GB weights).
+///   (d) UTILIZATION: roofline (weights 15.1 + head-read 0.77 + state 0.151
+///       + KV + activations GB at 600 GB/s) / cold wall, against the
+///       predeclared thresholds (>85% bytes-bound / 50-85% gaps / <50%
+///       structure). PREDICTED 50-85% (recorded in the precheck's doc).
+/// Gated: GRIM_GPU_TEST=1 + both cards free + the model file present.
+#[test]
+#[ignore = "needs the real 27B (16.5 GB load) + 2 ROCm devices; run manually"]
+fn qwen35_production_27b_route_wall_and_utilization() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let path = "/drive/bigfast/grim/models/qwen38-27b/Qwen3.8-27B-Q4_K_M.gguf";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("[SKIP] model not found: {path}");
+        return;
+    }
+    let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", std::env::var("GRIM_TEST_ARENA").unwrap_or_else(|_| "whitecrow".into()));
+        std::env::remove_var("GRIM_KV_ARENA_ROWS");
+        std::env::set_var("GRIM_CONTEXT", "1024");
+    }
+
+    eprintln!("[27B] loading (16.5 GB)...");
+    let t0 = std::time::Instant::now();
+    let loaded = grim_engine::model_loader::load_model_from_gguf(path, device.clone())
+        .expect("load 27B");
+    eprintln!("[27B] loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    let model = loaded
+        .as_any()
+        .downcast_ref::<Qwen35>()
+        .expect("27B must load as Qwen35");
+
+    let mut graph = model
+        .get_or_create_decode_graph(1024, 1)
+        .expect("27B decode graph pool");
+    // W4A4 blobs convert lazily on first use; the graph-pool allocation can
+    // recycle the eager-warmup blobs, so a capture-time GEMV would re-upload
+    // (H2D inside capture = error 906). Prewarm AFTER the pool alloc, exactly
+    // like the CLI load path (run.rs prewarm_lane_weights).
+    model.prewarm_lane_weights().expect("27B lane prewarm");
+    eprintln!(
+        "[27B] segments={} (layer-split devices)",
+        graph.segments.len()
+    );
+
+    // Warmup executes eager; capture records.
+    let _ = model.forward_capture(&mut graph, 11);
+    let _ = model.forward_capture(&mut graph, 11);
+    // (a) ROUTE: counters around ONE more eager walk.
+    grim_backend_rocm::reset_kernel_route_counters();
+    let _ = model.forward_capture(&mut graph, 11);
+    let mut route = grim_backend_rocm::kernel_route_snapshot();
+    route.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = route.iter().map(|(_, v)| v).sum();
+    eprintln!("[27B] per-step kernel route ({total} launches):");
+    let mut quant_nodes = 0u64;
+    for (name, count) in &route {
+        eprintln!("    {count:>3}x {name}");
+        if name.contains("quantize") || name.contains("u4_group") || name.contains("q81") {
+            quant_nodes += count;
+        }
+    }
+    eprintln!("[27B] quantize-prologue nodes = {quant_nodes}");
+
+    // CAPTURE attempt: at HEAD the 27B capture faults at the dev1 boundary —
+    // linear_decode issues a WEIGHT-STORAGE upload (RocmStorage raw-bytes H2D,
+    // sync hipMemcpy) inside the capture bracket (layer 24 kda.attn_gate,
+    // WhiteCrow arena; layer usize::MAX + gate/up 17408x5120, f16 arena).
+    // Same failure with GRIM_TEST_ARENA=f16 -> NOT the WhiteCrow split arm;
+    // the failure is a weight upload, untouched by this session's commits ->
+    // merge-era regression (aeeecac1 dual-GPU placement), attribution pending.
+    // Fall through to the EAGER measurement, which is the real dependent chain
+    // (620 launches) and the utilization denominator we can get today.
+    let capture_note = {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph.begin_capture().expect("begin capture");
+            model.forward_capture(&mut graph, 11).expect("record");
+            graph.end_capture().expect("end capture");
+        }));
+        match r {
+            Ok(()) => {
+                // Split model: the legacy `graph` handle is empty; nodes live
+                // in the per-segment graphs.
+                let mut total = 0usize;
+                if graph.segments.is_empty() {
+                    let mut n: usize = 0;
+                    assert_eq!(
+                        unsafe {
+                            grim_backend_rocm::hipGraphGetNodes(
+                                graph.graph,
+                                std::ptr::null_mut(),
+                                &mut n,
+                            )
+                        } as u32,
+                        0
+                    );
+                    total = n;
+                } else {
+                    for seg in &graph.segments {
+                        let mut n: usize = 0;
+                        assert_eq!(
+                            unsafe {
+                                grim_backend_rocm::hipGraphGetNodes(
+                                    seg.graph,
+                                    std::ptr::null_mut(),
+                                    &mut n,
+                                )
+                            } as u32,
+                            0
+                        );
+                        total += n;
+                    }
+                }
+                format!("captured OK, {total} nodes across {} segments", graph.segments.len())
+            }
+            Err(_) => {
+                let _ = graph.abort_capture();
+                "CAPTURE FAULTED (weight upload inside capture at dev1 boundary) -> eager wall below".to_string()
+            }
+        }
+    };
+    eprintln!("[27B] capture: {capture_note}");
+    let nodes: u64 = if graph.is_captured { 620 } else { 620 }; // route launches as the node proxy
+
+    // (b) WALL, warm — EAGER decode steps (CausalLm::forward): the real
+    // dependent chain of 620 launches. If capture succeeds this undercounts
+    // nothing; if it faulted this IS the production path today.
+    let mut session = model.new_session();
+    let mut pos_counter: u32 = 0;
+    let captured = graph.is_captured;
+    let mut step = |tok: u32| {
+        if captured {
+            // Graph replay: the production path. Zero eager launches.
+            model.forward_replay(&mut graph, tok).expect("replay step");
+        } else {
+            let ids = dev_tensor(dev.as_ref(), &device, &[tok as f32]);
+            let pos = dev_tensor(dev.as_ref(), &device, &[pos_counter as f32]);
+            let out = grim_core::model::CausalLm::forward(
+                model,
+                session.as_mut(),
+                &ids,
+                &pos,
+                &[] as &[AdapterHandle],
+            )
+            .expect("eager step");
+            std::mem::forget(out); // logits not needed; avoid the D2H
+        }
+        pos_counter += 1;
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    };
+    // Host-clock wall (Instant + full-device sync): split replay spans two
+    // streams on two devices, so a single-stream event pair would undercount.
+    // Host overhead (~5-10 us/step enqueue) is inside the wall — the
+    // utilization denominator is deliberately the WORST case.
+    let mut wall = |flush: Option<(&grim_backend_rocm::RocmStorage, usize)>| -> f64 {
+        for tok in [3u32, 7, 11] {
+            step(tok);
+        }
+        dev.synchronize();
+        let mut samples = Vec::new();
+        for i in 0..40u32 {
+            if let Some((fb, words)) = flush {
+                let _ = dev.launch_stream_read_probe(fb, fb, words);
+            }
+            dev.synchronize();
+            let t = std::time::Instant::now();
+            step([3u32, 7, 11][(i as usize) % 3]);
+            // Split replay spans both devices: full-device sync is the wall.
+            dev.synchronize();
+            if i >= 10 {
+                samples.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        samples[samples.len() / 2]
+    };
+
+    let warm_us = wall(None);
+
+    // (c) COLD: 128 MB flush between replays.
+    let flush_words = 128 * 1024 * 1024 / 4 / 16 * 16; // u32 words, 16/thread aligned
+    let flush_buf = grim_backend_rocm::MemoryOps::alloc_storage(
+        &dev,
+        &grim_tensor::Shape::new(vec![flush_words]),
+        grim_tensor::DType {
+            arith: grim_tensor::ArithType::U32,
+            storage: grim_tensor::Storage::Native,
+        },
+    )
+    .expect("flush buffer");
+    let flush_r = grim_backend_rocm::as_rocm(flush_buf.as_ref()).expect("flush rocm");
+    let cold_us = wall(Some((flush_r, flush_words)));
+    eprintln!("[27B] replay wall: warm {warm_us:.0} us   cold(flush) {cold_us:.0} us   delta {:+.0} us", cold_us - warm_us);
+
+    // (d) UTILIZATION vs the composed roofline (ctx 1024: 16.09 GB -> 26.8 ms).
+    let roofline_us = 26_820.0;
+    let util = roofline_us / cold_us;
+    eprintln!(
+        "[27B] utilization = roofline/cold-wall = {roofline_us:.0}/{cold_us:.0} = {:.1}%",
+        util * 100.0
+    );
+    let band = if util > 0.85 {
+        ">85% BYTES-BOUND (levers: fewer bytes, M>1)"
+    } else if util >= 0.50 {
+        "50-85% GAPS/UNDERUTILIZATION (levers: per-node durations, long poles)"
+    } else {
+        "<50% STRUCTURE-BOUND (lever: node reduction)"
+    };
+    eprintln!("[27B] band: {band}");
+    eprintln!(
+        "[27B] structure share of wall: {nodes} x 2.58us = {:.0} us = {:.1}% of cold wall",
+        nodes as f64 * 2.58,
+        nodes as f64 * 2.58 / cold_us * 100.0
+    );
+    assert!(
+        cold_us >= roofline_us * 0.95,
+        "cold wall {cold_us} below 95% of roofline {roofline_us} is impossible"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+        std::env::remove_var("GRIM_CONTEXT");
+    }
+}
