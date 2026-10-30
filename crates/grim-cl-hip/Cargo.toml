@@ -1,0 +1,72 @@
+[package]
+name = "grim-cl-hip"
+# Tracks the vendored upstream version (cubecl-hip 0.10.0).
+version = "0.10.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Vendored cubecl-hip 0.10.0 (AMD ROCm HIP runtime) for grim, renamed from upstream cubecl-hip"
+repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-hip"
+categories = ["science"]
+keywords = ["gpu", "amd", "rocm", "hip"]
+readme = "README.md"
+publish = false
+
+[lints.rust]
+warnings = "warn"
+[lints.clippy]
+doc_markdown = "warn"
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+invalid_html_tags = "warn"
+
+[features]
+default = [
+    "std",
+    "cubecl-runtime/default",
+    "cubecl-common/default",
+    "cubecl-core/default",
+]
+std = ["cubecl-runtime/std", "cubecl-common/std", "cubecl-core/std"]
+rocwmma = []
+tracing = [
+    "dep:tracing",
+    "cubecl-runtime/tracing",
+    "cubecl-common/tracing",
+    "cubecl-core/tracing",
+]
+
+[dependencies]
+log = { version = "^0.4.22", default-features = false }
+tracing = { version = "^0.1.43", features = ["attributes"], optional = true, default-features = false }
+cubecl-common = { version = "0.10.0", features = [
+    "compilation-cache",
+    "std",
+    "hash",
+] }
+cubecl-core = { version = "0.10.0", default-features = false }
+cubecl-cpp = { version = "0.10.0", default-features = false, features = ["hip"] }
+# Already bound to grim-hip-sys via the root [patch.crates-io] shim
+# (crates/cubecl-hip-sys), so this resolves to grim's ROCm 7.16 bindings.
+cubecl-hip-sys = { version = "7.1.5280200" }
+cubecl-runtime = { version = "0.10.0", default-features = false, features = [
+    "channel-mutex",
+] }
+bytemuck = "1.16.1"
+derive-new = { version = "0.7.0", default-features = false }
+half = { version = "2.5", default-features = false, features = [
+    "alloc",
+    "num-traits",
+    "serde",
+] }
+paste = "1"
+serde = { version = "1.0.204", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
+
+[dev-dependencies]
+cubecl-core = { version = "0.10.0", features = ["export_tests"] }
+cubecl-std = { version = "0.10.0", features = ["export_tests"] }
+pretty_assertions = "1.4"
+test-log = { version = "^0.2", features = ["trace"], default-features = false }

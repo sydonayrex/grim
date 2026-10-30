@@ -5,6 +5,7 @@ exclude = ["third-party/convert_case-0.10.1"]
 members = [
     "crates/grim-hip-sys",
     "crates/cubecl-hip-sys",
+    "crates/grim-cl-hip",
     "crates/grim-tensor",
     "crates/grim-backend-cpu",
     "crates/grim-backend-rocm",
