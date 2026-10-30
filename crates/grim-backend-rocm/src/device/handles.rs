@@ -427,6 +427,36 @@ pub unsafe fn hipGraphAddKernelNode(
     }
 }
 
+/// Per-node parameters of a captured graph's kernel nodes (precheck: what
+/// the decode step actually launches). Returns (node, func) pairs; callers
+/// reverse-map `func` through the device's resolved-kernel cache to names.
+pub unsafe fn hipGraphGetKernelNodes(
+    graph: *mut c_void,
+) -> Vec<(*mut c_void, *mut c_void)> {
+    let mut n: usize = 0;
+    assert_eq!(
+        unsafe { ffi::hipGraphGetNodes(graph as _, std::ptr::null_mut(), &mut n) } as u32,
+        0,
+        "hipGraphGetNodes(count)"
+    );
+    let mut nodes = vec![std::ptr::null_mut(); n];
+    assert_eq!(
+        unsafe { ffi::hipGraphGetNodes(graph as _, nodes.as_mut_ptr(), &mut n) } as u32,
+        0,
+        "hipGraphGetNodes"
+    );
+    nodes.truncate(n);
+    let mut out = Vec::new();
+    for node in nodes {
+        let mut params: ffi::hipKernelNodeParams = unsafe { std::mem::zeroed() };
+        // Memcpy/memset nodes return hipErrorInvalidValue here; skip them.
+        if unsafe { ffi::hipGraphKernelNodeGetParams(node, &mut params) } as u32 == 0 {
+            out.push((node as *mut c_void, params.func));
+        }
+    }
+    out
+}
+
 /// Number of nodes in a captured graph (precheck: launches per replay).
 pub unsafe fn hipGraphGetNodes(
     graph: *mut c_void,

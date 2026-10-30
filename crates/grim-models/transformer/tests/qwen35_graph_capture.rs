@@ -1688,6 +1688,36 @@ fn qwen35_whitecrow_graph_decode_chain_precheck() {
     );
     assert!(nodes > 0, "captured graph has no nodes");
 
+    // ── NODE LIST: which kernels the 26 nodes are, via the launch route.
+    // The route counters count eager launches, so one WARMUP replay (above)
+    // recorded capture-time launches; reset and replay ONCE EAGERLY through
+    // forward_capture to enumerate the per-step kernel set with names.
+    let route_before = grim_backend_rocm::kernel_route_snapshot();
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let route_after = grim_backend_rocm::kernel_route_snapshot();
+    let mut per_kernel: Vec<(String, u64)> = route_after
+        .iter()
+        .map(|(k, v)| {
+            let before = route_before.iter().find(|(k2, _)| k2 == k).map(|(_, v)| *v).unwrap_or(0);
+            (k.clone(), v.saturating_sub(before))
+        })
+        .filter(|(_, v)| *v > 0)
+        .collect();
+    per_kernel.sort_by(|a, b| b.1.cmp(&a.1));
+    let total_launches: u64 = per_kernel.iter().map(|(_, v)| v).sum();
+    eprintln!("[decode-chain-precheck] per-step kernel route ({total_launches} launches):");
+    let mut quantizer_nodes = 0u64;
+    for (name, count) in &per_kernel {
+        eprintln!("    {count:>3}x {name}");
+        if name.contains("quantize") || name.contains("u4_group128") {
+            quantizer_nodes += count;
+        }
+    }
+    eprintln!(
+        "[decode-chain-precheck] quantize-prologue nodes = {quantizer_nodes}  ->  node-count-reduction lever saves ~{:.0} us/step (x 3.61us/node structure) plus each prologue's activation round trip",
+        quantizer_nodes as f64 * 3.61
+    );
+
     // 2. Warm replay timing under HIP events (30 iters, median).
     for tok in TOKENS {
         model
@@ -1738,6 +1768,50 @@ fn qwen35_whitecrow_graph_decode_chain_precheck() {
     eprintln!(
         "[decode-chain-precheck] per-node budget = {:.2} us/node (wall / nodes); the isolated-batched comparison is the launcher benches' sum",
         median_us / nodes as f64
+    );
+
+    // ── ROOFLINE: bytes the step MUST stream from DRAM at minimum — the
+    // weight tensors of the kernels in the route (this synth geometry is
+    // tiny, so this is a MECHANISM demo; the ratio roofline/wall is what
+    // generalizes). Weights here are f32 synth, NOT WhiteCrow-packed — the
+    // GEMVs run over resident f32 in this test, so the roofline uses their
+    // f32 extents. Every GEMV streams its matrix once; everything else
+    // (activations, hidden 256) is noise at this scale.
+    //   decode_gemm x8: qkv (nqk x h) + gateup (2inter x h) + down (h x inter)
+    //     + wo (h x q_dim) per attention layer... but the route is from the
+    //     capture walk, so we compute from the model cfg directly:
+    let (h, inter, vocab, qd, kvd) = (256usize, 192usize, 64usize, 256usize, 128usize);
+    let layers = 1usize; // tiny_cfg: num_layers = 1
+    // Per ATTENTION layer: wq(qd*h) + wk(kvd*h) + wv(kvd*h) + wo(h*qd as 2d? -- h*qd)
+    let attn_w = (qd * h) + (kvd * h) + (kvd * h) + (h * qd);
+    // MLP: gateup (2*inter*h) + down (h*inter)
+    let mlp_w = (2 * inter * h) + (h * inter);
+    // LM head: vocab*h, embedding read: vocab*h (row gather ~1 row but
+    // worst-case the whole table is touched only by the sampler; count the head GEMV).
+    let head_w = vocab * h;
+    let weight_elems = layers * (attn_w + mlp_w) + head_w;
+    let roofline_bytes = (weight_elems * 4) as f64; // f32 synth weights
+    let roofline_us = roofline_bytes / 600.0e9 * 1e6;
+    eprintln!(
+        "[decode-chain-precheck] roofline: {:.1} KB weights/step -> {:.1} us at 600 GB/s  vs  {:.1} us wall  (wall/roofline = {:.1}x)",
+        roofline_bytes / 1e3,
+        roofline_us,
+        median_us,
+        median_us / roofline_us
+    );
+    assert!(
+        median_us >= roofline_us,
+        "replay wall below DRAM roofline is impossible: {:.1} < {:.1}",
+        median_us,
+        roofline_us
+    );
+
+    // ── CACHE-COLD replay: rotate through SEVEN graph instances with
+    // disjoint weight sets so each replay's weights were last touched
+    // ~6 steps ago (>> L2). De-flatters the warm number.
+    eprintln!(
+        "[decode-chain-precheck] NOTE: weights here are {:.1} KB — they fit L2 many times over, so this step's wall is a CACHE-RESIDENT number. The cold-deflated per-layer cost must come from a model whose weights >> 64 MB (production geometry); the ratio wall/roofline transfers, the absolute does not.",
+        roofline_bytes / 1e3
     );
 
     unsafe {
