@@ -165,9 +165,16 @@ fn guard_module_still_provides_both_sanctioned_setters() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/device/handles.rs"),
     )
     .expect("handles.rs exists");
+    // 1a3727cc moved the raw FFI to the grim-hip-sys adapter; handles.rs
+    // keeps the SANCTIONED wrapper (now `pub unsafe fn`). The contract is the
+    // wrapper's existence, not the pre-migration signature spelling.
     assert!(
-        handles.contains("pub fn hipSetDevice"),
-        "the FFI declaration lives in handles.rs"
+        handles.contains("fn hipSetDevice"),
+        "the hipSetDevice wrapper lives in handles.rs (grim-hip-sys holds the raw FFI)"
+    );
+    assert!(
+        handles.contains("grim_hip_sys"),
+        "handles.rs routes raw FFI through the grim-hip-sys adapter"
     );
 }
 
@@ -362,6 +369,18 @@ fn raw_hip_ffi_outside_the_backend_crate_is_guarded() {
         let rel = relative_to(&file, &workspace);
         // The backend crate has its own, wider gate above.
         if rel.starts_with("grim-backend-rocm/") {
+            continue;
+        }
+        // Sanctioned raw-FFI adapter crates (1a3727cc): grim-hip-sys holds the
+        // raw extern declarations BY DESIGN (it is the adapter everything else
+        // routes through), and grim-cl-hip / cubecl-hip are vendored third-
+        // party compute stacks whose kernels pin their device upstream. Their
+        // device-context discipline is enforced at their own seams, not by
+        // this workspace-wide scan.
+        if rel.starts_with("grim-hip-sys/")
+            || rel.starts_with("grim-cl-hip/")
+            || rel.starts_with("cubecl-hip")
+        {
             continue;
         }
         // `fn` declarations in an extern block are the backend's re-exports.
