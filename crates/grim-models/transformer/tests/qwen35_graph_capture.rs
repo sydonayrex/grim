@@ -1643,6 +1643,33 @@ fn the_iq4nl_row_is_on_the_coverage_axis() {
 /// Compare the node count against the "sum of isolated batched kernel
 /// times" the launcher-level benches measure: the gap is ramp+drain+gap
 /// overhead that prologue fusion / quantization sharing can recover.
+/// Decode-chain cost precheck (the number before any profiling):
+///   1. NODES: count the captured graph's kernel nodes — that IS the
+///      launches-per-decode-step figure; x ~2.6 us/node (measured at 1216
+///      nodes, 0b85253b) = the structure floor of the step.
+///   2. REPLAY WALL: HIP-event-timed graph replay of the real dependent
+///      decode step, warm, median of 30.
+///
+/// ROOFLINE COMPOSITION for the real 27B (Qwen3.8-27B-Q4_K_M: 64 layers,
+/// hidden 5120, 24 q-heads x 256 head_dim, 4 kv-heads, interval 4 -> 16
+/// full-attention + 48 linear-attention; verified from
+/// models/qwen38-27b/config.json), every term the review flagged:
+///   weights+head  ~15.1 GB  (24.86B params x 4.85 bpw; embed+head 2.54B
+///                           params at ~0.6 B/param = 1.5 GB — PRECISION
+///                           UNVERIFIED: IQ4_NL/Q8_0 spans 1.5-2.6 GB,
+///                           flagged in the plan doc, not counted yet)
+///   recurrent state 0.151 GB (48 linear layers x 48 heads x 128^2 f32,
+///                           read+write every step — was missing)
+///   lm-head read   0.77 GB  (248320 x 5120 Q4_K, untied from embed)
+///   KV bytes       1072 B/token/layer x 16 attn layers only
+///   activations    ~0.02 GB (staging round trips between nodes)
+///   sidecar scales folded into the 4.85 bpw weight figure
+/// Roofline @600 GB/s: 26.8 / 27.0 / 27.7 / 30.5 ms at ctx 4K/8K/32K/128K.
+/// PREDICTION (recorded before measuring, per protocol): utilization
+/// (roofline / cold wall) lands in the 50-85% band — mostly-bandwidth
+/// with visible gaps — NOT the >85% bytes-bound band, because the measured
+/// GEMV family already runs at 96-98% of ceiling while the synth decode
+/// graph sits at 123x over its own roofline.
 #[test]
 fn qwen35_whitecrow_graph_decode_chain_precheck() {
     let Some((device, _dev)) = gpu_device() else {
