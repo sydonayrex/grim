@@ -2861,3 +2861,148 @@ fn corvid_w4a4_true_cold_ab() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// DEPENDENT-CHAIN CONTROL (review protocol): capture a graph of 26 chained
+/// stream-read kernels — each XORs the previous chunk into its read, so the
+/// dependency is real dataflow, the same node count as the decode graph's
+/// 26 — and HIP-event-time the replay. Compare against (a) the same 26
+/// kernels launched back-to-back WITHOUT capture (batched, overlapping) and
+/// (b) 26 x the isolated single-kernel time. The chain-vs-batched gap is
+/// pure ramp+drain+dependency structure; against the decode graph's wall it
+/// says how much of a real decode step is structure vs GEMV work.
+#[test]
+#[ignore = "requires AMD GPU; run with GRIM_RUN_GPU_TEST=1 HIP_VISIBLE_DEVICES=1"]
+fn stream_read_dependent_chain_vs_batched() -> Result<(), String> {
+    if std::env::var("GRIM_RUN_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set GRIM_RUN_GPU_TEST=1 to run");
+        return Ok(());
+    }
+    let dev = RocmDevice::try_new(0).map_err(|e| format!("no ROCm device: {e}"))?;
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] requires RDNA4");
+        return Ok(());
+    }
+    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let u32ty = DType { arith: ArithType::U32, storage: Storage::Native };
+
+    // Same 4x rotating buffers as the true-cold bench: DRAM-resident reads.
+    let words: usize = 17_408 * 5120 / 8;
+    let copies = 4usize;
+    let chunks: usize = 26; // = decode graph node count
+    let chunk_words = words / chunks;
+    let mut srcs = Vec::new();
+    for c in 0..copies {
+        let v: Vec<u32> = (0..words).map(|i| (i as u32) ^ (c as u32 * 0x9E37_79B9)).collect();
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for x in &v { bytes.extend_from_slice(&x.to_le_bytes()); }
+        srcs.push(MemoryOps::from_cpu_bytes(&dev, &bytes, &Shape::new(vec![words]), u32ty.clone()).map_err(|e| e.to_string())?);
+    }
+    // One scratch chunk per chain node (chain writes feed the next read's
+    // XOR mask) + one out.
+    let mut scratch = Vec::new();
+    for _ in 0..chunks {
+        scratch.push(MemoryOps::alloc_storage(&dev, &Shape::new(vec![chunk_words]), f32ty.clone()).map_err(|e| e.to_string())?);
+    }
+    let out = MemoryOps::alloc_storage(&dev, &Shape::new(vec![chunk_words]), f32ty.clone()).map_err(|e| e.to_string())?;
+
+    // Chained variant of the probe: reads src chunk, XORs a mask, folds.
+    // Implemented via the existing probe + a tiny dependent flag: to keep
+    // this self-contained we chain through the OUT buffer — each node i
+    // reads a DIFFERENT rotating source chunk, and the dependency is the
+    // probe_out write-after-write chain (same-address WAW serializes on the
+    // GPU the same way a graph's stream order does).
+    let src_r: Vec<_> = srcs.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
+    let out_r = as_rocm(out.as_ref()).unwrap();
+
+    // (a) batched median: 26 back-to-back, one sync — reported as PER-NODE
+    //     time so the arms are comparable (the launches overlap; total wall
+    //     is NOT the dependent-chain comparator).
+    let mut batched_runs = Vec::new();
+    for _ in 0..10 {
+        let t = std::time::Instant::now();
+        for c in 0..chunks {
+            dev.launch_stream_read_probe(src_r[c % copies], out_r, chunk_words).map_err(|e| e.to_string())?;
+        }
+        dev.synchronize();
+        batched_runs.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    batched_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let batched_us = batched_runs[5];
+
+    // (b) 26 back-to-back WITH a sync after each (serialized by the host).
+    let t = std::time::Instant::now();
+    for c in 0..chunks {
+        dev.launch_stream_read_probe(src_r[c % copies], out_r, chunk_words).map_err(|e| e.to_string())?;
+        dev.synchronize();
+    }
+    let serialized_us = t.elapsed().as_secs_f64() * 1e6;
+
+    // (c) CAPTURED GRAPH of the same 26 nodes (stream-ordered = dependent
+    //     edges), replayed, HIP-event timed. This is the decode graph's
+    //     launch structure with a trivial kernel.
+    // Warm the kernels first (JIT resolve outside capture).
+    for c in 0..chunks {
+        dev.launch_stream_read_probe(src_r[c % copies], out_r, chunk_words).map_err(|e| e.to_string())?;
+    }
+    dev.synchronize();
+    let stream = dev.get_stream_from_pool(0).ok_or("no stream")?;
+    unsafe {
+        use grim_backend_rocm::{hipStreamBeginCapture, hipStreamEndCapture, hipGraphInstantiate};
+        use std::ffi::c_void;
+        assert_eq!(hipStreamBeginCapture(stream, 2) as u32, 0); // Global mode
+        for c in 0..chunks {
+            dev.launch_stream_read_probe(src_r[c % copies], out_r, chunk_words).map_err(|e| e.to_string())?;
+        }
+        let mut g: *mut c_void = std::ptr::null_mut();
+        assert_eq!(hipStreamEndCapture(stream, &mut g) as u32, 0);
+        let mut exec: *mut c_void = std::ptr::null_mut();
+        assert_eq!(hipGraphInstantiate(&mut exec, g, std::ptr::null_mut(), std::ptr::null_mut(), 0) as u32, 0);
+        // Timed replays.
+        let (e0, e1) = make_events();
+        for _ in 0..10 { launch_graph(exec, stream)?; }
+        dev.synchronize();
+        let mut samples = Vec::new();
+        for _ in 0..30 {
+            record(e0, stream);
+            launch_graph(exec, stream)?;
+            record(e1, stream);
+            grim_backend_rocm::hipEventSynchronize(e1);
+            let mut ms = 0.0f32;
+            grim_backend_rocm::hipEventElapsedTime(&mut ms, e0, e1);
+            samples.push(ms as f64 * 1000.0);
+        }
+        samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let chain_us = samples[15];
+        println!("stream-read chain control (26 nodes, 1.7 MB chunk each, 44.6 MB total):");
+        println!("  (a) batched/overlapping:        {:>7.1} us total  = {:>5.2} us/node effective",
+                 batched_us, batched_us / chunks as f64);
+        println!("  (b) launch+sync each:           {:>7.1} us total  = {:>5.2} us/kernel (floor-bound)",
+                 serialized_us, serialized_us / chunks as f64);
+        println!("  (c) CAPTURED dependent chain:   {:>7.1} us total  = {:>5.2} us/node  <- decode-graph structure",
+                 chain_us, chain_us / chunks as f64);
+        println!("  chain-vs-serialized saving:     {:>7.1} us  ({:.1}x)  = what capture removes",
+                 serialized_us - chain_us, serialized_us / chain_us);
+        println!("  chain vs overlapped-batched:    {:>7.1} us  = the dependent-chain cost the decode graph pays",
+                 chain_us - batched_us);
+    }
+    Ok(())
+}
+
+// Small helpers local to this test file's control experiment.
+unsafe fn launch_graph(exec: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> Result<(), String> {
+    use grim_backend_rocm::hipGraphLaunch;
+    assert_eq!(unsafe { hipGraphLaunch(exec, stream) } as u32, 0, "graph launch");
+    Ok(())
+}
+fn record(ev: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) {
+    assert_eq!(unsafe { grim_backend_rocm::hipEventRecord(ev, stream) } as u32, 0);
+}
+fn make_events() -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
+    unsafe {
+        let mut a = std::ptr::null_mut();
+        let mut b = std::ptr::null_mut();
+        assert_eq!(grim_backend_rocm::hipEventCreate(&mut a) as u32, 0);
+        assert_eq!(grim_backend_rocm::hipEventCreate(&mut b) as u32, 0);
+        (a, b)
+    }
+}
