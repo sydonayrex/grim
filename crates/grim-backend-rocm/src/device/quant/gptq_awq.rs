@@ -13,6 +13,19 @@ use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
 use crate::{HipDim3, HipMemcpyKind, arg, check_hip, hipMemcpyAsync, hipStreamSynchronize};
 
+/// The u4 activation-quant scratch (codes/scales/sums) with its allocation
+/// guards held; see [`RocmDevice::act_u4_quant_scratch`]. The guards must
+/// outlive the consumer's kernel launch: dropping them early would let a
+/// concurrent larger allocation replace (and free) the buffers mid-flight.
+pub(crate) struct ActU4QuantScratch<'a> {
+    _codes: std::sync::MutexGuard<'a, Option<RocmStorage>>,
+    _scales: std::sync::MutexGuard<'a, Option<RocmStorage>>,
+    _sums: std::sync::MutexGuard<'a, Option<RocmStorage>>,
+    pub codes_ptr: u64,
+    pub scales_ptr: u64,
+    pub sums_ptr: u64,
+}
+
 impl RocmDevice {
     pub(crate) fn launch_dequant_wna16(
         &self,
@@ -77,6 +90,7 @@ impl RocmDevice {
         n_bit: u8,
         num_blocks: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_shape = Shape::from_slice(&[num_weights]);
         let out = RocmStorage::alloc_gpu(
             &out_shape,
@@ -149,6 +163,7 @@ impl RocmDevice {
         embedding_dim: usize,
         tensor_scale: f32,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_shape = Shape::from_slice(&[total_elements]);
         let out = RocmStorage::alloc_gpu(
             &out_shape,
@@ -635,31 +650,17 @@ impl RocmDevice {
         Ok((8, sc_data as i64, zr_data as i64))
     }
 
-    /// Launch OSTQuant W4A4 GEMV directly over the resident blob:
-    /// `[u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]`
-    pub fn launch_w4a4_ostquant_gemv_blob(
+    /// Grow (if needed) and fill the per-device u4 activation-quant scratch
+    /// for `m x k` activations, then quantize A into it. Shared by the classic
+    /// and v4 blob launchers. The guards are held by the returned struct until
+    /// the caller's launch completes: dropping them would let a concurrent
+    /// larger allocation replace (and free) the buffers mid-launch.
+    fn act_u4_quant_scratch(
         &self,
         a_storage: &RocmStorage,
-        blob_storage: &RocmStorage,
-        out_storage: &RocmStorage,
         m: usize,
-        n: usize,
-        k: usize,
-        group_size: usize,
-    ) -> Result<*mut c_void> {
-        if k % 128 != 0 {
-            return Err(Error::Backend(format!(
-                "launch_w4a4_ostquant_gemv_blob: K={k} must be divisible by 128"
-            )));
-        }
-        let (qw_off, sc_off, zr_off) =
-            Self::ostquant_segment_offsets(group_size, k, n, blob_storage.bytes())?;
-
-        let blob_ptr = blob_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("ostquant gemv: blob has no device ptr".into()))?;
-
-        let n_groups = k / 128;
+        n_groups: usize,
+    ) -> Result<ActU4QuantScratch<'_>> {
         let codes_words = m * n_groups * 16;
         let scales_elems = m * n_groups;
         let sums_elems = m * n_groups;
@@ -731,14 +732,51 @@ impl RocmDevice {
         let act_codes = codes_guard.as_ref().unwrap();
         let act_scales = scales_guard.as_ref().unwrap();
         let act_sums = sums_guard.as_ref().unwrap();
+        self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, n_groups * 128)?;
+        let codes_ptr = act_codes.device_ptr.unwrap();
+        let scales_ptr = act_scales.device_ptr.unwrap();
+        let sums_ptr = act_sums.device_ptr.unwrap();
+        Ok(ActU4QuantScratch {
+            _codes: codes_guard,
+            _scales: scales_guard,
+            _sums: sums_guard,
+            codes_ptr,
+            scales_ptr,
+            sums_ptr,
+        })
+    }
 
-        // Quantize activations to u4 groups
-        self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, k)?;
+    /// Launch OSTQuant W4A4 GEMV directly over the resident blob:
+    /// `[u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]`
+    pub fn launch_w4a4_ostquant_gemv_blob(
+        &self,
+        a_storage: &RocmStorage,
+        blob_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_w4a4_ostquant_gemv_blob: K={k} must be divisible by 128"
+            )));
+        }
+        let (qw_off, sc_off, zr_off) =
+            Self::ostquant_segment_offsets(group_size, k, n, blob_storage.bytes())?;
 
+        let blob_ptr = blob_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("ostquant gemv: blob has no device ptr".into()))?;
+
+        let n_groups = k / 128;
+        let scratch = self.act_u4_quant_scratch(a_storage, m, n_groups)?;
         // Pointers into blob
-        let a_codes_ptr = act_codes.device_ptr.unwrap();
-        let a_scales_ptr = act_scales.device_ptr.unwrap();
-        let a_sums_ptr = act_sums.device_ptr.unwrap();
+        let a_codes_ptr = scratch.codes_ptr;
+        let a_scales_ptr = scratch.scales_ptr;
+        let a_sums_ptr = scratch.sums_ptr;
         let b_qw_ptr = (blob_ptr as usize + qw_off as usize) as *mut c_void;
         let b_sc_ptr = (blob_ptr as usize + sc_off as usize) as *mut c_void;
         let b_zr_ptr = (blob_ptr as usize + zr_off as usize) as *mut c_void;
@@ -746,9 +784,31 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("ostquant gemv: out has no device ptr".into()))?;
 
-        let grid_x = (n as u32).div_ceil(4);
+        static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v3 = *V3.get_or_init(|| {
+            matches!(
+                std::env::var("GRIM_WHITECROW_V3").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        });
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITECROW_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let grid_x = if v3 {
+            (n as u32).div_ceil(16)
+        } else {
+            (n as u32).div_ceil(4)
+        };
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = if v3 {
+            HipDim3::new(128, 1, 1)
+        } else {
+            HipDim3::new(32, 1, 1)
+        };
 
         let mut a_c = a_codes_ptr;
         let mut a_s = a_scales_ptr;
@@ -761,8 +821,22 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
+        if v2 || v3 {
+            crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
+        }
+        // GRIM_WHITECROW_V3=1 routes to v5: v3's layout and loads with the
+        // scalar tail replaced by the predicated 4-group structure — outputs
+        // bit-identical, measured 1.2-1.3x faster warm (K=5120/17408) and
+        // faster cold. See the v5 kernel comment and
+        // corvid_w4a4_v4_bit_exact_and_ab for the evidence.
         self.launch_compute_kernel(
-            "grim_dot8_w4a4_gemv",
+            if v3 {
+                "grim_dot8_w4a4_gemv_v5"
+            } else if v2 {
+                "grim_dot8_w4a4_gemv_v2"
+            } else {
+                "grim_dot8_w4a4_gemv"
+            },
             grid_dim,
             block_dim,
             &mut [
@@ -858,6 +932,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if k % 128 != 0 {
             return Err(Error::Backend(format!(
                 "launch_w4a4_ostquant_gemv: K={k} must be divisible by 128"
@@ -964,6 +1039,8 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("wna16 header: no device ptr".into()))?;
         check_hip("wna16 header D2H", unsafe {
+            // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+            crate::memory::storage::count_blocking_d2h();
             hipMemcpyAsync(
                 pinned.as_mut_ptr() as *mut c_void,
                 ptr as *const c_void,
@@ -1003,6 +1080,7 @@ impl RocmDevice {
         k_dim: usize,
         group_size: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::ArithType;
         let id: Vec<f32> = (0..k_dim)
             .flat_map(|i| (0..k_dim).map(move |j| if i == j { 1.0f32 } else { 0.0 }))
@@ -1038,6 +1116,7 @@ impl RocmDevice {
         bits: u8,
         group_size: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::ArithType;
         let mut vpw: i32 = match bits {
             2 => 16,

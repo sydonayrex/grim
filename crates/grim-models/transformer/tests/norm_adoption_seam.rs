@@ -11,8 +11,8 @@
 //! The default must stay `Rms` after this change. If the seam defaulted to
 //! anything else, the entire existing corpus would change arithmetic silently.
 
-use grim_models_transformer::block::{LayerAttentionSpec, LlamaBlock};
 use grim_models_transformer::LlamaConfig;
+use grim_models_transformer::block::{LayerAttentionSpec, LlamaBlock};
 use grim_nn::NormKind;
 use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::{Device, RawTensor, TensorMeta, TensorProvider};
@@ -35,7 +35,7 @@ fn cfg() -> LlamaConfig {
         max_seq_len: 32,
         partial_rotary_factor: 1.0,
         yarn: None,
-    ..Default::default()
+        ..Default::default()
     }
 }
 
@@ -52,11 +52,17 @@ impl TensorProvider for NoBiasProvider {
                 "tensor '{name}' not found"
             )));
         }
-        StubProvider { cfg: self.cfg.clone() }.get(name)
+        StubProvider {
+            cfg: self.cfg.clone(),
+        }
+        .get(name)
     }
 
     fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
-        StubProvider { cfg: self.cfg.clone() }.meta(name)
+        StubProvider {
+            cfg: self.cfg.clone(),
+        }
+        .meta(name)
     }
 }
 
@@ -255,8 +261,7 @@ fn a_dense_model_can_adopt_layer_norm_through_the_moe_entry_point() {
     let c = cfg();
     let provider = StubProvider { cfg: c.clone() };
     let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
-    let none: Vec<Option<grim_models_transformer::moe_block::MoESpec>> =
-        vec![None; c.num_layers];
+    let none: Vec<Option<grim_models_transformer::moe_block::MoESpec>> = vec![None; c.num_layers];
     let m = grim_models_transformer::Llama::load_tp_moe(
         Device::Cpu,
         &ws,
@@ -276,8 +281,7 @@ fn a_dense_layer_norm_model_loads_through_load_tp_moe_specs() {
     let c = cfg();
     let provider = StubProvider { cfg: c.clone() };
     let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
-    let none: Vec<Option<grim_models_transformer::moe_block::MoESpec>> =
-        vec![None; c.num_layers];
+    let none: Vec<Option<grim_models_transformer::moe_block::MoESpec>> = vec![None; c.num_layers];
     let specs: Vec<LayerAttentionSpec> = (0..c.num_layers)
         .map(|_| {
             let mut s = LayerAttentionSpec::default_full(
@@ -300,7 +304,9 @@ fn a_dense_layer_norm_model_loads_through_load_tp_moe_specs() {
     )
     .expect("a dense LayerNorm model must load");
     assert!(
-        m.layers.iter().all(|l| l.attn_norm.kind == NormKind::LayerNorm),
+        m.layers
+            .iter()
+            .all(|l| l.attn_norm.kind == NormKind::LayerNorm),
         "every layer must adopt the spec's norm kind"
     );
 }
@@ -353,13 +359,9 @@ fn the_output_head_honours_has_output_bias() {
     c.has_output_bias = true;
     let provider = StubProvider { cfg: c.clone() };
     let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
-    let m = grim_models_transformer::Llama::load_tp(
-        Device::Cpu,
-        &ws,
-        c.clone(),
-        Default::default(),
-    )
-    .expect("Llama loads");
+    let m =
+        grim_models_transformer::Llama::load_tp(Device::Cpu, &ws, c.clone(), Default::default())
+            .expect("Llama loads");
     assert_eq!(c.has_output_bias, m.cfg.has_output_bias);
     assert!(
         m.output.bias.is_some(),
@@ -388,13 +390,9 @@ fn the_final_norm_gets_its_bias_when_the_checkpoint_ships_one() {
     let c = cfg();
     let provider = StubProvider { cfg: c.clone() };
     let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
-    let m = grim_models_transformer::Llama::load_tp(
-        Device::Cpu,
-        &ws,
-        c.clone(),
-        Default::default(),
-    )
-    .expect("Llama loads");
+    let m =
+        grim_models_transformer::Llama::load_tp(Device::Cpu, &ws, c.clone(), Default::default())
+            .expect("Llama loads");
     assert!(
         m.norm.has_bias(),
         "the checkpoint ships norm.bias and the final norm dropped it, so the \
@@ -423,7 +421,10 @@ fn a_model_with_an_output_norm_bias_and_no_layer_bias_loads() {
                     "tensor '{name}' not found"
                 )));
             }
-            StubProvider { cfg: self.cfg.clone() }.get(name)
+            StubProvider {
+                cfg: self.cfg.clone(),
+            }
+            .get(name)
         }
         fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
             if is_layer_norm_bias(name) {
@@ -431,7 +432,10 @@ fn a_model_with_an_output_norm_bias_and_no_layer_bias_loads() {
                     "tensor '{name}' not found"
                 )));
             }
-            StubProvider { cfg: self.cfg.clone() }.meta(name)
+            StubProvider {
+                cfg: self.cfg.clone(),
+            }
+            .meta(name)
         }
     }
 
@@ -444,13 +448,9 @@ fn a_model_with_an_output_norm_bias_and_no_layer_bias_loads() {
     let c = cfg();
     let provider = OutputBiasOnly { cfg: c.clone() };
     let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
-    let m = grim_models_transformer::Llama::load_tp(
-        Device::Cpu,
-        &ws,
-        c.clone(),
-        Default::default(),
-    )
-    .expect("a checkpoint with output_norm_b and no layer *_norm_b must load");
+    let m =
+        grim_models_transformer::Llama::load_tp(Device::Cpu, &ws, c.clone(), Default::default())
+            .expect("a checkpoint with output_norm_b and no layer *_norm_b must load");
     assert!(m.norm.has_bias(), "the final norm lost its bias");
     assert!(
         !m.layers[0].attn_norm.has_bias(),

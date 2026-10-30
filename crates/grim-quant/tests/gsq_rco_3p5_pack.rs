@@ -114,9 +114,23 @@ fn rejects_bad_inputs() {
     assert!(quantize_gsq_rco_3p5_block(&bad, &mut out).is_err());
     // Output too short
     assert!(quantize_gsq_rco_3p5_block(&values, &mut vec![0u8; BLOCK_BYTES_Q2_0 - 1]).is_err());
-    // All-zero block
+    // All-zero block: since the 2026-10-04 flush-class change this is NOT an
+    // error — released GSQ-RCO artifacts carry ~50% zero-scale blocks, so an
+    // all-zero block encodes as d=0/codes=0 (the decoder reproduces exact
+    // zeros) and the COUNTED variant reports it. Pin that contract here.
     let zeros = vec![0.0f32; BLOCK_SIZE_Q2_0];
-    assert!(quantize_gsq_rco_3p5_block(&zeros, &mut out).is_err());
+    let mut flush_out = vec![0xaau8; BLOCK_BYTES_Q2_0];
+    let mut flushed = 0usize;
+    grim_quant::quantize_gsq_rco_3p5_block_counted(&zeros, &mut flush_out, &mut flushed)
+        .expect("all-zero block must flush, not error");
+    assert_eq!(flushed, 1, "the zero block must be counted as flushed");
+    assert!(
+        flush_out.iter().all(|&b| b == 0),
+        "flushed block must encode as d=0/codes=0 (all zero bytes)"
+    );
+    // And the uncounted wrapper stays Ok for the same input.
+    let mut out2 = vec![0xaau8; BLOCK_BYTES_Q2_0];
+    assert!(quantize_gsq_rco_3p5_block(&zeros, &mut out2).is_ok());
 }
 
 // ---------------------------------------------------------------------------

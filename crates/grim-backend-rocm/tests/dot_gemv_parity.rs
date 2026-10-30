@@ -83,12 +83,44 @@ fn reference_q80(a: &[f32], b_packed: &[u8], m: usize, n: usize, k: usize) -> Ve
     c
 }
 
+/// NaN-aware max absolute error.
+///
+/// `f32::max` IGNORES NaN (IEEE-754 maxNum semantics), so folding with it
+/// reported `0.0` for a kernel that emitted NaN on *every* element. That is
+/// exactly how a broken dequant rode a tolerance gate green: the diff was
+/// never computed, it was silently dropped. `wmma_quant_parity` fixed this in
+/// `041cb708` ("wmma_quant_parity: max_diff was NaN-blind"); this shared
+/// helper was never given the same treatment and still had the blind fold.
+///
+/// Any non-finite value (NaN or ±Inf) on EITHER side now returns `INFINITY`,
+/// so every existing `assert!(diff < tol)` fails loudly and every
+/// `eprintln!` prints `inf` — no call site needs to change. The offending
+/// index is reported once so a NaN halfway through a big tensor is
+/// identifiable rather than just "somewhere in there".
 fn max_diff(want: &[f32], got: &[f32]) -> f32 {
     assert_eq!(want.len(), got.len(), "length mismatch");
-    want.iter()
-        .zip(got.iter())
-        .map(|(w, g)| (w - g).abs())
-        .fold(0.0f32, f32::max)
+    let mut max_diff = 0.0f32;
+    let mut nonfinite: Option<(usize, f32, f32)> = None;
+    for (i, (&w, &g)) in want.iter().zip(got.iter()).enumerate() {
+        if !w.is_finite() || !g.is_finite() {
+            if nonfinite.is_none() {
+                nonfinite = Some((i, w, g));
+            }
+            continue;
+        }
+        let d = (w - g).abs();
+        if d > max_diff {
+            max_diff = d;
+        }
+    }
+    if let Some((i, w, g)) = nonfinite {
+        eprintln!(
+            "[max_diff] non-finite output at index {i}: want={w} got={g} \
+             (max_diff=inf — a NaN/Inf here is a kernel bug, not tolerance noise)"
+        );
+        return f32::INFINITY;
+    }
+    max_diff
 }
 
 type Q80Pair = (
@@ -134,7 +166,6 @@ fn run_quant_matmul(
 /// PASSED: dot2 GEMV matches the fp32 CPU reference within fp16-activation
 /// quantization tolerance at the LFM2.5 decode shapes.
 #[test]
-#[ignore]
 fn dot2_q80_parity_vs_cpu() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -230,7 +261,6 @@ fn pack_q80(w: &[f32], rows: usize, k: usize) -> Vec<u8> {
 /// QKV weight blob must reproduce the three separate GEMV outputs (sliced back
 /// into q/k/v) within 1e-4 — same kernel, same math, only launch grouping differs.
 #[test]
-#[ignore]
 fn fused_qkv_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -345,7 +375,6 @@ fn fused_qkv_gemv_parity() {
 /// PASSED: dot2 and WMMA paths compute the same GEMM — outputs agree within
 /// the combined quantization tolerance.
 #[test]
-#[ignore]
 fn dot2_matches_wmma() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -377,7 +406,6 @@ fn dot2_matches_wmma() {
 /// the existing host-position `grim_rope` kernel at max_diff ≤ 1e-6 (fp32 identical
 /// math). Random q [1, heads*steps, head_dim] at base positions B ∈ {0, 17, 500}.
 #[test]
-#[ignore]
 fn rope_dev_base_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -438,7 +466,6 @@ fn rope_dev_base_parity() {
 /// SPEED-DOT (Phase 4.5a): `dot4_q4k_q81_gemv` (sudot4 + nibble unpack + two-dot decomposition)
 /// matches the CPU reference within quantization tolerance.
 #[test]
-#[ignore]
 fn dot4_q4k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -515,7 +542,6 @@ fn dot4_q4k_gemv_parity() {
 
 /// SPEED-DOT: Q5_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
-#[ignore]
 fn dot4_q5k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -591,7 +617,6 @@ fn dot4_q5k_gemv_parity() {
 
 /// SPEED-DOT: Q6_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
-#[ignore]
 fn dot4_q6k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -667,7 +692,6 @@ fn dot4_q6k_gemv_parity() {
 
 /// SPEED-DOT-FUSED (Phase 4c): `launch_fused_gate_up_dot4` matches CPU reference.
 #[test]
-#[ignore]
 fn fused_gate_up_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -775,7 +799,6 @@ fn fused_gate_up_gemv_parity() {
 
 /// SPEED-DOT-OPFUSE (Phase 4a): `rmsnorm_rope` matches unfused RMSNorm then RoPE.
 #[test]
-#[ignore]
 fn rmsnorm_rope_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -857,7 +880,6 @@ fn rmsnorm_rope_parity() {
 
 /// SPEED-DOT-OPFUSE (Phase 4d): `grim_silu_mul_quant_q8_1` parity test.
 #[test]
-#[ignore]
 fn silu_mul_quant_q81_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1042,7 +1064,6 @@ fn fp8_e4m3_to_f32_host(val: u8) -> f32 {
 /// E4M3 in-register) must match a CPU reference that performs the identical
 /// E4M3 quantization + dequantization.
 #[test]
-#[ignore]
 fn dot4_fp8_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1130,7 +1151,6 @@ fn dot4_fp8_gemv_parity() {
 /// the CPU dequant reference. Fixture encodes grim's Q2_K layout (84 bytes /
 /// 256 weights) and the CPU side mirrors the kernel's Q8_1 activation quant.
 #[test]
-#[ignore]
 fn dot4_q2k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1241,7 +1261,6 @@ fn dot4_q2k_gemv_parity() {
 /// must match the CPU dequant reference. Fixture encodes grim's Q3_K layout
 /// (110 bytes / 256 weights, llama.cpp spec).
 #[test]
-#[ignore]
 fn dot4_q3k_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1343,7 +1362,6 @@ fn dot4_q3k_gemv_parity() {
 /// Verifies the two-dot algebraic zero-point formulation and native dot8 accumulation
 /// against the CPU dequantization oracle.
 #[test]
-#[ignore]
 fn dot8_w4a4_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1657,8 +1675,8 @@ fn dot8_w4a4_gemv_parity_multi_row() {
         dev.launch_w4a4_ostquant_gemv(a_rocm, b_qw_rocm, b_sc_rocm, b_zr_rocm, out_rocm, m, n, k)
             .expect("launch_w4a4_ostquant_gemv");
 
-        let c_dev = grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref())
-            .expect("d2h c");
+        let c_dev =
+            grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref()).expect("d2h c");
 
         // Per-row CPU reference: the activation quantizer is per (row, group),
         // so each row has its own scales.
@@ -1724,8 +1742,14 @@ fn dot8_w4a4_gemv_parity_multi_row() {
 /// the kernel was given — plus a bit-mirror of the device's activation
 /// quantizer. A wrong codebook or lane geometry shows up as O(amax) error,
 /// not tolerance noise.
+///
+/// Un-ignored: this is the only parity test exercising `grim_dot8_w4a4_gemv`
+/// with real `repack_to_u4_lanes` triples — the exact path the CityCrow
+/// GSQ-RCO 27B takes, where it produced all-NaN logits at step 0. The
+/// shared `max_diff` was also NaN-blind (folded with `f32::max`), so even
+/// when run this test would have reported `max_diff=0` on an all-NaN device
+/// buffer. Both are fixed; the test now runs and its diff means something.
 #[test]
-#[ignore]
 fn citycrow_sudot8_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -1759,13 +1783,8 @@ fn citycrow_sudot8_gemv_parity() {
     let mut blocks = vec![0u8; (n * k).div_ceil(64) * 18];
     grim_quant::quantize_gsq_rco_3p5_block(&flat, &mut blocks).expect("pack");
 
-    let repacked = grim_quant::citycrow::repack_to_u4_lanes(
-        &blocks,
-        n,
-        k,
-        KQuantScheme::GsqRco3p5,
-    )
-    .expect("citycrow repack");
+    let repacked = grim_quant::citycrow::repack_to_u4_lanes(&blocks, n, k, KQuantScheme::GsqRco3p5)
+        .expect("citycrow repack");
     assert_eq!(repacked.n, n);
     assert_eq!(repacked.k, k);
     let b_qw = repacked.qweight.clone();
@@ -1885,7 +1904,6 @@ fn citycrow_sudot8_gemv_parity() {
 
 /// Phase 4.5b: W4A4 GEMV against real model weights from Qwen3-4B OSTQuant layout.
 #[test]
-#[ignore]
 fn dot8_w4a4_qwen3_model_tensor_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2049,7 +2067,6 @@ fn dot8_w4a4_qwen3_model_tensor_parity() {
 }
 
 #[test]
-#[ignore]
 fn dot8_w4a4_safetensors_loader_e2e() {
     if std::env::var("GRIM_RUN_GPU_TEST").unwrap_or_default() != "1" {
         eprintln!("skipping dot8_w4a4_safetensors_loader_e2e (GRIM_RUN_GPU_TEST!=1)");
@@ -2132,7 +2149,6 @@ fn dot8_w4a4_safetensors_loader_e2e() {
 /// Phase 4.5d: BF16 × BF16 dot2 GEMV (V_DOT2_F32_BF16, dot12-insts on RDNA3/4).
 /// Tests launch_dot2_bf16_gemv and end-to-end matmul dispatch against the CPU reference.
 #[test]
-#[ignore]
 fn dot2_bf16_gemv_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2267,7 +2283,6 @@ fn dot2_bf16_gemv_parity() {
 /// executes on the APU and matches the CPU reference — i.e. that RDNA2 gets the
 /// same dot4 speedup RDNA3/4 do, not the scalar fallback. Skipped if no APU.
 #[test]
-#[ignore]
 fn dot4_q4k_gemv_parity_on_rdna2_apu() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -2366,7 +2381,6 @@ fn gpu_device_rdna2() -> Option<RocmDevice> {
 /// for every arch with no `is_dot4_arch` guard, so the APU already takes the dot4
 /// path. This test proves it matches the CPU reference on the gfx1036.
 #[test]
-#[ignore]
 fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -2453,7 +2467,6 @@ fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
 /// This gate pins the fast kernel to the CPU dequant-matmul reference at a
 /// multi-superblock shape before it is allowed near production dispatch.
 #[test]
-#[ignore]
 fn dot4_q4k_gemv_fast_parity() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2483,13 +2496,8 @@ fn dot4_q4k_gemv_fast_parity() {
         arith: ArithType::F32,
         storage: Storage::KQuant(KQuantScheme::Q4K),
     };
-    let b_dev = MemoryOps::from_cpu_bytes(
-        &dev,
-        &b_bytes,
-        &Shape::new(vec![n, k]),
-        q4k_dtype,
-    )
-    .expect("upload q4k weights");
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_bytes, &Shape::new(vec![n, k]), q4k_dtype)
+        .expect("upload q4k weights");
 
     let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
     let out_shape = Shape::new(vec![m, n]);
@@ -2539,7 +2547,6 @@ fn dot4_q4k_gemv_fast_parity() {
 /// quantization error (Q4_K then u4 group-128) that decode would actually
 /// inherit, not just the requantizer's own round-trip.
 #[test]
-#[ignore]
 fn decode_w4a4_requant_parity_vs_original_f32() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2568,13 +2575,9 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
         arith: ArithType::F32,
         storage: Storage::KQuant(KQuantScheme::Q4K),
     };
-    let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
-        &dev,
-        &b_bytes,
-        &Shape::new(vec![n, k]),
-        q4k_dtype,
-    )
-    .expect("upload q4k weights");
+    let b_dev =
+        grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_bytes, &Shape::new(vec![n, k]), q4k_dtype)
+            .expect("upload q4k weights");
     let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
 
     let b_rocm = b_dev
@@ -2595,8 +2598,9 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
         0,
     )
     .expect("alloc scratch");
-    let out = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &alloc, 0)
-        .expect("alloc out");
+    let out =
+        grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &alloc, 0)
+            .expect("alloc out");
 
     let h = dev
         .linear_decode_into(a_dev.as_ref(), &b_rocm, &out, &act_q81)
@@ -2628,9 +2632,7 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
 
     let d_orig = max_diff(&c_cpu, &c_dev);
     let d_q4k = max_diff(&c_q4k, &c_dev);
-    eprintln!(
-        "[decode-w4a4-parity] vs original f32: {d_orig:.5}; vs q4k-only: {d_q4k:.5}"
-    );
+    eprintln!("[decode-w4a4-parity] vs original f32: {d_orig:.5}; vs q4k-only: {d_q4k:.5}");
     // Double-quantization tolerance: u4 activations x u4 weights on top of
     // Q4_K. Relative bound (5% of the reference magnitude) catches layout,
     // nibble-order and zero-point regressions — those produce O(1)-vs-O(100)
@@ -2655,7 +2657,6 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
 /// WhiteCrow requant path needs n=256 k=512 and produced exact zeros. Same
 /// synthetic packing as dot8_w4a4_gemv_parity, at the bigger shape.
 #[test]
-#[ignore]
 fn dot8_w4a4_gemv_parity_n256_k512() {
     let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -2697,23 +2698,58 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
             b_qw[col * words_per_col + w] = word;
         }
     }
-    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType {
-        arith: ArithType::F32,
-        storage: Storage::Native,
-    })
+    let a_dev = CoreTensorOps::from_cpu(
+        &dev,
+        &a_f32,
+        &Shape::new(vec![m, k]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
     .unwrap();
     let to_bytes_u32 = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
-    let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &to_bytes_u32(&b_qw),
-        &Shape::new(vec![n, words_per_col]), DType { arith: ArithType::U32, storage: Storage::Native }).unwrap();
-    let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev,
-        &b_sc.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>(),
-        &Shape::new(vec![n, n_groups]), DType { arith: ArithType::BF16, storage: Storage::Native }).unwrap();
-    let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_zr,
-        &Shape::new(vec![n, n_groups]), DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
-    let out = grim_tensor::CoreTensorOps::zeros(&dev, &Shape::new(vec![m, n]), DType {
-        arith: ArithType::F32,
-        storage: Storage::Native,
-    })
+    let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &to_bytes_u32(&b_qw),
+        &Shape::new(vec![n, words_per_col]),
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
+    )
+    .unwrap();
+    let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_sc
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>(),
+        &Shape::new(vec![n, n_groups]),
+        DType {
+            arith: ArithType::BF16,
+            storage: Storage::Native,
+        },
+    )
+    .unwrap();
+    let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_zr,
+        &Shape::new(vec![n, n_groups]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .unwrap();
+    let out = grim_tensor::CoreTensorOps::zeros(
+        &dev,
+        &Shape::new(vec![m, n]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
     .unwrap();
     fn as_rocm(b: &Box<dyn grim_tensor::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
         b.as_any()
@@ -2721,8 +2757,14 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
             .unwrap()
     }
     dev.launch_w4a4_ostquant_gemv(
-        as_rocm(&a_dev), as_rocm(&b_qw_dev), as_rocm(&b_sc_dev), as_rocm(&b_zr_dev),
-        as_rocm(&out), m, n, k,
+        as_rocm(&a_dev),
+        as_rocm(&b_qw_dev),
+        as_rocm(&b_sc_dev),
+        as_rocm(&b_zr_dev),
+        as_rocm(&out),
+        m,
+        n,
+        k,
     )
     .expect("launch");
     dev.synchronize();
@@ -2754,9 +2796,240 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
         }
         c_cpu[col] = acc;
     }
-    eprintln!("[dot8-w4a4-dbg2] a_deq[0..4]={:?} a_deq sum={:.4} a_f32[0..4]={:?}", &a_deq[..4], a_deq.iter().sum::<f32>(), &a_f32[..4]);
+    eprintln!(
+        "[dot8-w4a4-dbg2] a_deq[0..4]={:?} a_deq sum={:.4} a_f32[0..4]={:?}",
+        &a_deq[..4],
+        a_deq.iter().sum::<f32>(),
+        &a_f32[..4]
+    );
     let diff = max_diff(&c_cpu, &c);
-    eprintln!("[dot8-w4a4-n256k512] max_diff={diff:.6} c[0..4]={:?} c_cpu[0..4]={:?} sc[0..4]={:?} zr[0..4]={:?} qw[0..4]={:?}",
-        &c[..4], &c_cpu[..4], &b_sc[..4], &b_zr[..4], &b_qw[..4]);
+    eprintln!(
+        "[dot8-w4a4-n256k512] max_diff={diff:.6} c[0..4]={:?} c_cpu[0..4]={:?} sc[0..4]={:?} zr[0..4]={:?} qw[0..4]={:?}",
+        &c[..4],
+        &c_cpu[..4],
+        &b_sc[..4],
+        &b_zr[..4],
+        &b_qw[..4]
+    );
     assert!(diff < 0.05, "dot8 w4a4 n=256 k=512 diverges: {diff}");
+}
+
+/// Partial-rotary parity: `rope_dev_base[_into]` must match the generic
+/// `dev.rope` (YaRN/partial path, the verified eager route) when the config
+/// carries `rotary_dim < dim` + NeoX pairing — the Qwen3.5/3.8 decode-graph
+/// configuration. Previously the base kernel rotated all `dim` dims, so the
+/// graph decoded with 192 wrongly-rotated dims per head while prefill (eager)
+/// was correct.
+#[test]
+fn rope_dev_base_partial_rotary_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+
+    // Qwen3.5/3.8 attention geometry: 24 heads x 256, rotary 64, NeoX.
+    let heads = 24usize;
+    let steps = 1usize;
+    let head_dim = 256usize;
+    let elems = heads * steps * head_dim;
+
+    let mut seed = 0xC0FFEE123456789Au64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q: Vec<f32> = (0..elems).map(|_| rand()).collect();
+    let mut rope_cfg = grim_tensor::RopeConfig::new(head_dim, 10_000_000.0);
+    rope_cfg.rotary_dim = 64;
+    rope_cfg.interleaved = false;
+
+    let out_shape = Shape::new(vec![1, steps * heads, head_dim]);
+    let q_dev = CoreTensorOps::from_cpu(&dev, &q, &out_shape, DType::F32).expect("q upload");
+
+    for base in [0u32, 5, 500] {
+        let positions = vec![base; heads * steps];
+        let (ref_st, _rh) = dev
+            .rope(q_dev.as_ref(), &positions, &rope_cfg, &out_shape)
+            .expect("ref rope");
+        let ref_v = ref_st.to_cpu_vec_f32().expect("ref d2h");
+
+        let pos_bits = f32::from_bits(base);
+        let pos_dev = dev
+            .from_cpu(&[pos_bits], &Shape::new(vec![1]), DType::U32)
+            .expect("pos upload");
+        // Allocating launcher.
+        let (dev_st, _dh) = dev
+            .rope_dev_base(
+                q_dev.as_ref(),
+                pos_dev.as_ref(),
+                &rope_cfg,
+                &out_shape,
+                heads,
+                steps,
+            )
+            .expect("rope_dev_base");
+        let dev_v = dev_st.to_cpu_vec_f32().expect("dev d2h");
+        let diff = max_diff(&ref_v, &dev_v);
+        eprintln!("[rope-partial-parity] base={base} rope_dev_base max_diff={diff:.8}");
+        // NOTE: tolerance is 2e-4, not 1e-6 like the full-rotary gate above.
+        // The reference here is the YaRN/table path (per-element inv_freq
+        // table + mscale multiply); the base kernel evaluates powf per
+        // element. The two arithmetics diverge ~5e-5 at pos=500 through
+        // sin/cos amplification, which is fp noise, not a pairing error: a
+        // real pairing/width defect (e.g. rotating all 256 dims) measures
+        // O(1). Verified: base=500 gives 3.7e-5 here.
+        assert!(diff < 2e-4, "rope_dev_base diverges at base={base}: {diff}");
+
+        // In-place _into launcher (the decode-graph path).
+        let q_into = CoreTensorOps::from_cpu(&dev, &q, &out_shape, DType::F32).expect("q upload");
+        let q_into_r = grim_backend_rocm::as_rocm(q_into.as_ref()).unwrap();
+        dev.rope_dev_base_into(
+            q_into.as_ref(),
+            pos_dev.as_ref(),
+            q_into_r,
+            &rope_cfg,
+            &out_shape,
+            heads,
+            steps,
+        )
+        .expect("rope_dev_base_into");
+        let into_v = q_into.to_cpu_vec_f32().expect("into d2h");
+        let diff2 = max_diff(&ref_v, &into_v);
+        eprintln!("[rope-partial-parity] base={base} rope_dev_base_into max_diff={diff2:.8}");
+        assert!(
+            diff2 < 2e-4,
+            "rope_dev_base_into diverges at base={base}: {diff2}"
+        );
+    }
+}
+
+/// WhiteCrow lane-GEMV kernel exactness vs an activation-quant-AWARE host
+/// reference (Q5K root-cause pin).
+///
+/// The Q5K M=1 divergence (~0.2 vs an f32-activation reference) was
+/// misattributed to the encode/GEMV stages. Split measured on real 27B
+/// bytes (blk.3.attn_q, gfx1201): encode roundtrip RMSE 1.8e-3 (sane),
+/// single-hot/constant activations bit-exact (7e-9), dense-activation
+/// residual vs a bit-identical host replica of `grim_quantize_u4_group128`
+/// plus lane matvec 1.8e-7. I.e. the kernel is exact given its quantized
+/// inputs; the divergence is inherent W4A4 format noise (activation quant +
+/// requant, amplified by Q5K's ~2x weight magnitudes), which is why Q5K M=1
+/// rides the exact dot4/WMMA legs instead.
+///
+/// This gate pins the kernel side permanently with SYNTHETIC weights (no
+/// checkpoint): if the lane kernel ever mis-reads scales/zeros/codes, the
+/// AQ-aware residual — not the format noise — blows up. Tolerance admits
+/// f32 association order only.
+#[test]
+fn w4a4_gemv_matches_aq_aware_reference() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+
+    fn host_aq(a: &[f32], k: usize) -> Vec<f32> {
+        let ng = k / 128;
+        let mut out = vec![0.0f32; a.len()];
+        for g in 0..ng {
+            let grp = &a[g * 128..g * 128 + 128];
+            let mx = grp.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let (d, inv) = if mx > 1e-9 {
+                (mx / 7.0, 7.0 / mx)
+            } else {
+                (0.0, 0.0)
+            };
+            let _ = d;
+            for (i, &v) in grp.iter().enumerate() {
+                let q = (v * inv).round().clamp(-8.0, 7.0);
+                out[g * 128 + i] = (mx / 7.0) * q;
+            }
+        }
+        out
+    }
+    fn matvec(x: &[f32], wt: &[f32], in_n: usize, out_n: usize) -> Vec<f32> {
+        let mut y = vec![0.0f32; out_n];
+        for (o, yv) in y.iter_mut().enumerate() {
+            let mut s = 0.0f64;
+            for (i, xv) in x.iter().enumerate() {
+                s += (*xv as f64) * (wt[o * in_n + i] as f64);
+            }
+            *yv = s as f32;
+        }
+        y
+    }
+
+    // (scheme, pack, dequant) triads; Q5K is the case that motivated this.
+    let schemes: Vec<(
+        KQuantScheme,
+        fn(&[f32]) -> Vec<u8>,
+        fn(&[u8], usize) -> Vec<f32>,
+    )> = vec![
+        (
+            KQuantScheme::Q5K,
+            |w| grim_quant::quant_q5k(w).expect("pack5"),
+            |b, n| grim_quant::dequant_q5k(b, n).expect("deq5"),
+        ),
+        (
+            KQuantScheme::Q4K,
+            |w| grim_quant::quant_q4k(w).expect("pack4"),
+            |b, n| grim_quant::dequant_q4k(b, n).expect("deq4"),
+        ),
+    ];
+    for (scheme, pack, dequant) in schemes {
+        let (n, k) = (256usize, 512usize);
+        let mut seed = 0x5EEDu64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let w_f32: Vec<f32> = (0..n * k).map(|_| rand() * 0.3).collect();
+        let a_f32: Vec<f32> = (0..k).map(|_| rand() * 0.5).collect();
+        let packed = pack(&w_f32);
+        let w_orig = dequant(&packed, n * k);
+
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(scheme),
+        };
+        let w_dev = MemoryOps::from_cpu_bytes(&dev, &packed, &Shape::new(vec![n, k]), dtype)
+            .expect("w upload");
+        let w_rocm = grim_backend_rocm::as_rocm(w_dev.as_ref()).unwrap();
+        let lanes = dev
+            .requant_kquant_to_whitecrow(w_rocm, n, k, scheme)
+            .expect("requant");
+
+        let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![1, k]), DType::F32)
+            .expect("a up");
+        let a_rocm = grim_backend_rocm::as_rocm(a_dev.as_ref()).unwrap();
+        let out_dev = CoreTensorOps::zeros(&dev, &Shape::new(vec![1, n]), DType::F32).expect("out");
+        let out_rocm = grim_backend_rocm::as_rocm(out_dev.as_ref()).unwrap();
+        dev.launch_w4a4_ostquant_gemv(
+            a_rocm,
+            lanes.qweight_rocm().expect("qw"),
+            lanes.scales_rocm().expect("sc"),
+            lanes.zeros_rocm().expect("zr"),
+            out_rocm,
+            1,
+            n,
+            k,
+        )
+        .expect("gemv");
+        let got = out_dev.to_cpu_vec_f32().expect("d2h");
+
+        // AQ-aware reference: same quantized activations the kernel sees.
+        let (qw, sc, zr) =
+            grim_quant::quant_ostquant_w4_group128(&w_orig, n, k).expect("host encode");
+        let w_lane =
+            grim_quant::dequant_ostquant_w4a4(&qw, &sc, &zr, &[n, k], 128).expect("host lane deq");
+        let want = matvec(&host_aq(&a_f32, k), &w_lane, k, n);
+        let diff = max_diff(&want, &got);
+        eprintln!("[w4a4-aq-parity] {scheme:?} n={n} k={k} aq_aware_diff={diff:.3e}");
+        assert!(
+            diff < 1e-4,
+            "{scheme:?} lane GEMV disagrees with AQ-aware reference: {diff:.3e} \
+             (format noise is excluded here — this is a kernel/encode bug)"
+        );
+    }
 }

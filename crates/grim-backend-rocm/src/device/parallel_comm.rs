@@ -697,6 +697,7 @@ impl ParallelCommunicator {
 
             if let Some(d_ptr) = dst.device_ptr {
                 let bytes: Vec<u8> = dst_vec.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                let _g = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
                 unsafe {
                     crate::hipMemcpy(
                         d_ptr as *mut std::ffi::c_void,
@@ -771,6 +772,7 @@ impl ParallelCommunicator {
 
             if let Some(d_ptr) = dst.device_ptr {
                 let bytes: Vec<u8> = dst_vec.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                let _g = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
                 unsafe {
                     crate::hipMemcpy(
                         d_ptr as *mut std::ffi::c_void,

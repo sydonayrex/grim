@@ -2,14 +2,247 @@
 
 extern crate alloc;
 
+/// Pure parser for the legacy `GRIM_F16_KV` flag. Split out of
+/// [`kv_f16_enabled`] so the mapping is unit-testable without touching the
+/// process-global environment (which parallel tests share), and so the
+/// Qwen35 resolver can share one definition instead of re-parsing the flag
+/// with different spellings.
+///
+/// `None` (unset) is `false`. Only an explicit `0`/`false`/`off`/`no`
+/// (case-insensitive) disables; any other value — including garbage — reads
+/// as "enabled".
+pub fn parse_f16_kv_env(v: Option<&str>) -> bool {
+    match v {
+        Some(v) => {
+            let v = v.trim();
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        }
+        None => false,
+    }
+}
+
 /// GRAVE Phase 1: store the LFM2-family KV arena in f16 (2 bytes/element)
-/// instead of f32 — halves attention bytes. Read at BOTH the arena allocation
-/// sites and the kernel launchers so the flag stays consistent. LFM2-family
+/// instead of f32 — halves attention bytes. Read at arena allocation sites
+/// (launchers derive representation from storage instead). LFM2-family
 /// only; other models' arenas are unaffected while the default is off.
 pub fn kv_f16_enabled() -> bool {
-    std::env::var("GRIM_F16_KV")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false)
+    parse_f16_kv_env(std::env::var("GRIM_F16_KV").ok().as_deref())
+}
+
+/// The `GRIM_F16_KV` flag read in the **disabled** sense: `true` only when the
+/// value is an explicit off spelling. Models whose DEFAULT is f16 (they opt
+/// OUT of f16 rather than in) must use this, because
+/// [`parse_f16_kv_env`] treats *unset* as "off" — correct for the f32-default
+/// backend, wrong for a f16-default model.
+///
+/// Invariant (pinned by `f16_kv_flag_senses_are_complements`):
+/// `parse_f16_kv_env(v) == !f16_kv_explicitly_disabled(v)`.
+pub fn f16_kv_explicitly_disabled(v: Option<&str>) -> bool {
+    match v {
+        Some(v) => {
+            let v = v.trim();
+            v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no")
+        }
+        None => false,
+    }
+}
+
+/// Phase-3 KV-eviction ring policy handed to the graph kernels.
+///
+/// `cap_rows <= 0` means "no cap": the arena grows with the context and every
+/// kernel behaves exactly as before eviction existed. Otherwise the arena
+/// holds `cap_rows` token rows — `sink_rows` pinned attention sinks followed
+/// by the newest `cap_rows - sink_rows` tokens, overwritten in place. See
+/// `grim_kv_ring_row` for the mapping and why the live set stays contiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvRingPolicy {
+    pub cap_rows: i32,
+    pub sink_rows: i32,
+}
+
+impl KvRingPolicy {
+    /// No eviction: the identity for every ring kernel.
+    pub const UNLIMITED: Self = Self {
+        cap_rows: 0,
+        sink_rows: 0,
+    };
+
+    /// Build a policy, clamping sinks into `[0, cap_rows - 1]` so a bad
+    /// `GRIM_KV_SINKS` can never consume the whole arena (which would make the
+    /// ring degenerate to `t % cap_rows` and drop the sinks).
+    pub fn new(cap_rows: usize, sink_rows: usize) -> Self {
+        if cap_rows == 0 {
+            return Self::UNLIMITED;
+        }
+        let cap = i32::try_from(cap_rows).unwrap_or(i32::MAX);
+        let sink = i32::try_from(sink_rows)
+            .unwrap_or(i32::MAX)
+            .min(cap - 1)
+            .max(0);
+        Self {
+            cap_rows: cap,
+            sink_rows: sink,
+        }
+    }
+
+    pub fn is_limited(self) -> bool {
+        self.cap_rows > 0
+    }
+
+    /// Host twin of `grim_kv_ring_row`: the arena row an ABSOLUTE token row
+    /// maps to. `KvRingPolicy::row_matches_device_arithmetic` pins this against
+    /// the inlined device formula, and every host-side caller (the eager
+    /// append, the capture-topology validators) goes through here so there is
+    /// exactly one copy of the mapping in Rust.
+    pub fn row(self, t: usize) -> usize {
+        if self.cap_rows <= 0 {
+            return t;
+        }
+        let t = t as i64;
+        let cap = self.cap_rows as i64;
+        if t < cap {
+            return t as usize;
+        }
+        let span = cap - self.sink_rows as i64;
+        if span <= 0 {
+            return (t % cap) as usize;
+        }
+        (self.sink_rows as i64 + (t - self.sink_rows as i64) % span) as usize
+    }
+}
+
+/// Dense KV-arena representation on ROCm.
+///
+/// `GRIM_KV_ARENA=f32|f16|int8` wins when set; otherwise the legacy
+/// `GRIM_F16_KV` maps on (any non-`0`/`false`) to F16 and anything else to
+/// F32. Global default is F32 — models opt into narrower formats through
+/// their own `kv_arena_dtype` (Qwen35 defaults to F16; int8 is always
+/// explicit). Launchers never read this: they derive the representation
+/// from arena storage (storage truth).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvArenaFormat {
+    F32,
+    F16,
+    Int8,
+    Int4,
+    /// Asymmetric 2-bit keys / 4-bit values (WS-3A). The representation is
+    /// declared here so the selector is first-class and cannot be mistaken for
+    /// another format, but its DEVICE KERNELS DO NOT EXIST YET — every arena
+    /// entry point must refuse it rather than fall through (int2v4 and int8 are
+    /// both byte-addressed, so a fallthrough would serve 2-bit codes as 8-bit).
+    Int2V4,
+    /// WhiteCrow (u4 group-128 OSTQuant): unsigned 4-bit codes quantized over
+    /// **flat contiguous 128-value groups** of the arena (`grp = flat_idx/128`,
+    /// exactly the paged `dequant_kv_element(format=9)` grouping), each carrying
+    /// an inline bf16 scale + u8 zero — 67 bytes per 128 values.
+    ///
+    /// Unlike Int8/Int4/Int2V4, whose scale sidecars are per-(row, kv_head)
+    /// f32 vectors, WhiteCrow's scale/zero ride INSIDE the interleaved 67-byte
+    /// blocks in the arena itself; there is no separate f32 scale sidecar. The
+    /// per-element width is the non-uniform 67/128 ≈ 0.523 (codes + inline
+    /// scale/zero amortized over the group).
+    WhiteCrow,
+}
+
+impl KvArenaFormat {
+    /// Bytes per stored element, excluding sidecars (scales ride separately).
+    /// `Int2V4` is the average of its two widths: 2-bit K + 4-bit V.
+    /// `WhiteCrow` is the amortized width of its interleaved 67-byte blocks
+    /// (67 bytes per 128 values), since its scale/zero ride inline.
+    pub fn bytes_per_elem(self) -> f32 {
+        match self {
+            KvArenaFormat::F32 => 4.0,
+            KvArenaFormat::F16 => 2.0,
+            KvArenaFormat::Int8 => 1.0,
+            KvArenaFormat::Int4 => 0.5,
+            KvArenaFormat::Int2V4 => 0.375,
+            KvArenaFormat::WhiteCrow => 67.0 / 128.0,
+        }
+    }
+
+    /// True for representations whose device kernels are implemented. Every
+    /// declared format is implemented as of WS-3A (`int2v4` gained its 2-bit-K
+    /// quantizer and its mixed-width attention kernel); the query stays so a
+    /// future format can declare itself incomplete and be refused centrally.
+    pub fn has_device_kernels(self) -> bool {
+        match self {
+            KvArenaFormat::F32
+            | KvArenaFormat::F16
+            | KvArenaFormat::Int8
+            | KvArenaFormat::Int4
+            | KvArenaFormat::Int2V4
+            | KvArenaFormat::WhiteCrow => true,
+        }
+    }
+
+    /// True when a DEVICE-TOTAL (graph-capturable) append + attention pair
+    /// exists for this format.
+    ///
+    /// Distinct from [`Self::has_device_kernels`], which is about the EAGER
+    /// path: K2V4 has eager kernels and no graph pair, so the two questions have
+    /// different answers and must not share a predicate. The capture sites ask
+    /// THIS one, because the eager kernels cannot be captured — the K2V4
+    /// attention kernel is single-slot (no `batch`, no `slot_stride`, no device
+    /// `total_dev`), so capture would bake a host scalar into the graph.
+    pub fn graph_kernel_pair(self) -> bool {
+        matches!(
+            self,
+            KvArenaFormat::Int8 | KvArenaFormat::Int4 | KvArenaFormat::WhiteCrow
+        )
+    }
+}
+
+/// Pure parser for an explicit `GRIM_KV_ARENA` value. `None` means "not one
+/// of the known spellings" — the caller decides whether that is a typo
+/// (warn, fall back) or simply unset. This is the SINGLE place the explicit
+/// format spellings live; the Qwen35 model resolver delegates here too, so an
+/// explicit `GRIM_KV_ARENA` can never be read two different ways.
+pub fn parse_kv_arena_env(v: &str) -> Option<KvArenaFormat> {
+    match v {
+        "f32" => Some(KvArenaFormat::F32),
+        "f16" => Some(KvArenaFormat::F16),
+        "int8" | "i8" | "q8" => Some(KvArenaFormat::Int8),
+        "int4" | "i4" | "q4" => Some(KvArenaFormat::Int4),
+        // WS-3A: asymmetric bits. Resolves, then every graph entry point
+        // refuses it (`graph_kernel_pair` == false) instead of mis-serving;
+        // the EAGER kernels for it exist (`has_device_kernels` == true).
+        "int2v4" | "i2v4" | "k2v4" => Some(KvArenaFormat::Int2V4),
+        // WhiteCrow u4 group-128 OSTQuant (sudot8-friendly on RDNA3/4).
+        "whitecrow" | "w4a4" => Some(KvArenaFormat::WhiteCrow),
+        _ => None,
+    }
+}
+
+/// Pure core of [`kv_arena_format`]: resolve from already-read env strings.
+/// Kept pure so the mapping is unit-testable without the process-global
+/// environment.
+pub(crate) fn resolve_kv_arena_format(arena: Option<&str>, f16_kv: Option<&str>) -> KvArenaFormat {
+    match arena {
+        Some(v) => parse_kv_arena_env(v).unwrap_or_else(|| {
+            eprintln!("[kv] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using F32");
+            KvArenaFormat::F32
+        }),
+        None => {
+            if parse_f16_kv_env(f16_kv) {
+                KvArenaFormat::F16
+            } else {
+                KvArenaFormat::F32
+            }
+        }
+    }
+}
+
+/// Resolve the dense-arena representation (see [`KvArenaFormat`]).
+pub fn kv_arena_format() -> KvArenaFormat {
+    let arena = std::env::var("GRIM_KV_ARENA").ok();
+    let f16 = std::env::var("GRIM_F16_KV").ok();
+    resolve_kv_arena_format(arena.as_deref(), f16.as_deref())
 }
 
 /// HIP source for `grim_qkv_attention`. [see: `COMPUTE_KERNEL_SOURCE`, `lib.rs::RocmDevice::qkv_attention`, `j`, `__shared__`]
@@ -167,6 +400,737 @@ void grim_qkv_attention(
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
                 out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
+            }
+        }
+    }
+
+    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform (all lanes see same j_start/j_end loop range).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Reconstruct this lane's slice of the normalized attention vector.
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its strided slice of the head_dim axis; per output column oc
+        // the lane partial is butterfly-reduced across the wavefront and lane 0 atomically accumulates into the (host-zeroed) fused output row.
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+
+// int8-KV variant of `grim_qkv_attention` (Phase 2 KV shrink): identical
+// math, K/V rows read as biased-u8 codes with f32 per-(row,kv_head)
+// scales. q, out, and all epilogues are untouched f32.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_i8kv(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,   // absolute position of q[head, 0, *]
+    float inv_sqrt_d,
+    int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
+    float softcap,      // logit softcapping cap (e.g. 50.0f for Gemma-2). Pass <=0.0f to disable.
+                        // WI-F2 - fused O-projection epilogue.
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    // ALiBi per-head slopes [num_heads]. When has_alibi != 0 the score for
+    // query abs_i / key j gains slopes[h] * (j - abs_i). Pass null/0 to skip.
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
+    const int i = blockIdx.x;             // query position (0..seq_len)
+    const int h = blockIdx.y;             // head index
+    if (i >= seq_len || h >= num_heads) return;
+
+    // GQA mapping: every (num_heads/num_kv_heads) query heads share one kv_head.
+    // The host validates that num_heads % num_kv_heads == 0, so this is exact.
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+
+    // Pointers to this head's q column / kv column.
+    // Layouts (Phase-1 contract): q: [seq_len, num_heads, head_dim] -> q_offset = (i * num_heads + h).
+    const int q_offset = (i * num_heads + h) * head_dim;
+
+    // Cache offset: query position i within this call is at absolute position
+    // (cache_offset + i). All past K/V positions are valid up to that.
+    const int abs_i = cache_offset + i;
+
+    // ────────────────────────────────────────────────────────────────────── Phase 1: online softmax.
+    // Running max + running weighted sum, no full score vector materialized; kv_seq_len may exceed the.
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
+    const int num_waves = blockDim.x / wave_size;
+
+    // Every head_dim axis loop must cover the SAME range as the q staging loop
+    // (8 chunks). It used to be 4, which covered only 4*wave_size = 128 dims, so
+    // for head_dim 256 the upper half of every output row was never written and
+    // read back as whatever the allocation held - observed as exactly half the
+    // output elements wrong. s_acc[8][260] and the head_dim>256 guard already
+    // assumed 256.
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+
+    // Hardware-aware head-dim cap.
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    // Per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized to worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and head.
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    // Causal KV range for this query: [lo, hi) where: hi = min(abs_i + 1, kv_seq_len) (standard causal upper bound) lo = window_lo (0 for full attention; sliding lower
+    // bound for SWA) `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so the kernel stays branch-free for the common full-causal case (window_lo == 0).
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
+    const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
+
+    // Quarter-stride partitioning of [lo, hi) across the wavefronts.
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    // j_start / j_end are offsets into [0, range_len); add `lo` when accessing KV.
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Fast-path GQA key/value stride pointers
+    // int8-KV variant (Phase 2): codes are u8 (biased +128, same element
+    // layout as f32 rows, 1 B/elem); scales are f32 per (row, kv_head).
+    const unsigned char* __restrict__ k_u8 =
+        ((const unsigned char*)k_tensor) + (long long)kv_head * head_dim;
+    const unsigned char* __restrict__ v_u8 =
+        ((const unsigned char*)v_tensor) + (long long)kv_head * head_dim;
+    const int kv_stride = num_kv_heads * head_dim;
+
+    // Stage this lane's strided slice of q into registers ONCE.
+    // The previous form re-fetched the whole q head from global memory on every KV token.
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        // Lane-strided partial dot product Q.K, then butterfly reduction.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                float k_dq = ((float)((int)k_u8[j * kv_stride + dd] - 128) / 127.0f)
+                    * k_scales[(long long)j * num_kv_heads + kv_head];
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        // Online-softmax update
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_dq = ((float)((int)v_u8[j * (num_kv_heads * head_dim) + d] - 128) / 127.0f)
+                    * v_scales[(long long)j * num_kv_heads + kv_head];
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform (all lanes see same j_start/j_end loop range).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Reconstruct this lane's slice of the normalized attention vector.
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its strided slice of the head_dim axis; per output column oc
+        // the lane partial is butterfly-reduced across the wavefront and lane 0 atomically accumulates into the (host-zeroed) fused output row.
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+// int4-KV variant of `grim_qkv_attention` (Phase 3 KV shrink: ~2.2GB @ 262K):
+// K/V rows read as packed nibbles (2 values per byte, low nibble first,
+// biased by +7, range -7..+7 mapped to 0..14).
+// Scales are f32 per (row, kv_head).
+// q, out, and all epilogues are untouched f32.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_i4kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Packed int4 storage: 2 values per byte. Row stride in bytes is (num_kv_heads * head_dim) / 2.
+    // Offset for head is (kv_head * head_dim) / 2 bytes.
+    const int kv_stride_bytes = (num_kv_heads * head_dim) / 2;
+    const int head_offset_bytes = (kv_head * head_dim) / 2;
+    const unsigned char* __restrict__ k_bytes = k_tensor + head_offset_bytes;
+    const unsigned char* __restrict__ v_bytes = v_tensor + head_offset_bytes;
+
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float partial = 0.0f;
+        const long long row_base_bytes = (long long)j * kv_stride_bytes;
+        const float k_sc = k_scales[(long long)j * num_kv_heads + kv_head];
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                unsigned char packed = k_bytes[row_base_bytes + (dd >> 1)];
+                int code = (dd & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+                float k_dq = ((float)(code - 7) / 7.0f) * k_sc;
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        const float v_sc = v_scales[(long long)j * num_kv_heads + kv_head];
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                unsigned char packed = v_bytes[row_base_bytes + (d >> 1)];
+                int code = (d & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+                float v_dq = ((float)(code - 7) / 7.0f) * v_sc;
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+// f16-KV variant of `grim_qkv_attention` (Phase 1 KV shrink): bit-identical
+// math, K/V rows read as fp16 through u16 views. q, out, and all
+// epilogues (max/sum/softcap/alibi/fused-O) are untouched f32.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_f16kv(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,   // absolute position of q[head, 0, *]
+    float inv_sqrt_d,
+    int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
+    float softcap,      // logit softcapping cap (e.g. 50.0f for Gemma-2). Pass <=0.0f to disable.
+                        // WI-F2 - fused O-projection epilogue.
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    // ALiBi per-head slopes [num_heads]. When has_alibi != 0 the score for
+    // query abs_i / key j gains slopes[h] * (j - abs_i). Pass null/0 to skip.
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
+    const int i = blockIdx.x;             // query position (0..seq_len)
+    const int h = blockIdx.y;             // head index
+    if (i >= seq_len || h >= num_heads) return;
+
+    // GQA mapping: every (num_heads/num_kv_heads) query heads share one kv_head.
+    // The host validates that num_heads % num_kv_heads == 0, so this is exact.
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+
+    // Pointers to this head's q column / kv column.
+    // Layouts (Phase-1 contract): q: [seq_len, num_heads, head_dim] -> q_offset = (i * num_heads + h).
+    const int q_offset = (i * num_heads + h) * head_dim;
+
+    // Cache offset: query position i within this call is at absolute position
+    // (cache_offset + i). All past K/V positions are valid up to that.
+    const int abs_i = cache_offset + i;
+
+    // ────────────────────────────────────────────────────────────────────── Phase 1: online softmax.
+    // Running max + running weighted sum, no full score vector materialized; kv_seq_len may exceed the.
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
+    const int num_waves = blockDim.x / wave_size;
+
+    // Every head_dim axis loop must cover the SAME range as the q staging loop
+    // (8 chunks). It used to be 4, which covered only 4*wave_size = 128 dims, so
+    // for head_dim 256 the upper half of every output row was never written and
+    // read back as whatever the allocation held - observed as exactly half the
+    // output elements wrong. s_acc[8][260] and the head_dim>256 guard already
+    // assumed 256.
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+
+    // Hardware-aware head-dim cap.
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    // Per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized to worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and head.
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    // Causal KV range for this query: [lo, hi) where: hi = min(abs_i + 1, kv_seq_len) (standard causal upper bound) lo = window_lo (0 for full attention; sliding lower
+    // bound for SWA) `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so the kernel stays branch-free for the common full-causal case (window_lo == 0).
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
+    const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
+
+    // Quarter-stride partitioning of [lo, hi) across the wavefronts.
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    // j_start / j_end are offsets into [0, range_len); add `lo` when accessing KV.
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Fast-path GQA key/value stride pointers
+    const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
+    const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
+    // f16-KV variant: same math, K/V read through u16 views (arenas hold
+    // fp16 when GRIM_F16_KV is on; q stays f32).
+    //
+    // STRIDE CORRECTNESS (do not "simplify"): the head base MUST be computed
+    // in u16 units from the tensor base. `&k_tensor[kv_head*head_dim]` advances
+    // kv_head*head_dim FLOATS (= ×4 bytes); reinterpreting that address as u16
+    // puts every kv_head>0 at 2x its true offset (head 0 accidentally exact,
+    // all later heads out-of-bounds). Index from the u16 base instead.
+    const unsigned short* __restrict__ k_head16 =
+        ((const unsigned short*)k_tensor) + kv_head * head_dim;
+    const unsigned short* __restrict__ v_head16 =
+        ((const unsigned short*)v_tensor) + kv_head * head_dim;
+    (void)k_head;
+    (void)v_head;
+    const int kv_stride = num_kv_heads * head_dim;
+
+    // Stage this lane's strided slice of q into registers ONCE.
+    // The previous form re-fetched the whole q head from global memory on every KV token.
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        // Lane-strided partial dot product Q.K, then butterfly reduction.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                partial += q_reg[chunk] * fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        // Online-softmax update
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * fp16_bits_to_float_device(v_head16[j * (num_kv_heads * head_dim) + d]);
             }
         }
     }
@@ -844,8 +1808,172 @@ __device__ inline float dequant_kv_element(
         int mant = nibble & 1;
         float val = (exp == 0) ? ((float)mant * 0.5f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
         return (sign ? -val : val) * blk_scale;
+    } else if (quant_format == 9) { // WhiteCrow (unsigned 4-bit group-128 OSTQuant)
+        // 67 bytes per 128 values: 64 code bytes + 2 bf16 scale bytes + 1 zero byte
+        int grp = idx / 128;
+        int in_grp = idx % 128;
+        const unsigned char* g = data + grp * 67;
+        unsigned short sc_bits = (unsigned short)g[64] | ((unsigned short)g[65] << 8);
+        unsigned int sc_u32 = ((unsigned int)sc_bits) << 16;
+        float grp_scale;
+        __builtin_memcpy(&grp_scale, &sc_u32, 4);
+        int grp_zero = (int)g[66];
+
+        int byte_idx = in_grp >> 1;
+        unsigned char b = g[byte_idx];
+        int nibble = (in_grp & 1) ? ((int)(b >> 4)) : ((int)(b & 0x0F));
+        return grp_scale * ((float)(nibble - grp_zero));
     }
     return 0.0f;
+}
+
+// ── WhiteCrow sudot8 Q·K helpers ───────────────────────────────────────────
+//
+// The Q·K dot against a WhiteCrow KV arena is ALU-bound in the per-value
+// dequant (measured 6.4-6.7x over an f32 baseline at every context length,
+// constant ratio -> per-value penalty, ~80000x above the DRAM floor). These
+// helpers replace the serial nibble-extract + per-value scale with the
+// hardware 8-lane u4 dot (`__builtin_amdgcn_sudot8`, the same mixed-sign
+// form proven in `grim_dot8_w4a4_gemv`):
+//
+//   sum_d q_d*k_d = qs*ks * ( iacc - z_k * sum_qa )
+//
+// Q is quantized to the arena's own u4 group-128 grid but SYMMETRICALLY
+// (codes -8..7, amax/7 scale), so the signed-flag operand is Q and the
+// unsigned operand is the row's WhiteCrow codes; the row's u8 zero folds
+// into the algebraic correction. Groups align because head_dim % 128 == 0
+// and both sides span the same 128 values.
+//
+// Lane partition (wave form): word w (8 values) = lane; group g = lane>>4.
+// Valid while total_words = (head_dim/128)*16 <= wave_size, which always
+// holds: head_dim <= 256 -> 32 words, wave_size >= 32. The 16-lane xor
+// reductions (offsets 1..8) stay inside one group's lanes.
+
+struct GrimWcQLane {
+    unsigned int word;  // 8 signed nibble codes, low nibble = lowest dim
+    float qs;           // group scale (amax/7)
+    int codes_sum;      // sum of this lane's 8 codes
+    int valid;          // lane owns a word
+};
+
+__device__ inline GrimWcQLane grim_whitecrow_quant_q_lane(
+    const float* __restrict__ q,
+    int q_offset,
+    int head_dim,
+    int lane)
+{
+    GrimWcQLane s;
+    s.word = 0u; s.qs = 0.0f; s.codes_sum = 0; s.valid = 0;
+    const int words_total = (head_dim >> 7) << 4;
+    if (lane >= words_total) return s;
+    s.valid = 1;
+    const int g = lane >> 4;
+    const int base = q_offset + g * 128 + (lane & 15) * 8;
+    float qv[8];
+    float amax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        qv[j] = q[base + j];
+        amax = fmaxf(amax, fabsf(qv[j]));
+    }
+    // Group amax across the 16 lanes owning group g.
+    #pragma unroll
+    for (int off = 1; off < 16; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
+    float qs = amax / 7.0f;
+    unsigned int w = 0u;
+    int csum = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        int c = (qs > 0.0f) ? (int)rintf(qv[j] / qs) : 0;
+        c = c < -8 ? -8 : (c > 7 ? 7 : c);
+        w |= ((unsigned int)(c & 0xF)) << (4 * j);
+        csum += c;
+    }
+    s.word = w; s.qs = qs; s.codes_sum = csum;
+    return s;
+}
+
+// Wave-uniform Q·K dot for one WhiteCrow K head row. `k_head` is the byte
+// address of this kv_head's first 67-byte block; `row_base` the row's byte
+// offset from it. Every lane must hold the GrimWcQLane returned by
+// grim_whitecrow_quant_q_lane with the SAME lane index. Byte-composed word
+// loads: 67-byte blocks are only 1-byte aligned at group granularity.
+__device__ inline float grim_whitecrow_qk_dot(
+    const unsigned char* __restrict__ k_head,
+    long long row_base,
+    const GrimWcQLane& s,
+    int lane,
+    int wave_size)
+{
+    float f = 0.0f;
+    if (s.valid) {
+        const int g = lane >> 4;
+        const unsigned char* blk = k_head + row_base + (long long)g * 67;
+        const unsigned char* p = blk + (lane & 15) * 4;
+        unsigned int kw = (unsigned int)p[0] | ((unsigned int)p[1] << 8)
+                        | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+        int iacc = __builtin_amdgcn_sudot8(true, s.word, false, kw, 0, false);
+        int csum = s.codes_sum;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            iacc += __shfl_xor(iacc, off);
+            csum += __shfl_xor(csum, off);
+        }
+        float ks = __uint_as_float((((unsigned int)blk[64] | ((unsigned int)blk[65] << 8)) << 16));
+        int zi = (int)blk[66];
+        f = s.qs * ks * (float)(iacc - zi * csum);
+    }
+    // Sum per-group partials across the wave (offsets >= 16 cross groups).
+    for (int off = 16; off < wave_size; off <<= 1) f += __shfl_xor(f, off);
+    return f;
+}
+
+// Scalar (per-thread) form for the paged kernel, whose score loop is uniform
+// across lanes: quantize this head's Q and dot one WhiteCrow row. The paged
+// format-9 layout groups over FLAT 128-value spans of the page buffer, so the
+// group base byte is ((elem_offset >> 7) + g) * 67 (elem_offset is a multiple
+// of 128: page_stride and head_dim both are).
+__device__ inline float grim_whitecrow_qk_dot_scalar(
+    const float* __restrict__ q,
+    int q_offset,
+    const unsigned char* __restrict__ data,
+    int elem_offset,
+    int head_dim)
+{
+    const int gph = head_dim >> 7;
+    float total = 0.0f;
+    for (int g = 0; g < gph; ++g) {
+        float amax = 0.0f;
+        for (int j = 0; j < 128; ++j) {
+            amax = fmaxf(amax, fabsf(q[q_offset + g * 128 + j]));
+        }
+        float qs = amax / 7.0f;
+        int csum = 0;
+        unsigned int qw[16];
+        for (int w = 0; w < 16; ++w) {
+            unsigned int word = 0u;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int c = (qs > 0.0f) ? (int)rintf(q[q_offset + g * 128 + w * 8 + j] / qs) : 0;
+                c = c < -8 ? -8 : (c > 7 ? 7 : c);
+                word |= ((unsigned int)(c & 0xF)) << (4 * j);
+                csum += c;
+            }
+            qw[w] = word;
+        }
+        const unsigned char* blk = data + (long long)((elem_offset >> 7) + g) * 67;
+        float ks = __uint_as_float((((unsigned int)blk[64] | ((unsigned int)blk[65] << 8)) << 16));
+        int zi = (int)blk[66];
+        int iacc = 0;
+        for (int w = 0; w < 16; ++w) {
+            const unsigned char* p = blk + w * 4;
+            unsigned int kw = (unsigned int)p[0] | ((unsigned int)p[1] << 8)
+                            | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+            iacc = __builtin_amdgcn_sudot8(true, qw[w], false, kw, iacc, false);
+        }
+        total += qs * ks * (float)(iacc - zi * csum);
+    }
+    return total;
 }
 
 extern "C" __global__ __launch_bounds__(256)
@@ -915,11 +2043,20 @@ void grim_qkv_attention_paged_quant(
         const int elem_offset = physical_block * page_stride + (page_offset * num_kv_heads + kv_head) * head_dim;
 
         float score = 0.0f;
-        #pragma unroll
-        for (int dim = 0; dim < 256; ++dim) {
-            if (dim < head_dim) {
-                float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
-                score += q[q_offset + dim] * k_val;
+        // The paged format-9 arena groups over FLAT 128-value spans of the
+        // page buffer, which only aligns with per-head Q groups when
+        // head_dim % 128 == 0 (otherwise one K group mixes several heads'
+        // dims). The sudot8 dot requires that alignment; anything else keeps
+        // the per-element dequant with unquantized Q.
+        if (quant_format == 9 && (head_dim & 127) == 0) {
+            score = grim_whitecrow_qk_dot_scalar(q, q_offset, k_pages, elem_offset, head_dim);
+        } else {
+            #pragma unroll
+            for (int dim = 0; dim < 256; ++dim) {
+                if (dim < head_dim) {
+                    float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
+                    score += q[q_offset + dim] * k_val;
+                }
             }
         }
         score *= inv_sqrt_d;
@@ -988,6 +2125,579 @@ void grim_qkv_attention_paged_quant(
     }
 }
 
+
+// ── Token-parallel (flash-decoding) split of the paged quant kernel ────────
+//
+// The single-workgroup serial loop is the family's dominant bottleneck
+// (measured: even f32 runs ~2.8 us/token vs ~0.1 for a parallel kernel;
+// post-sudot8 WhiteCrow sits at 3.4-3.9 us/token). This split moves the
+// token range onto the GRID: block (i, h, c) computes an online-softmax
+// PARTIAL over token chunk c, and `grim_qkv_attention_paged_merge` combines
+// the partials with the standard LSE rescale. The inner-loop bodies (sudot8
+// Q·K for format 9, per-element dequant otherwise) are unchanged, so the
+// split inherits the sudot8 win and adds cross-CU parallelism on top.
+//
+// Partials layout (f32 device scratch, sized by the launcher):
+//   pm: [n_chunks, batch, num_heads]   running max per chunk
+//   pl: [n_chunks, batch, num_heads]   running sum per chunk
+//   po: [n_chunks, batch, num_heads, head_dim]  UNNORMALIZED accumulator
+// An empty chunk (window doesn't reach it) publishes l = 0, which the merge
+// skips — no separate zero-init pass needed as long as the launcher sizes
+// n_chunks from the SAME host-visible range the kernel clamps to.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_paged_quant_split(
+    const float* __restrict__ q,
+    const BlockTableEntry* __restrict__ block_tables,
+    const unsigned char* __restrict__ k_pages,
+    const unsigned char* __restrict__ v_pages,
+    float* __restrict__ partial_m,   // [n_chunks, batch, num_heads]
+    float* __restrict__ partial_l,   // [n_chunks, batch, num_heads]
+    float* __restrict__ partial_o,   // [n_chunks, batch, num_heads, head_dim]
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_blocks,
+    int page_size,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    int quant_format,
+    float k_scale,
+    float k_bias,
+    float v_scale,
+    float v_bias,
+    int chunk_len,   // tokens per chunk (> 0)
+    int n_chunks
+) {
+    const int batch_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    const int chunk = blockIdx.z;
+    if (chunk >= n_chunks) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (batch_idx * num_heads + h) * head_dim;
+    const int abs_i = cache_offset;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    // Same causal window as the serial kernel, sliced to this chunk.
+    const int range_lo = window_lo > 0 ? window_lo : 0;
+    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
+    int j_start = range_lo + chunk * chunk_len;
+    int j_end = j_start + chunk_len;
+    if (j_start < range_lo) j_start = range_lo;
+    if (j_end > range_hi) j_end = range_hi;
+
+    const int base = (j_end - j_start) / num_waves;
+    const int rem  = (j_end - j_start) % num_waves;
+    int w_start = j_start + wave_id * base + (wave_id < rem ? wave_id : rem);
+    int w_end   = w_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int page_stride = page_size * num_kv_heads * head_dim;
+
+    for (int j = w_start; j < w_end; ++j) {
+        const int page_idx = j / page_size;
+        const int page_offset = j % page_size;
+        if (page_idx >= max_blocks) continue;
+
+        const BlockTableEntry entry = block_tables[batch_idx * max_blocks + page_idx];
+        const int physical_block = entry.block_id;
+        const int elem_offset = physical_block * page_stride + (page_offset * num_kv_heads + kv_head) * head_dim;
+
+        float score = 0.0f;
+        if (quant_format == 9 && (head_dim & 127) == 0) {
+            score = grim_whitecrow_qk_dot_scalar(q, q_offset, k_pages, elem_offset, head_dim);
+        } else {
+            #pragma unroll
+            for (int dim = 0; dim < 256; ++dim) {
+                if (dim < head_dim) {
+                    float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
+                    score += q[q_offset + dim] * k_val;
+                }
+            }
+        }
+        score *= inv_sqrt_d;
+
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+                out_acc[chunk_i] = out_acc[chunk_i] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) {
+                float v_val = dequant_kv_element(v_pages, elem_offset + d, quant_format, v_scale, v_bias);
+                out_acc[chunk_i] += w * v_val;
+            }
+        }
+        running_sum += w;
+    }
+
+    // Cross-wave merge within this block (same protocol as the serial kernel).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+        int d = lane_id + chunk_i * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk_i];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id == 0) {
+        float m_final = s_max[0];
+        float sum_final = s_sum[0];
+        float acc_final[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) acc_final[chunk_i] = s_acc[0][d];
+        }
+        for (int w = 1; w < num_waves; ++w) {
+            float mw = s_max[w];
+            float uw = s_sum[w];
+            if (uw == 0.0f) continue;
+            if (sum_final == 0.0f) {
+                m_final = mw; sum_final = uw;
+                for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+                    int d = lane_id + chunk_i * wave_size;
+                    if (d < head_dim) acc_final[chunk_i] = s_acc[w][d];
+                }
+                continue;
+            }
+            float m_new = m_final > mw ? m_final : mw;
+            float scale_a = expf(m_final - m_new);
+            float scale_b = expf(mw - m_new);
+            sum_final = sum_final * scale_a + uw * scale_b;
+            for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+                int d = lane_id + chunk_i * wave_size;
+                if (d < head_dim) {
+                    acc_final[chunk_i] = acc_final[chunk_i] * scale_a + s_acc[w][d] * scale_b;
+                }
+            }
+            m_final = m_new;
+        }
+        // Publish the block partial UNNORMALIZED; the merge kernel does the
+        // final LSE combine + normalization.
+        float* pm = partial_m + ((long long)chunk * gridDim.x + batch_idx) * num_heads + h;
+        float* pl = partial_l + ((long long)chunk * gridDim.x + batch_idx) * num_heads + h;
+        float* po = partial_o
+            + (((long long)chunk * gridDim.x + batch_idx) * num_heads + h) * head_dim;
+        if (lane_id == 0) {
+            *pm = m_final;
+            *pl = sum_final;
+        }
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) {
+                po[d] = (sum_final > 0.0f) ? acc_final[chunk_i] : 0.0f;
+            }
+        }
+    }
+}
+
+// LSE merge of the split partials: grid (batch, num_heads), block (256).
+// Each thread owns strided head_dim slices; the m/l scalars are re-read per
+// thread (n_chunks is small, so this stays trivially cached).
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_paged_merge(
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    const float* __restrict__ partial_o,
+    float* __restrict__ out,
+    int num_heads,
+    int head_dim,
+    int n_chunks,
+    int batch
+) {
+    const int batch_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int lane_id = tid % wave_size;
+
+    const long long mh_base = (long long)batch_idx * num_heads + h;
+    const long long po_base = mh_base * head_dim;
+    const long long po_stride = (long long)batch * num_heads * head_dim;
+
+    float m_final = -1e30f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const long long ci = (long long)c * batch * num_heads;
+        if (partial_l[ci + mh_base] > 0.0f && partial_m[ci + mh_base] > m_final) {
+            m_final = partial_m[ci + mh_base];
+        }
+    }
+    float sum_final = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c = 0; c < n_chunks; ++c) {
+        const long long ci = (long long)c * batch * num_heads;
+        float m = partial_m[ci + mh_base];
+        float l = partial_l[ci + mh_base];
+        if (l <= 0.0f) continue;
+        const float scale = expf(m - m_final);
+        sum_final += l * scale;
+        const float* po_c = partial_o + (long long)c * po_stride + po_base;
+        for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+            int d = lane_id + chunk_i * wave_size;
+            if (d < head_dim) {
+                acc[chunk_i] += po_c[d] * scale;
+            }
+        }
+    }
+    float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+    for (int chunk_i = 0; chunk_i < 4; ++chunk_i) {
+        int d = lane_id + chunk_i * wave_size;
+        if (d < head_dim) {
+            out[po_base + d] = acc[chunk_i] * inv_sum;
+        }
+    }
+}
+
+// Phase 3 (KV eviction): map an ABSOLUTE token row to its arena row under a
+// fixed-capacity ring with pinned attention sinks.
+//
+//   rows [0, sink_rows)            -> the first tokens, never evicted
+//   rows [sink_rows, cap_rows)     -> the newest (cap_rows - sink_rows) tokens,
+//                                     overwritten in place
+//
+// The live set is therefore ALWAYS the contiguous range [0, min(t, cap_rows)),
+// which is why the attention kernels only need a capacity clamp and no gather.
+// cap_rows <= 0 means "no cap" (today's grow-with-context behavior).
+//
+// The eager path passes absolute offsets and maps on the host; only the graph
+// kernels need this on-device.
+__device__ inline int grim_kv_ring_row(int t, int cap_rows, int sink_rows) {
+    if (cap_rows <= 0 || t < cap_rows) return t;
+    const int span = cap_rows - sink_rows;
+    if (span <= 0) return t % cap_rows;  // sinks consumed the arena
+    return sink_rows + (t - sink_rows) % span;
+}
+
+// Phase 2 (int8 KV arenas): append-quantize. One block per (slot, step, kv_head)
+// head-vector quantizes `head_dim` f32 values to symmetric int8
+// (q = clamp(round(x/scale), -127, 127), scale = maxabs/127, all-zero row
+// stores scale 1.0 + zero codes) into the codes arena, plus one f32 scale
+// into the scales sidecar. `head_dim` <= 256 (block 256, one thread/elem).
+// Strides are in ELEMENTS of their own buffer.
+extern "C" __global__ void grim_kv_append_i8(
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ codes,
+    float* __restrict__ scales,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,
+    int scale_slot_stride,
+    int cap_rows,
+    int sink_rows) {
+    const int vec = blockIdx.x;  // one head-vector per block
+    const int tid = threadIdx.x;
+    const int vecs_per_slot = steps * nkv_heads;
+    const int total_vecs = batch * vecs_per_slot;
+    if (vec >= total_vecs) return;
+    const int slot = vec / vecs_per_slot;
+    const int rem = vec - slot * vecs_per_slot;
+    const int step = rem / nkv_heads;
+    const int kh = rem - step * nkv_heads;
+    const int past = past_dev[slot];
+    // Phase 3: codes and scales are indexed by the SAME (ring-mapped) token
+    // row — they must never drift apart, or the reader pairs a row's codes
+    // with another row's scale.
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    // Last-writer-wins within a single dispatch: when the ring wraps several
+    // steps onto the same row, only the newest step (largest t that maps to
+    // this row) writes, matching the sequential overwrite order the eager path
+    // uses and avoiding a block-level data race on the same destination bytes.
+    bool _keep = true;
+    for (int _j = step + 1; _j < steps; ++_j)
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) { _keep = false; break; }
+    if (!_keep) return;
+    const long long src_base = ((long long)slot * steps + step) * kv_stride + (long long)kh * head_dim;
+    const long long dst_base = (long long)slot * arena_slot_stride + (long long)abs_row * kv_stride + (long long)kh * head_dim;
+    const long long sc_idx = (long long)slot * scale_slot_stride + (long long)abs_row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    float v = (tid < head_dim) ? k_rot[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    // Cross-wave fold through shared (mirrors grim_qkv_attention), then
+    // broadcast the winning scale: every quantizing thread needs the SAME
+    // denominator, not its wave's partial max.
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    // NOTE: lanes outside wave 0 hold a partial max here; only lane 0's
+    // value is final (contributors tids 0..num_waves-1 all live in wave 0
+    // when num_waves <= wave_size, i.e. block 256 on wave32/wave64).
+    float scale = 1.0f;
+    if (tid == 0) {
+        // Legacy int8 convention (matches `grim_kv_dequant_attention`): the
+        // stored scale is the vector maxabs and codes are fractions of it,
+        // dequant = (code-128)/127*scale. NOT the step size.
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+    if (tid < head_dim) {
+        // Reciprocal of the BROADCAST winning scale (not the thread's
+        // partial mx): every code in the vector shares one denominator.
+        // Codes are fractions of maxabs: q = round(v/scale*127).
+        float inv = (scale > 1e-30f) ? (127.0f / scale) : 0.0f;
+        int q = (int)__builtin_roundf(v * inv);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        // Stored biased by 128 (u8); readers subtract 128 (matches the
+        // legacy int8 dequant convention `(int8-128)/127*scale` with the
+        // sign folded into the byte).
+        codes[dst_base + tid] = (unsigned char)(q + 128);
+    }
+}
+
+// Phase 3 (graph i4 append): the int4 twin of `grim_kv_append_i8`. Same
+// device-side `past` and same ring mapping, so capture bakes no host scalar;
+// the difference is the PACKING. Two codes per byte, low nibble first, biased
+// +7, per-(row, kv_head) amax - bit-for-bit the mapping
+// `grim_kv_quantize_rows_i4` writes, which is what the parity gate pins.
+//
+// codes row stride is `kv_stride / 2` BYTES and a head's is `head_dim / 2`.
+extern "C" __global__ void grim_kv_append_i4(
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ codes,
+    float* __restrict__ scales,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,
+    int scale_slot_stride,
+    int cap_rows,
+    int sink_rows) {
+    const int vec = blockIdx.x;  // one head-vector per block
+    const int tid = threadIdx.x;
+    const int vecs_per_slot = steps * nkv_heads;
+    const int total_vecs = batch * vecs_per_slot;
+    if (vec >= total_vecs) return;
+    const int slot = vec / vecs_per_slot;
+    const int rem = vec - slot * vecs_per_slot;
+    const int step = rem / nkv_heads;
+    const int kh = rem - step * nkv_heads;
+    const int past = past_dev[slot];
+    // Codes and scales MUST land on the same ring-mapped row: a reader pairs
+    // them by row index, so drift pairs one row's codes with another's scale.
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    bool _keep = true;
+    for (int _j = step + 1; _j < steps; ++_j)
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) { _keep = false; break; }
+    if (!_keep) return;
+    const long long src_base = ((long long)slot * steps + step) * kv_stride
+                             + (long long)kh * head_dim;
+    // BYTES: half the element stride, and half the head.
+    const long long dst_base = (long long)slot * arena_slot_stride
+                             + (long long)abs_row * (kv_stride / 2)
+                             + (long long)kh * (head_dim / 2);
+    const long long sc_idx = (long long)slot * scale_slot_stride
+                           + (long long)abs_row * nkv_heads + kh;
+
+    const int wave_size = warpSize;          // 32 on RDNA, 64 on CDNA
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+
+    float v = (tid < head_dim) ? k_rot[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    // `tid < num_waves` zero-fills the unused slots, so the 8-wide fold below
+    // is correct for both wave32 (8 waves at block 256) and wave64 (4 waves).
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        // amax, NOT the step: dequant is (code - 7)/7 * scale, the same
+        // convention `grim_dequant_iN` and the eager quantizer use.
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+
+    int q = 7;
+    if (tid < head_dim) {
+        float inv = (scale > 1e-30f) ? (7.0f / scale) : 0.0f;
+        int val = (int)__builtin_roundf(v * inv);
+        val = val < -7 ? -7 : (val > 7 ? 7 : val);
+        q = val + 7;                       // 0..14; code 15 is unreachable
+    }
+    // Pack adjacent pairs. The partner lane is inside the same head-vector
+    // because head_dim is even (the launcher enforces it), so no lane pairs
+    // across a head boundary.
+    int q_odd = __shfl_xor_sync(0xffffffffffffffffULL, q, 1);
+    if ((tid & 1) == 0 && tid < head_dim) {
+        unsigned char packed = (unsigned char)((q & 0x0f) | ((q_odd & 0x0f) << 4));
+        codes[dst_base + (tid >> 1)] = packed;
+    }
+}
+
+// ── WhiteCrow (u4 group-128) GRAPH-form append ─────────────────────────────
+//
+// Device-side append + quantize for the dense WhiteCrow arena: the int4 twin
+// `grim_kv_append_i4`'s structure (device `past`, ring mapping, duplicate-skip)
+// fused with `grim_kv_quantize_rows_whitecrow`'s EXACT quantizer body, so the
+// graph path emits bit-identical bytes to the eager quantizer (pinned by
+// `whitecrow_graph_append_matches_eager_quantizer`).
+//
+// Differences vs grim_kv_append_i4:
+//   * one block per (slot, step, kv_head, GROUP) of 128 values — WhiteCrow
+//     groups are 128 values, so block = 128 and grid covers
+//     batch * steps * nkv * (head_dim/128).
+//   * NO scales sidecar: the bf16 scale + u8 zero ride inline in each 67-byte
+//     block; `arena_slot_stride` and the row stride are in BYTES.
+extern "C" __global__ void grim_kv_append_whitecrow(
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ dst,   // interleaved 67-byte blocks
+    int kv_stride,                     // elements (nkv * head_dim)
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,             // BYTES per slot arena region
+    int cap_rows,
+    int sink_rows) {
+    const int g = blockIdx.x;          // one 128-value group per block
+    const int groups_per_head = head_dim >> 7; // head_dim / 128
+    if (groups_per_head <= 0) return;
+    const int per_slot = steps * nkv_heads * groups_per_head;
+    const int total = batch * per_slot;
+    if (g >= total) return;
+    const int slot = g / per_slot;
+    const int r = g - slot * per_slot;
+    const int step = r / (nkv_heads * groups_per_head);
+    const int rem = r - step * nkv_heads * groups_per_head;
+    const int kh = rem / groups_per_head;
+    const int gi = rem - kh * groups_per_head;
+    const int past = past_dev[slot];
+    // Same ring mapping + duplicate-skip as grim_kv_append_i4: when the ring
+    // wraps mid-call, a later step lands on the same abs_row as an earlier
+    // one — only the LAST writer may keep it, so a stale earlier quantization
+    // cannot overwrite the newer row.
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    bool _keep = true;
+    for (int _j = step + 1; _j < steps; ++_j)
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) { _keep = false; break; }
+    if (!_keep) return;
+
+    const long long src_base = ((long long)slot * steps + step) * kv_stride
+                             + (long long)kh * head_dim + (long long)gi * 128;
+    // BYTES: a row holds nkv heads x groups_per_head x 67-byte blocks.
+    const long long row_bytes = (long long)nkv_heads * groups_per_head * 67;
+    const long long dst_base = (long long)slot * arena_slot_stride
+                             + (long long)abs_row * row_bytes
+                             + (long long)kh * groups_per_head * 67
+                             + (long long)gi * 67;
+    const int tid = threadIdx.x;        // 0..127, one per value
+
+    float v = k_rot[src_base + tid];
+
+    // Block-wide min/max reduction over the 128 values (identical to the
+    // eager quantizer so the grid is bit-identical).
+    __shared__ float s_min[128];
+    __shared__ float s_max[128];
+    s_min[tid] = v;
+    s_max[tid] = v;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float mn = s_min[0];
+    float mx = s_max[0];
+
+    // Affine grid: scale = (max-min)/15 (bf16-rounded, truncating to match the
+    // host `to_bf16`), zero = round(-min/scale) clamped to [0,15].
+    float d = fmaxf((mx - mn) / 15.0f, 1e-30f);
+    unsigned int dbits = __float_as_uint(d);
+    unsigned short sc16 = (unsigned short)(dbits >> 16);
+    float d_bf16 = __uint_as_float(((unsigned int)sc16) << 16);
+    float zero_f = __builtin_roundf(-mn / d_bf16);
+    zero_f = fminf(fmaxf(zero_f, 0.0f), 15.0f);
+    unsigned char zero = (unsigned char)zero_f;
+
+    // Each value -> a nibble in [0,15].
+    int nib = (int)__builtin_roundf(v / d_bf16) + (int)zero;
+    nib = nib < 0 ? 0 : (nib > 15 ? 15 : nib);
+
+    // Pack adjacent even/odd lanes into one byte (low nibble first), staged in
+    // shared memory so the writer can be ordered before the OR.
+    __shared__ unsigned char s_codes[64];
+    if ((tid & 1) == 0) {
+        s_codes[tid >> 1] = (unsigned char)(nib & 0x0F);
+    }
+    __syncthreads();
+    if ((tid & 1) == 1) {
+        s_codes[tid >> 1] |= (unsigned char)((nib & 0x0F) << 4);
+    }
+    __syncthreads();
+
+    // Emit 64 code bytes + 2 scale bytes (LE bf16) + 1 zero byte.
+    if (tid < 64) {
+        dst[dst_base + tid] = s_codes[tid];
+    } else if (tid == 64) {
+        dst[dst_base + 64] = (unsigned char)(sc16 & 0xFF);
+        dst[dst_base + 65] = (unsigned char)(sc16 >> 8);
+        dst[dst_base + 66] = zero;
+    }
+}
+
 // Item 3 — device-side KV append. Replaces the host-offset `copy_slice_into`:
 // each thread reads `past = past_dev[slot]` ON DEVICE, computes its own destination
 // offset `slot*arena_slot_stride + past*kv_stride + local`, and copies one element.
@@ -1001,7 +2711,9 @@ extern "C" __global__ void grim_kv_append(
     int steps,
     int batch,
     int arena_slot_stride,
-    int f16
+    int f16,
+    int cap_rows,
+    int sink_rows
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int per_slot = steps * kv_stride;
@@ -1010,7 +2722,13 @@ extern "C" __global__ void grim_kv_append(
     const int slot = (batch > 1) ? (tid / per_slot) : 0;
     const int local = tid - slot * per_slot;
     const int past = past_dev[slot];
-    long long off = (long long)slot * arena_slot_stride + past * kv_stride + local;
+    // Phase 3: map the token row through the eviction ring. `local` walks the
+    // whole steps x kv_stride span, so the row advances every kv_stride
+    // elements and the in-row column is the remainder.
+    const int row_local = local / kv_stride;
+    const int col = local - row_local * kv_stride;
+    const int dst_tok = grim_kv_ring_row(past + row_local, cap_rows, sink_rows);
+    long long off = (long long)slot * arena_slot_stride + (long long)dst_tok * kv_stride + col;
     if (f16) {
         // GRAVE Phase 1: arena holds f16 (2-byte) elements at the same
         // element offsets; convert on store.
@@ -1237,7 +2955,8 @@ extern "C" __global__ void grim_qkv_attention_dev(
     int has_alibi,
     int batch,
     int arena_slot_stride,
-    int kv_f16
+    int kv_f16,
+    int cap_rows   // Phase 3 ring capacity in token rows; <= 0 means unlimited
 ) {
     // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
     // P3: blockIdx.z is the batch slot — every slot has its own arena region
@@ -1258,7 +2977,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const int d = lane_id;
     const bool thread_active = d < head_dim;
     if (head_dim > 256) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) out[q_offset + d] = nanf("");
         }
@@ -1273,17 +2992,25 @@ extern "C" __global__ void grim_qkv_attention_dev(
     // so the live KV length during this attention is `total_dev[slot] + steps`.
     // `steps` is a graph-safe constant (1 for decode), so replay N times
     // re-derives the right total from the live per-slot total_dev each time.
-    const int kv_seq_len = total_dev[slot] + steps;
-    // Decode: single query at absolute position (kv_seq_len - 1).
+    int live_rows = total_dev[slot] + steps;
+    // Phase 3: under the eviction ring the arena is a fixed capacity and the
+    // live tokens are the contiguous prefix [0, min(live_rows, cap_rows)) —
+    // sinks plus the newest tokens. Clamping here is the whole read-side
+    // change; no gather is needed. cap_rows <= 0 means unlimited.
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    // Decode: single query at the last live row (all live rows are <= it).
     const int abs_i = kv_seq_len - 1;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
-    const int lo = window_lo;
+    // A window lower bound computed from the ABSOLUTE position can exceed the
+    // live range once tokens have been evicted; clamp so the range is never
+    // inverted (hi < lo).
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
     const int range_len = hi - lo;
     const int base = range_len / num_waves;
     const int rem  = range_len % num_waves;
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
-    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
     const unsigned short* k_head16 = (const unsigned short*)k_tensor;
@@ -1293,7 +3020,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const int kv_stride = num_kv_heads * head_dim;
     float q_reg[8];
     if (thread_active) {
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
         }
@@ -1301,7 +3028,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     for (int j = j_start; j < j_end; ++j) {
         const int kv_idx = lo + j;
         float score = 0.0f;
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) {
                 float kvv = kv_f16
@@ -1324,7 +3051,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
             float scale_a = expf(running_max - mw);
             float scale_b = expf(score - mw);
             running_sum = running_sum * scale_a + scale_b;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < 8; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
                     float vv = kv_f16
@@ -1343,7 +3070,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 8; ++c) {
         int idx = d + c * wave_size;
         if (idx < head_dim) {
             s_acc[wave_id][idx] = out_acc[c];
@@ -1369,9 +3096,9 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
 
     // Each lane reconstructs its strided slice of the normalized attention row.
-    float attn_reg[4];
+    float attn_reg[8];
     #pragma unroll
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 8; ++c) {
         attn_reg[c] = 0.0f;
         int idx = d + c * wave_size;
         if (idx < head_dim) {
@@ -1386,7 +3113,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     }
 
     if (fuse_o == 0) {
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
         }
@@ -1397,7 +3124,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
         // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
         for (int oc = 0; oc < o_dim; ++oc) {
             float partial = 0.0f;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < 8; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
                     partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
@@ -1411,6 +3138,963 @@ extern "C" __global__ void grim_qkv_attention_dev(
             }
         }
     }
+}
+
+
+// int8-KV device-total variant of `grim_qkv_attention_dev` (Phase 2):
+// identical math and capture semantics, K/V rows read as biased-u8
+// codes with f32 per-(slot,row,kv_head) scales. No f16/f32 legs.
+extern "C" __global__ void grim_qkv_attention_dev_i8(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    int scale_slot_stride,
+    int cap_rows   // Phase 3 ring capacity in token rows; <= 0 means unlimited
+) {
+    // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
+    // P3: blockIdx.z is the batch slot — every slot has its own arena region
+    // (`slot * arena_slot_stride`) and its own position scalar (`total_dev[slot]`).
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) out[q_offset + d] = nanf("");
+        }
+        return;
+    }
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+    // Device-driven KV length. `total_dev` holds the per-slot pre-step past
+    // count (bumped by grim_bump_i32 AFTER this attention node), and `steps` is
+    // the number of rows the preceding kv_append node appended IN EACH SLOT —
+    // so the live KV length during this attention is `total_dev[slot] + steps`.
+    // `steps` is a graph-safe constant (1 for decode), so replay N times
+    // re-derives the right total from the live per-slot total_dev each time.
+    int live_rows = total_dev[slot] + steps;
+    // Phase 3: under the eviction ring the arena is a fixed capacity and the
+    // live tokens are the contiguous prefix [0, min(live_rows, cap_rows)) —
+    // sinks plus the newest tokens. Clamping here is the whole read-side
+    // change; no gather is needed. cap_rows <= 0 means unlimited.
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    // Decode: single query at the last live row (all live rows are <= it).
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    // A window lower bound computed from the ABSOLUTE position can exceed the
+    // live range once tokens have been evicted; clamp so the range is never
+    // inverted (hi < lo).
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    // int8-KV variant (Phase 2): codes are biased-u8 (same element layout
+    // as f32 rows, 1 B/elem); scales are f32 per (slot, row, kv_head).
+    const unsigned char* __restrict__ k_u8 = (const unsigned char*)k_tensor;
+    const unsigned char* __restrict__ v_u8 = (const unsigned char*)v_tensor;
+    const int kv_stride = num_kv_heads * head_dim;
+    float q_reg[8];
+    if (thread_active) {
+        for (int c = 0; c < 8; ++c) {
+            int idx = d + c * wave_size;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
+        }
+    }
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = lo + j;
+        float score = 0.0f;
+        for (int c = 0; c < 8; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) {
+                float kvv = ((float)((int)k_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_stride + (long long)kv_head * head_dim + idx] - 128) / 127.0f)
+                    * k_scales[(long long)slot * scale_slot_stride + (long long)kv_idx * num_kv_heads + kv_head];
+                score += q_reg[c] * kvv;
+            }
+        }
+        // Wave-uniform total score (every lane holds the sum).
+        for (int off = wave_size / 2; off > 0; off >>= 1)
+            score += __shfl_xor(score, off);
+        score *= inv_sqrt_d;
+        if (thread_active) {
+            if (softcap > 0.0f) {
+                float t = score / softcap;
+                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+            }
+            if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+            float mw = fmaxf(running_max, score);
+            float scale_a = expf(running_max - mw);
+            float scale_b = expf(score - mw);
+            running_sum = running_sum * scale_a + scale_b;
+            for (int c = 0; c < 8; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    float vv = ((float)((int)v_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_stride + (long long)kv_head * head_dim + idx] - 128) / 127.0f)
+                        * v_scales[(long long)slot * scale_slot_stride + (long long)kv_idx * num_kv_heads + kv_head];
+                    out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+                }
+            }
+            running_max = mw;
+        }
+    }
+    // Publish per-wavefront partials: max/sum are wave-uniform (lane 0 stores
+    // the wave's scalars); acc is per-lane strided. Empty waves keep
+    // running_max = -1e30 and are skipped by the merge (scale 0).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 8; ++c) {
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    // Wave-0 merge of per-wave scalars (same pattern as grim_qkv_attention).
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Each lane reconstructs its strided slice of the normalized attention row.
+    float attn_reg[8];
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        attn_reg[c] = 0.0f;
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+            attn_reg[c] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int c = 0; c < 8; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue: each wave-0 lane owns a strided
+        // slice of head_dim; per output column the lane partial is
+        // butterfly-reduced and lane 0 atomically accumulates into the
+        // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
+// int4-KV device-total variant of `grim_qkv_attention_dev` (Phase 4):
+// 2 codes/byte, biased +7, (code-7)/7*scale; half-width rows.
+extern "C" __global__ void grim_qkv_attention_dev_i4(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    int scale_slot_stride,
+    int cap_rows   // Phase 3 ring capacity in token rows; <= 0 means unlimited
+) {
+    // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
+    // P3: blockIdx.z is the batch slot — every slot has its own arena region
+    // (`slot * arena_slot_stride`) and its own position scalar (`total_dev[slot]`).
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) out[q_offset + d] = nanf("");
+        }
+        return;
+    }
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+    // Device-driven KV length. `total_dev` holds the per-slot pre-step past
+    // count (bumped by grim_bump_i32 AFTER this attention node), and `steps` is
+    // the number of rows the preceding kv_append node appended IN EACH SLOT —
+    // so the live KV length during this attention is `total_dev[slot] + steps`.
+    // `steps` is a graph-safe constant (1 for decode), so replay N times
+    // re-derives the right total from the live per-slot total_dev each time.
+    int live_rows = total_dev[slot] + steps;
+    // Phase 3: under the eviction ring the arena is a fixed capacity and the
+    // live tokens are the contiguous prefix [0, min(live_rows, cap_rows)) —
+    // sinks plus the newest tokens. Clamping here is the whole read-side
+    // change; no gather is needed. cap_rows <= 0 means unlimited.
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    // Decode: single query at the last live row (all live rows are <= it).
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    // A window lower bound computed from the ABSOLUTE position can exceed the
+    // live range once tokens have been evicted; clamp so the range is never
+    // inverted (hi < lo).
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    // int8-KV variant (Phase 2): codes are biased-u8 (same element layout
+    // as f32 rows, 1 B/elem); scales are f32 per (slot, row, kv_head).
+    const unsigned char* __restrict__ k_u8 = (const unsigned char*)k_tensor;
+    const unsigned char* __restrict__ v_u8 = (const unsigned char*)v_tensor;
+    const int kv_byte_stride = num_kv_heads * (head_dim / 2);
+    float q_reg[8];
+    if (thread_active) {
+        for (int c = 0; c < 8; ++c) {
+            int idx = d + c * wave_size;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
+        }
+    }
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = lo + j;
+        float score = 0.0f;
+        for (int c = 0; c < 8; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) {
+                unsigned char _kp = k_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_byte_stride + (long long)kv_head * (head_dim / 2) + (idx >> 1)];
+                int _kc = (idx & 1) ? ((_kp >> 4) & 0x0f) : (_kp & 0x0f);
+                float kvv = ((float)(_kc - 7) / 7.0f)
+                    * k_scales[(long long)slot * scale_slot_stride + (long long)kv_idx * num_kv_heads + kv_head];
+                score += q_reg[c] * kvv;
+            }
+        }
+        // Wave-uniform total score (every lane holds the sum).
+        for (int off = wave_size / 2; off > 0; off >>= 1)
+            score += __shfl_xor(score, off);
+        score *= inv_sqrt_d;
+        if (thread_active) {
+            if (softcap > 0.0f) {
+                float t = score / softcap;
+                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+            }
+            if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+            float mw = fmaxf(running_max, score);
+            float scale_a = expf(running_max - mw);
+            float scale_b = expf(score - mw);
+            running_sum = running_sum * scale_a + scale_b;
+            for (int c = 0; c < 8; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    unsigned char _vp = v_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_byte_stride + (long long)kv_head * (head_dim / 2) + (idx >> 1)];
+                    int _vc = (idx & 1) ? ((_vp >> 4) & 0x0f) : (_vp & 0x0f);
+                    float vv = ((float)(_vc - 7) / 7.0f)
+                        * v_scales[(long long)slot * scale_slot_stride + (long long)kv_idx * num_kv_heads + kv_head];
+                    out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+                }
+            }
+            running_max = mw;
+        }
+    }
+    // Publish per-wavefront partials: max/sum are wave-uniform (lane 0 stores
+    // the wave's scalars); acc is per-lane strided. Empty waves keep
+    // running_max = -1e30 and are skipped by the merge (scale 0).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 8; ++c) {
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    // Wave-0 merge of per-wave scalars (same pattern as grim_qkv_attention).
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Each lane reconstructs its strided slice of the normalized attention row.
+    float attn_reg[8];
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        attn_reg[c] = 0.0f;
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+            attn_reg[c] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int c = 0; c < 8; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue: each wave-0 lane owns a strided
+        // slice of head_dim; per output column the lane partial is
+        // butterfly-reduced and lane 0 atomically accumulates into the
+        // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
+// ── WhiteCrow (u4 group-128) dequant helper ────────────────────────────────
+//
+// Shared by BOTH WhiteCrow kernels below (graph `..._dev_whitecrow` and
+// eager `grim_qkv_attention_whitecrow`), so it MUST precede them in this
+// single translation unit — a definition after the first caller compiles to
+// "use of undeclared identifier" under hiprtc.
+//
+// Dequantize one value from a WhiteCrow head vector.
+//   base: byte address of the (row, kv_head) head's FIRST block
+//   gi:   group index within the head (0..head_dim/128)
+//   pos:  value position within the group (0..127)
+// Block layout (mirrors host `grim_quant::dequant_whitecrow`):
+//   64 B LE u4 nibbles, 2 B LE bf16 scale, 1 B u8 zero.
+//   dq = scale * (nibble - zero), bf16 widened to f32 by top-16-bits shift.
+__device__ inline float grim_dequant_whitecrow(
+    const unsigned char* __restrict__ base,
+    int gi,
+    int pos) {
+    const unsigned char* blk = base + (long long)gi * 67;
+    unsigned char packed = blk[pos >> 1];
+    int nib = (pos & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+    unsigned int lo = (unsigned int)blk[64];
+    unsigned int hi = (unsigned int)blk[65];
+    float sc = __uint_as_float((lo | (hi << 8)) << 16);
+    float z = (float)blk[66];
+    return sc * ((float)nib - z);
+}
+
+// ── WhiteCrow (u4 group-128) GRAPH-form attention ─────────────────────────
+//
+// Graph-capture sibling of `grim_qkv_attention_whitecrow`, structured like
+// `grim_qkv_attention_dev_i4`: device-driven KV length (`total_dev[slot] +
+// steps`), per-slot arenas (`slot * arena_slot_stride`, in BYTES), Phase-3
+// eviction ring (`cap_rows`), and the decode single-query-at-last-live-row
+// range. Differences vs the i4 graph kernel:
+//   * K/V are interleaved 67-byte WhiteCrow blocks (64 B LE u4 nibbles +
+//     2 B LE bf16 scale + 1 B u8 zero) — the scale is INLINE, so there are
+//     NO k_scales/v_scales/scale_slot_stride parameters at all.
+//   * decode via `grim_dequant_whitecrow` (same helper as the eager kernel,
+//     so eager and graph forms of WhiteCrow decode IDENTICALLY).
+//   * softcap uses tanhf (the eager family's correct Gemma-2 cap), not the
+//     graph family's softplus — softplus is identity for positive logits and
+//     caps nothing; keeping tanhf here means both WhiteCrow forms agree.
+// head_dim must be a multiple of 128 (groups align to head vectors) and
+// <= 256; anything else writes NaN (caught by the launcher check).
+extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,   // BYTES per slot arena region
+    int cap_rows             // ring capacity in token rows; <= 0 = unlimited
+) {
+    // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256 || head_dim % 128 != 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) out[q_offset + d] = nanf("");
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+    // Device-driven KV length (see grim_qkv_attention_dev_i4): live rows are
+    // `total_dev[slot] + steps`, clamped to the eviction ring's capacity —
+    // the contiguous prefix [0, min(live, cap_rows)).
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // WhiteCrow geometry: each (row, kv_head) head vector owns
+    // (head_dim/128)*67 bytes at block g = row*nkv*gph + kh*gph + gi.
+    // Slot arenas are byte-addressed (`arena_slot_stride` in bytes).
+    const int blocks_per_head = head_dim >> 7;
+    const int kv_stride_bytes = num_kv_heads * blocks_per_head * 67;
+    const long long slot_base = (long long)slot * arena_slot_stride;
+    const long long head_off = (long long)kv_head * blocks_per_head * 67;
+
+    // Q·K via the hardware u4 dot (same helper pair as the eager kernel, so
+    // eager and graph WhiteCrow agree by construction).
+    const GrimWcQLane qlane = grim_whitecrow_quant_q_lane(q, q_offset, head_dim, lane_id);
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = lo + j;
+        const long long row_base = slot_base + (long long)kv_idx * kv_stride_bytes + head_off;
+        // Wave-uniform total score (every lane holds the sum).
+        float score = grim_whitecrow_qk_dot(k_tensor + head_off, row_base - head_off,
+                                            qlane, lane_id, wave_size)
+            * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+        const float mw = fmaxf(running_max, score);
+        const float scale_a = expf(running_max - mw);
+        const float scale_b = expf(score - mw);
+        running_sum = running_sum * scale_a + scale_b;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) {
+                float vv = grim_dequant_whitecrow(v_tensor + row_base, idx >> 7, idx & 127);
+                out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+            }
+        }
+        running_max = mw;
+    }
+    // Publish per-wavefront partials (same protocol as dev_i4).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        attn_reg[c] = 0.0f;
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+            attn_reg[c] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue (identical to dev_i4).
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                int idx = lane_id + c * wave_size;
+                if (idx < head_dim) {
+                    partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
+// ── Token-parallel (flash-decoding) split of the GRAPH WhiteCrow kernel ────
+//
+// `grim_qkv_attention_dev_whitecrow` serial-loops the whole live KV range in
+// one block per (query, head, slot) — the same bottleneck the paged split
+// removed (measured 3-154x there). This pair is the graph-capturable split:
+//
+//   * FIXED grid (seq_len, num_heads, batch*max_chunks) — nothing shape-
+//     dynamic is baked at capture except what the serial kernel already bakes.
+//   * The live chunk count is DERIVED ON DEVICE from total_dev[slot]+steps
+//     and the ring cap, so replays pick up growing contexts with no recapture.
+//   * Blocks whose chunk is beyond the live range STILL write their partial
+//     (l=0) — partials are never zeroed between replays, so every slot must
+//     be rewritten every replay for the merge to see fresh state.
+//
+// Partials layout (f32 scratch, per (slot,chunk), sized max_chunks):
+//   pm/pl: [slot*max_chunks+chunk][seq_len][num_heads]
+//   po:    [slot*max_chunks+chunk][seq_len][num_heads][head_dim]
+extern "C" __global__ void grim_qkv_attention_dev_whitecrow_split(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    float* __restrict__ partial_o,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,   // BYTES per slot arena region
+    int cap_rows,            // ring capacity in token rows; <= 0 = unlimited
+    int chunk_len,           // tokens per chunk (> 0)
+    int max_chunks           // fixed grid z extent per slot
+) {
+    const int slot = blockIdx.z / max_chunks;
+    const int chunk = blockIdx.z % max_chunks;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256 || head_dim % 128 != 0) {
+        // Mirror the serial kernel's fail-loud shape contract; the split
+        // partials would be garbage, so poison them for the merge to see.
+        const long long z = (long long)slot * max_chunks + chunk;
+        float* pmz = partial_m + (z * seq_len + i) * num_heads + h;
+        float* plz = partial_l + (z * seq_len + i) * num_heads + h;
+        if (lane_id == 0) { *pmz = nanf(""); *plz = 0.0f; }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    int n_live_chunks = (kv_seq_len + chunk_len - 1) / chunk_len;
+    if (n_live_chunks < 1) n_live_chunks = 1;
+    const int abs_i = kv_seq_len - 1;
+
+    const long long z = (long long)slot * max_chunks + chunk;
+    float* pmz = partial_m + (z * seq_len + i) * num_heads + h;
+    float* plz = partial_l + (z * seq_len + i) * num_heads + h;
+    float* poz = partial_o + ((z * seq_len + i) * num_heads + h) * head_dim;
+
+    // Dead chunk (beyond the live range): publish an EMPTY partial. l=0 is
+    // the merge's skip marker; po must still be rewritten because the buffer
+    // carries the previous replay's values.
+    if (chunk >= n_live_chunks) {
+        if (lane_id == 0) { *pmz = -1e30f; *plz = 0.0f; }
+        for (int c = 0; c < 8; ++c) {
+            int d = lane_id + c * wave_size;
+            if (d < head_dim) poz[d] = 0.0f;
+        }
+        return;
+    }
+
+    // This chunk's token range [c_lo, c_hi), clipped to the causal window.
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    int c_lo = chunk * chunk_len;
+    int c_hi = c_lo + chunk_len;
+    if (c_lo < lo) c_lo = lo;
+    if (c_hi > hi) c_hi = hi;
+    const int range_len = c_hi > c_lo ? c_hi - c_lo : 0;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = c_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int blocks_per_head = head_dim >> 7;
+    const int kv_stride_bytes = num_kv_heads * blocks_per_head * 67;
+    const long long slot_base = (long long)slot * arena_slot_stride;
+    const long long head_off = (long long)kv_head * blocks_per_head * 67;
+
+    const GrimWcQLane qlane = grim_whitecrow_quant_q_lane(q, q_offset, head_dim, lane_id);
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = j;
+        const long long row_base = slot_base + (long long)kv_idx * kv_stride_bytes + head_off;
+        float score = grim_whitecrow_qk_dot(k_tensor + head_off, row_base - head_off,
+                                            qlane, lane_id, wave_size)
+            * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+        const float mw = fmaxf(running_max, score);
+        const float scale_a = expf(running_max - mw);
+        const float scale_b = expf(score - mw);
+        running_sum = running_sum * scale_a + scale_b;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * wave_size;
+            if (idx < head_dim) {
+                float vv = grim_dequant_whitecrow(v_tensor + row_base, idx >> 7, idx & 127);
+                out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+            }
+        }
+        running_max = mw;
+    }
+
+    // Cross-wave merge within the block (same protocol as the serial kernel).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+
+    // Reconstruct the UNNORMALIZED wave-0 accumulator, then absorb the other
+    // waves with their LSE scales (identical algebra to the serial kernel's
+    // attn_reg reconstruction, minus the final normalization — the merge
+    // kernel owns that).
+    float part[8];
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        part[c] = 0.0f;
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                part[c] += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+        }
+    }
+    if (lane_id == 0) { *pmz = m_final; *plz = sum_final; }
+    for (int c = 0; c < 8; ++c) {
+        int idx = lane_id + c * wave_size;
+        if (idx < head_dim) {
+            poz[idx] = part[c];
+        }
+    }
+}
+
+// LSE merge of the split partials: grid (seq_len, num_heads, batch). The
+// live chunk count is derived on device from total_dev[slot]+steps and the
+// ring cap, exactly as in the split kernel, so the pair stays consistent
+// across replays with no host involvement. The tail (out, fuse_o epilogue)
+// mirrors `grim_qkv_attention_dev_whitecrow` exactly — including its
+// behavior of NEVER writing out_max/out_sum (those params are dropped here;
+// the buffers they name are sized [num_heads] and the serial kernel leaves
+// them untouched too).
+extern "C" __global__ void grim_qkv_attention_dev_whitecrow_merge(
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    const float* __restrict__ partial_o,
+    float* __restrict__ out,
+    int num_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    int batch,
+    int cap_rows,
+    int chunk_len,
+    int max_chunks
+) {
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int lane_id = tid % wave_size;
+
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    int n_live_chunks = (kv_seq_len + chunk_len - 1) / chunk_len;
+    if (n_live_chunks < 1) n_live_chunks = 1;
+
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+
+    float m_final = -1e30f;
+    for (int c = 0; c < n_live_chunks; ++c) {
+        const long long z = (long long)slot * max_chunks + c;
+        const float* pmc = partial_m + (z * seq_len + i) * num_heads + h;
+        const float* plc = partial_l + (z * seq_len + i) * num_heads + h;
+        if (*plc > 0.0f && *pmc > m_final) m_final = *pmc;
+    }
+    float sum_final = 0.0f;
+    float part[8];
+    #pragma unroll
+    for (int c8 = 0; c8 < 8; ++c8) part[c8] = 0.0f;
+    for (int c = 0; c < n_live_chunks; ++c) {
+        const long long z = (long long)slot * max_chunks + c;
+        const float* pmc = partial_m + (z * seq_len + i) * num_heads + h;
+        const float* plc = partial_l + (z * seq_len + i) * num_heads + h;
+        const float m = *pmc;
+        const float l = *plc;
+        if (l <= 0.0f) continue;
+        const float scale = expf(m - m_final);
+        sum_final += l * scale;
+        const float* poc = partial_o + ((z * seq_len + i) * num_heads + h) * head_dim;
+        #pragma unroll
+        for (int c8 = 0; c8 < 8; ++c8) {
+            int d = lane_id + c8 * wave_size;
+            if (d < head_dim) {
+                part[c8] += poc[d] * scale;
+            }
+        }
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int c8 = 0; c8 < 8; ++c8) attn_reg[c8] = part[c8] * inv_sum;
+
+    if (fuse_o == 0) {
+        for (int c8 = 0; c8 < 8; ++c8) {
+            int d = lane_id + c8 * wave_size;
+            if (d < head_dim) out[q_offset + d] = attn_reg[c8];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue (identical to the serial kernel).
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c8 = 0; c8 < 8; ++c8) {
+                int d = lane_id + c8 * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[c8] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
+// D1: clamp a per-layer KV total to the eviction ring's capacity. The eager
+// path resets `current_pos` to the retained count at the boundary (the host
+// CurDKV pass), which keeps the ring's absolute row sequence at
+// 0,1,..,cap-1,cap,cap,.. — the graph reproduces that with this node right
+// after the bump. `cap <= 0` (no ring) is the identity.
+extern "C" __global__ void grim_kv_clamp_total(
+    int* __restrict__ total_dev,
+    int cap
+) {
+    if (cap <= 0) return;
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (total_dev[slot] > cap) total_dev[slot] = cap;
 }
 
 // P3: per-slot position bump. Grid (batch,1,1)/(1,1,1) — thread b bumps
@@ -1452,6 +4136,69 @@ extern "C" __global__ void grim_scythe_write_slot(
         *(unsigned long long*)(slot + 24) = weight_ptr;
         *(unsigned long long*)(slot + 32) = output_ptr;
         *(unsigned long long*)(slot + 40) = peer_ptr;
+        *(unsigned int*)(slot + 48) = 0u; // ST_PENDING
+        __threadfence();
+    }
+}
+
+// Event-Tensor on-device successor enqueue (Task M5 Step 3):
+// Dynamically binds a device-resident MoETaskDescriptor with computed routing pointers
+// and writes the ScytheRing slot and advances head on-device without host round-trip.
+extern "C" __global__ void grim_scythe_enqueue_dynamic_moe(
+    unsigned char* __restrict__ slots_base,
+    unsigned int capacity,
+    unsigned int* __restrict__ head_dev,
+    unsigned char* __restrict__ desc_staging, // device memory holding MoETaskDescriptor
+    unsigned int hidden,
+    unsigned int inter,
+    unsigned int num_tokens,
+    unsigned int block_size,
+    unsigned int num_experts,
+    unsigned int top_k,
+    unsigned int quant_mode,
+    float routed_scaling_factor,
+    unsigned long long gate_w_ptr,
+    unsigned long long up_w_ptr,
+    unsigned long long down_w_ptr,
+    unsigned long long token_ids_ptr,
+    unsigned long long expert_ids_ptr,
+    unsigned long long weights_ptr,
+    unsigned long long input_ptr,
+    unsigned long long output_ptr
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // 1. Fill the device-side MoETaskDescriptor (96 bytes)
+        *(unsigned int*)(desc_staging + 0)  = hidden;
+        *(unsigned int*)(desc_staging + 4)  = inter;
+        *(unsigned int*)(desc_staging + 8)  = num_tokens;
+        *(unsigned int*)(desc_staging + 12) = block_size;
+        *(unsigned int*)(desc_staging + 16) = num_experts;
+        *(unsigned int*)(desc_staging + 20) = top_k;
+        *(unsigned int*)(desc_staging + 24) = quant_mode;
+        *(float*)(desc_staging + 28)        = routed_scaling_factor;
+        *(unsigned long long*)(desc_staging + 32) = gate_w_ptr;
+        *(unsigned long long*)(desc_staging + 40) = up_w_ptr;
+        *(unsigned long long*)(desc_staging + 48) = down_w_ptr;
+        *(unsigned long long*)(desc_staging + 56) = token_ids_ptr;
+        *(unsigned long long*)(desc_staging + 64) = expert_ids_ptr;
+        *(unsigned long long*)(desc_staging + 72) = weights_ptr;
+
+        // 2. Atomically claim slot via head_dev
+        unsigned int head = atomicAdd(head_dev, 1u);
+        unsigned int slot_idx = head & (capacity - 1u);
+
+        // 3. Write task descriptor into ring slot
+        unsigned char* slot = slots_base + (unsigned long long)slot_idx * 64ull;
+        *(unsigned int*)(slot + 0)  = 6u; // OP_MOE
+        *(unsigned int*)(slot + 4)  = num_tokens;
+        *(unsigned int*)(slot + 8)  = num_experts;
+        *(unsigned int*)(slot + 12) = top_k;
+        *(unsigned long long*)(slot + 16) = input_ptr;
+        *(unsigned long long*)(slot + 24) = (unsigned long long)desc_staging;
+        *(unsigned long long*)(slot + 32) = output_ptr;
+        *(unsigned long long*)(slot + 40) = 0ull;
+        *(unsigned int*)(slot + 48) = 0u; // ST_PENDING
+        __threadfence();
     }
 }
 
@@ -1464,6 +4211,755 @@ extern "C" __global__ void grim_scythe_publish_head(
 ) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *head_dev = head_value;
+        // FENCE, and it is load-bearing.
+        //
+        // The head counter is read by the ring's wave, which runs on ANOTHER
+        // stream — often another CU. A global store without a fence can stay in
+        // the publisher's L1, and the wave's read (a device-scope atomic, which
+        // bypasses L1) then sees the OLD head and finds no work: the node is
+        // silently never drained.
+        //
+        // The host-side synchronisation that used to follow this launch was
+        // masking it (a stream sync flushes the publisher's caches). With the
+        // publish no longer synchronised, the fence IS the ordering.
+        __threadfence();
+    }
+}
+
+// Phase 2 (eager int8 append): quantize explicit f32 rows to biased-u8 codes
+// + f32 per-head scales at explicit destination offsets (host-computed, like
+// `copy_slice_range`). One block per (row, kv_head) head-vector; block 256.
+extern "C" __global__ void grim_kv_quantize_rows_i8(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ codes,
+    int codes_off,
+    float* __restrict__ scales,
+    int scales_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int vec = blockIdx.x;  // one head-vector per block
+    const int tid = threadIdx.x;
+    const int vecs = n_rows * nkv_heads;
+    if (vec >= vecs) return;
+    const int row = vec / nkv_heads;
+    const int kh = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    const long long dst_base = (long long)codes_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    const long long sc_idx = (long long)scales_off + (long long)row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    float v = (tid < head_dim) ? src[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        // Legacy int8 convention (matches `grim_kv_dequant_attention`): the
+        // stored scale is the vector maxabs and codes are fractions of it,
+        // dequant = (code-128)/127*scale. NOT the step size.
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+    if (tid < head_dim) {
+        // Reciprocal of the BROADCAST winning scale (not the thread's
+        // partial mx): every code in the vector shares one denominator.
+        // Codes are fractions of maxabs: q = round(v/scale*127).
+        float inv = (scale > 1e-30f) ? (127.0f / scale) : 0.0f;
+        int q = (int)__builtin_roundf(v * inv);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        codes[dst_base + tid] = (unsigned char)(q + 128);
+    }
+}
+
+// Phase 3 (eager int4 append): quantize explicit f32 rows to packed u4 nibbles
+// (2 values per byte, low nibble first, biased by +7) + f32 per-head scales.
+// One block per (row, kv_head) head-vector; block 256.
+extern "C" __global__ void grim_kv_quantize_rows_i4(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ codes,
+    int codes_off,
+    float* __restrict__ scales,
+    int scales_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int vec = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int vecs = n_rows * nkv_heads;
+    if (vec >= vecs) return;
+    const int row = vec / nkv_heads;
+    const int kh = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    // codes row stride in bytes is kv_stride / 2. Head offset is kh * head_dim / 2.
+    const long long dst_base = (long long)codes_off + (long long)row * (kv_stride / 2) + (long long)kh * (head_dim / 2);
+    const long long sc_idx = (long long)scales_off + (long long)row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+
+    float v = (tid < head_dim) ? src[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+
+    // Quantize to [-7, +7] -> [0, 14]
+    int q = 7;
+    if (tid < head_dim) {
+        float inv = (scale > 1e-30f) ? (7.0f / scale) : 0.0f;
+        int val = (int)__builtin_roundf(v * inv);
+        val = val < -7 ? -7 : (val > 7 ? 7 : val);
+        q = val + 7;
+    }
+
+    // Pack adjacent pairs (even/odd lane) into single bytes
+    // Only even lanes write to codes buffer
+    int q_odd = __shfl_xor_sync(0xffffffffffffffffULL, q, 1);
+    if ((tid & 1) == 0 && tid < head_dim) {
+        unsigned char packed = (unsigned char)((q & 0x0f) | ((q_odd & 0x0f) << 4));
+        codes[dst_base + (tid >> 1)] = packed;
+    }
+}
+
+// ── WhiteCrow (u4 group-128 OSTQuant) dense-arena quantizer ────────────────
+//
+// Mirrors `grim_quant::quant_whitecrow` EXACTLY (including its truncating
+// bf16 conversion) so the device bytes are bit-identical to the host encoder:
+// one 67-byte block per 128-value group of a head vector — 64 B u4 nibbles
+// (low nibble first) + 2 B little-endian bf16 scale + 1 B u8 zero — decoded as
+// `scale * (nibble - zero)`. Requires `head_dim % 128 == 0` so groups align to
+// head-vector starts (the production Qwen head_dim = 128 case: one group per
+// head). No f32 scale sidecar: the scale/zero ride inline.
+extern "C" __global__ void grim_kv_quantize_rows_whitecrow(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ dst,   // interleaved 67-byte blocks
+    int dst_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int g = blockIdx.x;                 // group index over the appended block
+    const int groups_per_head = head_dim >> 7; // head_dim / 128
+    if (groups_per_head <= 0) return;
+    const int total_groups = n_rows * nkv_heads * groups_per_head;
+    if (g >= total_groups) return;
+    const int vec = g / groups_per_head;       // (row, kv_head) head vector
+    const int gi  = g - vec * groups_per_head; // which group within the head
+    const int row = vec / nkv_heads;
+    const int kh  = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride
+                             + (long long)kh * head_dim + (long long)gi * 128;
+    const long long dst_base = (long long)dst_off + (long long)g * 67;
+    const int tid = threadIdx.x;               // 0..127, one per value
+
+    float v = src[src_base + tid];
+
+    // Block-wide min/max reduction over the 128 values.
+    __shared__ float s_min[128];
+    __shared__ float s_max[128];
+    s_min[tid] = v;
+    s_max[tid] = v;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float mn = s_min[0];
+    float mx = s_max[0];
+
+    // Affine grid: scale = (max-min)/15 (bf16-rounded, truncating to match the
+    // host `to_bf16`), zero = round(-min/scale) clamped to [0,15].
+    float d = fmaxf((mx - mn) / 15.0f, 1e-30f);
+    unsigned int dbits = __float_as_uint(d);
+    unsigned short sc16 = (unsigned short)(dbits >> 16);
+    float d_bf16 = __uint_as_float(((unsigned int)sc16) << 16);
+    float zero_f = __builtin_roundf(-mn / d_bf16);
+    zero_f = fminf(fmaxf(zero_f, 0.0f), 15.0f);
+    unsigned char zero = (unsigned char)zero_f;
+
+    // Each value -> a nibble in [0,15].
+    int nib = (int)__builtin_roundf(v / d_bf16) + (int)zero;
+    nib = nib < 0 ? 0 : (nib > 15 ? 15 : nib);
+
+    // Pack adjacent even/odd lanes into one byte (low nibble first), staged in
+    // shared memory so the writer can be ordered before the OR.
+    __shared__ unsigned char s_codes[64];
+    if ((tid & 1) == 0) {
+        s_codes[tid >> 1] = (unsigned char)(nib & 0x0F);
+    }
+    __syncthreads();
+    if ((tid & 1) == 1) {
+        s_codes[tid >> 1] |= (unsigned char)((nib & 0x0F) << 4);
+    }
+    __syncthreads();
+
+    // Emit 64 code bytes + 2 scale bytes (LE bf16) + 1 zero byte.
+    if (tid < 64) {
+        dst[dst_base + tid] = s_codes[tid];
+    } else if (tid == 64) {
+        dst[dst_base + 64] = (unsigned char)(sc16 & 0xFF);
+        dst[dst_base + 65] = (unsigned char)(sc16 >> 8);
+        dst[dst_base + 66] = zero;
+    }
+}
+
+// ── WhiteCrow (u4 group-128) dense-arena attention ─────────────────────────
+//
+// Eager sibling of `grim_qkv_attention_i4kv`: same wave-parallel softmax and
+// the same tanhf softcap, but the K/V sides decode INTERLEAVED 67-byte
+// WhiteCrow blocks inline — 64 B LE u4 nibbles + 2 B LE bf16 scale + 1 B u8
+// zero point (see `grim_kv_quantize_rows_whitecrow` above) — so there is no
+// scale sidecar and no separate codes buffer. Value decode mirrors the host
+// `grim_quant::dequant_whitecrow` via `grim_dequant_whitecrow` (defined
+// above the graph kernel, which is the first WhiteCrow kernel in this
+// translation unit that calls it).
+// head_dim must be a multiple of 128 (groups align to head vectors) and
+// <= 256; anything else writes NaN and returns (caught by the launcher check
+// and visible in any output rather than silently misreading bytes).
+
+extern "C" __global__ void grim_qkv_attention_whitecrow(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256 || head_dim % 128 != 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // WhiteCrow row stride: every (row, kv_head) head vector owns
+    // (head_dim/128) * 67 bytes, interleaved head-major (block
+    // g = row*nkv*gph + kh*gph + gi at byte g*67).
+    const int blocks_per_head = head_dim >> 7;
+    const long long kv_stride_bytes = (long long)num_kv_heads * blocks_per_head * 67;
+    const long long head_bytes = (long long)kv_head * blocks_per_head * 67;
+    const unsigned char* __restrict__ k_head = k_tensor + head_bytes;
+    const unsigned char* __restrict__ v_head = v_tensor + head_bytes;
+
+    // Q·K via the hardware u4 dot: quantize Q once per (i,h) block, then each
+    // token costs one sudot8 per word instead of a per-value dequant FMA.
+    const GrimWcQLane qlane = grim_whitecrow_quant_q_lane(q, q_offset, head_dim, lane_id);
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        const long long row_base = (long long)j * kv_stride_bytes;
+        float score = grim_whitecrow_qk_dot(k_head, row_base, qlane, lane_id, wave_size)
+            * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_dq = grim_dequant_whitecrow(v_head + row_base, d >> 7, d & 127);
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+// ── WS-3A (K2V4): asymmetric 2-bit KEY / 4-bit VALUE dense arena ──────────
+//
+// The int4 kernels hardcode 2 codes/byte and `(code - 7) / 7`. K2V4 needs a
+// different width on each side, so the width is a RUNTIME parameter here and
+// the packing stride follows from it. `k_bits`/`v_bits` are uniform across the
+// launch, so the branches below are not divergence.
+
+// Dequantize one element of a packed signed code row.
+//   bits == 2 -> 4 codes/byte, levels [-1, +1] stored biased +1
+//   bits == 4 -> 2 codes/byte, levels [-7, +7] stored biased +7
+__device__ inline float grim_dequant_iN(
+    const unsigned char* __restrict__ base,
+    long long row_bytes,
+    int d,
+    int bits,
+    float sc) {
+    if (bits == 2) {
+        unsigned char packed = base[row_bytes + (d >> 2)];
+        int code = (packed >> ((d & 3) * 2)) & 0x03;
+        return ((float)(code - 1)) * sc;
+    }
+    unsigned char packed = base[row_bytes + (d >> 1)];
+    int code = (d & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+    return ((float)(code - 7) / 7.0f) * sc;
+}
+
+// Bytes per element for a packed signed code of `bits` width.
+__device__ inline int grim_bytes_per_elem_iN(int bits) { return bits / 8; }
+
+// WS-3A: 2-bit KEY quantizer. Same per-(row, kv_head) amax scheme as the i4
+// quantizer, but 3 used levels (signed [-1, +1], biased +1) packed FOUR codes
+// per byte, lowest 2 bits first. head_dim must be a multiple of 4.
+extern "C" __global__ void grim_kv_quantize_rows_i2(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ codes,
+    int codes_off,
+    float* __restrict__ scales,
+    int scales_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int vec = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int vecs = n_rows * nkv_heads;
+    if (vec >= vecs) return;
+    const int row = vec / nkv_heads;
+    const int kh = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    // 2-bit codes: row stride is kv_stride / 4 bytes, head offset kh * head_dim / 4.
+    const long long dst_base = (long long)codes_off + (long long)row * (kv_stride / 4) + (long long)kh * (head_dim / 4);
+    const long long sc_idx = (long long)scales_off + (long long)row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+
+    float v = (tid < head_dim) ? src[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max2[8];
+    __shared__ float s_scale2;
+    if (lane_id == 0) s_max2[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max2[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale2 = scale;
+    }
+    __syncthreads();
+    scale = s_scale2;
+
+    // Quantize to [-1, +1] -> [0, 2]; stored biased +1 so the reader is a plain
+    // (code - 1) * scale, the 2-bit analogue of the i4 convention.
+    int q = 1;
+    if (tid < head_dim) {
+        float inv = (scale > 1e-30f) ? (1.0f / scale) : 0.0f;
+        int val = (int)__builtin_roundf(v * inv);
+        val = val < -1 ? -1 : (val > 1 ? 1 : val);
+        q = val + 1;
+    }
+
+    // Pack FOUR adjacent lanes into one byte, lowest 2 bits first.
+    const unsigned long long m = 0xffffffffffffffffULL;
+    int q1 = __shfl_xor_sync(m, q, 1);
+    int q2 = __shfl_xor_sync(m, q, 2);
+    int q3 = __shfl_xor_sync(m, q1, 2);
+    if ((tid & 3) == 0 && tid < head_dim) {
+        unsigned char packed = (unsigned char)((q & 0x03) | ((q1 & 0x03) << 2) | ((q2 & 0x03) << 4) | ((q3 & 0x03) << 6));
+        codes[dst_base + (tid >> 2)] = packed;
+    }
+}
+
+// WS-3A: dense-arena attention over a MIXED-WIDTH packed KV row. Same body as
+// `grim_qkv_attention_i4kv` with the K side generalized to `k_bits`; with
+// k_bits == v_bits == 4 it must reproduce that kernel bit for bit, which is
+// what the parity gate pins.
+extern "C" __global__ void grim_qkv_attention_ixkv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int k_bits,
+    int v_bits
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Packed storage: the K and V sides may use DIFFERENT widths, so each side
+    // carries its own row stride and head offset.
+    const int k_elems_per_byte = (k_bits == 2) ? 4 : 2;
+    const int v_elems_per_byte = (v_bits == 2) ? 4 : 2;
+    const int k_stride_bytes = (num_kv_heads * head_dim) / k_elems_per_byte;
+    const int v_stride_bytes = (num_kv_heads * head_dim) / v_elems_per_byte;
+    const int k_head_bytes = (kv_head * head_dim) / k_elems_per_byte;
+    const int v_head_bytes = (kv_head * head_dim) / v_elems_per_byte;
+    const unsigned char* __restrict__ k_bytes = k_tensor + k_head_bytes;
+    const unsigned char* __restrict__ v_bytes = v_tensor + v_head_bytes;
+
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float partial = 0.0f;
+        const long long k_row_bytes = (long long)j * k_stride_bytes;
+        const float k_sc = k_scales[(long long)j * num_kv_heads + kv_head];
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                float k_dq = grim_dequant_iN(k_bytes, k_row_bytes, dd, k_bits, k_sc);
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        const float v_sc = v_scales[(long long)j * num_kv_heads + kv_head];
+        const long long v_row_bytes = (long long)j * v_stride_bytes;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_dq = grim_dequant_iN(v_bytes, v_row_bytes, d, v_bits, v_sc);
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
     }
 }
 "#;
@@ -1843,8 +5339,12 @@ pub enum KvCacheQuantFormat {
     NutFp4 = 8,
     /// WhiteCrow: RDNA 3/4 native unsigned 4-bit group-128 OSTQuant layout
     /// (discriminant matches `grim_tensor::PagedKvQuantFormat::WhiteCrow`).
-    /// The paged-attention kernel has no WhiteCrow decode leg yet, so the
-    /// launcher refuses it loudly rather than misreading packed pages.
+    ///
+    /// 67 bytes per 128 values: 64 B u4 codes + 2 B bf16 scale + 1 B u8 zero,
+    /// decoded on device by the `quant_format == 9` arm of
+    /// `dequant_kv_element` as `scale * (nibble - zero)`. Like `NutFp4`, the
+    /// scale travels inline in the buffer, so the caller's per-tensor
+    /// `k_scale`/`v_scale` is ignored.
     WhiteCrow = 9,
 }
 
@@ -1867,12 +5367,13 @@ impl KvCacheQuantFormat {
             // Per-32 microscale groups with one inline E8M0 scale byte.
             Self::MxFp4 | Self::MxFp8 => (num_values + 31) / 32,
             Self::Int8 | Self::Int4 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp4E2M1 => 0,
-            // WhiteCrow: per 128 values - 64 B codes + 2 B scale + 1 B zero
-            // (the codes ride u32 words, so the arithmetic below collapses to
-            // num_values/2 + num_values/128*2 + num_values/128).
-            Self::WhiteCrow => (num_values + 127) / 128,
+            // WhiteCrow: per 128 values - 64 B codes + 2 B scale + 1 B zero = 67 bytes.
+            Self::WhiteCrow => (num_values + 127) / 128 * 3,
         };
-        let payload = (num_values * bits).div_ceil(8);
+        let payload = match self {
+            Self::WhiteCrow => ((num_values + 127) / 128) * 64,
+            _ => (num_values * bits).div_ceil(8),
+        };
         payload + groups
     }
 
@@ -1986,17 +5487,6 @@ pub fn launch_paged_attention_quant(
     let mut co = cache_offset as i32;
     let mut isd = inv_sqrt_d;
     let mut wl = window_lo;
-    // WhiteCrow pages have no kernel decode leg yet (the format exists so
-    // grim-memory's packed-pool producer can round-trip through the neutral
-    // enum). Refuse loudly: a silent fallthrough would make the kernel read
-    // OSTQuant u4 group-128 pages as whichever dense layout shares the
-    // discriminant - finite, plausible, wrong attention.
-    if quant_format == KvCacheQuantFormat::WhiteCrow {
-        return Err(crate::Error::Backend(
-            "launch_paged_attention_quant: WhiteCrow KV pages have no kernel decode leg yet; \
-             run with GRIM_PACKED_POOL=0 (dense KV) until the WhiteCrow leg lands".into(),
-        ));
-    }
     let mut qf = quant_format as i32;
     let mut ks = k_scale;
     let mut kb = k_bias;
@@ -2027,6 +5517,146 @@ pub fn launch_paged_attention_quant(
             arg(&mut kb),
             arg(&mut vs),
             arg(&mut vb),
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Token-parallel (flash-decoding) split of [`launch_paged_attention_quant`]:
+/// two launches — `grim_qkv_attention_paged_quant_split` writes per-chunk
+/// online-softmax partials into caller-provided device scratch, then
+/// `grim_qkv_attention_paged_merge` LSE-combines and normalizes into `out`.
+///
+/// `chunk_len` is tokens per chunk; `n_chunks` is computed here from the same
+/// host-visible causal window the kernel clamps to, so empty chunks never
+/// occur (the merge still skips l==0 defensively). Partials must be sized:
+/// `pm`/`pl` = n_chunks*batch*num_heads f32, `po` = n_chunks*batch*num_heads*head_dim f32.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attention_quant_split(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    block_tables: &dyn BackendStorage,
+    k_pages: &dyn BackendStorage,
+    v_pages: &dyn BackendStorage,
+    partial_m: &dyn BackendStorage,
+    partial_l: &dyn BackendStorage,
+    partial_o: &dyn BackendStorage,
+    out: &mut dyn BackendStorage,
+    batch: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    max_blocks: u32,
+    page_size: u32,
+    kv_seq_len: u32,
+    cache_offset: u32,
+    window_lo: i32,
+    quant_format: KvCacheQuantFormat,
+    k_scale: f32,
+    k_bias: f32,
+    v_scale: f32,
+    v_bias: f32,
+    chunk_len: u32,
+) -> Result<(), crate::Error> {
+    if chunk_len == 0 {
+        return Err(crate::Error::Backend(
+            "paged split: chunk_len must be > 0".into(),
+        ));
+    }
+    let range_lo = window_lo.max(0) as u32;
+    let range_hi = (cache_offset + 1).min(kv_seq_len);
+    let range_len = range_hi.saturating_sub(range_lo);
+    if range_len == 0 {
+        return Err(crate::Error::Backend(
+            "paged split: empty causal window".into(),
+        ));
+    }
+    let n_chunks = range_len.div_ceil(chunk_len).max(1);
+
+    let ptr = |b: &dyn BackendStorage, what: &str| -> Result<u64, crate::Error> {
+        b.as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend(format!("{what} must be RocmStorage")))?
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend(format!("{what} has no device ptr")))
+    };
+    let mut qptr = ptr(q, "q")?;
+    let mut btptr = ptr(block_tables, "block_tables")?;
+    let mut kptr = ptr(k_pages, "k_pages")?;
+    let mut vptr = ptr(v_pages, "v_pages")?;
+    let mut pmptr = ptr(partial_m, "partial_m")?;
+    let mut plptr = ptr(partial_l, "partial_l")?;
+    let mut poptr = ptr(partial_o, "partial_o")?;
+    let mut optr = ptr(out, "out")?;
+
+    let wf = dev.wavefront_size() as u32;
+    let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut mb = max_blocks as i32;
+    let mut ps = page_size as i32;
+    let mut ksl = kv_seq_len as i32;
+    let mut co = cache_offset as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut qf = quant_format as i32;
+    let mut ks = k_scale;
+    let mut kb = k_bias;
+    let mut vs = v_scale;
+    let mut vb = v_bias;
+    let mut cl = chunk_len as i32;
+    let mut nc = n_chunks as i32;
+
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_paged_quant_split",
+        crate::HipDim3::new(batch, num_heads, n_chunks),
+        crate::HipDim3::new(wf * 4, 1, 1),
+        &mut [
+            arg(&mut qptr),
+            arg(&mut btptr),
+            arg(&mut kptr),
+            arg(&mut vptr),
+            arg(&mut pmptr),
+            arg(&mut plptr),
+            arg(&mut poptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut mb),
+            arg(&mut ps),
+            arg(&mut ksl),
+            arg(&mut co),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut qf),
+            arg(&mut ks),
+            arg(&mut kb),
+            arg(&mut vs),
+            arg(&mut vb),
+            arg(&mut cl),
+            arg(&mut nc),
+        ],
+    )?;
+
+    let mut nh_m = num_heads as i32;
+    let mut hd_m = head_dim as i32;
+    let mut nc_m = n_chunks as i32;
+    let mut bt_m = batch as i32;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_paged_merge",
+        crate::HipDim3::new(batch, num_heads, 1),
+        crate::HipDim3::new(wf * 4, 1, 1),
+        &mut [
+            arg(&mut pmptr),
+            arg(&mut plptr),
+            arg(&mut poptr),
+            arg(&mut optr),
+            arg(&mut nh_m),
+            arg(&mut hd_m),
+            arg(&mut nc_m),
+            arg(&mut bt_m),
         ],
     )?;
 
@@ -2068,24 +5698,25 @@ fn kv_rot_device_ptr(
     )))
 }
 
-/// M3: KV-arena dtype must match the live `GRIM_F16_KV` flag. A stale F32
-/// arena read as F16 (or vice versa) silently reinterprets bits — Err here
-/// routes callers to the host fallback instead of garbage.
-fn check_kv_arena_dtype(arena: &dyn BackendStorage, what: &str) -> Result<(), crate::Error> {
+/// M3: KV-arena representation from STORAGE, not env. Uniform F32 or
+/// uniform F16 arenas are accepted regardless of `GRIM_F16_KV` (the flag is
+/// only an allocation hint); anything else — mixed dtypes, packed/quant
+/// storages that the dense kernels would reinterpret — fails loud here and
+/// routes callers to the host fallback instead of garbage. Returns true for
+/// f16 arenas (kernels take the f16 leg) and false for f32.
+fn kv_arena_f16(arena: &dyn BackendStorage, what: &str) -> Result<bool, crate::Error> {
     use crate::memory::storage::RocmStorage;
     let s = arena
         .as_any()
         .downcast_ref::<RocmStorage>()
         .ok_or_else(|| crate::Error::Backend(format!("{what}: K/V arena must be RocmStorage")))?;
-    let want_f16 = kv_f16_enabled();
-    let is_f16 = s.dtype.arith == grim_tensor::dtype::ArithType::F16;
-    if is_f16 != want_f16 {
-        return Err(crate::Error::Backend(format!(
-            "{what}: arena dtype {:?} does not match GRIM_F16_KV={want_f16}",
-            s.dtype.arith,
-        )));
+    match s.dtype.arith {
+        grim_tensor::dtype::ArithType::F16 => Ok(true),
+        grim_tensor::dtype::ArithType::F32 => Ok(false),
+        other => Err(crate::Error::Backend(format!(
+            "{what}: K/V arena dtype {other:?} needs the paged quant path, not dense kernels"
+        ))),
     }
-    Ok(())
 }
 
 pub fn launch_kv_append(
@@ -2095,8 +5726,9 @@ pub fn launch_kv_append(
     past_dev: &dyn BackendStorage,
     kv_stride: usize,
     steps: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
-    check_kv_arena_dtype(k_arena, "kv_append")?;
+    let mut f16_flag = kv_arena_f16(k_arena, "kv_append")? as i32;
     let total = steps * kv_stride;
     let arena_s = k_arena
         .as_any()
@@ -2115,8 +5747,10 @@ pub fn launch_kv_append(
         .ok_or_else(|| crate::Error::Backend("kv_append: past_dev has no device ptr".into()))?;
     let mut stride_i = kv_stride as i32;
     let mut steps_i = steps as i32;
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
     let (grid, block) = crate::device::util::linear_launch(total);
-    let mut f16_flag = kv_f16_enabled() as i32;
     // Legacy single-sequence path: batch=1 (slot always 0 in the kernel).
     dev.launch_compute_kernel(
         "grim_kv_append",
@@ -2131,6 +5765,8 @@ pub fn launch_kv_append(
             arg(&mut 1i32),
             arg(&mut 0i32),
             arg(&mut f16_flag),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
         ],
     )
 }
@@ -2148,8 +5784,12 @@ pub fn launch_kv_append_batch(
     steps: usize,
     batch: usize,
     arena_slot_stride: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
-    check_kv_arena_dtype(k_arena, "kv_append_batch")?;
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    let mut f16_flag = kv_arena_f16(k_arena, "kv_append_batch")? as i32;
     let arena_s = k_arena
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -2175,7 +5815,6 @@ pub fn launch_kv_append_batch(
     let mut slot_stride_i = arena_slot_stride as i32;
     let total = batch.max(1) * steps * kv_stride;
     let (grid, block) = crate::device::util::linear_launch(total);
-    let mut f16_flag = kv_f16_enabled() as i32;
     dev.launch_compute_kernel(
         "grim_kv_append",
         grid,
@@ -2189,6 +5828,643 @@ pub fn launch_kv_append_batch(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut f16_flag),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
+        ],
+    )
+}
+
+// Phase 2 launcher: `grim_kv_append_i8`. Quantizes `steps` f32 rows per slot
+/// (each (step, kv_head) head-vector independently, symmetric int8 with an
+/// f32 per-vector scale) into the u8 codes arena + f32 scales sidecar.
+/// Block 256 required (one thread per head_dim element, `head_dim` <= 256).
+#[allow(clippy::too_many_arguments)]
+/// Phase 2 launcher: `grim_kv_quantize_rows_i8`. Host-offset sibling of
+/// `launch_kv_append_i8` for the eager path (offsets computed on host like
+/// `copy_slice_range`; no past_dev). Quantizes `n_rows` f32 head-vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_i8(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    codes: &dyn BackendStorage,
+    codes_off: usize,
+    scales: &dyn BackendStorage,
+    scales_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i8: src must be F32".into(),
+        ));
+    }
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i8: codes must be RocmStorage".into())
+        })?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i8: codes must be U8".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i8: scales must be RocmStorage".into())
+        })?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i8: scales must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_i8: head_dim {head_dim} not in 1..=256"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: src has no device ptr".into())
+    })?;
+    let mut cptr = codes_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: codes have no device ptr".into())
+    })?;
+    let mut scptr = scales_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: scales have no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut codes_off_i = codes_off as i32;
+    let mut scales_off_i = scales_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_i8",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut cptr),
+            arg(&mut codes_off_i),
+            arg(&mut scptr),
+            arg(&mut scales_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
+/// Phase 3 launcher: `grim_kv_quantize_rows_i4`.
+/// Quantizes `n_rows` f32 head-vectors into packed 4-bit nibbles + f32 per-vector scales.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_i4(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    codes: &dyn BackendStorage,
+    codes_off: usize,
+    scales: &dyn BackendStorage,
+    scales_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i4: src must be F32".into(),
+        ));
+    }
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i4: codes must be RocmStorage".into())
+        })?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i4: codes must be U8 (byte storage for packed u4)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i4: scales must be RocmStorage".into())
+        })?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i4: scales must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 || head_dim % 2 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_i4: head_dim {head_dim} must be even and in 1..=256"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: src has no device ptr".into())
+    })?;
+    let mut cptr = codes_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: codes have no device ptr".into())
+    })?;
+    let mut scptr = scales_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: scales have no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut codes_off_i = codes_off as i32;
+    let mut scales_off_i = scales_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_i4",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut cptr),
+            arg(&mut codes_off_i),
+            arg(&mut scptr),
+            arg(&mut scales_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
+/// WS-3A: 2-bit KEY quantizer launcher. Same per-(row, kv_head) amax scheme
+/// as the i4 launcher, packing four codes per byte (`head_dim % 4 == 0`).
+pub fn launch_kv_quantize_rows_i2(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    codes: &dyn BackendStorage,
+    codes_off: usize,
+    scales: &dyn BackendStorage,
+    scales_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i2: src must be F32".into(),
+        ));
+    }
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i2: codes must be RocmStorage".into())
+        })?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i2: codes must be U8 (byte storage for packed u2)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i2: scales must be RocmStorage".into())
+        })?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i2: scales must be F32".into(),
+        ));
+    }
+    // 2-bit packing puts FOUR codes per byte, so head_dim must divide by 4.
+    if head_dim == 0 || head_dim > 256 || head_dim % 4 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_i2: head_dim {head_dim} must be a multiple of 4 and in 1..=256"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: src has no device ptr".into())
+    })?;
+    let mut cptr = codes_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: codes have no device ptr".into())
+    })?;
+    let mut scptr = scales_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: scales have no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut codes_off_i = codes_off as i32;
+    let mut scales_off_i = scales_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_i2",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut cptr),
+            arg(&mut codes_off_i),
+            arg(&mut scptr),
+            arg(&mut scales_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
+/// WhiteCrow launcher: `grim_kv_quantize_rows_whitecrow`.
+/// Quantizes `n_rows` f32 token rows into interleaved 67-byte u4 group-128
+/// blocks (inline bf16 scale + u8 zero). NO f32 scale sidecar — the scales ride
+/// inline. `head_dim` must be a multiple of 128 so groups align to head vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_whitecrow(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    dst: &dyn BackendStorage,
+    dst_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_whitecrow: src must be F32".into(),
+        ));
+    }
+    let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: dst must be RocmStorage".into())
+    })?;
+    if dst_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_whitecrow: dst must be U8 (byte storage for 67B blocks)".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_whitecrow: head_dim {head_dim} must be a positive multiple of 128 \
+             so 128-value groups align to head vectors"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: src has no device ptr".into())
+    })?;
+    let mut dptr = dst_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_whitecrow: dst has no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut dst_off_i = dst_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let groups_per_head = head_dim / 128;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads * groups_per_head) as u32, 1, 1);
+    let block = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_whitecrow",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut dptr),
+            arg(&mut dst_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
+pub fn launch_kv_append_i8(
+    dev: &crate::RocmDevice,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    codes: &dyn BackendStorage,
+    scales: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    scale_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: codes must be RocmStorage".into()))?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_append_i8: codes arena must be U8 (int8 format)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: scales must be RocmStorage".into()))?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_append_i8: scales sidecar must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_i8: head_dim {head_dim} not in 1..=256"
+        )));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_i8")?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_i8: past_dev must be RocmStorage".into())
+        })?;
+    let mut codes_ptr = codes_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: codes have no device ptr".into()))?;
+    let mut scales_ptr = scales_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: scales have no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let mut sc_slot_stride_i = scale_slot_stride as i32;
+    let grid = crate::HipDim3::new((batch.max(1) * steps * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_append_i8",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut codes_ptr),
+            arg(&mut scales_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
+        ],
+    )
+}
+
+/// Phase 3 launcher: `grim_kv_append_i4`. The int4 twin of
+/// [`launch_kv_append_i8`] — same device-side `past`, same ring mapping, same
+/// argument order; the kernel packs TWO codes per byte, so the arena's codes
+/// buffer holds `kv_stride / 2` bytes per row.
+///
+/// Bit-for-bit parity with the eager `launch_kv_quantize_rows_i4` is pinned by
+/// `graph_i4_append_matches_eager_quantizer` in tests/qkv_attention.rs.
+pub fn launch_kv_append_i4(
+    dev: &crate::RocmDevice,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    codes: &dyn BackendStorage,
+    scales: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    scale_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_i4: codes must be RocmStorage".into()))?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_append_i4: codes arena must be U8 (int8 format)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_i4: scales must be RocmStorage".into()))?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_append_i4: scales sidecar must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_i4: head_dim {head_dim} not in 1..=256"
+        )));
+    }
+    // Two codes per byte are packed by pairing ADJACENT LANES, so an odd
+    // head_dim pairs the last lane of one head-vector with the first lane of
+    // the next and writes two different heads' codes into one byte.
+    if head_dim % 2 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_i4: head_dim {head_dim} must be even (2 codes per byte)"
+        )));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_i8")?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_i4: past_dev must be RocmStorage".into())
+        })?;
+    let mut codes_ptr = codes_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i4: codes have no device ptr".into()))?;
+    let mut scales_ptr = scales_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i4: scales have no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i4: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let mut sc_slot_stride_i = scale_slot_stride as i32;
+    let grid = crate::HipDim3::new((batch.max(1) * steps * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_append_i4",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut codes_ptr),
+            arg(&mut scales_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
+        ],
+    )
+}
+
+/// Graph launcher: `grim_kv_append_whitecrow`. Device-side append + quantize
+/// into the dense WhiteCrow arena — the sibling of [`launch_kv_append_i4`]
+/// minus the scale sidecar (the bf16 scale + u8 zero ride inline in each
+/// 67-byte block) and with WhiteCrow's group geometry: `arena_slot_stride` is
+/// in BYTES (`max_ctx * nkv * (head_dim/128) * 67`), `kv_stride` stays in
+/// ELEMENTS (`nkv * head_dim`) for the f32 source rows, and `head_dim` must be
+/// a positive multiple of 128 so groups align to head vectors.
+pub fn launch_kv_append_whitecrow(
+    dev: &crate::RocmDevice,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    dst: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_append_whitecrow: dst must be RocmStorage".into())
+    })?;
+    if dst_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_append_whitecrow: dst arena must be U8 (byte storage for 67B blocks)".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_whitecrow: head_dim {head_dim} must be a positive multiple of 128 \
+             so 128-value groups align to head vectors"
+        )));
+    }
+    if arena_slot_stride == 0 {
+        return Err(crate::Error::Backend(
+            "kv_append_whitecrow: arena_slot_stride must be non-zero BYTES".into(),
+        ));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_whitecrow")?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_whitecrow: past_dev must be RocmStorage".into())
+        })?;
+    let mut dst_ptr = dst_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_whitecrow: dst has no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_whitecrow: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend("kv_append_whitecrow: arena_slot_stride exceeds i32::MAX".into())
+    })?;
+    // One block per (slot, step, kv_head, group); block = 128 values.
+    let groups_per_head = head_dim / 128;
+    let grid = crate::HipDim3::new(
+        (batch.max(1) * steps * nkv_heads * groups_per_head) as u32,
+        1,
+        1,
+    );
+    let block = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_append_whitecrow",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut dst_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
         ],
     )
 }
@@ -2218,6 +6494,7 @@ pub fn launch_qkv_attention_dev(
     fuse_o: u32,
     alibi_slopes: &dyn BackendStorage,
     has_alibi: u32,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     launch_qkv_attention_dev_batch(
         dev,
@@ -2243,6 +6520,7 @@ pub fn launch_qkv_attention_dev(
         has_alibi,
         1,
         0,
+        ring,
     )
 }
 
@@ -2275,6 +6553,7 @@ pub fn launch_qkv_attention_dev_batch(
     has_alibi: u32,
     batch: usize,
     arena_slot_stride: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     const KERNEL: &str = "grim_qkv_attention_dev";
     if head_dim > 256 {
@@ -2287,8 +6566,14 @@ pub fn launch_qkv_attention_dev_batch(
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
         .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
-    check_kv_arena_dtype(k_tensor, "grim_qkv_attention_dev")?;
-    check_kv_arena_dtype(v_tensor, "grim_qkv_attention_dev")?;
+    let k_f16 = kv_arena_f16(k_tensor, "grim_qkv_attention_dev k")?;
+    let v_f16 = kv_arena_f16(v_tensor, "grim_qkv_attention_dev v")?;
+    if k_f16 != v_f16 {
+        return Err(crate::Error::Backend(
+            "grim_qkv_attention_dev: K/V arenas must share one dtype (storage truth)".into(),
+        ));
+    }
+    let mut f16_flag = k_f16 as i32;
     let k_s = k_tensor
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -2367,9 +6652,11 @@ pub fn launch_qkv_attention_dev_batch(
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
     let mut batch_i = batch.max(1) as i32;
     let mut slot_stride_i = arena_slot_stride as i32;
-    let mut f16_flag = kv_f16_enabled() as i32;
+    // f16_flag derived from the arenas above (storage truth).
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
     dev.launch_compute_kernel(
         KERNEL,
         grid_dim,
@@ -2398,6 +6685,732 @@ pub fn launch_qkv_attention_dev_batch(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut f16_flag),
+            arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+/// Phase-2 launcher: `grim_qkv_attention_dev_i8`. Device-total twin of the
+/// scalar int8 attend: K/V are biased-u8 codes with f32 per-(slot,row,kv_head)
+/// scales. Same capture semantics as `launch_qkv_attention_dev_batch`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_dev_batch_i8(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    scale_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    const KERNEL: &str = "grim_qkv_attention_dev_i8";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{}: head_dim {} exceeds kernel cap of 256",
+            KERNEL, head_dim
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
+    for (buf, what, want) in [
+        (k_codes, "k_codes", ArithType::U8),
+        (v_codes, "v_codes", ArithType::U8),
+        (k_scales, "k_scales", ArithType::F32),
+        (v_scales, "v_scales", ArithType::F32),
+    ] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{KERNEL}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != want {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} must be {want:?}, got {:?}",
+                r.dtype.arith
+            )));
+        }
+        if !r.device_ptr_is_valid() {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} lacks a valid device pointer"
+            )));
+        }
+    }
+    fn dc<'a>(
+        b: &'a dyn BackendStorage,
+        what: &'static str,
+    ) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!(
+                "grim_qkv_attention_dev_i8: {what} must be RocmStorage"
+            ))
+        })
+    }
+    let out_s = dc(out, "out")?;
+    let om_s = dc(out_max, "out_max")?;
+    let os_s = dc(out_sum, "out_sum")?;
+    let total_s = dc(total_dev, "total_dev")?;
+    let oproj_s = dc(o_proj_w, "o_proj_w")?;
+    let alibi_s = dc(alibi_slopes, "alibi_slopes")?;
+    let kq = dc(k_codes, "k_codes")?;
+    let ks = dc(k_scales, "k_scales")?;
+    let vq = dc(v_codes, "v_codes")?;
+    let vs = dc(v_scales, "v_scales")?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = kq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_codes have no ptr".into()))?;
+    let mut ksc_ptr = ks
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_scales have no ptr".into()))?;
+    let mut v_ptr = vq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_codes have no ptr".into()))?;
+    let mut vsc_ptr = vs
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_scales have no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi_slopes has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let mut sc_slot_stride_i = scale_slot_stride as i32;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            // Argument order MUST match `grim_qkv_attention_dev_i8`'s parameter
+            // list exactly. The i8 kernel takes the code/scale pointers LAST
+            // (after the batch/slot strides), not next to k/v: emitting them
+            // early made the kernel treat `k_scales` as `out`, `num_heads` as a
+            // pointer, and fault at the first dereference.
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut ksc_ptr),
+            arg(&mut vsc_ptr),
+            arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+pub fn launch_qkv_attention_dev_batch_i4(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    scale_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    const KERNEL: &str = "grim_qkv_attention_dev_i4";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{}: head_dim {} exceeds kernel cap of 256",
+            KERNEL, head_dim
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
+    for (buf, what, want) in [
+        (k_codes, "k_codes", ArithType::U8),
+        (v_codes, "v_codes", ArithType::U8),
+        (k_scales, "k_scales", ArithType::F32),
+        (v_scales, "v_scales", ArithType::F32),
+    ] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{KERNEL}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != want {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} must be {want:?}, got {:?}",
+                r.dtype.arith
+            )));
+        }
+        if !r.device_ptr_is_valid() {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} lacks a valid device pointer"
+            )));
+        }
+    }
+    fn dc<'a>(
+        b: &'a dyn BackendStorage,
+        what: &'static str,
+    ) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!(
+                "grim_qkv_attention_dev_i4: {what} must be RocmStorage"
+            ))
+        })
+    }
+    let out_s = dc(out, "out")?;
+    let om_s = dc(out_max, "out_max")?;
+    let os_s = dc(out_sum, "out_sum")?;
+    let total_s = dc(total_dev, "total_dev")?;
+    let oproj_s = dc(o_proj_w, "o_proj_w")?;
+    let alibi_s = dc(alibi_slopes, "alibi_slopes")?;
+    let kq = dc(k_codes, "k_codes")?;
+    let ks = dc(k_scales, "k_scales")?;
+    let vq = dc(v_codes, "v_codes")?;
+    let vs = dc(v_scales, "v_scales")?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = kq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_codes have no ptr".into()))?;
+    let mut ksc_ptr = ks
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_scales have no ptr".into()))?;
+    let mut v_ptr = vq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_codes have no ptr".into()))?;
+    let mut vsc_ptr = vs
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_scales have no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi_slopes has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let mut sc_slot_stride_i = scale_slot_stride as i32;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            // Argument order MUST match `grim_qkv_attention_dev_i4`'s parameter
+            // list exactly. The i4 kernel takes the code/scale pointers LAST
+            // (after the batch/slot strides), not next to k/v: emitting them
+            // early made the kernel treat `k_scales` as `out`, `num_heads` as a
+            // pointer, and fault at the first dereference.
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut ksc_ptr),
+            arg(&mut vsc_ptr),
+            arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+/// Graph launcher for `grim_qkv_attention_dev_whitecrow`. Same contract as
+/// [`launch_qkv_attention_dev_batch_i4`] minus the scale sidecar (WhiteCrow's
+/// scale lives inside each 67-byte block) plus a head_dim % 128 check.
+/// `arena_slot_stride` is in BYTES (one slot's row-major block region).
+pub fn launch_qkv_attention_dev_batch_whitecrow(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cap_rows_i = ring.cap_rows;
+    const KERNEL: &str = "grim_qkv_attention_dev_whitecrow";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{KERNEL}: head_dim {head_dim} exceeds kernel cap of 256"
+        )));
+    }
+    if head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "{KERNEL}: head_dim {head_dim} must be a multiple of 128 \
+             (WhiteCrow groups are 128 values)"
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{KERNEL}: q must be RocmStorage")))?;
+    for (buf, what) in [(k_arena, "k_arena"), (v_arena, "v_arena")] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{KERNEL}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != ArithType::U8 {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} must be U8, got {:?}",
+                r.dtype.arith
+            )));
+        }
+        if !r.device_ptr_is_valid() {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} lacks a valid device pointer"
+            )));
+        }
+    }
+    fn dc<'a>(
+        b: &'a dyn BackendStorage,
+        what: &'static str,
+    ) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!(
+                "grim_qkv_attention_dev_whitecrow: {what} must be RocmStorage"
+            ))
+        })
+    }
+    let out_s = dc(out, "out")?;
+    let om_s = dc(out_max, "out_max")?;
+    let os_s = dc(out_sum, "out_sum")?;
+    let total_s = dc(total_dev, "total_dev")?;
+    let oproj_s = dc(o_proj_w, "o_proj_w")?;
+    let alibi_s = dc(alibi_slopes, "alibi_slopes")?;
+    let kq = dc(k_arena, "k_arena")?;
+    let vq = dc(v_arena, "v_arena")?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = kq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_arena has no ptr".into()))?;
+    let mut v_ptr = vq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_arena has no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi_slopes has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend(format!("{KERNEL}: arena_slot_stride exceeds i32::MAX"))
+    })?;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            // Argument order MUST match `grim_qkv_attention_dev_whitecrow`'s
+            // parameter list exactly (see the past-fault note on the i4
+            // launcher above: a reordered pointer shifts every later arg).
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+/// Graph-capturable token-parallel split of [`launch_qkv_attention_dev_batch_whitecrow`].
+///
+/// Two launches, both with FIXED grids (capture-safe):
+///   1. `grim_qkv_attention_dev_whitecrow_split` — grid (seq_len, num_heads,
+///      batch*max_chunks). Each block computes an online-softmax partial over
+///      its token chunk and publishes pm/pl/po. Dead chunks (beyond the
+///      device-derived live range) publish l=0, and every partial slot is
+///      rewritten every launch — the scratch is never zeroed between replays.
+///   2. `grim_qkv_attention_dev_whitecrow_merge` — grid (seq_len, num_heads,
+///      batch). Derives the same live chunk count on device, LSE-combines,
+///      normalizes, and runs the serial kernel's exact out/fuse_o tail.
+///
+/// The live chunk count is derived from `total_dev[slot] + steps` and the
+/// ring cap inside BOTH kernels, so a captured pair tracks growing contexts
+/// with no recapture. `max_chunks` must be >= ceil(cap_rows-or-max_ctx /
+/// chunk_len) — the launcher derives it from the ring cap (or max_ctx when
+/// uncapped) and errors if the caller's scratch is too small.
+///
+/// Unlike the serial launcher, `out_max`/`out_sum` are NOT written (the
+/// serial dev WhiteCrow kernel never writes them either; the scratch the
+/// caller passes is accepted for signature symmetry only).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_dev_batch_whitecrow_split(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    partial_m: &dyn BackendStorage,
+    partial_l: &dyn BackendStorage,
+    partial_o: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+    chunk_len: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    const SPLIT: &str = "grim_qkv_attention_dev_whitecrow_split";
+    const MERGE: &str = "grim_qkv_attention_dev_whitecrow_merge";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{SPLIT}: head_dim {head_dim} exceeds kernel cap of 256"
+        )));
+    }
+    if head_dim % 128 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "{SPLIT}: head_dim {head_dim} must be a multiple of 128 \
+             (WhiteCrow groups are 128 values)"
+        )));
+    }
+    if chunk_len == 0 {
+        return Err(crate::Error::Backend(format!("{SPLIT}: chunk_len must be > 0")));
+    }
+    let live_bound: usize = if ring.cap_rows > 0 {
+        ring.cap_rows.max(1) as usize
+    } else {
+        // Uncapped: the arena holds max_ctx rows; derive the bound from the
+        // slot stride the caller passes (bytes -> rows).
+        let bytes_per_row = (num_kv_heads * (head_dim / 128) * 67) as usize;
+        (arena_slot_stride / bytes_per_row.max(1)).max(1)
+    };
+    let max_chunks = live_bound.div_ceil(chunk_len as usize).max(1);
+
+    let ptr = |b: &dyn BackendStorage, what: &str| -> Result<u64, crate::Error> {
+        b.as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend(format!("{SPLIT}: {what} must be RocmStorage")))?
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend(format!("{SPLIT}: {what} has no device ptr")))
+    };
+    for (buf, what) in [(k_arena, "k_arena"), (v_arena, "v_arena")] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{SPLIT}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != ArithType::U8 {
+            return Err(crate::Error::Backend(format!(
+                "{SPLIT}: {what} must be U8, got {:?}",
+                r.dtype.arith
+            )));
+        }
+    }
+    let mut q_ptr = ptr(q, "q")?;
+    let mut k_ptr = ptr(k_arena, "k_arena")?;
+    let mut v_ptr = ptr(v_arena, "v_arena")?;
+    let mut pm_ptr = ptr(partial_m, "partial_m")?;
+    let mut pl_ptr = ptr(partial_l, "partial_l")?;
+    let mut po_ptr = ptr(partial_o, "partial_o")?;
+    let mut o_ptr = ptr(out, "out")?;
+    let mut tot_ptr = ptr(total_dev, "total_dev")?;
+    let mut opptr = ptr(o_proj_w, "o_proj_w")?;
+    let mut asl = ptr(alibi_slopes, "alibi_slopes")?;
+
+    // Scratch capacity check: pm/pl are [batch*max_chunks*seq_len*num_heads],
+    // po adds head_dim. The shapes are opaque here (1-D scratch), so the
+    // element count is checked against the worst case the pair will index.
+    let need_pm = batch * max_chunks * seq_len as usize * num_heads as usize;
+    for (buf, what, need) in [
+        (partial_m, "partial_m", need_pm),
+        (partial_l, "partial_l", need_pm),
+        (
+            partial_o,
+            "partial_o",
+            need_pm * head_dim as usize,
+        ),
+    ] {
+        let r = buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend(format!("{SPLIT}: {what} must be RocmStorage")))?;
+        let elems = r.shape().dims().iter().product::<usize>().max(1);
+        if elems < need {
+            return Err(crate::Error::Backend(format!(
+                "{SPLIT}: {what} too small: need {need} elems (batch={batch} max_chunks={max_chunks} \
+                 seq_len={seq_len} nh={num_heads} hd={head_dim}), have {elems}"
+            )));
+        }
+    }
+
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend(format!("{SPLIT}: arena_slot_stride exceeds i32::MAX"))
+    })?;
+    let mut cap_rows_i = ring.cap_rows;
+    let mut cl = chunk_len as i32;
+    let mut mc = max_chunks as i32;
+
+    // Argument order MUST match `grim_qkv_attention_dev_whitecrow_split`'s
+    // parameter list exactly.
+    dev.launch_compute_kernel(
+        SPLIT,
+        crate::HipDim3::new(sl as u32, nh as u32, (batch.max(1) * max_chunks) as u32),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut pm_ptr),
+            arg(&mut pl_ptr),
+            arg(&mut po_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut cl),
+            arg(&mut mc),
+        ],
+    )?;
+
+    // Argument order MUST match `grim_qkv_attention_dev_whitecrow_merge`'s
+    // parameter list exactly.
+    dev.launch_compute_kernel(
+        MERGE,
+        crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut pm_ptr),
+            arg(&mut pl_ptr),
+            arg(&mut po_ptr),
+            arg(&mut o_ptr),
+            arg(&mut nh),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut batch_i),
+            arg(&mut cap_rows_i),
+            arg(&mut cl),
+            arg(&mut mc),
         ],
     )
 }
@@ -2438,6 +7451,37 @@ pub fn launch_bump_i32_slots(
     )
 }
 
+/// D1: clamp a layer's KV total to the ring capacity (identity when
+/// `cap_rows <= 0`). Captured node — launched right after the per-layer bump
+/// so the absolute row sequence matches the eager path's post-compaction
+/// `current_pos`.
+pub fn launch_clamp_layer_total(
+    dev: &crate::RocmDevice,
+    total_dev: &dyn BackendStorage,
+    cap_rows: i32,
+    batch: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    if cap_rows <= 0 {
+        return Ok(std::ptr::null_mut());
+    }
+    let tot_s = total_dev
+        .as_any()
+        .downcast_ref::<crate::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("clamp_total: not RocmStorage".into()))?;
+    let mut tp = tot_s
+        .device_ptr_u64()
+        .ok_or_else(|| crate::Error::Backend("clamp_total: no ptr".into()))?;
+    let mut cap = cap_rows;
+    let grid = crate::HipDim3::new(batch.max(1) as u32, 1, 1);
+    let block = crate::HipDim3::new(1, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_clamp_total",
+        grid,
+        block,
+        &mut [crate::arg(&mut tp), crate::arg(&mut cap)],
+    )
+}
+
 /// ScytheRing head publish — fully on-device (no pinned staging, no H2D).
 /// Writes a single u32 head counter to head_dev. Launched as grid
 /// (1,1,1)/block (1,1,1): thread 0 writes the value. HIP-graph capturable.
@@ -2459,6 +7503,37 @@ pub fn launch_scythe_publish_head(
         crate::hipStreamSynchronize(dev.active_stream())
     })?;
     Ok(handle)
+}
+
+/// Publish the ring's head counter WITHOUT a host synchronisation.
+///
+/// The synchronising variant ([`launch_scythe_publish_head`]) ends with
+/// `hipStreamSynchronize`, which makes every enqueue a HOST-visible
+/// synchronisation — the opposite of what a ring is for: the ring exists so a
+/// step costs ONE launch instead of one per node, and a host sync per node
+/// gives that back.
+///
+/// The publish does not need it. The kernel's store reaches L2 (global stores
+/// are not cached in L1 on RDNA) and the kernel's completion makes it visible
+/// device-wide; the wave reads the counter with a device-scope atomic, which
+/// reads L2. The cross-stream case — the wave parked on the ring's own
+/// stream while the publish runs on the caller's — is exactly what
+/// `resident_wave_drains_a_node_enqueued_after_it_parked` gates: a node
+/// enqueued AFTER the wave parked is still drained, which it cannot be unless
+/// the publish reached the wave's stream.
+pub fn launch_scythe_publish_head_async(
+    dev: &crate::RocmDevice,
+    head_dev_ptr: u64,
+    head_value: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut hp = head_dev_ptr;
+    let mut hv = head_value;
+    dev.launch_compute_kernel(
+        "grim_scythe_publish_head",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [arg(&mut hp), arg(&mut hv)],
+    )
 }
 
 /// ScytheRing descriptor write — fully on-device (no host pack, no H2D).
@@ -2515,11 +7590,188 @@ pub fn launch_scythe_write_slot(
     )
 }
 
+/// Dynamic MoE on-device enqueue launcher. Binds the MoETaskDescriptor and pushes into ScytheRing
+/// fully on-device (HIP-graph capturable, zero host round-trips).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_scythe_enqueue_dynamic_moe(
+    dev: &crate::RocmDevice,
+    slots_base: &dyn BackendStorage,
+    capacity: u32,
+    head_dev_ptr: u64,
+    desc_staging_ptr: u64,
+    hidden: u32,
+    inter: u32,
+    num_tokens: u32,
+    block_size: u32,
+    num_experts: u32,
+    top_k: u32,
+    quant_mode: u32,
+    routed_scaling_factor: f32,
+    gate_w_ptr: u64,
+    up_w_ptr: u64,
+    down_w_ptr: u64,
+    token_ids_ptr: u64,
+    expert_ids_ptr: u64,
+    weights_ptr: u64,
+    input_ptr: u64,
+    output_ptr: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let slots_s = slots_base
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("scythe_enqueue_dynamic_moe: slots must be RocmStorage".into())
+        })?;
+    let mut base_ptr = slots_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("scythe_enqueue_dynamic_moe: slots have no device ptr".into())
+    })?;
+    let mut cap = capacity;
+    let mut hp = head_dev_ptr;
+    let mut dsp = desc_staging_ptr;
+    let mut h = hidden;
+    let mut it = inter;
+    let mut nt = num_tokens;
+    let mut bs = block_size;
+    let mut ne = num_experts;
+    let mut tk = top_k;
+    let mut qm = quant_mode;
+    let mut rsf = routed_scaling_factor;
+    let mut gw = gate_w_ptr;
+    let mut uw = up_w_ptr;
+    let mut dw = down_w_ptr;
+    let mut ti = token_ids_ptr;
+    let mut ei = expert_ids_ptr;
+    let mut w = weights_ptr;
+    let mut inp = input_ptr;
+    let mut outp = output_ptr;
+
+    dev.launch_compute_kernel(
+        "grim_scythe_enqueue_dynamic_moe",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [
+            arg(&mut base_ptr),
+            arg(&mut cap),
+            arg(&mut hp),
+            arg(&mut dsp),
+            arg(&mut h),
+            arg(&mut it),
+            arg(&mut nt),
+            arg(&mut bs),
+            arg(&mut ne),
+            arg(&mut tk),
+            arg(&mut qm),
+            arg(&mut rsf),
+            arg(&mut gw),
+            arg(&mut uw),
+            arg(&mut dw),
+            arg(&mut ti),
+            arg(&mut ei),
+            arg(&mut w),
+            arg(&mut inp),
+            arg(&mut outp),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use grim_tensor::dtype::{ArithType, DType, Storage};
     use grim_tensor::{AttentionOps, CoreTensorOps, MemoryOps, Shape};
+
+    /// WS-0: the explicit-format spelling table is the single source of truth.
+    /// Every alias must resolve, and an unknown value must NOT silently become
+    /// a valid format (it is `None`; callers warn and fall back).
+    #[test]
+    fn kv_arena_env_aliases_resolve() {
+        use KvArenaFormat::*;
+        for (s, want) in [
+            ("f32", F32),
+            ("f16", F16),
+            ("int8", Int8),
+            ("i8", Int8),
+            ("q8", Int8),
+            ("int4", Int4),
+            ("i4", Int4),
+            ("q4", Int4),
+        ] {
+            assert_eq!(parse_kv_arena_env(s), Some(want), "GRIM_KV_ARENA={s}");
+        }
+        assert_eq!(parse_kv_arena_env("bogus"), None);
+        // Spellings are case-sensitive; an uppercase value is a typo, not f16.
+        assert_eq!(parse_kv_arena_env("F16"), None);
+        // WS-3A: the asymmetric format resolves as a first-class selector and,
+        // as of the K2V4 kernels landing, reports itself implemented.
+        assert_eq!(parse_kv_arena_env("int2v4"), Some(KvArenaFormat::Int2V4));
+        assert_eq!(parse_kv_arena_env("k2v4"), Some(KvArenaFormat::Int2V4));
+        assert!(KvArenaFormat::Int2V4.has_device_kernels());
+        for f in [
+            KvArenaFormat::F32,
+            KvArenaFormat::F16,
+            KvArenaFormat::Int8,
+            KvArenaFormat::Int4,
+        ] {
+            assert!(f.has_device_kernels(), "{f:?} should have device kernels");
+        }
+        // Density: 2-bit K + 4-bit V averages 0.375 B/elem, half of int4's.
+        assert!((KvArenaFormat::Int2V4.bytes_per_elem() - 0.375).abs() < 1e-6);
+    }
+
+    /// WS-0: the legacy f16 flag and the arena resolver must not drift. The
+    /// backend resolver's only two inputs are these strings, so pinning the
+    /// pure core pins the public `kv_arena_format`/`kv_f16_enabled` pair.
+    #[test]
+    fn kv_arena_resolver_is_consistent_with_f16_flag() {
+        use KvArenaFormat::*;
+        // Unset arena -> driven entirely by the legacy flag.
+        assert_eq!(resolve_kv_arena_format(None, None), F32);
+        assert_eq!(resolve_kv_arena_format(None, Some("1")), F16);
+        assert_eq!(resolve_kv_arena_format(None, Some("off")), F32);
+        // Explicit arena wins over the flag, in every spelling.
+        assert_eq!(resolve_kv_arena_format(Some("f32"), Some("1")), F32);
+        assert_eq!(resolve_kv_arena_format(Some("int8"), Some("1")), Int8);
+        assert_eq!(resolve_kv_arena_format(Some("int4"), Some("0")), Int4);
+        // Unrecognized explicit value falls back to F32 (with a warning).
+        assert_eq!(resolve_kv_arena_format(Some("q7"), None), F32);
+    }
+
+    /// The f16 flag's disabled spellings are ONE set, not two — this is the
+    /// drift that let `GRIM_F16_KV=off` mean f16 to the backend and f32 to the
+    /// model before WS-0.
+    #[test]
+    fn f16_kv_flag_disabled_spellings() {
+        for s in ["0", "false", "FALSE", "off", "no", " off "] {
+            assert!(
+                !parse_f16_kv_env(Some(s)),
+                "GRIM_F16_KV={s:?} should disable"
+            );
+        }
+        for s in ["1", "true", "yes", "on", "garbage"] {
+            assert!(parse_f16_kv_env(Some(s)), "GRIM_F16_KV={s:?} should enable");
+        }
+        assert!(!parse_f16_kv_env(None), "unset must not enable f16");
+    }
+
+    /// WS-0: for an explicit value the two senses of the flag are exact
+    /// complements, so a f16-default model and the f32-default backend can
+    /// never disagree about what a spelling means. UNSET is where the two
+    /// defaults legitimately differ (backend reads it as f32, a f16-default
+    /// model as f16), and there BOTH parsers report false.
+    #[test]
+    fn f16_kv_flag_senses_are_complements() {
+        for v in [
+            "0", "false", "off", "no", "1", "true", "yes", "garbage", " off ",
+        ] {
+            assert_eq!(
+                parse_f16_kv_env(Some(v)),
+                !f16_kv_explicitly_disabled(Some(v)),
+                "GRIM_F16_KV={v:?}"
+            );
+        }
+        assert!(!parse_f16_kv_env(None));
+        assert!(!f16_kv_explicitly_disabled(None));
+    }
 
     #[test]
     fn test_wmma_qkv_attention_source_contains_tensor_core_and_fallback() {
@@ -3141,6 +8393,7 @@ mod tests {
                 past_dev.as_ref(),
                 kv_stride,
                 steps,
+                KvRingPolicy::UNLIMITED,
             )
             .unwrap();
             dev.synchronize();
@@ -3280,6 +8533,7 @@ mod tests {
                 0,
                 dummy.as_ref(),
                 0,
+                KvRingPolicy::UNLIMITED,
             )
             .unwrap();
             let _ = stream;
@@ -3301,8 +8555,38 @@ mod tests {
 }
 
 #[cfg(test)]
+mod kv_kernel_source_structure_tests {
+    use super::KERNEL_SOURCE;
+
+    /// Every `grim_*` kernel in this TU must carry `extern "C" __global__`.
+    /// A script-generated duplicate once lost its prefix line: the TU still
+    /// parsed (the body became a host function), hiprtc failed every entry
+    /// compiled afterwards with `__shared__ not allowed in __host__`, and the
+    /// failure surfaced far from its cause. String-level, runs everywhere.
+    #[test]
+    fn every_kernel_has_global_prefix() {
+        for (i, line) in KERNEL_SOURCE.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("void grim_") {
+                let prev: Vec<&str> = KERNEL_SOURCE.lines().take(i).collect();
+                let mut j = prev.len();
+                while j > 0 && prev[j - 1].trim().is_empty() {
+                    j -= 1;
+                }
+                let pre = prev[j - 1];
+                assert!(
+                    pre.contains("__global__"),
+                    "kernel without __global__ prefix near TU line {}: {t} (previous: {pre})",
+                    i + 1,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod kv_arena_dtype_tests {
-    use super::check_kv_arena_dtype;
+    use super::kv_arena_f16;
     use grim_tensor::dtype::{ArithType, Storage};
     use grim_tensor::{CoreTensorOps, DType, Shape};
 
@@ -3310,41 +8594,61 @@ mod kv_arena_dtype_tests {
         crate::RocmDevice::try_new(0).ok()
     }
 
-    /// M3: arena dtype must match the live `GRIM_F16_KV` flag (off by default
-    /// here — no env mutation, so no races with parallel tests assuming the
-    /// default). F32 arena passes; F16 arena must Err loudly instead of being
-    /// silently reinterpreted by the kernel. The mirrored case (flag on, F32
-    /// arena) shares the same `!=` branch.
+    fn arena_of(dev: &crate::RocmDevice, arith: ArithType) -> Box<dyn grim_tensor::BackendStorage> {
+        let shape = Shape::new(vec![4, 64]);
+        let data = vec![0.5f32; 4 * 64];
+        dev.from_cpu(
+            &data,
+            &shape,
+            DType {
+                arith,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Storage truth: uniform F32 or uniform F16 arenas are accepted
+    /// regardless of `GRIM_F16_KV` (no env mutation here, so no races with
+    /// parallel tests). Packed/quant storages fail loud — the dense kernels
+    /// would reinterpret their bytes.
     #[test]
-    fn kv_arena_dtype_mismatch_is_loud_not_silent() {
+    fn kv_arena_dtype_storage_truth() {
         let Some(dev) = gpu_dev() else {
             eprintln!("[SKIP] requires GPU");
             return;
         };
-        assert!(
-            !super::kv_f16_enabled(),
-            "test assumes default GRIM_F16_KV off; run without the flag"
+        assert_eq!(
+            kv_arena_f16(arena_of(&dev, ArithType::F32).as_ref(), "m3-test").unwrap(),
+            false,
+            "F32 arena must take the f32 leg"
         );
-        let shape = Shape::new(vec![4, 64]);
-        let data = vec![0.5f32; 4 * 64];
-        let f32_arena = dev.from_cpu(&data, &shape, DType::F32).unwrap();
-        check_kv_arena_dtype(f32_arena.as_ref(), "m3-test")
-            .expect("F32 arena with flag off must pass");
-        let f16_arena = dev
-            .from_cpu(
-                &data,
-                &shape,
-                DType {
-                    arith: ArithType::F16,
-                    storage: Storage::Native,
-                },
-            )
-            .unwrap();
-        let err = check_kv_arena_dtype(f16_arena.as_ref(), "m3-test")
-            .expect_err("F16 arena with flag off must Err loudly");
-        assert!(
-            format!("{err:?}").contains("does not match"),
-            "unexpected error shape: {err:?}"
+        assert_eq!(
+            kv_arena_f16(arena_of(&dev, ArithType::F16).as_ref(), "m3-test").unwrap(),
+            true,
+            "F16 arena must take the f16 leg"
         );
+    }
+
+    /// The flag is an allocation hint, not a behavior switch: F32 arenas
+    /// keep working with the flag ON, and F16 arenas with it OFF.
+    #[test]
+    fn kv_arena_dtype_ignores_env() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        temp_env::with_var("GRIM_F16_KV", Some("1"), || {
+            assert_eq!(
+                kv_arena_f16(arena_of(&dev, ArithType::F32).as_ref(), "m3-test").unwrap(),
+                false
+            );
+        });
+        temp_env::with_var("GRIM_F16_KV", Some("0"), || {
+            assert_eq!(
+                kv_arena_f16(arena_of(&dev, ArithType::F16).as_ref(), "m3-test").unwrap(),
+                true
+            );
+        });
     }
 }

@@ -106,7 +106,14 @@ fn xorshift() -> impl FnMut() -> u64 {
 }
 
 /// Host W8A8 with the kernel's exact activation formula.
-fn w8a8_reference(a: &[f32], codes: &[u8], scales: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+fn w8a8_reference(
+    a: &[f32],
+    codes: &[u8],
+    scales: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
     for row in 0..m {
         for col in 0..n {
@@ -176,16 +183,24 @@ fn journey_case(m: usize, n: usize, k: usize, name: &str) -> TestResult {
 
     // 3. Load through the ordinary provider path. Everything the dispatch
     //    needs must come from here.
-    let provider = GrimProvider::open(grim_path.to_str().expect("path"))
-        .map_err(|e| format!("open: {e}"))?;
-    let meta = provider.meta("blk.weight").map_err(|e| format!("meta: {e}"))?;
+    let provider =
+        GrimProvider::open(grim_path.to_str().expect("path")).map_err(|e| format!("open: {e}"))?;
+    let meta = provider
+        .meta("blk.weight")
+        .map_err(|e| format!("meta: {e}"))?;
     assert_eq!(
         meta.dtype.storage,
         Storage::Block(grim_tensor::BlockDtype::Int8PerChannel),
         "{name}: tag 672 must load as row-scaled INT8"
     );
-    assert_eq!(meta.shape, vec![n, k], "{name}: loader must preserve [n, k]");
-    let raw = provider.get("blk.weight").map_err(|e| format!("get: {e}"))?;
+    assert_eq!(
+        meta.shape,
+        vec![n, k],
+        "{name}: loader must preserve [n, k]"
+    );
+    let raw = provider
+        .get("blk.weight")
+        .map_err(|e| format!("get: {e}"))?;
 
     // 4. Host reference from the SAME file-loaded bytes, so a layout
     //    disagreement shows as a numeric mismatch rather than cancelling out.
@@ -201,7 +216,9 @@ fn journey_case(m: usize, n: usize, k: usize, name: &str) -> TestResult {
     // 5. Through the real dispatch, from the file-loaded bytes.
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
         DType {
             arith: ArithType::F32,
@@ -209,13 +226,8 @@ fn journey_case(m: usize, n: usize, k: usize, name: &str) -> TestResult {
         },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
-    let b_t = MemoryOps::from_cpu_bytes(
-        &dev,
-        &raw.bytes,
-        &Shape::new(vec![n, k]),
-        meta.dtype,
-    )
-    .map_err(|e| format!("b h2d: {e}"))?;
+    let b_t = MemoryOps::from_cpu_bytes(&dev, &raw.bytes, &Shape::new(vec![n, k]), meta.dtype)
+        .map_err(|e| format!("b h2d: {e}"))?;
 
     let (c_t, _handle) = dev.quantized_matmul(
         &*a_t,

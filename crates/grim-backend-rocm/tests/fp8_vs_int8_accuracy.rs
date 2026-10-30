@@ -158,7 +158,9 @@ fn relative_l2(got: &[f32], oracle: &[f64]) -> f64 {
 #[test]
 #[ignore = "FP8 loses to Q8_0 by 7.8x here; needs a ship/no-ship decision (see note)"]
 fn fp8_weights_are_within_2x_of_int8_under_channel_outliers() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
 
     let w = weights_with_channel_outliers();
     let a = activations();
@@ -166,14 +168,19 @@ fn fp8_weights_are_within_2x_of_int8_under_channel_outliers() -> TestResult {
     // The f32 oracle both arms are judged against: the *original* values, not the
     // quantized ones. The question is which format preserves the real weights, so
     // an oracle built from either arm's own quantized data would answer nothing.
-    let oracle: Vec<f64> = (0..N).map(|n| (0..K).map(|k| a[k] as f64 * w[k * N + n] as f64).sum()).collect();
+    let oracle: Vec<f64> = (0..N)
+        .map(|n| (0..K).map(|k| a[k] as f64 * w[k * N + n] as f64).sum())
+        .collect();
 
     let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
         &a_bytes,
         &Shape::new(vec![1, K]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
 
@@ -182,28 +189,51 @@ fn fp8_weights_are_within_2x_of_int8_under_channel_outliers() -> TestResult {
         &dev,
         &pack_fp8(&w),
         &Shape::new(vec![K * N]),
-        DType { arith: ArithType::F32, storage: Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8) },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8),
+        },
     )
     .map_err(|e| format!("fp8 b: {e}"))?;
     let q8_b = MemoryOps::from_cpu_bytes(
         &dev,
         &pack_q8_0(&w),
         &Shape::new(vec![K * N / 32 * 34]),
-        DType { arith: ArithType::F32, storage: Storage::KQuant(grim_tensor::KQuantScheme::Q80) },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(grim_tensor::KQuantScheme::Q80),
+        },
     )
     .map_err(|e| format!("q8_0 b: {e}"))?;
 
     let out_shape = Shape::new(vec![1, N]);
     let read = |t: &Box<dyn grim_tensor::BackendStorage>| -> TestResult<Vec<f32>> {
-        let raw = grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
-        Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        let raw = grim_backend_rocm::as_rocm(t.as_ref())
+            .map_err(|e| e.to_string())?
+            .copy_to_host()?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     };
 
     let (fp8_out, _) = dev
-        .quantized_matmul(&*a_t, &*fp8_b, &[], grim_tensor::QuantFormat::Fp8, &out_shape)
+        .quantized_matmul(
+            &*a_t,
+            &*fp8_b,
+            &[],
+            grim_tensor::QuantFormat::Fp8,
+            &out_shape,
+        )
         .map_err(|e| format!("fp8 arm: {e}"))?;
     let (int8_out, _) = dev
-        .quantized_matmul(&*a_t, &*q8_b, &[], grim_tensor::QuantFormat::Q8_0, &out_shape)
+        .quantized_matmul(
+            &*a_t,
+            &*q8_b,
+            &[],
+            grim_tensor::QuantFormat::Q8_0,
+            &out_shape,
+        )
         .map_err(|e| format!("int8 arm: {e}"))?;
     dev.synchronize();
 

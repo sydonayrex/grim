@@ -10,11 +10,11 @@ use grim_core::session::{Inner, SessionT};
 use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_tensor::{
-    ArithType, CoreTensorOps, DType, Device, QuantProvenance, RecurrentOps, Shape, Storage, Tensor,
+    ArithType, CoreTensorOps, DType, Device, MemoryOps, QuantProvenance, RecurrentOps, Shape,
+    Storage, Tensor,
 };
 
 // Config
-
 
 /// Why a D2D decode path declined, for `GRIM_D2D_TRACE=1`.
 pub(crate) fn d2d_trace_enabled() -> bool {
@@ -25,7 +25,11 @@ pub(crate) fn d2d_trace_enabled() -> bool {
 /// Check if D2D is strictly required (panics or errors on fallback)
 pub(crate) fn d2d_strict_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GRIM_FORCE_D2D").map(|v| v != "0").unwrap_or(false))
+    *ON.get_or_init(|| {
+        std::env::var("GRIM_FORCE_D2D")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
 }
 
 /// `GRIM_DEBUG_ATTN_SHAPES`, cached.
@@ -151,6 +155,13 @@ pub struct Qwen35LayerCache {
     pub k_device: Option<Box<dyn grim_tensor::BackendStorage>>,
     #[doc(hidden)]
     pub v_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// Phase-2 int8 scale sidecars: f32 per (row, kv_head), parallel to
+    /// `k_device`/`v_device` codes arenas. `None` unless the int8 format is
+    /// active (F32/F16 need no sidecar).
+    #[doc(hidden)]
+    pub k_scales_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+    #[doc(hidden)]
+    pub v_scales_device: Option<Box<dyn grim_tensor::BackendStorage>>,
     /// Quantized paged KV cache, used when `GRIM_KV_QUANT` selects a packed
     /// format. `k_pages`/`v_pages` hold packed sub-blocks; `block_table` maps
     /// logical page index -> physical page id for the paged attention kernel.
@@ -197,6 +208,8 @@ impl std::fmt::Debug for Qwen35LayerCache {
             .field("current_pos", &self.current_pos)
             .field("k_device", &self.k_device.is_some())
             .field("v_device", &self.v_device.is_some())
+            .field("k_scales_device", &self.k_scales_device.is_some())
+            .field("v_scales_device", &self.v_scales_device.is_some())
             .field("k_pages", &self.k_pages.is_some())
             .field("conv_state_dev", &self.conv_state_dev.is_some())
             .field("ssm_state_dev", &self.ssm_state_dev.is_some())
@@ -216,6 +229,8 @@ impl Clone for Qwen35LayerCache {
             current_pos: self.current_pos,
             k_device: None,
             v_device: None,
+            k_scales_device: None,
+            v_scales_device: None,
             k_pages: None,
             v_pages: None,
             block_table: None,
@@ -247,6 +262,8 @@ impl Qwen35LayerCache {
             current_pos: 0,
             k_device: None,
             v_device: None,
+            k_scales_device: None,
+            v_scales_device: None,
             k_pages: None,
             v_pages: None,
             block_table: None,
@@ -459,7 +476,9 @@ impl Qwen35Block {
                 ) {
                     Ok(l) => Some(l),
                     Err(e) => {
-                        eprintln!("[qwen35-load-error] layer {layer_idx} attn_qkv failed to load: {e}");
+                        eprintln!(
+                            "[qwen35-load-error] layer {layer_idx} attn_qkv failed to load: {e}"
+                        );
                         return Err(grim_core::error::Error::Backend(format!(
                             "qwen35 layer {layer_idx} attn_qkv failed: {e}"
                         )));
@@ -524,22 +543,39 @@ impl Qwen35Block {
             .get_unconstrained("ssm_a")
             .ok()
             .and_then(|t| t.to_vec_f32().ok());
-        let ssm_alpha = Linear::load_column_parallel(
-            &ws.pp("ssm_alpha"),
-            cfg.hidden_size,
-            cfg.ssm_dt_rank,
-            false,
-            tp,
-        )
-        .ok();
-        let ssm_beta = Linear::load_column_parallel(
-            &ws.pp("ssm_beta"),
-            cfg.hidden_size,
-            cfg.ssm_dt_rank,
-            false,
-            tp,
-        )
-        .ok();
+        // The KDA alpha/beta gates are loaded at f32 even when the checkpoint
+        // quantizes them. They are tiny ([dt_rank, hidden] = 48x5120 = 0.5 MB
+        // each) and precision-critical: alpha is the recurrence decay and beta
+        // the write strength, so a coarse quantized projection corrupts the
+        // whole Gated DeltaNet stream. The reference Q4_K_M checkpoint keeps
+        // them f32; a UD checkpoint that quantizes them to Q8_0 routed them
+        // through the int8-dot GEMV, whose activation quantization is coarser
+        // than llama.cpp's q8_1 and moved the 27B's step-0 logprob from -0.2 to
+        // -4.6. Dequantizing these two to f32 restores it. `GRIM_SSM_AB_F32=0`
+        // keeps the checkpoint scheme for A/B.
+        let ab_f32 = !matches!(
+            std::env::var("GRIM_SSM_AB_F32").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        let load_ab = |name: &str| -> Option<Linear> {
+            if ab_f32 {
+                ws.pp(name)
+                    .get_f32([cfg.ssm_dt_rank, cfg.hidden_size], "weight")
+                    .ok()
+                    .map(|t| Linear::from_tensor(t, None))
+            } else {
+                Linear::load_column_parallel(
+                    &ws.pp(name),
+                    cfg.hidden_size,
+                    cfg.ssm_dt_rank,
+                    false,
+                    tp,
+                )
+                .ok()
+            }
+        };
+        let ssm_alpha = load_ab("ssm_alpha");
+        let ssm_beta = load_ab("ssm_beta");
         let ssm_dt_bias = ws
             .get_unconstrained("ssm_dt.bias")
             .ok()
@@ -642,13 +678,31 @@ impl Qwen35Block {
             let n_val = cfg.ssm_dt_rank.max(1);
             let h_dim = cfg.ssm_d_state.max(1);
             let dt_b = ssm_dt_bias.as_ref().and_then(|v| {
-                dev.from_cpu(&v[..n_val.min(v.len())], &Shape::new(vec![n_val]), DType::F32).ok().map(std::sync::Arc::from)
+                dev.from_cpu(
+                    &v[..n_val.min(v.len())],
+                    &Shape::new(vec![n_val]),
+                    DType::F32,
+                )
+                .ok()
+                .map(std::sync::Arc::from)
             });
             let sa_b = ssm_a.as_ref().and_then(|v| {
-                dev.from_cpu(&v[..n_val.min(v.len())], &Shape::new(vec![n_val]), DType::F32).ok().map(std::sync::Arc::from)
+                dev.from_cpu(
+                    &v[..n_val.min(v.len())],
+                    &Shape::new(vec![n_val]),
+                    DType::F32,
+                )
+                .ok()
+                .map(std::sync::Arc::from)
             });
             let sn_b = ssm_norm.as_ref().and_then(|v| {
-                dev.from_cpu(&v[..h_dim.min(v.len())], &Shape::new(vec![h_dim]), DType::F32).ok().map(std::sync::Arc::from)
+                dev.from_cpu(
+                    &v[..h_dim.min(v.len())],
+                    &Shape::new(vec![h_dim]),
+                    DType::F32,
+                )
+                .ok()
+                .map(std::sync::Arc::from)
             });
             (dt_b, sa_b, sn_b)
         } else {
@@ -755,8 +809,7 @@ impl Qwen35Block {
             && seq_len == 1
             && self.layer_idx == 0
         {
-            static ENTRY: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static ENTRY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if call == 2 {
                 // call 1 = prefill, call 2 = decode step 1. Read x TWICE
@@ -783,10 +836,7 @@ impl Qwen35Block {
                                 if round == 1 {
                                     let bytes: Vec<u8> =
                                         vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-                                    let _ = std::fs::write(
-                                        "/tmp/kda_probe_x_entry.bin",
-                                        &bytes,
-                                    );
+                                    let _ = std::fs::write("/tmp/kda_probe_x_entry.bin", &bytes);
                                 }
                             }
                             Err(e) => eprintln!("[x-entry] round {round} read FAILED: {e}"),
@@ -823,446 +873,630 @@ impl Qwen35Block {
             if let Some(t) = attention_layer_d2d(self, &x_normed, positions, cache, seq_len)? {
                 branch_dev = Some(t);
             } else {
-            // TEMP probe: the attention branch aborts on a bad transfer at the
-            // first attention layer, on both the D2D and host routes. Print the
-            // geometry each step assumes so a wrong width is visible without
-            // re-deriving it.
-            if attn_shapes_debug() {
-                let shp = |t: &Option<Linear>| {
-                    t.as_ref()
-                        .map(|l| (l.weight().shape().dims().to_vec(), l.weight().shape().elem_count()))
-                };
-                let nshp = |n: &Option<RmsNorm>| {
-                    n.as_ref().map(|x| (x.weight.shape().dims().to_vec(), x.weight.shape().elem_count()))
-                };
-                eprintln!(
-                    "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
-                    self.layer_idx,
-                    seq_len,
-                    shp(&self.wq),
-                    shp(&self.wk),
-                    shp(&self.wv),
-                    shp(&self.wo),
-                    nshp(&self.attn_q_norm),
-                    nshp(&self.attn_k_norm),
-                    shp(&self.attn_gate),
-                );
-            }
-            // Attention path with separated wq, wk, wv.
-            // GPU-first: projections stay on-device; RoPE runs through the device kernel; K/V are appended into the.
-            let dev = pick_device_for_storage_device(&device);
-            // Some TP-sharded projections emit padded rows — cut to the
-            // exact [seq, width] extent via a D2D staging copy when needed.
-            let exact = |t: Tensor, rows: usize, width: usize| -> Result<Tensor> {
-                let want = Shape::new(vec![rows, width]);
-                if t.shape().elem_count() == rows * width {
-                    return crate::block::reshaped_view(&t, &want);
-                }
-                let scratch = dev.alloc_storage(&want, DType::F32)?;
-                dev.copy_slice_range(scratch.as_ref(), 0, t.storage().as_ref(), 0, rows * width)?;
-                Ok(Tensor::new(
-                    scratch.into(),
-                    want,
-                    DType::F32,
-                    t.provenance().clone(),
-                    t.device().clone(),
-                ))
-            };
-
-            let mut rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
-            rope_cfg.rotary_dim = self.rotary_dim;
-            // NeoX HALF-SPLIT pairing, not GPT-J interleaved.
-            //
-            // `RopeConfig::interleaved` defaults to `true` (x[2i], x[2i+1]) because
-            // that is what the LFM2 family uses. Qwen3.5/3.8 does NOT: llama.cpp
-            // runs it through `ggml_rope_multi`, whose NEOX/MROPE branch is
-            //   `rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst)`
-            // (ggml/src/ggml-cpu/ops.cpp:6212), and `rotate_pairs` reads
-            //   x0 = src[ic],  x1 = src[ic + n_offset]        (ops.cpp:6073-6074)
-            // i.e. dim i pairs with dim i + n_dims/2 — the half-split. With
-            // rotary_dim=64 that is (0,32),(1,33),...,(31,63), and dims 64..255
-            // pass through unrotated.
-            //
-            // Leaving the default silently rotated Q/K by the wrong pairs. It is
-            // invisible at position 0, where a RoPE is the identity, which is why
-            // every position-0 assertion and every one-token gate passed while
-            // the model was comprehensively wrong.
-            rope_cfg.interleaved = false;
-            let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
-                let mut pos_ext = Vec::with_capacity(seq_len * heads);
-                for &pos in positions {
-                    for _ in 0..heads {
-                        pos_ext.push(pos);
-                    }
-                }
-                let t3 = crate::block::reshaped_view(
-                    t,
-                    &Shape::new(vec![1, seq_len * heads, self.head_dim]),
-                )?;
-                if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() && heads == self.num_kv_heads {
-                    let pre_rope = t.to_vec_f32()?;
-                    let t3_flat = t3.to_vec_f32()?;
+                // TEMP probe: the attention branch aborts on a bad transfer at the
+                // first attention layer, on both the D2D and host routes. Print the
+                // geometry each step assumes so a wrong width is visible without
+                // re-deriving it.
+                if attn_shapes_debug() {
+                    let shp = |t: &Option<Linear>| {
+                        t.as_ref().map(|l| {
+                            (
+                                l.weight().shape().dims().to_vec(),
+                                l.weight().shape().elem_count(),
+                            )
+                        })
+                    };
+                    let nshp = |n: &Option<RmsNorm>| {
+                        n.as_ref().map(|x| {
+                            (
+                                x.weight.shape().dims().to_vec(),
+                                x.weight.shape().elem_count(),
+                            )
+                        })
+                    };
                     eprintln!(
-                        "[rope_isolate pre] seq_len={} heads={} hd={} t_len={} t3_len={}",
-                        seq_len, heads, self.head_dim, pre_rope.len(), t3_flat.len()
+                        "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
+                        self.layer_idx,
+                        seq_len,
+                        shp(&self.wq),
+                        shp(&self.wk),
+                        shp(&self.wv),
+                        shp(&self.wo),
+                        nshp(&self.attn_q_norm),
+                        nshp(&self.attn_k_norm),
+                        shp(&self.attn_gate),
                     );
-                    for r in 0..seq_len.min(5) {
-                        let off = r * heads * self.head_dim;
-                        eprintln!(
-                            "[rope_isolate t_row {}] {:?} ...",
-                            r,
-                            &pre_rope[off..off + 4.min(pre_rope.len() - off)]
-                        );
-                        eprintln!(
-                            "[rope_isolate t3_row {}] {:?} ...",
-                            r,
-                            &t3_flat[off..off + 4.min(t3_flat.len() - off)]
-                        );
-                    }
                 }
-                let (rope_s, _) =
-                    dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape())?;
-                let roped = Tensor::new(
-                    rope_s.into(),
-                    t3.shape().clone(),
-                    DType::F32,
-                    t.provenance().clone(),
-                    t.device().clone(),
-                );
-                let reshaped = crate::block::reshaped_view(
-                    &roped,
-                    &Shape::new(vec![seq_len, heads * self.head_dim]),
-                )?;
-                if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() && heads == self.num_kv_heads {
-                    let roped_raw = roped.to_vec_f32()?;
-                    let res_raw = reshaped.to_vec_f32()?;
-                    for r in 0..seq_len.min(5) {
-                        let off = r * heads * self.head_dim;
-                        eprintln!(
-                            "[rope_isolate roped_row {}] {:?} ...",
-                            r,
-                            &roped_raw[off..off + 4.min(roped_raw.len() - off)]
-                        );
-                        eprintln!(
-                            "[rope_isolate res_row {}] {:?} ...",
-                            r,
-                            &res_raw[off..off + 4.min(res_raw.len() - off)]
-                        );
+                // Attention path with separated wq, wk, wv.
+                // GPU-first: projections stay on-device; RoPE runs through the device kernel; K/V are appended into the.
+                let dev = pick_device_for_storage_device(&device);
+                // Some TP-sharded projections emit padded rows — cut to the
+                // exact [seq, width] extent via a D2D staging copy when needed.
+                let exact = |t: Tensor, rows: usize, width: usize| -> Result<Tensor> {
+                    let want = Shape::new(vec![rows, width]);
+                    if t.shape().elem_count() == rows * width {
+                        return crate::block::reshaped_view(&t, &want);
                     }
-                }
-                Ok(reshaped)
-            };
+                    let scratch = dev.alloc_storage(&want, DType::F32)?;
+                    dev.copy_slice_range(
+                        scratch.as_ref(),
+                        0,
+                        t.storage().as_ref(),
+                        0,
+                        rows * width,
+                    )?;
+                    Ok(Tensor::new(
+                        scratch.into(),
+                        want,
+                        DType::F32,
+                        t.provenance().clone(),
+                        t.device().clone(),
+                    ))
+                };
 
-            // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
-            // (pre-rope) instead of 3 separate GEMVs; the same rope_ext and
-            // arena-attention path follow unchanged.
-            let (q_dev, k_dev_t, v_dev_t, q_gate): (Tensor, Tensor, Tensor, Option<Tensor>) =
-                match self.wqkv_q80_fused.as_ref() {
-                    Some(fused) if seq_len == 1 => {
-                        let (q, k, v) =
-                            crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
-                        // The fused-QKV path has no separate attn_q tensor, so it
-                        // has NO gate half. `None` means "do not apply a gate" —
-                        // a zero tensor would be read as sigmoid(0) = 0.5 and
-                        // uniformly halve every decode step.
-                        (q, k, v, None)
+                let mut rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+                rope_cfg.rotary_dim = self.rotary_dim;
+                // NeoX HALF-SPLIT pairing, not GPT-J interleaved.
+                //
+                // `RopeConfig::interleaved` defaults to `true` (x[2i], x[2i+1]) because
+                // that is what the LFM2 family uses. Qwen3.5/3.8 does NOT: llama.cpp
+                // runs it through `ggml_rope_multi`, whose NEOX/MROPE branch is
+                //   `rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst)`
+                // (ggml/src/ggml-cpu/ops.cpp:6212), and `rotate_pairs` reads
+                //   x0 = src[ic],  x1 = src[ic + n_offset]        (ops.cpp:6073-6074)
+                // i.e. dim i pairs with dim i + n_dims/2 — the half-split. With
+                // rotary_dim=64 that is (0,32),(1,33),...,(31,63), and dims 64..255
+                // pass through unrotated.
+                //
+                // Leaving the default silently rotated Q/K by the wrong pairs. It is
+                // invisible at position 0, where a RoPE is the identity, which is why
+                // every position-0 assertion and every one-token gate passed while
+                // the model was comprehensively wrong.
+                rope_cfg.interleaved = false;
+                let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
+                    let mut pos_ext = Vec::with_capacity(seq_len * heads);
+                    for &pos in positions {
+                        for _ in 0..heads {
+                            pos_ext.push(pos);
+                        }
                     }
-                    _ => {
-                        // attn_q emits [Q(q_dim) | gate(q_dim)] fused, so split it
-                        // ROW-AWARE per token. A flat byte-range copy of the first
-                        // q_dim elements is wrong for seq_len > 1: it cuts across
-                        // row boundaries and scrambles Q itself, not just the gate.
-                        let (q_dev, q_gate) = match self.wq.as_ref() {
-                            Some(wq) => {
-                                let full = wq.forward(&x_normed)?.to_vec_f32()?;
-                                let wide = full.len() / seq_len.max(1);
-                                let mut q_rows = vec![0.0f32; seq_len * q_dim];
-                                let mut gate_rows = vec![0.0f32; seq_len * q_dim];
-                                // [all Q | all gate] per row: the checkpoint's
-                                // per-head interleave was permuted away at load
-                                // (see the attn_q_perm construction above).
-                                for t in 0..seq_len {
-                                    let base = t * wide;
-                                    if base + wide > full.len() {
-                                        continue;
+                    let t3 = crate::block::reshaped_view(
+                        t,
+                        &Shape::new(vec![1, seq_len * heads, self.head_dim]),
+                    )?;
+                    if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok()
+                        && heads == self.num_kv_heads
+                    {
+                        let pre_rope = t.to_vec_f32()?;
+                        let t3_flat = t3.to_vec_f32()?;
+                        eprintln!(
+                            "[rope_isolate pre] seq_len={} heads={} hd={} t_len={} t3_len={}",
+                            seq_len,
+                            heads,
+                            self.head_dim,
+                            pre_rope.len(),
+                            t3_flat.len()
+                        );
+                        for r in 0..seq_len.min(5) {
+                            let off = r * heads * self.head_dim;
+                            eprintln!(
+                                "[rope_isolate t_row {}] {:?} ...",
+                                r,
+                                &pre_rope[off..off + 4.min(pre_rope.len() - off)]
+                            );
+                            eprintln!(
+                                "[rope_isolate t3_row {}] {:?} ...",
+                                r,
+                                &t3_flat[off..off + 4.min(t3_flat.len() - off)]
+                            );
+                        }
+                    }
+                    let (rope_s, _) =
+                        dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape())?;
+                    let roped = Tensor::new(
+                        rope_s.into(),
+                        t3.shape().clone(),
+                        DType::F32,
+                        t.provenance().clone(),
+                        t.device().clone(),
+                    );
+                    let reshaped = crate::block::reshaped_view(
+                        &roped,
+                        &Shape::new(vec![seq_len, heads * self.head_dim]),
+                    )?;
+                    if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok()
+                        && heads == self.num_kv_heads
+                    {
+                        let roped_raw = roped.to_vec_f32()?;
+                        let res_raw = reshaped.to_vec_f32()?;
+                        for r in 0..seq_len.min(5) {
+                            let off = r * heads * self.head_dim;
+                            eprintln!(
+                                "[rope_isolate roped_row {}] {:?} ...",
+                                r,
+                                &roped_raw[off..off + 4.min(roped_raw.len() - off)]
+                            );
+                            eprintln!(
+                                "[rope_isolate res_row {}] {:?} ...",
+                                r,
+                                &res_raw[off..off + 4.min(res_raw.len() - off)]
+                            );
+                        }
+                    }
+                    Ok(reshaped)
+                };
+
+                // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
+                // (pre-rope) instead of 3 separate GEMVs; the same rope_ext and
+                // arena-attention path follow unchanged.
+                let (q_dev, k_dev_t, v_dev_t, q_gate): (Tensor, Tensor, Tensor, Option<Tensor>) =
+                    match self.wqkv_q80_fused.as_ref() {
+                        Some(fused) if seq_len == 1 => {
+                            let (q, k, v) =
+                                crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
+                            // The fused-QKV path has no separate attn_q tensor, so it
+                            // has NO gate half. `None` means "do not apply a gate" —
+                            // a zero tensor would be read as sigmoid(0) = 0.5 and
+                            // uniformly halve every decode step.
+                            (q, k, v, None)
+                        }
+                        _ => {
+                            // attn_q emits [Q(q_dim) | gate(q_dim)] fused, so split it
+                            // ROW-AWARE per token. A flat byte-range copy of the first
+                            // q_dim elements is wrong for seq_len > 1: it cuts across
+                            // row boundaries and scrambles Q itself, not just the gate.
+                            let (q_dev, q_gate) = match self.wq.as_ref() {
+                                Some(wq) => {
+                                    let full = wq.forward(&x_normed)?.to_vec_f32()?;
+                                    let wide = full.len() / seq_len.max(1);
+                                    let mut q_rows = vec![0.0f32; seq_len * q_dim];
+                                    let mut gate_rows = vec![0.0f32; seq_len * q_dim];
+                                    // [all Q | all gate] per row: the checkpoint's
+                                    // per-head interleave was permuted away at load
+                                    // (see the attn_q_perm construction above).
+                                    for t in 0..seq_len {
+                                        let base = t * wide;
+                                        if base + wide > full.len() {
+                                            continue;
+                                        }
+                                        let row = &full[base..base + wide];
+                                        let n = q_dim.min(wide);
+                                        q_rows[t * q_dim..t * q_dim + n].copy_from_slice(&row[..n]);
+                                        if wide >= 2 * q_dim {
+                                            gate_rows[t * q_dim..t * q_dim + n]
+                                                .copy_from_slice(&row[q_dim..q_dim + n]);
+                                        }
                                     }
-                                    let row = &full[base..base + wide];
-                                    let n = q_dim.min(wide);
-                                    q_rows[t * q_dim..t * q_dim + n].copy_from_slice(&row[..n]);
-                                    if wide >= 2 * q_dim {
-                                        gate_rows[t * q_dim..t * q_dim + n]
-                                            .copy_from_slice(&row[q_dim..q_dim + n]);
-                                    }
+                                    (
+                                        device_tensor(
+                                            q_rows,
+                                            Shape::new(vec![seq_len, q_dim]),
+                                            &device,
+                                        )?,
+                                        Some(device_tensor(
+                                            gate_rows,
+                                            Shape::new(vec![seq_len, q_dim]),
+                                            &device,
+                                        )?),
+                                    )
                                 }
-                                (
-                                    device_tensor(
-                                        q_rows,
+                                None => (
+                                    Tensor::new(
+                                        dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                                            .into(),
                                         Shape::new(vec![seq_len, q_dim]),
-                                        &device,
-                                    )?,
-                                    Some(device_tensor(
-                                        gate_rows,
-                                        Shape::new(vec![seq_len, q_dim]),
-                                        &device,
-                                    )?),
-                                )
-                            }
-                            None => (
-                                Tensor::new(
-                                    dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                                        DType::F32,
+                                        x_normed.provenance().clone(),
+                                        x_normed.device().clone(),
+                                    ),
+                                    // No attn_q weights at all: nothing to gate with.
+                                    None,
+                                ),
+                            };
+                            let k_dev_t = match self.wk.as_ref() {
+                                Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
+                                None => Tensor::new(
+                                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
                                         .into(),
-                                    Shape::new(vec![seq_len, q_dim]),
+                                    Shape::new(vec![seq_len, kv_dim]),
                                     DType::F32,
                                     x_normed.provenance().clone(),
                                     x_normed.device().clone(),
                                 ),
-                                // No attn_q weights at all: nothing to gate with.
-                                None,
-                            ),
-                        };
-                        let k_dev_t = match self.wk.as_ref() {
-                            Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
-                            None => Tensor::new(
-                                dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
-                                    .into(),
-                                Shape::new(vec![seq_len, kv_dim]),
-                                DType::F32,
-                                x_normed.provenance().clone(),
-                                x_normed.device().clone(),
-                            ),
-                        };
-                        let v_dev_t = match self.wv.as_ref() {
-                            Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
-                            None => Tensor::new(
-                                dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
-                                    .into(),
-                                Shape::new(vec![seq_len, kv_dim]),
-                                DType::F32,
-                                x_normed.provenance().clone(),
-                                x_normed.device().clone(),
-                            ),
-                        };
-                        (q_dev, k_dev_t, v_dev_t, q_gate)
+                            };
+                            let v_dev_t = match self.wv.as_ref() {
+                                Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
+                                None => Tensor::new(
+                                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
+                                        .into(),
+                                    Shape::new(vec![seq_len, kv_dim]),
+                                    DType::F32,
+                                    x_normed.provenance().clone(),
+                                    x_normed.device().clone(),
+                                ),
+                            };
+                            (q_dev, k_dev_t, v_dev_t, q_gate)
+                        }
+                    };
+
+                // Q/K RMS norm, BEFORE RoPE. The reference does exactly this at
+                // qwen35.cpp:281/286 with MRoPE following at line 299. Both weights
+                // were previously loaded from the checkpoint and never applied, so
+                // unnormalized q and k reached RoPE and the softmax. Normalizing
+                // after RoPE would be a different function, not a reordering detail.
+                let q_dev = match self.attn_q_norm.as_ref() {
+                    Some(n) => {
+                        let w = n.weight.to_vec_f32()?;
+                        let cur = q_dev.to_vec_f32()?;
+                        let normed =
+                            apply_head_rms_norm(&cur, self.num_heads, self.head_dim, &w, n.eps);
+                        let sh = Shape::new(vec![seq_len, self.num_heads * self.head_dim]);
+                        Tensor::new(
+                            dev.from_cpu(&normed, &sh, DType::F32)?.into(),
+                            sh,
+                            DType::F32,
+                            q_dev.provenance().clone(),
+                            q_dev.device().clone(),
+                        )
                     }
+                    None => q_dev,
+                };
+                let k_dev_t = match self.attn_k_norm.as_ref() {
+                    Some(n) => {
+                        let w = n.weight.to_vec_f32()?;
+                        let cur = k_dev_t.to_vec_f32()?;
+                        let normed =
+                            apply_head_rms_norm(&cur, self.num_kv_heads, self.head_dim, &w, n.eps);
+                        if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
+                            let stride = self.num_kv_heads * self.head_dim;
+                            eprintln!(
+                                "[rope_isolate k_norm] seq_len={} stride={}",
+                                seq_len, stride
+                            );
+                            for r in 0..seq_len.min(5) {
+                                let off = r * stride;
+                                eprintln!(
+                                    "[rope_isolate k_raw_row {}] {:?} ...",
+                                    r,
+                                    &cur[off..off + 4.min(cur.len() - off)]
+                                );
+                                eprintln!(
+                                    "[rope_isolate k_normed_row {}] {:?} ...",
+                                    r,
+                                    &normed[off..off + 4.min(normed.len() - off)]
+                                );
+                            }
+                        }
+                        let sh = Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]);
+                        Tensor::new(
+                            dev.from_cpu(&normed, &sh, DType::F32)?.into(),
+                            sh,
+                            DType::F32,
+                            k_dev_t.provenance().clone(),
+                            k_dev_t.device().clone(),
+                        )
+                    }
+                    None => k_dev_t,
                 };
 
-            // Q/K RMS norm, BEFORE RoPE. The reference does exactly this at
-            // qwen35.cpp:281/286 with MRoPE following at line 299. Both weights
-            // were previously loaded from the checkpoint and never applied, so
-            // unnormalized q and k reached RoPE and the softmax. Normalizing
-            // after RoPE would be a different function, not a reordering detail.
-            let q_dev = match self.attn_q_norm.as_ref() {
-                Some(n) => {
-                    let w = n.weight.to_vec_f32()?;
-                    let cur = q_dev.to_vec_f32()?;
-                    let normed =
-                        apply_head_rms_norm(&cur, self.num_heads, self.head_dim, &w, n.eps);
-                    let sh = Shape::new(vec![seq_len, self.num_heads * self.head_dim]);
-                    Tensor::new(
-                        dev.from_cpu(&normed, &sh, DType::F32)?.into(),
-                        sh,
-                        DType::F32,
-                        q_dev.provenance().clone(),
-                        q_dev.device().clone(),
-                    )
+                let q_rope = rope_ext(&q_dev, self.num_heads)?;
+                let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
+
+                // Per-step Q crosses to host for the arena attention entry
+                // point; K/V history never leaves the device.
+                let q_all = q_rope.to_vec_f32()?;
+
+                // Quantized paged KV: when GRIM_KV_QUANT selects a packed format,
+                // the f32 rows produced above are quantized on the host, uploaded
+                // into paged buffers, and read back through the quant paged kernel.
+                // The dense f32 arena below is the default and is left untouched.
+                if let Some(fmt) = kv_quant_format() {
+                    return crate::shared_attention::fused_or_scalar_attention_paged_quant(
+                        &q_all,
+                        k_dev_t.storage().as_ref(),
+                        v_dev_t.storage().as_ref(),
+                        cache,
+                        fmt,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        seq_len,
+                        // Use the device the K rows actually live on, not the
+                        // layer's declared device: the packed-page append and the
+                        // paged kernel both need the concrete ROCm device, and a
+                        // mismatch silently resolves to a backend without the
+                        // byte-copy primitive.
+                        k_dev_t.device(),
+                    );
                 }
-                None => q_dev,
-            };
-            let k_dev_t = match self.attn_k_norm.as_ref() {
-                Some(n) => {
-                    let w = n.weight.to_vec_f32()?;
-                    let cur = k_dev_t.to_vec_f32()?;
-                    let normed =
-                        apply_head_rms_norm(&cur, self.num_kv_heads, self.head_dim, &w, n.eps);
+
+                // Append to the device arena (device-side). f32 rows convert to
+                // the arena dtype via arena_append_from_f32 — never a raw copy
+                // into an f16 arena. K/V history stays on the GPU.
+                ensure_arena_format_supported(&device)?;
+                let k_new_rows = seq_len * self.num_kv_heads;
+                let evict = kv_eviction_policy_for_layer(&device, self.layer_idx);
+                let k_cap_rows = cache
+                    .k_device
+                    .as_ref()
+                    .map(|s| s.shape().dims()[0])
+                    .unwrap_or(0);
+                let v_cap_rows = cache
+                    .v_device
+                    .as_ref()
+                    .map(|s| s.shape().dims()[0])
+                    .unwrap_or(0);
+                // Phase 3: the arena stops growing at the eviction capacity, and
+                // past it the write slot wraps into the ring instead.
+                let need_rows = evict.live_rows(cache.current_pos + k_new_rows);
+                let wrapped = evict
+                    .cap_rows
+                    .map(|cap| cache.current_pos >= cap)
+                    .unwrap_or(false);
+                let _ = v_cap_rows;
+
+                if k_cap_rows >= need_rows || wrapped {
+                    let k_dev = cache.k_device.as_ref().ok_or_else(|| {
+                        grim_core::error::Error::Backend("cache.k_device missing".into())
+                    })?;
+                    let v_dev = cache.v_device.as_ref().ok_or_else(|| {
+                        grim_core::error::Error::Backend("cache.v_device missing".into())
+                    })?;
+                    arena_append_kv_rows(
+                        &dev,
+                        &device,
+                        k_dev.as_ref(),
+                        v_dev.as_ref(),
+                        evict.arena_row(cache.current_pos),
+                        k_rope.storage().as_ref(),
+                        v_dev_t.storage().as_ref(),
+                        seq_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        cache.k_scales_device.as_deref(),
+                        cache.v_scales_device.as_deref(),
+                    )?;
+                    if cache.current_pos == 24 {
+                        use grim_backend_rocm::device::util::as_rocm;
+                        if let Ok(rocm) = as_rocm(k_dev.as_ref()) {
+                            let n_bytes = rocm.bytes();
+                            let mut host_bytes = vec![0u8; n_bytes];
+                            unsafe {
+                                if let Some(p) = rocm.device_ptr_u64() {
+                                    grim_backend_rocm::hipMemcpy(
+                                        host_bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                                        p as *const std::ffi::c_void,
+                                        n_bytes,
+                                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                                    );
+                                    let k_u16: &[u16] = std::slice::from_raw_parts(
+                                        host_bytes.as_ptr() as *const u16,
+                                        n_bytes / 2,
+                                    );
+                                    let r24_start = 24 * 1024;
+                                    let r24_end = (25 * 1024).min(k_u16.len());
+                                    let nans = k_u16[r24_start..r24_end]
+                                        .iter()
+                                        .filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0)
+                                        .count();
+                                    eprintln!(
+                                        "[eager-scan layer {}] step pos=24: k_ptr=0x{:x} total_rows={} r24_nans={nans}/1024 first_val=0x{:04x}",
+                                        self.layer_idx,
+                                        p,
+                                        k_u16.len() / 1024,
+                                        k_u16.get(r24_start).copied().unwrap_or(0)
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
-                        let stride = self.num_kv_heads * self.head_dim;
-                        eprintln!("[rope_isolate k_norm] seq_len={} stride={}", seq_len, stride);
-                        for r in 0..seq_len.min(5) {
+                        let arena_k = k_dev.to_cpu_vec_f32()?;
+                        let stride = self.head_dim;
+                        eprintln!(
+                            "[rope_isolate arena_dump] current_pos={} k_cap_rows={}",
+                            cache.current_pos, k_cap_rows
+                        );
+                        for r in 0..(cache.current_pos + k_new_rows).min(5) {
                             let off = r * stride;
                             eprintln!(
-                                "[rope_isolate k_raw_row {}] {:?} ...",
+                                "[rope_isolate arena_row {}] {:?} ...",
                                 r,
-                                &cur[off..off + 4.min(cur.len() - off)]
-                            );
-                            eprintln!(
-                                "[rope_isolate k_normed_row {}] {:?} ...",
-                                r,
-                                &normed[off..off + 4.min(normed.len() - off)]
+                                &arena_k[off..off + 4.min(arena_k.len().saturating_sub(off))]
                             );
                         }
                     }
-                    let sh = Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]);
-                    Tensor::new(
-                        dev.from_cpu(&normed, &sh, DType::F32)?.into(),
-                        sh,
-                        DType::F32,
-                        k_dev_t.provenance().clone(),
-                        k_dev_t.device().clone(),
-                    )
+                } else {
+                    // Arena full — grow geometrically and re-copy via D2D.
+                    // Phase 3: clamped to the eviction capacity (never resized
+                    // past it — the arena is reused instead).
+                    let new_rows = ((need_rows * 2) + 64)
+                        .next_power_of_two()
+                        .min(evict.cap_rows.unwrap_or(usize::MAX))
+                        .max(need_rows);
+                    let fmt = kv_arena_format_qwen(&device);
+                    let full_shape = Shape::new(vec![
+                        new_rows,
+                        self.num_kv_heads,
+                        kv_arena_head_extent(fmt, self.head_dim),
+                    ]);
+                    let row_extent = kv_arena_row_extent(fmt, self.num_kv_heads, self.head_dim);
+                    let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
+                    let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
+                    if let Some(ref old_k) = cache.k_device {
+                        dev.copy_slice_range(
+                            k_grown.as_ref(),
+                            0,
+                            old_k.as_ref(),
+                            0,
+                            cache.current_pos * row_extent,
+                        )?;
+                    }
+                    if let Some(ref old_v) = cache.v_device {
+                        dev.copy_slice_range(
+                            v_grown.as_ref(),
+                            0,
+                            old_v.as_ref(),
+                            0,
+                            cache.current_pos * row_extent,
+                        )?;
+                    }
+                    // Install the grown arena and its int8 sidecars BEFORE the append: the
+                    // quantizer writes codes AND scales in one launch, so the sidecar must
+                    // exist first (and its carry-over copies from the previous one).
+                    cache.k_device = Some(k_grown);
+                    cache.v_device = Some(v_grown);
+                    ensure_int8_scales(
+                        &dev,
+                        &device,
+                        &mut cache.k_scales_device,
+                        &mut cache.v_scales_device,
+                        new_rows,
+                        cache.current_pos,
+                        self.num_kv_heads,
+                    )?;
+                    let (k_g, v_g) = (
+                        cache.k_device.as_ref().expect("just installed"),
+                        cache.v_device.as_ref().expect("just installed"),
+                    );
+                    arena_append_kv_rows(
+                        &dev,
+                        &device,
+                        k_g.as_ref(),
+                        v_g.as_ref(),
+                        cache.current_pos,
+                        k_rope.storage().as_ref(),
+                        v_dev_t.storage().as_ref(),
+                        seq_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        cache.k_scales_device.as_deref(),
+                        cache.v_scales_device.as_deref(),
+                    )?;
                 }
-                None => k_dev_t,
-            };
 
-            let q_rope = rope_ext(&q_dev, self.num_heads)?;
-            let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
+                // WS-4.3: CurDKV compaction at the eviction boundary. Survivors
+                // are chosen by leverage score (sinks + residual + top-k) and
+                // gathered to the front; `current_pos` is reset to the retained
+                // count so the attention below reads exactly that prefix.
+                if evict.mode == EvictionMode::Curdkv {
+                    curdkv_compact_arena(
+                        &dev,
+                        &mut *cache,
+                        &evict,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    )?;
+                }
 
-            // Per-step Q crosses to host for the arena attention entry
-            // point; K/V history never leaves the device.
-            let q_all = q_rope.to_vec_f32()?;
-
-            // Quantized paged KV: when GRIM_KV_QUANT selects a packed format,
-            // the f32 rows produced above are quantized on the host, uploaded
-            // into paged buffers, and read back through the quant paged kernel.
-            // The dense f32 arena below is the default and is left untouched.
-            if let Some(fmt) = kv_quant_format() {
-                return crate::shared_attention::fused_or_scalar_attention_paged_quant(
-                    &q_all,
-                    k_dev_t.storage().as_ref(),
-                    v_dev_t.storage().as_ref(),
-                    cache,
-                    fmt,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    seq_len,
-                    // Use the device the K rows actually live on, not the
-                    // layer's declared device: the packed-page append and the
-                    // paged kernel both need the concrete ROCm device, and a
-                    // mismatch silently resolves to a backend without the
-                    // byte-copy primitive.
-                    k_dev_t.device(),
-                );
-            }
-
-            // Append to the device arena via copy_slice_range (device-side).
-            // K/V history stays on the GPU — never round-trips to host.
-            let k_new_rows = seq_len * self.num_kv_heads;
-            let kv_elems = k_new_rows * self.head_dim;
-            let k_cap_rows = cache
-                .k_device
-                .as_ref()
-                .map(|s| s.shape().dims()[0])
-                .unwrap_or(0);
-            let v_cap_rows = cache
-                .v_device
-                .as_ref()
-                .map(|s| s.shape().dims()[0])
-                .unwrap_or(0);
-            let need_rows = cache.current_pos + k_new_rows;
-            let _ = v_cap_rows;
-
-            if k_cap_rows >= need_rows {
+                // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
+                let total_kv = evict.live_rows(cache.current_pos + seq_len);
                 let k_dev = cache.k_device.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("cache.k_device missing".into())
                 })?;
                 let v_dev = cache.v_device.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("cache.v_device missing".into())
                 })?;
-                dev.copy_slice_range(
-                    &**k_dev,
-                    cache.current_pos * self.num_kv_heads * self.head_dim,
-                    k_rope.storage().as_ref(),
-                    0,
-                    kv_elems,
-                )?;
-                if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
-                    let arena_k = k_dev.to_cpu_vec_f32()?;
-                    let stride = self.head_dim;
-                    eprintln!("[rope_isolate arena_dump] current_pos={} k_cap_rows={}", cache.current_pos, k_cap_rows);
-                    for r in 0..(cache.current_pos + k_new_rows).min(5) {
-                        let off = r * stride;
-                        eprintln!(
-                            "[rope_isolate arena_row {}] {:?} ...",
-                            r,
-                            &arena_k[off..off + 4.min(arena_k.len().saturating_sub(off))]
-                        );
+                // int8/int4 arenas carry a scale sidecar.
+                let format = kv_arena_format_qwen(&device);
+                let attn_tensor = match (
+                    cache.k_scales_device.as_ref(),
+                    cache.v_scales_device.as_ref(),
+                ) {
+                    // WhiteCrow first: its 67-byte blocks carry the scale
+                    // INLINE, so k/v_scales_device are None and the arm must
+                    // intercept BEFORE the `_` f32 fallthrough — falling
+                    // through would hand the byte-arena to the f32 reader
+                    // and silently reinterpret quantized bytes as floats.
+                    _ if format == grim_backend_rocm::KvArenaFormat::WhiteCrow => {
+                        crate::shared_attention::fused_or_scalar_attention_whitecrow_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            v_dev.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
+                    (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int2V4 => {
+                        crate::shared_attention::fused_or_scalar_attention_i2v4_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            ks.as_ref(),
+                            v_dev.as_ref(),
+                            vs.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
+                    (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int4 => {
+                        crate::shared_attention::fused_or_scalar_attention_i4_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            ks.as_ref(),
+                            v_dev.as_ref(),
+                            vs.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
+                    (Some(ks), Some(vs)) => {
+                        crate::shared_attention::fused_or_scalar_attention_i8_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            ks.as_ref(),
+                            v_dev.as_ref(),
+                            vs.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
+                    _ => crate::shared_attention::fused_or_scalar_attention_arena(
+                        &q_all,
+                        k_dev.as_ref(),
+                        v_dev.as_ref(),
+                        total_kv,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        seq_len,
+                        None,
+                        &device,
+                    )?,
+                };
+                let mut attn_out = attn_tensor.to_vec_f32()?;
+                // Output gate: attn_out * sigmoid(attn_q's gate half), per
+                // llama.cpp qwen35.cpp:
+                //   gate = ggml_sigmoid(gate_view)
+                //   cur  = ggml_mul(cur, gate_sigmoid)   // "attn_gated"
+                // applied BEFORE `wo`. Without this the gate half of attn_q is
+                // computed and discarded.
+                if let Some(ref gate_t) = q_gate {
+                    let g = gate_t.to_vec_f32()?;
+                    for i in 0..attn_out.len().min(g.len()) {
+                        attn_out[i] *= 1.0 / (1.0 + (-g[i]).exp());
                     }
                 }
-                dev.copy_slice_range(
-                    &**v_dev,
-                    cache.current_pos * self.num_kv_heads * self.head_dim,
-                    v_dev_t.storage().as_ref(),
-                    0,
-                    kv_elems,
-                )?;
-            } else {
-                // Arena full — grow geometrically and re-copy via D2D.
-                let new_rows = ((need_rows * 2) + 64).next_power_of_two();
-                let k_idx = self.num_kv_heads * self.head_dim;
-                let full_shape = Shape::new(vec![new_rows, self.num_kv_heads, self.head_dim]);
-                let k_grown = dev.alloc_storage(&full_shape, DType::F32)?;
-                let v_grown = dev.alloc_storage(&full_shape, DType::F32)?;
-                if let Some(ref old_k) = cache.k_device {
-                    dev.copy_slice_range(
-                        k_grown.as_ref(),
-                        0,
-                        old_k.as_ref(),
-                        0,
-                        cache.current_pos * self.num_kv_heads * self.head_dim,
-                    )?;
-                }
-                if let Some(ref old_v) = cache.v_device {
-                    dev.copy_slice_range(
-                        v_grown.as_ref(),
-                        0,
-                        old_v.as_ref(),
-                        0,
-                        cache.current_pos * self.num_kv_heads * self.head_dim,
-                    )?;
-                }
-                dev.copy_slice_range(
-                    k_grown.as_ref(),
-                    cache.current_pos * k_idx,
-                    k_rope.storage().as_ref(),
-                    0,
-                    kv_elems,
-                )?;
-                dev.copy_slice_range(
-                    v_grown.as_ref(),
-                    cache.current_pos * k_idx,
-                    v_dev_t.storage().as_ref(),
-                    0,
-                    kv_elems,
-                )?;
-                cache.k_device = Some(k_grown);
-                cache.v_device = Some(v_grown);
-            }
-
-            let total_kv = cache.current_pos + seq_len;
-            let k_dev = cache
-                .k_device
-                .as_ref()
-                .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
-            let v_dev = cache
-                .v_device
-                .as_ref()
-                .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
-            let attn_tensor = crate::shared_attention::fused_or_scalar_attention_arena(
-                &q_all,
-                k_dev.as_ref(),
-                v_dev.as_ref(),
-                total_kv,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                seq_len,
-                None,
-                &device,
-            )?;
-            let mut attn_out = attn_tensor.to_vec_f32()?;
-            // Output gate: attn_out * sigmoid(attn_q's gate half), per
-            // llama.cpp qwen35.cpp:
-            //   gate = ggml_sigmoid(gate_view)
-            //   cur  = ggml_mul(cur, gate_sigmoid)   // "attn_gated"
-            // applied BEFORE `wo`. Without this the gate half of attn_q is
-            // computed and discarded.
-            if let Some(ref gate_t) = q_gate {
-                let g = gate_t.to_vec_f32()?;
-                for i in 0..attn_out.len().min(g.len()) {
-                    attn_out[i] *= 1.0 / (1.0 + (-g[i]).exp());
-                }
-            }
-            out_branch = attn_out;
+                out_branch = attn_out;
             }
         } else {
             // Gated DeltaNet recurrence. Prefer the device path, which keeps
@@ -1376,7 +1610,10 @@ impl Qwen35Block {
                         Ok(r) => match r.copy_to_host() {
                             Ok(b) => {
                                 let bytes: Vec<u8> = b;
-                                let _ = std::fs::write(format!("/tmp/kda_probe_d2d_{name}.bin"), &bytes);
+                                let _ = std::fs::write(
+                                    format!("/tmp/kda_probe_d2d_{name}.bin"),
+                                    &bytes,
+                                );
                                 eprintln!("[kda-probe-d2d] wrote {name} ({} B)", bytes.len());
                             }
                             Err(e) => eprintln!("[kda-probe-d2d] {name} read FAILED: {e}"),
@@ -1440,7 +1677,8 @@ impl Qwen35Block {
                                 "[proj-fp] layer 0 decode proj_out[0:4]={:?} sum8={s8:+.6} sum={s:+.6}",
                                 &vals[..4]
                             );
-                            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let bytes: Vec<u8> =
+                                vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                             let _ = std::fs::write("/tmp/kda_probe_proj_out.bin", &bytes);
                         }
                         Err(e) => eprintln!("[proj-fp] read FAILED: {e}"),
@@ -1454,7 +1692,8 @@ impl Qwen35Block {
         // KDA-STEP-PROBE: layer-0 decode — where does the [1024..4096) garbage
         // start? Dump h and a fresh proj_out readback (synced).
         if kda_probe_layer0 {
-            static H_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static H_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !H_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 if let Device::Rocm(ord) = x.device() {
                     grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
@@ -1463,16 +1702,24 @@ impl Qwen35Block {
                     match grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
                         Ok(r) => match r.copy_to_host() {
                             Ok(b) => {
-                                let vals: Vec<f32> = b.chunks_exact(4)
-                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let vals: Vec<f32> = b
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect();
                                 let s8: f32 = vals.iter().take(8).sum();
                                 if vals.len() >= 1027 {
-                                    eprintln!("[resid-fp] {name} len {} sum8={s8:+.6} [1024:1027]={:?}", vals.len(), &vals[1024..1027]);
+                                    eprintln!(
+                                        "[resid-fp] {name} len {} sum8={s8:+.6} [1024:1027]={:?}",
+                                        vals.len(),
+                                        &vals[1024..1027]
+                                    );
                                 } else {
                                     eprintln!("[resid-fp] {name} len {} sum8={s8:+.6}", vals.len());
                                 }
-                                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-                                let _ = std::fs::write(format!("/tmp/kda_probe_{name}.bin"), &bytes);
+                                let bytes: Vec<u8> =
+                                    vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                let _ =
+                                    std::fs::write(format!("/tmp/kda_probe_{name}.bin"), &bytes);
                             }
                             Err(e) => eprintln!("[resid-fp] {name} read FAILED: {e}"),
                         },
@@ -1497,12 +1744,34 @@ impl Qwen35Block {
                 // allocator handed `h` memory that aliases a live d2d buffer,
                 // the pointers will say so.
                 {
-                    let ptr = |t: &Tensor| grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()).ok().and_then(|r| r.device_ptr_u64()).unwrap_or(0);
+                    let ptr = |t: &Tensor| {
+                        grim_backend_rocm::device::util::as_rocm(t.storage().as_ref())
+                            .ok()
+                            .and_then(|r| r.device_ptr_u64())
+                            .unwrap_or(0)
+                    };
                     eprintln!(
                         "[chain-ptr] x={:#x} proj_out={:#x} h={:#x} h_normed={:#x} conv_ring={:#x} ssm_state={:#x}",
-                        ptr(x), ptr(&proj_out), ptr(&h), ptr(&h_normed),
-                        cache.conv_state_dev.as_ref().map(|c| grim_backend_rocm::device::util::as_rocm(c.as_ref()).ok().and_then(|r| r.device_ptr_u64()).unwrap_or(0)).unwrap_or(0),
-                        cache.ssm_state_dev.as_ref().map(|c| grim_backend_rocm::device::util::as_rocm(c.as_ref()).ok().and_then(|r| r.device_ptr_u64()).unwrap_or(0)).unwrap_or(0),
+                        ptr(x),
+                        ptr(&proj_out),
+                        ptr(&h),
+                        ptr(&h_normed),
+                        cache
+                            .conv_state_dev
+                            .as_ref()
+                            .map(|c| grim_backend_rocm::device::util::as_rocm(c.as_ref())
+                                .ok()
+                                .and_then(|r| r.device_ptr_u64())
+                                .unwrap_or(0))
+                            .unwrap_or(0),
+                        cache
+                            .ssm_state_dev
+                            .as_ref()
+                            .map(|c| grim_backend_rocm::device::util::as_rocm(c.as_ref())
+                                .ok()
+                                .and_then(|r| r.device_ptr_u64())
+                                .unwrap_or(0))
+                            .unwrap_or(0),
                     );
                 }
                 for (t, name) in [
@@ -1590,11 +1859,15 @@ impl Qwen35Block {
                 };
                 // Raw ffn_gate weight bytes: identical across runs unless a
                 // d2d kernel wrote out of bounds into the weight pool.
-                { let wg = &self.ffn_gate;
+                {
+                    let wg = &self.ffn_gate;
                     match grim_backend_rocm::device::util::as_rocm(wg.weight().storage().as_ref()) {
                         Ok(r) => match r.copy_to_host() {
                             Ok(b) => {
-                                let _ = std::fs::write(format!("/tmp/kda_probe_ffn_{mode}_w_gate_raw.bin"), &b);
+                                let _ = std::fs::write(
+                                    format!("/tmp/kda_probe_ffn_{mode}_w_gate_raw.bin"),
+                                    &b,
+                                );
                                 eprintln!("[ffn-fp] w_gate raw ({} B) dumped", b.len());
                             }
                             Err(e) => eprintln!("[ffn-fp] w_gate raw read FAILED: {e}"),
@@ -1612,21 +1885,22 @@ impl Qwen35Block {
                             "layer has no fused gate_up weights (KDA layer)",
                         ))
                     })
-                    .and_then(|f| grim_backend_rocm::device::util::as_rocm(&f.storage).map_err(|e| grim_core::error::Error::Backend(format!("{e}"))))
-                {
+                    .and_then(|f| {
+                        grim_backend_rocm::device::util::as_rocm(&f.storage)
+                            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))
+                    }) {
                     Ok(r) => match r.copy_to_host() {
                         Ok(b) => {
                             let _ = std::fs::write(
                                 format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"),
                                 &b,
                             );
-                            let vals: Vec<f32> = std::fs::read(
-                                format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"),
-                            )
-                            .unwrap_or_default()
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
+                            let vals: Vec<f32> =
+                                std::fs::read(format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"))
+                                    .unwrap_or_default()
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect();
                             eprintln!(
                                 "[ffn-fp] fused_w ({} B) sum8={:+.6} [0:3]={:?}",
                                 b.len(),
@@ -1645,18 +1919,22 @@ impl Qwen35Block {
         let out = grim_nn::modules::add_on_device(&h, &ffn_out)?;
         // KDA-STEP-PROBE: block-output fingerprint + device at the first
         // decode step, per layer — the first divergent element hunt.
-        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && out.shape().dims().first() == Some(&1) {
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && out.shape().dims().first() == Some(&1)
+        {
             static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if call <= 8 {
                 if let Device::Rocm(ord) = out.device() {
                     grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
                 }
-                let vals: Vec<f32> = match grim_backend_rocm::device::util::as_rocm(out.storage().as_ref())
-                    .and_then(|r| {
-                        let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
-                        r.copy_to_host()
-                    }) {
+                let vals: Vec<f32> = match grim_backend_rocm::device::util::as_rocm(
+                    out.storage().as_ref(),
+                )
+                .and_then(|r| {
+                    let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                    r.copy_to_host()
+                }) {
                     Ok(b) => b
                         .chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1664,7 +1942,10 @@ impl Qwen35Block {
                     Err(_) => Vec::new(),
                 };
                 if vals.is_empty() {
-                    eprintln!("[blk-fp] call {call} layer {} READBACK FAILED", self.layer_idx);
+                    eprintln!(
+                        "[blk-fp] call {call} layer {} READBACK FAILED",
+                        self.layer_idx
+                    );
                 } else {
                     let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                     let _ = std::fs::write(format!("/tmp/kda_probe_blkfp_call{call}.bin"), &bytes);
@@ -1721,6 +2002,31 @@ impl Qwen35 {
         );
 
         let first_device = available_devices[0].clone();
+
+        // Plan BEFORE any weight is uploaded, then upload the embedding.
+        //
+        // `plan_layer_devices` reads live `vram_info` for each card's usable
+        // bytes and reserves `token_embd` on device 0 from that reading. It
+        // used to run while the embedding was already resident, so the table
+        // was subtracted TWICE — once implicitly, because `vram_info` had
+        // already dropped by the 4.74 GiB a 248320-row vocab dequantized to
+        // f32 occupies, and again explicitly by the reserve. Device 0 was
+        // thereby planned as if it had 9.5 GiB less headroom than it had, which
+        // is what skewed a dual-16 GiB 27B load off its natural 32/33 split and
+        // starved the card that also has to host the LM head, `pos_dev` and the
+        // decode graph.
+        let layer_devices = plan_layer_devices(
+            ws,
+            &available_devices,
+            cfg.num_layers,
+            cfg.max_seq_len,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.full_attention_interval,
+            cfg.vocab_size,
+            cfg.hidden_size,
+        );
+
         let tok_embeddings = Embedding::load(
             &ws.with_device(first_device.clone()).pp("token_embd"),
             cfg.vocab_size,
@@ -1735,16 +2041,6 @@ impl Qwen35 {
                 )
             })
         })?;
-
-        let layer_devices = plan_layer_devices(
-            ws,
-            &available_devices,
-            cfg.num_layers,
-            cfg.max_seq_len,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            cfg.full_attention_interval,
-        );
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -1761,7 +2057,18 @@ impl Qwen35 {
             blocks.push(Qwen35Block::load_tp(&layer_ws, &cfg, i, tp)?);
         }
 
-        let last_device = available_devices.last().unwrap_or(&device).clone();
+        // The head must live where the LAST LAYER lives, not on the last
+        // VISIBLE device: the two coincide only while the placement's tail
+        // lands on the last ordinal. When the planner puts every layer on one
+        // device (single-device fit) and the head stayed on the other, its
+        // kernels launched on device 1 while the capture ran on device 0 —
+        // the cross-device capture fault, reproduced as `Memory access fault by
+        // GPU node-1` on the 9B. A6's gate asserts this invariant for the graph;
+        // this makes the loader honour it.
+        let last_device = layer_devices
+            .last()
+            .cloned()
+            .unwrap_or_else(|| available_devices.last().unwrap_or(&device).clone());
         let output_norm = RmsNorm::load(
             &ws.with_device(last_device.clone()).pp("output_norm"),
             cfg.hidden_size,
@@ -1913,7 +2220,11 @@ impl CausalLm for Qwen35 {
             eprintln!(
                 "[positions] seq_len={} positions={:?} ids_len={}",
                 positions_vec.len(),
-                if positions_vec.len() <= 16 { positions_vec.clone() } else { positions_vec[..16].to_vec() },
+                if positions_vec.len() <= 16 {
+                    positions_vec.clone()
+                } else {
+                    positions_vec[..16].to_vec()
+                },
                 ids.len()
             );
         }
@@ -2063,9 +2374,7 @@ impl CausalLm for Qwen35 {
             }
             // KDA-STEP-PROBE: in-process h fingerprint at decode step 1,
             // per layer — h vs the block's view of x, no cross-run dumps.
-            if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-                && seq_len == 1
-                && i <= 2
+            if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 && i <= 2
             {
                 static H_FP: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -2109,8 +2418,56 @@ impl CausalLm for Qwen35 {
             h = grim_nn::modules::move_to_device(&h, self.output_norm.weight.device())?;
         }
 
-        let normed = self.output_norm.forward(&h)?;
-        let logits = self.output.forward(&normed)?;
+        // Slicing optimization: for causal generation prefill (seq_len > 1), only the
+        // last position's logits are needed unless GRIM_FULL_PREFILL_LOGITS=1 or scoring is active.
+        // Slicing normed [seq_len, hidden] to [1, hidden] before the LM head projection
+        // avoids allocating [seq_len, vocab] f32 (~993 KB per token, 2+ GB at M=2k) on dev1.
+        let full_logits = std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_some()
+            || std::env::var_os("GRIM_SCORE_FILE").is_some();
+        let skip_head = session.skip_output_projection();
+        // Reset skip flag on forward exit so intermediate chunk state never leaks
+        session.set_skip_output_projection(false);
+
+        let logits = if skip_head {
+            // For intermediate prefill chunks, skip output norm and LM head entirely.
+            // Return an empty tensor on the current device to satisfy the return type.
+            let empty_shape = grim_tensor::Shape::new(vec![0]);
+            grim_tensor::Tensor::new(
+                std::sync::Arc::from(
+                    grim_backend_cpu::CpuDevice::new()
+                        .alloc_storage(&empty_shape, grim_tensor::dtype::DType::F32)?,
+                ),
+                empty_shape,
+                grim_tensor::dtype::DType::F32,
+                grim_tensor::dtype::QuantProvenance::default(),
+                grim_tensor::Device::Cpu,
+            )
+        } else {
+            let normed = self.output_norm.forward(&h)?;
+            let head_in = if seq_len > 1 && !full_logits {
+                let dev = grim_nn::modules::pick_device_for_storage_device(normed.device());
+                let hidden = self.cfg.hidden_size;
+                let last_shape = grim_tensor::Shape::new(vec![1, hidden]);
+                let (last_row_storage, handle) = dev.narrow_rows(
+                    normed.storage().as_ref(),
+                    seq_len - 1,
+                    1,
+                    hidden,
+                    &last_shape,
+                )?;
+                let _ = handle;
+                grim_tensor::Tensor::new(
+                    std::sync::Arc::from(last_row_storage),
+                    last_shape,
+                    normed.dtype().clone(),
+                    normed.provenance().clone(),
+                    normed.device().clone(),
+                )
+            } else {
+                normed
+            };
+            self.output.forward(&head_in)?
+        };
         session.advance_pos(seq_len);
         Ok(logits)
     }
@@ -2430,7 +2787,11 @@ fn gated_delta_net_forward(
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_host_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-probe-host] prefill wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-probe-host] prefill wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             dump(&qkv_vec, "prefill_conv_x");
@@ -2441,7 +2802,10 @@ fn gated_delta_net_forward(
             dump(&z_vec, "prefill_z");
             let taps = blk.cfg_ssm_d_conv().max(1);
             let ring_elems = (taps - 1) * qkv_vec.len();
-            dump(&cache.conv_state[..ring_elems.min(cache.conv_state.len())], "prefill_ring_post");
+            dump(
+                &cache.conv_state[..ring_elems.min(cache.conv_state.len())],
+                "prefill_ring_post",
+            );
         }
     }
     {
@@ -2472,7 +2836,11 @@ fn gated_delta_net_forward(
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_host_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-probe-host] wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-probe-host] wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             dump(&conv_mix, "conv_mix");
@@ -2621,7 +2989,9 @@ fn gated_delta_net_forward(
         }
         // host branch dump at decode step 1 (call 1 of seq==1 = layer 0):
         // elementwise arbitration against the D2D branch dump.
-        if blk.layer_idx == kda_probe_prefill_layer() && CALLS.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        if blk.layer_idx == kda_probe_prefill_layer()
+            && CALLS.load(std::sync::atomic::Ordering::Relaxed) == 1
+        {
             let bytes: Vec<u8> = out_branch.iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = std::fs::write("/tmp/kda_probe_host_branch.bin", &bytes);
             eprintln!("[kda-probe-host] wrote branch ({} f32)", out_branch.len());
@@ -2644,8 +3014,14 @@ fn kda_probe_host_post(ssm_state: &[f32], seq_len: usize) {
     let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && call <= 4 {
         let bytes: Vec<u8> = ssm_state.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let _ = std::fs::write(format!("/tmp/kda_probe_host_ssm_call{call}_seq{seq_len}.bin"), &bytes);
-        eprintln!("[kda-probe-host] call {call} seq_len {seq_len}: dumped state ({} f32)", ssm_state.len());
+        let _ = std::fs::write(
+            format!("/tmp/kda_probe_host_ssm_call{call}_seq{seq_len}.bin"),
+            &bytes,
+        );
+        eprintln!(
+            "[kda-probe-host] call {call} seq_len {seq_len}: dumped state ({} f32)",
+            ssm_state.len()
+        );
     }
 }
 
@@ -2708,8 +3084,12 @@ fn gated_delta_net_forward_d2d(
         d2d_decline!("kda: degenerate head config (v={n_val_heads} k={n_key_heads} d={head_dim})");
     }
     let Some(ref qkv_lin) = blk.attn_qkv else {
-        d2d_decline!("kda: layer {} attn_qkv is None (is_full_attn={}, wq={})",
-            blk.layer_idx, blk.is_full_attention, blk.wq.is_some());
+        d2d_decline!(
+            "kda: layer {} attn_qkv is None (is_full_attn={}, wq={})",
+            blk.layer_idx,
+            blk.is_full_attention,
+            blk.wq.is_some()
+        );
     };
     // No conv weights means the stream is used un-convolved, which is a real
     // fallback case the host path supports; this one does not.
@@ -2761,7 +3141,9 @@ fn gated_delta_net_forward_d2d(
         || (cw_dims.len() == 2 && cw_dims[0] == taps && cw_dims[1] == conv_dim)
         || (cw_dims.len() == 1 && cw_dims[0] == conv_dim * taps);
     if !shape_ok {
-        d2d_decline!("kda: conv_w shape {cw_dims:?} incompatible with conv_dim={conv_dim}, taps={taps}");
+        d2d_decline!(
+            "kda: conv_w shape {cw_dims:?} incompatible with conv_dim={conv_dim}, taps={taps}"
+        );
     }
     let is_quant_conv = matches!(
         conv_w.dtype().storage,
@@ -2796,15 +3178,27 @@ fn gated_delta_net_forward_d2d(
     // Static per-head vectors pre-uploaded to device. Fallback to upload only if not pre-cached.
     let dt_bias_d = match blk.ssm_dt_bias_dev.as_ref() {
         Some(st) => st.clone(),
-        None => std::sync::Arc::from(dev.from_cpu(&dt_bias[..n_val_heads], &Shape::new(vec![n_val_heads]), DType::F32)?),
+        None => std::sync::Arc::from(dev.from_cpu(
+            &dt_bias[..n_val_heads],
+            &Shape::new(vec![n_val_heads]),
+            DType::F32,
+        )?),
     };
     let ssm_a_d = match blk.ssm_a_dev.as_ref() {
         Some(st) => st.clone(),
-        None => std::sync::Arc::from(dev.from_cpu(&ssm_a[..n_val_heads], &Shape::new(vec![n_val_heads]), DType::F32)?),
+        None => std::sync::Arc::from(dev.from_cpu(
+            &ssm_a[..n_val_heads],
+            &Shape::new(vec![n_val_heads]),
+            DType::F32,
+        )?),
     };
     let ssm_norm_d = match blk.ssm_norm_dev.as_ref() {
         Some(st) => st.clone(),
-        None => std::sync::Arc::from(dev.from_cpu(&ssm_norm[..head_dim], &Shape::new(vec![head_dim]), DType::F32)?),
+        None => std::sync::Arc::from(dev.from_cpu(
+            &ssm_norm[..head_dim],
+            &Shape::new(vec![head_dim]),
+            DType::F32,
+        )?),
     };
 
     // --- short conv, state in place on device ------------------------------
@@ -2835,7 +3229,8 @@ fn gated_delta_net_forward_d2d(
     })?;
     // KDA-STEP-PROBE: PRE-step ssm state (end-of-prefill handoff check).
     {
-        static PRE_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static PRE_DUMPED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
             && blk.layer_idx == kda_probe_prefill_layer()
             && seq_len == 1
@@ -2868,14 +3263,22 @@ fn gated_delta_net_forward_d2d(
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
                     .and_then(|r| r.copy_to_host())
-                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .map(|b| {
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             let dump = |vals: &[f32], name: &str| {
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-step-probe] decode wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-step-probe] decode wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             if let Device::Rocm(ord) = x_normed.device() {
@@ -2903,14 +3306,22 @@ fn gated_delta_net_forward_d2d(
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
                     .and_then(|r| r.copy_to_host())
-                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .map(|b| {
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             let dump = |vals: &[f32], name: &str| {
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-step-probe] prefill wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-step-probe] prefill wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             if let Device::Rocm(ord) = x_normed.device() {
@@ -2969,14 +3380,22 @@ fn gated_delta_net_forward_d2d(
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
                     .and_then(|r| r.copy_to_host())
-                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .map(|b| {
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             let dump = |vals: &[f32], name: &str| {
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-step-probe] decode wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-step-probe] decode wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             if let Device::Rocm(ord) = x_normed.device() {
@@ -3000,14 +3419,22 @@ fn gated_delta_net_forward_d2d(
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
                     .and_then(|r| r.copy_to_host())
-                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .map(|b| {
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             let dump = |vals: &[f32], name: &str| {
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-step-probe] prefill wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-step-probe] prefill wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             if let Device::Rocm(ord) = x_normed.device() {
@@ -3037,14 +3464,26 @@ fn gated_delta_net_forward_d2d(
             let taps = blk.cfg_ssm_d_conv().max(1);
             let ring_elems = conv_dim * (taps - 1);
             // Import the live device state.
-            let conv_dev_host: Vec<f32> = grim_backend_rocm::device::util::as_rocm(cache.conv_state_dev.as_ref().unwrap().as_ref())
-                .and_then(|r| r.copy_to_host())
-                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                .unwrap_or_default();
-            let ssm_dev_host: Vec<f32> = grim_backend_rocm::device::util::as_rocm(cache.ssm_state_dev.as_ref().unwrap().as_ref())
-                .and_then(|r| r.copy_to_host())
-                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                .unwrap_or_default();
+            let conv_dev_host: Vec<f32> = grim_backend_rocm::device::util::as_rocm(
+                cache.conv_state_dev.as_ref().unwrap().as_ref(),
+            )
+            .and_then(|r| r.copy_to_host())
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default();
+            let ssm_dev_host: Vec<f32> = grim_backend_rocm::device::util::as_rocm(
+                cache.ssm_state_dev.as_ref().unwrap().as_ref(),
+            )
+            .and_then(|r| r.copy_to_host())
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default();
             eprintln!(
                 "[kda-step-probe] imported device ring {} floats (need {ring_elems}), ssm {} floats",
                 conv_dev_host.len(),
@@ -3119,7 +3558,11 @@ fn gated_delta_net_forward_d2d(
             // conv_out dump for the same step (device tensor -> host).
             let conv_dump = grim_backend_rocm::device::util::as_rocm(conv_out.as_ref())
                 .and_then(|r| r.copy_to_host())
-                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>())
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect::<Vec<f32>>()
+                })
                 .unwrap_or_default();
             eprintln!(
                 "[kda-step-probe] conv_out[0..6]={:?} alpha[0..4]={:?} beta[0..4]={:?} z[0..4]={:?}",
@@ -3132,7 +3575,11 @@ fn gated_delta_net_forward_d2d(
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
-                    eprintln!("[kda-step-probe] wrote {} ({} f32) -> {path}", name, vals.len());
+                    eprintln!(
+                        "[kda-step-probe] wrote {} ({} f32) -> {path}",
+                        name,
+                        vals.len()
+                    );
                 }
             };
             dump(&conv_dump, "conv_mix");
@@ -3201,14 +3648,14 @@ fn gated_delta_net_forward_d2d(
                         .chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
-                    (
-                        vals.iter().take(8).sum::<f32>(),
-                        vals.iter().sum::<f32>(),
-                    )
+                    (vals.iter().take(8).sum::<f32>(), vals.iter().sum::<f32>())
                 })
                 .unwrap_or((0.0, 0.0));
             // Which input died? z gate, conv stream, alpha, beta sums.
-            let z_sum = z.to_vec_f32().map(|v| v.iter().sum::<f32>()).unwrap_or(f32::NAN);
+            let z_sum = z
+                .to_vec_f32()
+                .map(|v| v.iter().sum::<f32>())
+                .unwrap_or(f32::NAN);
             let conv_sum = grim_backend_rocm::device::util::as_rocm(conv_out.as_ref())
                 .and_then(|r| r.copy_to_host())
                 .map(|b| {
@@ -3217,8 +3664,14 @@ fn gated_delta_net_forward_d2d(
                         .sum::<f32>()
                 })
                 .unwrap_or(f32::NAN);
-            let a_sum = alpha.to_vec_f32().map(|v| v.iter().sum::<f32>()).unwrap_or(f32::NAN);
-            let b_sum = beta.to_vec_f32().map(|v| v.iter().sum::<f32>()).unwrap_or(f32::NAN);
+            let a_sum = alpha
+                .to_vec_f32()
+                .map(|v| v.iter().sum::<f32>())
+                .unwrap_or(f32::NAN);
+            let b_sum = beta
+                .to_vec_f32()
+                .map(|v| v.iter().sum::<f32>())
+                .unwrap_or(f32::NAN);
             let nw_sum = blk
                 .ssm_norm_dev
                 .as_ref()
@@ -3314,10 +3767,20 @@ fn attention_layer_d2d(
         // 33.5 M floats for `attn_q` alone, per attention layer, per token.
         // The count is `shape().elem_count()`; nothing about it needs the data.
         let shp = |t: &Option<Linear>| {
-            t.as_ref().map(|l| (l.weight().shape().dims().to_vec(), l.weight().shape().elem_count()))
+            t.as_ref().map(|l| {
+                (
+                    l.weight().shape().dims().to_vec(),
+                    l.weight().shape().elem_count(),
+                )
+            })
         };
         let nshp = |n: &Option<RmsNorm>| {
-            n.as_ref().map(|x| (x.weight.shape().dims().to_vec(), x.weight.shape().elem_count()))
+            n.as_ref().map(|x| {
+                (
+                    x.weight.shape().dims().to_vec(),
+                    x.weight.shape().elem_count(),
+                )
+            })
         };
         eprintln!(
             "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
@@ -3375,9 +3838,11 @@ fn attention_layer_d2d(
     let (q_st, gate_st) = {
         let mark = |tag: &str| {
             if attn_shapes_debug() {
-                eprintln!("[attn-split] {tag} q_full ptr_ok={} dims={:?}",
+                eprintln!(
+                    "[attn-split] {tag} q_full ptr_ok={} dims={:?}",
                     q_full.storage().device_ptr().is_some(),
-                    q_full.shape().dims().to_vec());
+                    q_full.shape().dims().to_vec()
+                );
             }
         };
         mark("before_lo");
@@ -3422,7 +3887,11 @@ fn attention_layer_d2d(
         let three = Shape::new(vec![1, seq_len * heads, blk.head_dim]);
         let mk2 = |tag: &str| {
             if attn_shapes_debug() {
-                eprintln!("[attn-hn] {tag} in_dims={:?} three={:?}", t.shape().dims().to_vec(), three.dims().to_vec());
+                eprintln!(
+                    "[attn-hn] {tag} in_dims={:?} three={:?}",
+                    t.shape().dims().to_vec(),
+                    three.dims().to_vec()
+                );
             }
         };
         mk2("A_reshape_view_pre");
@@ -3494,15 +3963,22 @@ fn attention_layer_d2d(
     stage!("rope");
     // --- append K/V to the device arena, then attend -----------------------
     let k_new_rows = seq_len * blk.num_kv_heads;
-    let kv_elems = k_new_rows * blk.head_dim;
+    ensure_arena_format_supported(&device)?;
+    let evict = kv_eviction_policy_for_layer(&device, blk.layer_idx);
     let k_cap_rows = cache
         .k_device
         .as_ref()
         .map(|s| s.shape().dims()[0])
         .unwrap_or(0);
-    let need_rows = cache.current_pos + k_new_rows;
+    // Phase 3: stop growing at the eviction capacity; past it the write slot
+    // wraps into the ring (see site 1).
+    let need_rows = evict.live_rows(cache.current_pos + k_new_rows);
+    let wrapped = evict
+        .cap_rows
+        .map(|cap| cache.current_pos >= cap)
+        .unwrap_or(false);
 
-    if k_cap_rows >= need_rows {
+    if k_cap_rows >= need_rows || wrapped {
         let k_dev = cache
             .k_device
             .as_ref()
@@ -3511,33 +3987,46 @@ fn attention_layer_d2d(
             .v_device
             .as_ref()
             .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
-        dev.copy_slice_range(
-            &**k_dev,
-            cache.current_pos * blk.num_kv_heads * blk.head_dim,
+        arena_append_kv_rows(
+            &dev,
+            &device,
+            k_dev.as_ref(),
+            v_dev.as_ref(),
+            evict.arena_row(cache.current_pos),
             k_rope.storage().as_ref(),
-            0,
-            kv_elems,
-        )?;
-        dev.copy_slice_range(
-            &**v_dev,
-            cache.current_pos * blk.num_kv_heads * blk.head_dim,
             v_dev_t.storage().as_ref(),
-            0,
-            kv_elems,
+            seq_len,
+            blk.num_kv_heads,
+            blk.head_dim,
+            cache.k_scales_device.as_deref(),
+            cache.v_scales_device.as_deref(),
         )?;
     } else {
-        let new_rows = ((need_rows * 2) + 64).next_power_of_two();
-        let k_idx = blk.num_kv_heads * blk.head_dim;
-        let full_shape = Shape::new(vec![new_rows, blk.num_kv_heads, blk.head_dim]);
-        let k_grown = dev.alloc_storage(&full_shape, DType::F32)?;
-        let v_grown = dev.alloc_storage(&full_shape, DType::F32)?;
+        // Growth is clamped to the eviction capacity: past it the arena is
+        // reused, never resized, so the KV footprint is a known quantity.
+        let new_rows = ((need_rows * 2) + 64)
+            .next_power_of_two()
+            .min(evict.cap_rows.unwrap_or(usize::MAX))
+            .max(need_rows);
+        // The arena is byte-addressed for the packed formats, so a row's extent
+        // is its BYTE count there and `k_idx` (the KV element count) is wrong
+        // for int4 by 2x — as an allocation size AND as the copy length below.
+        let fmt = kv_arena_format_qwen(&device);
+        let full_shape = Shape::new(vec![
+            new_rows,
+            blk.num_kv_heads,
+            kv_arena_head_extent(fmt, blk.head_dim),
+        ]);
+        let row_extent = kv_arena_row_extent(fmt, blk.num_kv_heads, blk.head_dim);
+        let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
+        let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
         if let Some(ref old_k) = cache.k_device {
             dev.copy_slice_range(
                 k_grown.as_ref(),
                 0,
                 old_k.as_ref(),
                 0,
-                cache.current_pos * k_idx,
+                cache.current_pos * row_extent,
             )?;
         }
         if let Some(ref old_v) = cache.v_device {
@@ -3546,29 +4035,50 @@ fn attention_layer_d2d(
                 0,
                 old_v.as_ref(),
                 0,
-                cache.current_pos * k_idx,
+                cache.current_pos * row_extent,
             )?;
         }
-        dev.copy_slice_range(
-            k_grown.as_ref(),
-            cache.current_pos * k_idx,
-            k_rope.storage().as_ref(),
-            0,
-            kv_elems,
-        )?;
-        dev.copy_slice_range(
-            v_grown.as_ref(),
-            cache.current_pos * k_idx,
-            v_dev_t.storage().as_ref(),
-            0,
-            kv_elems,
-        )?;
+        // Install the grown arena and its int8 sidecars BEFORE the append: the
+        // quantizer writes codes AND scales in one launch, so the sidecar must
+        // exist first (and its carry-over copies from the previous one).
         cache.k_device = Some(k_grown);
         cache.v_device = Some(v_grown);
+        ensure_int8_scales(
+            &dev,
+            &device,
+            &mut cache.k_scales_device,
+            &mut cache.v_scales_device,
+            new_rows,
+            cache.current_pos,
+            blk.num_kv_heads,
+        )?;
+        let (k_g, v_g) = (
+            cache.k_device.as_ref().expect("just installed"),
+            cache.v_device.as_ref().expect("just installed"),
+        );
+        arena_append_kv_rows(
+            &dev,
+            &device,
+            k_g.as_ref(),
+            v_g.as_ref(),
+            cache.current_pos,
+            k_rope.storage().as_ref(),
+            v_dev_t.storage().as_ref(),
+            seq_len,
+            blk.num_kv_heads,
+            blk.head_dim,
+            cache.k_scales_device.as_deref(),
+            cache.v_scales_device.as_deref(),
+        )?;
     }
 
     stage!("arena_append");
-    let total_kv = cache.current_pos + seq_len;
+    // WS-4.3: CurDKV compaction at the eviction boundary (see the host-q path).
+    if evict.mode == EvictionMode::Curdkv {
+        curdkv_compact_arena(&dev, &mut *cache, &evict, blk.num_kv_heads, blk.head_dim)?;
+    }
+    // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
+    let total_kv = evict.live_rows(cache.current_pos + seq_len);
     let k_arena = cache
         .k_device
         .as_ref()
@@ -3605,18 +4115,88 @@ fn attention_layer_d2d(
         );
     }
 
-    let attn = crate::shared_attention::fused_or_scalar_attention_arena_device(
-        q_rope.storage().as_ref(),
-        k_arena.as_ref(),
-        v_arena.as_ref(),
-        total_kv,
-        blk.num_heads,
-        blk.num_kv_heads,
-        blk.head_dim,
-        seq_len,
-        None,
-        &device,
-    )?;
+    let format = kv_arena_format_qwen(&device);
+    let attn = match (
+        cache.k_scales_device.as_ref(),
+        cache.v_scales_device.as_ref(),
+    ) {
+        // WhiteCrow first (same rationale as the host-query dispatch): the
+        // scale lives INSIDE each 67-byte block, so scales are None and this
+        // arm must beat the `_` f32 fallthrough or the byte arena would be
+        // read as raw floats.
+        _ if format == grim_backend_rocm::KvArenaFormat::WhiteCrow => {
+            crate::shared_attention::fused_or_scalar_attention_whitecrow_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
+        (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int2V4 => {
+            crate::shared_attention::fused_or_scalar_attention_i2v4_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                ks.as_ref(),
+                v_arena.as_ref(),
+                vs.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
+        (Some(ks), Some(vs)) if format == grim_backend_rocm::KvArenaFormat::Int4 => {
+            crate::shared_attention::fused_or_scalar_attention_i4_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                ks.as_ref(),
+                v_arena.as_ref(),
+                vs.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
+        (Some(ks), Some(vs)) => crate::shared_attention::fused_or_scalar_attention_i8_arena_device(
+            q_rope.storage().as_ref(),
+            k_arena.as_ref(),
+            ks.as_ref(),
+            v_arena.as_ref(),
+            vs.as_ref(),
+            total_kv,
+            blk.num_heads,
+            blk.num_kv_heads,
+            blk.head_dim,
+            seq_len,
+            None,
+            &device,
+        )?,
+        _ => crate::shared_attention::fused_or_scalar_attention_arena_device(
+            q_rope.storage().as_ref(),
+            k_arena.as_ref(),
+            v_arena.as_ref(),
+            total_kv,
+            blk.num_heads,
+            blk.num_kv_heads,
+            blk.head_dim,
+            seq_len,
+            None,
+            &device,
+        )?,
+    };
 
     // --- output gate: attn_out * sigmoid(gate), on device ------------------
     // Reuse the existing device sigmoid rather than adding a second one: the
@@ -3782,6 +4362,12 @@ pub(crate) fn quantize_kv_block(
             })?;
             Ok((bytes, 1.0))
         }
+        F::WhiteCrow => {
+            let bytes = grim_quant::quant_whitecrow(data).map_err(|e| {
+                grim_core::error::Error::Backend(format!("quant_whitecrow failed: {e}"))
+            })?;
+            Ok((bytes, 1.0))
+        }
         other => Err(grim_core::error::Error::Backend(format!(
             "kv_quant_format: {other:?} has no host packer wired for Qwen35 KV"
         ))),
@@ -3796,6 +4382,1017 @@ const NUT_SUB_BLOCK: usize = 16;
 #[allow(dead_code)]
 const NUT_SUB_BLOCK_BYTES: usize = 9;
 
+/// Dense-arena representation for this model's ROCm KV path.
+/// Explicit `GRIM_KV_ARENA=int8` opts into int8 codes + f32 per-row scales
+/// (always explicit, never default); otherwise the Qwen35 f16 default
+/// applies (f16 unless `GRIM_F16_KV` explicitly disables). Other backends
+/// stay F32.
+/// CurDKV variants the Phase-3 eviction can select survivors by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EvictionMode {
+    /// Default: keep first `sinks`, then the most recent `cap_rows - sinks` tokens.
+    #[default]
+    Positional,
+    /// Keep first `sinks`, then the highest-leverage `cap_rows - sinks` tokens
+    /// chosen by [`KvEvictionPolicy::curdkv_indices`]. Requires a gather pass
+    /// at the eviction boundary; falls back to Positional where the pass is
+    /// not yet wired.
+    Curdkv,
+}
+
+/// Phase-3 KV-eviction policy for the dense ROCm arenas.
+///
+/// `cap_rows` is a FIXED capacity in TOKEN rows (one arena row is one token,
+/// all kv-heads packed). Once set, the arena never grows past it: the first
+/// `sinks` tokens are pinned as attention sinks and the newest
+/// `cap_rows - sinks` tokens live in a ring that overwrites in place, so the
+/// KV footprint is decoupled from `ctx`. `None` keeps the grow-with-context
+/// behaviour (the default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvEvictionPolicy {
+    pub cap_rows: Option<usize>,
+    pub sinks: usize,
+    /// Which survivor-selection strategy the policy uses (default Positional).
+    pub mode: EvictionMode,
+    /// WS-4.3: newest token rows the CurDKV pass NEVER evicts. The residual
+    /// window is what makes the selection decode-safe: the newest row is the
+    /// context the current query was just computed against, so dropping it
+    /// would make the model attend to a history that excludes its own prefix.
+    /// Unused by the positional ring (which keeps the newest rows by
+    /// construction).
+    pub residual: usize,
+}
+
+impl KvEvictionPolicy {
+    pub fn disabled() -> Self {
+        Self {
+            cap_rows: None,
+            sinks: 0,
+            mode: EvictionMode::Positional,
+            residual: 0,
+        }
+    }
+
+    /// Kernel-facing policy. `UNLIMITED` makes every ring kernel an identity.
+    pub fn ring(&self) -> grim_backend_rocm::KvRingPolicy {
+        match self.cap_rows {
+            None => grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            Some(cap) => grim_backend_rocm::KvRingPolicy::new(cap, self.sinks),
+        }
+    }
+
+    /// Arena rows the context may use: the cap when set, else `ctx`.
+    pub fn effective_ctx(&self, ctx: usize) -> usize {
+        match self.cap_rows {
+            Some(cap) => ctx.min(cap),
+            None => ctx,
+        }
+    }
+
+    /// Live arena rows after `abs_rows` absolute rows have been written.
+    /// The ring keeps every row live and contiguous, so this is a clamp.
+    pub fn live_rows(&self, abs_rows: usize) -> usize {
+        match self.cap_rows {
+            Some(cap) => abs_rows.min(cap),
+            None => abs_rows,
+        }
+    }
+
+    /// Arena row for the absolute row `abs_row`.
+    ///
+    /// Delegates to the backend's single host copy of the mapping
+    /// (`KvRingPolicy::row`), which is the twin of the device `grim_kv_ring_row`;
+    /// `kv_ring_row_host_matches_device` pins that pair. Keeping one Rust
+    /// implementation means the eager append, the capture validators and the
+    /// kernels cannot drift apart.
+    pub fn arena_row(&self, abs_row: usize) -> usize {
+        self.ring().row(abs_row)
+    }
+
+    /// Compute the retained arena-row order for `n_tokens` tokens using the
+    /// policy's survivor-selection strategy.
+    ///
+    /// Returns `None` for `Positional` mode (the existing contiguous ring
+    /// layout already provides its ordering) and `Some(indices)` for `Curdkv`
+    /// mode. CurDKV itself lives in [`Self::curdkv_indices`].
+    pub fn compute_retained(
+        &self,
+        n_tokens: usize,
+        d: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<Vec<usize>> {
+        match self.mode {
+            EvictionMode::Positional => None,
+            EvictionMode::Curdkv => Some(Self::curdkv_indices(
+                k,
+                v,
+                n_tokens,
+                d,
+                self.cap_rows.unwrap_or(n_tokens),
+                self.sinks,
+            )),
+        }
+    }
+
+    /// Wire-in shim around [`select_curdkv_indices`] used by the CuRD-KV
+    /// eviction path. Exists so the policy carries its own call site.
+    pub fn curdkv_indices(
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+        budget: usize,
+        sinks: usize,
+    ) -> Vec<usize> {
+        Self::select_curdkv_indices(k_group, v_group, n_tokens, d, budget, sinks)
+    }
+}
+
+/// CurDKV Gaussian projection dimension for low-rank leverage score estimation.
+pub const CURDKV_R: usize = 20;
+
+/// Deterministic Gaussian projection matrix G [d, r] generated via pseudo-random normal.
+/// G_ij ~ N(0, 1/r).
+#[allow(dead_code)]
+pub fn curdkv_projection_matrix(d: usize, r: usize) -> Vec<f32> {
+    let scale = 1.0f32 / (r as f32).sqrt();
+    let mut g = Vec::with_capacity(d * r);
+    // Standard linear congruential / Box-Muller generator for deterministic zero-overhead matrix
+    let mut state = 0x123456789abcdef0u64;
+    let mut next_u01 = || -> f32 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as f32 + 1.0) / (2147483648.0)
+    };
+    for _ in 0..(d * r / 2) {
+        let u1 = next_u01().max(1e-7);
+        let u2 = next_u01();
+        let r_val = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        g.push(r_val * theta.cos() * scale);
+        g.push(r_val * theta.sin() * scale);
+    }
+    if g.len() < d * r {
+        let u1 = next_u01().max(1e-7);
+        let u2 = next_u01();
+        let r_val = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        g.push(r_val * theta.cos() * scale);
+    }
+    g
+}
+
+impl KvEvictionPolicy {
+    /// Compute CurDKV leverage scores for group i (K_i [n, d], V_i [n, d])
+    /// and select top-(budget - sinks) tokens.
+    ///
+    /// Algorithm 1 from Sengupta et al. (NeurIPS 2025):
+    /// 1. G in R^{d x r}, G_ij ~ N(0, 1/r)
+    /// 2. K_proj = K_i * G, V_proj = V_i * G
+    /// 3. l^(K)_j = ||K_proj[j]||_2^2, l^(V)_j = ||V_proj[j]||_2^2
+    /// 4. l^(KV)_j = l^(K)_j * l^(V)_j
+    /// 5. Top-k selection preserving initial `sinks` tokens.
+    pub fn select_curdkv_indices(
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+        budget: usize,
+        sinks: usize,
+    ) -> Vec<usize> {
+        if n_tokens <= budget {
+            return (0..n_tokens).collect();
+        }
+        let r = CURDKV_R;
+        let g = curdkv_projection_matrix(d, r);
+        let mut scores = Vec::with_capacity(n_tokens);
+
+        for j in 0..n_tokens {
+            let k_row = &k_group[j * d..(j + 1) * d];
+            let v_row = &v_group[j * d..(j + 1) * d];
+
+            let mut l_k = 0.0f32;
+            let mut l_v = 0.0f32;
+            for col in 0..r {
+                let mut kp = 0.0f32;
+                let mut vp = 0.0f32;
+                for i in 0..d {
+                    let g_val = g[i * r + col];
+                    kp += k_row[i] * g_val;
+                    vp += v_row[i] * g_val;
+                }
+                l_k += kp * kp;
+                l_v += vp * vp;
+            }
+            scores.push(l_k * l_v);
+        }
+
+        // Pinned sinks
+        let mut selected = Vec::with_capacity(budget);
+        let s = sinks.min(n_tokens).min(budget);
+        for i in 0..s {
+            selected.push(i);
+        }
+
+        // Top-(budget - s) from remaining tokens
+        let rem_budget = budget.saturating_sub(s);
+        if rem_budget > 0 && n_tokens > s {
+            let mut rem_indices: Vec<usize> = (s..n_tokens).collect();
+            rem_indices.sort_by(|&a, &b| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            selected.extend(rem_indices.into_iter().take(rem_budget));
+            selected.sort_unstable();
+        }
+
+        selected
+    }
+
+    /// WS-4.3: CurDKV survivor selection WITH a residual window.
+    ///
+    /// Retains, up to `budget` rows: the leading `sinks`, the newest `residual`
+    /// tokens, and the highest-leverage tokens from what is left. The residual
+    /// window is the decode-safety property — the newest token is the prefix the
+    /// current query was just computed against, so evicting it would make the
+    /// model attend to a history that excludes its own context.
+    ///
+    /// Returns indices in ascending order, which is what makes the in-place
+    /// gather in [`curdkv_compact_arena`] safe.
+    pub fn select_curdkv_indices_residual(
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+        budget: usize,
+        sinks: usize,
+        residual: usize,
+    ) -> Vec<usize> {
+        if n_tokens <= budget {
+            return (0..n_tokens).collect();
+        }
+        let r = CURDKV_R;
+        let g = curdkv_projection_matrix(d, r);
+        let mut scores = vec![0.0f32; n_tokens];
+        for j in 0..n_tokens {
+            let k_row = &k_group[j * d..(j + 1) * d];
+            let v_row = &v_group[j * d..(j + 1) * d];
+            let mut l_k = 0.0f32;
+            let mut l_v = 0.0f32;
+            for col in 0..r {
+                let mut kp = 0.0f32;
+                let mut vp = 0.0f32;
+                for i in 0..d {
+                    let g_val = g[i * r + col];
+                    kp += k_row[i] * g_val;
+                    vp += v_row[i] * g_val;
+                }
+                l_k += kp * kp;
+                l_v += vp * vp;
+            }
+            scores[j] = l_k * l_v;
+        }
+
+        // Pinned: the leading sinks.
+        let s = sinks.min(n_tokens).min(budget);
+        let mut selected: Vec<usize> = (0..s).collect();
+        // Pinned: the newest `residual` tokens.
+        let res = residual
+            .min(n_tokens.saturating_sub(s))
+            .min(budget.saturating_sub(s));
+        let res_start = n_tokens - res;
+        // Everything else competes on leverage score.
+        let rem_budget = budget.saturating_sub(s).saturating_sub(res);
+        if rem_budget > 0 && res_start > s {
+            let mut mid: Vec<usize> = (s..res_start).collect();
+            mid.sort_by(|&a, &b| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            selected.extend(mid.into_iter().take(rem_budget));
+        }
+        selected.extend(res_start..n_tokens);
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
+
+    /// The policy's own survivor selection: budget = `cap_rows`, sinks and
+    /// residual taken from the policy.
+    pub fn select_curdkv_with_residual(
+        &self,
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+    ) -> Vec<usize> {
+        let budget = self.cap_rows.unwrap_or(n_tokens).min(n_tokens);
+        Self::select_curdkv_indices_residual(
+            k_group,
+            v_group,
+            n_tokens,
+            d,
+            budget,
+            self.sinks,
+            self.residual,
+        )
+    }
+}
+
+/// WS-4.3: compact a layer's dense K/V arenas to the CurDKV survivor set.
+///
+/// Runs at the eviction boundary: the live row count has reached the cap and
+/// the mode is [`EvictionMode::Curdkv`]. Survivors are chosen on the host by
+/// leverage score (always keeping the pinned sinks and the newest `residual`
+/// tokens), then gathered into the FRONT of the arena with
+/// [`grim_tensor::MemoryOps::gather_rows_into`].
+///
+/// The gather is in place and safe: the survivor list is strictly increasing,
+/// so destination row `i` is never a row a later copy still has to read.
+///
+/// `cache.current_pos` is reset to the retained count. The attention kernels
+/// read the contiguous prefix `[0, live)`, so this is what makes a
+/// non-contiguous survivor set readable without touching the kernels.
+///
+/// Only F32/F16 arenas are supported. The int8/int4 scale sidecars would each
+/// need their own gather, and a half-compaction would pair a row's codes with
+/// another row's scale — the exact drift the append path already guards.
+pub(crate) fn curdkv_compact_arena(
+    dev: &Arc<dyn grim_tensor::BackendDevice>,
+    cache: &mut Qwen35LayerCache,
+    policy: &KvEvictionPolicy,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<usize> {
+    let abs = cache.current_pos;
+    let Some(cap) = policy.cap_rows else {
+        return Ok(abs);
+    };
+    if abs <= cap {
+        return Ok(abs);
+    }
+    // `current_pos` is the ABSOLUTE token count; the arena itself holds exactly
+    // `cap` rows (the ring wraps). The rows to compact are the RESIDENT ones.
+    let live = abs.min(cap);
+    if cache.k_scales_device.is_some() || cache.v_scales_device.is_some() {
+        return Err(grim_core::error::Error::Backend(
+            "curdkv compaction: quantized (int8/int4) arenas need a sidecar gather and are not \
+             supported yet"
+                .into(),
+        ));
+    }
+    let stride = num_kv_heads * head_dim;
+    let (Some(k_dev), Some(v_dev)) = (cache.k_device.as_ref(), cache.v_device.as_ref()) else {
+        return Ok(abs);
+    };
+    // Storage truth, not the env: the leverage scores below are host f32s, so
+    // only F32/F16 arenas can be gathered. int8/int4 are already caught by the
+    // sidecar check above; WhiteCrow is the case that is NOT — it is byte-
+    // addressed (U8) like them but carries its bf16 scale + u8 zero INLINE in
+    // each 67-byte block, so it has no sidecar and sails past that check into
+    // the f32 D2H below, where the byte arena either reinterprets its codes as
+    // floats or fails late on the shape. Refuse it here, loud and early.
+    {
+        let arith = k_dev.dtype().arith;
+        if arith != grim_tensor::ArithType::F32 && arith != grim_tensor::ArithType::F16 {
+            return Err(grim_core::error::Error::Backend(format!(
+                "curdkv compaction: dense KV arena dtype {arith:?} is not F32/F16 (packed \
+                 formats such as WhiteCrow/int8/int4 store bytes, not f32 rows) and is not \
+                 supported yet"
+            )));
+        }
+    }
+    // The one D2H on the eviction path, once per boundary: leverage scores are
+    // a host computation over the live rows.
+    let k_host = k_dev.to_cpu_vec_f32()?;
+    let v_host = v_dev.to_cpu_vec_f32()?;
+    if k_host.len() < live * stride || v_host.len() < live * stride {
+        return Err(grim_core::error::Error::Shape(format!(
+            "curdkv compaction: arena holds {} / {} f32 but {live} live rows need {}",
+            k_host.len(),
+            v_host.len(),
+            live * stride
+        )));
+    }
+    let survivors = policy.select_curdkv_with_residual(&k_host, &v_host, live, stride);
+    let rows: Vec<u32> = survivors.iter().map(|&r| r as u32).collect();
+    dev.gather_rows_into(k_dev.as_ref(), 0, k_dev.as_ref(), &rows, stride)?;
+    dev.gather_rows_into(v_dev.as_ref(), 0, v_dev.as_ref(), &rows, stride)?;
+    let retained = survivors.len();
+    cache.current_pos = retained;
+    Ok(retained)
+}
+
+/// Per-layer KV-arena capacity table parsed from `GRIM_KV_ARENA_ROWS`.
+///
+/// Accepted forms:
+///   - `N`             — every layer gets N (uniform)
+///   - `N0,N1,...,Nk`  — layer i gets N_i; layers past the list reuse the LAST
+///                       entry, so a short list degrades gracefully
+///   - a `0` entry     — that layer is UNLIMITED (no cap)
+///
+/// An absent/empty spec, or any non-numeric entry, disables eviction (`None`);
+/// an unparseable entry is rejected loudly rather than silently zeroed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvLayerBudgets {
+    per_layer: Vec<usize>,
+}
+
+impl KvLayerBudgets {
+    pub fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return None;
+        }
+        let mut per_layer = Vec::new();
+        for part in spec.split(',') {
+            let part = part.trim();
+            match part.parse::<usize>() {
+                Ok(v) if !part.is_empty() => per_layer.push(v),
+                _ => {
+                    eprintln!(
+                        "[qwen35] GRIM_KV_ARENA_ROWS entry {part:?} is not a number; eviction disabled"
+                    );
+                    return None;
+                }
+            }
+        }
+        if per_layer.is_empty() {
+            return None;
+        }
+        Some(Self { per_layer })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let spec = std::env::var("GRIM_KV_ARENA_ROWS").ok()?;
+        Self::parse(&spec)
+    }
+
+    /// Capacity for `layer`; `None` = unlimited. Layers past the table reuse
+    /// the last entry.
+    pub fn cap_for(&self, layer: usize) -> Option<usize> {
+        let idx = layer.min(self.per_layer.len() - 1);
+        match self.per_layer[idx] {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// True when every layer resolves to the same capacity. The decode graph
+    /// captures ONE ring for all layers, so it can only honor a uniform table.
+    pub fn is_uniform(&self) -> bool {
+        self.per_layer.iter().all(|v| *v == self.per_layer[0])
+    }
+
+    /// Worst-case capacity across layers for reservation planning: `None`
+    /// (unlimited) if ANY layer is uncapped, else the largest cap.
+    pub fn max_cap(&self) -> Option<usize> {
+        if self.per_layer.iter().any(|v| *v == 0) {
+            return None;
+        }
+        self.per_layer.iter().copied().max()
+    }
+
+    /// Number of explicit entries (a short table is padded with its last).
+    pub fn entries(&self) -> usize {
+        self.per_layer.len()
+    }
+}
+
+/// Pure parser for `GRIM_KV_SINKS`: default 4, clamped into `[0, cap-1]` so a
+/// bad value can never consume the whole ring.
+pub(crate) fn parse_sinks_env(v: Option<&str>, cap: usize) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .min(cap.saturating_sub(1))
+}
+
+/// Pure parser for `GRIM_KV_EVICT_MODE`.
+pub(crate) fn parse_evict_mode_env(v: Option<&str>) -> EvictionMode {
+    match v {
+        Some("curdkv" | "cur_dkv" | "leverage") => EvictionMode::Curdkv,
+        _ => EvictionMode::Positional,
+    }
+}
+
+/// Pure parser for `GRIM_KV_RESIDUAL`: the newest token rows the CurDKV pass
+/// never evicts. Defaults to `cap/8` (at least 1), clamped below the cap.
+pub(crate) fn parse_residual_env(v: Option<&str>, cap: usize) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| (cap / 8).max(1))
+        .min(cap.saturating_sub(1))
+}
+
+/// Eviction policy for ONE attention layer.
+///
+/// `GRIM_KV_ARENA_ROWS` = per-layer capacity in token rows (see
+/// [`KvLayerBudgets`]; unset/0 = unlimited for that layer).
+/// `GRIM_KV_SINKS` = pinned leading tokens (default 4), clamped below the cap.
+/// `GRIM_KV_EVICT_MODE` = `curdkv` enables leverage-score survivor selection.
+pub(crate) fn kv_eviction_policy_for_layer(device: &Device, layer_idx: usize) -> KvEvictionPolicy {
+    if !matches!(device, Device::Rocm(_)) {
+        return KvEvictionPolicy::disabled();
+    }
+    let Some(budgets) = KvLayerBudgets::from_env() else {
+        return KvEvictionPolicy::disabled();
+    };
+    let Some(cap) = budgets.cap_for(layer_idx) else {
+        return KvEvictionPolicy::disabled();
+    };
+    let sinks = parse_sinks_env(std::env::var("GRIM_KV_SINKS").ok().as_deref(), cap);
+    let mode = parse_evict_mode_env(std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref());
+    let residual = parse_residual_env(std::env::var("GRIM_KV_RESIDUAL").ok().as_deref(), cap);
+    KvEvictionPolicy {
+        cap_rows: Some(cap),
+        sinks,
+        mode,
+        residual,
+    }
+}
+
+/// Model-wide (worst-case) eviction policy: the largest per-layer cap, or
+/// disabled. Used for KV reservation planning, where the reservation must
+/// cover the layer that needs the most rows. NOT for per-layer append — use
+/// [`kv_eviction_policy_for_layer`] there.
+pub(crate) fn kv_eviction_policy(device: &Device) -> KvEvictionPolicy {
+    if !matches!(device, Device::Rocm(_)) {
+        return KvEvictionPolicy::disabled();
+    }
+    let Some(budgets) = KvLayerBudgets::from_env() else {
+        return KvEvictionPolicy::disabled();
+    };
+    let Some(cap) = budgets.max_cap() else {
+        return KvEvictionPolicy::disabled();
+    };
+    let sinks = parse_sinks_env(std::env::var("GRIM_KV_SINKS").ok().as_deref(), cap);
+    let mode = parse_evict_mode_env(std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref());
+    let residual = parse_residual_env(std::env::var("GRIM_KV_RESIDUAL").ok().as_deref(), cap);
+    KvEvictionPolicy {
+        cap_rows: Some(cap),
+        sinks,
+        mode,
+        residual,
+    }
+}
+
+/// Pure core of [`kv_arena_format_qwen`]: resolve from already-read env
+/// strings, with the Qwen35-specific DEFAULT (f16) applied only when
+/// `GRIM_KV_ARENA` is unset. Explicit values go through the backend's ONE
+/// spelling table ([`grim_backend_rocm::parse_kv_arena_env`]) so an explicit
+/// `GRIM_KV_ARENA` can never mean different things to the model and to the
+/// graph allocator.
+pub(crate) fn resolve_kv_arena_format_qwen(
+    arena: Option<&str>,
+    f16_kv: Option<&str>,
+) -> grim_backend_rocm::KvArenaFormat {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match arena {
+        Some(v) => match grim_backend_rocm::parse_kv_arena_env(v) {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "[qwen35] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using f16 default"
+                );
+                F::F16
+            }
+        },
+        None => {
+            // The model's default is f16, so the flag is read in the
+            // DISABLED sense: only an explicit off spelling opts out. (The
+            // backend's f32 default reads the same flag in the ENABLED
+            // sense; `f16_kv_explicitly_disabled` is the complement of
+            // `parse_f16_kv_env`, pinned by the backend's own test.)
+            if grim_backend_rocm::f16_kv_explicitly_disabled(f16_kv) {
+                F::F32
+            } else {
+                F::F16
+            }
+        }
+    }
+}
+
+pub(crate) fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvArenaFormat {
+    if !matches!(device, Device::Rocm(_)) {
+        return grim_backend_rocm::KvArenaFormat::F32;
+    }
+    resolve_kv_arena_format_qwen(
+        std::env::var("GRIM_KV_ARENA").ok().as_deref(),
+        std::env::var("GRIM_F16_KV").ok().as_deref(),
+    )
+}
+
+/// Codes-element dtype for the dense ROCm KV arenas. F32/F16/U8 per
+/// [`kv_arena_format_qwen`]. ALL dense arena touchpoints key off the format
+/// so the representation can never disagree with itself.
+pub(crate) fn kv_arena_dtype(device: &Device) -> DType {
+    kv_arena_dtype_for(kv_arena_format_qwen(device))
+}
+
+/// [`kv_arena_dtype`] keyed by format, so the size arithmetic below can be
+/// tested without a device.
+pub(crate) fn kv_arena_dtype_for(format: grim_backend_rocm::KvArenaFormat) -> DType {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::F32 => DType::F32,
+        F::F16 => DType {
+            arith: ArithType::F16,
+            storage: Storage::Native,
+        },
+        // WS-3A: byte-addressed like int8/int4 so the arena allocates, but
+        // `ensure_arena_format_supported` refuses it before any use — the
+        // 2-bit-K kernels do not exist.
+        //
+        // WhiteCrow is also byte-addressed: its arena is a sequence of
+        // interleaved 67-byte blocks (64 B u4 codes + 2 B bf16 scale + 1 B u8
+        // zero per 128 values), so the storage element is a U8 byte.
+        F::Int8 | F::Int4 | F::Int2V4 | F::WhiteCrow => DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    }
+}
+
+/// Innermost extent of the dense KV arena's storage shape for ONE KV head, in
+/// elements of [`kv_arena_dtype`] — i.e. the third dim of the arena's
+/// `[rows, nkv, extent]` shape.
+///
+/// The packed formats are byte-addressed — [`kv_arena_dtype`] gives them a U8
+/// element — so for them this number IS a head's byte count, and the shape's
+/// element count is the arena's byte count. int4 packs TWO codes per byte and
+/// int2v4 packs FOUR on the key side, so an extent of `head_dim` (the
+/// f32/f16/int8 layout) allocates twice what the kernels write.
+///
+/// That is how int4 came to occupy exactly as much VRAM as int8 — one byte per
+/// element — while costing 10x int8's perplexity: the format's entire reason to
+/// exist, silently discarded. This function and its two companions are the
+/// ONLY place the arena's size is derived from its representation; the
+/// allocator, the growth copies and the budget planner all call them, because
+/// the previous arrangement had three copies of the same fact and two of them
+/// were wrong.
+///
+/// The MAX over the two sides, because one shape serves both: int2v4's key
+/// codes are half of its value codes and the key side still has to fit.
+pub(crate) fn kv_arena_head_extent(
+    format: grim_backend_rocm::KvArenaFormat,
+    head_dim: usize,
+) -> usize {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::F32 | F::F16 | F::Int8 => head_dim,
+        F::Int4 => head_dim / 2,
+        F::Int2V4 => head_dim / 2,
+        // WhiteCrow: one 67-byte block per 128 values of the head vector, so a
+        // head costs `ceil(head_dim/128) * 67` bytes. The block boundaries align
+        // with head-vector starts exactly when `head_dim % 128 == 0` (the
+        // production Qwen head_dim = 128 case); the append/attention paths
+        // enforce that alignment rather than silently straddling heads.
+        F::WhiteCrow => (head_dim.div_ceil(128)) * 67,
+    }
+}
+
+/// Elements one whole token row (every KV head) occupies: `nkv` heads of
+/// [`kv_arena_head_extent`]. This is the unit the growth copies count in.
+pub(crate) fn kv_arena_row_extent(
+    format: grim_backend_rocm::KvArenaFormat,
+    nkv: usize,
+    head_dim: usize,
+) -> usize {
+    nkv * kv_arena_head_extent(format, head_dim)
+}
+
+/// Bytes one KV *element* costs in the dense arena, codes only, no scale
+/// sidecar — the unit the arena budget planner reserves in.
+pub(crate) fn kv_arena_bytes_per_kv_elem(format: grim_backend_rocm::KvArenaFormat) -> f64 {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::F32 => 4.0,
+        F::F16 => 2.0,
+        F::Int8 => 1.0,
+        // Key 0.25, value 0.5; the reservation takes the wider side.
+        F::Int4 | F::Int2V4 => 0.5,
+        // WhiteCrow: the amortized width of its interleaved blocks — 67 bytes
+        // per 128 values (u4 codes + inline bf16 scale + u8 zero).
+        F::WhiteCrow => 67.0 / 128.0,
+    }
+}
+
+/// Scale-sidecar BYTES one token row costs: one f32 per (row, kv head) for K
+/// and again for V. Zero for the formats that store K/V directly.
+///
+/// WhiteCrow carries its scale/zero INLINE in the 67-byte blocks, so it also
+/// costs zero sidecar bytes.
+pub(crate) fn kv_arena_row_scale_bytes(
+    format: grim_backend_rocm::KvArenaFormat,
+    nkv: usize,
+) -> usize {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::Int8 | F::Int4 | F::Int2V4 => nkv * 4 * 2,
+        F::F32 | F::F16 | F::WhiteCrow => 0,
+    }
+}
+
+/// Fail closed on an arena format whose device kernels do not exist yet.
+///
+/// `GRIM_KV_ARENA=int2v4` (WS-3A) resolves to a first-class format so it cannot
+/// be mistaken for another, but its 2-bit-K quantizer and mixed-width attention
+/// dequant are not written. `int2v4` and `int8` are BOTH byte-addressed, so a
+/// silent fallthrough would serve 2-bit codes as 8-bit and corrupt the cache —
+/// this refusal is the difference between a loud failure and a wrong answer.
+pub(crate) fn ensure_arena_format_supported(device: &Device) -> Result<()> {
+    let fmt = kv_arena_format_qwen(device);
+    if !fmt.has_device_kernels() {
+        return Err(grim_core::error::Error::Backend(format!(
+            "GRIM_KV_ARENA={fmt:?}: the native K2V4 arena kernels (2-bit K quantizer + \
+             mixed-width attention dequant) are not implemented; use int4, int8, f16 or f32"
+        )));
+    }
+    Ok(())
+}
+
+/// Per-(row, kv-head) f32 scales sidecar dtype for int8/int4 formats.
+/// `None` for F32/F16 (no sidecar) and for WhiteCrow (scales ride inline in
+/// the 67-byte blocks).
+fn kv_arena_scale_dtype(device: &Device) -> Option<DType> {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match kv_arena_format_qwen(device) {
+        F::Int8 | F::Int4 | F::Int2V4 => Some(DType::F32),
+        F::WhiteCrow => None, // inline bf16 scale + u8 zero per 128-value block
+        _ => None,
+    }
+}
+
+/// Dense-arena storage reference (K/V codes + scale sidecars). One
+/// spelling of the KV-buffer type for the Phase-2 helpers.
+type KvStor<'a> = &'a dyn grim_tensor::BackendStorage;
+
+/// Append `n_tok_rows` K and V token-rows into the dense arenas at element
+/// offset `row_off * kv_stride`.
+///
+/// UNIT DISCIPLINE (this helper has burned two off-by-a-factor bugs):
+/// - `row_off` counts ARENA ROWS, and one arena row is one kv-head vector, so
+///   `row_off == current_pos * num_kv_heads`. Element offset is
+///   `row_off * (num_kv_heads * head_dim)`.
+/// - `n_tok_rows` counts TOKEN rows in the SOURCE (`seq_len`), because the
+///   quantizer walks (token row, kv_head) pairs: `vecs = n_tok_rows * nkv`.
+///   Passing head-vector rows here double-counts `num_kv_heads`.
+///
+/// F32/F16 arenas take the plain `arena_append_from_f32` path (with the f32->f16
+/// cast). int8 arenas take the device quantizer, which writes biased-u8 codes
+/// plus one f32 scale per (row, kv_head); a missing sidecar is a loud `Err`
+/// rather than a raw byte copy. K and V always share the format, so one
+/// decision covers both.
+#[allow(clippy::too_many_arguments)]
+fn arena_append_kv_rows<'a>(
+    dev: &Arc<dyn grim_tensor::BackendDevice>,
+    device: &Device,
+    k_dst: KvStor<'a>,
+    v_dst: KvStor<'a>,
+    row_off: usize,
+    k_src: KvStor<'a>,
+    v_src: KvStor<'a>,
+    n_tok_rows: usize,
+    nkv: usize,
+    head_dim: usize,
+    k_scales: Option<KvStor<'a>>,
+    v_scales: Option<KvStor<'a>>,
+) -> grim_tensor::error::Result<()> {
+    use grim_backend_rocm::KvArenaFormat as F;
+    let stride = nkv * head_dim;
+    let kv_elems = n_tok_rows * stride;
+    let format = kv_arena_format_qwen(device);
+    if matches!(format, F::WhiteCrow) {
+        // WhiteCrow: interleaved 67-byte blocks with INLINE bf16 scale + u8
+        // zero — no f32 sidecar, so `k_scales`/`v_scales` are unused here. One
+        // block per 128 values; `head_dim % 128 == 0` keeps groups aligned to
+        // head vectors. Byte offset of the append point is `row_off` token
+        // rows, each `nkv * (head_dim/128) * 67` bytes.
+        if head_dim % 128 != 0 {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "WhiteCrow KV append: head_dim {head_dim} must be a multiple of 128 \
+                 (got {}); per-128 groups cannot align to head vectors",
+                head_dim
+            )));
+        }
+        let ordinal = k_dst.device_ordinal() as usize;
+        let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let row_bytes = nkv * (head_dim / 128) * 67;
+        let dst_off = row_off * row_bytes;
+        grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+            rocm.as_ref(),
+            k_src,
+            0,
+            k_dst,
+            dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+            rocm.as_ref(),
+            v_src,
+            0,
+            v_dst,
+            dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        return Ok(());
+    }
+    if !matches!(format, F::Int8 | F::Int4 | F::Int2V4) {
+        let dst_off = row_off * stride;
+        arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, 0, kv_elems)?;
+        arena_append_from_f32(dev.as_ref(), v_dst, dst_off, v_src, 0, kv_elems)?;
+        return Ok(());
+    }
+    let ksc = k_scales.ok_or_else(|| {
+        grim_tensor::error::Error::Backend("quantized KV append: k scale sidecar missing".into())
+    })?;
+    let vsc = v_scales.ok_or_else(|| {
+        grim_tensor::error::Error::Backend("quantized KV append: v scale sidecar missing".into())
+    })?;
+    let ordinal = k_dst.device_ordinal() as usize;
+    let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+    // UNIT: the sidecar is [rows, nkv], and both the quantizer kernel
+    // (`sc_idx = scales_off + row*nkv + kh`) and the attention readers
+    // (`scales[kv_idx*nkv + kv_head]`) address it in ELEMENTS. So the base for
+    // token row `row_off` is `row_off * nkv` — passing the row itself shifts
+    // every head past row 0 by `row_off*(nkv-1)` slots and makes the reader
+    // pair a row's codes with another row's scale (or an unwritten one).
+    // `i8_append_sidecar_offsets_are_independent_units` pins the kernel side;
+    // `qwen35_i8_kv_arena_rows_match_f32_within_code_step` pins this call site.
+    let scale_off = row_off * nkv;
+
+    if format == F::Int4 || format == F::Int2V4 {
+        // Packed byte stride differs per side: 2-bit K holds 4 codes/byte
+        // (stride/4), 4-bit V holds 2 codes/byte (stride/2).
+        let k_off_bytes = if format == F::Int2V4 {
+            row_off * (stride / 4)
+        } else {
+            row_off * (stride / 2)
+        };
+        let v_off_bytes = row_off * (stride / 2);
+        if format == F::Int2V4 {
+            grim_backend_rocm::launch_kv_quantize_rows_i2(
+                rocm.as_ref(),
+                k_src,
+                0,
+                k_dst,
+                k_off_bytes,
+                ksc,
+                scale_off,
+                n_tok_rows,
+                stride,
+                nkv,
+                head_dim,
+            )
+            .map(|_| ())?;
+        } else {
+            grim_backend_rocm::launch_kv_quantize_rows_i4(
+                rocm.as_ref(),
+                k_src,
+                0,
+                k_dst,
+                k_off_bytes,
+                ksc,
+                scale_off,
+                n_tok_rows,
+                stride,
+                nkv,
+                head_dim,
+            )
+            .map(|_| ())?;
+        }
+        grim_backend_rocm::launch_kv_quantize_rows_i4(
+            rocm.as_ref(),
+            v_src,
+            0,
+            v_dst,
+            v_off_bytes,
+            vsc,
+            scale_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())
+    } else {
+        let dst_off = row_off * stride;
+        grim_backend_rocm::launch_kv_quantize_rows_i8(
+            rocm.as_ref(),
+            k_src,
+            0,
+            k_dst,
+            dst_off,
+            ksc,
+            scale_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        grim_backend_rocm::launch_kv_quantize_rows_i8(
+            rocm.as_ref(),
+            v_src,
+            0,
+            v_dst,
+            dst_off,
+            vsc,
+            scale_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())
+    }
+}
+
+/// Grow/allocate the scale sidecars so they cover `rows` rows, carrying
+/// the `live_rows` already-populated scales across. No-op unless int8/int4
+/// format is active (F32/F16 need no sidecar), so every call site can be
+/// unconditional — the format check is the single decision point.
+fn ensure_int8_scales(
+    dev: &Arc<dyn grim_tensor::BackendDevice>,
+    device: &Device,
+    k_scales: &mut Option<Box<dyn grim_tensor::BackendStorage>>,
+    v_scales: &mut Option<Box<dyn grim_tensor::BackendStorage>>,
+    rows: usize,
+    live_rows: usize,
+    nkv: usize,
+) -> grim_tensor::error::Result<()> {
+    use grim_backend_rocm::KvArenaFormat as F;
+    let fmt = kv_arena_format_qwen(device);
+    if !matches!(fmt, F::Int8 | F::Int4 | F::Int2V4) {
+        return Ok(());
+    }
+    // f32 by construction (the int8 reader multiplies codes by an f32 scale);
+    // routed through the resolver so the dtype has one home.
+    let scale_dtype = kv_arena_scale_dtype(device).unwrap_or(DType::F32);
+    fn ensure_one(
+        dev: &Arc<dyn grim_tensor::BackendDevice>,
+        slot: &mut Option<Box<dyn grim_tensor::BackendStorage>>,
+        rows: usize,
+        live_rows: usize,
+        nkv: usize,
+        scale_dtype: &DType,
+    ) -> grim_tensor::error::Result<()> {
+        let cap = slot.as_ref().map(|s| s.shape().dims()[0]).unwrap_or(0);
+        if cap >= rows {
+            return Ok(());
+        }
+        let grown = dev.alloc_storage(&Shape::new(vec![rows, nkv]), scale_dtype.clone())?;
+        if let Some(ref old) = slot.as_ref() {
+            let n = live_rows.min(cap) * nkv;
+            if n > 0 {
+                dev.copy_slice_range(grown.as_ref(), 0, old.as_ref(), 0, n)?;
+            }
+        }
+        *slot = Some(grown);
+        Ok(())
+    }
+    ensure_one(dev, k_scales, rows, live_rows, nkv, &scale_dtype)?;
+    ensure_one(dev, v_scales, rows, live_rows, nkv, &scale_dtype)
+}
+
+/// Append `count` f32 elements into a dense KV arena at element offsets,
+/// converting f32->f16 on-device when the arena is f16. Same-dtype arenas
+/// keep the plain D2D copy. Offsets and counts are ELEMENTS (not bytes) in
+/// each side's own dtype.
+fn arena_append_from_f32(
+    dev: &dyn grim_tensor::BackendDevice,
+    dst_arena: &dyn grim_tensor::BackendStorage,
+    dst_off_elems: usize,
+    src_f32: &dyn grim_tensor::BackendStorage,
+    src_off_elems: usize,
+    count: usize,
+) -> grim_tensor::error::Result<()> {
+    use grim_backend_rocm::device::util::as_rocm;
+    if dst_arena.dtype().arith != ArithType::F16 {
+        return dev.copy_slice_range(dst_arena, dst_off_elems, src_f32, src_off_elems, count);
+    }
+    let rocm = as_rocm(dst_arena)?;
+    let ordinal = dst_arena.device_ordinal() as usize;
+    grim_backend_rocm::RocmDevice::shared(ordinal).convert_f32_to_f16_into(
+        src_f32,
+        src_off_elems,
+        rocm,
+        dst_off_elems,
+        count,
+    )
+}
+
 /// KV quantization format selected by `GRIM_KV_QUANT`.
 ///
 /// Only formats the paged attention kernel can actually decode are offered, and
@@ -3803,26 +5400,28 @@ const NUT_SUB_BLOCK_BYTES: usize = 9;
 /// `dequant_kv_element`. `None` keeps the dense f32 arena.
 ///
 /// `GRIM_KV_QUANT=f16` is deliberately rejected here: the f16 arena is a
-/// different representation with its own reader, and the f32<->f16 cast is
-/// currently unverified, so silently honoring it would reintroduce the exact
-/// reinterpretation bug the paged path is designed to avoid.
+/// different representation with its own reader (eager alloc/append/attend
+/// plus seeded graph replay, all validated f16-vs-f32). Routing it through
+/// the paged path would reintroduce the reinterpretation bug the paged path
+/// is designed to avoid; use the dense f16 arenas (Qwen35 default) instead.
 fn kv_quant_format() -> Option<grim_tensor::PagedKvQuantFormat> {
     match std::env::var("GRIM_KV_QUANT").as_deref() {
         Ok("int8" | "q8_0" | "q8") => Some(grim_tensor::PagedKvQuantFormat::Int8),
         Ok("fp8" | "fp8_e4m3") => Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3),
         Ok("nutcracker" | "nutfp4" | "nut_fp4") => Some(grim_tensor::PagedKvQuantFormat::NutFp4),
         Ok("nvfp4" | "nv_fp4" | "fp4") => Some(grim_tensor::PagedKvQuantFormat::NvFp4),
+        Ok("whitecrow" | "w4a4" | "white_crow") => Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
+        Ok("off" | "none" | "f32" | "dense") => None,
         Ok(other) => {
-            // Fail loud rather than silently falling back to f32: a user who
-            // asked for quantized KV and got a 32 GB arena would otherwise see
-            // an OOM with no indication the setting was ignored.
+            // Fail loud rather than silently falling back: a user who
+            // asked for an unsupported format should see the warning.
             eprintln!(
                 "[qwen35] GRIM_KV_QUANT={other:?} is not a supported paged KV format \
-                 (int8 | fp8 | nutcracker | nvfp4); using the dense f32 arena"
+                 (whitecrow | int8 | fp8 | nutcracker | nvfp4); using default whitecrow"
             );
-            None
+            Some(grim_tensor::PagedKvQuantFormat::WhiteCrow)
         }
-        _ => None,
+        _ => Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
     }
 }
 
@@ -3841,9 +5440,11 @@ pub(crate) fn packed_kv_bytes(n_values: usize, fmt: grim_tensor::PagedKvQuantFor
         F::MxFp4 => n_values.div_ceil(32) * 17,
         F::MxFp8 => n_values.div_ceil(32) * 33,
         // WhiteCrow: per 128 values - 64 B u4 codes + 2 B bf16 scale + 1 B zero.
-        // The packed pool has no WhiteCrow KV decode leg yet, so the arena
-        // selection arm above refuses it before this size is ever needed; the
-        // arm exists so the enum stays exhaustively matched.
+        // `div_ceil` on the group count (not the total) keeps a ragged KV
+        // length correct: a partial group still costs its inline scale byte,
+        // exactly as the host encoder and the paged device kernels lay out.
+        // This is live, not vestigial — the paged WhiteCrow decode kernels
+        // read this layout (`shared_attention.rs` sizes the pool with it).
         F::WhiteCrow => n_values.div_ceil(128) * 67,
     }
 }
@@ -3873,6 +5474,44 @@ const VRAM_PLAN_FRACTION: f64 = 0.90;
 /// backend without `hipMemGetInfo`), keeping the old behavior as the
 /// conservative default.
 #[allow(clippy::too_many_arguments)]
+/// Bytes a non-layer weight will actually occupy once loaded, given the
+/// embedding/head load rules: a verified K-quant scheme stays packed, any
+/// other quantized scheme dequantizes to f32. Sizing from checkpoint bytes
+/// alone under-counts a Q6_K table by ~7x (715 MB packed vs 5.09 GB f32) and
+/// leaves the owning card over-filled by the difference.
+fn non_layer_weight_bytes(
+    ws: &WeightSource<'_>,
+    prefix: &str,
+    fallback_elems: usize,
+    is_embedding: bool,
+) -> u64 {
+    let w = ws.pp(prefix);
+    let packed = w.prefix_bytes();
+    match w.meta("weight") {
+        Some(m) => {
+            let elems: usize = m.shape.iter().product();
+            match &m.dtype.storage {
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S) => packed,
+                // `Embedding::load` dequantizes an unverified scheme to f32;
+                // `Linear::load_column_parallel` keeps the packed tensor (it
+                // reads the natural weight, never the transpose). Reserving
+                // f32 for the LM head would over-charge the last card by ~4 GB.
+                Storage::KQuant(_) if is_embedding => elems as u64 * 4,
+                Storage::KQuant(_) => packed,
+                _ => packed,
+            }
+        }
+        None => {
+            if packed > 0 {
+                packed
+            } else {
+                fallback_elems as u64 * 4
+            }
+        }
+    }
+}
+
 fn plan_layer_devices(
     ws: &WeightSource<'_>,
     devices: &[Device],
@@ -3881,80 +5520,42 @@ fn plan_layer_devices(
     kv_heads: usize,
     head_dim: usize,
     interval: usize,
+    vocab: usize,
+    hidden: usize,
 ) -> Vec<Device> {
     // Single-device or unknown layout: nothing to plan.
     if devices.len() <= 1 {
         return vec![devices[0].clone(); num_layers];
     }
 
-    let round_robin = |i: usize| devices[i * devices.len() / num_layers.max(1)].clone();
-
-    // Reserve the decode-graph KV arenas BEFORE handing out weight budget.
-    //
-    // The arenas are allocated at full context for every full-attention layer:
-    // `ctx * num_kv_heads * head_dim * 4 bytes` for K and again for V. For this
-    // 27B Q4_K model at a 228k context that is ~1.87 GB per attention layer
-    // across 17 such layers = ~31.8 GB, which alone exceeds the 34 GB the pair
-    // has. Planning weights against the *whole* free budget therefore drives
-    // both cards to ~99% and leaves the arenas nowhere to go, which is what
-    // pushed the run into HIP managed memory. Reserving first lets weights and
-    // KV share the budget honestly, and makes an oversized context visible as a
-    // warning rather than a silent spill.
-    let num_attn_layers = (0..num_layers)
-        .filter(|i| (i + 1) % interval.max(1) == 0)
-        .count();
-
-    // Bound the arenas by the VRAM that can actually hold them, BEFORE
-    // reserving. The arena is sized from the model's context, and this 27B
-    // advertises 232k: 16 attention layers at that context reserve 30.4 GB,
-    // more than one 17.1 GB card holds. A reservation the device cannot hold is
-    // not a slow path, it is a guaranteed failure - the weights then have
-    // nowhere to go and the run dies at `vram_free=0.00` before the forward
-    // pass. Tests are pinned to 4k (GRIM_CONTEXT=4096), which is far smaller,
-    // but the bound holds whatever context is asked for.
-    let arena_budget: u64 = devices
-        .iter()
-        .map(|d| match d {
-            Device::Rocm(ord) => {
-                let (free, total) = grim_backend_rocm::vram_info(*ord);
-                if total == 0 { 0 } else { free }
+    // Explicit override via GRIM_SPLIT_LAYERS (e.g. "32,32" or "30,34")
+    if let Ok(split_env) = std::env::var("GRIM_SPLIT_LAYERS") {
+        let parts: Vec<usize> = split_env
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if parts.len() == devices.len() && parts.iter().sum::<usize>() == num_layers {
+            let mut manual_assignment = Vec::with_capacity(num_layers);
+            for (dev_idx, &count) in parts.iter().enumerate() {
+                for _ in 0..count {
+                    manual_assignment.push(devices[dev_idx].clone());
+                }
             }
-            _ => 0,
-        })
-        .sum();
-    let kv_per_attn = |c: usize| -> u64 {
-        (c as u64)
-            .saturating_mul(kv_heads as u64)
-            .saturating_mul(head_dim as u64)
-            .saturating_mul(4) // f32
-            .saturating_mul(2) // K and V
-    };
-    let (eff_ctx, kv_total) =
-        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, ctx.max(1));
-    if eff_ctx < ctx {
-        eprintln!(
-            "[qwen35] KV arena BOUNDED: requested ctx={ctx} needs {:.1} GB across \
-             {num_attn_layers} attention layers, but only {:.1} GB is free across {} \
-             device(s). Capping the arena at ctx={eff_ctx} ({:.1} GB). Set GRIM_CONTEXT \
-             explicitly (tests use 4096) to choose the context.",
-            ctx as f64 * kv_heads as f64 * head_dim as f64 * 4.0 * 2.0 * num_attn_layers as f64
-                / 1e9,
-            arena_budget as f64 / 1e9,
-            devices.len(),
-            kv_total as f64 / 1e9
-        );
-    } else if kv_total > 0 {
-        eprintln!(
-            "[qwen35] reserving KV arenas: ctx={eff_ctx}, kv_heads={kv_heads}, \
-             head_dim={head_dim}, attn_layers={num_attn_layers} \
-             -> {:.1} GB total (budget {:.1} GB)",
-            kv_total as f64 / 1e9,
-            arena_budget as f64 / 1e9
-        );
+            eprintln!(
+                "[qwen35] manual layer split via GRIM_SPLIT_LAYERS: {:?}",
+                parts
+            );
+            return manual_assignment;
+        }
     }
 
+    let round_robin = |i: usize| devices[i * devices.len() / num_layers.max(1)].clone();
+
     // Remaining plannable bytes per device, or None when VRAM is unknowable.
-    let kv_share = (kv_total as f64 / devices.len() as f64) as u64;
+    // Nothing is subtracted for KV here: the arenas are charged per attention
+    // layer, inside the per-layer cost the assigners walk (see below), so a
+    // 27/37 boundary charges the card with 10 attention layers more KV than the
+    // one with 6 instead of an even share that under-reserves the busier card.
     let per_device: Vec<Option<u64>> = devices
         .iter()
         .map(|d| match d {
@@ -3965,8 +5566,7 @@ fn plan_layer_devices(
                 if total == 0 {
                     return None;
                 }
-                let budget = ((free as f64) * VRAM_PLAN_FRACTION) as u64;
-                Some(budget.saturating_sub(kv_share.min(budget)))
+                Some(((free as f64) * VRAM_PLAN_FRACTION) as u64)
             }
             _ => None,
         })
@@ -3984,11 +5584,193 @@ fn plan_layer_devices(
         return (0..num_layers).map(round_robin).collect();
     };
 
-    let mut assignment = Vec::with_capacity(num_layers);
+    // Non-layer weights are pinned by `load_tp`: `token_embd` to the first
+    // device, `output` to the last. Reserve their loaded footprint up front, or
+    // the layer loop balances against a budget that silently over-commits the
+    // owning card. The embedding is the dangerous one: an unverified quant
+    // scheme dequantizes to f32 (715 MB packed -> 5.09 GB for the 27B vocab),
+    // while the LM head keeps its packed tensor.
+    if remaining.len() > 1 {
+        let embed_bytes =
+            non_layer_weight_bytes(ws, "token_embd", vocab.saturating_mul(hidden), true);
+        let output_bytes =
+            non_layer_weight_bytes(ws, "output", vocab.saturating_mul(hidden), false);
+        remaining[0] = remaining[0].saturating_sub(embed_bytes);
+        let last = remaining.len() - 1;
+        remaining[last] = remaining[last].saturating_sub(output_bytes);
+        if std::env::var_os("GRIM_PLACEMENT_TRACE").is_some() {
+            eprintln!(
+                "[qwen35] placement reserve: token_embd={:.2} GB -> dev0, output={:.2} GB -> dev{}; \
+                 per-device plannable remaining after reserve: {:?}",
+                embed_bytes as f64 / 1e9,
+                output_bytes as f64 / 1e9,
+                last,
+                remaining
+                    .iter()
+                    .map(|b| *b as f64 / 1e9)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     // Size each block from checkpoint metadata before committing it.
+    // Convert-on-load swaps every GSQ-RCO weight's resident bytes for its
+    // W4A4OstQuant blob (~1.8x the packed size), so the split must be budgeted
+    // at the RESIDENT size. Budgeting packed is how a 10.4 GB checkpoint
+    // "fit" and then spilled 18.5 GB of lanes to managed memory mid-load.
+    // Conversion fires per tensor only when every target device passes the
+    // W4A4OstQuant arch gate (the loader's own per-tensor K%128 test is applied
+    // inside `prefix_bytes_resident`).
+    let convert_gsq_rco = !devices.is_empty()
+        && devices.iter().all(|d| match d {
+            Device::Rocm(ord) => {
+                let shared = grim_backend_rocm::RocmDevice::shared(*ord);
+                let target = shared.gpu_target_str();
+                grim_backend_rocm::quantization::w4a4_ostquant_supported(
+                    grim_backend_rocm::quantization::gcn_arch(target),
+                    128,
+                )
+                .is_ok()
+            }
+            _ => false,
+        });
     let layer_bytes: Vec<u64> = (0..num_layers)
-        .map(|i| ws.pp("blk").pp(&i.to_string()).prefix_bytes())
+        .map(|i| {
+            ws.pp("blk")
+                .pp(&i.to_string())
+                .prefix_bytes_resident(convert_gsq_rco)
+        })
         .collect();
+
+    // Decode-graph workspace reserve. The captured decode graph allocates
+    // workspace and graph objects on every device that owns layers (~1.0 GiB
+    // measured post-prewarm on the 37-layer card of a 27B pair), and the
+    // planner used to charge none of it, which is what left that card at
+    // ~0 free and pushed it to eager. This is a reserve, not a derived
+    // number: only a GPU run validates it. Tunable via GRIM_GRAPH_RESERVE_MB
+    // (per device, MiB).
+    let graph_reserve_per_dev: u64 = std::env::var("GRIM_GRAPH_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1024)
+        .saturating_mul(1024 * 1024);
+    let graph_total = graph_reserve_per_dev.saturating_mul(devices.len() as u64);
+    // Routed per layer so a device holding more layers is charged more graph
+    // workspace, proportionally.
+    let graph_share_per_layer = if num_layers > 0 {
+        graph_total / num_layers as u64
+    } else {
+        0
+    };
+
+    // The decode-graph KV arenas are allocated at full context for every
+    // full-attention layer: `ctx * num_kv_heads * head_dim * bytes_per_elem`
+    // for K and again for V (2 with f16 arenas, 4 with f32). For this
+    // 27B Q4_K model at a 228k context that is ~1.87 GB per attention layer
+    // across 17 such layers = ~31.8 GB, which alone exceeds the 34 GB the pair
+    // has.
+    let num_attn_layers = (0..num_layers)
+        .filter(|i| (i + 1) % interval.max(1) == 0)
+        .count();
+
+    // Bound the arenas by the VRAM the weights ALSO need, not the raw free
+    // sum. The arena is sized from the model's context, and this 27B
+    // advertises 232k: 16 attention layers at that context reserve 30.4 GB
+    // against a raw free pool of 34 GB — "fits", unbounded — and then the
+    // 15.3 GB of layer weights plus the 4.74 GB f32 embedding are budgeted
+    // against the same 34 GB a second time. Same VRAM, counted twice over.
+    // A reservation the devices cannot hold alongside the weights is not a
+    // slow path, it is a guaranteed failure - the run dies at
+    // `vram_free=0.00` before the forward pass. Tests are pinned to 4k
+    // (GRIM_CONTEXT=4096), which is far smaller, but the bound holds whatever
+    // context is asked for.
+    let kv_per_attn = |c: usize| -> u64 {
+        // Bytes per KV element follow the dense arena representation (f16 halves
+        // the reservation vs f32; int8 codes are 1 B/elem plus an f32 scale
+        // per row per kv head for K and V); K and V share the representation.
+        // Conservative across devices: the max.
+        //
+        // The per-element figure comes from `kv_arena_bytes_per_kv_elem`, NOT
+        // from a table here: the table that used to live at this line said
+        // `_ => (4, 0)`, so int4 reserved as if it were f32 — eight times its
+        // own layout — and admission control could never trade int4's smaller
+        // footprint for a longer context.
+        let (bpe, scales_per_row) = devices
+            .iter()
+            .map(|d| {
+                let f = kv_arena_format_qwen(d);
+                (
+                    kv_arena_bytes_per_kv_elem(f),
+                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
+                )
+            })
+            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
+        (c as f64 * kv_heads as f64 * head_dim as f64 * bpe * 2.0 + c as f64 * scales_per_row)
+            as u64
+    };
+    let plannable_total: u64 = remaining.iter().sum();
+    let weights_total: u64 = layer_bytes.iter().sum();
+    let arena_budget: u64 = plannable_total
+        .saturating_sub(weights_total)
+        .saturating_sub(graph_total);
+    // Phase 3: a fixed eviction capacity caps the arena BELOW the model's
+    // advertised context, so the reservation must budget for the cap – that is
+    // the whole point of eviction (262K ctx at a 64K-token arena).
+    let evict = kv_eviction_policy(devices.first().unwrap_or(&Device::Cpu));
+    let budget_ctx = evict.effective_ctx(ctx.max(1));
+    let (eff_ctx, kv_total) =
+        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, budget_ctx);
+    if eff_ctx < ctx {
+        // Report against the capped request so the message names what was asked
+        // for after eviction, not the full advertised context.
+        let (bpe_msg, spr_msg) = devices
+            .iter()
+            .map(|d| {
+                let f = kv_arena_format_qwen(d);
+                (
+                    kv_arena_bytes_per_kv_elem(f),
+                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
+                )
+            })
+            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
+        eprintln!(
+            "[qwen35] KV arena BOUNDED: requested ctx={ctx} needs {:.1} GB across \
+             {num_attn_layers} attention layers, but only {:.1} GB is free across {} \
+             device(s). Capping the arena at ctx={eff_ctx} ({:.1} GB). Set GRIM_CONTEXT \
+             explicitly (tests use 4096) to choose the context.",
+            (ctx as f64 * kv_heads as f64 * head_dim as f64 * bpe_msg * 2.0 + ctx as f64 * spr_msg)
+                * num_attn_layers as f64
+                / 1e9,
+            arena_budget as f64 / 1e9,
+            devices.len(),
+            kv_total as f64 / 1e9
+        );
+    } else if kv_total > 0 {
+        eprintln!(
+            "[qwen35] reserving KV arenas: ctx={eff_ctx}, kv_heads={kv_heads}, \
+             head_dim={head_dim}, attn_layers={num_attn_layers} \
+             -> {:.1} GB total ({:.0} MB, budget {:.1} GB)",
+            kv_total as f64 / 1e9,
+            kv_total as f64 / 1e6,
+            arena_budget as f64 / 1e9
+        );
+    }
+
+    // Per-layer cost the assigners walk: resident weights + a graph-workspace
+    // share +, for each full-attention layer, its own KV arena at the bounded
+    // effective context. Routing KV through the layer that owns it (instead of
+    // an even `kv_total / devices` share) is what makes a 27/37 boundary
+    // reserve the 10-attention-layer card for 10 arenas, not 8. The assigners
+    // themselves are unchanged and their existing tests keep passing.
+    let kv_layer_bytes = kv_per_attn(eff_ctx);
+    let layer_cost = placement_layer_costs(
+        &layer_bytes,
+        interval,
+        kv_layer_bytes,
+        graph_share_per_layer,
+    );
+
+    let mut assignment = Vec::with_capacity(num_layers);
 
     // Measured per-device capability, in `devices` order.
     //
@@ -4012,7 +5794,23 @@ fn plan_layer_devices(
         } else {
             vec![Default::default(); devices.len()]
         };
-    let (targets, unplaced) = assign_by_headroom(&layer_bytes, &mut remaining, &caps);
+    // Single-device preference FIRST: a model that fits one card must not be
+    // split (see `single_device_fit` for the measurement).
+    if let Some(best) = single_device_fit(&layer_cost, &remaining) {
+        eprintln!(
+            "[qwen35] single-device fit: rocm:{} holds all {} layers ({:.2} GB of {:.2} GB \
+             budget) — not splitting (a split would add a cross-device hop per forward)",
+            match devices[best] {
+                Device::Rocm(o) => o,
+                _ => usize::MAX,
+            },
+            num_layers,
+            layer_cost.iter().sum::<u64>() as f64 / 1e9,
+            remaining[best] as f64 / 1e9,
+        );
+        return vec![devices[best].clone(); num_layers];
+    }
+    let (targets, unplaced) = assign_by_headroom(&layer_cost, &mut remaining, &caps);
     for t in targets {
         assignment.push(devices[t].clone());
     }
@@ -4066,6 +5864,73 @@ fn plan_layer_devices(
 /// Returns the chosen device index per layer plus the count of layers that did
 /// not fit anywhere (those are placed on device 0 and will fall back to managed
 /// memory). Pure function so placement can be unit-tested without a GPU.
+/// Single-device preference: if ONE device's remaining budget can hold every
+/// layer — with each layer's cost already carrying its KV arena (when the
+/// layer is full-attention) and its graph-workspace share — that device
+/// should take the whole model.
+///
+/// `assign_by_headroom` splits proportionally to headroom by design, so a model
+/// that fits one card is split anyway and pays a cross-device hop per forward
+/// for no memory benefit. Measured on the 9B at ctx 4096 / int8 KV, same
+/// prompt, 32 tokens: **single segment 83.23 ms/token vs the 2-segment split
+/// 117.63** — the split cost 34.4 ms/token (+41%) with nothing gained. (The
+/// 27B does not fit and is unaffected.)
+///
+/// Returns the device index to use, or `None` when the model genuinely needs
+/// more than one device.
+///
+/// **Only device 0 (the model's primary) is eligible.** The rest of the model
+/// — embedding table, output head, `pos_dev`, the graph's non-layer buffers —
+/// is placed on the primary, and the capture gate is raised there; moving every
+/// LAYER to another device while those stay put is exactly the cross-device
+/// capture that faults (`Memory access fault by GPU node-1`, reproduced when
+/// this helper first preferred the roomier card). A single-device layout is only
+/// safe when it is the primary's.
+/// Per-layer placement cost: resident weight bytes + a graph-workspace share
+/// + the layer's own KV arena when it is a full-attention layer
+/// (`(i + 1) % interval == 0`). KV follows the layer that owns it rather than
+/// an even per-device share, so a boundary that puts 10 attention layers on
+/// one card charges that card for 10 arenas, not `total / devices`. Pure so
+/// the routing is unit-testable without a GPU.
+fn placement_layer_costs(
+    layer_bytes: &[u64],
+    interval: usize,
+    kv_layer_bytes: u64,
+    graph_share_per_layer: u64,
+) -> Vec<u64> {
+    layer_bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let attn = if (i + 1) % interval.max(1) == 0 {
+                kv_layer_bytes
+            } else {
+                0
+            };
+            b.saturating_add(graph_share_per_layer)
+                .saturating_add(attn)
+        })
+        .collect()
+}
+
+fn single_device_fit(layer_bytes: &[u64], remaining: &[u64]) -> Option<usize> {
+    // `GRIM_FORCE_SPLIT=1` opts out: the split path must stay exercisable (and
+    // tested) even when a model fits one card, and the multi-GPU gates need a
+    // guaranteed 2-segment layout.
+    if matches!(
+        std::env::var("GRIM_FORCE_SPLIT").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        return None;
+    }
+    let total: u64 = layer_bytes.iter().sum();
+    if remaining.first().copied().unwrap_or(0) >= total {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn assign_by_headroom(
     layer_bytes: &[u64],
     remaining: &mut [u64],
@@ -4073,27 +5938,74 @@ fn assign_by_headroom(
 ) -> (Vec<usize>, usize) {
     // Effective FP16 throughput. A throttled card advertises less than its peak,
     // and a device with no measured row scores 0 rather than an invented number.
-    let throughput = |i: usize| -> f32 {
+    let throughput = |i: usize| -> f64 {
         caps.get(i)
-            .map(|c| c.tflops_fp16 * (1.0 - c.throttle_pct))
+            .map(|c| (c.tflops_fp16 * (1.0 - c.throttle_pct)) as f64)
             .unwrap_or(0.0)
     };
+    let n = remaining.len();
+    if n == 0 {
+        return (Vec::new(), layer_bytes.len());
+    }
+    // Layers are assigned as CONTIGUOUS blocks per device, not by a per-layer
+    // max-headroom pick. The per-layer greedy alternates GPUs whenever the two
+    // headrooms are within one layer of each other — which is exactly the
+    // balanced case it is supposed to produce — so a 64-layer model bounces its
+    // hidden state across the interconnect on nearly every layer. Grouping the
+    // layers means one cross-device hop per forward instead of ~60.
+    //
+    // Each device's share is proportional to its measured throughput times its
+    // headroom, so a faster or roomier card takes a larger contiguous block and
+    // uniform cards split evenly.
+    let total_bytes: u64 = layer_bytes.iter().sum();
+    let weight = |i: usize| -> f64 {
+        let t = throughput(i);
+        let base = if t > 0.0 { t } else { 1.0 };
+        base * (remaining[i] as f64).max(1.0)
+    };
+    let total_w: f64 = (0..n).map(weight).sum();
+    let target: Vec<f64> = (0..n)
+        .map(|i| {
+            if total_w > 0.0 {
+                total_bytes as f64 * weight(i) / total_w
+            } else {
+                total_bytes as f64 / n as f64
+            }
+        })
+        .collect();
+
+    let mut used = vec![0u64; n];
     let mut targets = Vec::with_capacity(layer_bytes.len());
     let mut unplaced = 0usize;
+    let mut cur = 0usize;
     for &bytes in layer_bytes {
-        // A device is a candidate only if this layer actually fits on it.
-        let target = match (0..remaining.len())
-            .filter(|&i| bytes <= remaining[i])
-            .max_by(|&a, &b| {
-                throughput(a)
-                    .partial_cmp(&throughput(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| remaining[a].cmp(&remaining[b]))
-                    // `max_by` yields the LAST of several equal maxima, so
-                    // invert the index to make the lowest ordinal win a tie.
-                    .then_with(|| b.cmp(&a))
-            }) {
-            Some(idx) => idx,
+        // Preferred candidate: the current block's device while it still fits
+        // and is under its byte share, else the next device in order.
+        let mut chosen: Option<usize> = None;
+        for i in cur..n {
+            if used[i] + bytes <= remaining[i] && (used[i] as f64) < target[i] {
+                chosen = Some(i);
+                break;
+            }
+        }
+        // Last-resort contiguous fit: the current device may exceed its share
+        // when nothing later can hold the layer.
+        if chosen.is_none() && cur < n && used[cur] + bytes <= remaining[cur] {
+            chosen = Some(cur);
+        }
+        // Fall back to any device that fits, least-loaded first.
+        if chosen.is_none() {
+            chosen = (0..n)
+                .filter(|&i| used[i] + bytes <= remaining[i])
+                .min_by_key(|&i| used[i]);
+        }
+        match chosen {
+            Some(i) => {
+                used[i] += bytes;
+                remaining[i] = remaining[i].saturating_sub(bytes);
+                targets.push(i);
+                cur = i;
+            }
             None => {
                 unplaced += 1;
                 // Overflow must SPREAD. Sending every unplaced layer to device 0
@@ -4101,16 +6013,15 @@ fn assign_by_headroom(
                 // `65/65 layers exceed aggregate plannable VRAM` and then placed
                 // all 65 on GPU 0, which is what filled it and locked the system.
                 // The least-loaded device is the safe overflow target.
-                remaining
+                let idx = remaining
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, r)| **r)
                     .map(|(i, _)| i)
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                targets.push(idx);
             }
-        };
-        remaining[target] = remaining[target].saturating_sub(bytes);
-        targets.push(target);
+        }
     }
     (targets, unplaced)
 }
@@ -4254,8 +6165,7 @@ pub fn apply_rope_yarn_interleaved(
                 let mut theta = theta_interp;
                 let mut ms = mscale_base;
                 if ext_factor != 0.0 {
-                    let y = (i as f32 - corr_dims[0])
-                        / (corr_dims[1] - corr_dims[0]).max(0.001);
+                    let y = (i as f32 - corr_dims[0]) / (corr_dims[1] - corr_dims[0]).max(0.001);
                     let ramp_mix = (1.0 - y.clamp(0.0, 1.0)) * ext_factor;
                     theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
                     ms *= mscale_boost;
@@ -4304,6 +6214,139 @@ fn bound_kv_arena(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// int4's whole reason to exist is memory, and the arena must be sized as
+    /// what it actually stores.
+    ///
+    /// It was not, in three places at once. `kv_arena_dtype` gives Int4 the same
+    /// U8 element as Int8, so a shape expressed in (row, nkv, head_dim)
+    /// ELEMENTS allocated one byte per element — twice the codes a two-per-byte
+    /// format writes — while the budget planner and its duplicate in the
+    /// BOUNDED message both carried `_ => (4.0, 0.0)`, i.e. f32. Net effect:
+    /// `GRIM_KV_ARENA=int4` occupied exactly as much VRAM as `int8` (67 MB vs
+    /// 67 MB at a 4096 context on this 9B) while costing 10x its perplexity, and
+    /// admission control could not use int4 to reach a longer context than f32.
+    ///
+    /// These functions are now the only place the size comes from. The identity
+    /// at the end is the point: the row extent and the per-element figure are
+    /// two spellings of one fact and must not drift apart again.
+    #[test]
+    fn kv_arena_size_tracks_the_representation() {
+        use grim_backend_rocm::KvArenaFormat as F;
+        let (nkv, hd) = (4usize, 256usize);
+        let row_bytes = |f: F| -> usize {
+            kv_arena_row_extent(f, nkv, hd) * kv_arena_dtype_for(f).expected_bytes(1)
+        };
+        // f32/f16 keep the natural layout; the packed formats pack.
+        assert_eq!(row_bytes(F::F32), nkv * hd * 4);
+        assert_eq!(row_bytes(F::F16), nkv * hd * 2);
+        assert_eq!(row_bytes(F::Int8), nkv * hd);
+        assert_eq!(row_bytes(F::Int4), nkv * hd / 2, "int4 is 2 codes/byte");
+        // K2V4: 4 codes/byte on K, 2 on V — the allocation takes the wider side.
+        assert_eq!(row_bytes(F::Int2V4), nkv * hd / 2);
+
+        // The per-element figure the planner reserves in must equal the bytes
+        // the allocator actually hands out, or the reservation lies.
+        for f in [F::F32, F::F16, F::Int8, F::Int4, F::Int2V4] {
+            let per_elem = kv_arena_bytes_per_kv_elem(f);
+            let from_layout = row_bytes(f) as f64 / (nkv * hd) as f64;
+            assert!(
+                (per_elem - from_layout).abs() < 1e-9,
+                "{f:?}: planner reserves {per_elem} B/elem but the arena layout is \
+                 {from_layout} B/elem"
+            );
+        }
+        // The ladder, stated once: each step halves.
+        assert!(kv_arena_bytes_per_kv_elem(F::Int4) < kv_arena_bytes_per_kv_elem(F::Int8));
+        assert!(kv_arena_bytes_per_kv_elem(F::Int8) < kv_arena_bytes_per_kv_elem(F::F16));
+        // int4 must actually be 8x smaller than the f32 default, not 2x.
+        assert_eq!(
+            kv_arena_bytes_per_kv_elem(F::F32) / kv_arena_bytes_per_kv_elem(F::Int4),
+            8.0
+        );
+
+        // Scale sidecars: one f32 per (row, kv head) per side, only for the
+        // formats that do not store K/V directly.
+        assert_eq!(kv_arena_row_scale_bytes(F::Int4, nkv), nkv * 4 * 2);
+        assert_eq!(kv_arena_row_scale_bytes(F::Int8, nkv), nkv * 4 * 2);
+        assert_eq!(kv_arena_row_scale_bytes(F::F16, nkv), 0);
+    }
+
+    /// WS-3A: every declared arena format passes the support guard now that
+    /// the K2V4 kernels exist. The guard remains the single place a future
+    /// format would be refused from, so it must accept exactly the formats
+    /// whose kernels are implemented.
+    #[test]
+    fn all_arena_formats_pass_the_support_guard() {
+        for spec in ["f32", "f16", "int8", "int4", "int2v4"] {
+            temp_env::with_var("GRIM_KV_ARENA", Some(spec), || {
+                assert!(
+                    ensure_arena_format_supported(&Device::Rocm(0)).is_ok(),
+                    "{spec} must pass the guard now that its kernels exist"
+                );
+            });
+        }
+    }
+
+    /// WS-0: an explicit `GRIM_KV_ARENA` must parse identically in the model
+    /// resolver and the backend allocator. Before WS-0 the two carried their
+    /// own spelling tables; this pins them to one.
+    #[test]
+    fn qwen35_arena_format_agrees_with_backend_for_explicit_values() {
+        use grim_backend_rocm::KvArenaFormat as F;
+        for (s, want) in [
+            ("f32", F::F32),
+            ("f16", F::F16),
+            ("int8", F::Int8),
+            ("i8", F::Int8),
+            ("q8", F::Int8),
+            ("int4", F::Int4),
+            ("i4", F::Int4),
+            ("q4", F::Int4),
+        ] {
+            assert_eq!(
+                resolve_kv_arena_format_qwen(Some(s), None),
+                want,
+                "model resolver GRIM_KV_ARENA={s}"
+            );
+            assert_eq!(
+                grim_backend_rocm::parse_kv_arena_env(s),
+                Some(want),
+                "backend parser GRIM_KV_ARENA={s}"
+            );
+        }
+    }
+
+    /// WS-0: the ONE intended difference between the model and backend
+    /// resolvers is the unset default (Qwen35 opts into f16; the backend
+    /// default is f32, pinned by that crate's own test). The f16 flag is
+    /// honored identically in both layers.
+    #[test]
+    fn qwen35_arena_format_default_and_f16_flag() {
+        use grim_backend_rocm::KvArenaFormat as F;
+        // Unset arena -> the Qwen35 f16 default.
+        assert_eq!(resolve_kv_arena_format_qwen(None, None), F::F16);
+        // The legacy flag is shared with the backend, so its disabled
+        // spellings mean f32 here too (this is the drift WS-0 closed).
+        for s in ["0", "false", "off", "no"] {
+            assert_eq!(
+                resolve_kv_arena_format_qwen(None, Some(s)),
+                F::F32,
+                "GRIM_F16_KV={s} should disable f16"
+            );
+        }
+        for s in ["1", "true", "yes"] {
+            assert_eq!(
+                resolve_kv_arena_format_qwen(None, Some(s)),
+                F::F16,
+                "GRIM_F16_KV={s} should enable f16"
+            );
+        }
+        // An unrecognized explicit value uses the model's f16 default (the
+        // backend warns and uses f32); the divergence is documented and only
+        // reachable on a typo.
+        assert_eq!(resolve_kv_arena_format_qwen(Some("q7"), None), F::F16);
+    }
 
     /// Uniform capability rows: every device measures identically, so placement
     /// must fall back to the headroom-only split it used before capability was
@@ -4448,6 +6491,49 @@ mod tests {
         let _ = unplaced;
     }
 
+    /// KV and graph-workspace reserve must follow the LAYER, not an even
+    /// per-device share. A 64-layer model at interval 4 has 16 full-attention
+    /// layers; a 27/37 boundary puts 6 of them on one card and 10 on the other.
+    /// Charging `kv_total / devices` under-reserves the 10-arena card by 2
+    /// arenas; charging each attention layer its own arena inside the cost the
+    /// assigners walk cannot. The graph share must likewise land on every
+    /// layer, so a device holding more layers pays more graph workspace.
+    #[test]
+    fn kv_and_graph_reserve_follow_the_layer_not_an_even_share() {
+        let num_layers = 64;
+        let interval = 4;
+        let layer_bytes = vec![240_000_000u64; num_layers]; // 240 MB weights
+        let kv_layer_bytes = 1_870_000_000u64; // 1.87 GB arena at bounded ctx
+        let graph_share = 33_000_000u64; // ~2 GiB over 2 devices / 64 layers
+
+        let costs = placement_layer_costs(&layer_bytes, interval, kv_layer_bytes, graph_share);
+
+        // Attention layers carry the arena; the others do not.
+        for (i, &c) in costs.iter().enumerate() {
+            let is_attn = (i + 1) % interval == 0;
+            let expect = 240_000_000 + graph_share + if is_attn { kv_layer_bytes } else { 0 };
+            assert_eq!(c, expect, "layer {i} (attn={is_attn}) mis-charged");
+        }
+        // Total conservation: weights + graph + exactly num_attn arenas.
+        let num_attn = (0..num_layers).filter(|i| (i + 1) % interval == 0).count();
+        assert_eq!(num_attn, 16);
+        let total: u64 = costs.iter().sum();
+        assert_eq!(
+            total,
+            layer_bytes.iter().sum::<u64>() + graph_share * num_layers as u64
+                + kv_layer_bytes * num_attn as u64,
+            "reserve must be conserved, not created or lost"
+        );
+        // The discriminating scenario from the 27B: a device taking 10
+        // attention layers is charged 10 arenas even though its even share
+        // would have been 8.
+        let ten_attn_card: u64 = costs[27..].iter().sum();
+        assert!(
+            ten_attn_card > layer_bytes.iter().sum::<u64>() / 2,
+            "the 37-layer half must carry more than half the weight bytes"
+        );
+    }
+
     /// `GRIM_KV_QUANT` must select the packed formats the paged kernel can
     /// actually decode, and must NOT silently fall back to the dense f32 arena
     /// for a value it does not recognize — a user who asked for quantized KV and
@@ -4459,26 +6545,20 @@ mod tests {
             ("fp8", Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3)),
             ("nutcracker", Some(grim_tensor::PagedKvQuantFormat::NutFp4)),
             ("nvfp4", Some(grim_tensor::PagedKvQuantFormat::NvFp4)),
+            ("whitecrow", Some(grim_tensor::PagedKvQuantFormat::WhiteCrow)),
+            ("off", None),
         ] {
             unsafe { std::env::set_var("GRIM_KV_QUANT", val) };
             assert_eq!(kv_quant_format(), expect, "GRIM_KV_QUANT={val}");
             unsafe { std::env::remove_var("GRIM_KV_QUANT") };
         }
-        // f16 is deliberately rejected: the dense arena's f16 reader is a
-        // different representation, and the f32<->f16 cast is unverified.
-        unsafe { std::env::set_var("GRIM_KV_QUANT", "f16") };
-        assert_eq!(
-            kv_quant_format(),
-            None,
-            "f16 must not select a paged format"
-        );
-        unsafe { std::env::set_var("GRIM_KV_QUANT", "bogus") };
-        assert_eq!(
-            kv_quant_format(),
-            None,
-            "unknown value must not select a format"
-        );
+        // Defaults to WhiteCrow when unset
         unsafe { std::env::remove_var("GRIM_KV_QUANT") };
+        assert_eq!(
+            kv_quant_format(),
+            Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
+            "unset GRIM_KV_QUANT must default to WhiteCrow"
+        );
     }
 
     /// Packed sizing must match the real host encoders byte for byte, or the
@@ -4543,7 +6623,13 @@ mod tests {
                 device: Device::Cpu,
                 layer_idx: i,
                 is_full_attention,
-                attn_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
+                attn_norm: RmsNorm::new(
+                    cpu_tensor(
+                        vec![1.0; cfg.hidden_size],
+                        Shape::new(vec![cfg.hidden_size]),
+                    ),
+                    1e-6,
+                ),
                 wq: None,
                 wk: None,
                 wv: None,
@@ -4567,10 +6653,34 @@ mod tests {
                 ssm_n_group_hint: cfg.ssm_n_group,
                 ssm_d_state_hint: cfg.ssm_d_state,
                 ssm_d_conv_hint: cfg.ssm_d_conv,
-                post_attention_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
-                ffn_gate: Linear::from_tensor(cpu_tensor(vec![1.0; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
-                ffn_up: Linear::from_tensor(cpu_tensor(vec![1.0; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
-                ffn_down: Linear::from_tensor(cpu_tensor(vec![1.0; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.hidden_size, cfg.intermediate_size])), None),
+                post_attention_norm: RmsNorm::new(
+                    cpu_tensor(
+                        vec![1.0; cfg.hidden_size],
+                        Shape::new(vec![cfg.hidden_size]),
+                    ),
+                    1e-6,
+                ),
+                ffn_gate: Linear::from_tensor(
+                    cpu_tensor(
+                        vec![1.0; cfg.hidden_size * cfg.intermediate_size],
+                        Shape::new(vec![cfg.intermediate_size, cfg.hidden_size]),
+                    ),
+                    None,
+                ),
+                ffn_up: Linear::from_tensor(
+                    cpu_tensor(
+                        vec![1.0; cfg.hidden_size * cfg.intermediate_size],
+                        Shape::new(vec![cfg.intermediate_size, cfg.hidden_size]),
+                    ),
+                    None,
+                ),
+                ffn_down: Linear::from_tensor(
+                    cpu_tensor(
+                        vec![1.0; cfg.hidden_size * cfg.intermediate_size],
+                        Shape::new(vec![cfg.hidden_size, cfg.intermediate_size]),
+                    ),
+                    None,
+                ),
                 num_heads: cfg.num_heads,
                 num_kv_heads: cfg.num_kv_heads,
                 head_dim: cfg.head_dim,
@@ -4586,7 +6696,9 @@ mod tests {
         let qwen = Qwen35 {
             cfg: cfg.clone(),
             device: Device::Cpu,
-            tok_embeddings: Embedding { weight: dummy.clone() },
+            tok_embeddings: Embedding {
+                weight: dummy.clone(),
+            },
             blocks,
             output_norm: RmsNorm::new(dummy.clone(), 1e-6),
             output: Linear::from_tensor(dummy, None),
@@ -4595,7 +6707,10 @@ mod tests {
         let kv_layers_count = (0..8)
             .filter(|&i| reg.get_group(i).map(|g| g.has_kv).unwrap_or(false))
             .count();
-        assert_eq!(kv_layers_count, cfg.num_layers / cfg.full_attention_interval);
+        assert_eq!(
+            kv_layers_count,
+            cfg.num_layers / cfg.full_attention_interval
+        );
     }
 
     #[allow(clippy::field_reassign_with_default)]
@@ -4861,8 +6976,9 @@ mod tests {
 
         // Build the recurrent block the way the real loader does, but with non-uniform
         // deterministic weights rather than all-0.1 constants.
-        let b =
-            |seed: usize, r: usize, c: usize| -> Tensor { cpu_tensor(det_weights(seed, r * c), Shape::new(vec![r, c])) };
+        let b = |seed: usize, r: usize, c: usize| -> Tensor {
+            cpu_tensor(det_weights(seed, r * c), Shape::new(vec![r, c]))
+        };
         let ssm_d_inner = cfg.ssm_d_inner;
         let ssm_qkv_rows = (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state;
         let blk = Qwen35Block {
@@ -4888,10 +7004,7 @@ mod tests {
             attn_qkv: Some(Linear::from_tensor(
                 cpu_tensor(
                     det_weights(102, ssm_qkv_rows * cfg.hidden_size),
-                    Shape::new(vec![
-                        ssm_qkv_rows,
-                        cfg.hidden_size,
-                    ]),
+                    Shape::new(vec![ssm_qkv_rows, cfg.hidden_size]),
                 ),
                 None,
             )),
@@ -5081,8 +7194,9 @@ mod tests {
         cfg.ssm_n_group = 16;
         cfg.ssm_n_group = 16;
 
-        let b =
-            |seed: usize, r: usize, c: usize| -> Tensor { cpu_tensor(det_weights(seed, r * c), Shape::new(vec![r, c])) };
+        let b = |seed: usize, r: usize, c: usize| -> Tensor {
+            cpu_tensor(det_weights(seed, r * c), Shape::new(vec![r, c]))
+        };
         let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
         let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
         let ssm_qkv_dim = 2 * key_dim + value_dim;
@@ -5111,9 +7225,15 @@ mod tests {
             wo: None,
             attn_q_norm: None,
             attn_k_norm: None,
-            attn_qkv: Some(Linear::from_tensor(b(202, ssm_qkv_dim, cfg.hidden_size), None)),
+            attn_qkv: Some(Linear::from_tensor(
+                b(202, ssm_qkv_dim, cfg.hidden_size),
+                None,
+            )),
             attn_gate: None,
-            ssm_out: Some(Linear::from_tensor(b(203, cfg.hidden_size, value_dim), None)),
+            ssm_out: Some(Linear::from_tensor(
+                b(203, cfg.hidden_size, value_dim),
+                None,
+            )),
             ssm_conv1d: None,
             ssm_conv_vec: None,
             ssm_a: Some(det_weights(204, cfg.ssm_dt_rank)),
@@ -5507,3 +7627,252 @@ mod rope_tests {
     }
 }
 
+#[cfg(test)]
+mod kv_eviction_tests {
+    use super::{EvictionMode, KvEvictionPolicy, kv_eviction_policy, parse_residual_env};
+    use grim_tensor::Device;
+
+    /// Phase 3: the host `arena_row` must equal the device `grim_kv_ring_row`
+    /// for every (cap, sinks, t). The eager path maps on the host and the graph
+    /// maps on device; if the two ever disagree, the eager and graph paths
+    /// write a token to different rows and the seeded arena is silently wrong.
+    /// The device copy is inlined from the kernel (the TU cannot be linked
+    /// into a host test), so this pins the arithmetic, not the link.
+    fn device_ring_row(t: usize, cap_rows: usize, sink_rows: usize) -> usize {
+        let t = t as i32;
+        let cap_rows = cap_rows as i32;
+        let sink_rows = sink_rows as i32;
+        if cap_rows <= 0 || t < cap_rows {
+            return t as usize;
+        }
+        let span = cap_rows - sink_rows;
+        if span <= 0 {
+            return (t % cap_rows) as usize;
+        }
+        (sink_rows + (t - sink_rows) % span) as usize
+    }
+
+    #[test]
+    fn kv_ring_row_host_matches_device() {
+        for cap in [1usize, 2, 5, 8, 16, 64, 257] {
+            for sinks in [0usize, 1, 2, 4, 8, 64] {
+                let eff_sinks = sinks.min(cap.saturating_sub(1));
+                let pol = KvEvictionPolicy {
+                    cap_rows: Some(cap),
+                    sinks: eff_sinks,
+                    mode: EvictionMode::Positional,
+                    residual: 0,
+                };
+                for t in 0..(cap * 3 + 17) {
+                    assert_eq!(
+                        pol.arena_row(t),
+                        device_ring_row(t, cap, eff_sinks),
+                        "host/device ring mismatch at cap={cap} sinks={eff_sinks} t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Ring invariants: sinks are pinned, every live row is written exactly
+    /// once by the newest tokens, and the live set stays a contiguous prefix.
+    #[test]
+    fn kv_ring_keeps_sinks_and_contiguous_live_prefix() {
+        let cap = 12usize;
+        let sinks = 3usize;
+        let pol = KvEvictionPolicy {
+            cap_rows: Some(cap),
+            sinks,
+            mode: EvictionMode::Positional,
+            residual: 0,
+        };
+        for t in 0..sinks {
+            assert_eq!(pol.arena_row(t), t, "sink token {t} was evicted");
+        }
+        // After writing `n` tokens the live rows are exactly [0, n) and the
+        // newest token sits at the end of that prefix.
+        for n in 1..=(cap * 2) {
+            let last = pol.arena_row(n - 1);
+            let live = pol.live_rows(n);
+            assert!(
+                last < live,
+                "newest token {n} landed at {last} >= live {live}"
+            );
+            let mut seen = std::collections::HashSet::new();
+            for t in 0..n {
+                seen.insert(pol.arena_row(t));
+            }
+            assert_eq!(
+                seen.len(),
+                live,
+                "after {n} tokens the ring occupies {} rows but {live} are live",
+                seen.len()
+            );
+        }
+    }
+
+    /// Eviction is off unless `GRIM_KV_ARENA_ROWS` is set to a positive count;
+    /// `GRIM_KV_SINKS` alone must not silently enable it, and sinks are clamped
+    /// below the capacity so they can never consume the whole ring.
+    #[test]
+    fn kv_eviction_env_is_opt_in_and_clamped() {
+        temp_env::with_var("GRIM_KV_ARENA_ROWS", None::<&str>, || {
+            assert_eq!(kv_eviction_policy(&Device::Cpu).cap_rows, None);
+        });
+        temp_env::with_var("GRIM_KV_SINKS", Some("8"), || {
+            temp_env::with_var("GRIM_KV_ARENA_ROWS", None::<&str>, || {
+                let p = kv_eviction_policy(&Device::Cpu);
+                assert_eq!(p.cap_rows, None, "sinks alone must not enable eviction");
+            });
+        });
+        temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("0"), || {
+            assert_eq!(
+                kv_eviction_policy(&Device::Cpu).cap_rows,
+                None,
+                "a zero capacity means unlimited"
+            );
+        });
+        // Non-ROCm devices never evict.
+        temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("64"), || {
+            assert_eq!(kv_eviction_policy(&Device::Cpu).cap_rows, None);
+        });
+    }
+
+    /// WS-4.1: the per-layer budget table. A single value is uniform; a list
+    /// gives each layer its own cap; layers past the list reuse the last; a 0
+    /// entry means unlimited; garbage disables eviction.
+    #[test]
+    fn kv_layer_budgets_parse_and_resolve() {
+        use super::KvLayerBudgets;
+        // Uniform.
+        let b = KvLayerBudgets::parse("4096").unwrap();
+        assert!(b.is_uniform());
+        for l in 0..8 {
+            assert_eq!(b.cap_for(l), Some(4096));
+        }
+        assert_eq!(b.max_cap(), Some(4096));
+        // Per-layer, short list pads with the last entry.
+        let b = KvLayerBudgets::parse("8192,4096,2048").unwrap();
+        assert!(!b.is_uniform());
+        assert_eq!(b.cap_for(0), Some(8192));
+        assert_eq!(b.cap_for(1), Some(4096));
+        assert_eq!(b.cap_for(2), Some(2048));
+        assert_eq!(
+            b.cap_for(7),
+            Some(2048),
+            "past the table reuses the last entry"
+        );
+        assert_eq!(b.max_cap(), Some(8192));
+        // A 0 entry is unlimited for that layer, and makes the model-wide
+        // planning cap unlimited too (the worst case).
+        let b = KvLayerBudgets::parse("4096,0").unwrap();
+        assert_eq!(b.cap_for(0), Some(4096));
+        assert_eq!(b.cap_for(1), None);
+        assert_eq!(b.max_cap(), None);
+        assert!(!b.is_uniform());
+        // Absent / empty / garbage -> disabled, loudly for garbage.
+        assert_eq!(KvLayerBudgets::parse(""), None);
+        assert_eq!(KvLayerBudgets::parse("   "), None);
+        assert_eq!(KvLayerBudgets::parse("4096,abc"), None);
+        assert_eq!(KvLayerBudgets::parse("4096,-1"), None);
+        // Whitespace tolerated.
+        let b = KvLayerBudgets::parse(" 4096 , 2048 ").unwrap();
+        assert_eq!(b.cap_for(0), Some(4096));
+        assert_eq!(b.cap_for(1), Some(2048));
+        assert_eq!(b.entries(), 2);
+    }
+
+    /// The sinks and eviction-mode parsers are pure, so they are testable
+    /// without touching the process environment.
+    #[test]
+    fn kv_eviction_parsers_are_pure() {
+        use super::{EvictionMode, parse_evict_mode_env, parse_sinks_env};
+        assert_eq!(parse_sinks_env(None, 64), 4, "default sinks");
+        assert_eq!(parse_sinks_env(Some("8"), 64), 8);
+        assert_eq!(parse_sinks_env(Some("1000"), 8), 7, "clamped below cap");
+        assert_eq!(parse_sinks_env(Some("junk"), 64), 4, "junk -> default");
+        assert_eq!(parse_sinks_env(Some("4"), 0), 0, "cap 0 -> 0 sinks");
+        assert_eq!(parse_evict_mode_env(None), EvictionMode::Positional);
+        assert_eq!(parse_evict_mode_env(Some("curdkv")), EvictionMode::Curdkv);
+        assert_eq!(parse_evict_mode_env(Some("leverage")), EvictionMode::Curdkv);
+        assert_eq!(
+            parse_evict_mode_env(Some("nonsense")),
+            EvictionMode::Positional
+        );
+    }
+
+    /// WS-4.3: the CurDKV residual window is never evicted and the sinks stay
+    /// pinned, and the survivor list is STRICTLY INCREASING — which is the
+    /// precondition that makes the in-place `gather_rows_into` compaction safe
+    /// (destination row i is never a row a later copy still has to read).
+    #[test]
+    fn curdkv_residual_window_keeps_sinks_and_newest() {
+        let (n, d) = (12usize, 4);
+        // Distinguishable rows: row j is all-j.
+        let k: Vec<f32> = (0..n * d).map(|i| (i / d) as f32).collect();
+        let v = k.clone();
+        let sel = KvEvictionPolicy::select_curdkv_indices_residual(&k, &v, n, d, 6, 2, 2);
+        assert_eq!(sel.len(), 6, "budget must be honored exactly: {sel:?}");
+        assert_eq!(
+            &sel[..2],
+            &[0, 1],
+            "sinks must be the first survivors: {sel:?}"
+        );
+        assert!(
+            sel.contains(&10) && sel.contains(&11),
+            "the newest `residual` rows must survive: {sel:?}"
+        );
+        assert!(
+            sel.windows(2).all(|w| w[0] < w[1]),
+            "survivors must be strictly increasing (gather precondition): {sel:?}"
+        );
+    }
+
+    /// The residual window is clamped so it can never overshoot the budget, and
+    /// a budget at least as large as the live set retains everything.
+    #[test]
+    fn curdkv_residual_is_clamped_and_identity_when_budget_covers_all() {
+        let (n, d) = (8usize, 2);
+        let k: Vec<f32> = (0..n * d).map(|i| i as f32).collect();
+        let sel = KvEvictionPolicy::select_curdkv_indices_residual(&k, &k, n, d, 3, 1, 99);
+        assert_eq!(
+            sel.len(),
+            3,
+            "residual must not overshoot the budget: {sel:?}"
+        );
+        assert!(sel.windows(2).all(|w| w[0] < w[1]));
+        let all = KvEvictionPolicy::select_curdkv_indices_residual(&k, &k, n, d, 8, 2, 2);
+        assert_eq!(all, (0..8).collect::<Vec<_>>());
+    }
+
+    /// `GRIM_KV_RESIDUAL` defaults to `cap/8` (floor 1) and clamps below the cap.
+    #[test]
+    fn residual_env_parses_and_clamps() {
+        assert_eq!(parse_residual_env(None, 64), 8);
+        assert_eq!(parse_residual_env(None, 4), 1, "small cap floors at 1");
+        assert_eq!(parse_residual_env(Some("3"), 64), 3);
+        assert_eq!(parse_residual_env(Some("9999"), 8), 7, "clamped below cap");
+        assert_eq!(parse_residual_env(Some("junk"), 64), 8, "junk -> default");
+    }
+
+    #[test]
+    fn kv_sinks_clamp_below_capacity() {
+        temp_env::with_var("GRIM_KV_SINKS", Some("1000"), || {
+            temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("8"), || {
+                // Device::Cpu short-circuits to disabled, so exercise the clamp
+                // through the policy constructor directly.
+                let ring = grim_backend_rocm::KvRingPolicy::new(8, 1000);
+                assert_eq!(ring.cap_rows, 8);
+                assert_eq!(ring.sink_rows, 7, "sinks must stay below the capacity");
+            });
+        });
+    }
+
+    #[test]
+    fn kv_ring_unlimited_is_identity() {
+        assert!(!KvEvictionPolicy::disabled().ring().is_limited());
+        assert_eq!(KvEvictionPolicy::disabled().effective_ctx(262_144), 262_144);
+        assert_eq!(KvEvictionPolicy::disabled().live_rows(999_999), 999_999);
+        assert_eq!(KvEvictionPolicy::disabled().arena_row(123_456), 123_456);
+    }
+}

@@ -627,13 +627,25 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
     for t in 0..total {
         let (out, h) = dev
             .kda_gated_delta_rule_batched(
-                upload(&dev, &conv[t * conv_dim..(t + 1) * conv_dim], Shape::new(vec![conv_dim])).as_ref(),
+                upload(
+                    &dev,
+                    &conv[t * conv_dim..(t + 1) * conv_dim],
+                    Shape::new(vec![conv_dim]),
+                )
+                .as_ref(),
                 upload(&dev, &alpha[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
                 upload(&dev, &beta[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
                 dt_b.as_ref(),
                 a_b.as_ref(),
                 nw_b.as_ref(),
-                Some(upload(&dev, &z[t * nv * d..(t + 1) * nv * d], Shape::new(vec![nv * d])).as_ref()),
+                Some(
+                    upload(
+                        &dev,
+                        &z[t * nv * d..(t + 1) * nv * d],
+                        Shape::new(vec![nv * d]),
+                    )
+                    .as_ref(),
+                ),
                 state_b.as_ref(),
                 nv,
                 nk,
@@ -651,13 +663,25 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
     let out_shape_scan = Shape::new(vec![t_scan, nv * d]);
     let (scan_out, h) = dev
         .kda_gated_delta_rule_scan(
-            upload(&dev, &conv[..t_scan * conv_dim], Shape::new(vec![t_scan, conv_dim])).as_ref(),
+            upload(
+                &dev,
+                &conv[..t_scan * conv_dim],
+                Shape::new(vec![t_scan, conv_dim]),
+            )
+            .as_ref(),
             upload(&dev, &alpha[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
             upload(&dev, &beta[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
             upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
             upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
             upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
-            Some(upload(&dev, &z[..t_scan * nv * d], Shape::new(vec![t_scan, nv * d])).as_ref()),
+            Some(
+                upload(
+                    &dev,
+                    &z[..t_scan * nv * d],
+                    Shape::new(vec![t_scan, nv * d]),
+                )
+                .as_ref(),
+            ),
             state_a.as_ref(),
             t_scan,
             nv,
@@ -697,7 +721,9 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
     };
     let a_err = rel(&a);
     let b_err = rel(&b);
-    eprintln!("[kda-chain] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}");
+    eprintln!(
+        "[kda-chain] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}"
+    );
     assert!(
         b_err < 1e-3,
         "batched-only chain diverges from the oracle ({b_err:.3e}) — the chain test's own baseline is broken"
@@ -707,5 +733,197 @@ fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
         "scan->batched chain diverges from the oracle ({a_err:.3e}) while batched-only matches \
          ({b_err:.3e}): the scan leaves the state in a form the batched decode step misreads — \
          this is the 9B decode divergence"
+    );
+}
+
+/// The 27B's ACTUAL KDA geometry: `ssm_dt_rank`=48, `ssm_n_group`=16,
+/// `ssm_d_state`=128 -> 48 value heads x 128.
+///
+/// 48 * 128 = 6144 threads = 24 blocks of 256. The v2 scan kernel launches
+/// one block PER HEAD (48 blocks); the 9B gate above covers 16 blocks but
+/// never this count, and the 27B prefill runs exactly this call on 48 of
+/// its 64 layers. Checked directly rather than inferred.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn scan_matches_f64_at_the_27b_geometry() {
+    let Some(dev) = gpu_device() else { return };
+    let worst = check_geometry(&dev, 48, 16, 128, 5);
+    eprintln!("[kda-scan] 27B geometry (48x128): worst {worst:.3e}");
+    assert!(
+        worst < 1e-3,
+        "kda_gated_delta_rule_scan is wrong at the 27B's own geometry (48 value heads x 128, \
+         16 key heads; {worst:.3e}). The 9B geometry passes, so this is specific to this \
+         shape — and it is the shape every 27B prefill uses."
+    );
+}
+
+/// 27B prefill->decode handoff: scan(5) then one batched step on the SAME
+/// device state, vs the f64 oracle chain. Same arm structure as
+/// `scan_then_batched_chain_matches_oracle_at_9b_geometry` (see its header
+/// for the A/B/oracle design); the only variable changed is the geometry.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn scan_then_batched_chain_matches_oracle_at_27b_geometry() {
+    let Some(dev) = gpu_device() else { return };
+    let (nv, nk, d) = (48usize, 16usize, 128usize);
+    let conv_dim = 2 * nk * d + nv * d;
+    let t_scan = 5usize;
+    let total = t_scan + 1usize;
+
+    let mut conv = Vec::with_capacity(total * conv_dim);
+    let mut alpha = Vec::with_capacity(total * nv);
+    let mut beta = Vec::with_capacity(total * nv);
+    let mut z = Vec::with_capacity(total * nv * d);
+    for t in 0..total {
+        let s = t as f64;
+        conv.extend(linspace(conv_dim, -1.5 + 0.3 * s, 2.0 - 0.4 * s));
+        alpha.extend(linspace(nv, -0.4 + 0.1 * s, 0.6));
+        beta.extend(linspace(nv, -1.0, 1.0));
+        z.extend(linspace(nv * d, -0.7 + 0.05 * s, 0.7));
+    }
+    let dt_bias = linspace(nv, 0.1, 0.9);
+    let ssm_a = linspace(nv, 0.5, 1.5);
+    let norm_w = linspace(d, 0.8, 1.2);
+    let seed = linspace(nv * d * d, -0.3, 0.3);
+
+    // ── oracle ──
+    let mut oracle_state: Vec<f64> = seed.iter().map(|&v| v as f64).collect();
+    let mut oracle_last = vec![0.0f64; nv * d];
+    for t in 0..total {
+        for h in 0..nv {
+            let mut head_acc = vec![0.0f64; d];
+            reference_step_head(
+                &conv[t * conv_dim..(t + 1) * conv_dim],
+                alpha[t * nv + h],
+                beta[t * nv + h],
+                h,
+                &dt_bias,
+                &ssm_a,
+                &norm_w,
+                Some(&z[t * nv * d..(t + 1) * nv * d]),
+                nk,
+                d,
+                &mut oracle_state,
+                &mut head_acc,
+            );
+            oracle_last[h * d..(h + 1) * d].copy_from_slice(&head_acc);
+        }
+    }
+
+    // ── arm B: batched x 6 on a fresh copy of the seed ──
+    let state_b = upload(&dev, &seed, Shape::new(vec![nv, d, d]));
+    let dt_b = upload(&dev, &dt_bias, Shape::new(vec![nv]));
+    let a_b = upload(&dev, &ssm_a, Shape::new(vec![nv]));
+    let nw_b = upload(&dev, &norm_w, Shape::new(vec![d]));
+    let mut b = vec![0.0f32; nv * d];
+    for t in 0..total {
+        let (out, h) = dev
+            .kda_gated_delta_rule_batched(
+                upload(
+                    &dev,
+                    &conv[t * conv_dim..(t + 1) * conv_dim],
+                    Shape::new(vec![conv_dim]),
+                )
+                .as_ref(),
+                upload(&dev, &alpha[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
+                upload(&dev, &beta[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
+                dt_b.as_ref(),
+                a_b.as_ref(),
+                nw_b.as_ref(),
+                Some(
+                    upload(
+                        &dev,
+                        &z[t * nv * d..(t + 1) * nv * d],
+                        Shape::new(vec![nv * d]),
+                    )
+                    .as_ref(),
+                ),
+                state_b.as_ref(),
+                nv,
+                nk,
+                d,
+                EPS,
+                &Shape::new(vec![nv * d]),
+            )
+            .expect("batched chain");
+        h.synchronize().unwrap();
+        b = out.to_cpu_vec_f32().expect("read B");
+    }
+
+    // ── arm A: scan(5) -> batched(1) on one device state ──
+    let state_a = upload(&dev, &seed, Shape::new(vec![nv, d, d]));
+    let out_shape_scan = Shape::new(vec![t_scan, nv * d]);
+    let (scan_out, h) = dev
+        .kda_gated_delta_rule_scan(
+            upload(
+                &dev,
+                &conv[..t_scan * conv_dim],
+                Shape::new(vec![t_scan, conv_dim]),
+            )
+            .as_ref(),
+            upload(&dev, &alpha[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
+            upload(&dev, &beta[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
+            upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
+            Some(
+                upload(
+                    &dev,
+                    &z[..t_scan * nv * d],
+                    Shape::new(vec![t_scan, nv * d]),
+                )
+                .as_ref(),
+            ),
+            state_a.as_ref(),
+            t_scan,
+            nv,
+            nk,
+            d,
+            EPS,
+            &out_shape_scan,
+        )
+        .expect("scan in chain");
+    h.synchronize().unwrap();
+    drop(scan_out);
+    let (a_out, h) = dev
+        .kda_gated_delta_rule_batched(
+            upload(&dev, &conv[t_scan * conv_dim..], Shape::new(vec![conv_dim])).as_ref(),
+            upload(&dev, &alpha[t_scan * nv..], Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &beta[t_scan * nv..], Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
+            Some(upload(&dev, &z[t_scan * nv * d..], Shape::new(vec![nv * d])).as_ref()),
+            state_a.as_ref(),
+            nv,
+            nk,
+            d,
+            EPS,
+            &Shape::new(vec![nv * d]),
+        )
+        .expect("batched after scan");
+    h.synchronize().unwrap();
+    let a = a_out.to_cpu_vec_f32().expect("read A");
+
+    let rel = |got: &[f32]| -> f32 {
+        got.iter()
+            .zip(&oracle_last)
+            .map(|(&g, &w)| ((g as f64 - w) / w.abs().max(1e-3)).abs() as f32)
+            .fold(0.0f32, f32::max)
+    };
+    let a_err = rel(&a);
+    let b_err = rel(&b);
+    eprintln!(
+        "[kda-chain-27b] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}"
+    );
+    assert!(
+        b_err < 1e-3,
+        "batched-only chain diverges from the oracle ({b_err:.3e}) — the chain test's own baseline is broken"
+    );
+    assert!(
+        a_err < 1e-3,
+        "scan->batched chain diverges from the oracle ({a_err:.3e}) while batched-only matches \
+         ({b_err:.3e}): the scan leaves the state in a form the batched decode step misreads — \
+         this is the 27B decode divergence"
     );
 }

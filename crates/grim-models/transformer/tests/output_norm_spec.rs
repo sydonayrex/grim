@@ -42,7 +42,7 @@ fn config_carries_the_output_norm_kind_and_bias() {
         max_seq_len: 16,
         partial_rotary_factor: 1.0,
         yarn: None,
-    ..Default::default()
+        ..Default::default()
     };
     // The default must stay RMS: every model that predates these fields is
     // RMSNorm, and a wrong default would silently change the whole corpus.
@@ -71,7 +71,7 @@ fn gptneox_output_shape_is_layer_norm_with_a_bias() {
         max_seq_len: 16,
         partial_rotary_factor: 1.0,
         yarn: None,
-    ..Default::default()
+        ..Default::default()
     };
     c.norm_kind = NormKind::LayerNorm;
     c.has_norm_bias = true;
@@ -96,7 +96,7 @@ fn a_model_with_no_output_norm_bias_keeps_it_false() {
         max_seq_len: 16,
         partial_rotary_factor: 1.0,
         yarn: None,
-    ..Default::default()
+        ..Default::default()
     };
     assert!(!c.has_norm_bias, "no *_b tensors means no norm bias");
     // LayerNorm kind and no bias is a legal combination, unlike bias without

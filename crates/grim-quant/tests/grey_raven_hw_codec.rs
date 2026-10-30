@@ -83,14 +83,15 @@ fn hw_codec_rejects_malformed_buffers() {
     let (rows, cols) = (16usize, 32usize);
     let w = vec![0.5f32; rows * cols];
     let pats = coupled_patterns_2_4(&w, rows, cols).expect("patterns");
-    let (frags, sidx) = pack_grey_raven_hw(&w, rows, cols, &pats).expect("pack");
+    let blob = pack_grey_raven_hw(&w, rows, cols, &pats).expect("pack");
+    assert_eq!(blob.len(), 260, "single tile-window = 256 B frag + u32 sidx");
     // Truncations refuse (including a cut inside the sidx word).
     assert!(dequant_grey_raven_hw(&blob[..200], rows, cols).is_err());
     assert!(dequant_grey_raven_hw(&blob[..258], rows, cols).is_err());
     // Trailing bytes refuse.
-    let mut long = frags.clone();
+    let mut long = blob.clone();
     long.push(0);
-    assert!(dequant_grey_raven_hw(&long, &sidx, rows, cols).is_err());
+    assert!(dequant_grey_raven_hw(&long, rows, cols).is_err());
     // Wrong geometry refuses when tiling disagrees (32 rows need 2 tiles).
     assert!(dequant_grey_raven_hw(&blob, 32, cols).is_err());
     // Empty dims refuse at every entry point.
@@ -105,10 +106,10 @@ fn partial_tiles_pad_with_zeros() {
     let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7) % 11) as f32 * 0.1 - 0.5).collect();
     let pats = coupled_patterns_2_4(&w, rows, cols).expect("patterns");
     assert_eq!(pats.len(), 2 * 2 * 4);
-    let (frags, sidx) = pack_grey_raven_hw(&w, rows, cols, &pats).expect("pack");
-    assert_eq!(frags.len(), 2 * 2 * 256);
-    assert_eq!(sidx.len(), 4);
-    let deq = dequant_grey_raven_hw(&frags, &sidx, rows, cols).expect("dequant");
+    let blob = pack_grey_raven_hw(&w, rows, cols, &pats).expect("pack");
+    // 4 tile-windows x 256 B of fragments, then one u32 sidx per window.
+    assert_eq!(blob.len(), 2 * 2 * 256 + 2 * 2 * 4);
+    let deq = dequant_grey_raven_hw(&blob, rows, cols).expect("dequant");
     assert_eq!(deq.len(), rows * cols);
     // Every decoded value is either 0 (pruned/pad) or the E4M3 round of the
     // source: no garbage from pad regions leaking into real cells.

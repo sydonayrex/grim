@@ -86,6 +86,12 @@ pub(crate) fn cuda_dequant_quantized_storage(
             KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(b_bytes, elem_count),
             KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(b_bytes, elem_count),
             KQuantScheme::IQ2S => grim_quant::dequant_iq2s(b_bytes, elem_count),
+            // IQ1_S/IQ1_M (tags 19/29): the same host dequants the CPU and
+            // Vulkan backends use. Added so the CUDA match is exhaustive after
+            // the IQ1 variants landed; the dequant is host-side here, so no
+            // CUDA kernel is implied.
+            KQuantScheme::IQ1S => grim_quant::dequant_iq1s(b_bytes, elem_count),
+            KQuantScheme::IQ1M => grim_quant::dequant_iq1_m(b_bytes, elem_count),
             // Upstream Q2_0 (tag 42). No CUDA dequant kernel exists; this path
             // runs on the host, so weights land back in VRAM as f32.
             KQuantScheme::Q2_0 => grim_quant::dequant_q2_0(b_bytes, elem_count),
@@ -124,6 +130,7 @@ pub(crate) fn cuda_dequant_quantized_storage(
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale) — same
             // host decode the vulkan quant_ops arm uses.
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(b_bytes, elem_count),
+            BlockDtype::Q4_1 => grim_quant::dequant_q4_1(b_bytes, elem_count),
             // GreyRaven 2:4: the packed form exists (`pack_grey_raven`) and the
             // host decodes it (`dequant_grey_raven`); what does not exist is a
             // CUDA kernel route. Unimplemented rather than a dense fallback:

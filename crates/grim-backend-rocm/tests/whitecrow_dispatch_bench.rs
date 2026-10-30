@@ -6,14 +6,13 @@
 //! decode (m=1) and small prefill (m=16), both F32 activations (the dispatch
 //! quantizes acts on-device: u4-group128 for WhiteCrow, Q8_1 for Q4K).
 //!
-//! DOMAIN RESTRICTION (load-bearing): the kernel computes
-//! `d_a*d_b*(iacc - z_b*sum_qa)` -- a B zero-point but NO A zero-point --
-//! and the act quantizer clamps to unsigned codes, so NEGATIVE activations
-//! decode as zero. The format is correct only for non-negative activations
-//! (post-ReLU/SiLU-type outputs); signed inputs (norm outputs) are silently
-//! wrong, and the dispatch arm does NOT check. Fixtures below are
-//! abs-valued to stay in-domain (same reason dot_gemv_parity uses ABS);
-//! the missing sign check is a separate safety gap, not bench scope.
+//! The A-side act quantizer is SIGNED-symmetric ([-8,7], absmax/7 scale) and
+//! the kernel reads A signed, so signed activations are in-domain; the B
+//! side keeps its zero point (`d_a*d_b*(iacc - z_b*sum_qa)`). Fixtures below
+//! are signed-symmetric on purpose: the previously clamped-unsigned code path
+//! used to silently zero negative activations, and every bench fixture was
+//! ABS-valued to dodge it (making the 0-0 gate vacuous). Signed fixtures are
+//! the regression coverage for that fix -- do not reintroduce ABS.
 //!
 //! Gate: must not lose badly to Q4_K at the same job. A 4-bit format slower
 //! than the incumbent 4-bit path is a regression disguised as a feature.
@@ -122,13 +121,13 @@ fn whitecrow_dispatch_keeps_pace_with_q4k() -> TestResult {
         return Ok(());
     }
 
-    for (m, n, k, iters) in [(1usize, 4096usize, 4096usize, 50usize), (16, 4096, 4096, 20)] {
-        // abs-valued: WhiteCrow's unsigned act codes are only valid for
-        // non-negative inputs (see header). Symmetric data would bench
-        // 0-vs-0 vacuously AND mislead about the format's domain.
+    for (m, n, k, iters) in [
+        (1usize, 4096usize, 4096usize, 50usize),
+        (16, 4096, 4096, 20),
+    ] {
         let mut rng = Lcg::warmed(0xC2049 ^ (m as u64));
-        let a: Vec<f32> = (0..m * k).map(|_| rng().abs()).collect();
-        let w: Vec<f32> = (0..n * k).map(|_| rng().abs() * 0.5).collect();
+        let a: Vec<f32> = (0..m * k).map(|_| rng()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rng() * 0.5).collect();
 
         // WhiteCrow: group-128 W4A4, length-prefixed triple-stream blob.
         let (qw, sc, zr) =
@@ -240,16 +239,7 @@ fn whitecrow_dispatch_keeps_pace_with_q4k() -> TestResult {
             std::env::set_var("GRIM_DECODE_EXACT_GEMV", "0");
         }
         let (us_q4k, gb_q4k) = bench(&dev, &w_q4k, &x, m, n, k, QuantFormat::Q4K, iters)?;
-        let (us_c, gb_c) = bench(
-            &dev,
-            &w_crow,
-            &x,
-            m,
-            n,
-            k,
-            QuantFormat::W4A4OstQuant,
-            iters,
-        )?;
+        let (us_c, gb_c) = bench(&dev, &w_crow, &x, m, n, k, QuantFormat::W4A4OstQuant, iters)?;
 
         println!("[crow-bench] m={m:<4} n={n} k={k}");
         println!("  q4k dot4    : {us_q4k:>9.1} us  {gb_q4k:>7.1} GB/s");

@@ -47,6 +47,7 @@ pub const fn to_route_link(status: P2PStatus, bytes: u64, pcie_threshold_bytes: 
 
 /// Pinned host allocation for the host-bounce path.
 /// Allocated via `hipHostMalloc` on a running ROCm box; on a GPU-less box the constructor returns.
+#[derive(Debug)]
 pub struct HostStagingBuffer {
     ptr: *mut c_void,
     size: usize,
@@ -60,14 +61,21 @@ impl HostStagingBuffer {
     /// Allocate `size` bytes of pinned host memory.
     /// Returns `Err` if the runtime refuses the size (zero-byte or out-of-quota) or if the runtime.
     pub fn new(size: usize) -> Result<Self> {
+        Self::with_flags(size, 0)
+    }
+
+    /// Allocate `size` bytes of pinned host memory with explicit flags (e.g. `hipHostMallocPortable = 0x1`).
+    pub fn with_flags(size: usize, flags: u32) -> Result<Self> {
         if size == 0 {
             return Err(Error::Backend(
                 "HostStagingBuffer::new: size must be > 0".into(),
             ));
         }
         let mut ptr: *mut c_void = std::ptr::null_mut();
+        // HIP_GUARD_EXEMPT: hipHostMalloc allocates pinned host memory only — no device
+        // context is touched and the result does not depend on the thread's current device.
         crate::device::helpers::check_hip("hipHostMalloc", unsafe {
-            hipHostMalloc(&mut ptr, size, 0)
+            hipHostMalloc(&mut ptr, size, flags)
         })?;
         Ok(Self { ptr, size })
     }
@@ -146,7 +154,35 @@ pub fn copy_route(
 ) -> Result<()> {
     match route {
         RouteLink::PeerDirect => {
-            crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream)?;
+            if crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream)
+                .is_err()
+            {
+                let staging = take_staging(stream, len, src_device)?;
+                {
+                    let _leg = crate::device::util::DeviceGuard::set(src_device);
+                    crate::device::helpers::check_hip("copy_route: D2H fallback", unsafe {
+                        hipMemcpyAsync(
+                            staging.as_device_ptr(),
+                            src_ptr,
+                            len,
+                            HipMemcpyKind::DeviceToHost,
+                            stream,
+                        )
+                    })?;
+                }
+                {
+                    let _leg = crate::device::util::DeviceGuard::set(dst_device);
+                    crate::device::helpers::check_hip("copy_route: H2D fallback", unsafe {
+                        hipMemcpyAsync(
+                            dst_ptr,
+                            staging.as_device_ptr(),
+                            len,
+                            HipMemcpyKind::HostToDevice,
+                            stream,
+                        )
+                    })?;
+                }
+            }
         }
         RouteLink::HostBounce => {
             let staging = take_staging(stream, len, src_device)?;

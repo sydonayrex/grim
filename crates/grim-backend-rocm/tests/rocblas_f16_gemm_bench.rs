@@ -44,11 +44,7 @@ fn f16_bytes(len: usize) -> Vec<u8> {
     v
 }
 
-fn f16_tensor(
-    dev: &RocmDevice,
-    bytes: &[u8],
-    shape: &Shape,
-) -> Box<dyn BackendStorage> {
+fn f16_tensor(dev: &RocmDevice, bytes: &[u8], shape: &Shape) -> Box<dyn BackendStorage> {
     MemoryOps::from_cpu_bytes(
         dev,
         bytes,
@@ -111,8 +107,6 @@ fn rocblas_f16_prefill_shapes() {
 
         let tflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms / 1e3) / 1e12;
         let gb = (2.0 * (m * k + n * k) as f64 * 2.0 + 4.0 * (m * n) as f64) / 1e9;
-        eprintln!(
-            "{m:>6} {n:>6}x{k:<6} {ms:>10.3} {tflops:>10.2} {gb:>11.2}"
-        );
+        eprintln!("{m:>6} {n:>6}x{k:<6} {ms:>10.3} {tflops:>10.2} {gb:>11.2}");
     }
 }

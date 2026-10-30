@@ -12,9 +12,7 @@ fn repo_root() -> PathBuf {
 #[test]
 fn test_cli_draft_graph_cpu_twin() {
     let bin_path = repo_root().join("target/debug/grim-cli");
-    let status = Command::new(&bin_path)
-        .arg("--help")
-        .status();
+    let status = Command::new(&bin_path).arg("--help").status();
     assert!(status.is_ok());
     assert!(status.unwrap().success());
 }

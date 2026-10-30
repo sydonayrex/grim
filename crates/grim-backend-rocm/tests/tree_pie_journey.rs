@@ -28,8 +28,8 @@
 //! RUN: HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 \
 //!      cargo test -p grim-backend-rocm --test tree_pie_journey -- --nocapture
 
-use grim_backend_rocm::{kernel_route_snapshot, RocmDevice};
-use grim_quant::tree_pie::{pack_tree_pie, unpack_tree_pie, TREE_PIE_WORDS_PER_32};
+use grim_backend_rocm::{RocmDevice, kernel_route_snapshot};
+use grim_quant::tree_pie::{TREE_PIE_WORDS_PER_32, pack_tree_pie, unpack_tree_pie};
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
 use std::panic;
 use std::time::Instant;
@@ -50,7 +50,10 @@ const VOCAB: usize = 1024;
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let unit = ((self.0 >> 40) as f32) / (1u32 << 24) as f32;
         (unit - 0.5) * 2.0
     }
@@ -141,7 +144,9 @@ fn tree_pie_journey_survives_end_to_end() -> TestResult {
     let mut quant: Vec<Vec<f32>> = Vec::new();
     for layer in 0..LAYERS + 1 {
         let out_dim = if layer == LAYERS { VOCAB } else { HIDDEN };
-        let w: Vec<f32> = (0..out_dim * HIDDEN).map(|_| rng.next_f32() * 0.5).collect();
+        let w: Vec<f32> = (0..out_dim * HIDDEN)
+            .map(|_| rng.next_f32() * 0.5)
+            .collect();
         base.push(w.clone());
         quant.push(quantize_tree_pie(&w));
     }
@@ -190,7 +195,9 @@ fn tree_pie_journey_survives_end_to_end() -> TestResult {
         s.sort_by(|a, b| b.partial_cmp(a).unwrap());
         s[0] - s[1]
     };
-    println!("  final output: {out_err:.4}   argmax f32={aw} treepie={ag} (top-2 margin {margin_w:.4})");
+    println!(
+        "  final output: {out_err:.4}   argmax f32={aw} treepie={ag} (top-2 margin {margin_w:.4})"
+    );
     println!("  argmax preserved: {}", aw == ag);
 
     // --- GPU arm: the real kernel, the real route counter, the real cost ---
@@ -204,8 +211,14 @@ fn tree_pie_journey_survives_end_to_end() -> TestResult {
     // One representative layer (the widest GEMV) on the GPU.
     let n = HIDDEN;
     let k = HIDDEN;
-    let a16: Vec<u16> = x0.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
-    let scaled: Vec<f32> = quant[0].iter().map(|&v| v / (quant_scale(&quant[0]))).collect();
+    let a16: Vec<u16> = x0
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_bits())
+        .collect();
+    let scaled: Vec<f32> = quant[0]
+        .iter()
+        .map(|&v| v / (quant_scale(&quant[0])))
+        .collect();
     let packed = pack_tree_pie(&scaled);
     debug_assert_eq!(packed.len(), n * (k / 32) * TREE_PIE_WORDS_PER_32);
 
@@ -213,20 +226,29 @@ fn tree_pie_journey_survives_end_to_end() -> TestResult {
         &dev,
         &u16_bytes(&a16),
         &Shape::new(vec![k]),
-        DType { arith: ArithType::F16, storage: Storage::Native },
+        DType {
+            arith: ArithType::F16,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
     let b_t = MemoryOps::from_cpu_bytes(
         &dev,
         &i32_bytes(&packed),
         &Shape::new(vec![packed.len()]),
-        DType { arith: ArithType::U32, storage: Storage::Native },
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("b h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         &dev,
         &Shape::new(vec![n]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
@@ -269,7 +291,10 @@ fn tree_pie_journey_survives_end_to_end() -> TestResult {
 
     // The route must have actually fired -- otherwise this file has measured
     // nothing about the kernel.
-    assert!(launched > 0, "grim_tree_pie_gemv route never recorded a launch");
+    assert!(
+        launched > 0,
+        "grim_tree_pie_gemv route never recorded a launch"
+    );
 
     // The GPU must agree with the CPU TreePie forward, or A6 and A7 disagree.
     let gpu_out = download_f32(&out_t)?;
@@ -283,7 +308,10 @@ fn tree_pie_journey_survives_end_to_end() -> TestResult {
     }
     let gpu_vs_cpu = rel_err(&gpu_out, &cpu_out);
     println!("  gpu vs cpu TreePie forward: {gpu_vs_cpu:.3e}");
-    assert!(gpu_vs_cpu <= 2e-2, "GPU/CPU TreePie disagreement {gpu_vs_cpu:.3e}");
+    assert!(
+        gpu_vs_cpu <= 2e-2,
+        "GPU/CPU TreePie disagreement {gpu_vs_cpu:.3e}"
+    );
 
     // --- the actual verdict ----------------------------------------------
     // A4's ~5% per-weight error is only meaningful once it has propagated. The
@@ -311,6 +339,11 @@ fn i32_bytes(v: &[i32]) -> &[u8] {
 }
 
 fn download_f32(t: &Box<dyn BackendStorage>) -> TestResult<Vec<f32>> {
-    let bytes = grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
-    Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    let bytes = grim_backend_rocm::as_rocm(t.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }

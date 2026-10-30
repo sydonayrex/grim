@@ -20,17 +20,18 @@ use grim_models_transformer::{
     DeepSeek4Config, DeepSeek32, DeepSeek32Config, DeepSeekConfig, DeltaNetBase,
     DeltaNetBaseConfig, DiffusionGemma, DiffusionGemmaConfig, Dots3Note, Dots3NoteConfig, Exaone45,
     Exaone45Config, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma2,
-    Gemma2Config, Gemma3n, Gemma3nConfig, GemmaConfig, Glm4MoeLite, Glm4MoeLiteConfig, Glm52,
-    Glm52Config, Gpt2, Gpt2Config, GptJ, GptJConfig, GptOss, GptOssConfig, GraniteMoeHybrid,
-    GraniteMoeHybridConfig, HunyuanVl, HunyuanVlConfig, HunyuanVlVisionConfig, HyV3, HyV3Config,
-    HyV4, HyV4Config, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
-    KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2AttentionMode, Lfm2Config, Llama,
-    LlamaConfig, LongCatFlash, LongCatFlashConfig, Mellum, MellumConfig, MiniCpmConfig,
-    MiniCpmModel, MiniMaxM3, MiniMaxM3Config, NemotronHMoe, NemotronHMoeConfig, Phi2, PhiConfig,
-    Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl,
-    Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig,
-    Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2,
-    SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig, Xing40, Xing40Config,
+    Gemma2Config, Gemma3n, Gemma3nConfig, Gemma4, Gemma4Config, Gemma4LayerType, GemmaConfig,
+    Glm4MoeLite, Glm4MoeLiteConfig, Glm52, Glm52Config, Gpt2, Gpt2Config, GptJ, GptJConfig, GptOss,
+    GptOssConfig, GraniteMoeHybrid, GraniteMoeHybridConfig, HunyuanVl, HunyuanVlConfig,
+    HunyuanVlVisionConfig, HyV3, HyV3Config, HyV4, HyV4Config, InklingSmall, InklingSmallConfig,
+    InternS2Mobius, InternS2MobiusConfig, KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2,
+    Lfm2AttentionMode, Lfm2Config, Llama, LlamaConfig, LongCatFlash, LongCatFlashConfig, Mellum,
+    MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, NemotronHMoe,
+    NemotronHMoeConfig, Phi2, PhiConfig, Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig,
+    Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config,
+    Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2,
+    SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec,
+    WavTokenizerDecConfig, Xing40, Xing40Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -211,9 +212,44 @@ fn resolve_tp_ordinal() -> Result<(Option<usize>, Option<Vec<usize>>)> {
     Ok((Some(my_ordinal), Some(all_ordinals)))
 }
 
+/// Sort discrete ROCm devices by measured effective DRAM bandwidth descending.
+/// Pure helper for testability and ordinal fallback on invalid measurements.
+pub fn sort_devices_by_bandwidth(devices: &mut [Device], caps: &[(usize, f32)]) {
+    if devices.len() < 2 {
+        return;
+    }
+    let mut bws = Vec::with_capacity(devices.len());
+    for d in devices.iter() {
+        if let Device::Rocm(ord) = d {
+            let bw = caps
+                .iter()
+                .find(|(o, _)| o == ord)
+                .map(|(_, b)| *b)
+                .unwrap_or(0.0);
+            if !(bw > 0.0 && bw.is_finite()) {
+                eprintln!("[placement] WARNING: bandwidth unmeasured, keeping ordinal order");
+                return;
+            }
+            bws.push((bw, d.clone()));
+        } else {
+            return;
+        }
+    }
+    // Stable sort descending by bandwidth
+    bws.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, (_, dev)) in bws.into_iter().enumerate() {
+        devices[i] = dev;
+    }
+}
+
 /// Resolve discrete ROCm GPUs (honoring `GRIM_GPUS` and taking only dedicated GPUs 0 and 1,
 /// strictly excluding integrated APU devices).
 pub fn resolve_discrete_rocm_devices(fallback: &Device) -> Vec<Device> {
+    static CACHED_SORTED: std::sync::OnceLock<Vec<Device>> = std::sync::OnceLock::new();
+    if let Some(cached) = CACHED_SORTED.get() {
+        return cached.clone();
+    }
+
     if let Ok(val) = std::env::var("GRIM_GPUS") {
         let explicit: Vec<Device> = val
             .split(',')
@@ -221,17 +257,32 @@ pub fn resolve_discrete_rocm_devices(fallback: &Device) -> Vec<Device> {
             .map(Device::Rocm)
             .collect();
         if !explicit.is_empty() {
+            let _ = CACHED_SORTED.set(explicit.clone());
             return explicit;
         }
     }
 
     if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-        let discrete: Vec<Device> = rocm_devices
+        let mut discrete: Vec<Device> = rocm_devices
             .iter()
             .take(2)
             .map(|d| Device::Rocm(d.ordinal()))
             .collect();
         if !discrete.is_empty() && !fallback.is_cpu() {
+            if matches!(
+                std::env::var("GRIM_PLACE_FASTEST_PRIMARY").as_deref(),
+                Ok("1" | "true" | "on")
+            ) && discrete.len() >= 2
+            {
+                let profiler = grim_backend_rocm::CapabilityProfiler::new();
+                let caps_snapshot = profiler.capabilities();
+                let caps: Vec<(usize, f32)> = caps_snapshot
+                    .iter()
+                    .map(|c| (c.ordinal, c.dram_bandwidth_gbps * (1.0 - c.throttle_pct)))
+                    .collect();
+                sort_devices_by_bandwidth(&mut discrete, &caps);
+            }
+            let _ = CACHED_SORTED.set(discrete.clone());
             return discrete;
         }
     }
@@ -704,8 +755,7 @@ pub fn load_model_from_safetensors(path: &str, device: Device) -> Result<Box<dyn
     // Read and parse config.json
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| Error::Config(format!("Failed to read config.json: {e}")))?;
-    let config: SafetensorsConfig = serde_json::from_str(&config_str)
-        .map_err(|e| Error::Config(format!("Failed to parse config.json: {e}")))?;
+    let config: SafetensorsConfig = parse_safetensors_config(&config_str)?;
 
     // Open safetensors provider
     let provider = SafetensorsProvider::open(path)?;
@@ -794,6 +844,45 @@ struct SafetensorsConfig {
     /// Parsed lazily by `parse_yarn_scaling`; absence = plain RoPE.
     #[serde(rename = "rope_scaling")]
     rope_scaling: Option<serde_json::Value>,
+    // Gemma-4 text stack
+    /// Number of tail blocks that reuse an earlier block's KV cache.
+    #[serde(rename = "num_kv_shared_layers")]
+    num_kv_shared_layers: Option<usize>,
+    /// Width of the per-layer ("per layer input") embedding.
+    #[serde(rename = "hidden_size_per_layer_input")]
+    hidden_size_per_layer_input: Option<usize>,
+    /// Head width of the full-attention blocks.
+    #[serde(rename = "global_head_dim")]
+    global_head_dim: Option<usize>,
+    /// Key/value head count of the full-attention blocks.
+    #[serde(rename = "num_global_key_value_heads")]
+    num_global_key_value_heads: Option<usize>,
+    /// Cap on the final logits.
+    #[serde(rename = "final_logit_softcapping")]
+    final_logit_softcapping: Option<f32>,
+    /// Softmax scale of the attention. Gemma 4 uses 1.0.
+    #[serde(rename = "attention_scale")]
+    attention_scale: Option<f32>,
+}
+
+/// Parse a HF `config.json`, flattening a nested `text_config` into the root.
+///
+/// Gemma 4 (like the other multimodal exports) keeps the text stack under
+/// `text_config`; the shared loader reads `hidden_size` / `num_hidden_layers` /
+/// `vocab_size` from the root. The root wins on conflicts - `model_type` is
+/// `gemma4` there and `gemma4_text` inside the nested block.
+fn parse_safetensors_config(config_str: &str) -> Result<SafetensorsConfig> {
+    let mut value: serde_json::Value = serde_json::from_str(config_str)
+        .map_err(|e| Error::Config(format!("Failed to parse config.json: {e}")))?;
+    if let Some(text) = value.get("text_config").cloned() {
+        if let (Some(nested), Some(root)) = (text.as_object(), value.as_object_mut()) {
+            for (k, v) in nested {
+                root.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    serde_json::from_value(value)
+        .map_err(|e| Error::Config(format!("Failed to parse config.json: {e}")))
 }
 
 /// Extract full-attention YaRN params from Laguna-S-2.1 `rope_parameters`.
@@ -1053,6 +1142,235 @@ fn qwen35_forward_layer_count<'a>(
     }
 }
 
+// Gemma 4
+//
+// Gemma 4 interleaves sliding-window and full-attention blocks, gives the
+// full-attention blocks their own head width and rope, shares the tail blocks'
+// KV cache with earlier blocks, and mixes a per-layer embedding into every
+// block. The reference is `old/repo/llama.cpp-master/src/models/gemma4.cpp`.
+
+/// Map a `model.*` weight name onto Gemma-4's `model.language_model.*` layout.
+///
+/// The Gemma 4 checkpoint is multimodal: the text stack lives under
+/// `model.language_model.*` next to the vision and audio towers. The model
+/// asks for the plain `model.*` names, so the provider rewrites the text
+/// prefixes and leaves everything else alone.
+fn gemma4_safetensors_name(name: &str) -> String {
+    const TEXT_ROOTS: [&str; 6] = [
+        "model.embed_tokens.",
+        "model.embed_tokens_per_layer.",
+        "model.per_layer_model_projection.",
+        "model.per_layer_projection_norm.",
+        "model.norm.",
+        "model.layers.",
+    ];
+    for root in TEXT_ROOTS {
+        if let Some(rest) = name.strip_prefix(root) {
+            // `root` carries the "model." prefix; the rewrite replaces it.
+            let tail = root.strip_prefix("model.").unwrap_or(root);
+            return format!("model.language_model.{tail}{rest}");
+        }
+    }
+    name.to_string()
+}
+
+/// The number of rotary pairs Gemma-4's full-attention blocks really rotate.
+///
+/// The HF->GGUF converter writes a `rope_freqs` vector whose leading entries
+/// are 1.0 (live pairs) and whose tail is 1e30 - the identity, i.e. the
+/// dimensions the "proportional" rope leaves alone
+/// (`conversion/gemma.py:757-762`). The GGUF does not store the partial-rotary
+/// fraction, so the count is read back from the file instead of guessed.
+fn gemma4_live_rot_pairs(provider: &dyn grim_tensor::TensorProvider) -> Option<usize> {
+    let raw = provider.get("rope_freqs.weight").ok()?;
+    if raw.dtype.arith != grim_tensor::dtype::ArithType::F32 {
+        return None;
+    }
+    let mut live = 0usize;
+    for chunk in raw.bytes.chunks_exact(4) {
+        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if v >= 1e29 {
+            break;
+        }
+        live += 1;
+    }
+    Some(live)
+}
+
+/// Gemma-4 configuration from GGUF metadata.
+///
+/// The generic hyperparameter extractor resolves the FULL-attention geometry
+/// (`gemma4.attention.key_length` = 512, `gemma4.rope.freq_base` = 1e6); the
+/// sliding-window geometry lives under the `_swa` keys
+/// (`src/models/gemma4.cpp:13-19`).
+fn gemma4_config_from_gguf(
+    lookup: &dyn MetadataLookup,
+    hparams: &grim_core::hyperparams::ArchHyperparameters,
+    live_rot_pairs: Option<usize>,
+) -> Gemma4Config {
+    let n_layers = hparams.num_layers;
+    let head_dim_full = lookup
+        .get_u32("gemma4.attention.key_length")
+        .map(|v| v as usize)
+        .unwrap_or(hparams.head_dim);
+    let head_dim_swa = lookup
+        .get_u32("gemma4.attention.key_length_swa")
+        .map(|v| v as usize)
+        .unwrap_or(head_dim_full);
+
+    // `attention.sliding_window_pattern` is a per-block bool array where
+    // `true` marks a sliding-window block.
+    let pattern: Vec<bool> = lookup
+        .get_bool_array("gemma4.attention.sliding_window_pattern")
+        .unwrap_or_default();
+    let layer_types: Vec<Gemma4LayerType> = (0..n_layers)
+        .map(|il| {
+            if pattern.get(il).copied().unwrap_or(true) {
+                Gemma4LayerType::Sliding
+            } else {
+                Gemma4LayerType::Full
+            }
+        })
+        .collect();
+
+    // `attention.head_count_kv` is a per-layer array when the full-attention
+    // blocks have their own key/value head count, and a scalar otherwise.
+    let kv_schedule = lookup.get_u32_array("gemma4.attention.head_count_kv");
+    let kv_default = hparams.num_kv_heads;
+    let kv_for = |want_full: bool| -> usize {
+        kv_schedule
+            .as_ref()
+            .and_then(|a| {
+                (0..n_layers)
+                    .find(|&il| {
+                        let is_full = layer_types[il] == Gemma4LayerType::Full;
+                        is_full == want_full
+                    })
+                    .and_then(|il| a.get(il).copied())
+            })
+            .map(|v| v as usize)
+            .unwrap_or(kv_default)
+    };
+
+    Gemma4Config {
+        vocab_size: hparams.vocab_size,
+        hidden_size: hparams.hidden_size,
+        num_hidden_layers: n_layers,
+        num_attention_heads: hparams.num_heads,
+        num_key_value_heads: kv_for(false),
+        num_key_value_heads_full: kv_for(true),
+        head_dim: head_dim_swa,
+        head_dim_full,
+        intermediate_size: hparams.intermediate_size,
+        rms_norm_eps: hparams.rms_norm_eps,
+        rope_theta: lookup
+            .get_f32("gemma4.rope.freq_base_swa")
+            .unwrap_or(10000.0),
+        rope_theta_full: lookup
+            .get_f32("gemma4.rope.freq_base")
+            .unwrap_or(hparams.rope_theta),
+        n_rot_pairs_full: live_rot_pairs.unwrap_or_else(|| head_dim_full / 2),
+        sliding_window: lookup
+            .get_u32("gemma4.attention.sliding_window")
+            .map(|v| v as usize)
+            .unwrap_or(512),
+        final_logit_softcapping: lookup.get_f32("gemma4.final_logit_softcapping"),
+        max_position_embeddings: hparams.max_seq_len,
+        n_embd_per_layer: lookup
+            .get_u32("gemma4.embedding_length_per_layer_input")
+            .map(|v| v as usize)
+            .unwrap_or(0),
+        num_kv_shared_layers: lookup
+            .get_u32("gemma4.attention.shared_kv_layers")
+            .map(|v| v as usize)
+            .unwrap_or(0),
+        layer_types,
+        attention_scale: 1.0,
+    }
+}
+
+/// Gemma-4 configuration from a HF `config.json`.
+///
+/// The text stack's fields live in the (flattened) `text_config` block.
+fn gemma4_config_from_hf(config: &SafetensorsConfig) -> Gemma4Config {
+    let n_layers = config.num_hidden_layers;
+    let head_dim_swa = config.head_dim.unwrap_or(256);
+    let head_dim_full = config.global_head_dim.unwrap_or(head_dim_swa);
+    let layer_types: Vec<Gemma4LayerType> = config
+        .layer_types
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .take(n_layers)
+        .map(|t| {
+            if t == "full_attention" {
+                Gemma4LayerType::Full
+            } else {
+                Gemma4LayerType::Sliding
+            }
+        })
+        .collect();
+    let layer_types = if layer_types.len() == n_layers {
+        layer_types
+    } else {
+        (0..n_layers)
+            .map(|il| {
+                if il % 6 == 5 {
+                    Gemma4LayerType::Full
+                } else {
+                    Gemma4LayerType::Sliding
+                }
+            })
+            .collect()
+    };
+
+    let rope = config.rope_parameters.as_ref();
+    let rope_theta_full = rope
+        .and_then(|r| r.get("full_attention"))
+        .and_then(|f| f.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1000000.0) as f32;
+    let rope_theta_swa = rope
+        .and_then(|r| r.get("sliding_attention"))
+        .and_then(|f| f.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0) as f32;
+    // The full-attention rope rotates `global_head_dim * partial_rotary_factor`
+    // dimensions, i.e. that many PAIRS of the NeoX half-split.
+    let partial_rotary_factor = rope
+        .and_then(|r| r.get("full_attention"))
+        .and_then(|f| f.get("partial_rotary_factor"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.25) as f32;
+    let n_rot_pairs_full =
+        ((head_dim_full as f32 * partial_rotary_factor / 2.0) as usize).min(head_dim_full / 2);
+
+    Gemma4Config {
+        vocab_size: config.vocab_size,
+        hidden_size: config.hidden_size,
+        num_hidden_layers: n_layers,
+        num_attention_heads: config.num_attention_heads.unwrap_or(8),
+        num_key_value_heads: config.num_key_value_heads.unwrap_or(1),
+        num_key_value_heads_full: config
+            .num_global_key_value_heads
+            .unwrap_or_else(|| config.num_key_value_heads.unwrap_or(1)),
+        head_dim: head_dim_swa,
+        head_dim_full,
+        intermediate_size: config.intermediate_size.unwrap_or(config.hidden_size * 4),
+        rms_norm_eps: config.rms_norm_eps.unwrap_or(1e-6),
+        rope_theta: rope_theta_swa,
+        rope_theta_full,
+        n_rot_pairs_full,
+        sliding_window: config.sliding_window.unwrap_or(512),
+        final_logit_softcapping: config.final_logit_softcapping,
+        max_position_embeddings: config.max_position_embeddings.unwrap_or(131072),
+        n_embd_per_layer: config.hidden_size_per_layer_input.unwrap_or(0),
+        num_kv_shared_layers: config.num_kv_shared_layers.unwrap_or(0),
+        layer_types,
+        attention_scale: config.attention_scale.unwrap_or(1.0),
+    }
+}
+
 fn load_model_from_config(
     config: SafetensorsConfig,
     provider: &SafetensorsProvider,
@@ -1061,9 +1379,16 @@ fn load_model_from_config(
     raw_config_str: Option<&str>,
 ) -> Result<Box<dyn CausalLm>> {
     // Determine architecture
+    // Cloned, not moved: the Gemma-4 arm below still borrows `config`.
     let arch_str = config
         .model_type
-        .or_else(|| config.architectures.and_then(|a| a.first().cloned()))
+        .clone()
+        .or_else(|| {
+            config
+                .architectures
+                .clone()
+                .and_then(|a| a.first().cloned())
+        })
         .ok_or_else(|| Error::Config("config.json missing model_type or architectures".into()))?;
     let model_arch = ModelArchitecture::from_str(&arch_str);
 
@@ -1074,7 +1399,6 @@ fn load_model_from_config(
     let vocab_size = config.vocab_size;
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
-
 
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
     // Qwen3.5/3.8 ships a multi-token-prediction head as a trailing layer and
@@ -1088,8 +1412,10 @@ fn load_model_from_config(
     // the reference never applies, immediately before the output projection.
     // Detected structurally from the `nextn.*` tensors rather than hardcoded, so
     // it follows the checkpoint instead of a magic 64.
-    let num_layers =
-        qwen35_forward_layer_count(provider.tensor_names().iter().map(|s| s.as_str()), num_layers);
+    let num_layers = qwen35_forward_layer_count(
+        provider.tensor_names().iter().map(|s| s.as_str()),
+        num_layers,
+    );
     let num_heads = config.num_attention_heads.unwrap_or(32);
     let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
     let head_dim = config
@@ -1143,7 +1469,8 @@ fn load_model_from_config(
         .unwrap_or(2.5);
     let moe_intermediate_size = config.moe_intermediate_size.unwrap_or(1024);
     let shared_expert_intermediate_size = config.shared_expert_intermediate_size.unwrap_or(1024);
-    let mlp_only_layers = config.mlp_only_layers.unwrap_or_else(|| vec![0]);
+    // Cloned, not moved: the Gemma-4 arm below still borrows `config`.
+    let mlp_only_layers = config.mlp_only_layers.clone().unwrap_or_else(|| vec![0]);
 
     dbg_eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
@@ -1154,7 +1481,21 @@ fn load_model_from_config(
     );
 
     let tp = resolve_tp_config()?;
-    let ws = WeightSource::root(provider, device.clone()).with_tp_config(tp);
+    // Gemma 4 keeps its text stack under `model.language_model.*` (the
+    // checkpoint also carries a vision and an audio tower), so the provider
+    // rewrites the text-model names.
+    let gemma4_provider = if model_arch == ModelArchitecture::Gemma4 {
+        Some(RemappingTensorProvider::new(
+            provider,
+            |name: &str| -> String { gemma4_safetensors_name(name) },
+        ))
+    } else {
+        None
+    };
+    let ws = match &gemma4_provider {
+        Some(p) => WeightSource::root(p, device.clone()).with_tp_config(tp),
+        None => WeightSource::root(provider, device.clone()).with_tp_config(tp),
+    };
     ws.prefetch_all();
 
     match model_arch {
@@ -1188,6 +1529,14 @@ fn load_model_from_config(
             };
             log::info!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma4 => {
+            // Gemma 4: interleaved sliding/full attention, per-layer embeddings,
+            // shared KV tail. The geometry comes from the (flattened) text_config.
+            let gemma4_cfg = gemma4_config_from_hf(&config);
+            log::info!("[grim] Loading Gemma-4 model with config: {:?}", gemma4_cfg);
+            let m = Gemma4::load_tp(device.clone(), &ws, gemma4_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Laguna => {
@@ -1313,6 +1662,7 @@ fn load_model_from_config(
             } else {
                 tp
             };
+            let qwen_primary = devices.first().cloned().unwrap_or_else(|| device.clone());
             let qwen35_cfg = Qwen35Config {
                 vocab_size,
                 hidden_size,
@@ -1345,7 +1695,7 @@ fn load_model_from_config(
                 devices,
             };
             log::info!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
-            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, qwen_tp)?;
+            let m = Qwen35::load_tp(qwen_primary, &ws, qwen35_cfg, qwen_tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -1428,7 +1778,7 @@ fn load_model_from_config(
                     beta_fast: 32.0,
                     beta_slow: 1.0,
                     attention_factor: 1.277_258_9,
-            rope_mscale: None,
+                    rope_mscale: None,
                 }),
             };
             log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -1928,7 +2278,7 @@ fn load_model_from_config(
             let m = Gpt2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Gemma | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+        ModelArchitecture::Gemma | ModelArchitecture::Gemma3 => {
             let cfg = GemmaConfig {
                 vocab_size,
                 hidden_size,
@@ -2775,8 +3125,8 @@ fn load_model_from_config(
                 // This arm is the safetensors/config.json path - yarn comes from the HF `rope_scaling` block (mirrors qwen35moe arms above).
                 // The GGUF path reads the dotted metadata keys via `parse_yarn_scaling_gguf` instead.
                 yarn: parse_yarn_scaling(&config.rope_scaling),
-            norm_kind: norm_kind_for(model_arch),
-..Default::default()
+                norm_kind: norm_kind_for(model_arch),
+                ..Default::default()
             };
             log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
@@ -2890,8 +3240,8 @@ fn load_model_from_config(
 
                 partial_rotary_factor: 1.0,
                 yarn: None,
-            norm_kind: norm_kind_for(model_arch),
-..Default::default()
+                norm_kind: norm_kind_for(model_arch),
+                ..Default::default()
             };
             let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -2919,7 +3269,10 @@ fn load_model_with_providers(
 
     let lookup = GgufMetadataLookup(provider);
     if std::env::var_os("GRIM_LOADER_TRACE").is_some() {
-        eprintln!("[loader-trace] arch_str={arch_str:?} -> {:?}", ModelArchitecture::from_str(arch_str));
+        eprintln!(
+            "[loader-trace] arch_str={arch_str:?} -> {:?}",
+            ModelArchitecture::from_str(arch_str)
+        );
     }
     let mut model_arch = ModelArchitecture::from_str(arch_str);
     if model_arch == ModelArchitecture::Llama {
@@ -3100,6 +3453,16 @@ fn load_model_with_providers(
             };
             log::info!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma4 => {
+            // The GGUF states the full-attention geometry; the sliding-window
+            // geometry sits under the `_swa` keys, and the number of live rotary
+            // pairs comes from the `rope_freqs` tensor the converter wrote.
+            let gemma4_cfg =
+                gemma4_config_from_gguf(&lookup, &hparams, gemma4_live_rot_pairs(weight_provider));
+            log::info!("[grim] Loading Gemma-4 model with config: {:?}", gemma4_cfg);
+            let m = Gemma4::load_tp(device.clone(), &ws, gemma4_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Laguna => {
@@ -3300,6 +3663,10 @@ fn load_model_with_providers(
             } else {
                 tp
             };
+            let qwen_primary = qwen_devices
+                .first()
+                .cloned()
+                .unwrap_or_else(|| device.clone());
             let qwen35_cfg = Qwen35Config {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -3369,7 +3736,7 @@ fn load_model_with_providers(
                 "[grim] Loading Qwen3.5/3.8 model with config: {:?}",
                 qwen35_cfg
             );
-            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, qwen_tp)?;
+            let m = Qwen35::load_tp(qwen_primary, &ws, qwen35_cfg, qwen_tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -3449,7 +3816,7 @@ fn load_model_with_providers(
                     beta_fast: 32.0,
                     beta_slow: 1.0,
                     attention_factor: 1.277_258_9,
-            rope_mscale: None,
+                    rope_mscale: None,
                 }),
             };
             log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -4029,7 +4396,7 @@ fn load_model_with_providers(
             let m = Gpt2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Gemma | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+        ModelArchitecture::Gemma | ModelArchitecture::Gemma3 => {
             let cfg = GemmaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -4239,13 +4606,12 @@ fn load_model_with_providers(
             // attention logit is ~2x off.
             let rope_yarn = match lookup.get_str("xing4_0.rope.scaling.type") {
                 Some(t) if t.eq_ignore_ascii_case("yarn") => {
-                    let factor = lookup
-                        .get_f32("xing4_0.rope.scaling.factor")
-                        .unwrap_or(8.0);
+                    let factor = lookup.get_f32("xing4_0.rope.scaling.factor").unwrap_or(8.0);
                     if factor > 0.0 {
                         let original_max_pos = lookup
                             .get_u32("xing4_0.rope.scaling.original_context_length")
-                            .unwrap_or(4096) as usize;
+                            .unwrap_or(4096)
+                            as usize;
                         let beta_fast = lookup
                             .get_f32("xing4_0.rope.scaling.yarn_beta_fast")
                             .unwrap_or(32.0);
@@ -5044,8 +5410,8 @@ fn load_model_with_providers(
 
                 partial_rotary_factor: 1.0,
                 yarn: parse_yarn_scaling_gguf(&lookup),
-            norm_kind: norm_kind_for(model_arch),
-..Default::default()
+                norm_kind: norm_kind_for(model_arch),
+                ..Default::default()
             };
             log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
@@ -5068,8 +5434,7 @@ fn load_model_with_providers(
                     m.layers.len()
                 );
                 for layer in m.layers.iter_mut() {
-                    *layer =
-                        std::mem::replace(layer, layer.clone()).with_parallel_residual();
+                    *layer = std::mem::replace(layer, layer.clone()).with_parallel_residual();
                 }
             }
             // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
@@ -5623,6 +5988,577 @@ pub fn load_diffusion_model_from_path(
 mod tests {
     use super::*;
 
+    /// A metadata map shaped like the E4B GGUF's `gemma4.*` keys.
+    struct FakeGgufMeta {
+        u32s: Vec<(String, u32)>,
+        f32s: Vec<(String, f32)>,
+        bools: Vec<(String, Vec<bool>)>,
+    }
+
+    impl MetadataLookup for FakeGgufMeta {
+        fn get_str(&self, _key: &str) -> Option<String> {
+            None
+        }
+        fn get_u32(&self, key: &str) -> Option<u32> {
+            self.u32s.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
+        fn get_f32(&self, key: &str) -> Option<f32> {
+            self.f32s.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
+        fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+            self.bools
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// The E4B GGUF states the FULL-attention geometry under the plain keys
+    /// and the sliding-window geometry under the `_swa` keys; the loader has
+    /// to read both, or every sliding block gets a 512-wide head.
+    #[test]
+    fn gemma4_gguf_config_reads_both_attention_geometries() {
+        let mut pattern = vec![true; 42];
+        for il in [5usize, 11, 17, 23, 29, 35, 41] {
+            pattern[il] = false;
+        }
+        let meta = FakeGgufMeta {
+            u32s: vec![
+                ("gemma4.attention.key_length".into(), 512),
+                ("gemma4.attention.key_length_swa".into(), 256),
+                ("gemma4.attention.head_count".into(), 8),
+                ("gemma4.attention.head_count_kv".into(), 2),
+                ("gemma4.attention.sliding_window".into(), 512),
+                ("gemma4.attention.shared_kv_layers".into(), 18),
+                ("gemma4.embedding_length_per_layer_input".into(), 256),
+            ],
+            f32s: vec![
+                ("gemma4.rope.freq_base".into(), 1_000_000.0),
+                ("gemma4.rope.freq_base_swa".into(), 10_000.0),
+                ("gemma4.attention.layer_norm_rms_epsilon".into(), 1e-6),
+                ("gemma4.final_logit_softcapping".into(), 30.0),
+            ],
+            bools: vec![("gemma4.attention.sliding_window_pattern".into(), pattern)],
+        };
+        let hparams = grim_core::hyperparams::ArchHyperparameters {
+            vocab_size: 262144,
+            hidden_size: 2560,
+            num_layers: 42,
+            num_heads: 8,
+            num_kv_heads: 2,
+            head_dim: 512,
+            intermediate_size: 10240,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_seq_len: 131072,
+            ..Default::default()
+        };
+        let cfg = gemma4_config_from_gguf(&meta, &hparams, Some(64));
+        assert_eq!(cfg.head_dim, 256, "sliding blocks are 256-wide");
+        assert_eq!(cfg.head_dim_full, 512, "full blocks are 512-wide");
+        assert_eq!(cfg.rope_theta, 10_000.0, "sliding rope base");
+        assert_eq!(cfg.rope_theta_full, 1_000_000.0, "full rope base");
+        assert_eq!(cfg.sliding_window, 512);
+        assert_eq!(cfg.n_embd_per_layer, 256);
+        assert_eq!(cfg.num_kv_shared_layers, 18);
+        assert_eq!(cfg.final_logit_softcapping, Some(30.0));
+        assert_eq!(cfg.n_rot_pairs_full, 64, "the live rotary pairs");
+        // The pattern marks the sliding blocks; the full ones are every sixth.
+        assert_eq!(cfg.layer_type(5), Gemma4LayerType::Full);
+        assert_eq!(cfg.layer_type(4), Gemma4LayerType::Sliding);
+        // 42 blocks, 18 shared -> the KV-owning blocks are 0..24.
+        assert_eq!(cfg.n_layer_kv_from_start(), 24);
+        assert_eq!(cfg.kv_source(24), Some(22));
+        assert_eq!(cfg.kv_source(29), Some(23));
+    }
+
+    /// Gemma 4 nests the text stack under `text_config`; the loader has to
+    /// flatten it, or the model never sees `hidden_size` / `num_hidden_layers`.
+    #[test]
+    fn gemma4_hf_config_flattens_the_text_config() {
+        let json = r#"{
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "vision_config": {"hidden_size": 768},
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "num_hidden_layers": 35,
+                "vocab_size": 262144,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "intermediate_size": 6144,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 512,
+                "num_kv_shared_layers": 20,
+                "hidden_size_per_layer_input": 256,
+                "final_logit_softcapping": 30.0,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "rope_parameters": {
+                    "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
+                    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}
+                }
+            }
+        }"#;
+        let config = parse_safetensors_config(json).expect("config.json must parse");
+        assert_eq!(config.hidden_size, 1536, "the text stack's hidden size");
+        assert_eq!(config.num_hidden_layers, 35);
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.model_type.as_deref(), Some("gemma4"));
+
+        let cfg = gemma4_config_from_hf(&config);
+        assert_eq!(cfg.num_hidden_layers, 35);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.head_dim_full, 512);
+        assert_eq!(cfg.num_key_value_heads, 1);
+        assert_eq!(cfg.n_embd_per_layer, 256);
+        assert_eq!(cfg.num_kv_shared_layers, 20);
+        assert_eq!(cfg.rope_theta, 10_000.0);
+        assert_eq!(cfg.rope_theta_full, 1_000_000.0);
+        // 512-wide head, a quarter of it rotated -> 64 live pairs.
+        assert_eq!(cfg.n_rot_pairs_full, 64);
+        assert_eq!(cfg.final_logit_softcapping, Some(30.0));
+    }
+
+    /// The Gemma-4 safetensors path, end to end, on a SYNTHETIC checkpoint.
+    ///
+    /// The real E2B is 10.2 GB of bf16 - about 30 GB once the loader inflates
+    /// it to f32 - so "load it and see" is not a check anyone can afford on a
+    /// 60 GB host, and there is no oracle for it anyway (llama.cpp reads
+    /// GGUF, not safetensors). What the real file needs is a NAMES-and-SHAPES
+    /// check, and that is the header audit above.
+    ///
+    /// This gate covers what the header audit cannot: that the safetensors
+    /// provider, the `model.language_model.*` rewrite, the nested
+    /// `text_config`, the per-layer embedding path, the sliding/full head
+    /// widths, the shared-KV tail and the "double wide MLP" actually LOAD and
+    /// RUN. It is 3 blocks and a few hundred KB.
+    ///
+    /// The geometry is chosen to hit the awkward cases in one file:
+    ///   * block 1 is a FULL-attention block (head_dim 16 vs 8),
+    ///   * block 2 shares block 0's KV (the shared-KV tail), and
+    ///   * block 2 is DOUBLE WIDE (its FFN is 2x the others) - the rule that
+    ///     fires at the KV-share boundary.
+    #[test]
+    fn gemma4_safetensors_path_loads_and_runs()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        use grim_tensor::CoreTensorOps;
+
+        let hidden = 32usize;
+        let vocab = 64usize;
+        let n_pl = 8usize;
+        let n_layers = 3usize;
+        let n_heads = 2usize;
+        let n_kv = 1usize;
+        let head_swa = 8usize;
+        let head_full = 16usize;
+        let inter = 16usize;
+
+        // Deterministic pseudo-random weights, small enough not to overflow.
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 9) as f32 / 8_388_608.0) - 0.5
+        };
+
+        // (name, shape) in the checkpoint's own `model.language_model.*` layout.
+        let mut tensors: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut add = |name: String, shape: Vec<usize>| tensors.push((name, shape));
+        add(
+            "model.language_model.embed_tokens.weight".into(),
+            vec![vocab, hidden],
+        );
+        add(
+            "model.language_model.embed_tokens_per_layer.weight".into(),
+            vec![vocab, n_pl * n_layers],
+        );
+        add(
+            "model.language_model.per_layer_model_projection.weight".into(),
+            vec![n_pl * n_layers, hidden],
+        );
+        add(
+            "model.language_model.per_layer_projection_norm.weight".into(),
+            vec![n_pl],
+        );
+        add("model.language_model.norm.weight".into(), vec![hidden]);
+
+        let layer_types = ["sliding_attention", "full_attention", "sliding_attention"];
+        for (il, kind) in layer_types.iter().enumerate() {
+            let head_dim = if *kind == "full_attention" {
+                head_full
+            } else {
+                head_swa
+            };
+            let q_dim = n_heads * head_dim;
+            let kv_dim = n_kv * head_dim;
+            // The "double wide MLP" fires at the KV-share boundary: 3 blocks,
+            // 1 shared -> the split is at block 2, so block 2 is double wide.
+            let ffn = if il >= n_layers - 1 { inter * 2 } else { inter };
+            let p = format!("model.language_model.layers.{il}.");
+            add(format!("{p}input_layernorm.weight"), vec![hidden]);
+            add(format!("{p}post_attention_layernorm.weight"), vec![hidden]);
+            add(format!("{p}pre_feedforward_layernorm.weight"), vec![hidden]);
+            add(
+                format!("{p}post_feedforward_layernorm.weight"),
+                vec![hidden],
+            );
+            add(format!("{p}post_per_layer_input_norm.weight"), vec![hidden]);
+            // The checkpoint's own name: NO ".weight" suffix (the GGUF
+            // conversion adds one; the safetensors file does not have it).
+            add(format!("{p}layer_scalar"), vec![1]);
+            add(
+                format!("{p}per_layer_input_gate.weight"),
+                vec![n_pl, hidden],
+            );
+            add(
+                format!("{p}per_layer_projection.weight"),
+                vec![hidden, n_pl],
+            );
+            add(format!("{p}self_attn.q_proj.weight"), vec![q_dim, hidden]);
+            add(format!("{p}self_attn.k_proj.weight"), vec![kv_dim, hidden]);
+            add(format!("{p}self_attn.v_proj.weight"), vec![kv_dim, hidden]);
+            add(format!("{p}self_attn.o_proj.weight"), vec![hidden, q_dim]);
+            add(format!("{p}self_attn.q_norm.weight"), vec![head_dim]);
+            add(format!("{p}self_attn.k_norm.weight"), vec![head_dim]);
+            add(format!("{p}mlp.gate_proj.weight"), vec![ffn, hidden]);
+            add(format!("{p}mlp.up_proj.weight"), vec![ffn, hidden]);
+            add(format!("{p}mlp.down_proj.weight"), vec![hidden, ffn]);
+        }
+
+        // Write the file: u64 header length, the JSON index, then the data.
+        let mut header = String::from("{");
+        let mut data: Vec<u8> = Vec::new();
+        for (i, (name, shape)) in tensors.iter().enumerate() {
+            let n: usize = shape.iter().product();
+            let start = data.len();
+            for _ in 0..n {
+                data.extend_from_slice(&next().to_le_bytes());
+            }
+            if i > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                shape
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                start,
+                data.len()
+            ));
+        }
+        header.push('}');
+
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4-st-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let st_path = dir.join("model.safetensors");
+        {
+            let mut f = std::fs::File::create(&st_path).expect("create safetensors");
+            f.write_all(&(header.len() as u64).to_le_bytes())
+                .expect("header len");
+            f.write_all(header.as_bytes()).expect("header");
+            f.write_all(&data).expect("data");
+        }
+        // The config the loader reads: the text stack is NESTED.
+        let config = format!(
+            r#"{{
+  "architectures": ["Gemma4ForConditionalGeneration"],
+  "model_type": "gemma4",
+  "text_config": {{
+    "model_type": "gemma4_text",
+    "hidden_size": {hidden},
+    "num_hidden_layers": {n_layers},
+    "vocab_size": {vocab},
+    "num_attention_heads": {n_heads},
+    "num_key_value_heads": {n_kv},
+    "head_dim": {head_swa},
+    "global_head_dim": {head_full},
+    "intermediate_size": {inter},
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 512,
+    "num_kv_shared_layers": 1,
+    "hidden_size_per_layer_input": {n_pl},
+    "final_logit_softcapping": 30.0,
+    "layer_types": ["{a}", "{b}", "{c}"],
+    "rope_parameters": {{
+      "full_attention": {{"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0}},
+      "sliding_attention": {{"rope_type": "default", "rope_theta": 10000.0}}
+    }}
+  }}
+}}"#,
+            a = layer_types[0],
+            b = layer_types[1],
+            c = layer_types[2],
+        );
+        std::fs::write(dir.join("config.json"), config).expect("config.json");
+
+        let model = load_model_from_safetensors(st_path.to_str().unwrap(), Device::Cpu)
+            .expect("the Gemma-4 safetensors path must load");
+        assert_eq!(model.config().name(), "gemma4");
+
+        // A forward over three tokens: the logits must be finite and the right
+        // shape, and the tied head must produce the vocabulary width.
+        let mut session = model.new_session();
+        let ids = grim_tensor::Tensor::new(
+            std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                &[1.0f32, 2.0, 3.0],
+                &grim_tensor::Shape::new(vec![3]),
+                grim_tensor::dtype::DType::F32,
+            )?),
+            grim_tensor::Shape::new(vec![3]),
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            Device::Cpu,
+        );
+        let pos = grim_tensor::Tensor::new(
+            std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                &[0.0f32, 1.0, 2.0],
+                &grim_tensor::Shape::new(vec![3]),
+                grim_tensor::dtype::DType::F32,
+            )?),
+            grim_tensor::Shape::new(vec![3]),
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            Device::Cpu,
+        );
+        let logits = CausalLm::forward(&*model, &mut *session, &ids, &pos, &[]).expect("forward");
+        assert_eq!(logits.shape().dims(), &[3, vocab], "the logits' shape");
+        let lv = logits.to_vec_f32().expect("logits");
+        assert!(
+            lv.iter().all(|v| v.is_finite()),
+            "the safetensors forward produced a non-finite logit"
+        );
+        // The softcap bounds the logits to (-30, 30).
+        assert!(
+            lv.iter().all(|v| v.abs() <= 30.001),
+            "the final logit softcap was not applied"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// The Gemma-4 E2B safetensors checkpoint: every tensor the loader asks
+    /// for must EXIST in the file, with the shape the config implies.
+    ///
+    /// The full model is 10.2 GB of bf16 - about 30 GB once the loader
+    /// inflates it to f32 - so "load it and see" is not a cheap check, and on a
+    /// 60 GB host it is how you OOM the box. The safetensors HEADER is: it
+    /// carries every tensor's name, shape and dtype, and it is the part that
+    /// decides whether the name mapping and the per-layer geometry are right.
+    ///
+    /// What this pins down:
+    ///   * the `model.language_model.*` name rewrite,
+    ///   * the nested `text_config` (hidden 1536, 35 blocks, 1 KV head),
+    ///   * the sliding/full split (head_dim 256 vs 512) and its layer pattern,
+    ///   * the "double wide MLP" rule - blocks 0..14 are 6144 wide and blocks
+    ///     15..34 are 12288 wide, and the header is the authority.
+    #[test]
+    fn gemma4_e2b_safetensors_has_every_tensor_the_loader_asks_for() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+        let dir = root.join("models/gemma-4-E2B-it");
+        let st_path = dir.join("model.safetensors");
+        if !st_path.exists() {
+            eprintln!("[SKIP] {} not present", st_path.display());
+            return;
+        }
+
+        // The header only: no tensor data is read.
+        let file = std::fs::File::open(&st_path).expect("open safetensors");
+        let (index, _meta, _data_start) =
+            grim_format::safetensors::read_safetensors_header(file).expect("read header");
+
+        let config_str = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+        let config = parse_safetensors_config(&config_str).expect("config parses");
+        let cfg = gemma4_config_from_hf(&config);
+
+        assert_eq!(cfg.num_hidden_layers, 35, "E2B block count");
+        assert_eq!(cfg.hidden_size, 1536, "E2B hidden width");
+        assert_eq!(cfg.head_dim, 256, "sliding head width");
+        assert_eq!(cfg.head_dim_full, 512, "full head width");
+        assert_eq!(cfg.n_embd_per_layer, 256, "per-layer embedding width");
+        assert_eq!(cfg.num_kv_shared_layers, 20, "shared KV tail");
+
+        // Every name the loader requests, with the shape it must have.
+        let mut want: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut push = |name: &str, shape: Vec<usize>| {
+            want.push((gemma4_safetensors_name(name), shape));
+        };
+        push(
+            "model.embed_tokens.weight",
+            vec![cfg.vocab_size, cfg.hidden_size],
+        );
+        push(
+            "model.embed_tokens_per_layer.weight",
+            vec![cfg.vocab_size, cfg.n_embd_per_layer * cfg.num_hidden_layers],
+        );
+        push(
+            "model.per_layer_model_projection.weight",
+            vec![
+                cfg.n_embd_per_layer * cfg.num_hidden_layers,
+                cfg.hidden_size,
+            ],
+        );
+        push(
+            "model.per_layer_projection_norm.weight",
+            vec![cfg.n_embd_per_layer],
+        );
+        push("model.norm.weight", vec![cfg.hidden_size]);
+
+        for il in 0..cfg.num_hidden_layers {
+            let head_dim = cfg.layer_head_dim(il);
+            let n_kv = cfg.layer_num_kv_heads(il);
+            let q_dim = cfg.num_attention_heads * head_dim;
+            let kv_dim = n_kv * head_dim;
+            // The "double wide MLP": the tail blocks are twice as wide.
+            let ffn = if il >= cfg.n_layer_kv_from_start() {
+                cfg.intermediate_size * 2
+            } else {
+                cfg.intermediate_size
+            };
+            let p = format!("model.layers.{il}.");
+            push(&format!("{p}input_layernorm.weight"), vec![cfg.hidden_size]);
+            push(
+                &format!("{p}post_attention_layernorm.weight"),
+                vec![cfg.hidden_size],
+            );
+            push(
+                &format!("{p}pre_feedforward_layernorm.weight"),
+                vec![cfg.hidden_size],
+            );
+            push(
+                &format!("{p}post_feedforward_layernorm.weight"),
+                vec![cfg.hidden_size],
+            );
+            push(
+                &format!("{p}post_per_layer_input_norm.weight"),
+                vec![cfg.hidden_size],
+            );
+            // The checkpoint names it `layer_scalar`; the GGUF conversion
+            // appends ".weight". Either is acceptable.
+            push(&format!("{p}layer_scalar"), vec![1]);
+            push(
+                &format!("{p}per_layer_input_gate.weight"),
+                vec![cfg.n_embd_per_layer, cfg.hidden_size],
+            );
+            push(
+                &format!("{p}per_layer_projection.weight"),
+                vec![cfg.hidden_size, cfg.n_embd_per_layer],
+            );
+            push(
+                &format!("{p}self_attn.q_proj.weight"),
+                vec![q_dim, cfg.hidden_size],
+            );
+            push(
+                &format!("{p}self_attn.k_proj.weight"),
+                vec![kv_dim, cfg.hidden_size],
+            );
+            push(
+                &format!("{p}self_attn.v_proj.weight"),
+                vec![kv_dim, cfg.hidden_size],
+            );
+            push(
+                &format!("{p}self_attn.o_proj.weight"),
+                vec![cfg.hidden_size, q_dim],
+            );
+            push(&format!("{p}self_attn.q_norm.weight"), vec![head_dim]);
+            push(&format!("{p}self_attn.k_norm.weight"), vec![head_dim]);
+            push(
+                &format!("{p}mlp.gate_proj.weight"),
+                vec![ffn, cfg.hidden_size],
+            );
+            push(
+                &format!("{p}mlp.up_proj.weight"),
+                vec![ffn, cfg.hidden_size],
+            );
+            push(
+                &format!("{p}mlp.down_proj.weight"),
+                vec![cfg.hidden_size, ffn],
+            );
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut mismatched: Vec<String> = Vec::new();
+        for (name, shape) in &want {
+            // The GGUF conversion appends ".weight" to the checkpoint's
+            // `layer_scalar`, so either spelling is acceptable.
+            let found = index
+                .get(name)
+                .or_else(|| index.get(&format!("{name}.weight")));
+            match found {
+                None => missing.push(name.clone()),
+                Some(info) => {
+                    let got = info.shape();
+                    if got != *shape {
+                        mismatched.push(format!("{name}: want {shape:?}, file has {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the loader asks for {} tensors the file does not have: {missing:?}",
+            missing.len()
+        );
+        assert!(
+            mismatched.is_empty(),
+            "{} tensors have the wrong shape: {mismatched:?}",
+            mismatched.len()
+        );
+        eprintln!(
+            "[gemma4-e2b] {} tensors checked against the header, all present with the expected shape",
+            want.len()
+        );
+    }
+
+    /// The Gemma-4 checkpoint keeps its text stack under `model.language_model.*`;
+    /// the loader must ask for the plain `model.*` names and have the provider
+    /// rewrite them.
+    #[test]
+    fn gemma4_safetensors_names_point_at_the_language_model() {
+        assert_eq!(
+            gemma4_safetensors_name("model.embed_tokens.weight"),
+            "model.language_model.embed_tokens.weight"
+        );
+        assert_eq!(
+            gemma4_safetensors_name("model.embed_tokens_per_layer.weight"),
+            "model.language_model.embed_tokens_per_layer.weight"
+        );
+        assert_eq!(
+            gemma4_safetensors_name("model.per_layer_model_projection.weight"),
+            "model.language_model.per_layer_model_projection.weight"
+        );
+        assert_eq!(
+            gemma4_safetensors_name("model.norm.weight"),
+            "model.language_model.norm.weight"
+        );
+        assert_eq!(
+            gemma4_safetensors_name("model.layers.7.self_attn.q_proj.weight"),
+            "model.language_model.layers.7.self_attn.q_proj.weight"
+        );
+        // A name outside the text stack is left alone (the vision and audio
+        // towers are not the text model's business).
+        assert_eq!(
+            gemma4_safetensors_name("model.vision_tower.patch_embedder.input_proj.weight"),
+            "model.vision_tower.patch_embedder.input_proj.weight"
+        );
+    }
+
     /// PLAN-reduce-d2h-h2d A4: load-time MXFP4 decision is default-on with an
     /// opt-out escape hatch. No other test in this binary touches this var,
     /// so save/set/restore here is race-free in practice.
@@ -6037,5 +6973,26 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("GRIM_PLUGINS_DIR") };
         }
+    }
+
+    #[test]
+    fn test_sort_devices_by_bandwidth_pure() {
+        let mut devices = vec![Device::Rocm(0), Device::Rocm(1)];
+        // Ordinal 1 is faster (576 GB/s) than Ordinal 0 (288 GB/s)
+        let caps = vec![(0, 288.0f32), (1, 576.0f32)];
+        sort_devices_by_bandwidth(&mut devices, &caps);
+        assert_eq!(devices, vec![Device::Rocm(1), Device::Rocm(0)]);
+
+        // Equal bandwidth keeps original order
+        let mut devices_equal = vec![Device::Rocm(0), Device::Rocm(1)];
+        let caps_equal = vec![(0, 500.0f32), (1, 500.0f32)];
+        sort_devices_by_bandwidth(&mut devices_equal, &caps_equal);
+        assert_eq!(devices_equal, vec![Device::Rocm(0), Device::Rocm(1)]);
+
+        // Zero or non-finite bandwidth warns and preserves ordinal order
+        let mut devices_zero = vec![Device::Rocm(0), Device::Rocm(1)];
+        let caps_zero = vec![(0, 0.0f32), (1, 500.0f32)];
+        sort_devices_by_bandwidth(&mut devices_zero, &caps_zero);
+        assert_eq!(devices_zero, vec![Device::Rocm(0), Device::Rocm(1)]);
     }
 }

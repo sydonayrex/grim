@@ -55,7 +55,7 @@
 //! The accumulator cannot hold a scale, so `zeros` is what makes the two-dot
 //! identity hold: `sum_i (A_i * W_i) = d_a * d_b * (iacc - z_b * sum_qa)`.
 
-use crate::{dequant_gsq_rco_3p5, Error, Result};
+use crate::{Error, Result, dequant_gsq_rco_3p5};
 use grim_tensor::KQuantScheme;
 
 /// Weights per `sudot8` accumulator group. Matches the `V_DOT8_U32_U4`
@@ -65,6 +65,23 @@ pub const CITYCROW_GROUP: usize = 128;
 /// `u32` words per group in the u4 lane array: 128 codes at 8 per word
 /// (four bits each, low nibble first).
 pub const CITYCROW_WORDS_PER_GROUP: usize = CITYCROW_GROUP / 8;
+
+/// The VRAM a [`repack_to_u4_lanes`] blob occupies once resident on the device:
+/// [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros] — 24 B of
+/// length prefixes, one nibble per weight, one bf16 scale and one u8 zero per
+/// group. Convert-on-load (grim-backend-rocm `from_cpu_bytes`) swaps this in
+/// for the packed 2.25 bpw bytes, so every VRAM budget must charge THIS size
+/// for a GsqRco3p5 weight, not the packed one — charging packed is how the 27B
+/// planner concluded 10.4 GB of weights fit and then spilled 18.5 GB of lanes
+/// to host RAM.
+///
+/// Mirrors `DType::expected_bytes` for `Storage::W4A4OstQuant`; a test pins
+/// the two together.
+pub fn resident_blob_bytes(elem_count: usize) -> u64 {
+    let group = CITYCROW_GROUP.max(1) as u64;
+    let e = elem_count as u64;
+    24 + e.div_ceil(2) + e.div_ceil(group) * 3
+}
 
 /// Bumped whenever the repack changes meaning, so a cached conversion can
 /// never be served for different bytes. Mirrors `OSTQUANT_ENCODER_VERSION`.
@@ -247,7 +264,7 @@ pub fn repack_to_u4_lanes(
         other => {
             return Err(Error::Backend(format!(
                 "citycrow: unhandled scheme {other:?}"
-            )))
+            )));
         }
     };
 
@@ -781,7 +798,7 @@ mod tests {
         for g in 0..3 {
             for i in 0..CITYCROW_GROUP {
                 let frac = (i % 16) as f32 / 16.0; // [0, 15/16]
-                                                   // Positive values only, so every code is >= the zero point.
+                // Positive values only, so every code is >= the zero point.
                 flat.push(frac * amps[g]);
             }
         }
@@ -899,7 +916,7 @@ mod tests {
             // 16 distinct levels over one period, spanning [-1, +1].
             let level = (i % 16) as f32 / 16.0; // [0, 1)
             let mut v = level * 2.0 - 1.0; // [-1, 1)
-                                           // Pin both extremes so codes 0 (-1) and 3 (+1) are represented.
+            // Pin both extremes so codes 0 (-1) and 3 (+1) are represented.
             match i % 16 {
                 0 => v = -1.0,
                 8 => v = 1.0,

@@ -110,7 +110,7 @@ pub mod configs;
 pub mod dbrx;
 pub mod deci;
 pub mod decode_graph;
-pub use decode_graph::{llama_wrapper_graph_model, DecodeGraphModel};
+pub use decode_graph::{DecodeGraphModel, llama_wrapper_graph_model};
 pub mod deepseek;
 pub mod deepseek2;
 pub mod deepseek2ocr;
@@ -133,6 +133,7 @@ pub mod falcon_h1;
 pub mod gemma;
 pub mod gemma2;
 pub mod gemma3n;
+pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod gemma_embedding;
 pub mod gla;
@@ -242,8 +243,8 @@ pub use codeshell::{Codeshell, CodeshellConfig};
 pub use configs::{MoeConfig, PhiConfig, QwenConfig};
 pub use deepseek::{DeepSeek, DeepSeekConfig};
 pub use deepseek2::{DeepSeek2, DeepSeek2Config};
-pub use deepseek32::{DeepSeek32, DeepSeek32Config};
 pub use deepseek4::{DeepSeek4, DeepSeek4Config};
+pub use deepseek32::{DeepSeek32, DeepSeek32Config};
 pub use delta_net_base::{DeltaNetBase, DeltaNetBaseConfig};
 pub use diffusion_gemma::{DiffusionGemma, DiffusionGemmaConfig};
 pub use falcon::{Falcon, FalconConfig};
@@ -286,24 +287,25 @@ pub use arctic::{Arctic, ArcticConfig};
 pub use bitnet::{BitNet, BitNetConfig};
 pub use cohere2::{Cohere2, Cohere2Config};
 pub use cohere2moe::{Cohere2Moe, Cohere2MoeConfig};
-pub use ernie45::{Ernie45, Ernie45Config};
 pub use ernie4_5_moe::{Ernie45Moe, Ernie45MoeConfig};
+pub use ernie45::{Ernie45, Ernie45Config};
 pub use exaone::{Exaone, ExaoneConfig};
+pub use exaone_moe::{ExaoneMoe, ExaoneMoeConfig};
 pub use exaone4::{Exaone4, Exaone4Config};
 pub use exaone4_5::{Exaone45, Exaone45Config};
-pub use exaone_moe::{ExaoneMoe, ExaoneMoeConfig};
 pub use falcon_h1::{FalconH1Config, FalconH1LayerCache, FalconH1Model};
 pub use gemma::{Gemma, GemmaConfig};
+pub use gemma_embedding::{GemmaEmbedding, GemmaEmbeddingConfig};
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use gemma3n::{Gemma3n, Gemma3nConfig};
+pub use gemma4::{Gemma4, Gemma4Config, Gemma4LayerType, Gemma4ProportionalRope};
 pub use gemma4_assistant::{Gemma4Assistant, Gemma4AssistantConfig};
-pub use gemma_embedding::{GemmaEmbedding, GemmaEmbeddingConfig};
 pub use glm4::{Glm4, Glm4Config};
 pub use glm4_moe_lite::{Glm4MoeLite, Glm4MoeLiteConfig};
 pub use glm4moe::{Glm4Moe, Glm4MoeConfig};
 pub use glmdsa::{GlmDsa, GlmDsaConfig};
-pub use gpt2::{Gpt2, Gpt2Config};
 pub use gpt_oss::{GptOss, GptOssConfig};
+pub use gpt2::{Gpt2, Gpt2Config};
 pub use gptj::{GptJ, GptJConfig};
 pub use gptneox::{GptNeoX, GptNeoXConfig};
 pub use granite::{Granite, GraniteConfig};
@@ -342,11 +344,11 @@ pub use plm::{Plm, PlmConfig};
 pub use qwen2moe::{Qwen2Moe, Qwen2MoeConfig};
 pub use qwen2vl::{Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig};
 pub use qwen3::{Qwen3, Qwen3Config};
-pub use qwen35::{Qwen35, Qwen35Config};
-pub use qwen35moe::{Qwen35Moe, Qwen35MoeConfig};
 pub use qwen3next::{Qwen3Next, Qwen3NextConfig};
 pub use qwen3vl::{Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig};
 pub use qwen4exp_flash_next::{Qwen38FlashNext, Qwen38FlashNextConfig};
+pub use qwen35::{Qwen35, Qwen35Config};
+pub use qwen35moe::{Qwen35Moe, Qwen35MoeConfig};
 pub use refact::{Refact, RefactConfig};
 pub use rnd1::{Rnd1, Rnd1Config};
 pub use seed_oss::{SeedOss, SeedOssConfig};
@@ -356,7 +358,7 @@ pub use solar_open2::{SolarLayerType, SolarOpen2, SolarOpen2Block, SolarOpen2Con
 pub use stablelm::{StableLm, StableLmConfig};
 pub use starcoder::{Starcoder, StarcoderConfig};
 pub use step35::{Step35, Step35Config};
-pub use t5::{T5Config, T5};
+pub use t5::{T5, T5Config};
 pub use talkie::{Talkie, TalkieConfig};
 pub use wav_tokenizer_dec::{WavTokenizerDec, WavTokenizerDecConfig};
 pub use xing40::{Xing40, Xing40Config, Xing40HcGates, Xing40HyperConnection};
@@ -386,12 +388,12 @@ mod tests {
             has_norm_bias: false,
             has_attn_post_norm: false,
             use_parallel_residual: false,
-        has_output_bias: false,
+            has_output_bias: false,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32], grim_tensor::Shape::new(vec![1]));
-        use grim_core::session::Inner;
         use grim_core::CausalLm;
+        use grim_core::session::Inner;
         let mut sess = Inner::new(model.device.clone());
         let logits = CausalLm::forward(&model, &mut sess, &tok, &tok, &[]).unwrap();
         assert_eq!(logits.shape().dims(), &[1, 32000]);
@@ -422,7 +424,7 @@ mod tests {
             has_norm_bias: false,
             has_attn_post_norm: false,
             use_parallel_residual: false,
-        has_output_bias: false,
+            has_output_bias: false,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok =
@@ -534,7 +536,7 @@ mod tests {
     /// latents, and SSM states must never route into a GDL recurrence.
     #[test]
     fn gdl_eligibility_classification() {
-        use crate::{gdl_eligibility, GdlEligibility};
+        use crate::{GdlEligibility, gdl_eligibility};
         assert_eq!(gdl_eligibility("lfm2"), GdlEligibility::EligibleNative);
         for arch in ["solar_open2", "delta-net-base"] {
             assert_eq!(

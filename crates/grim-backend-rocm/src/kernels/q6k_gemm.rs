@@ -38,6 +38,39 @@ extern "C" {
         return d * (float)sc * ((float)q_code - 32.0f);
     }
 
+/// Gather rows out of a packed Q6_K embedding table, dequantizing on read
+/// (210 bytes / 256 weights).
+///
+/// Gemma 4's per-layer embedding table is Q6_K: 2.3 GB packed against 11.3 GB
+/// inflated to f32, and the inflated form does not fit beside the model on a
+/// 16 GB card - it lands in managed memory and the decode page-faults. The
+/// gather keeps the table packed and materializes only the rows the batch
+/// actually asks for.
+///
+/// Six parameters, like the other gather kernels: the launcher passes the row
+/// count so the kernel can bound-check the device-resident index (the host
+/// cannot read it back inside a captured graph without a sync).
+extern "C" __global__ void __launch_bounds__(256)
+grim_embedding_q6k_gather(
+    const unsigned char* packed, float* out, const int* indices,
+    int dim, int total, int rows)
+{
+    const int QK_BLOCK = 256;
+    const int QK_BLOCK_BYTES = 210;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int i = idx / dim;
+    int j = idx - i * dim;
+    int row = indices[i];
+    if (row < 0 || row >= rows) {
+        out[idx] = 0.0f;
+        return;
+    }
+    long long e = (long long)row * (long long)dim + (long long)j;
+    const unsigned char* blk = packed + (e / QK_BLOCK) * QK_BLOCK_BYTES;
+    out[idx] = dequant_q6k_element(blk, (int)(e % QK_BLOCK));
+}
+
     __global__ void grim_fused_dequant_gemm_q6k(
         const float* __restrict__ A,
         const unsigned char* __restrict__ B_q6k,

@@ -2,8 +2,8 @@
 //! writes into caller-provided storages and reads its gate vectors from
 //! device memory, so capture records pure kernel launches.
 
+use crate::device::util::{DeviceGuard, as_rocm};
 use crate::device::util::{arg, dev_ptr};
-use crate::device::util::{as_rocm, DeviceGuard};
 use crate::memory::storage::RocmStorage;
 use grim_tensor::backend::BackendStorage;
 use grim_tensor::error::Result;
@@ -41,7 +41,13 @@ impl crate::RocmDevice {
             self,
             "grim_hc_collapse_step",
             hidden.div_ceil(256) as u32,
-            &mut [arg(&mut sp), arg(&mut pp), arg(&mut op), arg(&mut h), arg(&mut n)]
+            &mut [
+                arg(&mut sp),
+                arg(&mut pp),
+                arg(&mut op),
+                arg(&mut h),
+                arg(&mut n)
+            ]
         );
         Ok(())
     }
@@ -131,7 +137,14 @@ impl crate::RocmDevice {
             self,
             "grim_xing_q_split",
             (nh * (nope + rope_d)).div_ceil(256) as u32,
-            &mut [arg(&mut qp), arg(&mut np), arg(&mut pp), arg(&mut h), arg(&mut n), arg(&mut r)]
+            &mut [
+                arg(&mut qp),
+                arg(&mut np),
+                arg(&mut pp),
+                arg(&mut h),
+                arg(&mut n),
+                arg(&mut r)
+            ]
         );
         Ok(())
     }
@@ -160,7 +173,14 @@ impl crate::RocmDevice {
             self,
             "grim_xing_q_absorb",
             (nh * rank).div_ceil(256) as u32,
-            &mut [arg(&mut qp), arg(&mut wp), arg(&mut op), arg(&mut h), arg(&mut r), arg(&mut n)]
+            &mut [
+                arg(&mut qp),
+                arg(&mut wp),
+                arg(&mut op),
+                arg(&mut h),
+                arg(&mut r),
+                arg(&mut n)
+            ]
         );
         Ok(())
     }
@@ -188,7 +208,13 @@ impl crate::RocmDevice {
             self,
             "grim_xing_pack_latent",
             (rank + rope_d).div_ceil(256) as u32,
-            &mut [arg(&mut cp), arg(&mut kp), arg(&mut op), arg(&mut r), arg(&mut d)]
+            &mut [
+                arg(&mut cp),
+                arg(&mut kp),
+                arg(&mut op),
+                arg(&mut r),
+                arg(&mut d)
+            ]
         );
         Ok(())
     }

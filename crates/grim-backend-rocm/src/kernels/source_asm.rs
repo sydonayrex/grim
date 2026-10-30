@@ -58,6 +58,9 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::wmma_iq_gemm::KERNEL_SOURCE);
     // SPEED-ROC: FP8 E4M3 WMMA GEMM — 383 TFLOPS on RDNA4 (2x FP16).
     s.push_str(crate::kernels::wmma_fp8_gemm::KERNEL_SOURCE);
+    // res0-T1-3: INT8 WMMA probe (rocwmma iu8, RDNA4). Probe launcher only —
+    // not in the dispatch.
+    s.push_str(crate::kernels::wmma_i8_gemm::WMMA_I8_KERNEL_SOURCE);
     s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::q4k_dequant::Q8_0_DEQUANT_SOURCE);
     // grim_dequant_q4k must ride in the same aggregate unit — without this
@@ -72,11 +75,14 @@ pub fn compute_kernel_source() -> String {
     // SPEED-ROC-8: LDS-tiled quant GEMMs (macro-stamped from the q4k tiling
     // skeleton). Must come after iq_gemm/q5k_gemm/q6k_gemm — the tiled
     // kernels call those files' dequant_* device helpers.
-    s.push_str(&crate::kernels::quant_tiled_gemm::tiled_quant_kernel_source());
+    //
+    // M7.2a: q2k_gemm and q3k_gemm must ALSO precede the tiled source,
+    // because the Q2_K and Q3_K tiled stamps call their dequant_* helpers.
     #[cfg(feature = "q2k")]
     s.push_str(crate::kernels::q2k_gemm::KERNEL_SOURCE);
     #[cfg(feature = "q3k")]
     s.push_str(crate::kernels::q3k_gemm::KERNEL_SOURCE);
+    s.push_str(&crate::kernels::quant_tiled_gemm::tiled_quant_kernel_source());
     s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);
     s.push_str(crate::kernels::fp8_gemm_rdna4::KERNEL_SOURCE);
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
@@ -267,6 +273,19 @@ mod source_asm_self_tests {
             assert_eq!(
                 count, 1,
                 "shared __device__ symbol defined {} times (expected 1): '{}'",
+                count, sym
+            );
+        }
+        // The Q6_K element decoder lives in `q6k_gemm.rs` (next to the gather
+        // kernel that uses it), not in the shared file. It still has to be
+        // unique in the ASSEMBLED source: a second copy is a redefinition
+        // error, and it only surfaces as a hipRTC compile error on whichever
+        // model happens to need it.
+        for sym in ["float dequant_q6k_element("] {
+            let count = src.matches(sym).count();
+            assert_eq!(
+                count, 1,
+                "__device__ symbol defined {} times (expected 1): '{}'",
                 count, sym
             );
         }

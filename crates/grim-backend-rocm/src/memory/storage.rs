@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use grim_tensor::backend::BackendStorage;
 use grim_tensor::dtype::KQuantScheme;
@@ -12,6 +13,43 @@ use crate::{
     DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, RocmDevice, Shape,
     check_hip, hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipSuccess,
 };
+
+/// BLOCKING device-to-host copies, process-wide.
+///
+/// A blocking D2H is a HOST ROUND-TRIP: it cannot complete until the device
+/// has finished everything queued before it, so every one of these drains the
+/// pipeline. That is the metric the res7 corpus's §9c finding is about ("any
+/// device-side chaining scheme that waits on completion at fine granularity
+/// serialises, and the drains multiply with the number of transfers per
+/// step"), and the metric the M7.0 A/B needs to name a speed difference's
+/// MECHANISM rather than infer it.
+///
+/// It is process-global for the same reason the wave-launch counter is: the
+/// copies happen on whichever storage the caller holds, and the question the
+/// A/B asks is "how many host round-trips did this step cost", which is a
+/// property of the step and not of one device.
+static BLOCKING_D2H_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Count one blocking device-to-host copy.
+///
+/// Called from every `hipMemcpy` with `DeviceToHost` on this backend, and
+/// from every `hipMemcpyAsync` with `DeviceToHost` that is immediately
+/// followed by a `hipStreamSynchronize` (an async copy the host then waits
+/// on is the same host round-trip as a blocking one). The count is what
+/// makes the drain visible; the copies themselves are unchanged.
+pub fn count_blocking_d2h() {
+    BLOCKING_D2H_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Blocking device-to-host copies since the last [`reset_blocking_d2h_count`].
+pub fn blocking_d2h_count() -> u64 {
+    BLOCKING_D2H_COUNTER.load(Ordering::Relaxed)
+}
+
+/// Reset the blocking-D2H counter to zero.
+pub fn reset_blocking_d2h_count() {
+    BLOCKING_D2H_COUNTER.store(0, Ordering::Relaxed);
+}
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
 #[derive(Debug)]
@@ -124,6 +162,15 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
+                let allow_managed = matches!(
+                    std::env::var("GRIM_ROCM_MANAGED_FALLBACK").as_deref(),
+                    Ok("allow" | "1" | "true" | "on")
+                );
+                if !allow_managed {
+                    return Err(Error::Backend(format!(
+                        "GRIM_ROCM_MANAGED_FALLBACK=deny (default): allocation of {bytes} bytes on rocm:{ordinal} denied: {vram_error}"
+                    )));
+                }
                 let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
@@ -432,6 +479,15 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
+                let allow_managed = matches!(
+                    std::env::var("GRIM_ROCM_MANAGED_FALLBACK").as_deref(),
+                    Ok("allow" | "1" | "true" | "on")
+                );
+                if !allow_managed {
+                    return Err(Error::Backend(format!(
+                        "GRIM_ROCM_MANAGED_FALLBACK=deny (default): allocation of {bytes} bytes on rocm:{ordinal} denied: {vram_error}"
+                    )));
+                }
                 let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
@@ -467,14 +523,17 @@ impl RocmStorage {
         // runs on the decode path where those bytes live only on the device.
         // Uploading is the one moment they are in host memory, so take the
         // hash here: it removes a full D2H plus the hashing (measured 2.5 s
-        // across 201 weights) from the first decode step.
+        // across 201 weights) from the first decode step. It is ALSO the
+        // identity the in-memory memo verifies on every hit (recycled device
+        // pointers), so every lane-served weight registers regardless of
+        // size — hashing kilobytes is negligible next to the upload itself.
         if let grim_tensor::Storage::KQuant(scheme) = dtype.storage {
             use grim_tensor::KQuantScheme as S;
             let lane_served = matches!(
                 scheme,
                 S::Q4K | S::Q5K | S::Q6K | S::Q3K | S::IQ3S | S::Q2K | S::IQ4NL | S::GsqRco3p5
             );
-            if lane_served && bytes >= 1024 * 1024 {
+            if lane_served {
                 crate::device::compute::gemm_launchers::register_weight_source_hash(
                     dev_ptr_void as u64,
                     bytes,
@@ -516,6 +575,8 @@ impl RocmStorage {
         let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut raw = vec![0u8; self.bytes];
+        // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+        count_blocking_d2h();
         check_hip("hipMemcpyDtoH raw bytes", unsafe {
             hipMemcpy(
                 raw.as_mut_ptr() as *mut c_void,
@@ -537,14 +598,12 @@ impl Drop for RocmStorage {
             if std::env::var("GRIM_ALLOC_AUDIT").as_deref() == Ok("1")
                 && RocmCachingAllocator::size_class_of(self.bytes) >= 16384
             {
-                static N: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 400 {
                     eprintln!(
                         "[drop-trace] #{n} ptr={ptr_val:#x} bytes={} managed={}",
-                        self.bytes,
-                        self.managed
+                        self.bytes, self.managed
                     );
                     eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
                 }
@@ -604,17 +663,16 @@ impl BackendStorage for RocmStorage {
         }
         let mut raw = vec![0u8; need as usize];
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        crate::check_hip(
-            "hipMemcpyDtoH (u32)",
-            unsafe {
-                hipMemcpy(
-                    raw.as_mut_ptr() as *mut c_void,
-                    dev_ptr_void,
-                    need as usize,
-                    crate::HipMemcpyKind::DeviceToHost,
-                )
-            },
-        )?;
+        // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+        count_blocking_d2h();
+        crate::check_hip("hipMemcpyDtoH (u32)", unsafe {
+            hipMemcpy(
+                raw.as_mut_ptr() as *mut c_void,
+                dev_ptr_void,
+                need as usize,
+                crate::HipMemcpyKind::DeviceToHost,
+            )
+        })?;
         Ok(raw
             .chunks_exact(4)
             .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
@@ -669,6 +727,8 @@ impl BackendStorage for RocmStorage {
             DTypeStorage::KQuant(_) | DTypeStorage::FloatPack(_)
         ) {
             let mut raw = vec![0u8; self.bytes];
+            // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+            count_blocking_d2h();
             check_hip("hipMemcpyDtoH (quantized/packed)", unsafe {
                 hipMemcpy(
                     raw.as_mut_ptr() as *mut c_void,
@@ -725,6 +785,8 @@ impl BackendStorage for RocmStorage {
         match self.dtype.arith {
             grim_tensor::ArithType::F16 => {
                 let mut raw = vec![0u8; elem_count * 2];
+                // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                count_blocking_d2h();
                 check_hip("hipMemcpyDtoH (f16)", unsafe {
                     hipMemcpy(
                         raw.as_mut_ptr() as *mut c_void,
@@ -741,6 +803,8 @@ impl BackendStorage for RocmStorage {
             }
             grim_tensor::ArithType::BF16 => {
                 let mut raw = vec![0u8; elem_count * 2];
+                // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                count_blocking_d2h();
                 check_hip("hipMemcpyDtoH (bf16)", unsafe {
                     hipMemcpy(
                         raw.as_mut_ptr() as *mut c_void,
@@ -756,6 +820,8 @@ impl BackendStorage for RocmStorage {
             }
             grim_tensor::ArithType::U8 => {
                 let mut raw = vec![0u8; elem_count];
+                // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                count_blocking_d2h();
                 check_hip("hipMemcpyDtoH (u8)", unsafe {
                     hipMemcpy(
                         raw.as_mut_ptr() as *mut c_void,
@@ -769,6 +835,8 @@ impl BackendStorage for RocmStorage {
             // F32 and integer types: direct memcpy into f32 buffer.
             _ => {
                 let mut host_data = vec![0.0f32; elem_count];
+                // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
+                count_blocking_d2h();
                 check_hip("hipMemcpyDtoH", unsafe {
                     hipMemcpy(
                         host_data.as_mut_ptr() as *mut c_void,

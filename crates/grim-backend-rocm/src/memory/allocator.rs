@@ -83,7 +83,9 @@ impl RocmCachingAllocator {
     }
 
     /// Round a byte size up to the next power of two. Class 0 is treated as 1 to [see: `hipMalloc`]
-    pub fn size_class_of(bytes: usize) -> usize { Self::size_class(bytes) }
+    pub fn size_class_of(bytes: usize) -> usize {
+        Self::size_class(bytes)
+    }
 
     /// Slab sub-allocation bounds (pool-disabled mode, small blocks only).
     const SLAB_SIZE: usize = 128 << 20;
@@ -110,6 +112,7 @@ impl RocmCachingAllocator {
 
     /// Allocate a device buffer of at least `bytes` usable bytes, reusing a pooled
     pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let cls = Self::size_class(bytes);
         // Pool disabled (the default): serve SMALL allocations from 128 MiB
         // slabs. gfx1200's hipMalloc commit granularity costs ~0.5 MB per
@@ -136,20 +139,22 @@ impl RocmCachingAllocator {
                 let (ptr, fresh_slab) = match bump_from {
                     Some((ptr, _size)) => (ptr, None),
                     None => {
-                        let _guard =
-                            crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                         let mut p: *mut c_void = std::ptr::null_mut();
-                        check_hip(
-                            "hipMalloc(slab)",
-                            unsafe { hipMalloc(&mut p, Self::SLAB_SIZE) },
-                        )?;
+                        check_hip("hipMalloc(slab)", unsafe {
+                            hipMalloc(&mut p, Self::SLAB_SIZE)
+                        })?;
                         drop(_guard);
                         self.malloc_count.fetch_add(1, Ordering::Relaxed);
                         (p as u64, Some(Self::SLAB_SIZE))
                     }
                 };
                 if let Some(size) = fresh_slab {
-                    slabs.push(Slab { base: ptr, size, bump: 0 });
+                    slabs.push(Slab {
+                        base: ptr,
+                        size,
+                        bump: 0,
+                    });
                 }
                 if let Some(s) = slabs.last_mut() {
                     s.bump += need;
@@ -193,6 +198,19 @@ impl RocmCachingAllocator {
                     let _ = crate::hipEventDestroy(entry.event);
                 }
             }
+            if let Some(val) = std::env::var("GRIM_POISON_ALLOC").ok() {
+                let byte = if val == "nan" || val == "0xff" || val == "255" {
+                    0xff
+                } else if let Ok(parsed) = val.parse::<u8>() {
+                    parsed
+                } else {
+                    0x00
+                };
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                unsafe {
+                    let _ = crate::hipMemset(entry.ptr as *mut c_void, byte as i32, cls);
+                }
+            }
             return Ok(entry.ptr as *mut c_void);
         }
 
@@ -200,7 +218,9 @@ impl RocmCachingAllocator {
         // Pin this allocator's ordinal - a pool miss from a drifted thread must not materialise.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
+        crate::device::util::report_rocm_progress("hipMalloc:in-flight");
         let res = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
+        crate::device::util::report_rocm_progress("hipMalloc:done");
         if res.is_err() {
             if std::env::var_os("GRIM_ALLOC_TRACE").is_some() {
                 eprintln!(
@@ -219,19 +239,21 @@ impl RocmCachingAllocator {
                 // did, this path just falls through to the error and the
                 // managed fallback as before.
                 if let Ok(mut slabs) = self.slabs.lock() {
-                    let _guard =
-                        crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                    let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                     let mut p: *mut c_void = std::ptr::null_mut();
-                    if check_hip(
-                        "hipMalloc(fragmentation slab)",
-                        unsafe { hipMalloc(&mut p, Self::SLAB_SIZE) },
-                    )
+                    if check_hip("hipMalloc(fragmentation slab)", unsafe {
+                        hipMalloc(&mut p, Self::SLAB_SIZE)
+                    })
                     .is_ok()
                     {
                         self.malloc_count.fetch_add(1, Ordering::Relaxed);
                         let base = p as u64;
                         let slot = cls.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN;
-                        slabs.push(Slab { base, size: Self::SLAB_SIZE, bump: slot });
+                        slabs.push(Slab {
+                            base,
+                            size: Self::SLAB_SIZE,
+                            bump: slot,
+                        });
                         self.audit_trace("FSLAB", base, slot);
                         self.audit_insert(base, slot);
                         return Ok(p);
@@ -252,7 +274,9 @@ impl RocmCachingAllocator {
     }
 
     fn audit_trace(&self, what: &str, ptr: u64, cls: usize) {
-        if !self.audit_on() || cls != 16384 { return; }
+        if !self.audit_on() || cls != 16384 {
+            return;
+        }
         eprintln!("[alloc-trace] {} {ptr:#x} c{cls} id{}", what, self.id);
     }
 
@@ -265,13 +289,20 @@ impl RocmCachingAllocator {
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = live.insert(ptr, cls) {
             if self.audit_on() {
-                eprintln!("[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})", self.id);
+                eprintln!(
+                    "[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})",
+                    self.id
+                );
             }
         }
         if self.audit_on() {
             let live_bytes: usize = live.values().sum();
             if live_bytes >= self.next_live_report.load(Ordering::Relaxed) {
-                eprintln!("[alloc-audit] live total: {:.2} GiB across {} blocks", live_bytes as f64 / (1 << 30) as f64, live.len());
+                eprintln!(
+                    "[alloc-audit] live total: {:.2} GiB across {} blocks",
+                    live_bytes as f64 / (1 << 30) as f64,
+                    live.len()
+                );
                 self.next_live_report.fetch_add(1 << 30, Ordering::Relaxed);
             }
         }
@@ -296,7 +327,10 @@ impl RocmCachingAllocator {
             }
             Some(c) if c != cls => {
                 if self.audit_on() {
-                    eprintln!("[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))", self.id);
+                    eprintln!(
+                        "[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))",
+                        self.id
+                    );
                 }
             }
             _ => {}
@@ -315,6 +349,7 @@ impl RocmCachingAllocator {
     /// the violations ([alloc-audit]/[alloc-trace]); GRIM_ALLOC_POOL=1 opts
     /// back into reuse for perf work once the duplicate-owner site is fixed.
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // Audit BEFORE any branch: the no-pool path returns below and the
         // live-set must still see the release, or every later handout of a
         // legitimately recycled driver address prints as phantom
@@ -330,8 +365,11 @@ impl RocmCachingAllocator {
                 .lock()
                 .map(|slabs| {
                     let p = ptr as u64;
-                    slabs.iter()
-                        .any(|s| p >= s.base && p + (bytes.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN) as u64 <= s.base + s.size as u64)
+                    slabs.iter().any(|s| {
+                        p >= s.base
+                            && p + (bytes.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN) as u64
+                                <= s.base + s.size as u64
+                    })
                 })
                 .unwrap_or(false)
         {
@@ -476,6 +514,13 @@ impl RocmCachingAllocator {
                         unsafe {
                             let _ = hipFree(s.base as *mut c_void);
                         }
+                        // A slab release IS a real driver free: the counter's
+                        // contract is "real driver calls since start", and
+                        // `empty_cache_releases_pooled_buffers` asserts on it.
+                        // Without this the count only moved for pool-class
+                        // buffers, so a device whose small allocations all went
+                        // to slabs reported "released nothing" while hipFreeing.
+                        self.free_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 *slabs = keep;

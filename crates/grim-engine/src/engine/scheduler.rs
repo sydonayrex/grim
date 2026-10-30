@@ -295,7 +295,15 @@ impl Engine {
         );
         if let Some((model_id, _)) = self.model_for_request(id) {
             let model_id = model_id.to_string();
-            let outcome = self.drive_forward(&model_id, id, &ids, &positions)?;
+            let is_terminal_chunk = target >= prompt_tokens;
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.set_skip_output_projection(!is_terminal_chunk);
+            }
+            let forward_res = self.drive_forward(&model_id, id, &ids, &positions);
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.set_skip_output_projection(false);
+            }
+            let outcome = forward_res?;
             // Record progress only after the forward succeeded — a failed
             // pass must retry the same chunk, not skip it.
             self.prefill_progress.insert(id, target);

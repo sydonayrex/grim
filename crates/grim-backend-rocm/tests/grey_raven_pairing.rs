@@ -53,12 +53,7 @@ fn up(dev: &RocmDevice, bytes: &[u8]) -> TestResult<Box<dyn grim_tensor::Backend
     .map_err(|e| format!("h2d: {e}").into())
 }
 
-fn run_mma(
-    dev: &RocmDevice,
-    a_bytes: &[u8],
-    b_bytes: &[u8],
-    sidx: u32,
-) -> TestResult<Vec<f32>> {
+fn run_mma(dev: &RocmDevice, a_bytes: &[u8], b_bytes: &[u8], sidx: u32) -> TestResult<Vec<f32>> {
     let a_t = up(dev, a_bytes)?;
     let b_t = up(dev, b_bytes)?;
     let c_t = MemoryOps::alloc_storage(
@@ -94,7 +89,8 @@ fn pow2_codes() -> [u8; 8] {
 }
 
 #[test]
-fn grey_raven_joint_pairing_sweep() -> TestResult {    let Some(dev) = gpu_device() else {
+fn grey_raven_joint_pairing_sweep() -> TestResult {
+    let Some(dev) = gpu_device() else {
         return Ok(());
     };
     let p2 = pow2_codes();
@@ -291,10 +287,8 @@ fn grey_raven_halves_disambiguation() -> TestResult {
             if !nz.is_empty() {
                 // Split C indices into halves (0-127 vs 128-255) to see
                 // whether residues differ by half.
-                let lo: Vec<(usize, u32)> =
-                    nz.iter().filter(|(i, _)| *i < 128).cloned().collect();
-                let hi: Vec<(usize, u32)> =
-                    nz.iter().filter(|(i, _)| *i >= 128).cloned().collect();
+                let lo: Vec<(usize, u32)> = nz.iter().filter(|(i, _)| *i < 128).cloned().collect();
+                let hi: Vec<(usize, u32)> = nz.iter().filter(|(i, _)| *i >= 128).cloned().collect();
                 println!("  p={p:>3} lo={lo:?} hi={hi:?}");
             }
         }

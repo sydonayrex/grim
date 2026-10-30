@@ -26,9 +26,14 @@
 //! Gated: `GRIM_GPU_TEST=1` + a real ROCm device.
 
 use grim_backend_rocm::RocmDevice;
-use grim_models_transformer::qwen35::{Qwen35Block, Qwen35Config, Qwen35LayerCache};
-use grim_nn::modules::{Linear, RmsNorm, pick_device_for_storage_device};
+use grim_models_transformer::decode_graph::DecodeGraphModel;
+use grim_models_transformer::qwen35::{Qwen35, Qwen35Block, Qwen35Config, Qwen35LayerCache};
+use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
+
+/// Process-global KV-format env vars; the f16 and int8 decode gates both set
+/// them, so they must not run concurrently in one test binary.
+static KV_FORMAT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const HEADS: usize = 4;
 const KV_HEADS: usize = 2;
@@ -65,6 +70,11 @@ fn w(i: usize, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `w` with a magnitude knob (see `build_block_scaled`).
+fn ws(i: usize, n: usize, scale: f32) -> Vec<f32> {
+    w(i, n).into_iter().map(|v| v * scale).collect()
+}
+
 fn to_dev(dev: &RocmDevice, data: &[f32], shape: Shape, device: &Device) -> Tensor {
     let st = CoreTensorOps::from_cpu(dev, data, &shape, DType::F32).expect("from_cpu");
     Tensor::new(
@@ -77,6 +87,15 @@ fn to_dev(dev: &RocmDevice, data: &[f32], shape: Shape, device: &Device) -> Tens
 }
 
 fn build_block(device: &Device, dev: Option<&RocmDevice>) -> Qwen35Block {
+    build_block_scaled(device, dev, 1.0)
+}
+
+/// `scale` multiplies every synthetic weight. The default generator spans
+/// [-0.5, 0.5], and on the decode path that compounds into K/V rows with
+/// amax ~15 — where an int8 code step (amax/127) is ~0.12, so a quantization
+/// gate cannot tell a structural bug from legitimate rounding. Shrinking the
+/// range separates the two.
+fn build_block_scaled(device: &Device, dev: Option<&RocmDevice>, scale: f32) -> Qwen35Block {
     let mk = |data: Vec<f32>, shape: Shape| -> Tensor {
         match dev {
             Some(d) => to_dev(d, &data, shape, device),
@@ -92,7 +111,7 @@ fn build_block(device: &Device, dev: Option<&RocmDevice>) -> Qwen35Block {
         num_kv_heads: KV_HEADS,
         head_dim: HEAD_DIM,
         is_full_attention: true,
-        attn_norm: RmsNorm::new(mk(w(1, HIDDEN), Shape::new(vec![HIDDEN])), 1e-6),
+        attn_norm: RmsNorm::new(mk(ws(1, HIDDEN, scale), Shape::new(vec![HIDDEN])), 1e-6),
         // attn_q is FUSED query + output gate at 2*q_dim.
         wq: Some(lin(
             w(2, 2 * q_dim() * HIDDEN),
@@ -111,11 +130,11 @@ fn build_block(device: &Device, dev: Option<&RocmDevice>) -> Qwen35Block {
             Shape::new(vec![HIDDEN, q_dim()]),
         )),
         attn_q_norm: Some(RmsNorm::new(
-            mk(w(6, HEAD_DIM), Shape::new(vec![HEAD_DIM])),
+            mk(ws(6, HEAD_DIM, scale), Shape::new(vec![HEAD_DIM])),
             1e-6,
         )),
         attn_k_norm: Some(RmsNorm::new(
-            mk(w(7, HEAD_DIM), Shape::new(vec![HEAD_DIM])),
+            mk(ws(7, HEAD_DIM, scale), Shape::new(vec![HEAD_DIM])),
             1e-6,
         )),
         attn_qkv: None,
@@ -135,17 +154,26 @@ fn build_block(device: &Device, dev: Option<&RocmDevice>) -> Qwen35Block {
         ssm_n_group_hint: 0,
         ssm_d_state_hint: 0,
         ssm_d_conv_hint: 0,
-        post_attention_norm: RmsNorm::new(mk(w(8, HIDDEN), Shape::new(vec![HIDDEN])), 1e-6),
+        post_attention_norm: RmsNorm::new(mk(ws(8, HIDDEN, scale), Shape::new(vec![HIDDEN])), 1e-6),
         ffn_gate: Linear::from_tensor(
-            mk(w(9, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])),
+            mk(
+                ws(9, INTER * HIDDEN, scale),
+                Shape::new(vec![INTER, HIDDEN]),
+            ),
             None,
         ),
         ffn_up: Linear::from_tensor(
-            mk(w(10, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])),
+            mk(
+                ws(10, INTER * HIDDEN, scale),
+                Shape::new(vec![INTER, HIDDEN]),
+            ),
             None,
         ),
         ffn_down: Linear::from_tensor(
-            mk(w(11, HIDDEN * INTER), Shape::new(vec![HIDDEN, INTER])),
+            mk(
+                ws(11, HIDDEN * INTER, scale),
+                Shape::new(vec![HIDDEN, INTER]),
+            ),
             None,
         ),
         rotary_dim: HEAD_DIM,
@@ -166,6 +194,27 @@ fn cfg() -> Qwen35Config {
     c.intermediate_size = INTER;
     c.full_attention_interval = 4;
     c
+}
+
+/// Max absolute difference normalized by the reference's own magnitude scale.
+///
+/// `worst_rel` divides per element, which explodes on outputs near zero: this
+/// block's synthetic weights drive outputs of O(40), so a near-zero element
+/// reports a "relative" error near 1.0 while being irrelevant. Normalizing by
+/// the reference scale is the standard measure and is what the KV-format gates
+/// use.
+fn worst_scaled(a: &[f32], b: &[f32]) -> (f32, usize, f32) {
+    let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+    let mut worst = 0.0f32;
+    let mut at = 0usize;
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let d = (x - y).abs();
+        if d > worst {
+            worst = d;
+            at = i;
+        }
+    }
+    (worst / scale, at, worst)
 }
 
 fn worst_rel(a: &[f32], b: &[f32]) -> (f32, usize) {
@@ -302,6 +351,14 @@ fn qwen35_attention_device_path_engages_and_matches_host() {
         assert!(e <= 1e-5, "device sigmoid wrong at {at}: {e:.3e}");
     }
 
+    // This gate compares the host reference against the device path, NOT KV
+    // formats: pin f32 so the device arena matches the host block's (Qwen35
+    // defaults ROCm arenas to f16 otherwise). Shares the format lock with the
+    // f16/int8 decode gates.
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+    }
     let mut cpu_cache = Qwen35LayerCache::new(&c);
     let mut gpu_cache = Qwen35LayerCache::new(&c);
     let mut cpu_last = Vec::new();
@@ -385,5 +442,1038 @@ fn qwen35_attention_device_path_engages_and_matches_host() {
     eprintln!(
         "[attn-d2d] {STEPS} chained steps match host (worst {:.2e}), arena {rows} rows",
         worst_rel(&cpu_last, &gpu_last).0
+    );
+}
+
+/// Phase-1 f16 arena gate: the same chained decode run with f16 KV arenas
+/// (`GRIM_F16_KV=1`) must match the f32 run within f16-rounding budget.
+/// Exercises eager alloc (dtype), append-convert, the f16kv attend kernel,
+/// and host-fallback reads end to end — plus an engagement proof that the
+/// arenas really are f16 (a test that silently runs f32 twice proves nothing).
+#[test]
+fn qwen35_f16_kv_decode_matches_f32() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+
+    // Serializes against `qwen35_i8_kv_decode_matches_f32`: both drive the
+    // process-global KV-format env vars.
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let run = |f16: bool| -> (Vec<Vec<f32>>, bool) {
+        unsafe {
+            std::env::set_var("GRIM_F16_KV", if f16 { "1" } else { "0" });
+            std::env::set_var("GRIM_KV_ARENA", if f16 { "f16" } else { "f32" });
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let out = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            outs.push(out);
+            // Mirror the model loop's own advance (qwen35.rs bumps
+            // `caches[i].current_pos += seq_len`). Calling the block directly
+            // skips it, and without it every step rewrites arena row 0.
+            cache.current_pos += 1;
+        }
+        let arenas_f16 = cache
+            .k_device
+            .as_ref()
+            .map(|s| s.as_ref().dtype().arith == grim_tensor::ArithType::F16)
+            .unwrap_or(false);
+        unsafe {
+            std::env::set_var("GRIM_F16_KV", "0");
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        (outs, arenas_f16)
+    };
+
+    let (out32, f16_32) = run(false);
+    let (out16, f16_16) = run(true);
+    assert!(
+        !f16_32,
+        "f32 run unexpectedly built f16 arenas (flag leak between runs?)"
+    );
+    assert!(
+        f16_16,
+        "f16 run built f32 arenas: the f16 eager path was not engaged, \
+         so this test would prove nothing"
+    );
+    for (step, (a, b)) in out32.iter().zip(out16.iter()).enumerate() {
+        assert!(
+            b.iter().all(|x| x.is_finite()),
+            "step {step}: f16 decode produced non-finite output (NaN class)"
+        );
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[f16k-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        // f16 unit roundoff (2^-11) amplified through exp+normalize and this
+        // block's unnormalized FFN (block outputs reach O(1e2)): measured
+        // 7.0e-4, 1.1e-3, 2.8e-3, 6.6e-4 across the four steps — non-monotonic,
+        // i.e. rounding rather than drift. Bar is 2x the observed max; the
+        // misread-row / NaN failures that bit this path earlier measured
+        // O(0.1-1.0+), far above it.
+        assert!(
+            e <= 6e-3,
+            "step {step}: f16-vs-f32 decode diverges: worst {e:.3e} at {at} \
+             (f32 {}, f16 {})",
+            a[at],
+            b[at]
+        );
+    }
+}
+
+/// Phase-2 int8 arena gate: a chained decode run with `GRIM_KV_ARENA=int8`
+/// (u8 codes + f32 per-(row,kv_head) scales) must match the f32 run within
+/// the int8 rounding budget. Exercises the device quantizer, the sidecar
+/// growth path, and the int8 attention kernel end to end — plus an
+/// engagement proof (sidecars present + u8 codes), so a test that silently
+/// ran f32 twice cannot pass.
+#[test]
+fn qwen35_i8_kv_decode_matches_f32() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let run = |format: &str| -> (Vec<Vec<f32>>, bool) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let out = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            outs.push(out);
+            // Mirror the model loop's own advance (qwen35.rs bumps
+            // `caches[i].current_pos += seq_len`). Calling the block directly
+            // skips it, and without it every step rewrites arena row 0.
+            cache.current_pos += 1;
+        }
+        let engaged = cache
+            .k_device
+            .as_ref()
+            .map(|s| s.as_ref().dtype().arith == grim_tensor::ArithType::U8)
+            .unwrap_or(false)
+            && cache.k_scales_device.is_some()
+            && cache.v_scales_device.is_some();
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        (outs, engaged)
+    };
+
+    let (out32, engaged32) = run("f32");
+    let (out8, engaged8) = run("int8");
+    assert!(
+        !engaged32,
+        "f32 run built int8 arenas (env leak between runs?)"
+    );
+    assert!(
+        engaged8,
+        "int8 run built no u8 codes + scales: the int8 eager path was not \\
+         engaged, so this test would prove nothing"
+    );
+    for (step, (a, b)) in out32.iter().zip(out8.iter()).enumerate() {
+        assert!(
+            b.iter().all(|x| x.is_finite()),
+            "step {step}: int8 decode produced non-finite output"
+        );
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[i8k-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        // int8 symmetric per-(token, kv_head) quantization. The block's V rows
+        // reach amax ~15.6, so a code step is 15.6/127 = 0.123; this block's
+        // FFN is unnormalized with O(1) weights over HIDDEN=256, so it
+        // amplifies that per-element error by ~1e3 into the block output.
+        // Measured 1.1e-2, 1.3e-2, 4.1e-2, 6.6e-2 — bar is ~4x that, because
+        // this metric cannot separate rounding from an FFN gain change.
+        //
+        // It is NOT the correctness gate for int8: the sidecar-offset bug this
+        // metric reported as 1.0 lived inside the old 8e-1 bar. Use
+        // `qwen35_i8_kv_arena_rows_match_f32_within_code_step` (arena-level,
+        // scale-normalized-free) plus the kernel gates for structure, and the
+        // 9B logprob/text run for end-to-end.
+        assert!(
+            e <= 3e-1,
+            "step {step}: int8-vs-f32 decode diverges: worst {e:.3e} at {at} \\
+             (f32 {}, int8 {})",
+            a[at],
+            b[at]
+        );
+    }
+}
+
+/// Phase-3 int4 arena gate: a chained decode run with `GRIM_KV_ARENA=int4`
+/// (packed u4 codes + f32 per-(row,kv_head) scales) must match the f32 run within
+/// the int4 rounding budget.
+#[test]
+fn qwen35_i4_kv_decode_matches_f32() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let run = |format: &str| -> (Vec<Vec<f32>>, bool) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let out = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            outs.push(out);
+            // Mirror the model loop's own advance (qwen35.rs bumps
+            // `caches[i].current_pos += seq_len`). Calling the block directly
+            // skips it, and without it every step rewrites arena row 0.
+            cache.current_pos += 1;
+        }
+        let engaged = cache
+            .k_device
+            .as_ref()
+            .map(|s| s.as_ref().dtype().arith == grim_tensor::ArithType::U8)
+            .unwrap_or(false)
+            && cache.k_scales_device.is_some()
+            && cache.v_scales_device.is_some();
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        (outs, engaged)
+    };
+
+    let (out32, engaged32) = run("f32");
+    let (out4, engaged4) = run("int4");
+    assert!(
+        !engaged32,
+        "f32 run built int4 arenas (env leak between runs?)"
+    );
+    assert!(
+        engaged4,
+        "int4 run built no u4 codes + scales: the int4 eager path was not engaged"
+    );
+    for (step, (a, b)) in out32.iter().zip(out4.iter()).enumerate() {
+        assert!(
+            b.iter().all(|x| x.is_finite()),
+            "step {step}: int4 decode produced non-finite output"
+        );
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[i4k-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        // 4-bit: 15 bins over amax ~15.6 gives a step of ~2.2 per element,
+        // amplified by the same unnormalized FFN. Measured 1.0e-1, 2.2e-1,
+        // 5.2e-1, 6.5e-1; bar is ~2.3x that. int4 shares the sidecar-offset
+        // path with int8, so the arena-level gate covers its append too.
+        assert!(
+            e <= 1.5,
+            "step {step}: int4-vs-f32 decode diverges: worst {e:.3e} at {at} (f32 {}, int4 {})",
+            a[at],
+            b[at]
+        );
+    }
+}
+
+/// Phase-2 eager append/sidecar gate, at the ARENA level.
+///
+/// The block-output comparison in `qwen35_i8_kv_decode_matches_f32` cannot
+/// separate a wrong append from legitimate rounding: this synthetic block's FFN
+/// has unbounded gain (block outputs reach O(100)), so a single quantization
+/// step of ~0.12 in V-space shows up as O(1) relative on the output. So compare
+/// the thing the append is actually responsible for — the stored K/V — row by
+/// row, against the f32 arena written by the same inputs:
+///
+///   * the scale sidecar entry for (row, kv_head) must equal that row's amax,
+///     which is only true if `scales_off` counts TOKEN rows and tracks the
+///     codes' row (the off-by-a-factor bug this gate was written for);
+///   * the dequantized codes must be within HALF a code step of the f32 row,
+///     i.e. the quantizer round-trips the values it was handed.
+/// int4's whole reason to exist is memory: at a fixed context it must cost
+/// HALF of int8 and a QUARTER of f16.
+///
+/// It did not. `kv_arena_dtype` gives Int4 the same U8 element as Int8, and the
+/// arena shape was expressed in (row, nkv, head_dim) ELEMENTS, so int4
+/// allocated one byte per element — exactly int8's footprint — while writing
+/// only two codes per byte. Choosing int4 therefore saved nothing over int8 and
+/// cost 10x its perplexity. This gate reads the LIVE arena's byte size off the
+/// real layer cache, so it measures the allocation rather than the intention.
+#[test]
+fn qwen35_int4_kv_arena_is_a_quarter_of_f16_and_half_of_int8() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let arena_bytes = |format: &str| -> usize {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let _ = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            cache.current_pos += 1;
+        }
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        let k = cache.k_device.as_ref().expect("k arena");
+        let v = cache.v_device.as_ref().expect("v arena");
+        let bytes = |s: &dyn grim_tensor::backend::BackendStorage| -> usize {
+            s.shape().elem_count() * s.dtype().expected_bytes(1)
+        };
+        bytes(k.as_ref()) + bytes(v.as_ref())
+    };
+
+    let f16_b = arena_bytes("f16");
+    let i8_b = arena_bytes("int8");
+    let i4_b = arena_bytes("int4");
+    eprintln!("[kv-arena-bytes] f16={f16_b} int8={i8_b} int4={i4_b}");
+    assert!(
+        f16_b > 0 && i8_b > 0 && i4_b > 0,
+        "an arena allocated nothing"
+    );
+    assert_eq!(
+        i8_b * 2,
+        f16_b,
+        "int8 must be half of f16 ({i8_b} vs {f16_b})"
+    );
+    assert_eq!(
+        i4_b * 2,
+        i8_b,
+        "int4 must be half of int8 ({i4_b} vs {i8_b}) — it is 2 codes per byte, \
+         and while this held it bought nothing over int8"
+    );
+}
+
+#[test]
+fn qwen35_i8_kv_arena_rows_match_f32_within_code_step() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let run = |format: &'static str| -> (Vec<Vec<f32>>, Option<(Vec<f32>, Vec<f32>)>) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x = w(30 + step, HIDDEN);
+            let out = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            outs.push(out);
+            cache.current_pos += 1;
+        }
+        // Snapshot the final arena. Both formats return (payload, scales) with
+        // the payload as f32: f32 rows verbatim, int8 codes widened from bytes.
+        let snap = if format == "int8" {
+            let codes: Vec<u32> = cache
+                .k_device
+                .as_ref()
+                .expect("k arena")
+                .to_cpu_vec_u32()
+                .expect("codes d2h");
+            let codes_f32: Vec<f32> = codes
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .map(|b| b as f32)
+                .collect();
+            let scales: Vec<f32> = cache
+                .k_scales_device
+                .as_ref()
+                .expect("k sidecar")
+                .to_cpu_vec_f32()
+                .expect("scales d2h");
+            Some((codes_f32, scales))
+        } else {
+            let rows: Vec<f32> = cache
+                .k_device
+                .as_ref()
+                .expect("k arena")
+                .to_cpu_vec_f32()
+                .expect("f32 arena");
+            Some((rows, Vec::new()))
+        };
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        (outs, snap)
+    };
+
+    let (_, f32_snap) = run("f32");
+    let (_, i8_snap) = run("int8");
+    let (f32_rows, _) = f32_snap.expect("f32 snapshot");
+    let (codes_f32, scales) = i8_snap.expect("int8 snapshot");
+
+    let nkv = c.num_kv_heads;
+    let hd = c.head_dim;
+    let stride = nkv * hd;
+    // The arenas are 3-D [rows, nkv, hd] and grow geometrically, so only the
+    // first STEPS rows carry data; the rest is untouched capacity.
+    let live = cache_rows(&f32_rows, nkv * hd).min(STEPS);
+    assert!(live > 0, "no arena rows written");
+
+    // Every row that the int8 sidecar claims a scale for must match that row's
+    // amax, and the codes in that row must dequantize back to the f32 row.
+    let mut checked_rows = 0usize;
+    for r in 0..live {
+        for kh in 0..nkv {
+            let sc = scales[r * nkv + kh];
+            let row = &f32_rows[r * stride + kh * hd..r * stride + (kh + 1) * hd];
+            let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if amax == 0.0 {
+                continue;
+            }
+            assert!(
+                (sc - amax).abs() <= amax * 1e-3 + 1e-6,
+                "row {r} kv_head {kh}: sidecar scale {sc:.6} != row amax {amax:.6} \
+                 (scales_off must track the codes' TOKEN row)"
+            );
+            let half_step = sc / 254.0;
+            for e in 0..hd {
+                let code = codes_f32[r * stride + kh * hd + e];
+                // Kernel convention (grim_kv_quantize_rows_i8 / all i8
+                // readers): q = round(v * 127/scale), stored as u8 q + 128, so
+                // dequant = (code - 128) / 127 * scale.
+                let deq = (code - 128.0) / 127.0 * sc;
+                let want = row[e];
+                assert!(
+                    (deq - want).abs() <= half_step + 1e-6,
+                    "row {r} kv_head {kh} elem {e}: dequantized {deq:.6} vs f32 {want:.6} \
+                     exceeds half a code step ({half_step:.6})"
+                );
+            }
+            checked_rows += 1;
+        }
+    }
+    eprintln!("[i8k-arena] verified {checked_rows} (row, kv_head) vectors across {live} rows");
+    assert_eq!(
+        checked_rows,
+        live * nkv,
+        "expected every written (row, kv_head) to carry a nonzero scale"
+    );
+}
+
+/// Live token rows in a flat [rows, nkv, hd] arena buffer.
+fn cache_rows(flat: &[f32], stride: usize) -> usize {
+    if stride == 0 { 0 } else { flat.len() / stride }
+}
+
+/// Phase-3 gate 1: a capacity that can hold the whole run must be a NO-OP.
+///
+/// The ring maps token `t` to arena row `t` for every `t < cap`, so with
+/// `cap >= STEPS` every write lands exactly where the uncapped run put it and
+/// the decode output must be BIT-IDENTICAL — not close, identical. This is the
+/// gate that proves the eviction plumbing added nothing to the default path.
+#[test]
+fn qwen35_kv_eviction_capacity_at_least_run_is_bit_identical() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let run = |rows: Option<&str>| -> Vec<Vec<f32>> {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+            match rows {
+                Some(r) => std::env::set_var("GRIM_KV_ARENA_ROWS", r),
+                None => std::env::remove_var("GRIM_KV_ARENA_ROWS"),
+            }
+            std::env::set_var("GRIM_KV_SINKS", "2");
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x = w(30 + step, HIDDEN);
+            outs.push(
+                blk.forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read"),
+            );
+            cache.current_pos += 1;
+        }
+        unsafe {
+            std::env::remove_var("GRIM_KV_ARENA_ROWS");
+            std::env::remove_var("GRIM_KV_SINKS");
+        }
+        outs
+    };
+
+    let baseline = run(None);
+    // cap == STEPS is the tightest sufficient capacity: token STEPS-1 is the
+    // last write and lands at its own row.
+    let capped = run(Some(&STEPS.to_string()));
+    for (step, (a, b)) in baseline.iter().zip(capped.iter()).enumerate() {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "step {step}: output length changed under eviction"
+        );
+        assert!(
+            a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "step {step}: a capacity of {STEPS} rows must be a bit-exact no-op \
+             (max diff {:e})",
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        );
+    }
+    eprintln!("[kv-evict] capacity={STEPS} is bit-identical to uncapped across {STEPS} steps");
+}
+
+/// Phase-3 gate 2: a capacity SMALLER than the run must evict — pins the sinks,
+/// keep the newest token, stay finite, and never silently run uncapped.
+///
+/// cap=3 / sinks=2 gives span=1, so rows 0,1 hold tokens 0,1 forever and row 2
+/// is overwritten by every token from 3 onward. The arena layout is therefore
+/// fully determined, which makes it checkable against the uncapped reference.
+#[test]
+fn qwen35_kv_eviction_smaller_capacity_evicts_and_pins_sinks() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let cap = 3usize;
+    let sinks = 2usize;
+    let steps = 6usize;
+    let stride = c.num_kv_heads * c.head_dim;
+
+    let run = |rows: Option<&str>| -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+            match rows {
+                Some(r) => std::env::set_var("GRIM_KV_ARENA_ROWS", r),
+                None => std::env::remove_var("GRIM_KV_ARENA_ROWS"),
+            }
+            std::env::set_var("GRIM_KV_SINKS", &sinks.to_string());
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..steps {
+            let x = w(30 + step, HIDDEN);
+            outs.push(
+                blk.forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read"),
+            );
+            cache.current_pos += 1;
+        }
+        let arena = cache
+            .k_device
+            .as_ref()
+            .expect("k arena")
+            .to_cpu_vec_f32()
+            .expect("d2h");
+        let arena_rows = cache_rows(&arena, stride).min(steps);
+        unsafe {
+            std::env::remove_var("GRIM_KV_ARENA_ROWS");
+            std::env::remove_var("GRIM_KV_SINKS");
+        }
+        (outs, Some(arena[..arena_rows * stride].to_vec()))
+    };
+
+    let (ref_outs, ref_arena) = run(None);
+    let ref_arena = ref_arena.expect("reference arena");
+    let (outs, arena) = run(Some(&cap.to_string()));
+    let arena = arena.expect("capped arena");
+
+    // 1. Sink rows are untouched: rows [0, sinks) must equal the reference's
+    //    token 0 and token 1 bit for bit. This is the attention-sink promise.
+    for r in 0..sinks {
+        for e in 0..stride {
+            assert_eq!(
+                arena[r * stride + e].to_bits(),
+                ref_arena[r * stride + e].to_bits(),
+                "sink row {r} elem {e} was overwritten: eviction lost the sink"
+            );
+        }
+    }
+    // 2. The ring row holds the NEWEST token that mapped to it (token steps-1).
+    for e in 0..stride {
+        assert_eq!(
+            arena[(cap - 1) * stride + e].to_bits(),
+            ref_arena[(steps - 1) * stride + e].to_bits(),
+            "ring row {} does not hold the newest token ({})",
+            cap - 1,
+            steps - 1
+        );
+    }
+    // 3. The evicted middle really is gone: row sinks-1... the token that
+    //    eviction removed must NOT still be present anywhere in the arena.
+    //    (row 2 can only hold one token; token 2 was written there then
+    //    overwritten by 3,4,5.)
+    assert_eq!(
+        arena.len(),
+        cap * stride,
+        "arena grew past the eviction capacity"
+    );
+    // 4. Every output step is finite, and output must have DIVERGED from the
+    //    uncapped run once eviction starts biting (otherwise the cap was not
+    //    engaged at all).
+    for (step, o) in outs.iter().enumerate() {
+        assert!(
+            o.iter().all(|v| v.is_finite()),
+            "step {step}: non-finite output"
+        );
+    }
+    let last_ref = &ref_outs[steps - 1];
+    let last_got = &outs[steps - 1];
+    let diff = last_ref
+        .iter()
+        .zip(last_got.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        diff > 0.0,
+        "a {cap}-row capacity over {steps} steps produced identical output to \
+         the uncapped run — eviction was never engaged"
+    );
+    eprintln!(
+        "[kv-evict] cap={cap} sinks={sinks} over {steps} steps: sinks pinned, \
+         ring row holds token {}, final-step diff {diff:.3e}",
+        steps - 1
+    );
+}
+
+/// Phase 4 CurDKV: verify CurDKV value-guided leverage score selection preserves sinks and top tokens.
+#[test]
+fn qwen35_curdkv_selection_preserves_sinks_and_ranks_tokens() {
+    let (n_tokens, d, budget, sinks) = (32usize, 64usize, 8usize, 2usize);
+    // Synthetic K and V matrices with an artificially important token at j=10
+    let mut k = vec![0.1f32; n_tokens * d];
+    let mut v = vec![0.1f32; n_tokens * d];
+
+    // Give token 10 high norm in both K and V
+    for i in 0..d {
+        k[10 * d + i] = 5.0f32;
+        v[10 * d + i] = 5.0f32;
+    }
+
+    let selected = grim_models_transformer::qwen35::KvEvictionPolicy::select_curdkv_indices(
+        &k, &v, n_tokens, d, budget, sinks,
+    );
+
+    assert_eq!(selected.len(), budget);
+    // Sinks must be present: 0 and 1
+    assert!(selected.contains(&0), "CurDKV must retain sink 0");
+    assert!(selected.contains(&1), "CurDKV must retain sink 1");
+    // High-importance token 10 must be retained
+    assert!(
+        selected.contains(&10),
+        "CurDKV must retain high leverage token 10"
+    );
+    eprintln!("[curdkv] selected indices: {:?}", selected);
+}
+
+/// WS-4.3: `GRIM_KV_EVICT_MODE=curdkv` must actually DRIVE the arena — the
+/// surviving rows are chosen by leverage score and gathered to the front, so
+/// the output must differ from the positional ring, the pinned sinks must
+/// survive, and the newest token must never be evicted (the residual window).
+///
+/// The last clause is the one that matters for decode correctness: the newest
+/// row is the context the current query was just computed against.
+#[test]
+fn qwen35_curdkv_mode_changes_output_and_keeps_sinks_and_newest() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let cap = 6usize;
+    let sinks = 1usize;
+    let residual = 1usize;
+    let steps = 12usize;
+    let stride = c.num_kv_heads * c.head_dim;
+
+    // `mode = None` is the uncapped reference (every token kept, no eviction).
+    let run = |mode: Option<&str>| -> (Vec<Vec<f32>>, Vec<f32>) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+            match mode {
+                Some(m) => {
+                    std::env::set_var("GRIM_KV_ARENA_ROWS", cap.to_string());
+                    std::env::set_var("GRIM_KV_SINKS", sinks.to_string());
+                    std::env::set_var("GRIM_KV_RESIDUAL", residual.to_string());
+                    std::env::set_var("GRIM_KV_EVICT_MODE", m);
+                }
+                None => {
+                    std::env::remove_var("GRIM_KV_ARENA_ROWS");
+                    std::env::remove_var("GRIM_KV_SINKS");
+                    std::env::remove_var("GRIM_KV_RESIDUAL");
+                    std::env::remove_var("GRIM_KV_EVICT_MODE");
+                }
+            }
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..steps {
+            let x = w(30 + step, HIDDEN);
+            outs.push(
+                blk.forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read"),
+            );
+            cache.current_pos += 1;
+        }
+        let arena = cache
+            .k_device
+            .as_ref()
+            .expect("k arena")
+            .to_cpu_vec_f32()
+            .expect("d2h");
+        let rows = cache_rows(&arena, stride).min(steps);
+        unsafe {
+            std::env::remove_var("GRIM_KV_ARENA_ROWS");
+            std::env::remove_var("GRIM_KV_SINKS");
+            std::env::remove_var("GRIM_KV_RESIDUAL");
+            std::env::remove_var("GRIM_KV_EVICT_MODE");
+        }
+        (outs, arena[..rows * stride].to_vec())
+    };
+
+    let (ref_outs, ref_arena) = run(None);
+    let (pos_outs, _pos_arena) = run(Some("positional"));
+    let (cur_outs, cur_arena) = run(Some("curdkv"));
+
+    // 1. THE KNOB IS WIRED. Byte-identical output would mean the mode never
+    //    reached the arena (the first-order gap this workstream closes).
+    let differs = pos_outs
+        .iter()
+        .zip(&cur_outs)
+        .any(|(a, b)| a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits()));
+    assert!(
+        differs,
+        "GRIM_KV_EVICT_MODE=curdkv produced byte-identical output to positional: the \
+         survivor selection is not reaching the arena"
+    );
+    assert!(
+        cur_outs.iter().flatten().all(|v| v.is_finite()),
+        "curdkv produced non-finite logits"
+    );
+
+    // 2. Sinks survive: arena row 0 is the reference's token 0, bit for bit.
+    for e in 0..stride {
+        assert_eq!(
+            cur_arena[e].to_bits(),
+            ref_arena[e].to_bits(),
+            "curdkv evicted the pinned sink at row 0 (elem {e})"
+        );
+    }
+
+    // 3. The residual window holds: the NEWEST token's K row is present in the
+    //    retained prefix. Without it the model would attend to a history that
+    //    excludes the context its own query was computed against.
+    let newest = &ref_arena[(steps - 1) * stride..steps * stride];
+    let retained_rows = cur_arena.len() / stride;
+    let newest_present = (0..retained_rows).any(|r| {
+        cur_arena[r * stride..(r + 1) * stride]
+            .iter()
+            .zip(newest)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    });
+    assert!(
+        newest_present,
+        "curdkv evicted the newest token: the residual window is not honored"
+    );
+    let _ = ref_outs;
+}
+
+/// WS-2a: does per-vector int8 KV fidelity DEGRADE as context grows?
+///
+/// KIVI's per-channel-K / per-token-V granularity exists to hold long-context
+/// fidelity. grim's int8 arena is per-(row, kv_head) for BOTH K and V, so the
+/// question that decides whether KIVI is worth its kernel+layout change is
+/// whether the per-vector scheme actually drifts with context. This measures
+/// the max-abs (and relative) divergence of the final-token output against the
+/// f32 arena at increasing context.
+#[test]
+fn qwen35_i8_kv_divergence_vs_context_length() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let run = |ctx: usize, arena: &str| -> Vec<f32> {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", arena);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut last = Vec::new();
+        for step in 0..ctx {
+            let x = w(30 + step, HIDDEN);
+            last = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            cache.current_pos += 1;
+        }
+        unsafe {
+            std::env::remove_var("GRIM_KV_ARENA");
+        }
+        last
+    };
+
+    let mut report = Vec::new();
+    for ctx in [16usize, 128, 512] {
+        let f32o = run(ctx, "f32");
+        let i8o = run(ctx, "int8");
+        let d = f32o
+            .iter()
+            .zip(&i8o)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let scale = f32o.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        report.push((ctx, d, d / scale));
+    }
+    for (ctx, d, rel) in &report {
+        eprintln!("[i8-ctx] ctx={ctx} max_abs={d:.6} rel={rel:.6}");
+    }
+    // A per-vector int8 arena is a QUANTIZATION: its relative divergence must
+    // stay bounded rather than grow with context. A blow-up here is what would
+    // justify KIVI's per-channel K / per-token V.
+    let worst = report.iter().map(|(_, _, r)| *r).fold(0.0f32, f32::max);
+    assert!(
+        worst < 0.5,
+        "per-vector int8 relative divergence {worst:.4} at long context — KIVI may be warranted"
+    );
+}
+
+/// WS-3A: `GRIM_KV_ARENA=int2v4` runs a real layer end to end.
+///
+/// The kernel-level parity tests gate the quantizer and the mixed-width
+/// attention in isolation; this is the end-to-end gate the plan asked for —
+/// the asymmetric format must build u8 codes + f32 scales for BOTH sides, run
+/// the block forward without faulting, and land near the f32 arena within the
+/// coarser 2-bit-K budget.
+#[test]
+fn qwen35_i2v4_kv_decode_matches_f32_within_budget() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let run = |format: &str| -> (Vec<Vec<f32>>, bool) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let out = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            outs.push(out);
+            cache.current_pos += 1;
+        }
+        let engaged = cache
+            .k_device
+            .as_ref()
+            .map(|s| s.as_ref().dtype().arith == grim_tensor::ArithType::U8)
+            .unwrap_or(false)
+            && cache.k_scales_device.is_some()
+            && cache.v_scales_device.is_some();
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        (outs, engaged)
+    };
+
+    let (out32, engaged32) = run("f32");
+    let (out_k2v4, engaged) = run("int2v4");
+    assert!(!engaged32, "f32 run built quantized arenas (env leak?)");
+    assert!(
+        engaged,
+        "int2v4 run built no u8 codes + scales: the K2V4 eager path was not engaged"
+    );
+    assert!(
+        out_k2v4.iter().flatten().all(|v| v.is_finite()),
+        "int2v4 produced non-finite output"
+    );
+
+    // This gate proves the PATH RUNS; it does not (and cannot) prove 2-bit K is
+    // accurate. The K side has only THREE levels, so on synthetic random
+    // weights its attention scores are close to noise and the output diverges
+    // from f32 by more than its own magnitude — that is a property of the
+    // REPRESENTATION, not of the kernels (whose fidelity is pinned separately by
+    // `k2v4_attend_matches_host_oracle` at rel < 3e-2 against an independent
+    // host oracle). What this test must catch is a wrong stride/width, which
+    // shows up as garbage or non-finite output.
+    let mut worst_rel = 0.0f32;
+    for (a, b) in out32.iter().zip(&out_k2v4) {
+        let d = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let s = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        worst_rel = worst_rel.max(d / s);
+    }
+    eprintln!("[i2v4-kv] worst_rel_vs_f32={worst_rel:.6} (2-bit K is deliberately coarse)");
+    assert!(
+        worst_rel < 5.0,
+        "int2v4 output is grossly corrupted ({worst_rel:.6}) — a wrong packing stride or \
+         width, not 2-bit coarseness"
+    );
+    // The representation must actually be in use: a byte-identical result would
+    // mean the arena fell through to another format.
+    let identical = out32
+        .iter()
+        .zip(&out_k2v4)
+        .all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    assert!(
+        !identical,
+        "int2v4 produced byte-identical output to f32: the format is not reaching the arena"
+    );
+}
+
+/// Build a tiny Qwen35 model with one attention block, for graph-capture tests.
+fn build_model(device: &Device, dev: Option<&RocmDevice>, c: &Qwen35Config) -> Qwen35 {
+    let mk = |data: Vec<f32>, shape: Shape| -> Tensor {
+        match dev {
+            Some(d) => to_dev(d, &data, shape, device),
+            None => grim_backend_cpu::cpu_tensor(data, shape),
+        }
+    };
+    let lin =
+        |data: Vec<f32>, shape: Shape| -> Linear { Linear::from_tensor(mk(data, shape), None) };
+    let vocab = 128_usize;
+    Qwen35 {
+        cfg: c.clone(),
+        device: device.clone(),
+        tok_embeddings: Embedding {
+            weight: mk(w(12, vocab * HIDDEN), Shape::new(vec![vocab, HIDDEN])),
+        },
+        blocks: vec![build_block(device, dev)],
+        output_norm: RmsNorm::new(mk(ws(13, HIDDEN, 1.0), Shape::new(vec![HIDDEN])), 1e-6),
+        output: lin(w(14, HIDDEN * vocab), Shape::new(vec![HIDDEN, vocab])),
+    }
+}
+
+/// The graph pool's int4 arena must be HALF of int8 one. The pool narrowed the
+/// f32 arena's shape with `kv_arena_dtype` and kept the element count, which
+/// gives 1 byte/element for every packed format — the same defect the eager
+/// arena had, one layer over.
+#[test]
+fn graph_int4_kv_arena_is_half_of_int8() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let arena_bytes = |format: &str| -> usize {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let model = build_model(&device, Some(dev.as_ref()), &c);
+        let graph = model
+            .get_or_create_decode_graph(128, 1)
+            .expect("graph capture");
+        let bytes = graph
+            .buffers
+            .k_arena
+            .iter()
+            .chain(graph.buffers.v_arena.iter())
+            .map(|a| a.bytes())
+            .sum();
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        bytes
+    };
+
+    let i8_b = arena_bytes("int8");
+    let i4_b = arena_bytes("int4");
+    eprintln!("[graph-kv-arena-bytes] int8={i8_b} int4={i4_b}");
+    assert!(i8_b > 0 && i4_b > 0, "an arena allocated nothing");
+    assert_eq!(
+        i4_b * 2,
+        i8_b,
+        "graph int4 arena must be half of int8 ({i4_b} vs {i8_b})"
     );
 }

@@ -93,9 +93,7 @@
 //! RUN: GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --test wmma_q4k_shape_bench -- --ignored --nocapture
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{
-    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage,
-};
+use grim_tensor::{ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -118,13 +116,9 @@ fn time_shape(dev: &RocmDevice, m: usize, n: usize, k: usize) -> (f64, f64, f64)
         arith: ArithType::F32,
         storage: Storage::KQuant(KQuantScheme::Q4K),
     };
-    let b_dev = MemoryOps::from_cpu_bytes(
-        dev,
-        &b_packed,
-        &Shape::new(vec![b_packed.len()]),
-        q_dtype,
-    )
-    .expect("upload packed B");
+    let b_dev =
+        MemoryOps::from_cpu_bytes(dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype)
+            .expect("upload packed B");
     let out = CoreTensorOps::zeros(dev, &Shape::new(vec![m, n]), DType::F32).expect("alloc out");
 
     let a = grim_backend_rocm::as_rocm(a_dev.as_ref()).expect("a rocm");
@@ -168,7 +162,10 @@ fn wmma_q4k_shape_sweep() {
     let k_fixed = 4096usize;
 
     eprintln!("\n[K sweep] n={n} m={m_fixed} (4 M-tiles)");
-    eprintln!("{:>6} {:>9} {:>8} {:>9} {:>14}", "K", "ms", "GFLOP/s", "GB/s", "ns/k-iter");
+    eprintln!(
+        "{:>6} {:>9} {:>8} {:>9} {:>14}",
+        "K", "ms", "GFLOP/s", "GB/s", "ns/k-iter"
+    );
     let mut k_pts = Vec::new();
     for k in [512usize, 1024, 2048, 4096] {
         let (ms, gb, gflop) = time_shape(&dev, m_fixed, n, k);
@@ -183,7 +180,10 @@ fn wmma_q4k_shape_sweep() {
     }
 
     eprintln!("\n[M sweep] n={n} k={k_fixed}");
-    eprintln!("{:>6} {:>7} {:>9} {:>8} {:>9} {:>14}", "M", "tiles", "ms", "GFLOP/s", "GB/s", "ms/M-tile");
+    eprintln!(
+        "{:>6} {:>7} {:>9} {:>8} {:>9} {:>14}",
+        "M", "tiles", "ms", "GFLOP/s", "GB/s", "ms/M-tile"
+    );
     let mut m_pts = Vec::new();
     for m in [16usize, 32, 64, 128, 256] {
         let (ms, gb, gflop) = time_shape(&dev, m, n, k_fixed);
@@ -203,7 +203,12 @@ fn wmma_q4k_shape_sweep() {
         let den: f64 = pts.iter().map(|(x, _)| x * x).sum();
         num / den
     };
-    let per_k = slope(&k_pts.iter().map(|(k, ms)| (k / 16.0, *ms)).collect::<Vec<_>>());
+    let per_k = slope(
+        &k_pts
+            .iter()
+            .map(|(k, ms)| (k / 16.0, *ms))
+            .collect::<Vec<_>>(),
+    );
     let per_m = slope(&m_pts);
     eprintln!(
         "\n[fit] {:.4} ms per k-iteration  |  {:.4} ms per M-tile",

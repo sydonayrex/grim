@@ -5,8 +5,8 @@ use std::ffi::c_void;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType};
-use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 use grim_tensor::error::{Error, Result};
+use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
@@ -30,7 +30,7 @@ impl RocmDevice {
         let n_q_blocks = k / 32;
         let total_blocks = (n_q_blocks * m) as u32;
         let grid_dim = HipDim3::new(total_blocks, 1, 1);
-        let block_dim = HipDim3::new(256, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
         let mut sptr = src_ptr;
         let mut dptr = dst_ptr;
         let mut kk = k as i32;
@@ -56,14 +56,13 @@ impl RocmDevice {
         // stream waits on it before its own launch. Correct under eager AND
         // capture (the wait becomes a DAG edge), on every arch, and removes
         // the host-side stall entirely.
-        let ev = self.q81_quant_event();
+        let ev = if self.active_capture_stream().is_some() {
+            std::ptr::null_mut()
+        } else {
+            self.q81_quant_event()
+        };
         if !ev.is_null() {
-            // `launch_compute_kernel` restores the caller's context on the way
-            // out, so the thread is back on whatever it was parked on here.
-            // `hipEventRecord` acts on the CURRENT device, and both the event
-            // and the stream belong to `self`.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            // SAFETY: ev created via hipEventCreate; handle is a live stream.
             unsafe { crate::hipEventRecord(ev, handle) };
         }
         Ok(handle)
@@ -101,13 +100,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // P1-1: wait for the quantize producer's event (no-op once complete).
-        let ev = self.q81_quant_event();
+        let ev = if self.active_capture_stream().is_some() {
+            std::ptr::null_mut()
+        } else {
+            self.q81_quant_event()
+        };
         if !ev.is_null() {
-            // The wait orders `self`'s stream against `self`'s event, so it must
-            // run with this device current — see the note in q81_quant_event.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            // SAFETY: ev is a live event; active_stream is the device's stream.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
         if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
@@ -127,6 +126,13 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv: out has no device ptr".into()))?;
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q80_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         let grid_x = (n as u32).div_ceil(4);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
@@ -137,7 +143,85 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
+            if v2 {
+                "grim_dot4_q80_q81_gemv_v2"
+            } else {
+                "grim_dot4_q80_q81_gemv"
+            },
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_dot4_q80_q81_gemv_v1_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_q81_gemv_v1: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv_v1: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv_v1: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut bptr, mut optr) = (a_ptr, b_ptr, out_ptr);
+        let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
+        self.launch_compute_kernel(
             "grim_dot4_q80_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_dot4_q80_q81_gemv_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_q81_gemv_v2: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv_v2: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv_v2: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut bptr, mut optr) = (a_ptr, b_ptr, out_ptr);
+        let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
+        self.launch_compute_kernel(
+            "grim_dot4_q80_q81_gemv_v2",
             grid_dim,
             block_dim,
             &mut [
@@ -227,11 +311,13 @@ impl RocmDevice {
                 "dot4_q80_q81_add_gemv: K must be 32-aligned (k={k})"
             )));
         }
-        let ev = self.q81_quant_event();
+        let ev = if self.active_capture_stream().is_some() {
+            std::ptr::null_mut()
+        } else {
+            self.q81_quant_event()
+        };
         if !ev.is_null() {
-            // See the note in q81_quant_event: both operands belong to `self`.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            // SAFETY: ev is a live event; the active stream is graph-capture safe.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
         let a_ptr = act_q81.device_ptr.ok_or_else(|| {
@@ -285,6 +371,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q80_F32ACT_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         let a_ptr = act_f32.device_ptr.ok_or_else(|| {
             Error::Backend("dot4_q80_f32act_gemv: act_f32 has no device ptr".into())
         })?;
@@ -304,7 +397,85 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
+            if v2 {
+                "grim_dot4_q80_f32act_gemv_v2"
+            } else {
+                "grim_dot4_q80_f32act_gemv"
+            },
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_dot4_q80_f32act_gemv_v1_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_gemv_v1: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv_v1: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_gemv_v1: out has no device ptr".into())
+        })?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut bptr, mut optr) = (a_ptr, b_ptr, out_ptr);
+        let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
+        self.launch_compute_kernel(
             "grim_dot4_q80_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_dot4_q80_f32act_gemv_v2_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_gemv_v2: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv_v2: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_gemv_v2: out has no device ptr".into())
+        })?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut bptr, mut optr) = (a_ptr, b_ptr, out_ptr);
+        let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
+        self.launch_compute_kernel(
+            "grim_dot4_q80_f32act_gemv_v2",
             grid_dim,
             block_dim,
             &mut [
@@ -336,6 +507,78 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_FOREST_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot4_forest_gemv_named(
+            if v2 {
+                "grim_dot4_forest_gemv_v2"
+            } else {
+                "grim_dot4_forest_gemv"
+            },
+            act_f32,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot4_forest_gemv_v1_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_forest_gemv_named(
+            "grim_dot4_forest_gemv",
+            act_f32,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot4_forest_gemv_v2_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_forest_gemv_named(
+            "grim_dot4_forest_gemv_v2",
+            act_f32,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_dot4_forest_gemv_named(
+        &self,
+        kernel_name: &str,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         if k % 32 != 0 || k == 0 {
             return Err(Error::Backend(format!(
                 "dot4_forest_gemv: K must be a nonzero multiple of 32 (block loop), got k={k}"
@@ -353,9 +596,9 @@ impl RocmDevice {
                 b_storage.bytes, want_bytes
             )));
         }
-        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
-            Error::Backend("dot4_forest_gemv: act_f32 has no device ptr".into())
-        })?;
+        let a_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_forest_gemv: act_f32 has no device ptr".into()))?;
         let b_ptr = b_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_forest_gemv: b has no device ptr".into()))?;
@@ -372,7 +615,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_forest_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
@@ -403,12 +646,11 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let blob = b_storage.copy_to_host().map_err(|e| {
-            Error::Backend(format!("forest fallback: blob download failed: {e}"))
-        })?;
-        let w = grim_quant::dequant_forest(&blob, n, k).map_err(|e| {
-            Error::Backend(format!("forest fallback: blob decode failed: {e}"))
-        })?;
+        let blob = b_storage
+            .copy_to_host()
+            .map_err(|e| Error::Backend(format!("forest fallback: blob download failed: {e}")))?;
+        let w = grim_quant::dequant_forest(&blob, n, k)
+            .map_err(|e| Error::Backend(format!("forest fallback: blob decode failed: {e}")))?;
         let b_f32 = CoreTensorOps::from_cpu(
             self,
             &w,
@@ -1243,8 +1485,80 @@ impl RocmDevice {
         self.launch_dot4_fp8_gemv(a_storage, b_storage, out_storage, m, n, k)
     }
 
+    pub fn launch_dot4_fp8_gemv_v1_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_fp8_gemv_named(
+            "grim_dot4_fp8_gemv",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot4_fp8_gemv_v2_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_fp8_gemv_named(
+            "grim_dot4_fp8_gemv_v2",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
     pub(crate) fn launch_dot4_fp8_gemv(
         &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_FP8_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot4_fp8_gemv_named(
+            if v2 {
+                "grim_dot4_fp8_gemv_v2"
+            } else {
+                "grim_dot4_fp8_gemv"
+            },
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_dot4_fp8_gemv_named(
+        &self,
+        kernel_name: &str,
         a_storage: &RocmStorage,
         b_storage: &RocmStorage,
         out_storage: &RocmStorage,
@@ -1271,7 +1585,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_fp8_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
@@ -1301,7 +1615,79 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv_fast",
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q2_K GEMV (`grim_dot4_q2k_q81_gemv_sub`).
+    pub fn launch_dot4_q2k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv_sub",
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q2_K GEMV v2 (`grim_dot4_q2k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q2k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv_sub_v2",
+        )
+    }
+
+    /// The STOCK Q2_K dot4 kernel, for A/B and as the parity oracle's
+    /// counterpart. It is NOT what the default dispatch runs.
+    pub fn launch_dot4_q2k_q81_gemv_stock_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q2k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q2k_q81_gemv",
+        )
     }
 
     pub(crate) fn launch_dot4_q2k_q81_gemv(
@@ -1312,6 +1698,49 @@ impl RocmDevice {
         m: usize,
         n: usize,
         k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q2K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q2K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fast = *FAST.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q2K_DOT4_FAST").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let kernel_name = if sub && sub_v2 {
+            "grim_dot4_q2k_q81_gemv_sub_v2"
+        } else if sub {
+            "grim_dot4_q2k_q81_gemv_sub"
+        } else if fast {
+            "grim_dot4_q2k_q81_gemv_fast"
+        } else {
+            "grim_dot4_q2k_q81_gemv"
+        };
+        self.launch_dot4_q2k_q81_gemv_with(act_q81, b_storage, out_storage, m, n, k, kernel_name)
+    }
+
+    fn launch_dot4_q2k_q81_gemv_with(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        kernel_name: &str,
     ) -> Result<*mut c_void> {
         let a_ptr = act_q81
             .device_ptr
@@ -1332,7 +1761,235 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q2k_q81_gemv",
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the IQ4_NL x Q8_1 dot4 GEMV kernel (`grim_dot4_iq4nl_q81_gemv`).
+    pub(crate) fn launch_dot4_iq4nl_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq4nl_q81_gemv: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4nl_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4nl_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_iq4nl_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Public A/B wrapper for IQ4_NL x Q8_1 dot4 GEMV.
+    pub fn launch_dot4_iq4nl_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4nl_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+    }
+
+    /// res8-T2: IQ4_XS x Q8_1 GEMV via sudot4 over the kvalues_iq4nl table.
+    /// A/B wrapper for the word-nibble FAST kernel. NOT the production
+    /// dispatch: the decode leg still routes IQ4_XS through the f32-act
+    /// `_grouped` fused kernel (103.9 GB/s at n=4096/k=5120 per the census)
+    /// until the A/B earns a default switch.
+    pub fn launch_dot4_iq4xs_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_fast",
+        )
+    }
+
+    /// res8-T2: the byte-wise STOCK IQ4_XS dot4 kernel — the fast kernel's
+    /// byte-identity oracle and A/B counterpart.
+    pub fn launch_dot4_iq4xs_q81_gemv_stock_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv",
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane IQ4_XS GEMV (`grim_dot4_iq4xs_q81_gemv_sub`).
+    pub fn launch_dot4_iq4xs_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub",
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane IQ4_XS GEMV v2 (`grim_dot4_iq4xs_q81_gemv_sub_v2`).
+    pub fn launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub_v2",
+        )
+    }
+
+    pub(crate) fn launch_dot4_iq4xs_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ4XS_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ4XS_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            if sub && sub_v2 {
+                "grim_dot4_iq4xs_q81_gemv_sub_v2"
+            } else if sub {
+                "grim_dot4_iq4xs_q81_gemv_sub"
+            } else {
+                "grim_dot4_iq4xs_q81_gemv_fast"
+            },
+        )
+    }
+
+    fn launch_dot4_iq4xs_q81_gemv_with(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        kernel_name: &str,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq4xs_q81_gemv: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
@@ -1362,7 +2019,80 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_fast",
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q3_K GEMV (`grim_dot4_q3k_q81_gemv_sub`).
+    pub fn launch_dot4_q3k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_sub",
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q3_K GEMV v2 (`grim_dot4_q3k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q3k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_sub_v2",
+        )
+    }
+
+    /// The STOCK Q3_K dot4 kernel (per-byte magnitude loads), kept as the
+    /// fast kernel's byte-identity oracle and A/B counterpart. NOT what the
+    /// default dispatch runs once the word-wide-mask variant is live.
+    pub fn launch_dot4_q3k_q81_gemv_stock_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv",
+        )
     }
 
     pub(crate) fn launch_dot4_q3k_q81_gemv(
@@ -1373,6 +2103,49 @@ impl RocmDevice {
         m: usize,
         n: usize,
         k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fast = *FAST.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_DOT4_FAST").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let kernel_name = if sub && sub_v2 {
+            "grim_dot4_q3k_q81_gemv_sub_v2"
+        } else if sub {
+            "grim_dot4_q3k_q81_gemv_sub"
+        } else if fast {
+            "grim_dot4_q3k_q81_gemv_fast"
+        } else {
+            "grim_dot4_q3k_q81_gemv"
+        };
+        self.launch_dot4_q3k_q81_gemv_with(act_q81, b_storage, out_storage, m, n, k, kernel_name)
+    }
+
+    fn launch_dot4_q3k_q81_gemv_with(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        kernel_name: &str,
     ) -> Result<*mut c_void> {
         let a_ptr = act_q81
             .device_ptr
@@ -1393,7 +2166,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q3k_q81_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
@@ -1467,28 +2240,34 @@ impl RocmDevice {
         // faster (86.4 vs 23.1 GB/s at N=K=4096). GRIM_DOT4_FAST=0 keeps the
         // stock kernel reachable as an escape hatch.
         let fast = *FAST.get_or_init(|| {
-            !matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("0" | "false" | "off"))
+            !matches!(
+                std::env::var("GRIM_DOT4_FAST").as_deref(),
+                Ok("0" | "false" | "off")
+            )
         });
-        let kernel_name = if fast {
-            "grim_dot4_q4k_q81_gemv_fast"
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q4K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q4K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let (kernel_name, cols_per_block): (&str, u32) = if sub && sub_v2 {
+            ("grim_dot4_q4k_q81_gemv_sub_v2", 4)
+        } else if sub {
+            ("grim_dot4_q4k_q81_gemv_sub", 4)
+        } else if fast {
+            ("grim_dot4_q4k_q81_gemv_fast", 2)
         } else {
-            "grim_dot4_q4k_q81_gemv"
+            ("grim_dot4_q4k_q81_gemv", 4)
         };
-        // The grid must follow the kernel that is actually launched. The two
-        // variants cover a different number of output columns per block --
-        // the stock kernel does `col_base = blockIdx.x * 4`, the fast one
-        // `blockIdx.x * 2` -- so a grid sized for the stock kernel launched
-        // against the fast one covers only half the columns and leaves the
-        // rest of C never written.
-        //
-        // That is not a subtle numerical bug, it is why the fast variant
-        // measured 1.0 relative error on gfx1200: the unwritten half of the
-        // output reads as whatever was in the buffer, not as a slightly wrong
-        // number. The grid used to be computed as `n.div_ceil(4)` before the
-        // kernel was chosen, so GRIM_DOT4_FAST=1 silently halved the output.
-        // A test that only checked the columns the kernel did write would
-        // never have seen it; dot4_q4k_arch_probe checks all of them.
-        let cols_per_block: u32 = if fast { 2 } else { 4 };
         let grid_x = (n as u32).div_ceil(cols_per_block);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
@@ -1529,11 +2308,131 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
     }
 
+    /// Dispatch entry. Step 2.1: defaults to the sub-block-per-lane kernel
+    /// (`grim_dot4_q5k_q81_gemv_sub`, 4-8x the stock kernel on gfx1200,
+    /// tolerance-gated by `q5k_sub_lane_parity_and_speed`).
+    /// `GRIM_Q5K_SUB=0` restores the stock kernel.
     pub(crate) fn launch_dot4_q5k_q81_gemv(
         &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q5K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q5K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot4_q5k_q81_gemv_named(
+            if sub && sub_v2 {
+                "grim_dot4_q5k_q81_gemv_sub_v2"
+            } else if sub {
+                "grim_dot4_q5k_q81_gemv_sub"
+            } else {
+                "grim_dot4_q5k_q81_gemv"
+            },
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// M7.2b: the RETAINED ORACLE for the Q5_K group hoist — the pre-change
+    /// kernel body, kept alive so the hoist can be gated on BYTE-IDENTICAL
+    /// output rather than a hand-written oracle. Not on any dispatch path;
+    /// only tests/dot4_q5k_grouped_parity.rs launches it.
+    pub fn launch_dot4_q5k_q81_gemv_ref_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv_ref",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q5_K GEMV (`grim_dot4_q5k_q81_gemv_sub`).
+    /// Same grid/block as the stock kernel. Not on a dispatch path until measured.
+    pub fn launch_dot4_q5k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv_sub",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q5_K GEMV v2 (`grim_dot4_q5k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q5k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv_named(
+            "grim_dot4_q5k_q81_gemv_sub_v2",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_dot4_q5k_q81_gemv_named(
+        &self,
+        kernel_name: &str,
         act_q81: &RocmStorage,
         b_storage: &RocmStorage,
         out_storage: &RocmStorage,
@@ -1560,7 +2459,275 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q5k_q81_gemv",
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// M7.2c: the Q4_K STOCK kernel (the pre-`_fast` 4-column variant) with
+    /// the group hoist applied. The default dispatch launches the `_fast`
+    /// 2-column variant, so the stock one is reached through this launcher
+    /// rather than through the GRIM_DOT4_FAST switch (whose OnceLock is
+    /// process-wide and would make the parity gate order-dependent).
+    pub fn launch_dot4_q4k_q81_gemv_stock_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_stock: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_stock: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_stock: out has no device ptr".into())
+        })?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// res0-T1-4 A/B launcher: the Q4_K DMMV variant (2 columns x ALL M
+    /// rows per workgroup, M <= 8, weight bytes read once instead of M
+    /// times). Grid (n/2, 1). NOT on any dispatch path.
+    pub fn launch_dot4_q4k_q81_gemv_dmmv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if m > 8 {
+            return Err(Error::Backend(format!(
+                "dot4_q4k_dmmv: M={m} > 8 exceeds the kernel's register contract"
+            )));
+        }
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_dmmv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_dmmv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_dmmv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(2), 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_dmmv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// M7.2c: the RETAINED ORACLE for the Q4_K group hoist — the pre-change
+    /// stock kernel body, kept alive so the hoist can be gated on
+    /// BYTE-IDENTICAL output rather than a hand-written oracle. It uses the
+    /// STOCK 4-column grid (the default dispatch launches the `_fast`
+    /// 2-column variant). Not on any dispatch path.
+    pub fn launch_dot4_q4k_q81_gemv_ref_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_ref: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_ref: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_ref: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_ref",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q4_K GEMV (`grim_dot4_q4k_q81_gemv_sub`).
+    pub fn launch_dot4_q4k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_sub: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv_sub: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_sub",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q4_K GEMV v2 (`grim_dot4_q4k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q4k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_sub_v2: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_sub_v2: b has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_sub_v2: out has no device ptr".into())
+        })?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_sub_v2",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// M7.2c: the RETAINED ORACLE for the Q6_K group hoist. Not on any
+    /// dispatch path; only the parity gate launches it.
+    pub fn launch_dot4_q6k_q81_gemv_ref_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q6k_q81_gemv_ref: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_ref: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_ref: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q6k_q81_gemv_ref",
             grid_dim,
             block_dim,
             &mut [
@@ -1590,11 +2757,102 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+        self.launch_dot4_q6k_q81_gemv_named(
+            "grim_dot4_q6k_q81_gemv",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
     }
 
     pub(crate) fn launch_dot4_q6k_q81_gemv(
         &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v2 = *SUB_V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q6K_SUB_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub = *SUB.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q6K_SUB").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot4_q6k_q81_gemv_named(
+            if sub && sub_v2 {
+                "grim_dot4_q6k_q81_gemv_sub_v2"
+            } else if sub {
+                "grim_dot4_q6k_q81_gemv_sub"
+            } else {
+                "grim_dot4_q6k_q81_gemv"
+            },
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.1 A/B: sub-block-per-lane Q6_K GEMV (`grim_dot4_q6k_q81_gemv_sub`).
+    pub fn launch_dot4_q6k_q81_gemv_sub_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q6k_q81_gemv_named(
+            "grim_dot4_q6k_q81_gemv_sub",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Step 2.2 (#1 + #2) A/B: sub-block-per-lane Q6_K GEMV v2 (`grim_dot4_q6k_q81_gemv_sub_v2`).
+    pub fn launch_dot4_q6k_q81_gemv_sub_v2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q6k_q81_gemv_named(
+            "grim_dot4_q6k_q81_gemv_sub_v2",
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_dot4_q6k_q81_gemv_named(
+        &self,
+        kernel_name: &str,
         act_q81: &RocmStorage,
         b_storage: &RocmStorage,
         out_storage: &RocmStorage,
@@ -1621,7 +2879,54 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q6k_q81_gemv",
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// M7.2h: Q6_K dot4 GEMV with f32 activations — exact path for the LM head.
+    ///
+    /// Like launch_dot4_q6k_q81_gemv but reads f32 activations directly
+    /// (no Q8_1 quantization). Not on any dispatch path; wired in via
+    /// launch_dot4_q6k_f32act_gemv_for_ab.
+    pub fn launch_dot4_q6k_f32act_gemv_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q6k_f32act_gemv: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_f32act_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_f32act_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q6k_f32act_gemv",
             grid_dim,
             block_dim,
             &mut [
@@ -1639,6 +2944,62 @@ impl RocmDevice {
     /// projection (lm_head). Replaces rocBLAS which is pathologically slow at M=1.
     pub(crate) fn launch_fp32_gemv(
         &self,
+        act: &dyn BackendStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_FP32_GEMV_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_fp32_gemv_named(
+            if v2 {
+                "grim_fp32_gemv_v2"
+            } else {
+                "grim_fp32_gemv"
+            },
+            act,
+            weight,
+            out,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_fp32_gemv_v1_for_ab(
+        &self,
+        act: &RocmStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fp32_gemv_named("grim_fp32_gemv", act, weight, out, m, n, k)
+    }
+
+    pub fn launch_fp32_gemv_v2_for_ab(
+        &self,
+        act: &RocmStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fp32_gemv_named("grim_fp32_gemv_v2", act, weight, out, m, n, k)
+    }
+
+    fn launch_fp32_gemv_named(
+        &self,
+        kernel_name: &str,
         act: &dyn BackendStorage,
         weight: &RocmStorage,
         out: &RocmStorage,
@@ -1665,7 +3026,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_fp32_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
@@ -1760,6 +3121,180 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+
+        // v5 is the SHIPPED kernel (bit-identical to v1/v2, predicated tail;
+        // truly cold the whole family sits at 96.8-98.4% of the 601 GB/s
+        // ceiling, so the routing choice is about warm behavior and code
+        // count, not cold GB/s). GRIM_WHITECROW_V2=1 keeps v2 reachable as
+        // the A/B arm; v1 remains the in-tree reference. v3/v4 were deleted:
+        // v3 because v5 is its strict superset, v4 because its lane-
+        // contiguous layout measured no cold benefit (see the true-cold bench).
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            matches!(std::env::var("GRIM_WHITECROW_V2").as_deref(), Ok("1" | "true" | "on"))
+        });
+        self.launch_dot8_w4a4_gemv_named(
+            if v2 {
+                "grim_dot8_w4a4_gemv_v2"
+            } else {
+                "grim_dot8_w4a4_gemv_v5"
+            },
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot8_w4a4_gemv_v1_for_ab(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot8_w4a4_gemv_named(
+            "grim_dot8_w4a4_gemv",
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+    /// v2 A/B launcher: kept as the rotation arm of the true-cold bench
+    /// (`corvid_w4a4_true_cold_ab`), reachable under GRIM_WHITECROW_V2=1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dot8_w4a4_gemv_v2_for_ab(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot8_w4a4_gemv_named(
+            "grim_dot8_w4a4_gemv_v2",
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// v5 A/B launcher: `grim_dot8_w4a4_gemv_v5` (v3 layout + predicated tail).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dot8_w4a4_gemv_v5_for_ab(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot8_w4a4_gemv_named(
+            "grim_dot8_w4a4_gemv_v5",
+            a_codes,
+            a_scales,
+            a_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// Harness probe: empty kernel (launch+sync floor). See
+    /// grim_empty_probe in kernels/dot_gemv.rs.
+    pub fn launch_empty_probe(&self) -> Result<()> {
+        self.launch_compute_kernel(
+            "grim_empty_probe",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(32, 1, 1),
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    /// Harness probe: read-only DRAM streaming ceiling over `words` u32 of
+    /// `src` (4 x uint4 per thread, coalesced). See grim_stream_read_probe.
+    pub fn launch_stream_read_probe(
+        &self,
+        src: &RocmStorage,
+        out: &RocmStorage,
+        words: usize,
+    ) -> Result<()> {
+        let src_ptr = src
+            .device_ptr
+            .ok_or_else(|| Error::Backend("stream_read_probe: src has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("stream_read_probe: out has no device ptr".into()))?;
+        let mut sp = src_ptr;
+        let mut op = out_ptr;
+        let mut w = words as i64;
+        let threads: u32 = 256;
+        let blocks = (words as u64).div_ceil((threads * 16) as u64) as u32;
+        self.launch_compute_kernel(
+            "grim_stream_read_probe",
+            HipDim3::new(blocks, 1, 1),
+            HipDim3::new(threads, 1, 1),
+            &mut [arg(&mut sp), arg(&mut op), arg(&mut w)],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_dot8_w4a4_gemv_named(
+        &self,
+        kernel: &str,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         let a_codes_ptr = a_codes
             .device_ptr
             .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: a_codes has no device ptr".into()))?;
@@ -1788,9 +3323,17 @@ impl RocmDevice {
             )));
         }
 
-        let grid_x = (n as u32).div_ceil(4);
+        let grid_x = if kernel == "grim_dot8_w4a4_gemv_v5" {
+            (n as u32).div_ceil(16)
+        } else {
+            (n as u32).div_ceil(4)
+        };
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = if kernel == "grim_dot8_w4a4_gemv_v5" {
+            HipDim3::new(128, 1, 1)
+        } else {
+            HipDim3::new(32, 1, 1)
+        };
 
         let mut a_c = a_codes_ptr;
         let mut a_s = a_scales_ptr;
@@ -1803,8 +3346,11 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
+        if kernel.starts_with("grim_dot8_w4a4_gemv_v") {
+            crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
+        }
         self.launch_compute_kernel(
-            "grim_dot8_w4a4_gemv",
+            kernel,
             grid_dim,
             block_dim,
             &mut [
@@ -1940,6 +3486,28 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_TREE_PIE_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            self.launch_tree_pie_gemv_v2_for_ab(act_f16, b_storage, out_storage, n, k)
+        } else {
+            self.launch_tree_pie_gemv_v1_for_ab(act_f16, b_storage, out_storage, n, k)
+        }
+    }
+
+    pub fn launch_tree_pie_gemv_v1_for_ab(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         if k % 32 != 0 {
             return Err(Error::Backend(format!(
                 "tree_pie_gemv: K={k} must be a multiple of 32 (TreePie packs 32 values per 5 words)"
@@ -1968,7 +3536,60 @@ impl RocmDevice {
             "grim_tree_pie_gemv",
             grid_dim,
             block_dim,
-            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut nn), arg(&mut kk)],
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_tree_pie_gemv_v2_for_ab(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "tree_pie_gemv: K={k} must be a multiple of 32 (TreePie packs 32 values per 5 words)"
+            )));
+        }
+        if n == 0 {
+            return Err(Error::Backend("tree_pie_gemv: N must be > 0".into()));
+        }
+        let a_ptr = act_f16
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: act_f16 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        crate::device::compute::kernel_infra::record_kernel_route("grim_tree_pie_gemv");
+        self.launch_compute_kernel(
+            "grim_tree_pie_gemv_v2",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 
@@ -1994,19 +3615,22 @@ impl RocmDevice {
             )));
         }
         if m == 0 || n == 0 {
-            return Err(Error::Backend("tree_pie_gemm: m and n must be non-zero".to_string()));
+            return Err(Error::Backend(
+                "tree_pie_gemm: m and n must be non-zero".to_string(),
+            ));
         }
         const TP_M_TILE: usize = 8;
         let b_ptr = b_storage
             .device_ptr_u64()
-            .ok_or_else(|| Error::Backend("tree_pie_gemm: b has no device ptr".into()))? as u64;
+            .ok_or_else(|| Error::Backend("tree_pie_gemm: b has no device ptr".into()))?
+            as u64;
         let b_ptr = b_ptr as *mut c_void;
         let a_ptr = act_f16.device_ptr.ok_or_else(|| {
             Error::Backend("tree_pie_gemm: activations have no device ptr".into())
         })?;
-        let o_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("tree_pie_gemm: out has no device ptr".into())
-        })?;
+        let o_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemm: out has no device ptr".into()))?;
 
         let (mut ap, mut bp, mut op) = (a_ptr, b_ptr, o_ptr);
         let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
@@ -2020,7 +3644,14 @@ impl RocmDevice {
             "grim_tree_pie_gemm",
             HipDim3::new(n as u32, tiles, 1),
             HipDim3::new(32, 1, 1),
-            &mut [arg(&mut ap), arg(&mut bp), arg(&mut op), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+            &mut [
+                arg(&mut ap),
+                arg(&mut bp),
+                arg(&mut op),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 
@@ -2037,6 +3668,56 @@ impl RocmDevice {
     ///
     /// Requires K % 8 == 0 (the ScrubJay block granularity).
     pub fn launch_scrub_jay_gemv(
+        &self,
+        a_storage: &RocmStorage,
+        b_sel: &RocmStorage,
+        b_idx: &RocmStorage,
+        b_sgn: &RocmStorage,
+        b_scl: &RocmStorage,
+        out_storage: &RocmStorage,
+        pre_scale: f32,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // Note: Benchmark shows ScrubJay v1 achieves higher bandwidth (~300-330 GB/s)
+        // due to lower VGPR footprint in the 16-way codebook lookup loop. Default is v1;
+        // set GRIM_SCRUB_JAY_V2=1 to enable the 4-column batched v2.
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            matches!(
+                std::env::var("GRIM_SCRUB_JAY_V2").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        });
+        if v2 {
+            self.launch_scrub_jay_gemv_v2_for_ab(
+                a_storage,
+                b_sel,
+                b_idx,
+                b_sgn,
+                b_scl,
+                out_storage,
+                pre_scale,
+                n,
+                k,
+            )
+        } else {
+            self.launch_scrub_jay_gemv_v1_for_ab(
+                a_storage,
+                b_sel,
+                b_idx,
+                b_sgn,
+                b_scl,
+                out_storage,
+                pre_scale,
+                n,
+                k,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scrub_jay_gemv_v1_for_ab(
         &self,
         a_storage: &RocmStorage,
         b_sel: &RocmStorage,
@@ -2103,6 +3784,75 @@ impl RocmDevice {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scrub_jay_gemv_v2_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_sel: &RocmStorage,
+        b_idx: &RocmStorage,
+        b_sgn: &RocmStorage,
+        b_scl: &RocmStorage,
+        out_storage: &RocmStorage,
+        pre_scale: f32,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 8 != 0 {
+            return Err(Error::Backend(format!(
+                "scrub_jay_gemv: K={k} must be a multiple of 8 (ScrubJay blocks are 8 values)"
+            )));
+        }
+        if n == 0 {
+            return Err(Error::Backend("scrub_jay_gemv: N must be > 0".into()));
+        }
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: a has no device ptr".into()))?;
+        let sel_ptr = b_sel
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sel has no device ptr".into()))?;
+        let idx_ptr = b_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_idx has no device ptr".into()))?;
+        let sgn_ptr = b_sgn
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sgn has no device ptr".into()))?;
+        let scl_ptr = b_scl
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_scl has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut selp = sel_ptr;
+        let mut idxp = idx_ptr;
+        let mut sgnp = sgn_ptr;
+        let mut sclp = scl_ptr;
+        let mut pre = pre_scale;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        crate::device::compute::kernel_infra::record_kernel_route("grim_scrub_jay_gemv");
+        self.launch_compute_kernel(
+            "grim_scrub_jay_gemv_v2",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut selp),
+                arg(&mut idxp),
+                arg(&mut sgnp),
+                arg(&mut sclp),
+                arg(&mut pre),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Prefill/batched tiled ScrubJay GEMM (M > 1).
     pub fn launch_scrub_jay_gemm_tiled(
         &self,
@@ -2123,23 +3873,25 @@ impl RocmDevice {
             )));
         }
         if m == 0 || n == 0 {
-            return Err(Error::Backend("scrub_jay_gemm_tiled: M and N must be > 0".into()));
+            return Err(Error::Backend(
+                "scrub_jay_gemm_tiled: M and N must be > 0".into(),
+            ));
         }
         let a_ptr = a_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: a has no device ptr".into()))?;
-        let sel_ptr = b_sel
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_sel has no device ptr".into()))?;
-        let idx_ptr = b_idx
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_idx has no device ptr".into()))?;
-        let sgn_ptr = b_sgn
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_sgn has no device ptr".into()))?;
-        let scl_ptr = b_scl
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_scl has no device ptr".into()))?;
+        let sel_ptr = b_sel.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_sel has no device ptr".into())
+        })?;
+        let idx_ptr = b_idx.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_idx has no device ptr".into())
+        })?;
+        let sgn_ptr = b_sgn.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_sgn has no device ptr".into())
+        })?;
+        let scl_ptr = b_scl.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_scl has no device ptr".into())
+        })?;
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: out has no device ptr".into()))?;
@@ -2188,6 +3940,78 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_BF16_GEMV_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        self.launch_dot2_bf16_gemv_named(
+            if v2 {
+                "grim_dot2_bf16_gemv_v2"
+            } else {
+                "grim_dot2_bf16_gemv"
+            },
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot2_bf16_gemv_v1_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot2_bf16_gemv_named(
+            "grim_dot2_bf16_gemv",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_dot2_bf16_gemv_v2_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot2_bf16_gemv_named(
+            "grim_dot2_bf16_gemv_v2",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_dot2_bf16_gemv_named(
+        &self,
+        kernel_name: &str,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         let a_ptr = a_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot2_bf16_gemv: a has no device ptr".into()))?;
@@ -2207,7 +4031,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot2_bf16_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [

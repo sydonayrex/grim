@@ -6,7 +6,7 @@
 /// HIP source for the ScytheRing persistent dispatch kernel.
 /// The kernel is launched ONCE per persistent wave (one wave per CU typically) and runs.
 pub const KERNEL_SOURCE: &str = r#"
-// Device-side mirrors of the Rust ScytheTaskDescriptor / MoETaskDescriptor (grim_engine::scythe2).
+// Device-side mirrors of the Rust ScytheTaskDescriptor / MoETaskDescriptor (crate::scythe_task_descriptors).
 // #[repr(C, align(32))] on the Rust side; the device matches that layout exactly so the host-written.
 struct __align__(32) scythe_task_descriptor_t {
     unsigned int opcode;     // 0=nop,1=col-GEMM,2=row-GEMM,3=attn,4=norm,5=CommFuse,6=MoE,7=add
@@ -45,6 +45,35 @@ struct __align__(32) moe_task_descriptor_t {
     unsigned long long weights_ptr;
 };
 
+// M5 RECURRENT: the device-resident descriptor the wave's OP_RECURRENT arm casts
+// `desc->weight_ptr` to. It mirrors the Rust `KdaTaskDescriptor` field-for-field
+// (repr(C), u64 x 14 then u32 x 6, f32, u32 = 144 bytes). Layout parity is
+// pinned by `kda_task_descriptor_layout_matches_host`.
+struct __align__(32) kda_task_descriptor_t {
+    unsigned long long conv_in;
+    unsigned long long conv_w;
+    unsigned long long conv_bias;
+    unsigned long long conv_state;
+    unsigned long long conv_out;
+    unsigned long long alpha;
+    unsigned long long beta;
+    unsigned long long dt_bias;
+    unsigned long long ssm_a;
+    unsigned long long ssm_norm;
+    unsigned long long gate;
+    unsigned long long state;
+    unsigned long long acc;
+    unsigned long long branch;
+    unsigned int num_v;
+    unsigned int num_k;
+    unsigned int head_dim;
+    unsigned int batch;
+    unsigned int channels;
+    unsigned int kernel_size;
+    float eps;
+    unsigned int has_z;
+};
+
 // Opcodes (mirror grim_engine::scythe2 doc comment).
 #define OP_NOP        0u
 #define OP_COL_GEMM   1u
@@ -53,10 +82,23 @@ struct __align__(32) moe_task_descriptor_t {
 #define OP_NORM       4u
 #define OP_COMMFUSE   5u
 #define OP_MOE        6u
+// M5 RECURRENT: the qwen35 KDA/recurrent step. The wave casts weight_ptr to
+// `kda_task_descriptor_t` and runs the three kernels inline.
+#define OP_RECURRENT  11u
 #define OP_ADD        7u
 #define OP_PEER_REDUCE    8u
 #define OP_PEER_BROADCAST 9u
 #define OP_PEER_GATHER    10u
+// PM-6 / condition 4: the Q8_0 dot4 GEMV. The activation is Q8_1 (packed
+// 36-byte blocks) and the weight is Q8_0 (packed 34-byte blocks), so this arm
+// never dequantizes anything — it is the integer dot the launcher's
+// `grim_dot4_q80_q81_gemv` does, called through the SAME device body.
+#define OP_Q8_0_DOT4 12u
+// The f32-ACTIVATION variant of the same format: the activation is f32 and
+// the arm quantizes it in registers, exactly as the launcher's
+// `grim_dot4_q80_f32act_gemv` does. The models' plain Q8_0 paths are the
+// f32-activation ones, so this is the body a Q8_0 dot4 node would name.
+#define OP_Q8_0_DOT4_F32ACT 13u
 
 // Status codes.
 #define ST_PENDING  0u
@@ -87,8 +129,20 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     const unsigned int* head_ptr,
     const unsigned int* stop_ptr,
     unsigned int max_tasks,
-    unsigned int resident)
+    unsigned int resident,
+    const scythe_task_descriptor_t* staged,
+    unsigned int staged_count)
 {
+    // The stop flag is NOT cleared here. The host clears it, on THIS ring's
+    // stream, before it launches the wave — so the clear and the launch are
+    // ordered. Clearing it from inside the wave would race the host's stop:
+    // a stop that lands BEFORE the wave starts would be undone by the wave's
+    // own clear, and the wave would park forever.
+    //
+    // The flag means "no wave is running on this ring": the wave sets it when
+    // it leaves (on its own idle budget or on the host's stop), and the host
+    // sets it to ask the wave to stop.
+
     // Lane zero owns queue control; the whole block cooperates on the claimed descriptor so Charon receives the launch width it expects.
     // Shared state also gives every lane the same termination condition.
     __shared__ unsigned int claimed_slot;
@@ -97,12 +151,54 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     // WI-SB6 idle backoff: unthrottled global atomics from a tight spin wedged the wave on RDNA4 under ROCm 7.2 (idle-gap-then-wedge, scythe2 plan log 2026-08-24).
     // Exponential s_sleep backoff, capped, resets the moment a task claims.
     __shared__ unsigned int backoff_shift;
+    // M4 staged-descriptor prologue. Every caller so far passes staged_count = 0
+    // and keeps the old contract (the host publishes `head` before launch and the
+    // poll loop drains what it finds). When staged_count != 0 the wave takes the
+    // descriptors from the device-side `staged` array itself: one launch both
+    // uploads the descriptors and consumes them, which is the property the phase
+    // exists to buy (N descriptor-write launches per step become zero).
+    //
+    // tail is RESET here rather than left monotonic: a single-use ring per step
+    // needs both ends repointed, otherwise step 2 would see tail == head from
+    // step 1 and terminate without consuming anything. resident=1 (parking) waves
+    // must not use this path — their whole point is a persistent tail.
+    // The tail is NOT reset: it is the ring's MONOTONIC step counter, and a
+    // consumer on another device polls it to learn that a handoff landed. A
+    // counter that restarted at zero every launch could not be told apart
+    // from the previous launch's value, so a consumer would consume a stale
+    // signal.
+    //
+    // The slots are therefore written at the tail's CURRENT offset, and head
+    // points past the new set: the wave claims slot `tail & (capacity - 1)`,
+    // so the staged descriptors must land exactly where it will look.
+    if (staged_count != 0u && threadIdx.x == 0) {
+        // atomicAdd(0) READS the tail without writing it: the counter must
+        // keep advancing across launches, so it must not be reset here.
+        unsigned int tail_base = atomicAdd((unsigned int*)tail_ptr, 0u);
+        for (unsigned int i = 0; i < staged_count; ++i) {
+            slots[(tail_base + i) & (capacity - 1u)] = staged[i];
+        }
+        atomicExch((unsigned int*)head_ptr, tail_base + staged_count);
+        backoff_shift = 0;
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
         terminate = 0;
         backoff_shift = 0;
     }
     __syncthreads();
-    for (unsigned int iteration = 0; iteration < max_tasks; ++iteration) {
+    // The budget counts IDLE polls, not total iterations: a wave that is being
+    // FED must not expire, however long the feeding takes (the first enqueue
+    // after the wave parks can JIT the enqueue kernels, and a cold hipRTC
+    // compile of this source tree can outlast ANY wall-clock budget).
+    //
+    // An idle budget is also the DEADLOCK BOUND: a host that synchronises the
+    // device while the wave is parked waits for the wave, and the wave waits
+    // for the host — the ONLY thing that breaks that cycle is the wave giving
+    // up on its own. With an idle budget it gives up after the budget, so the
+    // host's wait is bounded instead of infinite.
+    unsigned int idle_polls = 0;
+    while (idle_polls < max_tasks) {
         if (atomicAdd((unsigned int*)stop_ptr, 0) != 0u) break;
         if (threadIdx.x == 0) {
             active = 0;
@@ -114,6 +210,13 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 if (atomicCAS((unsigned int*)&candidate->status, ST_PENDING, ST_RUNNING) == ST_PENDING) {
                     active = 1;
                     backoff_shift = 0; // snap back to fast polling on real work
+                } else {
+                    // The slot is already COMPLETE (or ERROR): it is not this
+                    // wave's work. SKIP it. Spinning here instead wedged the wave
+                    // forever — a wave that cannot claim its next slot never
+                    // advances the tail, so it never terminates and never lets
+                    // the host stop it either.
+                    atomicAdd(tail_ptr, 1);
                 }
             }
         }
@@ -122,6 +225,7 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (threadIdx.x == 0)
                 terminate = atomicAdd((unsigned int*)head_ptr, 0) == atomicAdd(tail_ptr, 0);
             __syncthreads();
+            idle_polls++;
             // WI-SB6 resident wave: an empty queue is not a stop condition - the worker parks
             // here until the host publishes new work via head, and exits only through stop_ptr (or max_tasks).
             if (terminate && !resident) break;
@@ -136,6 +240,9 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             }
             continue;
         }
+        // Work resets the idle budget: the wave is being fed, so it must not
+        // expire under the host.
+        idle_polls = 0;
         scythe_task_descriptor_t* desc = &slots[claimed_slot];
 
         // Dispatch on opcode.
@@ -320,6 +427,112 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
                 dst[idx] = src[idx];
             }
+        } else if (desc->opcode == OP_Q8_0_DOT4) {
+            // PM-6 / condition 4: the Q8_0 dot4 GEMV.
+            //   desc->input_ptr  = the Q8_1 activation (packed 36-byte blocks)
+            //   desc->weight_ptr = the Q8_0 weight      (packed 34-byte blocks)
+            //   desc->output_ptr = the f32 output [M, N]
+            //   desc->m / n / k  = M (rows), N (output width), K (reduction)
+            //
+            // The work decomposition is the standalone kernel's: one 32-lane
+            // GROUP owns one output row and four output columns, and its lanes
+            // split the K-blocks. The wave's 128 threads are four such groups,
+            // each taking the groups' share of the (row, col-group) tasks in
+            // turn. The 32-lane granularity is not an arbitrary choice — the
+            // body's reduction is a 32-lane shuffle tree, so a wider group
+            // would reduce a DIFFERENT set of partial sums and the arm's
+            // answer would stop being bit-identical to the launcher's.
+            const unsigned char* a_q81 = (const unsigned char*)desc->input_ptr;
+            const unsigned char* b_q80 = (const unsigned char*)desc->weight_ptr;
+            float* c_out = (float*)desc->output_ptr;
+            const int M = (int)desc->m;
+            const int N = (int)desc->n;
+            const int K = (int)desc->k;
+            if (M > 0 && N > 0 && K > 0) {
+                const int n_col_groups = (N + 3) / 4;
+                const int n_tasks = M * n_col_groups;
+                const int lane = (int)(threadIdx.x % 32u);
+                const int group = (int)(threadIdx.x / 32u);
+                const int n_groups = (int)((blockDim.x + 31u) / 32u);
+                for (int task = group; task < n_tasks; task += n_groups) {
+                    const int row = task / n_col_groups;
+                    const int col_base = (task % n_col_groups) * 4;
+                    grim_dot4_q80_q81_gemv_body(a_q81, b_q80, c_out, M, N, K,
+                                                row, col_base, lane);
+                }
+            }
+        } else if (desc->opcode == OP_Q8_0_DOT4_F32ACT) {
+            // The f32-activation Q8_0 dot4 GEMV — the launcher's own
+            // `grim_dot4_q80_f32act_gemv` body, so the arm's answer is
+            // bit-identical to the launcher's.
+            //
+            // The work decomposition is the same 32-lane GROUP shape as the
+            // q81 variant: one group owns one output row and four output
+            // columns, and the 32 lanes split the K-blocks. The 32-lane
+            // granularity is load-bearing — the body's reduction is a
+            // 32-lane shuffle tree, and a wider group would reduce a
+            // DIFFERENT set of partial sums.
+            const float* a_f32 = (const float*)desc->input_ptr;
+            const unsigned char* b_q80 = (const unsigned char*)desc->weight_ptr;
+            float* c_out = (float*)desc->output_ptr;
+            const int M = (int)desc->m;
+            const int N = (int)desc->n;
+            const int K = (int)desc->k;
+            if (M > 0 && N > 0 && K > 0) {
+                const int n_col_groups = (N + 3) / 4;
+                const int n_tasks = M * n_col_groups;
+                const int lane = (int)(threadIdx.x % 32u);
+                const int group = (int)(threadIdx.x / 32u);
+                const int n_groups = (int)((blockDim.x + 31u) / 32u);
+                for (int task = group; task < n_tasks; task += n_groups) {
+                    const int row = task / n_col_groups;
+                    const int col_base = (task % n_col_groups) * 4;
+                    grim_dot4_q80_f32act_gemv_body(a_f32, b_q80, c_out, M, N, K,
+                                                   row, col_base, lane);
+                }
+            }
+        } else if (desc->opcode == OP_RECURRENT) {
+            // M5: the qwen35 KDA/recurrent step — three kernels inline:
+            //   1. the short-conv causal step (state-shifted),
+            //   2. the batched gated delta rule (writes the recurrent state),
+            //   3. the gated head norm.
+            // All three are device-callable functions extracted from the kernels
+            // that used to be launched separately, so no hipLaunchKernel is needed.
+            // Every pass is a strided loop (the wave is 128 threads, any geometry);
+            // the __syncthreads() between passes is what makes pass k+1 observe
+            // pass k's writes, since the passes read each other's output.
+            kda_task_descriptor_t* kda = (kda_task_descriptor_t*)desc->weight_ptr;
+            const int num_v = kda->num_v;
+            const int num_k = kda->num_k;
+            const int head_dim = kda->head_dim;
+            const int batch = kda->batch;
+            const int channels = kda->channels;
+            const int kernel_size = kda->kernel_size;
+            const float eps = kda->eps;
+            const int has_z = kda->has_z;
+
+            for (int idx = threadIdx.x; idx < batch * channels; idx += blockDim.x) {
+                short_conv1d_causal_step_dev(
+                    (const float*)kda->conv_in, (const float*)kda->conv_w,
+                    (const float*)kda->conv_bias, (float*)kda->conv_state,
+                    (float*)kda->conv_out, idx, channels, kernel_size);
+            }
+            __syncthreads();
+            const int total = num_v * head_dim;
+            for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+                kda_delta_rule_batched_dev(
+                    (const float*)kda->conv_out, (const float*)kda->alpha,
+                    (const float*)kda->beta, (const float*)kda->dt_bias,
+                    (const float*)kda->ssm_a, (float*)kda->state,
+                    (float*)kda->acc, idx, num_v, num_k, head_dim, eps);
+            }
+            __syncthreads();
+            for (int h = threadIdx.x; h < num_v; h += blockDim.x) {
+                kda_head_norm_gate_dev(
+                    (const float*)kda->acc, (const float*)kda->ssm_norm,
+                    (const float*)kda->gate, (float*)kda->branch,
+                    h, num_v, head_dim, eps, has_z);
+            }
         } else if (desc->opcode != OP_NOP) {
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
@@ -336,6 +549,163 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
         }
         __syncthreads();
     }
+    // Leave the stop flag SET when the wave leaves on its own: the flag means
+    // "no wave is running on this ring", and the host uses it to know it must
+    // launch a fresh wave before the next enqueue. A host that only ever sets
+    // the flag (never clears it) would read the same value, so the two uses
+    // agree: set = not running.
+    if (threadIdx.x == 0) {
+        atomicExch((unsigned int*)stop_ptr, 1u);
+    }
+}
+
+// M6: wait for a ring descriptor to complete, DEVICE-SIDE.
+//
+// The wave moves a descriptor's status PENDING -> RUNNING -> COMPLETE, so a
+// consumer observes a cross-device handoff by polling that field. This is what
+// lets the consumer's graph wait for the producer's PEER_COPY without a HOST
+// event: the wait is a NODE in the consumer's graph, so the two sides overlap
+// instead of alternating.
+//
+// The spin is BOUNDED and the observed status is written out either way, so a
+// producer that never runs shows up as a TIMEOUT (the status is still PENDING)
+// rather than as a wedged device.
+//
+// The shared primitive is the SPIN: poll a 32-bit word until it reaches a
+// target value, or the spin budget runs out. The word is read through a
+// `volatile` pointer so the compiler cannot hoist the load out of the loop —
+// the value may live in ANOTHER device's memory, and only the hardware knows
+// when it changes.
+extern "C" __device__ unsigned int grim_scythe_spin_u32(
+    const volatile unsigned int* word,
+    unsigned int until_value,
+    unsigned int max_spins)
+{
+    unsigned int spins = 0;
+    unsigned int v = *word;
+    while (v != until_value && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *word;
+        spins++;
+    }
+    return v;
+}
+
+// Spin until the word becomes NON-ZERO.
+//
+// This is NOT the same predicate as `grim_scythe_spin_u32`: that one exits
+// when the word EQUALS a target, and a completion flag needs the opposite —
+// it starts at zero and must leave zero. Passing zero as the target would
+// exit IMMEDIATELY, on the initial value, which is the opposite of waiting.
+extern "C" __device__ unsigned int grim_scythe_spin_nonzero(
+    const volatile unsigned int* word,
+    unsigned int max_spins)
+{
+    unsigned int spins = 0;
+    unsigned int v = *word;
+    while (v == 0u && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *word;
+        spins++;
+    }
+    return v;
+}
+
+extern "C" __global__ void grim_scythe_wait_descriptor(
+    const scythe_task_descriptor_t* slots,
+    unsigned int slot_idx,
+    unsigned int max_spins,
+    unsigned int* observed_status)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const volatile unsigned int* status =
+        (const volatile unsigned int*)&slots[slot_idx].status;
+    *observed_status = grim_scythe_spin_u32(status, ST_COMPLETE, max_spins);
+}
+
+// M6: poll a MONOTONIC counter on ANOTHER device, DEVICE-SIDE.
+//
+// The cross-device completion signal. The counter lives in the PRODUCER's
+// memory and advances once per handoff, so a consumer that polls it can tell
+// one handoff from the next — a value that merely left zero could not.
+//
+// A peer READ is coherent on this hardware (measured: the consumer sees the
+// producer's descriptor transition), unlike a peer WRITE, which is why the
+// counter lives on the producer's side.
+//
+// The consumer's own "last seen" register says how far it has got, so the
+// comparison needs no host involvement. Bounded, and the observed value is
+// written out either way: a producer that never ran shows up as a TIMEOUT
+// rather than as a wedged device.
+extern "C" __global__ void grim_scythe_wait_counter(
+    const volatile unsigned int* counter,
+    unsigned int* last_seen,
+    unsigned int max_spins,
+    unsigned int* observed)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    unsigned int last = *last_seen;
+    unsigned int spins = 0;
+    unsigned int v = *counter;
+    while (v <= last && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *counter;
+        spins++;
+    }
+    *observed = v;
+    *last_seen = v;
+}
+
+// M6: wait for a FLAG to CHANGE, DEVICE-SIDE.
+//
+// This is the cross-device completion signal for a REPEATED handoff. A flag
+// that merely leaves zero cannot carry a second handoff: after the first
+// handoff the flag is non-zero, so the next wait would exit immediately on the
+// STALE value and let the consumer run before the new copy landed.
+//
+// So the producer writes a value that CHANGES per handoff (a counter the
+// wave increments), and the consumer waits for the flag to DIFFER from the
+// value it last saw. The consumer's own register is the "last seen", so the
+// comparison needs no host involvement.
+//
+// Bounded, and the observed value is written out either way: a producer that
+// never ran shows up as a TIMEOUT rather than as a wedged device.
+extern "C" __global__ void grim_scythe_wait_flag_change(
+    const volatile unsigned int* flag,
+    unsigned int* last_seen,
+    unsigned int max_spins,
+    unsigned int* observed)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    unsigned int last = *last_seen;
+    unsigned int spins = 0;
+    unsigned int v = *flag;
+    while (v == last && spins < max_spins) {
+        __builtin_amdgcn_s_sleep(64);
+        v = *flag;
+        spins++;
+    }
+    *observed = v;
+    *last_seen = v;
+}
+
+// M6: wait for a FLAG to become non-zero, DEVICE-SIDE.
+//
+// This is the cross-device completion flag: the producer's wave writes a
+// non-zero word into the CONSUMER's memory, and the consumer's device spins
+// on that word until it changes. The consumer never polls the producer's
+// memory, so the only cross-device traffic is the flag itself.
+//
+// Bounded, and the observed value is written out either way: a producer that
+// never ran shows up as a TIMEOUT (the flag is still zero) rather than as a
+// wedged device.
+extern "C" __global__ void grim_scythe_wait_flag(
+    const volatile unsigned int* flag,
+    unsigned int max_spins,
+    unsigned int* observed)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    *observed = grim_scythe_spin_nonzero(flag, max_spins);
 }
 "#;
 

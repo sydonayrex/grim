@@ -1675,12 +1675,31 @@ fn embedding_has_packed_gather(storage: &Storage, device: &grim_tensor::Device) 
     // a host packed gather (`CpuDevice::embedding_packed`, A2) that dequants
     // one row at a time -- so K-quant tables in a verified scheme stay packed
     // everywhere instead of deflating to f32 at load.
-    // Verified schemes only: Q4K + IQ3S. IQ2_S stays excluded (see above).
-    let _ = device;
+    //
+    // The CPU dequants a row with the same `grim_quant::dequant_*` the matmul
+    // path uses, so a packed gather agrees with the matmul by construction.
+    // Its schemes: Q4K + IQ3S + IQ2S + Q6K + Q5K.
+    //
+    // An accelerator has an on-device gather for Q4K + IQ3S + IQ2S + Q6K
+    // (`grim_embedding_q6k_gather` for the last), so Gemma 4's per-layer
+    // embedding table - a Q6K table of `[262144, 42*256]`, 2.3 GB packed
+    // against 11.3 GB inflated - stays packed on the card too.
+    if device.is_cpu() {
+        return matches!(
+            storage,
+            Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ2S)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q5K)
+        );
+    }
     matches!(
         storage,
         Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
             | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S)
+            | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ2S)
+            | Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K)
     )
 }
 
@@ -2844,7 +2863,17 @@ pub fn short_conv1d(
                 }
             }
             let dev = pick_device_for_tensor(state);
-            let new_shape = Shape::new(vec![b, d, k_size - 1]);
+            // Preserve the caller's shape label: the flat order above is
+            // channel-major regardless, and no reader here is dim-aware
+            // (sizing derives from `len / (b*d)`), so flipping the label
+            // ([B,K-1,D] -> [B,D,K-1]) only breaks dim-aware callers across
+            // calls while changing no numerics. Keep what arrived.
+            let in_shape = state.shape().clone();
+            let new_shape = if in_shape.elem_count() == new_state.len() {
+                in_shape
+            } else {
+                Shape::new(vec![b, k_size - 1, d])
+            };
             let storage = dev.from_cpu(&new_state, &new_shape, DType::F32)?;
             *state = Tensor::new(
                 Arc::from(storage),

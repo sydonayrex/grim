@@ -39,12 +39,18 @@ const OLLAMA_PARIS_LOGPROB: f64 = -0.46090;
 fn model_path() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("GRIM_CHECKPOINT") {
         let p = std::path::PathBuf::from(p);
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
-        if p.exists() { return Some(p); }
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        if p.exists() {
+            return Some(p);
+        }
     }
     eprintln!("[SKIP] 9B checkpoint not found");
     None
@@ -84,9 +90,14 @@ fn load_tensor(
         GgufDType::Q5K => grim_quant::dequant_q5k(&b, n).ok()?,
         GgufDType::Q6K => grim_quant::dequant_q6k(&b, n).ok()?,
         GgufDType::Q8_0 => grim_quant::dequant_q80(&b, n).ok()?,
-        GgufDType::F32 => b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        other => { eprintln!("[read] {name}: unhandled dtype {other:?}"); return None; }
+        GgufDType::F32 => b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        other => {
+            eprintln!("[read] {name}: unhandled dtype {other:?}");
+            return None;
+        }
     };
     Some((v, t.dims[0] as usize, t.dims[1] as usize))
 }
@@ -108,8 +119,8 @@ fn transpose_into(lin: &mut Linear, flat: &[f32], ne0: usize, ne1: usize, tag: &
 #[test]
 fn whole_stack_with_transposed_weights_predicts_paris() {
     let Some(path) = model_path() else { return };
-    let prov = grim_format::tprov::GgufProvider::open(path.to_str().expect("utf8 path"))
-        .expect("open 9B");
+    let prov =
+        grim_format::tprov::GgufProvider::open(path.to_str().expect("utf8 path")).expect("open 9B");
     let mut c = cfg();
     c.rotary_dim = Some(64);
     let positions: Vec<u32> = (0..S as u32).collect();
@@ -153,7 +164,9 @@ fn whole_stack_with_transposed_weights_predicts_paris() {
             ) {
                 let full = format!("{pref}.{nm}.weight");
                 if let Some((flat, ne0, ne1)) = load_tensor(r, g, &full) {
-                    if let Some(l) = lin.as_mut() { transpose_into(l, &flat, ne0, ne1, &full); }
+                    if let Some(l) = lin.as_mut() {
+                        transpose_into(l, &flat, ne0, ne1, &full);
+                    }
                 }
             }
             fn fix_val(
@@ -187,7 +200,11 @@ fn whole_stack_with_transposed_weights_predicts_paris() {
 
         let mut cache = Qwen35LayerCache::new(&c);
         let t = grim_backend_cpu::cpu_tensor(h.clone(), Shape::new(vec![S, HIDDEN]));
-        h = blk.forward(&t, &positions, &mut cache).expect("fwd").to_vec_f32().expect("read");
+        h = blk
+            .forward(&t, &positions, &mut cache)
+            .expect("fwd")
+            .to_vec_f32()
+            .expect("read");
     }
 
     // Head, also under reading B.
@@ -206,7 +223,11 @@ fn whole_stack_with_transposed_weights_predicts_paris() {
         let (flat, ne0, ne1) = load_tensor(&mut r, &g, "output.weight").expect("output.weight");
         eprintln!("[read] output.weight blob [{ne0},{ne1}]");
         let mut w = vec![0.0f32; ne0 * ne1];
-        for k in 0..ne0 { for j in 0..ne1 { w[j * ne0 + k] = flat[k * ne1 + j]; } }
+        for k in 0..ne0 {
+            for j in 0..ne1 {
+                w[j * ne0 + k] = flat[k * ne1 + j];
+            }
+        }
         let t = grim_backend_cpu::cpu_tensor(w, Shape::new(vec![ne1, ne0]));
         Linear::from_tensor(t, None)
     };

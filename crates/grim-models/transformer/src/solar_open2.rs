@@ -154,7 +154,7 @@ impl SolarOpen2Block {
                     max_seq_len: cfg.max_seq_len,
                     partial_rotary_factor: 1.0,
                     yarn: None,
-                ..Default::default()
+                    ..Default::default()
                 };
                 let mut block = crate::block::LlamaBlock::load_tp(ws, &llama_cfg, tp)?;
                 block.ffn_disabled = true;
@@ -195,9 +195,10 @@ impl SolarOpen2Block {
             max_seq_len: cfg.max_seq_len,
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
         let spec = crate::moe_block::MoESpec {
+            renorm: true,
             num_experts: cfg.num_routed_experts,
             top_k: cfg.top_k,
             router_kind: grim_nn::moe::RouterKind::SoftmaxTopK,

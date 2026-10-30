@@ -12,6 +12,7 @@
 
 use grim_backend_rocm::kernels::qkv_attention::{
     KvCacheQuantFormat, launch_paged_attention, launch_paged_attention_quant,
+    launch_paged_attention_quant_split,
 };
 use grim_backend_rocm::{BlockTableEntry, RocmDevice};
 use grim_tensor::CoreTensorOps;
@@ -584,5 +585,505 @@ fn nutcracker_quant_paged_attention_matches_f32_reference() {
             .zip(&want)
             .map(|(g, w)| (*g as f64 - w).abs())
             .fold(0.0f64, f64::max)
+    );
+}
+
+/// WhiteCrow (u4 group-128 OSTQuant) quantized paged attention must track the
+/// f32 reference.
+///
+/// WhiteCrow packs 128 values into 67 bytes (64 B u4 codes + 2 B bf16 scale +
+/// 1 B u8 zero), with an affine decode `scale * (nibble - zero)` per group. The
+/// scale travels inline in the block, so the launch passes `k_scale = v_scale =
+/// 1.0` to make that explicit (like Nutcracker).
+///
+/// The host side uses the production `grim_quant::quant_whitecrow`, so this
+/// measures the device `dequant_kv_element(format = 9)` leg against the real
+/// encoder. The flat physical element index the kernel passes (`elem_offset +
+/// dim` = `[physical_token][kv_head][dim]`) is exactly the sequential grouping
+/// the host packer uses, so the two agree by construction — which is the
+/// invariant this pins.
+///
+/// Gated: `GRIM_GPU_TEST=1` + a real ROCm device.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn whitecrow_quant_paged_attention_matches_f32_reference() {
+    let Some(dev) = gpu_device() else { return };
+
+    let q_shape = Shape::new(vec![BATCH as usize, NUM_HEADS as usize, HEAD_DIM as usize]);
+
+    let q_cpu: Vec<f32> = (0..(BATCH * NUM_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.1).sin())
+        .collect();
+    let k_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.15).cos())
+        .collect();
+    let v_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.2).sin())
+        .collect();
+
+    // Same page flattening as the other tests, via each block's physical id.
+    let entries = [
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
+    ];
+    let mut k_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
+    let mut v_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
+    for b in 0..MAX_BLOCKS as usize {
+        let entry = entries[b];
+        for t in 0..entry.page_size as usize {
+            let j = b * PAGE_SIZE as usize + t;
+            if j >= KV_SEQ_LEN as usize {
+                break;
+            }
+            let physical_token = entry.block_id as usize * PAGE_SIZE as usize + t;
+            let n = NUM_KV_HEADS as usize * HEAD_DIM as usize;
+            let src = physical_token * n;
+            let dst = j * n;
+            k_flat[dst..dst + n].copy_from_slice(&k_cpu[src..src + n]);
+            v_flat[dst..dst + n].copy_from_slice(&v_cpu[src..src + n]);
+        }
+    }
+
+    // Production encoder: 67 bytes per 128 values. Here the tensors are exactly
+    // 128 elements, so each packs to a single 67-byte group.
+    let k_packed = grim_quant::quant_whitecrow(&k_cpu).expect("quantize K");
+    let v_packed = grim_quant::quant_whitecrow(&v_cpu).expect("quantize V");
+    assert_eq!(
+        k_packed.len(),
+        k_cpu.len().div_ceil(128) * 67,
+        "67 bytes per 128 values"
+    );
+
+    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+    let table = block_table(&dev);
+    let mut out = dev.zeros(&q_shape, DType::F32).unwrap();
+
+    // Raw byte upload: the decoder indexes the page pointer bytewise.
+    let kq = dev
+        .from_cpu_bytes(&k_packed, &Shape::new(vec![k_packed.len()]), DType::F32)
+        .unwrap();
+    let vq = dev
+        .from_cpu_bytes(&v_packed, &Shape::new(vec![v_packed.len()]), DType::F32)
+        .unwrap();
+
+    launch_paged_attention_quant(
+        &dev,
+        q_storage.as_ref(),
+        table.as_ref(),
+        kq.as_ref(),
+        vq.as_ref(),
+        out.as_mut(),
+        BATCH,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        MAX_BLOCKS,
+        PAGE_SIZE,
+        KV_SEQ_LEN,
+        CACHE_OFFSET,
+        0i32,
+        KvCacheQuantFormat::WhiteCrow,
+        1.0, // ignored: WhiteCrow carries its bf16 scale inline per group
+        0.0,
+        1.0, // ignored
+        0.0,
+    )
+    .expect("whitecrow quant paged attention");
+    let got = out.to_cpu_vec_f32().unwrap();
+
+    let want = reference_attention(
+        &q_cpu,
+        &k_flat,
+        &v_flat,
+        NUM_HEADS as usize,
+        NUM_KV_HEADS as usize,
+        HEAD_DIM as usize,
+        KV_SEQ_LEN as usize,
+    );
+
+    // Two gates:
+    //
+    // 1. TIGHT — device output vs a host reference that decodes the packed K/V
+    //    with the *production* `dequant_whitecrow` and runs the same attention.
+    //    head_dim here is 8 (shared consts), so this leg exercises the LEGACY
+    //    per-element format-9 dequant with UNQUANTIZED Q; the sudot8 leg
+    //    (head_dim % 128 == 0, quantized Q) is gated separately in
+    //    `whitecrow_paged_sudot8_head128`.
+    let k_host =
+        grim_quant::dequant_whitecrow(&grim_quant::quant_whitecrow(&k_flat).unwrap(), k_flat.len())
+            .unwrap();
+    let v_host =
+        grim_quant::dequant_whitecrow(&grim_quant::quant_whitecrow(&v_flat).unwrap(), v_flat.len())
+            .unwrap();
+    let host_ref = reference_attention(
+        &q_cpu,
+        &k_host,
+        &v_host,
+        NUM_HEADS as usize,
+        NUM_KV_HEADS as usize,
+        HEAD_DIM as usize,
+        KV_SEQ_LEN as usize,
+    );
+    let decode_err = got
+        .iter()
+        .zip(&host_ref)
+        .map(|(g, w)| (*g as f64 - w).abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        decode_err < 0.01,
+        "whitecrow device decode disagrees with production host decoder: \
+         device/host max err {decode_err} (nibble/scale/zero/index bug)"
+    );
+
+    // 2. LOOSE — parity vs the pure f32 reference. The residual is inherent
+    //    per-128 4-bit quantization coarseness, NOT a device error: the host
+    //    calibration (`whitecrow_host_quant_fidelity_baseline`) measures the
+    //    encoder's own fidelity on this data at ~0.0496, so the device lands
+    //    exactly at the encoder's floor. Calibrated with headroom above that
+    //    floor; a broken decode degrades to O(0.1+).
+    let tol = 0.06;
+    for h in 0..NUM_HEADS as usize {
+        for d in 0..HEAD_DIM as usize {
+            let i = h * HEAD_DIM as usize + d;
+            let err = (got[i] as f64 - want[i]).abs();
+            assert!(
+                err < tol,
+                "whitecrow paged path disagrees at head {h} dim {d}: \
+                 got {} want {} (err {err})",
+                got[i],
+                want[i]
+            );
+        }
+    }
+    eprintln!(
+        "[quant-paged] whitecrow KV matches f32 reference within {tol} \
+         (max err {:.4}; device-vs-host-decode {decode_err:.6})",
+        got.iter()
+            .zip(&want)
+            .map(|(g, w)| (*g as f64 - w).abs())
+            .fold(0.0f64, f64::max)
+    );
+}
+
+/// sudot8 Q·K leg of the paged WhiteCrow path, at head_dim = 128 (the
+/// geometry where the flat-128 K groups align with per-head Q groups and the
+/// kernel takes the hardware u4 dot). Q is quantized to the symmetric u4
+/// group-128 grid on device (`grim_whitecrow_qk_dot_scalar`); the tight gate
+/// compares against a host reference using the canonical
+/// `quant_q_whitecrow_symmetric` mirror, so it isolates the device dot's
+/// packing/algebra, not the grid's inherent coarseness.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn whitecrow_paged_sudot8_head128() {
+    let Some(dev) = gpu_device() else { return };
+
+    // head_dim = 128: one WhiteCrow group per (token, kv_head) exactly.
+    let (num_heads, num_kv_heads, head_dim) = (2usize, 2usize, 128usize);
+    let (page_size, kv_seq_len, max_blocks, cache_offset) = (4usize, 8usize, 2usize, 7usize);
+    let q_shape = Shape::new(vec![1, num_heads, head_dim]);
+
+    let q_cpu: Vec<f32> = (0..num_heads * head_dim)
+        .map(|x| ((x as f32) * 0.1).sin())
+        .collect();
+    let total = max_blocks * page_size * num_kv_heads * head_dim;
+    let k_cpu: Vec<f32> = (0..total).map(|x| ((x as f32) * 0.15).cos()).collect();
+    let v_cpu: Vec<f32> = (0..total).map(|x| ((x as f32) * 0.2).sin()).collect();
+
+    // Identity page mapping (block b owns tokens [b*page_size, ..)).
+    let entries = [
+        BlockTableEntry {
+            block_id: 0,
+            page_size: page_size as u32,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: page_size as u32,
+        },
+    ];
+    let n = num_kv_heads * head_dim;
+    let mut k_flat = vec![0.0f32; kv_seq_len * n];
+    let mut v_flat = vec![0.0f32; kv_seq_len * n];
+    for b in 0..max_blocks {
+        for t in 0..page_size {
+            let j = b * page_size + t;
+            if j >= kv_seq_len {
+                break;
+            }
+            let src = entries[b].block_id as usize * page_size * n + t * n;
+            k_flat[j * n..(j + 1) * n].copy_from_slice(&k_cpu[src..src + n]);
+            v_flat[j * n..(j + 1) * n].copy_from_slice(&v_cpu[src..src + n]);
+        }
+    }
+
+    let k_packed = grim_quant::quant_whitecrow(&k_cpu).expect("quantize K");
+    let v_packed = grim_quant::quant_whitecrow(&v_cpu).expect("quantize V");
+
+    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+    let table = block_table(&dev);
+    let mut out = dev.zeros(&q_shape, DType::F32).unwrap();
+    let kq = dev
+        .from_cpu_bytes(&k_packed, &Shape::new(vec![k_packed.len()]), DType::F32)
+        .unwrap();
+    let vq = dev
+        .from_cpu_bytes(&v_packed, &Shape::new(vec![v_packed.len()]), DType::F32)
+        .unwrap();
+
+    launch_paged_attention_quant(
+        &dev,
+        q_storage.as_ref(),
+        table.as_ref(),
+        kq.as_ref(),
+        vq.as_ref(),
+        out.as_mut(),
+        1,
+        num_heads as u32,
+        num_kv_heads as u32,
+        head_dim as u32,
+        max_blocks as u32,
+        page_size as u32,
+        kv_seq_len as u32,
+        cache_offset as u32,
+        0i32,
+        KvCacheQuantFormat::WhiteCrow,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+    )
+    .expect("whitecrow sudot8 paged attention");
+    let got = out.to_cpu_vec_f32().unwrap();
+
+    // Tight: quantized-Q host reference over production-decoded K/V.
+    let k_host =
+        grim_quant::dequant_whitecrow(&grim_quant::quant_whitecrow(&k_flat).unwrap(), k_flat.len())
+            .unwrap();
+    let v_host =
+        grim_quant::dequant_whitecrow(&grim_quant::quant_whitecrow(&v_flat).unwrap(), v_flat.len())
+            .unwrap();
+    let q_host = grim_quant::quant_q_whitecrow_symmetric(&q_cpu);
+    let host_ref = reference_attention(
+        &q_host,
+        &k_host,
+        &v_host,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+    );
+    let decode_err = got
+        .iter()
+        .zip(&host_ref)
+        .map(|(g, w)| (*g as f64 - w).abs())
+        .fold(0.0f64, f64::max);
+    eprintln!("[quant-paged-sudot8] device vs quantized-Q host ref: max err {decode_err:.6}");
+    assert!(
+        decode_err < 0.01,
+        "whitecrow sudot8 paged dot disagrees with quantized-Q host reference: \
+         max err {decode_err} (packing/zero-correction bug)"
+    );
+
+    // Loose: f32 end-to-end fidelity (K/V affine grid + Q symmetric grid).
+    let want = reference_attention(
+        &q_cpu,
+        &k_flat,
+        &v_flat,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+    );
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(g, w)| (*g as f64 - w).abs())
+        .fold(0.0f64, f64::max);
+    eprintln!("[quant-paged-sudot8] vs f32 reference: max err {worst:.4}");
+    assert!(worst < 0.15, "whitecrow sudot8 f32 fidelity too low: {worst}");
+}
+
+/// Token-parallel (flash-decoding) split gate: `launch_paged_attention_quant_split`
+/// must agree with the single-workgroup serial kernel on the same quantized
+/// arena, at head_dim=128 with MULTIPLE chunks per head (chunk_len chosen so
+/// n_chunks > 1 at this small kv_seq_len — this exercises the partial/merge
+/// handshake, not just the degenerate one-chunk case). The serial kernel is
+/// the reference: it is itself gated against the host decoder and the
+/// quantized-Q reference by the two whitecrow tests above.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn whitecrow_paged_split_matches_serial_kernel() {
+    let Some(dev) = gpu_device() else { return };
+
+    let (num_heads, num_kv_heads, head_dim) = (2usize, 2usize, 128usize);
+    let (page_size, kv_seq_len, max_blocks, cache_offset) = (4usize, 64usize, 16usize, 63usize);
+    let q_shape = Shape::new(vec![1, num_heads, head_dim]);
+
+    let q_cpu: Vec<f32> = (0..num_heads * head_dim)
+        .map(|x| ((x as f32) * 0.1).sin())
+        .collect();
+    let total = max_blocks * page_size * num_kv_heads * head_dim;
+    let k_cpu: Vec<f32> = (0..total).map(|x| ((x as f32) * 0.15).cos()).collect();
+    let v_cpu: Vec<f32> = (0..total).map(|x| ((x as f32) * 0.2).sin()).collect();
+
+    let entries: Vec<BlockTableEntry> = (0..max_blocks)
+        .map(|b| BlockTableEntry {
+            block_id: b as u32,
+            page_size: page_size as u32,
+        })
+        .collect();
+    let n = num_kv_heads * head_dim;
+    let mut k_flat = vec![0.0f32; kv_seq_len * n];
+    let mut v_flat = vec![0.0f32; kv_seq_len * n];
+    for b in 0..max_blocks {
+        for t in 0..page_size {
+            let j = b * page_size + t;
+            if j >= kv_seq_len {
+                break;
+            }
+            let src = entries[b].block_id as usize * page_size * n + t * n;
+            k_flat[j * n..(j + 1) * n].copy_from_slice(&k_cpu[src..src + n]);
+            v_flat[j * n..(j + 1) * n].copy_from_slice(&v_cpu[src..src + n]);
+        }
+    }
+
+    let k_packed = grim_quant::quant_whitecrow(&k_cpu).expect("quantize K");
+    let v_packed = grim_quant::quant_whitecrow(&v_cpu).expect("quantize V");
+    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+    let kq = dev
+        .from_cpu_bytes(&k_packed, &Shape::new(vec![k_packed.len()]), DType::F32)
+        .unwrap();
+    let vq = dev
+        .from_cpu_bytes(&v_packed, &Shape::new(vec![v_packed.len()]), DType::F32)
+        .unwrap();
+
+    let run_serial = |out: &mut dyn grim_tensor::BackendStorage,
+                      table: &dyn grim_tensor::BackendStorage| {
+        launch_paged_attention_quant(
+            &dev,
+            q_storage.as_ref(),
+            table,
+            kq.as_ref(),
+            vq.as_ref(),
+            out,
+            1,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            max_blocks as u32,
+            page_size as u32,
+            kv_seq_len as u32,
+            cache_offset as u32,
+            0i32,
+            KvCacheQuantFormat::WhiteCrow,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+        )
+        .expect("serial paged whitecrow")
+    };
+
+    // Serial reference.
+    let table = block_table(&dev);
+    let mut out_serial = dev.zeros(&q_shape, DType::F32).unwrap();
+    run_serial(out_serial.as_mut(), table.as_ref());
+    let serial = out_serial.to_cpu_vec_f32().unwrap();
+
+    // Split run: chunk_len 8 -> n_chunks = ceil(64/8) = 8 (> 1 by design).
+    let n_chunks = 8usize;
+    let pm = dev
+        .zeros(&Shape::new(vec![n_chunks * num_heads]), DType::F32)
+        .unwrap();
+    let pl = dev
+        .zeros(&Shape::new(vec![n_chunks * num_heads]), DType::F32)
+        .unwrap();
+    let po = dev
+        .zeros(&Shape::new(vec![n_chunks * num_heads * head_dim]), DType::F32)
+        .unwrap();
+    let table = block_table(&dev);
+    let mut out_split = dev.zeros(&q_shape, DType::F32).unwrap();
+    launch_paged_attention_quant_split(
+        &dev,
+        q_storage.as_ref(),
+        table.as_ref(),
+        kq.as_ref(),
+        vq.as_ref(),
+        pm.as_ref(),
+        pl.as_ref(),
+        po.as_ref(),
+        out_split.as_mut(),
+        1,
+        num_heads as u32,
+        num_kv_heads as u32,
+        head_dim as u32,
+        max_blocks as u32,
+        page_size as u32,
+        kv_seq_len as u32,
+        cache_offset as u32,
+        0i32,
+        KvCacheQuantFormat::WhiteCrow,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        8,
+    )
+    .expect("split paged whitecrow");
+    dev.synchronize();
+
+    let split = out_split.to_cpu_vec_f32().unwrap();
+    assert_eq!(serial.len(), split.len());
+    let mut worst = 0.0f64;
+    for (i, (&s, &p)) in serial.iter().zip(split.iter()).enumerate() {
+        let err = (s as f64 - p as f64).abs();
+        worst = worst.max(err);
+        assert!(
+            err < 1e-4,
+            "split diverges from serial at {i}: serial {s} split {p} (err {err})"
+        );
+    }
+    eprintln!("[quant-paged-split] split vs serial: max abs err {worst:.2e}");
+    assert!(split.iter().all(|x| x.is_finite()), "split output non-finite");
+}
+
+/// Host-only calibration: how much error does the WhiteCrow encoder itself
+/// introduce on this exact data, independent of the GPU? Quantize K/V with the
+/// production encoder, dequantize with the production decoder, run the same
+/// `reference_attention`, and diff against the f32 reference.
+///
+/// This is NOT device-gated (pure host math). It separates "the 4-bit per-128
+/// grid is inherently ~X accurate" from "the device decode leg is buggy": if
+/// the device result lands within the same ballpark as this host-dequant
+/// fidelity, the decode is correct and any residual gap is encoder coarseness.
+#[test]
+fn whitecrow_host_quant_fidelity_baseline() {
+    let k_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.15).cos())
+        .collect();
+    let v_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.2).sin())
+        .collect();
+    let q_cpu: Vec<f32> = (0..(BATCH * NUM_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.1).sin())
+        .collect();
+
+    let kd = grim_quant::dequant_whitecrow(&grim_quant::quant_whitecrow(&k_cpu).unwrap(), k_cpu.len()).unwrap();
+    let vd = grim_quant::dequant_whitecrow(&grim_quant::quant_whitecrow(&v_cpu).unwrap(), v_cpu.len()).unwrap();
+    let kerr = k_cpu.iter().zip(&kd).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let verr = v_cpu.iter().zip(&vd).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+
+    // The test's flat layout already matches the physical-token order (block_id
+    // == b), so no page reordering is needed here.
+    let want = reference_attention(&q_cpu, &k_cpu, &v_cpu, NUM_HEADS as usize, NUM_KV_HEADS as usize, HEAD_DIM as usize, KV_SEQ_LEN as usize);
+    let got = reference_attention(&q_cpu, &kd, &vd, NUM_HEADS as usize, NUM_KV_HEADS as usize, HEAD_DIM as usize, KV_SEQ_LEN as usize);
+    let attn_err = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f64, f64::max);
+    eprintln!(
+        "[whitecrow-host] dequant elem max err K={kerr:.4} V={verr:.4}; \
+         host-dequant attention vs f32 ref max err {attn_err:.4}"
     );
 }

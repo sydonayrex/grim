@@ -136,7 +136,6 @@ pub struct LlamaConfigRefs {
     pub sliding_window: Option<usize>,
 }
 
-
 /// Compute the per-rank TP sharding plan for attention heads.
 /// Returns `(local_num_heads, local_num_kv_heads, kv_head_replica_factor)`: - If `num_kv_heads % world_size == 0`: KV heads are sharded,.
 pub fn plan_kv_head_sharding(
@@ -236,7 +235,10 @@ pub(crate) fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
         );
         if std::env::var("GRIM_DEBUG_RESHAPE").is_ok() {
             fn fmt(d: &[usize]) -> String {
-                d.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x")
+                d.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("x")
             }
             eprintln!(
                 "[reshape] {} -> {} : {}",
@@ -1893,6 +1895,7 @@ impl LlamaBlock {
             past_dev.storage().as_ref(),
             row_elems,
             1,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )?;
         let _ = grim_backend_rocm::launch_kv_append(
             &rocm,
@@ -1901,6 +1904,7 @@ impl LlamaBlock {
             past_dev.storage().as_ref(),
             row_elems,
             1,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )?;
 
         let inv_sqrt_d = 1.0 / (cfg.head_dim as f32).sqrt();
@@ -1962,6 +1966,7 @@ impl LlamaBlock {
             fuse_o,
             dummy.as_ref(),
             0,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )?;
         // Bump LAST so the next step appends at the new offset (and RoPE's
         // aliased base points at the next position).
@@ -2327,7 +2332,9 @@ mod tests {
         let cfg = small_cfg();
         let hidden = cfg.hidden_size;
         let x = make_tensor(
-            (0..hidden).map(|i| i as f32 * 0.1 - 0.5).collect::<Vec<f32>>(),
+            (0..hidden)
+                .map(|i| i as f32 * 0.1 - 0.5)
+                .collect::<Vec<f32>>(),
             &[1, hidden],
         );
         let positions = [0u32];
@@ -2411,7 +2418,9 @@ mod tests {
         block.attn_post_norm = Some(make_norm(hidden));
 
         let x = make_tensor(
-            (0..hidden).map(|i| i as f32 * 0.1 - 0.5).collect::<Vec<f32>>(),
+            (0..hidden)
+                .map(|i| i as f32 * 0.1 - 0.5)
+                .collect::<Vec<f32>>(),
             &[1, hidden],
         );
         let positions = [0u32];
@@ -2428,7 +2437,12 @@ mod tests {
             .prefilled_self_attention(&q, &k, &v, &positions, None, &mut false)
             .unwrap();
         let attn_out = block.wo.forward(&ctx).unwrap();
-        let post = block.attn_post_norm.as_ref().unwrap().forward(&attn_out).unwrap();
+        let post = block
+            .attn_post_norm
+            .as_ref()
+            .unwrap()
+            .forward(&attn_out)
+            .unwrap();
 
         let xv = x.to_vec_f32().unwrap();
         let postv = post.to_vec_f32().unwrap();
@@ -2960,7 +2974,7 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
         let provider = FullProvider { tensors };
         let ws = WeightSource::root(&provider, Device::Cpu);
@@ -3043,7 +3057,7 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
 
         // (name, out_dim, in_dim) for every weight the block loads.

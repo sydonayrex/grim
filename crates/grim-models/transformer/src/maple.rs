@@ -126,12 +126,13 @@ impl Maple {
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
 
         let router_kind = RouterKind::SigmoidTopKWithBias;
 
         let spec = MoESpec {
+            renorm: true,
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
             router_kind,

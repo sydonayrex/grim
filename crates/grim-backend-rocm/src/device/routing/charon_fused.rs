@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use grim_tensor::error::{Error, Result};
 
 #[cfg(feature = "training")]
+#[allow(unused_imports)]
 use crate::device::roc_device::CharonBackwardResult;
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;

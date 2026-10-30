@@ -611,14 +611,9 @@ impl Qwen38MoeBlock {
         } else if ws.has_tensor("ffn_gate_exps.weight") {
             // GPU target: experts are too large to upload; keep them as mmap'd
             // byte ranges (SSD-evictable) and stage active experts only.
-            let path = ws
-                .provider()
-                .source_path()
-                .ok_or_else(|| {
-                    grim_core::Error::Config(
-                        "expert offload requires a file-backed provider".into(),
-                    )
-                })?;
+            let path = ws.provider().source_path().ok_or_else(|| {
+                grim_core::Error::Config("expert offload requires a file-backed provider".into())
+            })?;
             let stores = grim_nn::ExpertOffloadBanks::open(
                 path,
                 &ws.full_name("ffn_gate_exps.weight"),
@@ -2000,8 +1995,7 @@ impl Qwen38NgramEmbedding {
                     let row_vec = sp.lookup(row)?;
                     let end = dst + self.ngram_dim;
                     if row_vec.len() >= self.ngram_dim {
-                        gathered_ngram[dst..end]
-                            .copy_from_slice(&row_vec[..self.ngram_dim]);
+                        gathered_ngram[dst..end].copy_from_slice(&row_vec[..self.ngram_dim]);
                     }
                 } else if let Some(ref tv) = table_vec {
                     if src + self.ngram_dim <= tv.len() {
@@ -2148,112 +2142,111 @@ impl Qwen38FlashNext {
             )
         })?;
 
-        let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
-            (cfg.ngram_vocab_size, cfg.ngram_dim)
-        {
-            // The gather yields `ple_n_heads` rows per token, each
-            // `ple_head_dim` (= ngram_dim) wide, so the projected block is
-            // n_heads * ngram_dim wide. For the released geometry that is
-            // 16 * 160 = 2560 = hidden_size, and the reference applies no
-            // projection at all (`reshape_2d(emb, ple_head_dim * n_heads,
-            // n_tokens)`). Declaring the projection at ngram_dim is a size
-            // mismatch against that gather.
-            let ple_gathered_dim = cfg.ple_addressing()?.n_heads() * ngram_dim;
-            // The row count is PADDED past the largest head range, so it
-            // comes from the tensor's own metadata and not from the config.
-            let padded_rows = root
-                .meta("per_layer_token_embd.weight")
-                .map(|m| m.shape[0])
-                .unwrap_or(ngram_vocab);
-            // The checkpoint PADS the PLE table past the largest head range:
-            // `per_layer_token_embd.weight` is [160, 320001536] while
-            // max(head_offset + head_vocab_size) is 320001446. Probing the
-            // derived row count can therefore never match, so the tensor is
-            // fetched by name and its own shape is trusted.
-            let table = match root
-                .with_device(Device::Cpu)
-                .get([padded_rows, ngram_dim], "per_layer_token_embd.weight")
-            {
-                Ok(t) => t,
-                Err(_) => root
+        let ngram_embeddings =
+            if let (Some(ngram_vocab), Some(ngram_dim)) = (cfg.ngram_vocab_size, cfg.ngram_dim) {
+                // The gather yields `ple_n_heads` rows per token, each
+                // `ple_head_dim` (= ngram_dim) wide, so the projected block is
+                // n_heads * ngram_dim wide. For the released geometry that is
+                // 16 * 160 = 2560 = hidden_size, and the reference applies no
+                // projection at all (`reshape_2d(emb, ple_head_dim * n_heads,
+                // n_tokens)`). Declaring the projection at ngram_dim is a size
+                // mismatch against that gather.
+                let ple_gathered_dim = cfg.ple_addressing()?.n_heads() * ngram_dim;
+                // The row count is PADDED past the largest head range, so it
+                // comes from the tensor's own metadata and not from the config.
+                let padded_rows = root
+                    .meta("per_layer_token_embd.weight")
+                    .map(|m| m.shape[0])
+                    .unwrap_or(ngram_vocab);
+                // The checkpoint PADS the PLE table past the largest head range:
+                // `per_layer_token_embd.weight` is [160, 320001536] while
+                // max(head_offset + head_vocab_size) is 320001446. Probing the
+                // derived row count can therefore never match, so the tensor is
+                // fetched by name and its own shape is trusted.
+                let table = match root
                     .with_device(Device::Cpu)
-                    .scoped("layers")
-                    .scoped("1")
-                    .scoped("ple")
-                    .scoped("ple_embedding")
-                    .scoped("ngram_embedding")
-                    .get([ngram_vocab, ngram_dim], "shard_0")
-                    .or_else(|_| {
-                        root.with_device(Device::Cpu)
-                            .scoped("ngram_embeddings")
-                            .get([ngram_vocab, ngram_dim], "weight")
-                    })
-                    .or_else(|_| {
-                        root.with_device(Device::Cpu)
-                            .scoped("ple_ngram_embd")
-                            .get([ngram_vocab, ngram_dim], "weight")
-                    })
-                    .map_err(|e| {
-                        grim_core::Error::Config(format!(
-                            "Qwen38FlashNext: config defines ngram_vocab_size={ngram_vocab}, \
+                    .get([padded_rows, ngram_dim], "per_layer_token_embd.weight")
+                {
+                    Ok(t) => t,
+                    Err(_) => root
+                        .with_device(Device::Cpu)
+                        .scoped("layers")
+                        .scoped("1")
+                        .scoped("ple")
+                        .scoped("ple_embedding")
+                        .scoped("ngram_embedding")
+                        .get([ngram_vocab, ngram_dim], "shard_0")
+                        .or_else(|_| {
+                            root.with_device(Device::Cpu)
+                                .scoped("ngram_embeddings")
+                                .get([ngram_vocab, ngram_dim], "weight")
+                        })
+                        .or_else(|_| {
+                            root.with_device(Device::Cpu)
+                                .scoped("ple_ngram_embd")
+                                .get([ngram_vocab, ngram_dim], "weight")
+                        })
+                        .map_err(|e| {
+                            grim_core::Error::Config(format!(
+                                "Qwen38FlashNext: config defines ngram_vocab_size={ngram_vocab}, \
                              ngram_dim={ngram_dim}, but no PLE table was found under any known \
                              name (per_layer_token_embd [{ngram_dim}, {ngram_vocab}], \
                              layers.1.ple.*, ngram_embeddings, ple_ngram_embd): {e}"
-                        ))
-                    })?,
-            };
+                            ))
+                        })?,
+                };
 
-            let proj = Linear::load_shape(
-                &root
-                    .with_device(Device::Cpu)
-                    .scoped("layers")
-                    .scoped("1")
-                    .scoped("ple")
-                    .scoped("key_proj"),
-                [ple_gathered_dim, cfg.hidden_size],
-            )
-            .or_else(|_| {
-                Linear::load_shape(
-                    &root.with_device(Device::Cpu).scoped("ngram_proj"),
+                let proj = Linear::load_shape(
+                    &root
+                        .with_device(Device::Cpu)
+                        .scoped("layers")
+                        .scoped("1")
+                        .scoped("ple")
+                        .scoped("key_proj"),
                     [ple_gathered_dim, cfg.hidden_size],
                 )
-            })
-            .or_else(|_| {
-                Linear::load_shape(
-                    &root.with_device(Device::Cpu).scoped("ple_ngram_proj"),
-                    [ple_gathered_dim, cfg.hidden_size],
-                )
-            })
-            .map_err(|e| {
-                grim_core::Error::Config(format!(
-                    "Qwen38FlashNext: checkpoint config specifies PLE projection, \
+                .or_else(|_| {
+                    Linear::load_shape(
+                        &root.with_device(Device::Cpu).scoped("ngram_proj"),
+                        [ple_gathered_dim, cfg.hidden_size],
+                    )
+                })
+                .or_else(|_| {
+                    Linear::load_shape(
+                        &root.with_device(Device::Cpu).scoped("ple_ngram_proj"),
+                        [ple_gathered_dim, cfg.hidden_size],
+                    )
+                })
+                .map_err(|e| {
+                    grim_core::Error::Config(format!(
+                        "Qwen38FlashNext: checkpoint config specifies PLE projection, \
                      but 'key_proj'/'ngram_proj' were not found in weights: {e}"
-                ))
-            })?;
+                    ))
+                })?;
 
-            let addressing = cfg.ple_addressing()?;
-            let spill = std::env::var("GRIM_PLE_SPILL_F32").ok().map(|p| {
-                std::sync::Arc::new(grim_nn::SpillableEmbedding::new_spilled(
-                    None,
-                    std::path::PathBuf::from(p),
-                    64,
-                    1024,
+                let addressing = cfg.ple_addressing()?;
+                let spill = std::env::var("GRIM_PLE_SPILL_F32").ok().map(|p| {
+                    std::sync::Arc::new(grim_nn::SpillableEmbedding::new_spilled(
+                        None,
+                        std::path::PathBuf::from(p),
+                        64,
+                        1024,
+                        ngram_dim,
+                    ))
+                });
+
+                Some(Qwen38NgramEmbedding {
+                    ngram_vocab_size: ngram_vocab,
                     ngram_dim,
-                ))
-            });
-
-            Some(Qwen38NgramEmbedding {
-                ngram_vocab_size: ngram_vocab,
-                ngram_dim,
-                hidden_size: cfg.hidden_size,
-                table,
-                proj,
-                addressing,
-                spill,
-            })
-        } else {
-            None
-        };
+                    hidden_size: cfg.hidden_size,
+                    table,
+                    proj,
+                    addressing,
+                    spill,
+                })
+            } else {
+                None
+            };
 
         let num_layers_to_load = cfg.num_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
@@ -2954,7 +2947,9 @@ mod moe_d2d_parity_tests {
         let experts = match &block.experts {
             Qwen38MoeExperts::Individual(v) => v,
             Qwen38MoeExperts::Bank(_) => panic!("host_reference only supports Individual experts"),
-            Qwen38MoeExperts::Offloaded(_) => panic!("host_reference only supports Individual experts"),
+            Qwen38MoeExperts::Offloaded(_) => {
+                panic!("host_reference only supports Individual experts")
+            }
         };
         let n_exp = experts.len();
         let mut out = vec![0.0f32; seq * hidden];

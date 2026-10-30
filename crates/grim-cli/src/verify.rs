@@ -199,10 +199,15 @@ fn verify_metadata<R: Read + Seek>(
                         "[OK]    {}: {} bytes, sha256:{}",
                         att.kind,
                         att.size,
-                        att.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                        att.sha256
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
                     ),
                     Err(e) => {
-                        report.errors.push(format!("Attachment '{}': {e}", att.kind));
+                        report
+                            .errors
+                            .push(format!("Attachment '{}': {e}", att.kind));
                         println!("[ERR]  Attachment '{}': {e}", att.kind);
                     }
                 }

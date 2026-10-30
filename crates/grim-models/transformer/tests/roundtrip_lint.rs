@@ -82,6 +82,13 @@ fn roundtrip_budget_not_exceeded() {
         ("falcon_h1.rs", 25), // WI-A: +4 test-module asserts; ratchet down in WI-G
         ("gemma.rs", 15),
         ("gemma2.rs", 13),
+        // Gemma 4: the full-attention "proportional" rope runs on the host
+        // (the device rope derives the pair count and the partner offset from
+        // one `rotary_dim`), the attention runs on the host (the device kernel
+        // hardcodes the `1/sqrt(head_dim)` softmax scale and Gemma 4 uses
+        // 1.0), the per-layer embedding is re-indexed on the host, and the
+        // final logit softcap is a host pass. Same seams as gemma2.rs.
+        ("gemma4.rs", 10),
         ("glm5_2.rs", 9),
         ("gpt2.rs", 11),
         ("kv_attention.rs", 1),

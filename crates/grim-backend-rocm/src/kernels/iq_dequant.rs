@@ -7,55 +7,76 @@ extern "C" {
 
     // ─── IQ dequant helpers (mirrors iq_gemm.rs device functions) ──
 
+    // block_iq2_xxs: 66 bytes / 256 weights. d(f16) @0, qs[64] @2 — no signs
+    // field; the top 4 bits of each group's aux32 carry the sub-scale and the
+    // low 28 bits carry four 7-bit sign patterns. Was a stub with a fabricated
+    // `(idx + i%8) % 4 - 1.5` grid and a `blk + 34` signs field this layout
+    // does not have. Mirrors `grim_quant::dequant_iq2xxs` and charon.rs.
     __device__ inline float dequant_iq2xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 34;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * val * sign_val;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        const unsigned char* aux8 = qs + 8 * ib32;
+        unsigned int aux32 = (unsigned int)aux8[4]
+                           | ((unsigned int)aux8[5] << 8)
+                           | ((unsigned int)aux8[6] << 16)
+                           | ((unsigned int)aux8[7] << 24);
+        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.25f;
+        unsigned long long gv = IQ2XXS_GRID[aux8[l]];
+        unsigned int signs = KSIGNS_IQ2XS[(aux32 >> (7 * l)) & 127];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
+    // block_iq2_xs: 74 bytes / 256 weights. d(f16) @0, qs[64] @2, scales[8] @66
+    // — one scale byte per 32 weights, NOT a per-16 sub-scale at offset 34, and
+    // there is no `signs` field: signs ride `q_val >> 9`. Was the same stub as
+    // IQ2_XXS above. Mirrors `grim_quant::dequant_iq2xs` and charon.rs.
     __device__ inline float dequant_iq2xs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 34;
-        const unsigned char* signs = blk + 42;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        const unsigned char* scales = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned char sc_byte = scales[ib32];
+        float db = d * (0.5f + (float)((l < 2) ? (sc_byte & 0x0F) : (sc_byte >> 4))) * 0.25f;
+        int q_off = (ib32 * 4 + l) * 2;
+        unsigned int q_val = (unsigned int)qs[q_off] | ((unsigned int)qs[q_off + 1] << 8);
+        unsigned long long gv = IQ2XS_GRID[q_val & 511];
+        unsigned int signs = KSIGNS_IQ2XS[q_val >> 9];
+        float g = (float)((gv >> (8 * j)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
+
     __device__ inline float dequant_iq2s_device(const unsigned char* blk, int in_sb) {
-        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 50;
-        const unsigned char* signs = blk + 58;
-        int sb = in_sb / 16;
-        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
-        float scale = d * sc;
-        int grid_idx = qs[in_sb / 8];
-        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * val * sign_val;
+        return dequant_iq2s(blk, in_sb);
     }
 
     __device__ inline float dequant_iq3xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* signs = blk + 66;
-        int grid_idx = qs[in_sb / 8];
-        int sub_idx = in_sb % 8;
-        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
-        int sign_byte_idx = (in_sb / 8);
-        if (sign_byte_idx >= 30) sign_byte_idx = 29;
-        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return d * base_val * 0.25f * sign_val;
+        const unsigned char* ss = blk + 66;
+        int ib32 = in_sb / 32;
+        int l = (in_sb % 32) / 8;
+        int j = in_sb % 8;
+        unsigned int aux = (unsigned int)ss[4 * ib32]
+                         | ((unsigned int)ss[4 * ib32 + 1] << 8)
+                         | ((unsigned int)ss[4 * ib32 + 2] << 16)
+                         | ((unsigned int)ss[4 * ib32 + 3] << 24);
+        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        unsigned int signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 127];
+        unsigned int gv = (j < 4) ? IQ3XXS_GRID[qs[ib32 * 8 + 2 * l]]
+                                  : IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1]];
+        int jj = (j < 4) ? j : j - 4;
+        float g = (float)((gv >> (8 * jj)) & 0xFF);
+        float sign = (signs & KMASK_IQ2XS[j]) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
     // block_q3_S layout, mirroring grim_quant::dequant_iq3s exactly:
@@ -103,22 +124,36 @@ extern "C" {
         return d * kvalues_iq4nl[q_code];
     }
 
+    // block_iq4_xs (136 B / 256): d f16 @0..2, scales_h u16 @2..4,
+    // scales_l[4] @4..8, qs[128] @8..136. Matches llama.cpp
+    // `dequantize_row_iq4_xs` and `grim_quant::dequant_iq4xs` byte-for-byte.
+    //
+    // The previous body was a stub that disagreed with BOTH in four ways: it
+    // read the 8 sub-block scales as a contiguous 6-bit field (they are a
+    // 2-bit high part per sub-block in `scales_h` plus a 4-bit low part in
+    // `scales_l`), omitted the `-32` bias, interleaved the nibbles (they are
+    // 16 low then 16 high per sub-block), and skipped the `kvalues_iq4nl`
+    // codebook. Every IQ4_XS weight — 117 tensors in the 27B — decoded wrong,
+    // which is why the 27B was gibberish while the 9B (no IQ4_XS) was correct.
     __device__ inline float dequant_iq4xs_device(const unsigned char* blk, int in_sb) {
-        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* sc = blk + 2;
+        const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+        const unsigned char* sc_h = blk + 2;
+        const unsigned char* sc_l = blk + 4;
         const unsigned char* qs = blk + 8;
-        int group = in_sb / 32;
-        int sc_byte_idx = (group * 6) / 8;
-        int sc_bit_offset = (group * 6) % 8;
-        unsigned int sc_val = 0;
-        sc_val = sc[sc_byte_idx] >> sc_bit_offset;
-        if (sc_bit_offset > 2) {
-            sc_val |= (unsigned int)sc[sc_byte_idx + 1] << (8 - sc_bit_offset);
-        }
-        sc_val &= 0x3F;
-        int q_byte = in_sb / 2;
-        unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-        return d * (float)sc_val * (float)q_code;
+        const int ib = in_sb >> 5;   // sub-block 0..7 (32 weights each)
+        const int j = in_sb & 31;    // 0..31 within the sub-block
+        const unsigned int scales_h = (unsigned int)sc_h[0] | ((unsigned int)sc_h[1] << 8);
+        const int ls = (int)((sc_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                     | (((int)((scales_h >> (2 * ib)) & 3)) << 4);
+        const float dl = d * (float)(ls - 32);
+        // Elements 0..15 take the LOW nibble of qs[0..15]; 16..31 the HIGH.
+        const unsigned char qb = qs[ib * 16 + (j & 15)];
+        const unsigned char q_code = (j < 16) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+        };
+        return dl * kvalues_iq4nl[q_code];
     }
 
     // ─── Standalone global kernels ──────────────────────────────────
@@ -196,7 +231,7 @@ extern "C" {
     {
         const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + (size_t)b * 96;
+        const unsigned char* blk = packed + (size_t)b * 98;  /* IQ3_XXS: 98 B per 256 */;
         float* dst = out + (size_t)b * 256;
         const int base = threadIdx.x * 4;
         float4 v;
@@ -332,6 +367,67 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
+    /// Dequantize IQ4_NL packed bytes directly to __half (F16) for accelerated prefill rocBLAS GEMM.
+    /// Uses 64 threads per workgroup decoding 8 blocks (8 threads per 32-element block, 4 elements per thread)
+    /// to eliminate launch overhead across large weight matrices (e.g. 17408x5120).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq4nl_f16(
+        const unsigned char* __restrict__ packed,
+        __half* __restrict__ out,
+        int n_blocks)
+    {
+        const int tid = threadIdx.x;
+        const int block_in_wg = tid / 8;
+        const int b = blockIdx.x * 8 + block_in_wg;
+        if (b >= n_blocks) return;
+
+        const unsigned char* blk = packed + (size_t)b * 18;
+        __half* dst = out + (size_t)b * 32;
+        const int base = (tid % 8) * 4;
+        dst[base + 0] = __float2half(dequant_iq4nl_device(blk, base + 0));
+        dst[base + 1] = __float2half(dequant_iq4nl_device(blk, base + 1));
+        dst[base + 2] = __float2half(dequant_iq4nl_device(blk, base + 2));
+        dst[base + 3] = __float2half(dequant_iq4nl_device(blk, base + 3));
+    }
+
+    /// Dequantize IQ4_XS packed bytes directly to __half (F16) for accelerated prefill rocBLAS GEMM.
+    /// One 64-thread block per 256-element quant block; each thread decodes 4 elements.
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq4xs_f16(
+        const unsigned char* __restrict__ packed,
+        __half* __restrict__ out,
+        int n_blocks)
+    {
+        const int b = blockIdx.x;
+        if (b >= n_blocks) return;
+        const unsigned char* blk = packed + (size_t)b * 136;
+        __half* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        dst[base + 0] = __float2half(dequant_iq4xs_device(blk, base + 0));
+        dst[base + 1] = __float2half(dequant_iq4xs_device(blk, base + 1));
+        dst[base + 2] = __float2half(dequant_iq4xs_device(blk, base + 2));
+        dst[base + 3] = __float2half(dequant_iq4xs_device(blk, base + 3));
+    }
+
+    /// Dequantize IQ3_S packed bytes directly to __half (F16) for accelerated prefill rocBLAS GEMM.
+    /// One 64-thread block per 256-element quant block; each thread decodes 4 elements.
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq3s_f16(
+        const unsigned char* __restrict__ packed,
+        __half* __restrict__ out,
+        int n_blocks)
+    {
+        const int b = blockIdx.x;
+        if (b >= n_blocks) return;
+        const unsigned char* blk = packed + (size_t)b * 110;
+        __half* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        dst[base + 0] = __float2half(dequant_iq3s_device(blk, base + 0));
+        dst[base + 1] = __float2half(dequant_iq3s_device(blk, base + 1));
+        dst[base + 2] = __float2half(dequant_iq3s_device(blk, base + 2));
+        dst[base + 3] = __float2half(dequant_iq3s_device(blk, base + 3));
+    }
+
 }
 "#;
 
@@ -348,5 +444,8 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_dequant_iq3s"));
         assert!(KERNEL_SOURCE.contains("grim_dequant_iq4nl"));
         assert!(KERNEL_SOURCE.contains("grim_dequant_iq4xs"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_iq4nl_f16"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_iq4xs_f16"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_iq3s_f16"));
     }
 }

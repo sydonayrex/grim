@@ -12,10 +12,10 @@ use grim_backend_vulkan;
 use grim_core::error::Result;
 use grim_core::model::CausalLm;
 use grim_core::sampler::{Sampler, SamplingParams};
-use grim_core::session::Inner as SessionInner;
+use grim_core::session::{Inner as SessionInner, SessionT};
 use grim_engine::{
-    model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
     Engine, EngineConfig,
+    model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
 };
 use grim_format::GgufTokenizer;
 
@@ -31,7 +31,12 @@ fn embedded_mtp_draft_path(model_path: &str) -> Option<String> {
         .ok()?
         .into_iter()
         .find(|a| a.kind == "mtp")?;
-    let sha16: String = att.sha256.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let sha16: String = att
+        .sha256
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let dest = std::env::temp_dir()
         .join("grim-sidecars")
         .join(format!("{sha16}-mtp.gguf"));
@@ -51,7 +56,7 @@ fn embedded_mtp_draft_path(model_path: &str) -> Option<String> {
     }
 }
 use grim_models_transformer::{
-    Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek32, DeepSeek4, Gemma2, Lfm2, Lfm2Config, Llama,
+    Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek4, DeepSeek32, Gemma2, Lfm2, Lfm2Config, Llama,
     LlamaConfig, Mistral3, Qwen35,
 };
 use grim_tensor::{CoreTensorOps, Device};
@@ -142,6 +147,217 @@ fn load_run_tokenizer(
         }
     }
     Ok(None)
+}
+
+/// Emit diffable JSON startup config banner to stderr
+pub(crate) fn emit_startup_config_banner(
+    model: &dyn CausalLm,
+    device: &Device,
+    prompt_len: usize,
+    max_tokens: usize,
+) {
+    let mut banner = serde_json::Map::new();
+    banner.insert(
+        "banner_type".into(),
+        serde_json::Value::String("grim_config".into()),
+    );
+
+    // Device topology mapping (rocm ordinal -> sysfs card -> PCI bus)
+    let mut devices_json = Vec::new();
+    let gm = resolve_graph_model(model);
+    let split_tuple = gm.and_then(|g| g.layer_devices_split()).unwrap_or((32, 32));
+
+    if let Device::Rocm(_) = device {
+        if let Ok(devs) = grim_backend_rocm::RocmDevice::probe() {
+            for d in &devs {
+                let ord = d.ordinal();
+                let mut dev_map = serde_json::Map::new();
+                dev_map.insert("rocm_idx".into(), serde_json::Value::Number(ord.into()));
+                let pci = grim_backend_rocm::device::util::get_device_pci_bus_id(ord)
+                    .unwrap_or_else(|| "unknown".into());
+                let sysfs = grim_backend_rocm::device::util::get_device_sysfs_card(ord)
+                    .unwrap_or_else(|| format!("card{ord}"));
+                let arch = grim_backend_rocm::device::util::detect_gpu_arch(ord as i32);
+                let (free, total) = grim_backend_rocm::device::capability_profiler::vram_info(ord);
+                let (free_raw, _quantized_free, total_raw) =
+                    grim_backend_rocm::device::capability_profiler::vram_info_detailed(ord);
+                let layers = if ord == 0 {
+                    split_tuple.0
+                } else {
+                    split_tuple.1
+                };
+
+                dev_map.insert("sysfs".into(), serde_json::Value::String(sysfs));
+                dev_map.insert("pci".into(), serde_json::Value::String(pci));
+                dev_map.insert("arch".into(), serde_json::Value::String(arch));
+                dev_map.insert("layers".into(), serde_json::Value::Number(layers.into()));
+                dev_map.insert(
+                    "free_vram_mb".into(),
+                    serde_json::Value::Number((free / (1024 * 1024)).into()),
+                );
+                dev_map.insert(
+                    "total_vram_mb".into(),
+                    serde_json::Value::Number((total / (1024 * 1024)).into()),
+                );
+                dev_map.insert(
+                    "free_vram_raw_bytes".into(),
+                    serde_json::Value::Number(free_raw.into()),
+                );
+                dev_map.insert(
+                    "total_vram_raw_bytes".into(),
+                    serde_json::Value::Number(total_raw.into()),
+                );
+                devices_json.push(serde_json::Value::Object(dev_map));
+            }
+        }
+    }
+    banner.insert("devices".into(), serde_json::Value::Array(devices_json));
+
+    // Split
+    let mut split_map = serde_json::Map::new();
+    split_map.insert(
+        "rocm:0".into(),
+        serde_json::Value::Number(split_tuple.0.into()),
+    );
+    split_map.insert(
+        "rocm:1".into(),
+        serde_json::Value::Number(split_tuple.1.into()),
+    );
+    banner.insert("split".into(), serde_json::Value::Object(split_map));
+
+    // KV Cache
+    let kv_fmt = grim_backend_rocm::parse_kv_arena_env(
+        std::env::var("GRIM_KV_ARENA")
+            .ok()
+            .as_deref()
+            .unwrap_or("int4"),
+    )
+    .unwrap_or(grim_backend_rocm::KvArenaFormat::Int4);
+    let kv_cap: usize = std::env::var("GRIM_KV_CACHE_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    let mut kv_map = serde_json::Map::new();
+    kv_map.insert(
+        "dtype".into(),
+        serde_json::Value::String(format!("{kv_fmt:?}")),
+    );
+    kv_map.insert("capacity".into(), serde_json::Value::Number(kv_cap.into()));
+    let bytes_per_elem = kv_fmt.bytes_per_elem();
+    let qwen_attn_layers = 16;
+    let n_kv = 4;
+    let head_dim = 256;
+    let dev0_attn_layers =
+        (split_tuple.0 * qwen_attn_layers) / (split_tuple.0 + split_tuple.1).max(1);
+    let dev1_attn_layers = qwen_attn_layers - dev0_attn_layers;
+    let dev0_kv_mb = (dev0_attn_layers * n_kv * head_dim * 2 * kv_cap) as f32 * bytes_per_elem
+        / (1024.0 * 1024.0);
+    let dev1_kv_mb = (dev1_attn_layers * n_kv * head_dim * 2 * kv_cap) as f32 * bytes_per_elem
+        / (1024.0 * 1024.0);
+    kv_map.insert(
+        "dev0_bytes_mb".into(),
+        serde_json::Value::Number(
+            serde_json::Number::from_f64(dev0_kv_mb as f64).unwrap_or(serde_json::Number::from(0)),
+        ),
+    );
+    kv_map.insert(
+        "dev1_bytes_mb".into(),
+        serde_json::Value::Number(
+            serde_json::Number::from_f64(dev1_kv_mb as f64).unwrap_or(serde_json::Number::from(0)),
+        ),
+    );
+    banner.insert("kv".into(), serde_json::Value::Object(kv_map));
+
+    // Dot4 kernels
+    let dot4_enabled = !matches!(
+        std::env::var("GRIM_DOT_GEMV").as_deref(),
+        Ok("0" | "false" | "off")
+    );
+    let mut dot4_map = serde_json::Map::new();
+    dot4_map.insert("enabled".into(), serde_json::Value::Bool(dot4_enabled));
+    dot4_map.insert("iq4nl".into(), serde_json::Value::Bool(dot4_enabled));
+    dot4_map.insert("iq4xs".into(), serde_json::Value::Bool(dot4_enabled));
+    dot4_map.insert("q4k".into(), serde_json::Value::Bool(dot4_enabled));
+    dot4_map.insert("q5k".into(), serde_json::Value::Bool(dot4_enabled));
+    dot4_map.insert("q6k".into(), serde_json::Value::Bool(dot4_enabled));
+    banner.insert("dot4".into(), serde_json::Value::Object(dot4_map));
+
+    // Dequant prefill path
+    let dequant_on = !matches!(
+        std::env::var("GRIM_PREFILL_DEQUANT_GEMM").as_deref(),
+        Ok("0" | "false" | "off")
+    );
+    let dequant_min_m: usize = std::env::var("GRIM_PREFILL_DEQUANT_MIN_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let mut dequant_map = serde_json::Map::new();
+    dequant_map.insert("enabled".into(), serde_json::Value::Bool(dequant_on));
+    dequant_map.insert(
+        "min_m".into(),
+        serde_json::Value::Number(dequant_min_m.into()),
+    );
+    banner.insert(
+        "dequant_prefill".into(),
+        serde_json::Value::Object(dequant_map),
+    );
+
+    // Chunk size
+    let chunk_size = compute_auto_chunk_size(prompt_len, max_tokens);
+    banner.insert(
+        "chunk_size".into(),
+        serde_json::Value::Number(chunk_size.into()),
+    );
+
+    // Active env flags
+    let mut flags_map = serde_json::Map::new();
+    let dev0 = grim_backend_rocm::RocmDevice::shared(0);
+    if let Ok(h0) = dev0.get_rocblas_handle() {
+        let mut mode: grim_backend_rocm::RocblasAtomicsMode = 0;
+        unsafe {
+            grim_backend_rocm::rocblas_get_atomics_mode(h0, &mut mode);
+        }
+        flags_map.insert(
+            "rocblas_atomics_mode".into(),
+            serde_json::Value::Number(mode.into()),
+        );
+        flags_map.insert(
+            "rocblas_atomics_not_allowed".into(),
+            serde_json::Value::Bool(mode == grim_backend_rocm::rocblas_atomics_not_allowed),
+        );
+    }
+    for key in [
+        "GRIM_KV_ARENA",
+        "GRIM_DECODE_W4A4",
+        "GRIM_BW_PLACEMENT",
+        "GRIM_SPLIT_LAYERS",
+        "GRIM_PREWARM",
+        "GRIM_PREFILL_CHUNK_SIZE",
+        "GRIM_ROCBLAS_DETERMINISTIC",
+        "GRIM_POISON_ALLOC",
+    ] {
+        let val = std::env::var(key).unwrap_or_else(|_| "default".into());
+        flags_map.insert(key.into(), serde_json::Value::String(val));
+    }
+    banner.insert("flags".into(), serde_json::Value::Object(flags_map));
+
+    if let Ok(json_str) = serde_json::to_string(&banner) {
+        eprintln!("{json_str}");
+    }
+}
+
+/// Compute auto chunk size from measured free VRAM capped between 1,024 and 2,048
+pub(crate) fn compute_auto_chunk_size(_prompt_len: usize, _max_tokens: usize) -> usize {
+    if let Ok(v) = std::env::var("GRIM_PREFILL_CHUNK_SIZE") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(16);
+        }
+    }
+    // Query minimum free VRAM across visible ROCm cards
+    let (free0, _) = grim_backend_rocm::device::capability_profiler::vram_info(0);
+    let (free1, _) = grim_backend_rocm::device::capability_profiler::vram_info(1);
+    let min_free_mb = (free0.min(free1) / (1024 * 1024)) as usize;
+    if min_free_mb >= 4000 { 2048 } else { 1024 }
 }
 
 /// Resolve a `&dyn DecodeGraphModel` from a model reference, unwrapping `SpeculativeCausalLm`
@@ -498,12 +714,16 @@ fn try_graph_decode_step(
         );
         return None;
     }
+    unsafe {
+        let _ = grim_backend_rocm::hipDeviceSynchronize();
+    }
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
 
     // Diagnostic: dump the replayed graph's own logits — the Sampled path
     // below never materializes them, so a diverging replay is invisible
     // (steps 2+ print no logprobs). GRIM_DEBUG_TOPLOGITS=1 enables.
     if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+        let _guard = grim_backend_rocm::device::util::DeviceGuard::set(0);
         // Localize the first NaN: scan each layer's graph-owned input buffer
         // (post-replay, stream synced by read paths below... sync first).
         unsafe {
@@ -544,21 +764,23 @@ fn try_graph_decode_step(
             .and_then(|a| usize::from_str_radix(a.trim_start_matches("0x"), 16).ok())
             .map(|q| vec![("GRIM_PEEK_ADDR".to_string(), q)])
             .unwrap_or_default();
-        if let Some(a) = grim_backend_rocm::device::compute::gemm_launchers::last_captured_head_gemv_a() {
+        if let Some(a) =
+            grim_backend_rocm::device::compute::gemm_launchers::last_captured_head_gemv_a()
+        {
             addrs.push(("head_gemv_A".to_string(), a));
         }
         for (tag, q) in addrs {
             {
-            let mut v = [0f32; 4];
-            let _ = unsafe {
-                grim_backend_rocm::hipMemcpy(
-                    v.as_mut_ptr() as *mut std::ffi::c_void,
-                    q as *mut std::ffi::c_void,
-                    16,
-                    grim_backend_rocm::HipMemcpyKind::DeviceToHost,
-                )
-            };
-            eprintln!("[graph-peek] {tag} {q:#x} head={v:?}");
+                let mut v = [0f32; 4];
+                let _ = unsafe {
+                    grim_backend_rocm::hipMemcpy(
+                        v.as_mut_ptr() as *mut std::ffi::c_void,
+                        q as *mut std::ffi::c_void,
+                        16,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    )
+                };
+                eprintln!("[graph-peek] {tag} {q:#x} head={v:?}");
             }
         }
         if let Ok(addr) = std::env::var("GRIM_PEEK_ADDR") {
@@ -600,7 +822,10 @@ fn try_graph_decode_step(
                     idx[0]
                 );
             } else {
-                eprintln!("[graph-toplogits] step={step} logits len {} != vocab {vocab}", flat.len());
+                eprintln!(
+                    "[graph-toplogits] step={step} logits len {} != vocab {vocab}",
+                    flat.len()
+                );
             }
         } else {
             eprintln!("[graph-toplogits] step={step} read_logits_f32 failed");
@@ -614,9 +839,10 @@ fn try_graph_decode_step(
         // coincidence — a future split of graph/sampler streams would
         // silently race. On miss (kernel not yet pre-resolved), sync the
         // graph stream once and take the ambient path (one-time cost).
-        if let Device::Rocm(ordinal) = device {
-            let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
-            let stream = g.stream;
+        if let Device::Rocm(_) = device {
+            let logits_ord = g.logits_device_storage().device_ordinal();
+            let dev = grim_backend_rocm::RocmDevice::shared(logits_ord);
+            let stream = dev.active_stream();
             let gate = sampling_params;
             match grim_backend_rocm::sample_logits_on_device_with_penalty_at_stream(
                 &dev,
@@ -645,8 +871,9 @@ fn try_graph_decode_step(
                 }
             }
         }
+        let logits_device = Device::Rocm(g.logits_device_storage().device_ordinal());
         if let Ok(tok) = sample_storage_on_rocm(
-            device,
+            &logits_device,
             g.logits_device_storage(),
             sampling_params,
             seed,
@@ -1002,105 +1229,16 @@ pub async fn cmd_run(
     }
 
     // One-shot inference path with generation loop.
-    let model: Box<dyn CausalLm> = if use_gguf {
-        eprintln!("[grim] Loading GGUF model: {}", model_path_str);
-        match load_model_from_gguf(&model_path_str, device.clone()) {
-            Ok(m) => {
-                eprintln!("[grim] GGUF model loaded successfully.");
-                if let Device::Rocm(o) = &device {
-                    let (free, total) = grim_backend_rocm::vram_info(*o);
-                    eprintln!(
-                        "[vram] after load: free {:.2} GiB / total {:.2} GiB",
-                        free as f64 / (1 << 30) as f64,
-                        total as f64 / (1 << 30) as f64
-                    );
-                }
-                m
-            }
-            Err(e) => {
-                eprintln!(
-                    "[grim] ERROR: failed to load GGUF model '{}': {}",
-                    model_path_str, e
-                );
-                return Err(e);
-            }
-        }
-    } else if use_grim {
-        eprintln!("[grim] Loading GRIM model: {}", model_path_str);
-        match load_model_from_grim(&model_path_str, device.clone()) {
-            Ok(m) => {
-                eprintln!("[grim] GRIM model loaded successfully.");
-                m
-            }
-            Err(e) => {
-                eprintln!(
-                    "[grim] ERROR: failed to load GRIM model '{}': {}",
-                    model_path_str, e
-                );
-                return Err(e);
-            }
-        }
-    } else if use_safetensors {
-        eprintln!("[grim] Loading safetensors model: {}", model_path_str);
-        match load_model_from_safetensors(&model_path_str, device.clone()) {
-            Ok(m) => {
-                eprintln!("[grim] safetensors model loaded successfully.");
-                m
-            }
-            Err(e) => {
-                eprintln!(
-                    "[grim] ERROR: failed to load safetensors model '{}': {}",
-                    model_path_str, e
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // Fail loudly — never generate from a toy model.
-        return Err(grim_core::error::Error::Config(format!(
-            "Model '{}' is not a valid .gguf, .grim, or .safetensors file or could not be found.\n\
-             Run 'grim pull <name>' to download a model, or provide an\n\
-             explicit path to a .gguf, .grim, or .safetensors file.",
-            model_path_str
-        )));
-    };
-
-    // Speculative decoding: if --draft-model was provided, wrap the base model.
-    // Full DSpark (markov+confidence scheduling) is wired in the HTTP engine path;
-    // CLI one-shot uses plain autoregressive + pre-loaded draft for future extension.
-    // ponytail: plain wrapper — add DSpark when CLI speculation throughput is measured.
-    // One-file speculative loading: fall back to an embedded MTP sidecar
-    // when --draft-model was not given.
-    let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
-    let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
-        let dev = model.device().clone();
-        match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
-            Ok(eagle3) => {
-                eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
-                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
-                // ponytail: plain for now; swap to with_dspark when markov/confidence CLI path added
-                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
-            }
-            Err(_) => match grim_engine::model_loader::load_from_path(d_path) {
-                Ok(_draft_raw) => {
-                    eprintln!(
-                        "[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)"
-                    );
-                    Box::new(grim_speculative::SpeculativeCausalLm::plain(model))
-                        as Box<dyn CausalLm>
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model"
-                    );
-                    model
-                }
-            },
-        }
-    } else {
-        model
-    };
-
+    //
+    // The tokenizer load, prompt tokenization, and the dynamic KV policy below
+    // all run BEFORE the model is loaded, deliberately: the placement planner
+    // inside `load_model_from_gguf` reads live free VRAM to reserve KV arenas
+    // and split layers, and the policy sets GRIM_KV_ARENA / GRIM_KV_CACHE_LEN
+    // from a VRAM probe. Probing after the load (the old order) addressed VRAM
+    // the planner had already committed, so the two disagreed about how much
+    // arena the cards could hold. Probing pre-load sees exactly the free VRAM
+    // the planner sees, so they agree. None of this touches the model object,
+    // which is why it can precede the load.
     let tokenizer = load_run_tokenizer(
         path_obj,
         &model_path_str,
@@ -1239,6 +1377,221 @@ pub async fn cmd_run(
         prompt.bytes().map(|b| b as u32 % 512).collect()
     };
 
+    // Dynamic KV policy & preflight sizing:
+    // If GRIM_KV_CACHE_LEN or GRIM_KV_ARENA are not explicitly fixed, derive optimal
+    // format and capacity from PRE-LOAD free VRAM across both cards — the same
+    // reading the placement planner inside the load uses to reserve arenas, so
+    // the two agree instead of the policy addressing VRAM the planner already
+    // committed.
+    let max_thinking: usize = std::env::var("GRIM_MAX_THINK_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    let total_budget_needed = tokens.len() + max_tokens + max_thinking;
+
+    if matches!(device, Device::Rocm(_)) {
+        let (d0_free_raw, _, _) = grim_backend_rocm::vram_info_detailed(0);
+        let (d1_free_raw, _, _) = grim_backend_rocm::vram_info_detailed(1);
+        let safety_floor_bytes = 512 * 1024 * 1024u64; // 512 MB floor
+        let d0_available = d0_free_raw.saturating_sub(safety_floor_bytes);
+        let d1_available = d1_free_raw.saturating_sub(safety_floor_bytes);
+        let min_headroom_bytes = d0_available.min(d1_available);
+
+        // Qwen3.8-27B geometry: 16 full-attention layers, 4 KV heads, head_dim 256.
+        // Distributed across 2 cards = 8 attention layers per card.
+        // Per-token row per card:
+        // K and V tensors: 8 layers * 4 kv_heads * 256 head_dim * 2 (K+V) = 16,384 elements / token row.
+        let attn_layers_per_card = 8u64;
+        let elems_per_token_row = attn_layers_per_card * 4 * 256 * 2; // 16384 elements
+
+        // Format selection if not explicitly set:
+        if std::env::var("GRIM_KV_ARENA").is_err() {
+            // F16: 2 bytes/elem = 32,768 bytes/row
+            let f16_row_bytes = elems_per_token_row * 2;
+            // INT8: 1 byte/elem + scale sidecars (8 layers * 4 heads * 4 bytes * 2 (K+V) = 256 bytes) = 16,640 bytes/row
+            let int8_row_bytes = elems_per_token_row * 1 + (attn_layers_per_card * 4 * 4 * 2);
+            // INT4: 0.5 bytes/elem + scale sidecars = 8,448 bytes/row
+            let _int4_row_bytes = (elems_per_token_row / 2) + (attn_layers_per_card * 4 * 4 * 2);
+
+            let chosen_format =
+                if (total_budget_needed as u64) * f16_row_bytes <= min_headroom_bytes {
+                    "f16"
+                } else if (total_budget_needed as u64) * int8_row_bytes <= min_headroom_bytes {
+                    "int8"
+                } else {
+                    "int4"
+                };
+            unsafe {
+                std::env::set_var("GRIM_KV_ARENA", chosen_format);
+            }
+            eprintln!(
+                "[dynamic-kv] Probed min free VRAM {} MB (safety floor 512 MB). Target budget {} tokens -> promoted GRIM_KV_ARENA={}",
+                min_headroom_bytes / (1024 * 1024),
+                total_budget_needed,
+                chosen_format
+            );
+        }
+
+        // Capacity resolution if not explicitly set:
+        if std::env::var("GRIM_KV_CACHE_LEN").is_err() {
+            let kv_fmt = grim_backend_rocm::parse_kv_arena_env(
+                std::env::var("GRIM_KV_ARENA")
+                    .ok()
+                    .as_deref()
+                    .unwrap_or("int4"),
+            )
+            .unwrap_or(grim_backend_rocm::KvArenaFormat::Int4);
+
+            let bytes_per_elem = kv_fmt.bytes_per_elem();
+            let sidecar_bytes = match kv_fmt {
+                grim_backend_rocm::KvArenaFormat::F32 | grim_backend_rocm::KvArenaFormat::F16 => {
+                    0u64
+                }
+                _ => attn_layers_per_card * 4 * 4 * 2,
+            };
+            let row_bytes =
+                (elems_per_token_row as f64 * (bytes_per_elem as f64)) as u64 + sidecar_bytes;
+            let max_fit_capacity = if row_bytes > 0 {
+                (min_headroom_bytes / row_bytes) as usize
+            } else {
+                4096
+            };
+            // Budget at least total_budget_needed, clamped to max headroom and minimum 4096:
+            let resolved_cap = total_budget_needed
+                .max(4096)
+                .min(max_fit_capacity.max(4096));
+            unsafe {
+                std::env::set_var("GRIM_KV_CACHE_LEN", resolved_cap.to_string());
+            }
+            eprintln!(
+                "[dynamic-kv] Dynamic capacity resolved: GRIM_KV_CACHE_LEN={} (max fit {} tokens)",
+                resolved_cap, max_fit_capacity
+            );
+        }
+    }
+
+    let model: Box<dyn CausalLm> = if use_gguf {
+        eprintln!("[grim] Loading GGUF model: {}", model_path_str);
+        match load_model_from_gguf(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] GGUF model loaded successfully.");
+                if let Device::Rocm(o) = &device {
+                    let (free, total) = grim_backend_rocm::vram_info(*o);
+                    eprintln!(
+                        "[vram] after load: free {:.2} GiB / total {:.2} GiB",
+                        free as f64 / (1 << 30) as f64,
+                        total as f64 / (1 << 30) as f64
+                    );
+                }
+                m
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim] ERROR: failed to load GGUF model '{}': {}",
+                    model_path_str, e
+                );
+                return Err(e);
+            }
+        }
+    } else if use_grim {
+        eprintln!("[grim] Loading GRIM model: {}", model_path_str);
+        match load_model_from_grim(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] GRIM model loaded successfully.");
+                m
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim] ERROR: failed to load GRIM model '{}': {}",
+                    model_path_str, e
+                );
+                return Err(e);
+            }
+        }
+    } else if use_safetensors {
+        eprintln!("[grim] Loading safetensors model: {}", model_path_str);
+        match load_model_from_safetensors(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] safetensors model loaded successfully.");
+                m
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim] ERROR: failed to load safetensors model '{}': {}",
+                    model_path_str, e
+                );
+                return Err(e);
+            }
+        }
+    } else {
+        // Fail loudly — never generate from a toy model.
+        return Err(grim_core::error::Error::Config(format!(
+            "Model '{}' is not a valid .gguf, .grim, or .safetensors file or could not be found.\n\
+             Run 'grim pull <name>' to download a model, or provide an\n\
+             explicit path to a .gguf, .grim, or .safetensors file.",
+            model_path_str
+        )));
+    };
+
+    // Speculative decoding: if --draft-model was provided, wrap the base model.
+    // Full DSpark (markov+confidence scheduling) is wired in the HTTP engine path;
+    // CLI one-shot uses plain autoregressive + pre-loaded draft for future extension.
+    // ponytail: plain wrapper — add DSpark when CLI speculation throughput is measured.
+    // One-file speculative loading: fall back to an embedded MTP sidecar
+    // when --draft-model was not given.
+    let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
+    let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
+        let dev = model.device().clone();
+        match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
+            Ok(eagle3) => {
+                eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
+                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
+                // ponytail: plain for now; swap to with_dspark when markov/confidence CLI path added
+                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+            }
+            Err(_) => match grim_engine::model_loader::load_from_path(d_path) {
+                Ok(_draft_raw) => {
+                    eprintln!(
+                        "[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)"
+                    );
+                    Box::new(grim_speculative::SpeculativeCausalLm::plain(model))
+                        as Box<dyn CausalLm>
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model"
+                    );
+                    model
+                }
+            },
+        }
+    } else {
+        model
+    };
+
+    // Prewarm u4 lane weights at model load time BEFORE any requests/prefill.
+    // Eliminates memory contention and peak VRAM spikes during prefill, and gives
+    // short prompts the fast ~141 ms decode rate from token one.
+    let prewarm_opt_out = matches!(
+        std::env::var("GRIM_PREWARM").as_deref(),
+        Ok("0" | "false" | "off")
+    );
+    if !prewarm_opt_out {
+        if let Some(gm) = resolve_graph_model(&*model) {
+            let t0 = std::time::Instant::now();
+            let r = gm.prewarm_lane_weights();
+            if std::env::var("GRIM_PREWARM_TRACE").is_ok()
+                || std::env::var("GRIM_PLACEMENT_TRACE").is_ok()
+            {
+                eprintln!(
+                    "[prewarm-load] lane weights {:?} ok={:?}",
+                    t0.elapsed(),
+                    r.is_ok()
+                );
+            }
+        }
+    }
+
     // Determine vocab size — fall back to tokenizer vocab length if model
     // config type is unknown (GPT2, Gemma, DeepSeek, etc.)
     let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
@@ -1256,6 +1609,26 @@ pub async fn cmd_run(
     } else {
         512
     };
+
+    // Emit diffable JSON startup config banner
+    emit_startup_config_banner(&*model, &device, tokens.len(), max_tokens);
+
+    // Preflight context budget check: verify prompt + max_tokens + thinking budget against KV capacity
+    let kv_cap_configured: usize = std::env::var("GRIM_KV_CACHE_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    if total_budget_needed > kv_cap_configured {
+        eprintln!(
+            "[preflight warning] Prompt ({}) + max_new ({}) + thinking_budget ({}) = {} tokens, \
+             which exceeds configured GRIM_KV_CACHE_LEN ({}). Cache overflow will occur if generation does not terminate early.",
+            tokens.len(),
+            max_tokens,
+            max_thinking,
+            total_budget_needed,
+            kv_cap_configured
+        );
+    }
 
     println!("Prompt: {prompt}");
     println!("Device: {device_name}");
@@ -1291,57 +1664,204 @@ pub async fn cmd_run(
         let chunk_len: usize = std::env::var("GRIM_SCORE_CHUNK_LEN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|&v| v >= 64 && v <= 32768)
-            .unwrap_or(1024);
+            .filter(|&v| v >= 16 && v <= 32768)
+            .unwrap_or_else(|| {
+                if full.len() > 1 {
+                    (full.len() - 1).min(1024)
+                } else {
+                    1024
+                }
+            });
+        let decode_mode = matches!(
+            std::env::var("GRIM_SCORE_DECODE_MODE").as_deref(),
+            Ok("1" | "true" | "on")
+        );
         let mut nll = 0.0f64;
         let mut n_target = 0usize;
         let mut chunks = 0usize;
         let mut start = 0usize;
         let score_start = std::time::Instant::now();
-        while start + chunk_len + 1 <= full.len() {
-            let ids_c: Vec<u32> = full[start..start + chunk_len].to_vec();
-            let targets: Vec<u32> = full[start + 1..start + chunk_len + 1].to_vec();
-            start += chunk_len;
-            let mut sess = SessionInner::new(model.device().clone());
-            let seq = ids_c.len();
-            let in_t = grim_tensor::Tensor::new(
-                std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
-                    &ids_c.iter().map(|&i| i as f32).collect::<Vec<f32>>(),
-                    &grim_tensor::Shape::new(vec![1, seq]),
-                    grim_tensor::dtype::DType::F32,
-                )?),
-                grim_tensor::Shape::new(vec![1, seq]),
-                grim_tensor::dtype::DType::F32,
-                grim_tensor::dtype::QuantProvenance::default(),
-                model.device().clone(),
+
+        let dump_nll_path = std::env::var("GRIM_DUMP_NLL_FILE").ok();
+        let mut per_pos_nll: Vec<(usize, f64, u32)> = Vec::new();
+
+        if decode_mode {
+            let max_seq_eval = std::env::var("GRIM_SCORE_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
+            let eval_total = full.len().saturating_sub(1);
+            eprintln!(
+                "[ppl-decode] Running M=1 step-by-step decode evaluation across {eval_total} tokens (chunked to {max_seq_eval})..."
             );
-            let pos_t = grim_tensor::Tensor::new(
-                std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
-                    &(0..seq as u32).map(|i| i as f32).collect::<Vec<f32>>(),
-                    &grim_tensor::Shape::new(vec![1, seq]),
+
+            let prefill_len = std::env::var("GRIM_SCORE_PREFILL_SEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32);
+            let mut chunk_start = 0;
+            while chunk_start + prefill_len + 1 < full.len() {
+                let chunk_end = (chunk_start + max_seq_eval).min(full.len().saturating_sub(1));
+                if chunk_end <= chunk_start + prefill_len {
+                    break;
+                }
+                let mut sess = SessionInner::new(model.device().clone());
+                let pref_ids = &full[chunk_start..chunk_start + prefill_len];
+                let in_pref = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                        &pref_ids.iter().map(|&i| i as f32).collect::<Vec<f32>>(),
+                        &grim_tensor::Shape::new(vec![1, prefill_len]),
+                        grim_tensor::dtype::DType::F32,
+                    )?),
+                    grim_tensor::Shape::new(vec![1, prefill_len]),
                     grim_tensor::dtype::DType::F32,
-                )?),
-                grim_tensor::Shape::new(vec![1, seq]),
-                grim_tensor::dtype::DType::F32,
-                grim_tensor::dtype::QuantProvenance::default(),
-                model.device().clone(),
-            );
-            let logits = CausalLm::forward(&*model, &mut sess, &in_t, &pos_t, &[])?;
-            let lv = logits.to_vec_f32()?;
-            for t in 0..seq - 1 {
-                let row = &lv[t * vocab..(t + 1) * vocab];
-                let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let logsumexp: f32 = row
-                    .iter()
-                    .map(|&x| ((x - max) as f64).exp() as f32)
-                    .sum::<f32>()
-                    .ln()
-                    + max;
-                let tgt = targets[t] as usize;
-                nll += -((row[tgt] - logsumexp) as f64);
-                n_target += 1;
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    model.device().clone(),
+                );
+                let pos_pref = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(
+                        grim_backend_cpu::CpuDevice::new().from_cpu(
+                            &(0..prefill_len as u32)
+                                .map(|i| i as f32)
+                                .collect::<Vec<f32>>(),
+                            &grim_tensor::Shape::new(vec![1, prefill_len]),
+                            grim_tensor::dtype::DType::F32,
+                        )?,
+                    ),
+                    grim_tensor::Shape::new(vec![1, prefill_len]),
+                    grim_tensor::dtype::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    model.device().clone(),
+                );
+                let mut last_logits =
+                    CausalLm::forward(&*model, &mut sess, &in_pref, &pos_pref, &[])?;
+
+                for local_pos in prefill_len..(chunk_end - chunk_start) {
+                    let global_pos = chunk_start + local_pos;
+                    let tgt = full[global_pos] as usize;
+                    let lv = last_logits.to_vec_f32()?;
+                    let last_start = lv.len().saturating_sub(vocab);
+                    let row = &lv[last_start..];
+                    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let logsumexp: f32 = row
+                        .iter()
+                        .map(|&x| ((x - max) as f64).exp() as f32)
+                        .sum::<f32>()
+                        .ln()
+                        + max;
+                    let tok_nll = -((row[tgt] - logsumexp) as f64);
+                    nll += tok_nll;
+                    n_target += 1;
+                    if dump_nll_path.is_some() {
+                        // argmax top-1 token
+                        let mut best_tok = 0u32;
+                        let mut best_val = f32::NEG_INFINITY;
+                        for (idx, &val) in row.iter().enumerate() {
+                            if val > best_val {
+                                best_val = val;
+                                best_tok = idx as u32;
+                            }
+                        }
+                        per_pos_nll.push((global_pos, tok_nll, best_tok));
+                    }
+
+                    // Step 1 token through M=1 decode
+                    let next_token_val = full[global_pos];
+                    let in_tok = grim_tensor::Tensor::new(
+                        std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                            &[next_token_val as f32],
+                            &grim_tensor::Shape::new(vec![1, 1]),
+                            grim_tensor::dtype::DType::F32,
+                        )?),
+                        grim_tensor::Shape::new(vec![1, 1]),
+                        grim_tensor::dtype::DType::F32,
+                        grim_tensor::dtype::QuantProvenance::default(),
+                        model.device().clone(),
+                    );
+                    let pos_tok = grim_tensor::Tensor::new(
+                        std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                            &[local_pos as f32],
+                            &grim_tensor::Shape::new(vec![1, 1]),
+                            grim_tensor::dtype::DType::F32,
+                        )?),
+                        grim_tensor::Shape::new(vec![1, 1]),
+                        grim_tensor::dtype::DType::F32,
+                        grim_tensor::dtype::QuantProvenance::default(),
+                        model.device().clone(),
+                    );
+                    last_logits = CausalLm::forward(&*model, &mut sess, &in_tok, &pos_tok, &[])?;
+                }
+                chunks += 1;
+                chunk_start += chunk_end - chunk_start;
             }
-            chunks += 1;
+        } else {
+            while start + chunk_len + 1 <= full.len() {
+                let ids_c: Vec<u32> = full[start..start + chunk_len].to_vec();
+                let targets: Vec<u32> = full[start + 1..start + chunk_len + 1].to_vec();
+                let global_offset = start;
+                start += chunk_len;
+                let mut sess = SessionInner::new(model.device().clone());
+                let seq = ids_c.len();
+                let in_t = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                        &ids_c.iter().map(|&i| i as f32).collect::<Vec<f32>>(),
+                        &grim_tensor::Shape::new(vec![1, seq]),
+                        grim_tensor::dtype::DType::F32,
+                    )?),
+                    grim_tensor::Shape::new(vec![1, seq]),
+                    grim_tensor::dtype::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    model.device().clone(),
+                );
+                let pos_t = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                        &(0..seq as u32).map(|i| i as f32).collect::<Vec<f32>>(),
+                        &grim_tensor::Shape::new(vec![1, seq]),
+                        grim_tensor::dtype::DType::F32,
+                    )?),
+                    grim_tensor::Shape::new(vec![1, seq]),
+                    grim_tensor::dtype::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    model.device().clone(),
+                );
+                let logits = CausalLm::forward(&*model, &mut sess, &in_t, &pos_t, &[])?;
+                let lv = logits.to_vec_f32()?;
+                for t in 0..seq - 1 {
+                    let row = &lv[t * vocab..(t + 1) * vocab];
+                    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let logsumexp: f32 = row
+                        .iter()
+                        .map(|&x| ((x - max) as f64).exp() as f32)
+                        .sum::<f32>()
+                        .ln()
+                        + max;
+                    let tgt = targets[t] as usize;
+                    let tok_nll = -((row[tgt] - logsumexp) as f64);
+                    nll += tok_nll;
+                    n_target += 1;
+                    if dump_nll_path.is_some() {
+                        let mut best_tok = 0u32;
+                        let mut best_val = f32::NEG_INFINITY;
+                        for (idx, &val) in row.iter().enumerate() {
+                            if val > best_val {
+                                best_val = val;
+                                best_tok = idx as u32;
+                            }
+                        }
+                        // position of target token in full is global_offset + t + 1
+                        per_pos_nll.push((global_offset + t + 1, tok_nll, best_tok));
+                    }
+                }
+                chunks += 1;
+            }
+        }
+        if let Some(path) = &dump_nll_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::File::create(path) {
+                for (pos, nll_val, best_tok) in &per_pos_nll {
+                    let _ = writeln!(f, "{pos}\t{nll_val:.6}\t{best_tok}");
+                }
+            }
         }
         let elapsed_s = score_start.elapsed().as_secs_f64();
         let ppl = (nll / n_target as f64).exp();
@@ -1390,8 +1910,8 @@ pub async fn cmd_run(
     // i-was-dumb-graph.md Phase 5: full-model graph state. Allocated once,
     // reused for stable addresses. `None` + `graph_failed` = eager fallback.
     let mut ctx_exhausted = false;
-    // One-shot: the decode-only lane-weight prewarm overlaps the prefill.
-    let mut prewarm_done = false;
+    // One-shot: the decode-only lane-weight prewarm was completed at model load.
+    let mut prewarm_done = true;
     let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
     let mut graph_just_captured = false;
     let mut graph_retry = grim_backend_rocm::graph_capture::GraphRetryPolicy::default_policy();
@@ -1402,7 +1922,57 @@ pub async fn cmd_run(
     // Generation loop
     let mut decode_total_us: u64 = 0;
     let mut decode_count: u64 = 0;
+    let mut prefill_us: u64 = 0;
+    grim_backend_rocm::reset_kernel_route_counters();
+    let initial_launch_count = if let Device::Rocm(ord) = device {
+        grim_backend_rocm::RocmDevice::new(ord).launch_count()
+    } else {
+        0
+    };
+    // GRIM_PHASE_TRACE=1: the phase-level wall-clock breakdown of the decode
+    // window (experiment (c) of plans/PLAN-m1-decode-regime-experiments.md).
+    //
+    // The plan's open item was the ~12 s CONSTANT inside the 27B's reported
+    // per-token number: a constant that size is a ONE-TIME cost landing
+    // inside the averaged window, not per-token work, and until it is named
+    // "606 ms/token" is an average over an unexplained constant. The
+    // per-step (path, duration) list is what identifies it: a constant shows
+    // up as a few steps that are orders of magnitude above the steady state.
+    let phase_trace_on = std::env::var_os("GRIM_PHASE_TRACE").is_some();
+    let phase_window_start = std::time::Instant::now();
+    let mut phase_steps: Vec<(u64, &'static str)> = Vec::new();
+    // res0-addendum (HybridAgents): a compute budget counted in FORWARD PASSES
+    // (prefill + every decode step) rather than emitted tokens. A draft/verify
+    // or any multi-forward primitive spends passes without emitting tokens, so
+    // a token cap cannot bound compute; this can. GRIM_MAX_FORWARD_PASSES=N.
+    let max_forward_passes: Option<usize> = std::env::var("GRIM_MAX_FORWARD_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut forward_passes = 0usize;
+
+    // Track reasoning (<think> ... </think>) state:
+    // If prompt ended with <think> or model emits it, do not count reasoning tokens
+    // towards `max_tokens` (capped by max_reasoning_passes safety budget).
+    let prompt_has_think = tokenizer.as_ref().map_or(false, |tok| {
+        let decoded = tok.decode(&tokens);
+        decoded.contains("<think>") && !decoded.contains("</think>")
+    });
+    let mut in_thinking = prompt_has_think;
+    let max_thinking_passes: usize = std::env::var("GRIM_MAX_THINK_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    let mut thinking_passes = 0usize;
+
     while generated < max_tokens {
+        if let Some(budget) = max_forward_passes {
+            if forward_passes >= budget {
+                eprintln!(
+                    "[grim] Forward-pass budget {budget} reached ({generated} tokens generated); stopping."
+                );
+                break;
+            }
+        }
         // Prefill on first pass to populate KV caches; decode one token at a time after.
         // HIGH-3: save first_pass before input_ids block mutates it to avoid wrong positions.
         let is_prefill = first_pass;
@@ -1457,7 +2027,7 @@ pub async fn cmd_run(
             // step allocate; later ROCm steps never reach here.
             let n_tokens = input_ids.len();
             let shape = grim_tensor::Shape::new(vec![n_tokens]);
-            let float_tokens = input_ids;
+            let float_tokens = input_ids.clone();
             let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
 
             // Forward pass with proper positions tensor (CRIT-1).
@@ -1513,7 +2083,10 @@ pub async fn cmd_run(
                 allow_gpu_sample,
                 &history,
                 Some(&session as &dyn grim_core::session::SessionT),
-                tokens.len() as u32,
+                // Fix off-by-one: `tokens` contains the prompt plus the unscheduled token
+                // being decoded in this step. The eager cache only contains tokens forwarded
+                // so far (`tokens.len() - 1`). Passing `tokens.len()` read unwritten tail rows!
+                tokens.len().saturating_sub(1) as u32,
                 &mut ctx_exhausted,
                 &mut graph_just_captured,
             )
@@ -1540,16 +2113,25 @@ pub async fn cmd_run(
         }
         let next_token = match graph_hit {
             Some(GraphDecodeResult::Sampled(tok)) => {
+                // A graph replay IS one forward pass — count it like eager.
+                forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                if phase_trace_on {
+                    phase_steps.push((step_us, "graph-sampled"));
+                }
                 step_timing!(step_us, "graph-sampled");
                 tok
             }
             Some(GraphDecodeResult::Logits(logits)) => {
+                forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                if phase_trace_on {
+                    phase_steps.push((step_us, "graph-logits"));
+                }
                 step_timing!(step_us, "graph-logits");
                 let logits_vec = logits.to_vec_f32()?;
                 let last_start = logits_vec.len().saturating_sub(vocab);
@@ -1585,7 +2167,20 @@ pub async fn cmd_run(
                 let want_prewarm =
                     is_prefill && !prewarm_done && gm_ref.is_some() && !prewarm_opt_out;
                 if is_prefill {
+                    grim_backend_rocm::set_prefill_in_flight(true);
                     prewarm_done = true;
+                }
+                // Diagnostic (GRIM_MGPU_SYNC=1): drain every visible ROCm device
+                // before starting a step. If a cross-device page fault
+                // disappears with this on, the cause is an unsynced dependency
+                // between the previous step's last-device work and this step's
+                // first-device kernels.
+                if std::env::var_os("GRIM_MGPU_SYNC").is_some() {
+                    if let Ok(devs) = grim_backend_rocm::RocmDevice::probe() {
+                        for d in &devs {
+                            d.synchronize();
+                        }
+                    }
                 }
                 let logits = if want_prewarm {
                     std::thread::scope(|scope| {
@@ -1607,18 +2202,77 @@ pub async fn cmd_run(
                             positions_tensor,
                             &[],
                         );
+                        forward_passes += 1;
                         let _ = handle.join();
                         out
                     })?
+                } else if is_prefill
+                    && input_ids.len() > compute_auto_chunk_size(tokens.len(), max_tokens)
+                {
+                    let total_prompt = input_ids.len();
+                    let max_chunk = compute_auto_chunk_size(tokens.len(), max_tokens);
+                    // Balanced chunking: split into equal-sized chunks so tail chunks don't fall
+                    // below the dequant/WMMA threshold (M >= 4) into decode-precision GEMVs.
+                    let n_chunks = (total_prompt + max_chunk - 1) / max_chunk;
+                    let mut chunk_start = 0;
+                    let mut rem_tokens = total_prompt;
+                    let mut rem_chunks = n_chunks;
+                    let mut final_out = None;
+                    while chunk_start < total_prompt {
+                        let chunk_sz = (rem_tokens + rem_chunks - 1) / rem_chunks;
+                        let chunk_end = (chunk_start + chunk_sz).min(total_prompt);
+                        let is_last = chunk_end == total_prompt;
+                        session.set_skip_output_projection(!is_last);
+                        let sub_input: Vec<f32> = input_ids[chunk_start..chunk_end].to_vec();
+                        let sub_pos: Vec<f32> =
+                            (chunk_start..chunk_end).map(|i| i as f32).collect();
+                        let sub_in_shape = grim_tensor::Shape::new(vec![sub_input.len()]);
+                        let sub_in_tensor = build_tensor(&sub_input, &sub_in_shape, &device)?;
+                        let sub_pos_shape = grim_tensor::Shape::new(vec![sub_pos.len()]);
+                        let sub_pos_tensor = build_tensor(&sub_pos, &sub_pos_shape, &device)?;
+                        let out = CausalLm::forward(
+                            &*model,
+                            &mut session,
+                            &sub_in_tensor,
+                            &sub_pos_tensor,
+                            &[],
+                        )?;
+                        forward_passes += 1;
+                        if is_last {
+                            final_out = Some(out);
+                        }
+                        chunk_start = chunk_end;
+                        rem_tokens = rem_tokens.saturating_sub(chunk_sz);
+                        rem_chunks = rem_chunks.saturating_sub(1);
+                    }
+                    final_out.expect("at least one chunk was processed")
                 } else {
-                    CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?
+                    let out = CausalLm::forward(
+                        &*model,
+                        &mut session,
+                        input_tensor,
+                        positions_tensor,
+                        &[],
+                    )?;
+                    forward_passes += 1;
+                    out
                 };
+                if is_prefill {
+                    grim_backend_rocm::set_prefill_in_flight(false);
+                }
                 let step_us = step_start.elapsed().as_micros() as u64;
                 if !is_prefill {
                     decode_total_us += step_us;
                     decode_count += 1;
+                    if phase_trace_on {
+                        phase_steps.push((step_us, "eager"));
+                    }
                     step_timing!(step_us, "eager");
                 } else {
+                    prefill_us = step_us;
+                    if phase_trace_on {
+                        phase_steps.push((step_us, "prefill"));
+                    }
                     step_timing!(step_us, "prefill");
                 }
 
@@ -1748,7 +2402,30 @@ pub async fn cmd_run(
         // Update state
         tokens.push(next_token);
         history.push(next_token);
-        generated += 1;
+
+        // Check if thinking concluded or began
+        if let Some(tok) = &tokenizer {
+            let piece = tok.decode(&[next_token]);
+            if in_thinking {
+                thinking_passes += 1;
+                if piece.contains("</think>") || tok.decode(&generated_tokens).contains("</think>")
+                {
+                    in_thinking = false;
+                } else if thinking_passes >= max_thinking_passes {
+                    eprintln!(
+                        "[grim] Reached max thinking token limit ({max_thinking_passes}); ending think phase."
+                    );
+                    in_thinking = false;
+                }
+            } else if piece.contains("<think>") {
+                in_thinking = true;
+                thinking_passes += 1;
+            } else {
+                generated += 1;
+            }
+        } else {
+            generated += 1;
+        }
 
         // Check for EOS or ChatML stop tokens, respecting min_tokens budget.
         if let Some(tok) = &tokenizer {
@@ -1794,6 +2471,13 @@ pub async fn cmd_run(
     }
 
     println!("\n[grim] Done. Generated {} tokens.", generated);
+    if prefill_us > 0 {
+        eprintln!(
+            "[grim] Time to first token (TTFT): {:.2} ms (prefill tokens: {})",
+            prefill_us as f64 / 1000.0,
+            prefill_len
+        );
+    }
     if decode_count > 0 {
         let avg_us = decode_total_us / decode_count;
         let tps = 1_000_000.0 / avg_us as f64;
@@ -1807,12 +2491,92 @@ pub async fn cmd_run(
             String::new()
         };
         eprintln!(
-            "[grim] Decode: {:.2} ms/token avg ({} tokens, {:.0} tokens/sec{})",
+            "[grim] Decode: {:.2} ms/token avg ({} tokens, {:.1} tokens/sec{})",
             avg_us as f64 / 1000.0,
             decode_count,
             tps,
             bw_str
         );
+    }
+    let final_launches = if let Device::Rocm(ord) = device {
+        grim_backend_rocm::RocmDevice::new(ord)
+            .launch_count()
+            .saturating_sub(initial_launch_count)
+    } else {
+        0
+    };
+    eprintln!("[grim] Total GPU kernel launches: {}", final_launches);
+    let routes = grim_backend_rocm::kernel_route_snapshot();
+    if !routes.is_empty() {
+        eprintln!("[grim] Top kernel launches by entry:");
+        let mut sorted_routes = routes;
+        sorted_routes.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, count) in sorted_routes.iter().take(10) {
+            eprintln!("  - {:<40}: {}", name, count);
+        }
+    }
+    // GRIM_PHASE_TRACE=1: name the constant. The reported average is
+    // total/count; if the window also holds a one-time cost (the graph
+    // capture's eager warmup, the prefill tail, the lane prewarm) the average
+    // is that cost smeared over every token. The steady state is the
+    // MEDIAN step; the excess is everything above median*n.
+    if phase_trace_on && !phase_steps.is_empty() {
+        let mut durs: Vec<u64> = phase_steps.iter().map(|(us, _)| *us).collect();
+        durs.sort_unstable();
+        let n = durs.len();
+        let p50 = durs[n / 2];
+        let p90 = durs[((n as f64 * 0.9) as usize).min(n - 1)];
+        let max = durs[n - 1];
+        let sum: u64 = durs.iter().sum();
+        let steady = p50 as u64 * n as u64;
+        let excess = sum.saturating_sub(steady);
+        eprintln!(
+            "[phase-trace] window={:.3}s steps={n} p50={:.1}ms p90={:.1}ms max={:.1}ms",
+            phase_window_start.elapsed().as_secs_f64(),
+            p50 as f64 / 1000.0,
+            p90 as f64 / 1000.0,
+            max as f64 / 1000.0
+        );
+        eprintln!(
+            "[phase-trace] step_sum={:.3}s  steady(median*n)={:.3}s  EXCESS={:.3}s ({:.1}% of the window)",
+            sum as f64 / 1e6,
+            steady as f64 / 1e6,
+            excess as f64 / 1e6,
+            excess as f64 / 1e6 / (phase_window_start.elapsed().as_secs_f64().max(1e-9)) * 100.0
+        );
+        // The slowest steps, with their path: the constant is NAMED by which
+        // path carried it.
+        let mut by_cost: Vec<(u64, &'static str)> = phase_steps.clone();
+        by_cost.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut shown = 0usize;
+        for (us, path) in &by_cost {
+            if shown >= 6 {
+                break;
+            }
+            eprintln!(
+                "[phase-trace] slow step #{shown}: {:.1} ms  path={path}",
+                *us as f64 / 1000.0
+            );
+            shown += 1;
+        }
+        // Per-path totals.
+        let mut paths: Vec<(&'static str, u64, u64)> = Vec::new();
+        for (us, path) in &phase_steps {
+            match paths.iter_mut().find(|(p, _, _)| p == path) {
+                Some((_, tot, cnt)) => {
+                    *tot += us;
+                    *cnt += 1;
+                }
+                None => paths.push((path, *us, 1)),
+            }
+        }
+        for (path, tot, cnt) in &paths {
+            eprintln!(
+                "[phase-trace] path {path:<14} n={cnt:<5} total={:.3}s  mean={:.2}ms",
+                *tot as f64 / 1e6,
+                *tot as f64 / 1e3 / (*cnt).max(1) as f64
+            );
+        }
     }
     // B3: operator-visible graph status (PLAN-reduce-d2h-h2d).
     if matches!(device, Device::Rocm(_)) {

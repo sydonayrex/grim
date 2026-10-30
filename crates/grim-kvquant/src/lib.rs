@@ -1,5 +1,22 @@
 //! `grim-kvquant` - runtime KV cache compression.
 //! §5.4 of the architecture: compress *runtime* KV blocks in place inside `grim-memory`'s block pool.
+//!
+//! # Scope: this crate is the SPILL/DEMOTE compressor, not the decode arena
+//!
+//! Everything here runs on the **host** (`LloydMaxCompressor::compress` pulls
+//! its inputs to `Vec<f32>` first), and its consumer is the paged/block pool:
+//! when a block leaves VRAM (`KvBlockPool::free_with_tier` / `evict_cold`), it
+//! is packed here before being written to host RAM or NVMe. It is deliberately
+//! NOT on the decode hot path — a per-step host round-trip would stall the
+//! stream.
+//!
+//! The **decode-time** KV representation is a different thing entirely and
+//! lives in the backends: the dense arena is selected by `GRIM_KV_ARENA`
+//! (`f32|f16|int8|int4`) and the packed paged path by `GRIM_KV_QUANT`'s paged
+//! formats. Both are device-resident; neither calls into this crate.
+//!
+//! Consequently the profiles below ([`named_profile`]) choose how a block is
+//! packed for storage, NOT what the model attends over.
 
 use grim_core::error::Result;
 use grim_tensor::{BackendDevice, BackendStorage, Device, QuantProvenance, Shape, Tensor};
@@ -158,6 +175,49 @@ impl Default for KvQuantConfig {
         }
     }
 }
+
+/// Named compression profiles selectable from `GRIM_KV_QUANT`.
+///
+/// These mirror the KV-OMNI modality policies in [`crate::kv_omni`]
+/// (`KvModality::policy`) so the engine and the omni compressor agree on what a
+/// profile means, instead of the engine carrying its own bit-width literals.
+/// A `K8V4` name means "keys at 8 bits, values at 4 bits".
+///
+/// This crate is the **spill/demote** compressor (see the crate docs): these
+/// profiles select how a block is packed before it is written to host/NVMe.
+/// They do NOT select the dense decode-time KV arena representation — that is
+/// `GRIM_KV_ARENA` in the backend.
+pub fn named_profile(name: &str) -> Option<KvQuantConfig> {
+    let (k, v, group) = match name.trim().to_ascii_lowercase().as_str() {
+        // KV-OMNI text (shallow): K8V4, group 64.
+        "text-shallow" | "k8v4" => (8, 4, 64),
+        // KV-OMNI text (deep): K4V2, group 64.
+        "text-deep" | "k4v2" => (4, 2, 64),
+        // KV-OMNI audio: K2V2, group 32 (rotation is a compressor-side policy).
+        "audio" | "k2v2" => (2, 2, 32),
+        // KV-OMNI visual: K8V16, group 32 (Tucker-16 core).
+        "visual" | "k8v16" => (8, 16, 32),
+        _ => return None,
+    };
+    Some(KvQuantConfig {
+        key_bits: k,
+        value_bits: v,
+        group_size: group,
+        qk_compute_bits: 8,
+    })
+}
+
+/// Every name [`named_profile`] accepts, for help text and tests.
+pub const NAMED_PROFILES: &[&str] = &[
+    "text-shallow",
+    "k8v4",
+    "text-deep",
+    "k4v2",
+    "audio",
+    "k2v2",
+    "visual",
+    "k8v16",
+];
 
 /// Configuration for GPU-accelerated fused dequant-attention (P1-WI-2).
 /// When `enabled = true` **and** the caller provides a non-CPU device type, `KvCompressor::fused_attention` will delegate.
@@ -2375,5 +2435,201 @@ mod tests {
         let compressor =
             LloydMaxCompressor::new(KvQuantConfig::default()).with_channel_alloc(alloc);
         assert!(compressor.compress(&keys, &values).is_err());
+    }
+}
+
+#[cfg(test)]
+mod named_profile_tests {
+    use super::*;
+
+    /// The engine's named table must not drift from the KV-OMNI modality
+    /// policies: both describe the same profiles, so they share one source.
+    #[test]
+    fn named_profiles_match_omni_modality_policies() {
+        let shallow = KvModality::Text.policy(0.0);
+        let deep = KvModality::Text.policy(1.0);
+        let audio = KvModality::Audio.policy(0.0);
+        let visual = KvModality::Visual.policy(0.0);
+        let cases = [
+            (
+                "text-shallow",
+                shallow.key_bits,
+                shallow.value_bits,
+                shallow.group_size,
+            ),
+            ("text-deep", deep.key_bits, deep.value_bits, deep.group_size),
+            ("audio", audio.key_bits, audio.value_bits, audio.group_size),
+            ("visual", visual.key_bits, visual.value_bits, visual.group_size),
+        ];
+        for (name, k, v, g) in cases {
+            let cfg = named_profile(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(cfg.key_bits, k, "{name} key_bits");
+            assert_eq!(cfg.value_bits, v, "{name} value_bits");
+            assert_eq!(cfg.group_size, g, "{name} group_size");
+        }
+    }
+
+    #[test]
+    fn named_profile_aliases_and_rejections() {
+        assert_eq!(
+            named_profile("k8v4").unwrap().key_bits,
+            named_profile("text-shallow").unwrap().key_bits
+        );
+        assert_eq!(
+            named_profile("K4V2").unwrap().value_bits,
+            2,
+            "case-insensitive"
+        );
+        assert_eq!(
+            named_profile(" text-deep ").unwrap().key_bits,
+            4,
+            "whitespace tolerated"
+        );
+        // `int8`/`int4` are the engine's legacy profiles, deliberately not
+        // modality names — they must not resolve here.
+        assert!(named_profile("int8").is_none());
+        assert!(named_profile("int4").is_none());
+        assert!(named_profile("nonsense").is_none());
+        // Every advertised name resolves (a help-text name that does not is a
+        // bug in the table).
+        for n in NAMED_PROFILES {
+            assert!(named_profile(n).is_some(), "advertised name {n} must resolve");
+        }
+    }
+}
+
+// ─────────────────── WS-3A: K2V4 host reference ───────────────────
+
+/// Levels for the 2-bit KEY side of the asymmetric K2V4 arena: signed range
+/// `[-1, +1]`, stored biased by `+1` (codes 0..=2 of the 4 a 2-bit field
+/// holds). The natural 2-bit analogue of the int4 arena's `±7` biased `+7`.
+pub const K2V4_KEY_LEVELS: i32 = 1;
+/// Levels for the 4-bit VALUE side: signed range `[-7, +7]`, biased `+7`.
+pub const K2V4_VALUE_LEVELS: i32 = 7;
+
+/// Pack 2-bit key codes, 4 per byte, lowest bits first. `codes` are the biased
+/// 0..=3 values.
+pub fn pack_k2(codes: &[i8]) -> Vec<u8> {
+    let mut out = vec![0u8; codes.len().div_ceil(4)];
+    for (i, &c) in codes.iter().enumerate() {
+        let c = (c as u8) & 0x03;
+        out[i / 4] |= c << ((i % 4) * 2);
+    }
+    out
+}
+
+/// Inverse of [`pack_k2`]: `n` codes from the packed bytes.
+pub fn unpack_k2(bytes: &[u8], n: usize) -> Vec<i8> {
+    (0..n)
+        .map(|i| ((bytes[i / 4] >> ((i % 4) * 2)) & 0x03) as i8)
+        .collect()
+}
+
+/// Quantize one head-vector to 2-bit key codes + its amax scale.
+///
+/// Symmetric, one scale per head-vector — the SAME per-(row, kv_head) scheme
+/// the int8/int4 arenas use, only 2 bits wide. `scale` is the vector maxabs
+/// (never the step), matching the legacy convention the other arenas follow.
+pub fn quantize_k2(row: &[f32]) -> (Vec<i8>, f32) {
+    let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let scale = if amax > 1e-30 { amax } else { 1.0 };
+    let codes = row
+        .iter()
+        .map(|&v| {
+            let q = (v * K2V4_KEY_LEVELS as f32 / scale).round() as i32;
+            (q.clamp(-K2V4_KEY_LEVELS, K2V4_KEY_LEVELS) + K2V4_KEY_LEVELS) as i8
+        })
+        .collect();
+    (codes, scale)
+}
+
+/// Dequantize 2-bit key codes with their scale.
+pub fn dequantize_k2(codes: &[i8], scale: f32) -> Vec<f32> {
+    codes
+        .iter()
+        .map(|&c| ((c as i32 - K2V4_KEY_LEVELS) as f32 / K2V4_KEY_LEVELS as f32) * scale)
+        .collect()
+}
+
+/// Quantize one head-vector to 4-bit value codes + its amax scale.
+pub fn quantize_v4(row: &[f32]) -> (Vec<i8>, f32) {
+    let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let scale = if amax > 1e-30 { amax } else { 1.0 };
+    let codes = row
+        .iter()
+        .map(|&v| {
+            let q = (v * K2V4_VALUE_LEVELS as f32 / scale).round() as i32;
+            (q.clamp(-K2V4_VALUE_LEVELS, K2V4_VALUE_LEVELS) + K2V4_VALUE_LEVELS) as i8
+        })
+        .collect();
+    (codes, scale)
+}
+
+/// Dequantize 4-bit value codes with their scale.
+pub fn dequantize_v4(codes: &[i8], scale: f32) -> Vec<f32> {
+    codes
+        .iter()
+        .map(|&c| ((c as i32 - K2V4_VALUE_LEVELS) as f32 / K2V4_VALUE_LEVELS as f32) * scale)
+        .collect()
+}
+
+#[cfg(test)]
+mod k2v4_tests {
+    use super::*;
+
+    /// The 2-bit key side rounds to its own step, and a round trip stays inside
+    /// half a step — the same bound the int8 arena is gated on.
+    #[test]
+    fn k2v4_key_round_trip_is_within_half_a_step() {
+        let row = vec![0.9f32, -0.4, 0.05, -0.95, 0.5];
+        let (codes, scale) = quantize_k2(&row);
+        assert!(scale > 0.0 && scale.is_finite());
+        assert!(
+            codes.iter().all(|&c| (0..=2).contains(&c)),
+            "2-bit codes must stay in the 3 used levels: {codes:?}"
+        );
+        let back = dequantize_k2(&codes, scale);
+        let step = scale / K2V4_KEY_LEVELS as f32;
+        for (a, b) in row.iter().zip(&back) {
+            assert!(
+                (a - b).abs() <= step / 2.0 + 1e-6,
+                "key round trip {a} -> {b} exceeds half a step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn k2v4_value_round_trip_is_within_half_a_step() {
+        let row: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) / 8.0).collect();
+        let (codes, scale) = quantize_v4(&row);
+        assert!(codes.iter().all(|&c| (0..=14).contains(&c)));
+        let back = dequantize_v4(&codes, scale);
+        let step = scale / K2V4_VALUE_LEVELS as f32;
+        for (a, b) in row.iter().zip(&back) {
+            assert!((a - b).abs() <= step / 2.0 + 1e-6, "{a} -> {b}");
+        }
+    }
+
+    /// 2-bit packing is 4 codes per byte, lowest bits first.
+    #[test]
+    fn k2_pack_round_trips_and_is_dense() {
+        let codes: Vec<i8> = vec![0, 1, 2, 3, 3, 2, 1, 0, 1, 1];
+        let packed = pack_k2(&codes);
+        assert_eq!(packed.len(), codes.len().div_ceil(4), "4 codes per byte");
+        assert_eq!(unpack_k2(&packed, codes.len()), codes);
+        // 2 bits per element, vs int8's 8 — the density point of K2V4.
+        assert_eq!(packed.len() * 8, codes.len().div_ceil(4) * 8);
+    }
+
+    /// A constant vector is exact under both sides (scale of a constant is the
+    /// constant), which is what makes the round-trip bound tight.
+    #[test]
+    fn k2v4_constant_is_exact() {
+        let k = vec![0.5f32; 8];
+        let (kc, ks) = quantize_k2(&k);
+        assert!(dequantize_k2(&kc, ks).iter().all(|v| (v - 0.5).abs() < 1e-6));
+        let v = vec![-0.25f32; 8];
+        let (vc, vs) = quantize_v4(&v);
+        assert!(dequantize_v4(&vc, vs).iter().all(|x| (x + 0.25).abs() < 1e-6));
     }
 }

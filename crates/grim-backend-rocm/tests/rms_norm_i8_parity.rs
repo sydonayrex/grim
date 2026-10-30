@@ -9,7 +9,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if std::env::var("GRIM_RUN_GPU_TESTS").ok().as_deref() != Some("1") {
         return None;
     }
-        RocmDevice::try_new(0).ok()
+    RocmDevice::try_new(0).ok()
 }
 
 #[test]
@@ -27,13 +27,20 @@ fn rms_norm_i8_matches_f32_within_int8_grid() {
     // The norm weight itself, quantized per-tensor absmax INT8.
     let mut state = 0xC0FF_EE12_3456_789Au64;
     let mut rand = || {
-        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
         ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
-    let norm_w: Vec<f32> = (0..dim).map(|i| 0.5 + rand().abs() * (i as f32 % 7.0)).collect();
+    let norm_w: Vec<f32> = (0..dim)
+        .map(|i| 0.5 + rand().abs() * (i as f32 % 7.0))
+        .collect();
     let amax = norm_w.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let scale = amax / 127.0;
-    let codes: Vec<u8> = norm_w.iter().map(|v| ((v / scale).round() as i8) as u8).collect();
+    let codes: Vec<u8> = norm_w
+        .iter()
+        .map(|v| ((v / scale).round() as i8) as u8)
+        .collect();
     let deq_w: Vec<f32> = norm_w.iter().map(|v| (v / scale).round() * scale).collect();
 
     // Frame: [u64 codes_len][codes][u64 scales_len][f32 scale]
@@ -54,10 +61,13 @@ fn rms_norm_i8_matches_f32_within_int8_grid() {
     let out_shape = Shape::new(vec![rows, dim]);
 
     let x_bytes: Vec<u8> = x.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let x_dev = MemoryOps::from_cpu_bytes(&dev, &x_bytes, &Shape::new(vec![rows, dim]), DType::F32).unwrap();
+    let x_dev = MemoryOps::from_cpu_bytes(&dev, &x_bytes, &Shape::new(vec![rows, dim]), DType::F32)
+        .unwrap();
     let w_bytes: Vec<u8> = norm_w.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let w_f32_dev = MemoryOps::from_cpu_bytes(&dev, &w_bytes, &Shape::new(vec![dim]), DType::F32).unwrap();
-    let w_i8_dev = MemoryOps::from_cpu_bytes(&dev, &blob, &Shape::new(vec![dim]), i8_dtype).unwrap();
+    let w_f32_dev =
+        MemoryOps::from_cpu_bytes(&dev, &w_bytes, &Shape::new(vec![dim]), DType::F32).unwrap();
+    let w_i8_dev =
+        MemoryOps::from_cpu_bytes(&dev, &blob, &Shape::new(vec![dim]), i8_dtype).unwrap();
 
     // f32-weight reference
     let (ref_s, ref_h) = dev
@@ -84,7 +94,8 @@ fn rms_norm_i8_matches_f32_within_int8_grid() {
         for c in 0..dim {
             let i = r * dim + c;
             if ref_out[i].abs() > 1e-6 {
-                max_rel = max_rel.max((i8_out[i] - ref_out[i]).abs() as f64 / ref_out[i].abs() as f64);
+                max_rel =
+                    max_rel.max((i8_out[i] - ref_out[i]).abs() as f64 / ref_out[i].abs() as f64);
             }
         }
     }

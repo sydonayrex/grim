@@ -347,6 +347,10 @@ pub struct RocmDevice {
     pub(crate) reduce_partials_buf: RwLock<Option<RocmStorage>>,
     pub(crate) reduce_out_buf: RwLock<Option<RocmStorage>>,
     pub(crate) reduce_argmax_idxs_buf: Mutex<Option<RocmStorage>>,
+    /// SPEED-ROC-PREFILL: Dedicated transient scratch for IQ dequant to F16 + rocBLAS prefill GEMM.
+    /// Allocated lazily on first prefill call with M >= 32, dropped when prefill finishes.
+    pub(crate) prefill_iq_weight_f16_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) prefill_act_f16_buf: Mutex<Option<RocmStorage>>,
 }
 
 // SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
@@ -407,6 +411,8 @@ impl RocmDevice {
         {
             let _leg = crate::device::util::DeviceGuard::set(src_ordinal as i32);
             check_hip("cross-bounce D2H", unsafe {
+                // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+                crate::memory::storage::count_blocking_d2h();
                 hipMemcpyAsync(
                     staging_buf.as_mut_ptr() as *mut c_void,
                     src_ptr,
@@ -511,6 +517,7 @@ impl RocmDevice {
 
     /// Create a new ROCm device instance and initialize its handle caches and stream pool. [see: `RocmDevice::try_new`, `hipSetDevice`]
     pub fn new(ordinal: usize) -> Self {
+        crate::device::util::ensure_rocm_watchdog_started();
         match Self::try_new(ordinal) {
             Ok(dev) => dev,
             Err(e) => {
@@ -562,6 +569,16 @@ impl RocmDevice {
             let mut h: RocblasHandle = RocblasHandle(std::ptr::null_mut());
             let status = rocblas_create_handle(&mut h);
             if status == rocblas_status_success {
+                if std::env::var_os("GRIM_ROCBLAS_DETERMINISTIC").is_some() {
+                    let atomics_mode = crate::rocblas_atomics_not_allowed;
+                    let a_status = crate::rocblas_set_atomics_mode(h, atomics_mode);
+                    if a_status != crate::rocblas_status_success {
+                        eprintln!(
+                            "[grim-backend-rocm] warning: rocblas_set_atomics_mode returned {}",
+                            a_status
+                        );
+                    }
+                }
                 handle_cache = Some(h);
             }
         }
@@ -570,6 +587,9 @@ impl RocmDevice {
         let mut warp_size = 32; // Default to W32 (RDNA) fallback
         let mut xnack_val = 0;
         let mut streams = Vec::new();
+        if std::env::var_os("GRIM_INIT_TRACE").is_some() {
+            eprintln!("[init-trace] attrs done, streams...");
+        }
         unsafe {
             let mut val = 0;
             let status =
@@ -680,6 +700,24 @@ impl RocmDevice {
         }
     }
 
+    /// Device-direct-first P2P memcpy helper for the layer-split decode path. Tries direct peer DMA
+    /// and falls back to guarded host staging when the peer route fails.
+    pub fn copy_via_direct_if_possible(
+        &self,
+        src_device: i32,
+        dst_device: i32,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+        len: usize,
+    ) -> Result<()> {
+        if src_ptr.is_null() || dst_ptr.is_null() {
+            return Err(Error::Backend(
+                "copy_via_direct_if_possible: null pointer".into(),
+            ));
+        }
+        self.copy_via_route(src_device, dst_device, src_ptr, dst_ptr, len)
+    }
+
     /// P2P memcpy that routes via direct peer DMA or host-bounce staging, bridging the typed routing decision (`P2PStatus` → `RouteLink`) to the actual memcpy primitives.
     /// This is the bridge that `p2p_route.rs` defers: it calls `peer_access::peer_status` to classify the link, `to_route_link`.
     pub fn copy_via_route(
@@ -700,6 +738,59 @@ impl RocmDevice {
 
     /// Process-wide cache of constructed devices, keyed by ordinal.
     /// Constructing a `RocmDevice` is *not* cheap: it creates a rocBLAS handle (which itself hipMallocs a.
+    /// Launch the fused all-reduce + RMSNorm epilogue kernel for a 2-GPU (local+peer) slice.
+    /// This wires COMM_FUSE_KERNEL_SOURCE (`grim_fused_allreduce_rms_norm`) into serving callers.
+    pub fn launch_fused_allreduce_rmsnorm_two_gpu(
+        &self,
+        local_in: *const c_void,
+        peer_in: *const c_void,
+        weight: *const c_void,
+        res_out: *mut c_void,
+        norm_out: *mut c_void,
+        eps: f32,
+        n: usize,
+        hidden_dim: usize,
+    ) -> Result<()> {
+        if local_in.is_null()
+            || peer_in.is_null()
+            || weight.is_null()
+            || res_out.is_null()
+            || norm_out.is_null()
+        {
+            return Err(Error::Backend(
+                "launch_fused_allreduce_rmsnorm_two_gpu: null buffer".into(),
+            ));
+        }
+        if n == 0 || hidden_dim == 0 {
+            return Err(Error::Backend(
+                "launch_fused_allreduce_rmsnorm_two_gpu: empty dims".into(),
+            ));
+        }
+        let eps_val: f32 = eps;
+        let n_i = n as i32;
+        let hd_i = hidden_dim as i32;
+        let mut args: [*mut c_void; 8] = [
+            local_in as *mut c_void,
+            peer_in as *mut c_void,
+            weight as *mut c_void,
+            res_out,
+            norm_out,
+            (&eps_val) as *const f32 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+            &hd_i as *const i32 as *mut c_void,
+        ];
+        let grid = crate::HipDim3::new(((n as u32) + 255) / 256, 1, 1);
+        let block = crate::HipDim3::new(256, 1, 1);
+        self.launch_from_source(
+            crate::kernels::comm_fuse::COMM_FUSE_KERNEL_SOURCE,
+            "grim_fused_allreduce_rms_norm",
+            grid,
+            block,
+            &mut args,
+        )?;
+        Ok(())
+    }
+
     fn device_cache() -> &'static Mutex<HashMap<usize, Arc<RocmDevice>>> {
         static CACHE: std::sync::OnceLock<Mutex<HashMap<usize, Arc<RocmDevice>>>> =
             std::sync::OnceLock::new();
@@ -911,12 +1002,24 @@ impl RocmDevice {
             reduce_partials_buf: RwLock::new(None),
             reduce_out_buf: RwLock::new(None),
             reduce_argmax_idxs_buf: Mutex::new(None),
+            prefill_iq_weight_f16_buf: Mutex::new(None),
+            prefill_act_f16_buf: Mutex::new(None),
         }
     }
 
     /// Release all pooled device buffers back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
         self.allocator.empty_cache();
+    }
+
+    /// Explicitly release transient prefill scratch buffers (called when prefill finishes).
+    pub fn release_prefill_scratch(&self) {
+        if let Ok(mut g) = self.prefill_iq_weight_f16_buf.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.prefill_act_f16_buf.lock() {
+            *g = None;
+        }
     }
 
     /// Return the GCN target architecture string (e.g. "gfx1036", "gfx1100").
@@ -1000,6 +1103,47 @@ impl RocmDevice {
     /// (RDNA2+). Graph decode branches on this instead of probing types.
     pub fn supports_dot4(&self) -> bool {
         self.is_dot4_arch
+    }
+
+    /// Whether a Q8_0 dot4 GEMV is exact on this GPU. `grim_sdot4` sign-extends
+    /// both packed operands on RDNA3/4, making Q8_0 dot4 exact across architectures.
+    pub fn q80_dot_ok(&self) -> bool {
+        true
+    }
+
+    /// The Q8_0 launch-path CONTRACT for this device (M7.4).
+    ///
+    /// The decision is made HERE, ONCE, and the IR carries the answer — so
+    /// the launcher and the ring read the SAME decision instead of each
+    /// re-deriving it from the environment and the arch. That is res7 §9d's
+    /// QEffect (arXiv:2609.23536) applied: "Explicit state/resource
+    /// contracts... enforced identically under eager and replay."
+    ///
+    /// The rules, in the order they apply:
+    ///
+    ///  1. `GRIM_DOT_GEMV=0` turns the dot4 path off everywhere, so the
+    ///     projection is the WMMA fused-dequant GEMV.
+    ///  2. Otherwise, a Q8_0 projection on a dot4-capable arch with
+    ///     `k % 32 == 0` is the f32-activation dot4 — the path the models'
+    ///     plain projections take, and the one the ring's
+    ///     `OP_Q8_0_DOT4_F32ACT` arm reproduces.
+    ///  3. Otherwise it is the WMMA fused-dequant GEMV.
+    ///
+    /// The prequantized Q8_1-activation variant is a SEPARATE contract
+    /// value, not a mode of this one: it is a different LAUNCH (a different
+    /// activation layout), so the IR's opcode for it is `OP_Q8_0_DOT4` and
+    /// not `OP_Q8_0_DOT4_F32ACT`.
+    pub fn q8_0_path_contract(&self, k: usize) -> u32 {
+        use crate::task_graph::q8_0_path;
+        let dot_disabled = matches!(
+            std::env::var("GRIM_DOT_GEMV").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if self.is_dot4_arch && !dot_disabled && k >= 32 && k % 32 == 0 {
+            q8_0_path::DOT4_F32ACT
+        } else {
+            q8_0_path::WMMA_DEQUANT
+        }
     }
 
     /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver
@@ -1193,7 +1337,7 @@ impl RocmDevice {
         &self.gpu_target
     }
 
-    pub(crate) fn active_stream(&self) -> *mut c_void {
+    pub fn active_stream(&self) -> *mut c_void {
         let stream = if self.capture_active.load(Ordering::SeqCst) {
             self.capture_stream
                 .read()
@@ -1250,8 +1394,9 @@ impl RocmDevice {
 
     /// Begin a generic graph-capture session keyed by `key`. Until `end_graph_capture` [see: `key`, `GRIM_CAPTURE_GRAPH`]
     pub fn begin_graph_capture(&self, _key: &str) -> Result<()> {
-        // P1-3: raw HIP ops below bind to the calling thread's current
-        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        // Invalidate stale CUR_DEV cache so DeviceGuard actually calls
+        // hipSetDevice. Prevents hipModuleLoad 209 from unguarded seam.
+        crate::device::util::note_current_device(-1);
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if !self.capture_enabled {
             return Ok(());
@@ -2094,6 +2239,8 @@ impl RocmDevice {
             }
         };
         let stream = self.active_stream();
+        // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+        crate::memory::storage::count_blocking_d2h();
         check_hip("hipMemcpyAsync(D2H)", unsafe {
             hipMemcpyAsync(
                 pinned.as_mut_ptr() as *mut c_void,
@@ -2141,6 +2288,8 @@ impl RocmDevice {
             }
         };
         let stream = self.active_stream();
+        // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).
+        crate::memory::storage::count_blocking_d2h();
         check_hip("hipMemcpyAsync(D2H)", unsafe {
             hipMemcpyAsync(
                 dst.as_mut_ptr() as *mut c_void,
@@ -2314,6 +2463,16 @@ impl RocmDevice {
                 status = rocblas_create_handle(&mut h);
             }
             if status == rocblas_status_success {
+                if std::env::var_os("GRIM_ROCBLAS_DETERMINISTIC").is_some() {
+                    let atomics_mode = crate::rocblas_atomics_not_allowed;
+                    let a_status = crate::rocblas_set_atomics_mode(h, atomics_mode);
+                    if a_status != crate::rocblas_status_success {
+                        eprintln!(
+                            "[grim-backend-rocm] warning: rocblas_set_atomics_mode returned {}",
+                            a_status
+                        );
+                    }
+                }
                 *cache = Some(h);
                 return Ok(h);
             }

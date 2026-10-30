@@ -40,10 +40,10 @@ mod e4m3;
 #[path = "precision_kernel_ab/w4a4.rs"]
 mod w4a4;
 use e4m3::{from_e4m3, to_e4m3_rne};
-use w4a4::{dot_packed, pack_a, GROUP};
+use w4a4::{GROUP, dot_packed, pack_a};
 
-use grim_backend_rocm::precision_ab::*;
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::precision_ab::*;
 use grim_tensor::{
     ArithType, BackendStorage, BlockDtype, CoreTensorOps, DType, MemoryOps, Shape, Storage,
 };
@@ -135,7 +135,9 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    std::panic::catch_unwind(|| RocmDevice::try_new(0).ok()).ok().flatten()
+    std::panic::catch_unwind(|| RocmDevice::try_new(0).ok())
+        .ok()
+        .flatten()
 }
 
 /// Which arms to run, from `GRIM_AB_ARMS` (comma-separated substrings).
@@ -175,7 +177,9 @@ fn arm_selected(name: &str) -> bool {
 fn lcg(seed: u64) -> impl FnMut() -> f32 {
     let mut s = seed;
     move || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 33) as f32 / 2147483648.0) - 1.0
     }
 }
@@ -330,42 +334,63 @@ impl BOnDevice {
         }
         let q80_host = pack_q8_0_host(b);
         let i4_host = w4a4::pack_b(b, n, k);
-        let u8_dtype = DType { arith: ArithType::U8, storage: Storage::Native };
+        let u8_dtype = DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        };
 
         let fp8t = MemoryOps::from_cpu_bytes(
             dev,
             &fp8_host,
             &Shape::new(vec![fp8_host.len()]),
-            DType { arith: ArithType::F32, storage: Storage::Block(BlockDtype::Fp8) },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Block(BlockDtype::Fp8),
+            },
         )
         .map_err(|e| format!("b fp8 h2d: {e}"))?;
-        let q80t = MemoryOps::from_cpu_bytes(dev, &q80_host, &Shape::new(vec![q80_host.len()]), u8_dtype)
-            .map_err(|e| format!("b q80 h2d: {e}"))?;
+        let q80t =
+            MemoryOps::from_cpu_bytes(dev, &q80_host, &Shape::new(vec![q80_host.len()]), u8_dtype)
+                .map_err(|e| format!("b q80 h2d: {e}"))?;
         let i4c = MemoryOps::from_cpu_bytes(
             dev,
             as_bytes(&i4_host.codes),
             &Shape::new(vec![i4_host.codes.len()]),
-            DType { arith: ArithType::U32, storage: Storage::Native },
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("b int4 codes h2d: {e}"))?;
         let i4s = MemoryOps::from_cpu_bytes(
             dev,
             as_bytes(&i4_host.scales),
             &Shape::new(vec![i4_host.scales.len()]),
-            DType { arith: ArithType::F16, storage: Storage::Native },
+            DType {
+                arith: ArithType::F16,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("b int4 scales h2d: {e}"))?;
         let i4z = MemoryOps::from_cpu_bytes(
             dev,
             &i4_host.zeros,
             &Shape::new(vec![i4_host.zeros.len()]),
-            DType { arith: ArithType::U8, storage: Storage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("b int4 zeros h2d: {e}"))?;
 
         Ok(Self {
-            fp8: buf(fp8t), fp8_host, q80: buf(q80t), q80_host,
-            i4_codes: buf(i4c), i4_scales: buf(i4s), i4_zeros: buf(i4z),
+            fp8: buf(fp8t),
+            fp8_host,
+            q80: buf(q80t),
+            q80_host,
+            i4_codes: buf(i4c),
+            i4_scales: buf(i4s),
+            i4_zeros: buf(i4z),
             i4_host,
         })
     }
@@ -470,7 +495,11 @@ fn paired_ratio(control: &[f32], challenger: &[f32]) -> (f64, f64) {
     // Relative IQR as a stability signal: tight means the box was quiet.
     let q1 = s[s.len() / 4];
     let q3 = s[3 * s.len() / 4];
-    let spread = if med.abs() > 0.0 { (q3 - q1) / med } else { f64::NAN };
+    let spread = if med.abs() > 0.0 {
+        (q3 - q1) / med
+    } else {
+        f64::NAN
+    };
     (med, spread)
 }
 
@@ -489,8 +518,6 @@ fn buf(t: Box<dyn BackendStorage>) -> Buf {
 fn raw(b: &Buf) -> &grim_backend_rocm::RocmStorage {
     grim_backend_rocm::as_rocm(b.as_ref().as_ref()).expect("storage is RocmStorage")
 }
-
-
 
 fn arm_raven(
     dev: &RocmDevice,
@@ -537,11 +564,20 @@ fn arm_raven(
     Ok(Armed {
         arm: "Raven",
         instruction: "V_DOT4_F32_FP8_FP8",
-        m, n, k,
+        m,
+        n,
+        k,
         launch: {
             let (a_buf, b_buf, out_buf) = (a_buf.clone(), b_buf.clone(), out_buf.clone());
             Box::new(move |dev: &RocmDevice| {
-                let _ = dev.launch_dot4_fp8_gemv_for_ab(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
+                let _ = dev.launch_dot4_fp8_gemv_for_ab(
+                    raw(&a_buf),
+                    raw(&b_buf),
+                    raw(&out_buf),
+                    m,
+                    n,
+                    k,
+                );
             })
         },
         score: Some({
@@ -585,8 +621,9 @@ fn arm_white_raven(
     let mut a_pad = vec![0u8; m_pad * k];
     a_pad[..a_fp8.len()].copy_from_slice(&a_fp8);
 
-    let a_t = MemoryOps::from_cpu_bytes(dev, &a_pad, &Shape::new(vec![m_pad * k]), fp8_dtype.clone())
-        .map_err(|e| format!("a h2d: {e}"))?;
+    let a_t =
+        MemoryOps::from_cpu_bytes(dev, &a_pad, &Shape::new(vec![m_pad * k]), fp8_dtype.clone())
+            .map_err(|e| format!("a h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         dev,
         &Shape::new(vec![m * n]),
@@ -596,7 +633,6 @@ fn arm_white_raven(
         },
     )
     .map_err(|e| format!("out alloc: {e}"))?;
-
 
     let pos = check_positions(m * n);
     let mut oracle = Vec::with_capacity(pos.len());
@@ -618,11 +654,20 @@ fn arm_white_raven(
     Ok(Armed {
         arm: "WhiteRaven",
         instruction: "V_WMMA_F32_16X16X16_FP8_FP8",
-        m, n, k,
+        m,
+        n,
+        k,
         launch: {
             let (a_buf, b_buf, out_buf) = (a_buf.clone(), b_buf.clone(), out_buf.clone());
             Box::new(move |dev: &RocmDevice| {
-                let _ = dev.launch_wmma_gemm_fp8_e4m3_for_ab(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
+                let _ = dev.launch_wmma_gemm_fp8_e4m3_for_ab(
+                    raw(&a_buf),
+                    raw(&b_buf),
+                    raw(&out_buf),
+                    m,
+                    n,
+                    k,
+                );
             })
         },
         score: Some({
@@ -663,7 +708,6 @@ fn arm_forest_raven(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-
     let pos = check_positions(m * n);
     let mut oracle = Vec::with_capacity(pos.len());
     // Row stride is n_q_blocks blocks, NOT 32. `i * 32` happens to be correct
@@ -684,9 +728,9 @@ fn arm_forest_raven(
             let ad = half::f16::from_bits(u16::from_le_bytes([a_q81[ab], a_q81[ab + 1]])).to_f32();
             let av = ad * (a_q81[ab + 4 + kk % 32] as i8) as f32;
             let bb = (j * nb + kk / 32) * 34;
-            let bscale = half::f16::from_bits(u16::from_le_bytes([
-                bd.q80_host[bb], bd.q80_host[bb + 1],
-            ])).to_f32();
+            let bscale =
+                half::f16::from_bits(u16::from_le_bytes([bd.q80_host[bb], bd.q80_host[bb + 1]]))
+                    .to_f32();
             let bv = bscale * (bd.q80_host[bb + 2 + kk % 32] as i8) as f32;
             acc += av as f64 * bv as f64;
         }
@@ -701,11 +745,14 @@ fn arm_forest_raven(
     Ok(Armed {
         arm: "ForestRaven",
         instruction: "V_DOT4_I32_IU8",
-        m, n, k,
+        m,
+        n,
+        k,
         launch: {
             let (a_buf, b_buf, out_buf) = (a_buf.clone(), b_buf.clone(), out_buf.clone());
             Box::new(move |dev: &RocmDevice| {
-                let _ = dev.launch_dot4_q80_q81_gemv(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
+                let _ =
+                    dev.launch_dot4_q80_q81_gemv(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
             })
         },
         score: Some({
@@ -754,8 +801,13 @@ fn arm_white_crow(
         },
     )
     .map_err(|e| format!("a_codes h2d: {e}"))?;
-    let a_scales = CoreTensorOps::from_cpu(dev, &pa.scales, &Shape::new(vec![pa.scales.len()]), DType::F32)
-        .map_err(|e| format!("a_scales h2d: {e}"))?;
+    let a_scales = CoreTensorOps::from_cpu(
+        dev,
+        &pa.scales,
+        &Shape::new(vec![pa.scales.len()]),
+        DType::F32,
+    )
+    .map_err(|e| format!("a_scales h2d: {e}"))?;
     // A_sums is i32 on the device side; upload as raw bytes at 4 B/element.
     let a_sums = MemoryOps::from_cpu_bytes(
         dev,
@@ -781,7 +833,6 @@ fn arm_white_crow(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-
     // Oracle over the packed operands, via the kernel's own identity.
     let pos = check_positions(m * n);
     let mut oracle = Vec::with_capacity(pos.len());
@@ -799,17 +850,31 @@ fn arm_white_crow(
     Ok(Armed {
         arm: "WhiteCrow",
         instruction: "V_DOT8_I32_IU4",
-        m, n, k,
+        m,
+        n,
+        k,
         launch: {
             let (ac, asc, asum, bc, bsc, bz, o) = (
-                a_codes.clone(), a_scales.clone(), a_sums.clone(),
-                bd.i4_codes.clone(), bd.i4_scales.clone(), bd.i4_zeros.clone(),
+                a_codes.clone(),
+                a_scales.clone(),
+                a_sums.clone(),
+                bd.i4_codes.clone(),
+                bd.i4_scales.clone(),
+                bd.i4_zeros.clone(),
                 out_buf.clone(),
             );
             Box::new(move |dev: &RocmDevice| {
                 let _ = dev.launch_dot8_w4a4_gemv(
-                    raw(&ac), raw(&asc), raw(&asum), raw(&bc), raw(&bsc), raw(&bz), raw(&o),
-                    m, n, k,
+                    raw(&ac),
+                    raw(&asc),
+                    raw(&asum),
+                    raw(&bc),
+                    raw(&bsc),
+                    raw(&bz),
+                    raw(&o),
+                    m,
+                    n,
+                    k,
                 );
             })
         },
@@ -856,7 +921,8 @@ fn precision_kernel_ab() {
     // roughly 6 GB of host writes for a sweep whose entire GPU cost is ~0.2 s --
     // which is why the run appeared to hang while never touching the GPU hard.
     // A is (m, k)-dependent and stays per-shape.
-    let mut b_cache: std::collections::BTreeMap<usize, Vec<f32>> = std::collections::BTreeMap::new();
+    let mut b_cache: std::collections::BTreeMap<usize, Vec<f32>> =
+        std::collections::BTreeMap::new();
     // Device-side B, packed once per K and shared by every arm and every M.
     //
     // B does not depend on M, and each arm wants the same rows of it in a
@@ -866,8 +932,7 @@ fn precision_kernel_ab() {
     // upload per format per K brings it to ~8 GB total, and the packed forms
     // are reused by the untiled and row-tiled twins alike since they differ only
     // in launch geometry.
-    let mut bdev: std::collections::BTreeMap<usize, BOnDevice> =
-        std::collections::BTreeMap::new();
+    let mut bdev: std::collections::BTreeMap<usize, BOnDevice> = std::collections::BTreeMap::new();
 
     for (m, n_fixed, k) in sweep_plan() {
         // N is widened per K so B cannot live in L2. At the old N=4096 and
@@ -917,7 +982,9 @@ fn precision_kernel_ab() {
         let candidates: [(&str, &dyn Fn() -> Result<Armed, String>); 4] = [
             ("Raven", &|| arm_raven(&dev, &a, &bdk, m, n, k)),
             ("ForestRaven", &|| arm_forest_raven(&dev, &a, &bdk, m, n, k)),
-            ("WhiteCrow", &|| arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k)),
+            ("WhiteCrow", &|| {
+                arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k)
+            }),
             ("WhiteRaven", &|| arm_white_raven(&dev, &a, &bdk, m, n, k)),
         ];
         for (name, build) in candidates {
@@ -972,7 +1039,11 @@ fn precision_kernel_ab() {
                     spreads.push(sp as f32);
                 }
                 paired_ratio_report.push((
-                    a.arm, a.m, a.k, median(&ratios) as f64, median(&spreads) as f64,
+                    a.arm,
+                    a.m,
+                    a.k,
+                    median(&ratios) as f64,
+                    median(&spreads) as f64,
                 ));
             }
         }
@@ -993,7 +1064,6 @@ fn precision_kernel_ab() {
                 tolerance: tol,
             });
         }
-
     }
 
     if results.is_empty() {
@@ -1028,7 +1098,14 @@ fn precision_kernel_ab() {
         };
         println!(
             "{:<13} {:>4} {:>6} {:>10.4} {:>10.4} {:>10.2e} {:>8}  {}",
-            r.arm, r.m, r.k, r.median_ms(), r.p90_ms(), r.max_abs_err, ratio, label
+            r.arm,
+            r.m,
+            r.k,
+            r.median_ms(),
+            r.p90_ms(),
+            r.max_abs_err,
+            ratio,
+            label
         );
     }
 
@@ -1040,28 +1117,51 @@ fn precision_kernel_ab() {
     // and the artifact should say so instead of printing the flattering one.
     if !paired_ratio_report.is_empty() {
         println!("\npaired vs median ratio (relative IQR = run-to-run noise):");
-        println!("{:<13} {:>4} {:>6} {:>10} {:>10} {:>8}", "arm", "M", "K", "paired", "median", "spread");
+        println!(
+            "{:<13} {:>4} {:>6} {:>10} {:>10} {:>8}",
+            "arm", "M", "K", "paired", "median", "spread"
+        );
         let mut worst: Option<(&str, f64)> = None;
         for (arm, m, k, paired, spread) in &paired_ratio_report {
             let (paired, spread) = (*paired, *spread);
-            let med = vs_control(&results, results.iter().find(|r| r.arm == *arm
-                && r.m == *m && r.k == *k).expect("row exists"))
-                .unwrap_or(f64::NAN);
+            let med = vs_control(
+                &results,
+                results
+                    .iter()
+                    .find(|r| r.arm == *arm && r.m == *m && r.k == *k)
+                    .expect("row exists"),
+            )
+            .unwrap_or(f64::NAN);
             if spread.is_finite() && worst.as_ref().map_or(true, |(_, w)| spread > *w) {
                 worst = Some((arm, spread));
             }
             // Only the noisiest few rows: 40 shapes x 3 arms is 120 lines.
             if *k == sweep_plan().last().map(|p| p.2).unwrap_or(0) {
-                println!("{:<13} {:>4} {:>6} {:>10.3} {:>10.3} {:>8.1}%", arm, m, k, paired, med, spread * 100.0);
+                println!(
+                    "{:<13} {:>4} {:>6} {:>10.3} {:>10.3} {:>8.1}%",
+                    arm,
+                    m,
+                    k,
+                    paired,
+                    med,
+                    spread * 100.0
+                );
             }
         }
         if let Some((arm, sp)) = worst {
-            println!("worst IQR: {arm} at {:.1}% -- a spread that wide means the", sp * 100.0);
+            println!(
+                "worst IQR: {arm} at {:.1}% -- a spread that wide means the",
+                sp * 100.0
+            );
             println!("median ratio carries that much uncertainty, whatever it says.");
         }
     }
 
-    let bad: Vec<&str> = results.iter().filter(|r| !r.accuracy_ok()).map(|r| r.arm).collect();
+    let bad: Vec<&str> = results
+        .iter()
+        .filter(|r| !r.accuracy_ok())
+        .map(|r| r.arm)
+        .collect();
     if !bad.is_empty() {
         println!("\nDISQUALIFIED on accuracy (speed not read): {bad:?}");
     }
@@ -1099,11 +1199,19 @@ fn wmma_fp8_operands_are_padded_to_whole_tiles() {
     for m in [1usize, 2, 4, 8] {
         let padded = m.div_ceil(WMMA_TILE) * WMMA_TILE;
         assert!(padded > m, "m={m} should have been padded up");
-        assert_eq!(padded % WMMA_TILE, 0, "padding must land on a tile boundary");
+        assert_eq!(
+            padded % WMMA_TILE,
+            0,
+            "padding must land on a tile boundary"
+        );
     }
     // Already-aligned shapes must not grow.
     for m in [16usize, 32, 64, 128] {
-        assert_eq!(m.div_ceil(WMMA_TILE) * WMMA_TILE, m, "aligned m must not be padded");
+        assert_eq!(
+            m.div_ceil(WMMA_TILE) * WMMA_TILE,
+            m,
+            "aligned m must not be padded"
+        );
     }
     // A non-multiple-of-16 n is the same hazard on the B operand.
     for n in [13720usize, 294916, 1, 7] {

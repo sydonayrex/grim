@@ -35,13 +35,16 @@ __device__ __forceinline__ void grim_deq_q4k(const unsigned char* blk, int w, fl
 
     // The eight weights of one call are EIGHT CONTIGUOUS qs bytes sharing ONE
     // 6-bit scale pair: for wv = w..w+7, k = wv/64 and (off >= 32) are constant
-    // (runs are 8-aligned and 32 is a multiple of 8), so qsb = 32*k + (w%64) + e,
-    // a multiple of 8 and therefore 8-byte aligned whenever the block base is
-    // (144 = 18*8, so every block in a row is). Two 4-byte loads replace eight
-    // 1-byte loads: the direct path issued ~10 scalar 1-byte loads per call with
-    // each lane on a DIFFERENT column's block, i.e. ~32 sectors per warp load
-    // instruction. Multiplication order is unchanged (`d * sc * q` still
-    // evaluates as `(d * sc) * q`).
+    // (runs are 8-aligned and 32 is a multiple of 8), so qsb = 32*k + (off0&31)
+    // and the run never crosses a 32-byte window.
+    //
+    // Load the bytes DIRECTLY. A previous "optimization" read them as two
+    // 4-byte words via `__builtin_memcpy(&qw_lo, qs + qsb, 4)` and shifted them
+    // out; on gfx1200 that produced all-NaN outputs for every Q4_K weight
+    // (weights finite, activations finite, host dequant of the same bytes
+    // finite), which made every K-quant model emit `!!!!`. The parity gate
+    // missed it because `f32::max` ignores NaN, so an all-NaN output reported
+    // `max_diff=0`. Direct byte indexing is correct here.
     const int k = w / 64;
     const int off0 = w % 64;
     const int s = 2 * k + (off0 >= 32 ? 1 : 0);
@@ -56,12 +59,9 @@ __device__ __forceinline__ void grim_deq_q4k(const unsigned char* blk, int w, fl
     const float dm = dmin * (float)m;
     const bool low = off0 < 32;
 
-    unsigned int qw_lo, qw_hi;
-    __builtin_memcpy(&qw_lo, qs + qsb, 4);
-    __builtin_memcpy(&qw_hi, qs + qsb + 4, 4);
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        const unsigned int byte = (e < 4) ? (qw_lo >> (8 * e)) : (qw_hi >> (8 * (e - 4)));
+        const unsigned int byte = (unsigned int)qs[qsb + e];
         const unsigned int q = low ? (byte & 0x0Fu) : (byte >> 4);
         out[e] = ds * (float)q - dm;
     }

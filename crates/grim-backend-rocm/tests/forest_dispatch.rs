@@ -32,7 +32,14 @@ fn gpu_device() -> Option<RocmDevice> {
 /// - B: stored codes + per-row fp32 scales (exact).
 /// - Accumulate per-block float partials sequentially (the kernel
 ///   lane-distributes then shuffle-sums: same terms, different association).
-fn w8a8_reference(a: &[f32], codes: &[u8], scales: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+fn w8a8_reference(
+    a: &[f32],
+    codes: &[u8],
+    scales: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
     assert_eq!(scales.len(), n);
     assert_eq!(codes.len(), n * k);
     let mut out = vec![0.0f32; m * n];
@@ -99,7 +106,9 @@ fn forest_case(m: usize, n: usize, k: usize, seed: u64) -> TestResult {
 
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
         DType {
             arith: ArithType::F32,
@@ -153,7 +162,9 @@ fn forest_case(m: usize, n: usize, k: usize, seed: u64) -> TestResult {
         max_abs = max_abs.max((g - x).abs());
     }
     let cosine = dot / (gg.sqrt() * xx.sqrt()).max(f64::MIN_POSITIVE);
-    eprintln!("FOREST_CASE m={m} n={n} k={k} seed={seed:#x} cosine={cosine:.8} max_abs={max_abs:e}");
+    eprintln!(
+        "FOREST_CASE m={m} n={n} k={k} seed={seed:#x} cosine={cosine:.8} max_abs={max_abs:e}"
+    );
     assert!(
         cosine >= 0.999,
         "m={m} n={n} k={k}: cosine {cosine:.6} -- a row-major read of the framed blob permutes weights and collapses this"
@@ -215,7 +226,9 @@ fn forest_k_tail_falls_back_correctly() -> TestResult {
 
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
         DType {
             arith: ArithType::F32,

@@ -24,6 +24,7 @@ impl RocmDevice {
         kv_seq_len: usize,
         num_splits: usize,
     ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let q_ptr = q_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("flash_decode: q has no device ptr".into()))?;
@@ -258,18 +259,18 @@ impl RocmDevice {
         h_idx: usize,
         d_idx: usize,
     ) -> Result<*mut c_void> {
-        let q_ptr = q_idx.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: q_idx has no device ptr".into())
-        })?;
-        let w_ptr = w_idx.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: w_idx has no device ptr".into())
-        })?;
-        let k_ptr = k_idx.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: k_idx has no device ptr".into())
-        })?;
-        let s_ptr = scores.device_ptr.ok_or_else(|| {
-            Error::Backend("sparse_index_score: scores has no device ptr".into())
-        })?;
+        let q_ptr = q_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: q_idx has no device ptr".into()))?;
+        let w_ptr = w_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: w_idx has no device ptr".into()))?;
+        let k_ptr = k_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: k_idx has no device ptr".into()))?;
+        let s_ptr = scores
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sparse_index_score: scores has no device ptr".into()))?;
 
         let block_threads = 256u32;
         let grid_blocks = ((seq_len as u32) + block_threads - 1) / block_threads;
@@ -464,6 +465,7 @@ impl RocmDevice {
                     best_ms = f64::INFINITY;
                     break;
                 }
+                let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 let stream = self.active_stream();
                 if unsafe { hipStreamSynchronize(stream) } != hipSuccess {
                     best_ms = f64::INFINITY;
@@ -552,6 +554,7 @@ impl RocmDevice {
         }
 
         let mut best = (fallback_block_dim, f64::INFINITY);
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         for cand in std::iter::once(fallback_block_dim).chain(candidates) {
             let mut best_ms = f64::INFINITY;
             for rep in 0..3 {
@@ -572,6 +575,7 @@ impl RocmDevice {
                 }
                 best_ms = best_ms.min(t0.elapsed().as_secs_f64() * 1e3);
             }
+
             if best_ms < best.1 {
                 best = (cand, best_ms);
             }

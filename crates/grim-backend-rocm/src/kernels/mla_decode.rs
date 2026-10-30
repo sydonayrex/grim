@@ -70,17 +70,31 @@ __global__ void grim_mla_absorbed_decode(
             local_score += q_rope[q_r_base + r] * kv_cache[token_base + kv_lora_rank + r];
         }
 
-        s_dot[tid] = local_score;
+        // In-wave reduction via butterfly shuffle
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            local_score += __shfl_xor(local_score, off);
+        }
+        const int wave_id = tid >> 5;
+        const int lane_id = tid & 31;
+        if (lane_id == 0) {
+            s_dot[wave_id] = local_score;
+        }
         __syncthreads();
 
-        for (int stride = block_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                s_dot[tid] += s_dot[tid + stride];
+        if (tid < 32) {
+            const int num_waves = block_size >> 5;
+            float wave_sum = (tid < num_waves) ? s_dot[tid] : 0.0f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                wave_sum += __shfl_xor(wave_sum, off);
             }
-            __syncthreads();
+            if (tid == 0) {
+                s_dot[0] = wave_sum;
+            }
         }
-        float score = s_dot[0] * inv_sqrt_d;
         __syncthreads();
+        float score = s_dot[0] * inv_sqrt_d;
 
         // 3. Online Softmax update
         float new_max = max(running_max, score);
@@ -320,17 +334,31 @@ __global__ void grim_mla_absorbed_indexed_decode(
             local_score += q_rope[q_r_base + r] * kv_cache[token_base + kv_lora_rank + r];
         }
 
-        s_dot[tid] = local_score;
+        // In-wave reduction via butterfly shuffle
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            local_score += __shfl_xor(local_score, off);
+        }
+        const int wave_id = tid >> 5;
+        const int lane_id = tid & 31;
+        if (lane_id == 0) {
+            s_dot[wave_id] = local_score;
+        }
         __syncthreads();
 
-        for (int stride = block_size / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                s_dot[tid] += s_dot[tid + stride];
+        if (tid < 32) {
+            const int num_waves = block_size >> 5;
+            float wave_sum = (tid < num_waves) ? s_dot[tid] : 0.0f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                wave_sum += __shfl_xor(wave_sum, off);
             }
-            __syncthreads();
+            if (tid == 0) {
+                s_dot[0] = wave_sum;
+            }
         }
-        float score = s_dot[0] * inv_sqrt_d;
         __syncthreads();
+        float score = s_dot[0] * inv_sqrt_d;
 
         float new_max = max(running_max, score);
         float alpha = expf(running_max - new_max);
@@ -372,4 +400,3 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_mla_absorbed_indexed_decode"));
     }
 }
-

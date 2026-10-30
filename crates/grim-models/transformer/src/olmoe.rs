@@ -74,7 +74,7 @@ impl Olmoe {
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
 
         // If num_experts > 0, wire through MoE blocks (OLMoE: 64 experts, 8 active, top-k softmax)
@@ -82,6 +82,7 @@ impl Olmoe {
             use crate::moe_block::MoESpec;
             use grim_nn::moe::RouterKind;
             let spec = MoESpec {
+                renorm: false,
                 num_experts: cfg.num_experts,
                 top_k: cfg.num_experts_per_tok,
                 router_kind: RouterKind::SoftmaxTopK,

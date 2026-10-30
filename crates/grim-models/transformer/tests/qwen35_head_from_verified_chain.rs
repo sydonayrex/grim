@@ -32,14 +32,25 @@ const TAPS: usize = 4;
 
 // Geometry is only needed to document what the layer cache sizes mean; the
 // block reports its own shapes and this test does not assert them.
-const _: () = { let _ = (NK, HD, NV, TAPS); };
+const _: () = {
+    let _ = (NK, HD, NV, TAPS);
+};
 
 fn model_path() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("GRIM_CHECKPOINT") { let p = std::path::PathBuf::from(p); if p.exists() { return Some(p); } }
+    if let Ok(p) = std::env::var("GRIM_CHECKPOINT") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
-        if p.exists() { return Some(p); }
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        if p.exists() {
+            return Some(p);
+        }
     }
     eprintln!("[SKIP] 9B checkpoint not found");
     None
@@ -92,7 +103,9 @@ fn head_readings_of_output_weight() {
     let prov = GgufProvider::open(path.to_str().expect("utf8 path")).expect("open 9B");
     let mut c = cfg();
     c.rotary_dim = Some(
-        prov.metadata("qwen35.rope.dimension_count").and_then(|v| v.as_u32()).unwrap_or(64) as usize,
+        prov.metadata("qwen35.rope.dimension_count")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(64) as usize,
     );
     let device = Device::Rocm(0);
     let dev = grim_nn::modules::pick_device_for_storage_device(&device);
@@ -128,7 +141,8 @@ fn head_readings_of_output_weight() {
     .expect("output_norm");
     let ht = grim_tensor::Tensor::new(
         std::sync::Arc::from(
-            dev.from_cpu(last, &Shape::new(vec![1, hid]), DType::F32).expect("u"),
+            dev.from_cpu(last, &Shape::new(vec![1, hid]), DType::F32)
+                .expect("u"),
         ),
         Shape::new(vec![1, hid]),
         DType::F32,
@@ -141,14 +155,28 @@ fn head_readings_of_output_weight() {
         use grim_format::gguf::{GgufDType, read_gguf, read_tensor_bytes};
         let mut r = std::io::BufReader::new(std::fs::File::open(&path).expect("open"));
         let f = read_gguf(&mut r).expect("gguf");
-        let t = f.tensors.iter().find(|t| t.name == "output.weight").expect("output.weight");
+        let t = f
+            .tensors
+            .iter()
+            .find(|t| t.name == "output.weight")
+            .expect("output.weight");
         assert_eq!(t.dtype, GgufDType::Q6K);
-        eprintln!("[head2] output.weight ggml dims {:?}  (ne0 = hidden)", t.dims);
+        eprintln!(
+            "[head2] output.weight ggml dims {:?}  (ne0 = hidden)",
+            t.dims
+        );
         read_tensor_bytes(&mut r, &f, t).expect("bytes")
     };
-    eprintln!("[head2] dequantising {} packed bytes with the VERIFIED dequant_q6k ...", raw.len());
+    eprintln!(
+        "[head2] dequantising {} packed bytes with the VERIFIED dequant_q6k ...",
+        raw.len()
+    );
     let w = grim_quant::dequant_q6k(&raw, v * hid).expect("dequant q6k");
-    eprintln!("[head2] got {} f32 ({:.2} GB)", w.len(), (w.len() * 4) as f64 / 1e9);
+    eprintln!(
+        "[head2] got {} f32 ({:.2} GB)",
+        w.len(),
+        (w.len() * 4) as f64 / 1e9
+    );
 
     // Ollama's top-5 for "The capital of France is", temperature 0.
     let ref_ids: [(u32, f64); 5] = [
@@ -159,10 +187,14 @@ fn head_readings_of_output_weight() {
         (198, 0.0), // grim's pick, for contrast
     ];
     let dot_a = |j: usize| -> f64 {
-        (0..hid).map(|k| w[j * hid + k] as f64 * normed[k] as f64).sum()
+        (0..hid)
+            .map(|k| w[j * hid + k] as f64 * normed[k] as f64)
+            .sum()
     };
     let dot_b = |j: usize| -> f64 {
-        (0..hid).map(|k| w[k * v + j] as f64 * normed[k] as f64).sum()
+        (0..hid)
+            .map(|k| w[k * v + j] as f64 * normed[k] as f64)
+            .sum()
     };
     eprintln!("[head2]  id     ollama_logprob   reading A[out,in]   reading B[in,out]");
     for (id, lp) in ref_ids {
@@ -183,4 +215,3 @@ fn head_readings_of_output_weight() {
         eprintln!("[head2]   id={} logit={:.4}", t, dot_a(t as usize));
     }
 }
-

@@ -108,6 +108,117 @@ extern "C" __global__ void grim_tree_pie_gemv(
     if (lane == 0) C[col] = facc;
 }
 
+// TreePie v2 decode GEMV:
+// - #1: 4 columns per wave (blockIdx.x * 4), batching all 5 i32 words (20 bytes)
+//       across 4 columns before decoding and issuing grim_fdot2_f32_f16.
+// - #2: Branchless VALU __builtin_amdgcn_perm lookup for the 16-entry E2M2 -> FP16
+//       magnitude table, plus 128-bit uint4 activation loads shared across all 4 columns.
+// Preserves the exact per-lane group and j accumulation order of v1 (0 bit diffs).
+__device__ __forceinline__ unsigned short grim_tree_pie_f16_valu(
+    unsigned nib,
+    unsigned sign_bit)
+{
+    // 16-entry E2M2 magnitude table (fp16 bits):
+    // 0: 0x0000 (0.0),  1: 0x3800 (0.5),  2: 0x3c00 (1.0),  3: 0x3e00 (1.5)
+    // 4: 0x4000 (2.0),  5: 0x4100 (2.5),  6: 0x4200 (3.0),  7: 0x4300 (3.5)
+    // 8: 0x4400 (4.0),  9: 0x4500 (5.0), 10: 0x4600 (6.0), 11: 0x4700 (7.0)
+    // 12: 0x4800 (8.0), 13: 0x4900 (10.0), 14: 0x4a00 (12.0), 15: 0x4b00 (14.0)
+    // Notice the low byte of every entry is 0x00! Only the high byte varies:
+    // {0x00, 0x38, 0x3c, 0x3e, 0x40, 0x41, 0x42, 0x43,
+    //  0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b}
+    const unsigned t0 = 0x3e3c3800u;
+    const unsigned t1 = 0x43424140u;
+    const unsigned t2 = 0x47464544u;
+    const unsigned t3 = 0x4b4a4948u;
+    const unsigned pair01 = __builtin_amdgcn_perm(t1, t0, nib & 7u);
+    const unsigned pair23 = __builtin_amdgcn_perm(t3, t2, nib & 7u);
+    const unsigned hi_byte = ((nib & 8u) ? pair23 : pair01) & 0xFFu;
+    return (unsigned short)((sign_bit << 15) | (hi_byte << 8));
+}
+
+extern "C" __global__ void __launch_bounds__(32) grim_tree_pie_gemv_v2(
+    const unsigned short* __restrict__ act_f16,
+    const int*             __restrict__ B_tree,
+    float*                __restrict__ C,
+    int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int lane     = threadIdx.x;
+    if (col_base >= N) return;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int groups      = K / 32;
+    const int row_words   = groups * 5;
+    const uint4* act_v4   = (const uint4*)act_f16;
+
+    const int* b_cols[4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        int col = col_base + ((c < active_cols) ? c : 0);
+        b_cols[c] = B_tree + (long long)col * row_words;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int g = lane; g < groups; g += 32) {
+        const uint4 av0 = act_v4[g * 4 + 0];
+        const uint4 av1 = act_v4[g * 4 + 1];
+        const uint4 av2 = act_v4[g * 4 + 2];
+        const uint4 av3 = act_v4[g * 4 + 3];
+        const unsigned a2[16] = {
+            av0.x, av0.y, av0.z, av0.w,
+            av1.x, av1.y, av1.z, av1.w,
+            av2.x, av2.y, av2.z, av2.w,
+            av3.x, av3.y, av3.z, av3.w
+        };
+
+        unsigned payload[4][4];
+        unsigned signs[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const int* __restrict__ gp = b_cols[c] + (long long)g * 5;
+            payload[c][0] = (unsigned)gp[0];
+            payload[c][1] = (unsigned)gp[1];
+            payload[c][2] = (unsigned)gp[2];
+            payload[c][3] = (unsigned)gp[3];
+            signs[c]      = (unsigned)gp[4];
+        }
+
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            if (c >= active_cols) break;
+            float bacc = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const unsigned pw = payload[c][w];
+                const unsigned sg = signs[c] >> (w * 8);
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    const unsigned nib0 = (pw >> (p * 8 + 0)) & 0xFu;
+                    const unsigned nib1 = (pw >> (p * 8 + 4)) & 0xFu;
+                    const unsigned s0   = (sg >> (p * 2 + 0)) & 1u;
+                    const unsigned s1   = (sg >> (p * 2 + 1)) & 1u;
+                    const unsigned w01  = (unsigned)grim_tree_pie_f16_valu(nib0, s0)
+                                        | ((unsigned)grim_tree_pie_f16_valu(nib1, s1) << 16);
+                    bacc = grim_fdot2_f32_f16(a2[w * 4 + p], w01, bacc);
+                }
+            }
+            facc[c] += bacc;
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[c] += __shfl_xor(facc[c], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < active_cols; c++)
+            C[col_base + c] = facc[c];
+    }
+}
+
 // Rows of A handled per block. The decode of a B group is amortised across all of
 // them, which is the point: TreePie stores 5 i32 per 32 values and decoding it
 // once for 8 output rows is 8x cheaper per row than decoding per row. Kept a
@@ -205,7 +316,11 @@ mod tests {
             let sign = (code >> 4) & 1;
             let (exp, mant) = (nib >> 2, nib & 3);
             let (exp_field, mant_10) = if exp == 0 {
-                if mant == 0 { (0u16, 0u16) } else { (14 + (mant >> 1), ((mant + 1) >> 2) << 9) }
+                if mant == 0 {
+                    (0u16, 0u16)
+                } else {
+                    (14 + (mant >> 1), ((mant + 1) >> 2) << 9)
+                }
             } else {
                 (exp + 15, mant << 8)
             };

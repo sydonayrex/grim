@@ -492,9 +492,9 @@ __device__ __forceinline__ float fp8e4m3_to_f32(unsigned char b) {
         return sign ? -val : val;
     }
     if (exp != 0) {
-        result = (mant / 8.0f + 1.0f) * __powf(2.0f, (float)(exp - 7));
+        result = (float)(8 + mant) * __int_as_float((unsigned int)(exp - 10 + 127) << 23);
     } else {
-        result = mant / 512.0f;
+        result = (float)mant * 0x1p-9f;
     }
     return sign ? -result : result;
 }
@@ -503,7 +503,7 @@ __device__ __forceinline__ float fp8e4m3_to_f32(unsigned char b) {
 // e:  value = e4m3(code) * 2^(e - 127). Mirrors grim-quant::dequant_mxfp8.
 __device__ __forceinline__ float mxfp8_e4m3_to_f32(unsigned char b, unsigned char e) {
     float v = fp8e4m3_to_f32(b);
-    float scale = __powf(2.0f, (float)((int)e - 127));
+    float scale = (e == 0) ? 0x1p-127f : __int_as_float((unsigned int)e << 23);
     return v * scale;
 }
 

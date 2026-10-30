@@ -171,7 +171,7 @@ impl ModelConfig for Lfm2Config {
 #[allow(clippy::large_enum_variant)]
 pub enum Lfm2LayerCache {
     /// ShortConv state: host mirror (row-major `[t, d]` layout, same as CPU path expects)
-    /// plus optional device-resident ring buffer (column-major `[d, kc]` layout matching the
+    /// plus optional device-resident ring buffer (channel-major `[d, kc]` layout matching the
     /// HIP kernel contract). The device buffer is allocated once on first ROCm decode step and
     /// updated in-place by `grim_short_conv1d_causal_step` — no per-token H2D or host transpose.
     /// During HIP graph capture the host mirror is NOT synced (host syncs abort capture); it is
@@ -2343,6 +2343,7 @@ impl Lfm2Block {
             past_dev.storage().as_ref(),
             kv_stride,
             steps,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )?;
         let _ = stream;
         let stream = grim_backend_rocm::launch_kv_append(
@@ -2352,6 +2353,7 @@ impl Lfm2Block {
             past_dev.storage().as_ref(),
             kv_stride,
             steps,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )?;
         let _ = stream;
         *dev_pos += steps;
@@ -2387,6 +2389,7 @@ impl Lfm2Block {
             0,
             dummy.as_ref(),
             0,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )?;
         let _ = stream;
         // Bump the counter LAST so the next replay appends at the new offset.
@@ -3708,7 +3711,13 @@ impl CausalLm for Lfm2 {
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() { eprintln!("[fwd-trace] forward enter: input_ids dtype={:?} len={}", input_ids.dtype(), input_ids.shape().dims().len()); }
+        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() {
+            eprintln!(
+                "[fwd-trace] forward enter: input_ids dtype={:?} len={}",
+                input_ids.dtype(),
+                input_ids.shape().dims().len()
+            );
+        }
         let ids: Vec<u32> = match input_ids.dtype() {
             d if d == DType::F32 => {
                 let v = input_ids.to_vec_f32()?;
@@ -3717,7 +3726,10 @@ impl CausalLm for Lfm2 {
             _ => return Err(grim_tensor::Error::Unimplemented("non-F32 inputs".into()).into()),
         };
         let seq_len = ids.len();
-        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() { eprintln!("[fwd-trace] ids={:?}", &ids[..ids.len().min(8)]); }        let mut h = self
+        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() {
+            eprintln!("[fwd-trace] ids={:?}", &ids[..ids.len().min(8)]);
+        }
+        let mut h = self
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
         fwd_trace_stage("embed", &h);

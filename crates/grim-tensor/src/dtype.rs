@@ -140,6 +140,12 @@ pub enum BlockDtype {
     /// super-blocks: typing Q4_0 as Q4_K made every consumer slice and decode
     /// the payload with the wrong geometry. This is the format GreyCrow repacks.
     Q4_0,
+    /// Legacy GGUF Q4_1 (type 3): 20-byte blocks of `[f16 d][f16 m][32 nibbles]`,
+    /// one block per 32 weights, `w = q * d + m`. Same nibble packing as Q4_0;
+    /// the difference is the per-block additive minimum `m` (Q4_0 hard-codes
+    /// bias 8 inside the nibble decode). Needed for the Llama-3.2-1B-Instruct
+    /// Q4_1 checkpoint (condition-1 fixture, plan Phase M).
+    Q4_1,
     Fp4Block16,
     Fp8Block16,
     /// E4M3 codes with a 128x128 (row x col) grid of `f32` inverse scales —
@@ -285,9 +291,16 @@ pub enum FloatPackScheme {
 
 /// Target quantization format for device-side `quantize` path.
 /// Selected variants have kernel acceleration; others fall back to CPU or error.
+///
+/// `repr(u32)` so a task-graph node can carry the format as a scalar (GEMM
+/// `params[0]`, the coverage table's QuantFormat axis): the ids are the
+/// explicit ordinals and MUST NOT be reordered — an id baked into an emitted
+/// IR would silently change meaning. `0` is reserved for "not quantized"
+/// (native f32/f16 weights), which has no variant of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 pub enum QuantFormat {
-    Q8_0,
+    Q8_0 = 1,
     Q2K,
     Q3K,
     /// TreePie (WS-A): 5-bit E2M2 with a sign plane, 5.0 bpw, 32 values per group.
@@ -482,6 +495,7 @@ impl DType {
                 // 18 B per 32 weights = 0.5625 B/elem, the same density as
                 // IQ4_NL but a different block (f16 scale, bias 8).
                 BlockDtype::Q4_0 => elem_count.div_ceil(32) * 18,
+                BlockDtype::Q4_1 => elem_count.div_ceil(32) * 20,
                 BlockDtype::Fp4Block16 => elem_count.div_ceil(2) + (elem_count.div_ceil(16)) * 2,
                 BlockDtype::Fp8Block16 => elem_count + (elem_count.div_ceil(16)) * 2,
                 // codes + 128x128 scale grid; the grid extent is in the blob
@@ -596,7 +610,6 @@ impl TryFrom<&Storage> for QuantFormat {
                 // packed bytes. A loud "no QuantFormat mapping" error is the
                 // better failure, so neither side moves alone.
                 KQuantScheme::GsqRco3p5 => Ok(QuantFormat::GsqRco3p5),
-
             },
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 => Ok(QuantFormat::Fp4),
@@ -616,10 +629,10 @@ impl TryFrom<&Storage> for QuantFormat {
                 BlockDtype::Fp8Sparse24 => Ok(QuantFormat::Fp8Sparse24),
                 BlockDtype::Int8PerChannel => Ok(QuantFormat::Int8PerChannel),
                 BlockDtype::Fp8Sparse24Hw => Ok(QuantFormat::Fp8Sparse24Hw),
-                // Legacy Q4_0 shares IQ4_NL's density but not its block, and no
-                // canonical QuantFormat names it yet; refuse rather than
-                // report a format a decoder would not honour.
-                BlockDtype::Q4_0 => Err(()),
+                // Legacy Q4_0/Q4_1 share IQ4_NL's density but not their block,
+                // and no canonical QuantFormat names them yet; refuse rather
+                // than report a format a decoder would not honour.
+                BlockDtype::Q4_0 | BlockDtype::Q4_1 => Err(()),
             },
             Storage::W4A4OstQuant(_) => Ok(QuantFormat::W4A4OstQuant),
             _ => Err(()),

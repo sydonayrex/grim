@@ -158,19 +158,31 @@ fn recurrent_block() -> Qwen35Block {
         attn_q_norm: None,
         attn_k_norm: None,
         attn_qkv: Some(Linear::from_tensor(
-            cpu(w(2, conv_dim() * HIDDEN), Shape::new(vec![conv_dim(), HIDDEN])),
+            cpu(
+                w(2, conv_dim() * HIDDEN),
+                Shape::new(vec![conv_dim(), HIDDEN]),
+            ),
             None,
         )),
         attn_gate: Some(Linear::from_tensor(
-            cpu(w(3, value_dim() * HIDDEN), Shape::new(vec![value_dim(), HIDDEN])),
+            cpu(
+                w(3, value_dim() * HIDDEN),
+                Shape::new(vec![value_dim(), HIDDEN]),
+            ),
             None,
         )),
         ssm_out: Some(Linear::from_tensor(
-            cpu(w(4, HIDDEN * value_dim()), Shape::new(vec![HIDDEN, value_dim()])),
+            cpu(
+                w(4, HIDDEN * value_dim()),
+                Shape::new(vec![HIDDEN, value_dim()]),
+            ),
             None,
         )),
         // REAL shape: the checkpoint stores this [taps, conv_dim] (9B: [4, 8192]).
-        ssm_conv1d: Some(cpu(w(5, conv_dim() * TAPS), Shape::new(vec![TAPS, conv_dim()]))),
+        ssm_conv1d: Some(cpu(
+            w(5, conv_dim() * TAPS),
+            Shape::new(vec![TAPS, conv_dim()]),
+        )),
         ssm_conv_vec: None,
         ssm_a: Some(w(6, NV)),
         ssm_alpha: Some(Linear::from_tensor(
@@ -192,9 +204,18 @@ fn recurrent_block() -> Qwen35Block {
         ssm_d_state_hint: HD,
         ssm_d_conv_hint: TAPS,
         post_attention_norm: RmsNorm::new(cpu(w(11, HIDDEN), Shape::new(vec![HIDDEN])), 1e-6),
-        ffn_gate: Linear::from_tensor(cpu(w(12, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])), None),
-        ffn_up: Linear::from_tensor(cpu(w(13, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])), None),
-        ffn_down: Linear::from_tensor(cpu(w(14, HIDDEN * INTER), Shape::new(vec![HIDDEN, INTER])), None),
+        ffn_gate: Linear::from_tensor(
+            cpu(w(12, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])),
+            None,
+        ),
+        ffn_up: Linear::from_tensor(
+            cpu(w(13, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])),
+            None,
+        ),
+        ffn_down: Linear::from_tensor(
+            cpu(w(14, HIDDEN * INTER), Shape::new(vec![HIDDEN, INTER])),
+            None,
+        ),
         rotary_dim: AHD,
         rope_theta: 10000.0,
         hidden_size: HIDDEN,
@@ -215,12 +236,30 @@ fn attention_block() -> Qwen35Block {
         attn_norm: RmsNorm::new(cpu(w(20, HIDDEN), Shape::new(vec![HIDDEN])), 1e-6),
         // attn_q is FUSED query + output gate at 2*q_dim (qwen35.cpp:280-292).
         wq: Some(Linear::from_tensor(
-            cpu(w(21, 2 * q_dim() * HIDDEN), Shape::new(vec![2 * q_dim(), HIDDEN])),
+            cpu(
+                w(21, 2 * q_dim() * HIDDEN),
+                Shape::new(vec![2 * q_dim(), HIDDEN]),
+            ),
             None,
         )),
-        wk: Some(Linear::from_tensor(cpu(w(22, akv_dim() * HIDDEN), Shape::new(vec![akv_dim(), HIDDEN])), None)),
-        wv: Some(Linear::from_tensor(cpu(w(23, akv_dim() * HIDDEN), Shape::new(vec![akv_dim(), HIDDEN])), None)),
-        wo: Some(Linear::from_tensor(cpu(w(24, HIDDEN * q_dim()), Shape::new(vec![HIDDEN, q_dim()])), None)),
+        wk: Some(Linear::from_tensor(
+            cpu(
+                w(22, akv_dim() * HIDDEN),
+                Shape::new(vec![akv_dim(), HIDDEN]),
+            ),
+            None,
+        )),
+        wv: Some(Linear::from_tensor(
+            cpu(
+                w(23, akv_dim() * HIDDEN),
+                Shape::new(vec![akv_dim(), HIDDEN]),
+            ),
+            None,
+        )),
+        wo: Some(Linear::from_tensor(
+            cpu(w(24, HIDDEN * q_dim()), Shape::new(vec![HIDDEN, q_dim()])),
+            None,
+        )),
         attn_q_norm: Some(RmsNorm::new(cpu(w(25, AHD), Shape::new(vec![AHD])), 1e-6)),
         attn_k_norm: Some(RmsNorm::new(cpu(w(26, AHD), Shape::new(vec![AHD])), 1e-6)),
         attn_qkv: None,
@@ -241,9 +280,18 @@ fn attention_block() -> Qwen35Block {
         ssm_d_state_hint: 0,
         ssm_d_conv_hint: 0,
         post_attention_norm: RmsNorm::new(cpu(w(27, HIDDEN), Shape::new(vec![HIDDEN])), 1e-6),
-        ffn_gate: Linear::from_tensor(cpu(w(28, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])), None),
-        ffn_up: Linear::from_tensor(cpu(w(29, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])), None),
-        ffn_down: Linear::from_tensor(cpu(w(30, HIDDEN * INTER), Shape::new(vec![HIDDEN, INTER])), None),
+        ffn_gate: Linear::from_tensor(
+            cpu(w(28, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])),
+            None,
+        ),
+        ffn_up: Linear::from_tensor(
+            cpu(w(29, INTER * HIDDEN), Shape::new(vec![INTER, HIDDEN])),
+            None,
+        ),
+        ffn_down: Linear::from_tensor(
+            cpu(w(30, HIDDEN * INTER), Shape::new(vec![HIDDEN, INTER])),
+            None,
+        ),
         rotary_dim: AHD,
         rope_theta: 10000.0,
         hidden_size: HIDDEN,
@@ -319,7 +367,12 @@ fn recurrent_layer_matches_hand_reference() {
 
     // ggml_ssm_conv: depthwise, `dim` taps, most recent tap = current input,
     // then the state shifts left and the new input lands at the end.
-    let cw = blk.ssm_conv1d.as_ref().unwrap().to_vec_f32().expect("conv w");
+    let cw = blk
+        .ssm_conv1d
+        .as_ref()
+        .unwrap()
+        .to_vec_f32()
+        .expect("conv w");
     let mut state = cache.conv_state.clone();
     let mut conv = vec![0.0f32; conv_dim()];
     for ch in 0..conv_dim() {
@@ -399,7 +452,11 @@ fn recurrent_layer_matches_hand_reference() {
     let (ow, oin, oout) = lin_w(blk.ssm_out.as_ref().unwrap());
     let proj = matvec(&branch, &ow, oin, oout);
     let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
-    let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+    let pan = blk
+        .post_attention_norm
+        .weight
+        .to_vec_f32()
+        .expect("post norm");
     let h2 = rms(&h1, &pan, eps);
     let (gw, gi, go) = lin_w(&blk.ffn_gate);
     let (uw, ui, uo) = lin_w(&blk.ffn_up);
@@ -412,7 +469,11 @@ fn recurrent_layer_matches_hand_reference() {
 
     // ── grim ────────────────────────────────────────────────────────────
     let got = blk
-        .forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[0], &mut cache)
+        .forward(
+            &cpu(x.clone(), Shape::new(vec![1, HIDDEN])),
+            &[0],
+            &mut cache,
+        )
         .expect("recurrent forward")
         .to_vec_f32()
         .expect("read");
@@ -446,7 +507,12 @@ fn recurrent_layer_state_bisect() {
     let xn = rms(&x, &an, eps);
     let (qw, qin, qout) = lin_w(blk.attn_qkv.as_ref().unwrap());
     let qkv = matvec(&xn, &qw, qin, qout);
-    let cw = blk.ssm_conv1d.as_ref().unwrap().to_vec_f32().expect("conv w");
+    let cw = blk
+        .ssm_conv1d
+        .as_ref()
+        .unwrap()
+        .to_vec_f32()
+        .expect("conv w");
     let mut ref_state = cache.conv_state.clone();
     let mut conv = vec![0.0f32; conv_dim()];
     for ch in 0..conv_dim() {
@@ -475,7 +541,10 @@ fn recurrent_layer_state_bisect() {
     for h in 0..NV {
         let kh = h % NK;
         let _q_slice = gdn_l2(&conv_silu[kh * HD..kh * HD + HD], eps);
-        let k_slice = gdn_l2(&conv_silu[key_dim() + kh * HD..key_dim() + kh * HD + HD], eps);
+        let k_slice = gdn_l2(
+            &conv_silu[key_dim() + kh * HD..key_dim() + kh * HD + HD],
+            eps,
+        );
         let v_slice = &conv_silu[2 * key_dim() + h * HD..2 * key_dim() + h * HD + HD];
         let gate = softplus(alpha[h] + dt_bias[h]) * ssm_a[h];
         let decay = (gate as f64).exp();
@@ -493,8 +562,12 @@ fn recurrent_layer_state_bisect() {
         }
     }
 
-    blk.forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[0], &mut cache)
-        .expect("recurrent forward");
+    blk.forward(
+        &cpu(x.clone(), Shape::new(vec![1, HIDDEN])),
+        &[0],
+        &mut cache,
+    )
+    .expect("recurrent forward");
 
     let ref_conv: Vec<f64> = ref_state.iter().map(|&v| v as f64).collect();
     let got_conv: Vec<f64> = cache.conv_state.iter().map(|&v| v as f64).collect();
@@ -544,8 +617,20 @@ fn attention_layer_matches_hand_reference() {
     let v = matvec(&xn, &vw, vin, vout);
 
     // Q/K RMS norm BEFORE rope, per head (qwen35.cpp:281/286).
-    let qn = blk.attn_q_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
-    let kn = blk.attn_k_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+    let qn = blk
+        .attn_q_norm
+        .as_ref()
+        .unwrap()
+        .weight
+        .to_vec_f32()
+        .unwrap();
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .unwrap()
+        .weight
+        .to_vec_f32()
+        .unwrap();
     for h in 0..AH {
         let s = h * AHD;
         let n = rms(&q[s..s + AHD], &qn, eps);
@@ -585,7 +670,11 @@ fn attention_layer_matches_hand_reference() {
     let (ow, oin, oout) = lin_w(blk.wo.as_ref().unwrap());
     let proj = matvec(&branch, &ow, oin, oout);
     let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
-    let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+    let pan = blk
+        .post_attention_norm
+        .weight
+        .to_vec_f32()
+        .expect("post norm");
     let h2 = rms(&h1, &pan, eps);
     let (gw, gi, go) = lin_w(&blk.ffn_gate);
     let (uw, ui, uo) = lin_w(&blk.ffn_up);
@@ -597,7 +686,11 @@ fn attention_layer_matches_hand_reference() {
     let want: Vec<f32> = (0..HIDDEN).map(|i| h1[i] + dn[i]).collect();
 
     let got = blk
-        .forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[0], &mut cache)
+        .forward(
+            &cpu(x.clone(), Shape::new(vec![1, HIDDEN])),
+            &[0],
+            &mut cache,
+        )
         .expect("attention forward")
         .to_vec_f32()
         .expect("read");
@@ -629,8 +722,20 @@ fn attention_layer_matches_hand_reference_nonzero_pos() {
     let mut k = matvec(&xn, &kw, kin, kout);
     let v = matvec(&xn, &vw, vin, vout);
 
-    let qn = blk.attn_q_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
-    let kn = blk.attn_k_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+    let qn = blk
+        .attn_q_norm
+        .as_ref()
+        .unwrap()
+        .weight
+        .to_vec_f32()
+        .unwrap();
+    let kn = blk
+        .attn_k_norm
+        .as_ref()
+        .unwrap()
+        .weight
+        .to_vec_f32()
+        .unwrap();
     for h in 0..AH {
         let s = h * AHD;
         let n = rms(&q[s..s + AHD], &qn, eps);
@@ -667,7 +772,11 @@ fn attention_layer_matches_hand_reference_nonzero_pos() {
     let (ow, oin, oout) = lin_w(blk.wo.as_ref().unwrap());
     let proj = matvec(&branch, &ow, oin, oout);
     let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
-    let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+    let pan = blk
+        .post_attention_norm
+        .weight
+        .to_vec_f32()
+        .expect("post norm");
     let h2 = rms(&h1, &pan, eps);
     let (gw, gi, go) = lin_w(&blk.ffn_gate);
     let (uw, ui, uo) = lin_w(&blk.ffn_up);
@@ -679,7 +788,11 @@ fn attention_layer_matches_hand_reference_nonzero_pos() {
     let want: Vec<f32> = (0..HIDDEN).map(|i| h1[i] + dn[i]).collect();
 
     let got = blk
-        .forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[pos], &mut cache)
+        .forward(
+            &cpu(x.clone(), Shape::new(vec![1, HIDDEN])),
+            &[pos],
+            &mut cache,
+        )
         .expect("attention forward non-zero pos")
         .to_vec_f32()
         .expect("read");
@@ -716,8 +829,20 @@ fn attention_layer_matches_hand_reference_multi_step() {
         let mut k = matvec(&xn, &kw, kin, kout);
         let v = matvec(&xn, &vw, vin, vout);
 
-        let qn = blk.attn_q_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
-        let kn = blk.attn_k_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+        let qn = blk
+            .attn_q_norm
+            .as_ref()
+            .unwrap()
+            .weight
+            .to_vec_f32()
+            .unwrap();
+        let kn = blk
+            .attn_k_norm
+            .as_ref()
+            .unwrap()
+            .weight
+            .to_vec_f32()
+            .unwrap();
         for h in 0..AH {
             let s = h * AHD;
             let n = rms(&q[s..s + AHD], &qn, eps);
@@ -783,7 +908,11 @@ fn attention_layer_matches_hand_reference_multi_step() {
         let (ow, oin, oout) = lin_w(blk.wo.as_ref().unwrap());
         let proj = matvec(&branch, &ow, oin, oout);
         let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
-        let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+        let pan = blk
+            .post_attention_norm
+            .weight
+            .to_vec_f32()
+            .expect("post norm");
         let h2 = rms(&h1, &pan, eps);
         let (gw, gi, go) = lin_w(&blk.ffn_gate);
         let (uw, ui, uo) = lin_w(&blk.ffn_up);
@@ -795,12 +924,20 @@ fn attention_layer_matches_hand_reference_multi_step() {
         let want: Vec<f32> = (0..HIDDEN).map(|i| h1[i] + dn[i]).collect();
 
         let got = blk
-            .forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[step], &mut cache)
+            .forward(
+                &cpu(x.clone(), Shape::new(vec![1, HIDDEN])),
+                &[step],
+                &mut cache,
+            )
             .expect("attention forward chained step")
             .to_vec_f32()
             .expect("read");
 
-        compare(&format!("attention layer chained step {step} (kv_len={num_keys})"), &got, &want);
+        compare(
+            &format!("attention layer chained step {step} (kv_len={num_keys})"),
+            &got,
+            &want,
+        );
         cache.current_pos += 1;
     }
 }

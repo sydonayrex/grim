@@ -46,15 +46,22 @@ pub mod quantization;
 pub mod rccl;
 pub mod rocm_detect;
 pub mod scythe2_placement;
+pub mod scythe_task_descriptors;
+pub mod task_graph;
+pub mod task_graph_exec;
+pub use crate::scythe_task_descriptors::{
+    MoETaskDescriptor, MoeQuantMode, ScytheTaskDescriptor, moe_quant_mode,
+};
 pub mod speculative;
 pub mod trace;
 
 /// SCYTHE-2 WI-2: capability profiler re-export.
 pub use device::capability_profiler::{
     CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch,
-    free_device_memory, vram_info,
+    free_device_memory, vram_info, vram_info_detailed,
 };
 pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
+pub use device::util::{ensure_rocm_watchdog_started, report_rocm_progress};
 
 // S4: the dispatch route counter. Re-exported at the crate root because the T2
 // journey tests that consume it live in `tests/`, and an integration test can
@@ -78,18 +85,19 @@ pub use crate::device::handles::{
     HIP_MEM_ADVISE_UNSET_COARSE_GRAIN, HIP_MEM_ADVISE_UNSET_PREFERRED_LOCATION,
     HIP_MEM_ADVISE_UNSET_READ_MOSTLY, HipDim3, HipErrorT, HipGraphKernelNodeParams,
     HipGraphMemcpyNodeParams, HipMemcpyKind, HiprtcProgram, RocmDeviceProps, RocmHandle,
-    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipEventCreate, hipEventDestroy,
-    hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
+    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipErrorNotReady, hipEventCreate,
+    hipEventDestroy, hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
     hipGetDeviceProperties, hipGraphAddKernelNode, hipGraphCreate, hipGraphDestroy,
     hipGraphExecDestroy, hipGraphExecKernelNodeSetParams, hipGraphExtendFromGlobalStream,
     hipGraphInstantiate, hipGraphLaunch, hipGraphUpload, hipHostFree, hipHostMalloc, hipMalloc,
     hipMallocManaged, hipMemAdvise, hipMemGetInfo, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync,
     hipMemset, hipMemsetAsync, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
     hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate,
-    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize,
-    hipStreamWaitEvent, hipSuccess, hiprtcAddNameExpression, hiprtcCompileProgram,
-    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
-    hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamEndCapture, hipStreamQuery,
+    hipStreamSynchronize, hipStreamWaitEvent, hipSuccess, hiprtcAddNameExpression,
+    hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode,
+    hiprtcGetCodeSize, hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog,
+    hiprtcGetProgramLogSize,
 };
 
 pub use crate::device::blaslt::{
@@ -98,12 +106,15 @@ pub use crate::device::blaslt::{
 };
 pub use crate::device::rocblas::{
     ROCBLAS_GEMM_FLAGS_NONE,
+    RocblasAtomicsMode,
     RocblasHandle,
     RocblasInt,
     RocblasOperation,
     Rocblstatus,
     arith_to_compute_dtype,
     arith_to_rocblas_dtype,
+    rocblas_atomics_allowed,
+    rocblas_atomics_not_allowed,
     rocblas_create_handle,
     rocblas_datatype,
     rocblas_destroy_handle,
@@ -111,6 +122,8 @@ pub use crate::device::rocblas::{
     rocblas_gemm_ex,
     rocblas_gemm_flags,
     rocblas_gemm_strided_batched_ex,
+    rocblas_get_atomics_mode,
+    rocblas_set_atomics_mode,
     rocblas_set_stream,
     rocblas_sgemm,
     rocblas_status_success,
@@ -135,7 +148,7 @@ pub use crate::gptq_kernel::wavefront_size_for_gcn;
 pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
 pub use crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE;
 pub use crate::kernels::jit_cache::HsacoKernelCache;
-pub use crate::kernels::qkv_attention::kv_f16_enabled;
+pub use crate::kernels::qkv_attention::{kv_arena_format, kv_f16_enabled};
 pub use crate::kernels::source_asm::compute_kernel_source;
 
 pub use crate::device::compute::{FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvWeights};
@@ -143,6 +156,7 @@ pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
+pub use crate::memory::storage::{blocking_d2h_count, reset_blocking_d2h_count};
 pub use crate::memory::view::RocmStorageView;
 
 pub use crate::device::helpers::{
@@ -156,7 +170,7 @@ pub use crate::device::util::{
     dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch,
     prefill_in_flight, raw_set_device, set_prefill_in_flight, warp_rows_launch,
 };
-pub use crate::peer_access::enumerate_devices;
+pub use crate::peer_access::{enable_peer_access, enumerate_devices, p2p_memcpy_async};
 
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.
@@ -167,11 +181,12 @@ pub use crate::device::roc_device::{
 };
 
 pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
-pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::decode_graph_buffers::{
-    DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
-    launch_attention, launch_qkv_gemv, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
+    DecodeGraphBuffers, EagerKvSource, KV_ARENA_BITS_WHITECROW, check_layer_topology,
+    decode_graph_enabled, launch_attention, launch_attention_ring, launch_qkv_gemv,
+    launch_qkv_gemv_ring, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
 };
+pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::device::parallel_comm::{
     CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,
 };
@@ -187,10 +202,17 @@ pub use fusion::{
 };
 
 pub use kernels::qkv_attention::{
-    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_bump_i32_slots, launch_kv_append,
-    launch_kv_append_batch, launch_paged_attention, launch_paged_attention_quant,
-    launch_qkv_attention_dev, launch_qkv_attention_dev_batch, launch_qkv_attention_wmma,
-    launch_tree_attention,
+    BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, KvRingPolicy, f16_kv_explicitly_disabled,
+    launch_bump_i32, launch_bump_i32_slots, launch_clamp_layer_total, launch_kv_append,
+    launch_kv_append_batch, launch_kv_append_i4, launch_kv_append_i8,
+    launch_kv_append_whitecrow, launch_kv_quantize_rows_i2,
+    launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8, launch_kv_quantize_rows_whitecrow,
+    launch_paged_attention, launch_paged_attention_quant, launch_paged_attention_quant_split,
+    launch_qkv_attention_dev,
+    launch_qkv_attention_dev_batch, launch_qkv_attention_dev_batch_i4,
+    launch_qkv_attention_dev_batch_i8, launch_qkv_attention_dev_batch_whitecrow,
+    launch_qkv_attention_dev_batch_whitecrow_split,
+    launch_qkv_attention_wmma, launch_tree_attention, parse_f16_kv_env, parse_kv_arena_env,
 };
 pub use kernels::tile_picker::run_install_tune;
 

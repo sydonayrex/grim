@@ -12,6 +12,7 @@ use crate::memory::storage::RocmStorage;
 impl RocmDevice {
     /// Launch the JIT compiled Q8_0 dequantization kernel.  Reads packed [see: `packed_storage`, `n_weights`, `out_storage`, `materialize()`]
     pub fn dequantize_q8_0(&self, packed: &RocmStorage) -> Result<RocmStorage> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         const QK8_0: usize = 32;
         // Q8_0 stores weights as packed bytes: each block is 34 bytes (2-byte [see: `n_blocks * 32`]
         let packed_bytes = packed.bytes;
@@ -51,6 +52,7 @@ impl RocmDevice {
     /// Dequantize Q4_K packed bytes to F32 on the GPU.
     /// [see: `block_q4_K`] `packed` must hold `n_blocks` × 144-byte super-blocks; `out` must hold `n_blocks` × 256.
     pub fn dequantize_q4k(&self, packed: &RocmStorage) -> Result<RocmStorage> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         const QK4_K: usize = 256;
         const BLOCK_BYTES: usize = 144;
         let packed_bytes = packed.bytes;
@@ -170,7 +172,7 @@ impl RocmDevice {
 
     /// Dequantize IQ3_XXS packed bytes via the ROCm kernel. 96 bytes / 256-elem super-block.
     pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 96, 256, "grim_dequant_iq3xxs")
+        self.dequantize_iq_host(bytes, elem_count, 98, 256, "grim_dequant_iq3xxs")
     }
 
     /// Dequantize IQ3_S packed bytes via the ROCm kernel. 110 bytes / 256-elem super-block.
@@ -193,6 +195,7 @@ impl RocmDevice {
 
     /// Dequantize packed FP8 bytes (4-byte f32 LE scale header, then one E4M3 code per element).
     pub fn dequantize_fp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let scale = if bytes.len() >= 4 {
             f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         } else {
@@ -303,6 +306,7 @@ impl RocmDevice {
     /// Dequantize Nutcracker interleaved packed bytes (1 `[exp:6|sel:2]` scale byte
     /// + 8 E2M1 code bytes per 16 values) to f32.
     pub fn dequantize_nutcracker_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let packed = RocmStorage::copy_from_host_raw_bytes(
             bytes,
             &Shape::new(vec![bytes.len()]),
@@ -331,6 +335,7 @@ impl RocmDevice {
     /// Dequantize NVFP4 interleaved packed bytes (1 **E4M3** scale byte + 8 E2M1
     /// code bytes per 16 values) to f32, on device.
     pub fn dequantize_nvfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let packed = RocmStorage::copy_from_host_raw_bytes(
             bytes,
             &Shape::new(vec![bytes.len()]),

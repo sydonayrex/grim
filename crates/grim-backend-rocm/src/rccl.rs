@@ -4,6 +4,9 @@ use grim_tensor::DType;
 use grim_tensor::error::{Error, Result};
 use std::ffi::{c_char, c_void};
 
+#[cfg(feature = "rccl")]
+use crate::device::handles::hipMemcpyPeerAsync;
+
 /// Opaque NCCL communicator handle. # Safety `NcclComm` wraps a raw NCCL
 /// communicator pointer that is valid process-wide once initialized via `ncclCommInitRank` or `ncclCommInitAll`.
 #[repr(transparent)]
@@ -98,15 +101,8 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> NcclResult;
 
-    // FFI for P2P copy
-    pub fn hipMemcpyPeerAsync(
-        dst: *mut c_void,
-        dstDevice: i32,
-        src: *const c_void,
-        srcDevice: i32,
-        count: usize,
-        stream: *mut c_void,
-    ) -> i32;
+    // FFI for P2P copy lives in device::handles (grim-hip-sys adapter layer);
+    // this block declares RCCL symbols only.
 }
 
 #[cfg(not(feature = "rccl"))]
@@ -332,8 +328,18 @@ impl RocmComm {
                     )));
                 }
             } else {
+                let mut grouped: Vec<(*const c_void, i32)> = send_buffs.to_vec();
+                grouped.sort_by_key(|b| b.1);
+                let mut seen_ranks = std::collections::HashSet::new();
+                for &(_, rank) in &grouped {
+                    if !seen_ranks.insert(rank) {
+                        return Err(Error::Backend(
+                            "fuse_reduce_scatter: duplicate rank in grouped collective".into(),
+                        ));
+                    }
+                }
                 let _ = ncclGroupStart();
-                for &(send_ptr, _rank) in send_buffs {
+                for &(send_ptr, _rank) in &grouped {
                     if !send_ptr.is_null() {
                         let _ = ncclReduceScatter(
                             send_ptr, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm,
@@ -406,8 +412,18 @@ impl RocmComm {
                     )));
                 }
             } else {
+                let mut grouped: Vec<(*mut c_void, i32)> = recv_buffs.to_vec();
+                grouped.sort_by_key(|b| b.1);
+                let mut seen_ranks = std::collections::HashSet::new();
+                for &(_, rank) in &grouped {
+                    if !seen_ranks.insert(rank) {
+                        return Err(Error::Backend(
+                            "fuse_all_gather: duplicate rank in grouped collective".into(),
+                        ));
+                    }
+                }
                 let _ = ncclGroupStart();
-                for &(recv_ptr, _rank) in recv_buffs {
+                for &(recv_ptr, _rank) in &grouped {
                     if !recv_ptr.is_null() {
                         let _ = ncclAllGather(
                             send_buff, recv_ptr, send_count, nccl_dtype, self.comm, stream,
@@ -453,6 +469,7 @@ pub fn p2p_memcpy_async(
     count: usize,
     stream: *mut c_void,
 ) -> Result<()> {
+    let _guard = crate::device::util::DeviceGuard::set(src_device);
     #[cfg(feature = "rccl")]
     unsafe {
         // rust-ffi-grim §1.3: guard null pointers before the FFI call so

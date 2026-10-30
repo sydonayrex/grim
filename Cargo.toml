@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 exclude = ["third-party/convert_case-0.10.1"]
+
 members = [
+    "crates/grim-hip-sys",
+    "crates/cubecl-hip-sys",
     "crates/grim-tensor",
     "crates/grim-backend-cpu",
     "crates/grim-backend-rocm",
@@ -106,3 +109,7 @@ codegen-units = 1
 
 [patch.crates-io]
 convert_case = { path = "third-party/convert_case-0.10.1" }
+# crates.io cubecl-hip-sys 7.2 does not compile against ROCm 7.16 headers
+# (bindgen renamed the enum consts); grim-hip-sys carries a 7.16-generated
+# file with the full surface cubecl-hip 0.10 imports.
+cubecl-hip-sys = { path = "crates/cubecl-hip-sys" }

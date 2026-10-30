@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -17,10 +17,10 @@ use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_i
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, hipMemGetInfo,
-    rocblas_gemm_ex, rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm,
-    rocblas_status_success, select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle,
-    ROCBLAS_GEMM_FLAGS_NONE,
+    HipDim3, ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle, arg,
+    arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, hipMemGetInfo, rocblas_gemm_ex,
+    rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success,
+    select_gemm_algo,
 };
 
 impl RocmDevice {
@@ -177,6 +177,184 @@ impl RocmDevice {
             }
         }
         Ok(stream)
+    }
+
+    /// Launch rocBLAS F16 x F16 -> F32 GEMM directly on active stream.
+    /// Used for accelerated prefill dequant GEMM (A: f16, B: f16, C/D: f32, compute: f32).
+    pub(crate) fn launch_rocblas_gemm_f16_f32(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        use crate::device::rocblas::*;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let handle = self.get_rocblas_handle()?;
+        let stream = self.active_stream();
+        unsafe {
+            let _ = rocblas_set_stream(handle, stream);
+        }
+        let alpha: f32 = 1.0f32;
+        let beta: f32 = 0.0f32;
+        let a_ptr_void = a_storage.device_ptr_checked()? as *const c_void;
+        let b_ptr_void = b_storage.device_ptr_checked()? as *const c_void;
+        let out_ptr_void = out_storage.device_ptr_checked()? as *mut c_void;
+        let alpha_ptr = &alpha as *const f32 as *const c_void;
+        let beta_ptr = &beta as *const f32 as *const c_void;
+        unsafe {
+            // C = A @ B^T, B stored (N, K). transA=Trans, transB=NoTrans;
+            // m=N, n=M, k=K, A=b_ptr (lda=K), B=a_ptr (ldb=K), C=D=out (ldc/ldd=N).
+            let status = rocblas_gemm_ex(
+                handle,
+                RocblasOperation::Transpose,
+                RocblasOperation::None,
+                n as RocblasInt,
+                m as RocblasInt,
+                k as RocblasInt,
+                alpha_ptr,
+                b_ptr_void,
+                rocblas_datatype::f16_r,
+                k as RocblasInt,
+                a_ptr_void,
+                rocblas_datatype::f16_r,
+                k as RocblasInt,
+                beta_ptr,
+                out_ptr_void,
+                rocblas_datatype::f32_r,
+                n as RocblasInt,
+                out_ptr_void,
+                rocblas_datatype::f32_r,
+                n as RocblasInt,
+                rocblas_datatype::f32_r,
+                rocblas_gemm_algo::standard,
+                0 as RocblasInt,
+                ROCBLAS_GEMM_FLAGS_NONE,
+            );
+            if status != rocblas_status_success {
+                return Err(Error::Backend(format!(
+                    "rocblas_gemm_ex (f16,f16->f32) failed with code {status}"
+                )));
+            }
+        }
+        Ok(stream)
+    }
+
+    /// SPEED-ROC-PREFILL: Accelerated prefill GEMM for IQ-family weights (IQ4_NL, IQ4_XS, IQ3_S)
+    /// Dequantizes the packed weight once directly to F16 into transient prefill scratch,
+    /// converts activation A from F32 to F16 (or reuses F16 A), then executes rocBLAS gemm_ex
+    /// with mixed precision (A: F16, B: F16 -> C/D: F32).
+    pub(crate) fn launch_iq_prefill_dequant_rocblas_f16(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        format_tag: &str,
+    ) -> Result<()> {
+        let n_elements = n * k;
+        let weight_bytes = n_elements * 2; // F16 = 2 bytes per weight
+
+        // 1. Ensure transient weight F16 scratch buffer
+        let mut w_guard = self
+            .prefill_iq_weight_f16_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let need_w_alloc = match w_guard.as_ref() {
+            Some(s) => s.bytes < weight_bytes,
+            None => true,
+        };
+        if need_w_alloc {
+            let shape = Shape::new(vec![n_elements]);
+            *w_guard = Some(RocmStorage::alloc_gpu(
+                &shape,
+                DType {
+                    arith: ArithType::F16,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let w_f16 = w_guard.as_ref().unwrap();
+
+        // 2. Dequantize packed weight directly to F16
+        match format_tag {
+            "iq4nl" => {
+                let n_blocks = n_elements / 32;
+                self.launch_dequant_iq4nl_f16(b_storage, w_f16, n_blocks)?;
+            }
+            "iq4xs" => {
+                let n_blocks = n_elements / 256;
+                self.launch_dequant_iq4xs_f16(b_storage, w_f16, n_blocks)?;
+            }
+            "iq3s" => {
+                let n_blocks = n_elements / 256;
+                self.launch_dequant_iq3s_f16(b_storage, w_f16, n_blocks)?;
+            }
+            other => {
+                return Err(Error::Backend(format!(
+                    "launch_iq_prefill_dequant_rocblas_f16 unsupported format {other}"
+                )));
+            }
+        }
+
+        // 3. Prepare activation A in F16
+        let a_f16_storage = if Self::is_fp16_activation(a_storage) {
+            None
+        } else {
+            let a_elems = m * k;
+            let a_bytes = a_elems * 2;
+            let mut a_guard = self
+                .prefill_act_f16_buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let need_a_alloc = match a_guard.as_ref() {
+                Some(s) => s.bytes < a_bytes,
+                None => true,
+            };
+            if need_a_alloc {
+                let shape = Shape::new(vec![a_elems]);
+                *a_guard = Some(RocmStorage::alloc_gpu(
+                    &shape,
+                    DType {
+                        arith: ArithType::F16,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?);
+            }
+            let a_f16 = a_guard.as_ref().unwrap();
+            let mut sptr = a_storage
+                .device_ptr
+                .ok_or_else(|| Error::Backend("cvt A: src ptr".into()))?;
+            let mut dptr = a_f16
+                .device_ptr
+                .ok_or_else(|| Error::Backend("cvt A: dst ptr".into()))?;
+            let mut n_i = a_elems as i32;
+            let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+            self.launch_compute_kernel(
+                "grim_cvt_f32_f16",
+                HipDim3::new(1024, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut n_i)],
+            )?;
+            Some(a_guard)
+        };
+
+        let a_act = match &a_f16_storage {
+            Some(g) => g.as_ref().unwrap(),
+            None => a_storage,
+        };
+
+        // 4. Dispatch mixed-precision rocBLAS GEMM (A: F16, B: F16 -> C/D: F32)
+        self.launch_rocblas_gemm_f16_f32(a_act, w_f16, out_storage, m, n, k)?;
+        Ok(())
     }
 
     /// Enqueues the JIT-compiled WMMA matrix-core GEMM kernel (WI-G).
@@ -775,30 +953,64 @@ impl RocmDevice {
         self.launch_wmma_big_fmt_a16(kernel, 64, 128, a16_ptr, b_storage, out_storage, m, n, k, 1)
     }
 
-    fn f32_activation_as_f16_ptr(
-        &self,
-        a: &RocmStorage,
-        elems: usize,
-    ) -> Result<u64> {
-        static F16_A: OnceLock<std::sync::Mutex<std::collections::HashMap<(u64, usize), Arc<RocmStorage>>>> =
-            OnceLock::new();
+    /// Scratch f16 copy of a f32 A operand, for the 64x128 big tile's
+    /// `a_f16 = 1` mode.
+    ///
+    /// The fill re-reads A once per column block, so handing it halves instead
+    /// of floats halves that traffic; the copy is therefore redone on EVERY
+    /// call and only the BUFFER is reused.
+    ///
+    /// It used to be memoized on `(device_ptr, bytes, elems, ordinal)` and skip
+    /// the copy on a hit. That key names an allocation, not its contents, and
+    /// the pooled allocator hands one address to one activation after another
+    /// of the same shape — which is the normal case, since a layer's input
+    /// activation is freed as the next layer's is allocated. So the second
+    /// GEMM launch of a forward read the FIRST activation's halves. Measured
+    /// by `tests/big64x128_activation_reuse.rs`: the second launch came back
+    /// 3311.1 from the oracle for the rewritten A and 0.13 from the result for
+    /// the old one. Every 9B prefill with m >= 64 was computed on stale
+    /// activations, which is the whole of the "prefill collapse at 64 tokens".
+    fn f32_activation_as_f16_ptr(&self, a: &RocmStorage, elems: usize) -> Result<u64> {
+        static F16_A: OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, Arc<RocmStorage>>>,
+        > = OnceLock::new();
         if a.dtype.arith != ArithType::F32 {
             return Err(Error::Backend("f32_activation_as_f16: A is not f32".into()));
         }
-        let key = (a.device_ptr.unwrap_or(0), a.bytes);
         let map = F16_A.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        if let Some(hit) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return Ok(hit.device_ptr.unwrap_or(0));
+        // Grown, never reused for its contents: an activation can be longer
+        // than the one that sized the buffer (the same device runs several
+        // shapes), and the ordinal keys the scratch to the card that owns it.
+        // One scratch per ordinal assumes one forward at a time per device,
+        // which is how this backend is driven (a device owns one compute
+        // stream); concurrent forward passes would need a scratch per stream.
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        let need_alloc = match guard.get(&self.ordinal) {
+            Some(s) => s.bytes < elems * 2,
+            None => true,
+        };
+        if need_alloc {
+            let shape = Shape::new(vec![elems]);
+            guard.insert(
+                self.ordinal,
+                Arc::new(RocmStorage::alloc_gpu(
+                    &shape,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?),
+            );
         }
-        let shape = Shape::new(vec![elems]);
-        let dst = RocmStorage::alloc_gpu(
-            &shape,
-            DType { arith: ArithType::F32, storage: DTypeStorage::Native },
-            &self.allocator,
-            self.ordinal,
-        )?;
-        let mut sptr = a.device_ptr.ok_or_else(|| Error::Backend("cvt: src ptr".into()))?;
-        let mut dptr = dst.device_ptr.ok_or_else(|| Error::Backend("cvt: dst ptr".into()))?;
+        let dst = guard.get(&self.ordinal).expect("just inserted");
+        let mut sptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("cvt: src ptr".into()))?;
+        let mut dptr = dst
+            .device_ptr
+            .ok_or_else(|| Error::Backend("cvt: dst ptr".into()))?;
         let mut n_i = elems as i32;
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         self.launch_compute_kernel(
@@ -807,40 +1019,92 @@ impl RocmDevice {
             HipDim3::new(256, 1, 1),
             &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut n_i)],
         )?;
-        let dptr_ret = dst.device_ptr.unwrap_or(0);
-        map.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, Arc::new(dst));
-        Ok(dptr_ret)
+        Ok(dst.device_ptr.unwrap_or(0))
     }
 
     pub(crate) fn launch_wmma_big64x128_q4k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q4k", a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big64x128_q5k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q5k", a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big64x128_q6k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q6k", a, b, out, m, n, k)
     }
 
+    /// TEST ENTRY: the PRODUCTION 64x128 path, `a_f16 = 1` — the memoized
+    /// f32->f16 activation conversion. The `_for_ab` entry below passes six
+    /// arguments to a seven-parameter kernel and leaves `a_f16` undefined, so
+    /// it exercises the fill-converts-A path; a gate that has to see the memo
+    /// must come through here. See `tests/big64x128_activation_reuse.rs`.
+    pub fn launch_wmma_big64x128_q4k_a16_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big64x128_fmt(
+            "grim_wmma_big64x128_q4k",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
     /// A/B EXPERIMENT: 64x128 tile, 256 threads (8 waves: 2 row x 4 col quadrants).
+    ///
+    /// `a_f16 = 0`: the fill converts A from f32 itself. This entry used to
+    /// pass SIX arguments to a seven-parameter kernel, leaving `a_f16`
+    /// undefined — it happened to arrive as 0, so the tests built on it stayed
+    /// green while exercising a call production never makes. The parameter is
+    /// now passed explicitly; `..._q4k_a16_for_ab` is the production shape.
     pub fn launch_wmma_big64x128_q4k_for_ab(
         &self,
-        a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
-        m: usize, n: usize, k: usize,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = a_storage.device_ptr
+        let a_ptr = a_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("wmma_big64x128_q4k: a has no device ptr".into()))?;
-        let b_ptr = b_storage.device_ptr
+        let b_ptr = b_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("wmma_big64x128_q4k: b has no device ptr".into()))?;
-        let out_ptr = out_storage.device_ptr
+        let out_ptr = out_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("wmma_big64x128_q4k: out has no device ptr".into()))?;
         let grid_dim = HipDim3::new(n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1);
         let block_dim = HipDim3::new(256, 1, 1);
@@ -850,36 +1114,64 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
+        let mut af = 0i32;
         self.launch_compute_kernel(
             "grim_wmma_big64x128_q4k",
             grid_dim,
             block_dim,
-            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr),
-                  arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut af),
+            ],
         )
     }
 
     pub(crate) fn launch_wmma_big_q5k(
         &self,
-        a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big_fmt("grim_wmma_big_q5k", 64, 64, a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big_q6k(
         &self,
-        a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big_fmt("grim_wmma_big_q6k", 64, 64, a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big128_q5k(
         &self,
-        a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big_fmt("grim_wmma_big128_q5k", 128, 64, a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big128_q6k(
         &self,
-        a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big_fmt("grim_wmma_big128_q6k", 128, 64, a, b, out, m, n, k)
     }
@@ -898,26 +1190,46 @@ impl RocmDevice {
     }
 
     pub fn launch_wmma_big_q5k_for_ab(
-        &self, a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
-        m: usize, n: usize, k: usize,
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big_q5k(a_storage, b_storage, out_storage, m, n, k)
     }
     pub fn launch_wmma_big_q6k_for_ab(
-        &self, a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
-        m: usize, n: usize, k: usize,
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big_q6k(a_storage, b_storage, out_storage, m, n, k)
     }
     pub fn launch_wmma_big128_q5k_for_ab(
-        &self, a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
-        m: usize, n: usize, k: usize,
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big128_q5k(a_storage, b_storage, out_storage, m, n, k)
     }
     pub fn launch_wmma_big128_q6k_for_ab(
-        &self, a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
-        m: usize, n: usize, k: usize,
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_big128_q6k(a_storage, b_storage, out_storage, m, n, k)
     }
@@ -933,7 +1245,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q5k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q5k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q2_K GEMM launcher (RDNA3/4).
@@ -947,7 +1259,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q2k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q2k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q3_K GEMM launcher (RDNA3/4).
@@ -961,7 +1273,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q3k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q3k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q6_K GEMM launcher (RDNA3/4).
@@ -975,7 +1287,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q6k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q6k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant IQ-family GEMM launchers (RDNA3/4).
@@ -989,7 +1301,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xxs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant(
+            "grim_wmma_fused_dequant_iq2xxs",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            16,
+        )
     }
 
     #[allow(dead_code)]
@@ -1002,7 +1323,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant(
+            "grim_wmma_fused_dequant_iq2xs",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            16,
+        )
     }
 
     #[allow(dead_code)]
@@ -1015,7 +1345,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1028,7 +1358,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3xxs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant(
+            "grim_wmma_fused_dequant_iq3xxs",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            16,
+        )
     }
 
     #[allow(dead_code)]
@@ -1041,7 +1380,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1054,7 +1393,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4nl", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant(
+            "grim_wmma_fused_dequant_iq4nl",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            16,
+        )
     }
 
     #[allow(dead_code)]
@@ -1067,7 +1415,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4xs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant(
+            "grim_wmma_fused_dequant_iq4xs",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            16,
+        )
     }
 
     /// SPEED-ROC: FP8 E4M3 WMMA GEMM launcher (RDNA4 only, 383 TFLOPS).
@@ -1213,6 +1570,36 @@ impl RocmDevice {
         n_tiles: usize,
         n_windows: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_GREY_RAVEN_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            self.launch_grey_raven_gemm_v2_for_ab(
+                w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows,
+            )
+        } else {
+            self.launch_grey_raven_gemm_v1_for_ab(
+                w_blob, b_frag, y_out, m, n, k, n_tiles, n_windows,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_grey_raven_gemm_v1_for_ab(
+        &self,
+        w_blob: &RocmStorage,
+        b_frag: &RocmStorage,
+        y_out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        n_tiles: usize,
+        n_windows: usize,
+    ) -> Result<*mut c_void> {
         let want_bytes = n_tiles
             .checked_mul(n_windows)
             .and_then(|t| t.checked_mul(260))
@@ -1226,9 +1613,11 @@ impl RocmDevice {
         let wptr = w_blob
             .device_ptr
             .ok_or_else(|| Error::Backend("grey_raven_gemm: w has no device ptr".into()))?;
-        let bptr = b_frag
-            .device_ptr
-            .ok_or_else(|| Error::Backend("grey_raven_gemm: b_frag has no device ptr (run the prologue first)".into()))?;
+        let bptr = b_frag.device_ptr.ok_or_else(|| {
+            Error::Backend(
+                "grey_raven_gemm: b_frag has no device ptr (run the prologue first)".into(),
+            )
+        })?;
         let yptr = y_out
             .device_ptr
             .ok_or_else(|| Error::Backend("grey_raven_gemm: y has no device ptr".into()))?;
@@ -1258,6 +1647,220 @@ impl RocmDevice {
                 arg(&mut nt),
                 arg(&mut nw),
                 arg(&mut mt),
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_grey_raven_gemm_v2_for_ab(
+        &self,
+        w_blob: &RocmStorage,
+        b_frag: &RocmStorage,
+        y_out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        n_tiles: usize,
+        n_windows: usize,
+    ) -> Result<*mut c_void> {
+        let want_bytes = n_tiles
+            .checked_mul(n_windows)
+            .and_then(|t| t.checked_mul(260))
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: tile geometry overflows".into()))?;
+        if w_blob.bytes != want_bytes {
+            return Err(Error::Backend(format!(
+                "grey_raven_gemm: HW blob is {} bytes, need {} ({} N-tiles x {} K-windows x 260) -- truncated upload or wrong tensor",
+                w_blob.bytes, want_bytes, n_tiles, n_windows
+            )));
+        }
+        let wptr = w_blob
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: w has no device ptr".into()))?;
+        let bptr = b_frag.device_ptr.ok_or_else(|| {
+            Error::Backend(
+                "grey_raven_gemm: b_frag has no device ptr (run the prologue first)".into(),
+            )
+        })?;
+        let yptr = y_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: y has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n_tiles.div_ceil(2) as u32, m.div_ceil(16) as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let m_tiles = m.div_ceil(16);
+        let mut w = wptr;
+        let mut bb = bptr;
+        let mut yy = yptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut nt = n_tiles as i32;
+        let mut nw = n_windows as i32;
+        let mut mt = m_tiles as i32;
+        crate::device::compute::kernel_infra::record_kernel_route("grim_grey_raven_gemm");
+        self.launch_compute_kernel(
+            "grim_grey_raven_gemm_v2",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut w),
+                arg(&mut bb),
+                arg(&mut yy),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut nt),
+                arg(&mut nw),
+                arg(&mut mt),
+            ],
+        )
+    }
+
+    /// res0-T1-3 probe launcher: INT8 x UINT8 -> INT32 WMMA (RDNA4).
+    /// A [M,K] int8 row-major, B [N,K] uint8 row-major, D [M,N] int32.
+    /// Both A and B padded to whole 16-row tiles (same OOB contract as the
+    /// fp8 kernel: load_matrix_sync is unmasked, only the store is).
+    pub fn launch_wmma_gemm_iu8_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 16;
+        const TILE_N: usize = 16;
+        const N_TILES_PER_BLOCK: usize = 2;
+        let n_per_block = TILE_N * N_TILES_PER_BLOCK;
+
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8: b has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8: out has no device ptr".into()))?;
+
+        if k % 16 != 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8: K={k} must be divisible by 16"
+            )));
+        }
+        let tile = 16usize;
+        if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8: A must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                a.bytes()
+            )));
+        }
+        if b.bytes() % (tile * k) != 0 || b.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8: B must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                b.bytes()
+            )));
+        }
+
+        let grid_dim = HipDim3::new(
+            (n as u32).div_ceil(n_per_block as u32),
+            (m as u32).div_ceil(TILE_M as u32),
+            1,
+        );
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_gemm_iu8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// res0-T1-3 probe launcher: the 4-M-tile variant (B reused across 4
+    /// row tiles per block). Same OOB contract as launch_wmma_gemm_iu8_for_ab.
+    pub fn launch_wmma_gemm_iu8_mtile_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 64; // 4 x 16
+        const TILE_N: usize = 16;
+        const N_TILES_PER_BLOCK: usize = 2;
+        let n_per_block = TILE_N * N_TILES_PER_BLOCK;
+
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8_mtile: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8_mtile: b has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_iu8_mtile: out has no device ptr".into()))?;
+
+        if k % 16 != 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8_mtile: K={k} must be divisible by 16"
+            )));
+        }
+        let tile = 16usize;
+        if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8_mtile: A must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                a.bytes()
+            )));
+        }
+        if b.bytes() % (tile * k) != 0 || b.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_iu8_mtile: B must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                b.bytes()
+            )));
+        }
+
+        let grid_dim = HipDim3::new(
+            (n as u32).div_ceil(n_per_block as u32),
+            (m as u32).div_ceil(TILE_M as u32),
+            1,
+        );
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_gemm_iu8_mtile",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
             ],
         )
     }
@@ -1442,7 +2045,7 @@ impl RocmDevice {
             other => {
                 return Err(Error::Backend(format!(
                     "quant_fp8_pad16: act must be f32 or u8 codes, got {other:?}"
-                )))
+                )));
             }
         };
         if src_is_fp8 == 1 && act.bytes() < m * k {
@@ -1542,6 +2145,70 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITE_RAVEN_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            self.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a, b_blocked, out, m, n, k)
+        } else {
+            self.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a, b_blocked, out, m, n, k)
+        }
+    }
+
+    pub fn launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(
+        &self,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_gemm_fp8_e4m3_blocked_named(
+            "grim_wmma_gemm_fp8_e4m3_blocked",
+            a,
+            b_blocked,
+            out,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(
+        &self,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_gemm_fp8_e4m3_blocked_named(
+            "grim_wmma_gemm_fp8_e4m3_blocked_v2",
+            a,
+            b_blocked,
+            out,
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn launch_wmma_gemm_fp8_e4m3_blocked_named(
+        &self,
+        kernel: &str,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         const TILE_M: usize = 16;
         const N_TILES_PER_BLOCK: usize = 2;
         let n_per_block = TILE_M * N_TILES_PER_BLOCK;
@@ -1598,8 +2265,13 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
+        if kernel == "grim_wmma_gemm_fp8_e4m3_blocked_v2" {
+            crate::device::compute::kernel_infra::record_kernel_route(
+                "grim_wmma_gemm_fp8_e4m3_blocked",
+            );
+        }
         self.launch_compute_kernel(
-            "grim_wmma_gemm_fp8_e4m3_blocked",
+            kernel,
             grid_dim,
             block_dim,
             &mut [
@@ -1623,6 +2295,7 @@ impl RocmDevice {
         m: usize,
         n: usize,
         k: usize,
+        n_tile: u32,
     ) -> Result<*mut c_void> {
         let a_ptr = a_storage
             .device_ptr
@@ -1634,7 +2307,12 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{name}: out has no device ptr")))?;
 
-        let grid_x = n.div_ceil(64) as u32;
+        // Grid stride follows the KERNEL's N tile, not a hardcoded 64:
+        // the macro-stamped K-quant kernels tile 64-wide while the explicit
+        // IQ kernels (wmma_iq_gemm.rs) tile 16-wide. A 64-wide grid on a
+        // 16-wide kernel leaves cols >= 16*ceil(N/64) unwritten (measured:
+        // IQ4_NL ffn_down [5120,17408] at M=1 computed only cols 0..1280).
+        let grid_x = n.div_ceil(n_tile as usize) as u32;
         let grid_y = m.div_ceil(16) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
         let block_dim = HipDim3::new(128, 1, 1);
@@ -2402,6 +3080,7 @@ impl RocmDevice {
         out: &RocmStorage,
         act_q81: &RocmStorage,
     ) -> Result<Box<dyn ComputeHandle>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::KQuantScheme;
         let a_dims = a.shape().dims();
         let k = a_dims.last().copied().unwrap_or(0);
@@ -2434,6 +3113,56 @@ impl RocmDevice {
                 got: vec![1, n],
             });
         }
+        // res0-T1-2 SPARSITY OPPORTUNITY PROBE. Env-gated (GRIM_SPARSE_PROBE=1,
+        // capped by GRIM_SPARSE_PROBE_MAX_CALLS, default 2000): copy the f32
+        // activation to host and report what fraction of 32-wide k-groups are
+        // DEAD — max|a| in group below tau x the call's global max — for tau in
+        // {0.02, 0.05, 0.1}. A dead k-group means SpQt-style skip saves that
+        // group's weight bytes for ALL n outputs, so the dead-group fraction
+        // IS the byte-savings fraction. One JSONL line per call: post-process
+        // outside. This is a probe; the D2H sync makes it slow by design.
+        if std::env::var("GRIM_SPARSE_PROBE").as_deref() == Ok("1") {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let max_calls: usize = std::env::var("GRIM_SPARSE_PROBE_MAX_CALLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000);
+            let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c < max_calls {
+                if let Some(a_rocm) = a.as_any().downcast_ref::<RocmStorage>() {
+                    if a_rocm.dtype().arith == grim_tensor::ArithType::F32 {
+                        if let Ok(host) = a_rocm.copy_to_host() {
+                            let vals: Vec<f32> = host
+                                .chunks_exact(4)
+                                .map(|ch| f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]))
+                                .collect();
+                            let gmax = vals.iter().fold(0f32, |m, v| m.max(v.abs()));
+                            let mut dead = [0usize; 3];
+                            let taus = [0.02f32, 0.05, 0.1];
+                            let mut total_groups = 0usize;
+                            for row in 0..m {
+                                for g0 in (0..k).step_by(32) {
+                                    let gend = (g0 + 32).min(k);
+                                    let g = vals[row * k + g0..row * k + gend]
+                                        .iter()
+                                        .fold(0f32, |mx, v| mx.max(v.abs()));
+                                    total_groups += 1;
+                                    for (ti, tau) in taus.iter().enumerate() {
+                                        if g < tau * gmax {
+                                            dead[ti] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "[sparse-probe] {{\"call\":{c},\"m\":{m},\"n\":{n},\"k\":{k},\"groups\":{total_groups},\"dead02\":{},\"dead05\":{},\"dead10\":{},\"gmax\":{gmax:.4}}}",
+                                dead[0], dead[1], dead[2]
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let need_q81 = m * (k / 32) * 36;
         let dot_disabled = matches!(
             std::env::var("GRIM_DOT_GEMV").as_deref(),
@@ -2457,7 +3186,16 @@ impl RocmDevice {
                     )));
                 }
                 let k_aligned = k - (k % 32);
-                if self.is_dot4_arch && !dot_disabled && k_aligned >= 32 {
+                // `grim_sdot4` now sign-extends both packed operands, so the
+                // dot4 leg is exact for signed Q8_0 codes on every arch.
+                //
+                // M7.4: the path is the DEVICE'S CONTRACT
+                // (`q8_0_path_contract`), not a re-derivation here. The
+                // contract is resolved once — the same resolution the IR
+                // carries — so the launcher and the ring cannot disagree
+                // about which path a Q8_0 projection takes.
+                let path = self.q8_0_path_contract(k);
+                if path == crate::task_graph::q8_0_path::DOT4_F32ACT && k_aligned >= 32 {
                     let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                         Error::Backend("linear_decode_into: a not RocmStorage".into())
                     })?;
@@ -2529,23 +3267,20 @@ impl RocmDevice {
                 // output buffers shows what the replay actually fed and
                 // produced. During capture (gate up) the D2H is skipped — a
                 // sync mid-capture would invalidate the graph.
-                let peek_io = !self.is_capturing()
-                    && std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some();
+                let peek_io =
+                    !self.is_capturing() && std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some();
                 if peek_io {
                     let peek = |s: &RocmStorage, tag: &str| {
                         let mut v = [0f32; 4];
                         let p = s.device_ptr.unwrap_or(0) as *mut c_void;
-                        let _ = crate::check_hip(
-                            "gsq-peek",
-                            unsafe {
-                                crate::hipMemcpy(
-                                    v.as_mut_ptr() as *mut c_void,
-                                    p,
-                                    16,
-                                    crate::HipMemcpyKind::DeviceToHost,
-                                )
-                            },
-                        );
+                        let _ = crate::check_hip("gsq-peek", unsafe {
+                            crate::hipMemcpy(
+                                v.as_mut_ptr() as *mut c_void,
+                                p,
+                                16,
+                                crate::HipMemcpyKind::DeviceToHost,
+                            )
+                        });
                         eprintln!("[gsq-peek] {tag} ptr={p:p} head={v:?}");
                     };
                     peek(a_rocm, "input");
@@ -2564,22 +3299,46 @@ impl RocmDevice {
                     let peek = |s: &RocmStorage, tag: &str| {
                         let mut v = [0f32; 4];
                         let p = s.device_ptr.unwrap_or(0) as *mut c_void;
-                        let _ = crate::check_hip(
-                            "gsq-peek",
-                            unsafe {
-                                crate::hipMemcpy(
-                                    v.as_mut_ptr() as *mut c_void,
-                                    p,
-                                    16,
-                                    crate::HipMemcpyKind::DeviceToHost,
-                                )
-                            },
-                        );
+                        let _ = crate::check_hip("gsq-peek", unsafe {
+                            crate::hipMemcpy(
+                                v.as_mut_ptr() as *mut c_void,
+                                p,
+                                16,
+                                crate::HipMemcpyKind::DeviceToHost,
+                            )
+                        });
                         eprintln!("[gsq-peek] {tag} ptr={p:p} head={v:?}");
                     };
                     peek(out, "out");
                 }
                 return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
+                let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("linear_decode_into: a not RocmStorage".into())
+                })?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ4NL_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                // IQ4_NL fast dot4 decode: Q8_1 activation dot4 GEMV.
+                // Replaces 5.6 ms (dev0) and 11.8 ms (dev1) scalar fused GEMV with ~0.2 ms dot4 GEMV.
+                if self.is_dot4_arch && !dot_disabled && k % 32 == 0 {
+                    if act_q81.bytes < need_q81 {
+                        return Err(Error::Backend(format!(
+                            "linear_decode_into: act scratch {}B < {need_q81}B",
+                            act_q81.bytes
+                        )));
+                    }
+                    self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
+                    self.launch_dot4_iq4nl_q81_gemv(act_q81, w, out, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_iq4nl(a_rocm, w, out, m, n, k)?;
+                }
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
             DTypeStorage::KQuant(
                 scheme @ (KQuantScheme::Q4K
@@ -2588,12 +3347,17 @@ impl RocmDevice {
                 | KQuantScheme::Q2K
                 | KQuantScheme::Q3K
                 | KQuantScheme::IQ3S
-                | KQuantScheme::IQ4NL
                 | KQuantScheme::IQ4XS
                 | KQuantScheme::IQ2S
                 | KQuantScheme::IQ2XS
                 | KQuantScheme::IQ2XXS
-                | KQuantScheme::IQ3XXS),
+                | KQuantScheme::IQ3XXS
+                // Swift-1.5 27B GSQ-RCO banks: IQ1_S/IQ1_M ride the same
+                // fused-dequant legs (the f32-act inner arms below); without
+                // them here the graph path refused mid-capture and every step
+                // fell back to eager.
+                | KQuantScheme::IQ1S
+                | KQuantScheme::IQ1M),
             ) => {
                 if act_q81.bytes < need_q81 {
                     return Err(Error::Backend(format!(
@@ -2649,7 +3413,7 @@ impl RocmDevice {
                         other => {
                             return Err(Error::Backend(format!(
                                 "linear_decode_into: no WMMA leg for K-quant {other:?}"
-                            )))
+                            )));
                         }
                     }
                     return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
@@ -2685,9 +3449,7 @@ impl RocmDevice {
                     scheme,
                     KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K
                 ) {
-                    if let Some(stream) =
-                        self.try_u4_lane_decode(a_s, w, out, m, n, k, *scheme)?
-                    {
+                    if let Some(stream) = self.try_u4_lane_decode(a_s, w, out, m, n, k, *scheme)? {
                         return Ok(Box::new(RocmHandle::new(Some(stream))));
                     }
                 }
@@ -2730,23 +3492,41 @@ impl RocmDevice {
                 match scheme {
                     KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,
                     KQuantScheme::Q5K => self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?,
-                    // Q6_K's dot4 GEMV is not bit-exact at production shapes:
-                    // the Xing4.0-29B lm_head oracle (real output.weight,
-                    // k=3584) measures rel 3.2e-3 / max_abs 1.5 at m=1, while
-                    // the fused-dequant path agrees with the host dequant at
-                    // 3.9e-7. The k=256 arch probes cannot see this (the scale
-                    // skew grows with k), so Q6_K skips the dot4 leg here.
-                    // Same treatment as the IQ3_S fused WMMA GEMM, and gated
-                    // on the same GRIM_Q6K_DOT4 escape hatch as the sibling
-                    // dispatch in device/quant/mod.rs — two sites, one switch,
-                    // so a capture run and an eager run cannot disagree about
+                    // M7.2e: the Q6_K dot4 leg is ON by default — the
+                    // "not bit-exact at production shapes" reason it was off
+                    // is refuted by measurement on the REAL 27B tensors (see
+                    // the sibling dispatch in device/quant/mod.rs for the
+                    // numbers: the Q6_K dot4 kernel's own error is 9.6e-8
+                    // rms-rel against the host dequant with the same q8_1
+                    // codes, i.e. it is the only numerically exact K-quant
+                    // dot4 kernel, and the 3.2e-3 that was cited is the
+                    // Q8_1 activation quantization that the Q4_K and Q5_K
+                    // legs already carry by default).
+                    //
+                    // Two sites, one switch (GRIM_Q6K_DOT4=0 opts out), so a
+                    // capture run and an eager run cannot disagree about
                     // which Q6_K path is trusted.
                     KQuantScheme::Q6K => {
-                        if matches!(
+                        if !matches!(
                             std::env::var("GRIM_Q6K_DOT4").as_deref(),
-                            Ok("1" | "true" | "on")
+                            Ok("0" | "false" | "off")
                         ) {
-                            self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                            if crate::device::quant::kquant_dot4_ok_for(n) {
+                                // Body tensor: dot4 with Q8_1 activations (fast).
+                                self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                            } else {
+                                // LM HEAD: dot4 with f32 activations (fast,
+                                // exact activations). Falls back to exact
+                                // fused-dequant when dot4 can't run.
+                                self.launch_dot4_q6k_f32act_gemv_for_ab(
+                                    a_s,
+                                    w,
+                                    out,
+                                    m,
+                                    n,
+                                    k,
+                                )?
+                            }
                         } else {
                             self.launch_fused_dequant_gemm_q6k(a_s, w, out, m, n, k)?
                         }
@@ -2759,7 +3539,50 @@ impl RocmDevice {
                     // every Xing4.0 projection came out zero, because the whole
                     // model is IQ3_S). The fused-dequant leg reads A as f32 and
                     // dequantizes inline, so it needs no act_q81 either.
-                    KQuantScheme::IQ3S => self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?,
+                    KQuantScheme::IQ3S => {
+                        self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?
+                    }
+                    // IQ1_S/IQ1_M/IQ2 family: the scalar fused-dequant GEMMs
+                    // (ported from llama.cpp dequantize_row_iq1_s/iq1_m,
+                    // ggml-quants.c:2650/2675; IQ1S/M must NEVER ride the
+                    // Q3_K/Q2S catch-all — the aliased layouts read past the
+                    // allocation). Same f32-act leg as IQ3_S: no act_q81, no
+                    // allocation, capture-safe. The Swift-1.5 27B's GSQ-RCO
+                    // banks decode through these on the graph path.
+                    KQuantScheme::IQ1S => {
+                        self.launch_fused_dequant_gemm_iq1s(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ1M => {
+                        self.launch_fused_dequant_gemm_iq1m(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ2S => {
+                        self.launch_fused_dequant_gemm_iq2s(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ2XS => {
+                        self.launch_fused_dequant_gemm_iq2xs(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ2XXS => {
+                        self.launch_fused_dequant_gemm_iq2xxs(a_s, w, out, m, n, k)?
+                    }
+                    KQuantScheme::IQ3XXS => {
+                        self.launch_fused_dequant_gemm_iq3xxs(a_s, w, out, m, n, k)?
+                    }
+                    // IQ4_XS fast dot4 decode: sub-block-per-lane v2 kernel with 4-column
+                    // load batching and pure VALU byte permute LUT.
+                    KQuantScheme::IQ4XS => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ4XS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        if self.is_dot4_arch && !dot_disabled && k % 256 == 0 {
+                            self.launch_dot4_iq4xs_q81_gemv(act_q81, w, out, m, n, k)?
+                        } else {
+                            self.launch_fused_dequant_gemm_iq4xs(a_s, w, out, m, n, k)?
+                        }
+                    }
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
@@ -3244,6 +4067,47 @@ impl RocmDevice {
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<WhiteCrowDecodedWeights> {
         let u4_split = std::env::var("GRIM_U4_TRACE").is_ok();
+        // Storage/dtype coherence: the decode path derives `scheme` from the
+        // weight's dtype, so a Q5_K tag over a Q3_K/IQ3_S-sized allocation
+        // (38,297,600 B for [17408,5120]) means the loader sized the tensor
+        // with one scheme and tagged it with another. Name both here rather
+        // than failing later inside the row-slicing loop.
+        if let grim_tensor::dtype::Storage::KQuant(_) = &w.dtype.storage {
+            let expected = w.dtype.expected_bytes(w.shape.elem_count()) as u64;
+            if expected != w.bytes as u64 {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: storage/dtype mismatch: shape={:?} \
+                     dtype={:?} scheme={scheme:?} bytes={} expected_bytes={}",
+                    w.shape.dims(),
+                    w.dtype,
+                    w.bytes,
+                    expected
+                )));
+            }
+        }
+        // Shape/stride guard at the entry that owns `w`, so the diagnostic can
+        // name the weight's own shape/dtype/bytes rather than just the slice.
+        let blk_per_256: usize = match scheme {
+            grim_tensor::KQuantScheme::Q4K => 144,
+            grim_tensor::KQuantScheme::Q5K => 176,
+            grim_tensor::KQuantScheme::Q6K => 210,
+            grim_tensor::KQuantScheme::Q3K | grim_tensor::KQuantScheme::IQ3S => 110,
+            grim_tensor::KQuantScheme::Q2K => 84,
+            grim_tensor::KQuantScheme::IQ4NL => 144,
+            _ => 0,
+        };
+        if blk_per_256 > 0 && k % 256 == 0 {
+            let row_bytes = (k / 256) * blk_per_256;
+            if row_bytes > 0 && n > w.bytes / row_bytes {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: storage/dtype mismatch: w.shape={:?} \
+                     w.dtype={:?} scheme={scheme:?} w.bytes={} n={n} k={k} row_bytes={row_bytes}",
+                    w.shape.dims(),
+                    w.dtype,
+                    w.bytes
+                )));
+            }
+        }
         let converter = u4_lane_converter_for(scheme)?;
         // The key needs a hash of the packed bytes. If this process uploaded
         // them, the hash was taken then and the D2H (and the hashing) is
@@ -3258,13 +4122,7 @@ impl RocmDevice {
         let sp1 = std::time::Instant::now();
         let cache_key = u4_lane_cache_enabled().then(|| match known_hash {
             Some(h) => u4_lane_cache_key_from_hash(h, n, k, scheme, converter),
-            None => u4_lane_cache_key(
-                packed.as_deref().unwrap_or(&[]),
-                n,
-                k,
-                scheme,
-                converter,
-            ),
+            None => u4_lane_cache_key(packed.as_deref().unwrap_or(&[]), n, k, scheme, converter),
         });
 
         if std::env::var("GRIM_U4_TRACE").is_ok() {
@@ -3309,7 +4167,7 @@ impl RocmDevice {
     /// Split out of [`Self::requant_kquant_to_whitecrow`] so cache read, encode,
     /// and cache write are three separable steps, and so the encode is reachable
     /// without a device allocation.
-    fn encode_u4_lanes(
+    pub(crate) fn encode_u4_lanes(
         &self,
         packed: &[u8],
         n: usize,
@@ -3353,6 +4211,22 @@ impl RocmDevice {
             .min(8)
             .max(1);
         let row_bytes = (k / per_256) * block_bytes;
+        // Shape/stride guard: `n` and `k` come from the caller and, for a
+        // transposed view (LM head `[vocab, hidden]` over a `[hidden, vocab]`
+        // packed layout), can disagree with the resident bytes. Slicing on the
+        // disagreement panicked a worker thread with a bare "range out of
+        // range"; name the tensor and the two geometries instead.
+        if row_bytes > 0 && k % per_256 == 0 {
+            let rows_avail = packed.len() / row_bytes;
+            if n > rows_avail {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: shape/stride mismatch: n={n} k={k} \
+                     scheme={scheme:?} packed_bytes={} row_bytes={row_bytes} \
+                     rows_available={rows_avail}",
+                    packed.len()
+                )));
+            }
+        }
         if threads > 1 && n >= 2 && k % per_256 == 0 {
             let rows_per = n.div_ceil(threads);
             let chunks: Vec<(usize, usize)> = (0..n)
@@ -3399,20 +4273,19 @@ impl RocmDevice {
     }
 
     /// Get `w` in u4 group-128 lane form, converting at most once per
-    /// `(device pointer, byte length, shape)` for the process lifetime.
+    /// `(device pointer, byte length, shape, ordinal, scheme)` for the process
+    /// lifetime.
     ///
     /// Both the eager `quantized_matmul` arm and the `linear_decode_into`
     /// WhiteCrow leg call this, so a model that is exercised through both paths
     /// pays one conversion rather than one per path.
     ///
-    /// KDA-FIX, inherited from the decode leg this replaces: the cache key is
-    /// the raw device pointer plus length plus shape, never the pointer alone.
-    /// The caching allocator recycles blocks, so a freed weight's pointer can be
-    /// handed to a different tensor — keying on the pointer alone served that
-    /// tensor the first one's converted weights, which is silent wrong weights,
-    /// not a crash. Three recycled-pointer collisions in a row with matching
-    /// bytes AND shape is not a realistic hazard, and the true fix (keying on
-    /// an allocator generation) needs an allocator API this does not have.
+    /// The key carries the device ordinal and the scheme (two GPUs never share
+    /// an allocation, and two schemes over the same bytes mean different
+    /// things), and every entry is verified against the content hash taken at
+    /// upload time (see `u4_lane_weights_budgeted`): a recycled device pointer
+    /// serving a different tensor is detected as a hash mismatch and
+    /// reconverts instead of serving stale lanes.
     ///
     /// Weights are static for the process lifetime, so entries never evict.
     pub fn u4_lane_weights(
@@ -3448,10 +4321,18 @@ impl RocmDevice {
         scheme: grim_tensor::KQuantScheme,
         budget: bool,
     ) -> Result<Option<Arc<WhiteCrowDecodedWeights>>> {
+        // The key deliberately excludes the weight BYTES (a D2H per lookup
+        // would defeat the cache); instead each entry carries the content hash
+        // taken at upload time, verified on every hit. The caching allocator
+        // recycles device pointers, so a freed weight's pointer can be handed
+        // to a different tensor: without the hash check that tensor would be
+        // served the first one's converted lanes — silent wrong weights, not
+        // a crash. A hash mismatch (or a first sighting under a recycled
+        // pointer) is treated as a miss and reconverts.
         type LaneCache = std::sync::Mutex<
             std::collections::HashMap<
-                (usize, usize, [usize; 2]),
-                Option<Arc<WhiteCrowDecodedWeights>>,
+                (usize, usize, [usize; 2], usize, grim_tensor::KQuantScheme),
+                (Option<u64>, Option<Arc<WhiteCrowDecodedWeights>>),
             >,
         >;
         static CONVERTED: OnceLock<LaneCache> = OnceLock::new();
@@ -3460,10 +4341,24 @@ impl RocmDevice {
             w.device_ptr.map(|p| p as usize).unwrap_or(0),
             w.bytes,
             [n, k],
+            self.ordinal,
+            scheme,
         );
+        let content_hash = weight_source_hash(w.device_ptr, w.bytes);
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = guard.get(&key) {
-            return Ok(hit.clone());
+        if let Some((stored_hash, hit)) = guard.get(&key) {
+            // Verify identity: a recycled pointer serving a different tensor
+            // must not hit. `None` on either side means "hash unknown" (a
+            // weight this process did not upload, e.g. legacy path) — keep
+            // the entry; the (ptr, bytes, shape, ordinal, scheme) tuple is
+            // then the best identity available.
+            let aliased = match (stored_hash, content_hash) {
+                (Some(a), Some(b)) => *a != b,
+                _ => false,
+            };
+            if !aliased {
+                return Ok(hit.clone());
+            }
         }
         // Reserve: lazy kernel-module loads and activation scratch still
         // need headroom after the last lane copy lands. 256 MiB is far above
@@ -3492,7 +4387,7 @@ impl RocmDevice {
                          weight keeps its dot4/WMMA route for this process"
                     );
                 }
-                guard.insert(key, None);
+                guard.insert(key, (content_hash, None));
                 return Ok(None);
             }
         }
@@ -3506,7 +4401,7 @@ impl RocmDevice {
                 w.bytes / (1024 * 1024)
             );
         }
-        guard.insert(key, Some(converted.clone()));
+        guard.insert(key, (content_hash, Some(converted.clone())));
         Ok(Some(converted))
     }
 
@@ -3621,10 +4516,9 @@ impl RocmDevice {
         }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let stream = self.active_stream();
-        crate::check_hip(
-            "hipMemsetD8Async",
-            unsafe { crate::device::handles::hipMemsetD8Async(ptr, value, bytes, stream) },
-        )?;
+        crate::check_hip("hipMemsetAsync", unsafe {
+            crate::device::handles::hipMemsetAsync(ptr, value as i32, bytes, stream)
+        })?;
         Ok(ptr)
     }
 
@@ -3647,17 +4541,14 @@ impl RocmDevice {
         }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let stream = self.active_stream();
-        crate::check_hip(
-            "hipMemcpyDtoDAsync",
-            unsafe {
-                crate::device::handles::hipMemcpyDtoDAsync(
-                    (d as usize + offset_bytes) as *mut std::ffi::c_void,
-                    s,
-                    bytes,
-                    stream,
-                )
-            },
-        )?;
+        crate::check_hip("hipMemcpyDtoDAsync", unsafe {
+            crate::device::handles::hipMemcpyDtoDAsync(
+                (d as usize + offset_bytes) as *mut std::ffi::c_void,
+                s,
+                bytes,
+                stream,
+            )
+        })?;
         Ok(d)
     }
 }
@@ -3679,8 +4570,8 @@ pub fn last_captured_head_gemv_a() -> Option<usize> {
 /// Returns (cc_tflops, tc_tflops); ρ = tc/cc decides whether dequant-on-the-
 /// fly is structurally right for this silicon (APEX4 framework, old/res4).
 pub fn rho_microbench_for_test(dev: &RocmDevice, iters: i32) -> Result<(f64, f64)> {
-        use std::time::Instant;
     use grim_tensor::CoreTensorOps;
+    use std::time::Instant;
     let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
     let threads: u64 = 32 * 1024;
     let block: u32 = 256;
@@ -3722,6 +4613,12 @@ pub fn rho_microbench_for_test(dev: &RocmDevice, iters: i32) -> Result<(f64, f64
     let waves = threads / 32;
     let tc_tflops = (waves * (itw as u64 / 4) * 4 * 8192) as f64 / t / 1e12;
 
-    Ok((cc_tflops, tc_tflops))
+    // res0-T3-9: the measured I8 WMMA rate (same op count per mma_sync).
+    let _ = run("grim_rho_wmma_i8", 100);
+    let t8 = run("grim_rho_wmma_i8", itw);
+    let tc8_tflops = (waves * (itw as u64 / 4) * 4 * 8192) as f64 / t8 / 1e12;
+    let _ = tc8_tflops;
+    eprintln!("[rho] gfx I8 WMMA: {tc8_tflops:.1} TFLOP/s (f16 {tc_tflops:.1})");
 
+    Ok((cc_tflops, tc_tflops))
 }

@@ -100,7 +100,9 @@ fn test_small_batch_prefill_gemm_parity() {
 #[ignore]
 fn skinny_m_kquant_tiled_parity_and_throughput() {
     if !grim_backend_rocm::gpu_test_enabled() {
-        eprintln!("ROCm device tests disabled: skipping skinny_m_kquant_tiled_parity_and_throughput");
+        eprintln!(
+            "ROCm device tests disabled: skipping skinny_m_kquant_tiled_parity_and_throughput"
+        );
         return;
     }
     unsafe {
@@ -138,7 +140,9 @@ fn skinny_m_kquant_tiled_parity_and_throughput() {
                     _ => grim_tensor::dtype::KQuantScheme::Q6K,
                 }),
             };
-            let a_storage = dev.from_cpu(&a_data, &Shape::new(vec![m, k]), DType::F32).unwrap();
+            let a_storage = dev
+                .from_cpu(&a_data, &Shape::new(vec![m, k]), DType::F32)
+                .unwrap();
             let b_storage = grim_tensor::MemoryOps::from_cpu_bytes(
                 &dev,
                 &b_bytes,
@@ -193,7 +197,9 @@ fn skinny_m_kquant_tiled_parity_and_throughput() {
                 _ => grim_tensor::dtype::KQuantScheme::Q6K,
             }),
         };
-        let a_storage = dev.from_cpu(&a_data, &Shape::new(vec![m, k]), DType::F32).unwrap();
+        let a_storage = dev
+            .from_cpu(&a_data, &Shape::new(vec![m, k]), DType::F32)
+            .unwrap();
         let b_storage = grim_tensor::MemoryOps::from_cpu_bytes(
             &dev,
             &b_bytes,
@@ -224,7 +230,9 @@ fn skinny_m_kquant_tiled_parity_and_throughput() {
         };
         let gb = n as f64 * (k as f64 / 256.0) * block_bytes / 1e9;
         let gbps = gb / (ms * 1e-3);
-        eprintln!("[skinny-m] {tag} m=5 n={n} k={k}: {ms:.2} ms/iter = {gbps:.1} GB/s weight bytes");
+        eprintln!(
+            "[skinny-m] {tag} m=5 n={n} k={k}: {ms:.2} ms/iter = {gbps:.1} GB/s weight bytes"
+        );
         // Floor = 10x the scalar kernel's MEASURED rate at this exact shape
         // (181 ms = 0.2 GB/s in the pre-gate red run). Not an absolute
         // ambition: TILE_M=4 wastes half its M tile at M=5; the point is that

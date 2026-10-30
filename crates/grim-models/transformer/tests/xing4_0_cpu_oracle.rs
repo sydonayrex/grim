@@ -66,7 +66,11 @@ fn hc_pre_matches_the_reference_formula() {
         let _ = sigmoid(mixes[hc + h] * scale[1] + base[hc + h]);
     }
     let collapsed: Vec<f32> = (0..hidden)
-        .map(|d| (0..hc).map(|h| expect_pre[h] * streams[h * hidden + d]).sum())
+        .map(|d| {
+            (0..hc)
+                .map(|h| expect_pre[h] * streams[h * hidden + d])
+                .sum()
+        })
         .collect();
 
     // Now the implementation under test. Xing40HyperConnection is crate-
@@ -99,7 +103,10 @@ fn sinkhorn_reference_is_doubly_stochastic() {
     let hc = 4usize;
     let eps = 1e-6f32;
     let logits = [
-    [1.0f32, -1.0, 0.5, 0.25], [0.1, 0.9, -0.3, 0.4], [2.0, 0.0, -1.0, 0.7], [-0.2, 0.3, 0.8, -1.1],
+        [1.0f32, -1.0, 0.5, 0.25],
+        [0.1, 0.9, -0.3, 0.4],
+        [2.0, 0.0, -1.0, 0.7],
+        [-0.2, 0.3, 0.8, -1.1],
     ];
     // comb[src][dst]
     let mut comb = [[0f32; 4]; 4];
@@ -183,11 +190,16 @@ fn noaux_tc_routing_separates_selection_from_weights() {
     let bias = [0.0f32, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0]; // demotes expert 3
     let k = 2usize;
     let scores: Vec<f32> = logits.iter().map(|&l| sigmoid(l)).collect();
-    let mut sel: Vec<(usize, f32)> = (0..scores.len()).map(|i| (i, scores[i] + bias[i])).collect();
+    let mut sel: Vec<(usize, f32)> = (0..scores.len())
+        .map(|i| (i, scores[i] + bias[i]))
+        .collect();
     sel.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let chosen: Vec<usize> = sel[..k].iter().map(|(i, _)| *i).collect();
     // Without the bias, expert 3 (logit 2.1) would win; with -3.0 it must not.
-    assert!(!chosen.contains(&3), "bias must affect selection: {chosen:?}");
+    assert!(
+        !chosen.contains(&3),
+        "bias must affect selection: {chosen:?}"
+    );
     let mut weights: Vec<f32> = chosen.iter().map(|&i| scores[i]).collect();
     let sum: f32 = weights.iter().sum();
     for w in weights.iter_mut() {
@@ -260,10 +272,7 @@ fn xing40_config() -> Xing40Config {
     }
 }
 
-fn load_block(
-    layer: usize,
-    device: grim_tensor::Device,
-) -> Option<(Xing40Block, Xing40Config)> {
+fn load_block(layer: usize, device: grim_tensor::Device) -> Option<(Xing40Block, Xing40Config)> {
     use grim_format::tprov::GgufProvider;
     let path = gguf_path()?;
     let cfg = xing40_config();
@@ -318,7 +327,9 @@ fn host_and_device_blocks_agree_on_real_weights() {
         let mut x = vec![0f32; seq * hc * hidden];
         let mut s = 0x1234_5678u64 ^ layer as u64;
         for v in x.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = (((s >> 33) as f32 / 8388608.0) - 1.0) * 0.02;
         }
         use grim_tensor::{DType, QuantProvenance, Shape};
@@ -343,7 +354,10 @@ fn host_and_device_blocks_agree_on_real_weights() {
         let out_host = blk_host
             .forward_host_for_oracle(&x_cpu, &[0u32, 1, 2], &mut kv_host)
             .expect("host block forward");
-        let (a, b) = (out_host.to_vec_f32().unwrap(), out_d2d.to_vec_f32().unwrap());
+        let (a, b) = (
+            out_host.to_vec_f32().unwrap(),
+            out_d2d.to_vec_f32().unwrap(),
+        );
         let (max_abs, max_rel) = rel_err(&a, &b);
         eprintln!("[xing-oracle] blk.{layer}: max_abs {max_abs:.3e} rel {max_rel:.3e}");
         if max_rel > worst.0 {
@@ -354,7 +368,10 @@ fn host_and_device_blocks_agree_on_real_weights() {
             "blk.{layer}: host vs device block output diverges (rel {max_rel:.3e})"
         );
     }
-    eprintln!("[xing-oracle] worst layer {} at rel {:.3e}", worst.1, worst.0);
+    eprintln!(
+        "[xing-oracle] worst layer {} at rel {:.3e}",
+        worst.1, worst.0
+    );
 }
 
 /// Bisection inside the block: the device and host hyper-connection COLLAPSE
@@ -377,7 +394,9 @@ fn hc_collapse_host_and_device_agree() {
     let mut x = vec![0f32; seq * hc * hidden];
     let mut s = 0x5EED_1234u64;
     for v in x.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *v = (((s >> 33) as f32 / 8388608.0) - 1.0) * 0.02;
     }
     let x_shape = grim_tensor::Shape::new(vec![seq, hc * hidden]);
@@ -426,10 +445,7 @@ fn hc_collapse_host_and_device_agree() {
         "[xing-oracle] hc: pre gate max|dev-host| = {pre_max:.3e}; collapse max_abs {max_abs:.3e} rel {max_rel:.3e}"
     );
     assert!(pre_max < 1e-5, "HC pre gate diverges: {pre_max}");
-    assert!(
-        max_rel < 1e-3,
-        "HC collapse diverges (rel {max_rel:.3e})"
-    );
+    assert!(max_rel < 1e-3, "HC collapse diverges (rel {max_rel:.3e})");
 }
 
 /// Bisection: the MLA attention on both paths, fed the SAME collapsed stream.
@@ -450,7 +466,9 @@ fn mla_attention_host_and_device_agree() {
     let mut x = vec![0f32; seq * hidden];
     let mut s = 0xABCD_9876u64;
     for v in x.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *v = (((s >> 33) as f32 / 8388608.0) - 1.0) * 0.05;
     }
     let x_shape = grim_tensor::Shape::new(vec![seq, hidden]);
@@ -479,7 +497,10 @@ fn mla_attention_host_and_device_agree() {
 
     let (a, b) = (attn_h.to_vec_f32().unwrap(), attn_d.to_vec_f32().unwrap());
     let (max_abs, max_rel) = rel_err(&a, &b);
-    eprintln!("[xing-oracle] attn: max_abs {max_abs:.3e} rel {max_rel:.3e} (len {})", a.len());
+    eprintln!(
+        "[xing-oracle] attn: max_abs {max_abs:.3e} rel {max_rel:.3e} (len {})",
+        a.len()
+    );
     let _ = hc;
     assert!(max_rel < 1e-3, "MLA attention diverges (rel {max_rel:.3e})");
 }
@@ -505,7 +526,7 @@ fn rope_device_and_cpu_agree_with_xing4_yarn_config() {
         beta_fast: 32.0,
         beta_slow: 1.0,
         attention_factor: 0.1 * factor.ln() + 1.0,
-            rope_mscale: None,
+        rope_mscale: None,
     });
     let mut rc = grim_tensor::RopeConfig::new(cfg.qk_rope_head_dim, cfg.rope_theta);
     rc.interleaved = false;
@@ -518,7 +539,9 @@ fn rope_device_and_cpu_agree_with_xing4_yarn_config() {
     let mut x = vec![0f32; total];
     let mut s = 0x1357_9BDFu64;
     for v in x.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *v = (((s >> 33) as f32 / 8388608.0) - 1.0) * 0.5;
     }
     let positions: Vec<u32> = (0..seq as u32).collect();
@@ -538,12 +561,22 @@ fn rope_device_and_cpu_agree_with_xing4_yarn_config() {
     );
     // The device rope takes one position per (step, head) pair; the CPU path
     // takes one per step. Same math, different calling conventions.
-    assert_eq!(positions.len(), seq, "device rope wants one position per step");
+    assert_eq!(
+        positions.len(),
+        seq,
+        "device rope wants one position per step"
+    );
     let out_dev = rope.forward(&x_dev, &positions).expect("device rope");
     let (a, b) = (out_cpu.to_vec_f32().unwrap(), out_dev.to_vec_f32().unwrap());
     let (max_abs, max_rel) = rel_err(&a, &b);
-    eprintln!("[xing-oracle] rope (NEOX + yarn {:?}): max_abs {max_abs:.3e} rel {max_rel:.3e}", yarn.is_some());
-    assert!(max_rel < 1e-4, "rope device vs CPU diverges (rel {max_rel:.3e})");
+    eprintln!(
+        "[xing-oracle] rope (NEOX + yarn {:?}): max_abs {max_abs:.3e} rel {max_rel:.3e}",
+        yarn.is_some()
+    );
+    assert!(
+        max_rel < 1e-4,
+        "rope device vs CPU diverges (rel {max_rel:.3e})"
+    );
 }
 
 /// MoE bisection: the grouped Charon dispatch on the device versus the
@@ -573,7 +606,9 @@ fn moe_dispatch_and_reference_agree() {
     let mut x = vec![0f32; seq * hidden];
     let mut s = 0x9E37_79B9u64;
     for v in x.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *v = (((s >> 33) as f32 / 8388608.0) - 1.0) * 0.05;
     }
     let shape = grim_tensor::Shape::new(vec![seq, hidden]);
@@ -591,8 +626,14 @@ fn moe_dispatch_and_reference_agree() {
     let out_h = moe_h.forward(&x_cpu).expect("host moe");
     let (a, b) = (out_h.to_vec_f32().unwrap(), out_d.to_vec_f32().unwrap());
     let (max_abs, max_rel) = rel_err(&a, &b);
-    eprintln!("[xing-oracle] moe: max_abs {max_abs:.3e} rel {max_rel:.3e} len {}", a.len());
-    assert!(max_rel < 1e-2, "MoE dispatch vs reference diverges (rel {max_rel:.3e})");
+    eprintln!(
+        "[xing-oracle] moe: max_abs {max_abs:.3e} rel {max_rel:.3e} len {}",
+        a.len()
+    );
+    assert!(
+        max_rel < 1e-2,
+        "MoE dispatch vs reference diverges (rel {max_rel:.3e})"
+    );
 }
 
 /// Bisect blk.0's HOST path stage by stage against llama.cpp's own dumps.
@@ -619,13 +660,15 @@ fn ref_f32(dir: &str, name: &str) -> Vec<f32> {
 #[ignore = "needs XING_GGUF + XING_REF_DUMP_DIR; CPU only, no device needed"]
 fn blk0_host_stages_match_the_reference_dumps() {
     let Some(path) = gguf_path() else { return };
-    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else { return };
+    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else {
+        return;
+    };
     let cfg = xing40_config();
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = ids.len();
 
@@ -659,10 +702,7 @@ fn blk0_host_stages_match_the_reference_dumps() {
         eprintln!("[xing-oracle] blk0 hc_init vs reference: rel {r:.3e} max_abs {a:.3e}");
     }
 
-    eprintln!(
-        "[xing-oracle] fixture cfg.rope_yarn = {:?}",
-        cfg.rope_yarn
-    );
+    eprintln!("[xing-oracle] fixture cfg.rope_yarn = {:?}", cfg.rope_yarn);
     let (blk, _) = load_block(0, grim_tensor::Device::Cpu).expect("load blk.0 host");
     let streams_t = grim_backend_cpu::cpu_tensor(
         streams.clone(),
@@ -676,12 +716,15 @@ fn blk0_host_stages_match_the_reference_dumps() {
     // Downstream of the collapse: RMS norm into the attention path. Compared in
     // graph order; the FIRST stage over tolerance is the one to fix, because
     // every later stage inherits its error.
-    let collapsed_t =
-        grim_backend_cpu::cpu_tensor(collapsed.clone(), grim_tensor::Shape::new(vec![seq, hidden]));
+    let collapsed_t = grim_backend_cpu::cpu_tensor(
+        collapsed.clone(),
+        grim_tensor::Shape::new(vec![seq, hidden]),
+    );
     let normed = blk.attn_norm.forward(&collapsed_t).expect("attn_norm");
     let normed_v = normed.to_vec_f32().expect("read attn_norm");
-    let t =
-        |v: Vec<f32>, d: usize| grim_backend_cpu::cpu_tensor(v, grim_tensor::Shape::new(vec![seq, d]));
+    let t = |v: Vec<f32>, d: usize| {
+        grim_backend_cpu::cpu_tensor(v, grim_tensor::Shape::new(vec![seq, d]))
+    };
 
     // MLA projection stages, each through the block's OWN module so the bisect
     // walks the ops production runs.
@@ -755,7 +798,9 @@ fn blk0_host_stages_match_the_reference_dumps() {
             .find(|(n, _)| *n == "q_anorm-0")
             .map(|(_, v)| v.clone())
             .expect("q_anorm stage");
-        let q_full = qb.forward(&t(qb_out, cfg.q_lora_rank.unwrap_or(768))).expect("q_b");
+        let q_full = qb
+            .forward(&t(qb_out, cfg.q_lora_rank.unwrap_or(768)))
+            .expect("q_b");
         let q_full_v = q_full.to_vec_f32().expect("read q_b");
         let (nope, rope_d, nh) = (cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.num_heads);
         let mut q_rope = vec![0f32; seq * nh * rope_d];
@@ -813,15 +858,21 @@ fn blk0_host_stages_match_the_reference_dumps() {
                 let rope_d_ = cfg.qk_rope_head_dim;
                 let base = cfg.rope_theta;
                 let factor = cfg.rope_yarn.as_ref().map(|y| y.factor).unwrap_or(1.0);
-                let orig = cfg.rope_yarn.as_ref().map(|y| y.original_max_pos).unwrap_or(4096) as f32;
+                let orig = cfg
+                    .rope_yarn
+                    .as_ref()
+                    .map(|y| y.original_max_pos)
+                    .unwrap_or(4096) as f32;
                 let bfast = cfg.rope_yarn.as_ref().map(|y| y.beta_fast).unwrap_or(32.0);
                 let bslow = cfg.rope_yarn.as_ref().map(|y| y.beta_slow).unwrap_or(1.0);
                 let corr = |n_rot: f32| {
-                    (rope_d_ as f32)
-                        * ((orig / (n_rot * 2.0 * std::f32::consts::PI)).ln())
+                    (rope_d_ as f32) * ((orig / (n_rot * 2.0 * std::f32::consts::PI)).ln())
                         / (2.0 * base.ln())
                 };
-                let cd = [corr(bfast).floor().max(0.0), corr(bslow).ceil().min((rope_d_ - 1) as f32)];
+                let cd = [
+                    corr(bfast).floor().max(0.0),
+                    corr(bslow).ceil().min((rope_d_ - 1) as f32),
+                ];
                 let variant = |name: &str, angle: &dyn Fn(usize, f32) -> f32, ms: f32| {
                     let mut t = vec![0f32; rope_d_];
                     // rebuild from the pre-rope slice for token 1
@@ -843,27 +894,41 @@ fn blk0_host_stages_match_the_reference_dumps() {
                     let (a, r) = rel_err(&want[rope_d_..2 * rope_d_], &t);
                     eprintln!("[xing-oracle]   sweep {name}: tok1 rel {r:.3e} max_abs {a:.3e}");
                 };
-                variant("a: llama.cpp ramp", &|i, pos| {
-                    let te = pos * base.powf(-((2 * i) as f32) / rope_d_ as f32);
-                    let y = (i as f32 - cd[0]) / (cd[1] - cd[0]).max(0.001);
-                    let rm = 1.0 - y.clamp(0.0, 1.0);
-                    (1.0 / factor) * te * (1.0 - rm) + te * rm
-                }, 1.0);
-                variant("b: pure interp", &|i, pos| {
-                    pos * base.powf(-((2 * i) as f32) / rope_d_ as f32) / factor
-                }, 1.0);
-                variant("c: pure extrap", &|i, pos| {
-                    pos * base.powf(-((2 * i) as f32) / rope_d_ as f32)
-                }, 1.0);
-                variant("d: ramp inverted", &|i, pos| {
-                    let te = pos * base.powf(-((2 * i) as f32) / rope_d_ as f32);
-                    let y = (i as f32 - cd[0]) / (cd[1] - cd[0]).max(0.001);
-                    let rm = y.clamp(0.0, 1.0);
-                    (1.0 / factor) * te * (1.0 - rm) + te * rm
-                }, 1.0);
-                variant("e: freq over 192", &|i, pos| {
-                    pos * base.powf(-((2 * i) as f32) / 192.0)
-                }, 1.0);
+                variant(
+                    "a: llama.cpp ramp",
+                    &|i, pos| {
+                        let te = pos * base.powf(-((2 * i) as f32) / rope_d_ as f32);
+                        let y = (i as f32 - cd[0]) / (cd[1] - cd[0]).max(0.001);
+                        let rm = 1.0 - y.clamp(0.0, 1.0);
+                        (1.0 / factor) * te * (1.0 - rm) + te * rm
+                    },
+                    1.0,
+                );
+                variant(
+                    "b: pure interp",
+                    &|i, pos| pos * base.powf(-((2 * i) as f32) / rope_d_ as f32) / factor,
+                    1.0,
+                );
+                variant(
+                    "c: pure extrap",
+                    &|i, pos| pos * base.powf(-((2 * i) as f32) / rope_d_ as f32),
+                    1.0,
+                );
+                variant(
+                    "d: ramp inverted",
+                    &|i, pos| {
+                        let te = pos * base.powf(-((2 * i) as f32) / rope_d_ as f32);
+                        let y = (i as f32 - cd[0]) / (cd[1] - cd[0]).max(0.001);
+                        let rm = y.clamp(0.0, 1.0);
+                        (1.0 / factor) * te * (1.0 - rm) + te * rm
+                    },
+                    1.0,
+                );
+                variant(
+                    "e: freq over 192",
+                    &|i, pos| pos * base.powf(-((2 * i) as f32) / 192.0),
+                    1.0,
+                );
                 // INTERLEAVED (ggml ROPE_TYPE_NORM = 0 — exactly what the
                 // reference logs): pair (2i, 2i+1), not (i, i+half).
                 {
@@ -884,7 +949,9 @@ fn blk0_host_stages_match_the_reference_dumps() {
                         t[2 * i + 1] = x0 * sn + x1 * cs;
                     }
                     let (a, r) = rel_err(&want[rope_d_..2 * rope_d_], &t);
-                    eprintln!("[xing-oracle]   sweep f: INTERLEAVED norm: tok1 rel {r:.3e} max_abs {a:.3e}");
+                    eprintln!(
+                        "[xing-oracle]   sweep f: INTERLEAVED norm: tok1 rel {r:.3e} max_abs {a:.3e}"
+                    );
                     // and the same with YaRN interpolation on top
                     let mut t2 = vec![0f32; rope_d_];
                     let cd0 = corr(bfast).floor().max(0.0);
@@ -901,7 +968,9 @@ fn blk0_host_stages_match_the_reference_dumps() {
                         t2[2 * i + 1] = x0 * sn + x1 * cs;
                     }
                     let (a2, r2) = rel_err(&want[rope_d_..2 * rope_d_], &t2);
-                    eprintln!("[xing-oracle]   sweep g: INTERLEAVED + yarn ramp: tok1 rel {r2:.3e} max_abs {a2:.3e}");
+                    eprintln!(
+                        "[xing-oracle]   sweep g: INTERLEAVED + yarn ramp: tok1 rel {r2:.3e} max_abs {a2:.3e}"
+                    );
                 }
                 // Recover the reference's ACTUAL angle per dim from its own
                 // output: out = R(theta) . x, so theta_ref = atan2(out32,out0)
@@ -919,8 +988,7 @@ fn blk0_host_stages_match_the_reference_dumps() {
                     for i in 0..6usize {
                         let (x0, x1) = (xin[off1 + i], xin[off1 + i + half]);
                         let (o0, o1) = (want[off1 + i], want[off1 + i + half]);
-                        let th_ref =
-                            o1.atan2(o0) - x1.atan2(x0);
+                        let th_ref = o1.atan2(o0) - x1.atan2(x0);
                         let th_ref = if th_ref > std::f32::consts::PI {
                             th_ref - 2.0 * std::f32::consts::PI
                         } else if th_ref < -std::f32::consts::PI {
@@ -955,7 +1023,11 @@ fn blk0_host_stages_match_the_reference_dumps() {
     let mut kv: Option<(grim_tensor::Tensor, grim_tensor::Tensor)> = None;
     let attn_out = blk
         .self_attn
-        .forward(&t(normed_v.clone(), hidden), &(0..seq as u32).collect::<Vec<u32>>(), &mut kv)
+        .forward(
+            &t(normed_v.clone(), hidden),
+            &(0..seq as u32).collect::<Vec<u32>>(),
+            &mut kv,
+        )
         .expect("self_attn");
     stages.push(("attn_out-0", attn_out.to_vec_f32().expect("read attn_out")));
 
@@ -1028,9 +1100,9 @@ fn model_chain_matches_the_reference_layer_by_layer() {
     // The reference's 36-token prompt: grim's 38-token render minus the
     // trailing `▁`(124361) + `\n`(35) that `-f` trims.
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = std::env::var("XING_CHAIN_SEQ")
         .ok()
@@ -1091,8 +1163,7 @@ fn model_chain_matches_the_reference_layer_by_layer() {
     let mut first_ref_bad: Option<String> = None;
     let mut ref_rels: Vec<f32> = Vec::new();
     for layer in 0..cfg.num_layers {
-        let (blk_dev, _) =
-            load_block(layer, grim_tensor::Device::Rocm(0)).expect("device block");
+        let (blk_dev, _) = load_block(layer, grim_tensor::Device::Rocm(0)).expect("device block");
         x_dev = blk_dev
             .forward_device_for_oracle(&x_dev, &positions, &mut kv_dev[layer])
             .expect("device chain layer");
@@ -1116,10 +1187,7 @@ fn model_chain_matches_the_reference_layer_by_layer() {
                 let mut wt = (0usize, 0f32);
                 for t in 0..seq {
                     let off = t * hc * hidden;
-                    let (_, r) = rel_err(
-                        &want[off..off + hc * hidden],
-                        &d[off..off + hc * hidden],
-                    );
+                    let (_, r) = rel_err(&want[off..off + hc * hidden], &d[off..off + hc * hidden]);
                     if r > wt.1 {
                         wt = (t, r);
                     }
@@ -1145,8 +1213,7 @@ fn model_chain_matches_the_reference_layer_by_layer() {
                 // this predicate sees on a rerun).
                 if layer < cfg.first_k_dense_replace {
                     if rr > 2e-2 && first_ref_bad.is_none() {
-                        first_ref_bad =
-                            Some(format!("blk.{layer} (rel {rr:.3e}, dense prefix)"));
+                        first_ref_bad = Some(format!("blk.{layer} (rel {rr:.3e}, dense prefix)"));
                     }
                 } else {
                     let prev_max = ref_rels
@@ -1196,7 +1263,9 @@ fn device_rope_matches_the_verified_host_rope() {
     let mut q = vec![0f32; seq * nh * (nope + rope_d)];
     let mut st = 0x9E37_79B9u64;
     for v in q.iter_mut() {
-        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *v = ((st >> 33) as f32 / 8388608.0 - 1.0) * 0.5;
     }
     let positions: Vec<u32> = (0..seq as u32).collect();
@@ -1246,13 +1315,9 @@ fn device_rope_matches_the_verified_host_rope() {
             interleaved: true,
         };
         use grim_tensor::AttentionOps;
-        let (out, _h) = dev.rope(
-            x.storage().as_ref(),
-            &positions,
-            &rc,
-            &shape,
-        )
-        .expect("device rope");
+        let (out, _h) = dev
+            .rope(x.storage().as_ref(), &positions, &rc, &shape)
+            .expect("device rope");
         let v = grim_tensor::Tensor::new(
             std::sync::Arc::from(out),
             shape,
@@ -1314,13 +1379,15 @@ fn device_sinkhorn_comb_values_match_the_reference() {
     if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
         return;
     }
-    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else { return };
+    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else {
+        return;
+    };
     let cfg = xing40_config();
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = ids.len();
 
@@ -1420,7 +1487,10 @@ fn device_sinkhorn_comb_values_match_the_reference() {
     // Reading A (grim's documented layout): element (dst, src) at
     // [dst*hc + src]*seq + t. Reading B (transposed): element (dst, src) at
     // [src*hc + dst]*seq + t.
-    for label in ["A: row=dst*hc+src (grim's documented layout)", "B: row=src*hc+dst (transposed)"] {
+    for label in [
+        "A: row=dst*hc+src (grim's documented layout)",
+        "B: row=src*hc+dst (transposed)",
+    ] {
         for dst in 0..hc {
             let s: f32 = (0..hc)
                 .map(|src| {
@@ -1479,9 +1549,9 @@ fn mhc_device_stage_probe_binary() {
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let flat = hc * hidden;
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = ids.len();
 
@@ -1549,10 +1619,7 @@ fn mhc_device_stage_probe_binary() {
             eprintln!("[probe] arm C host proj vs reference: rel {r:.3e} max_abs {a:.3e}");
         }
     }
-    eprintln!(
-        "[probe] arm C host proj[0..4] tok0: {:?}",
-        &proj_host[0..4]
-    );
+    eprintln!("[probe] arm C host proj[0..4] tok0: {:?}", &proj_host[0..4]);
 
     // ---- arm A: device input_norm vs an in-test f32 norm oracle ----
     let normed_dev = blk_dev
@@ -1631,10 +1698,7 @@ fn mhc_device_stage_probe_binary() {
 
 /// Host F32 tensor helper for the probe (a [seq, flat] row-major buffer).
 fn make_host_tensor(v: &[f32], rows: usize, cols: usize) -> grim_tensor::Tensor {
-    grim_backend_cpu::cpu_tensor(
-        v.to_vec(),
-        grim_tensor::Shape::new(vec![rows, cols]),
-    )
+    grim_backend_cpu::cpu_tensor(v.to_vec(), grim_tensor::Shape::new(vec![rows, cols]))
 }
 
 /// Arms E–I for the same probe: the ASSEMBLED blk.0 chain against the
@@ -1650,15 +1714,17 @@ fn mhc_assembly_probe_against_reference_dumps() {
     if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
         return;
     }
-    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else { return };
+    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else {
+        return;
+    };
     let Some(path) = gguf_path() else { return };
     let cfg = xing40_config();
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let flat = hc * hidden;
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = ids.len();
 
@@ -1703,7 +1769,11 @@ fn mhc_assembly_probe_against_reference_dumps() {
             let (a, r) = rel_err(&ref_init, &seed);
             eprintln!("[probe] arm E seed vs reference hc_init: rel {r:.3e} max_abs {a:.3e}");
         } else {
-            eprintln!("[probe] arm E hc_init size mismatch: ref {} grim {}", ref_init.len(), seed.len());
+            eprintln!(
+                "[probe] arm E hc_init size mismatch: ref {} grim {}",
+                ref_init.len(),
+                seed.len()
+            );
         }
     }
 
@@ -1712,8 +1782,16 @@ fn mhc_assembly_probe_against_reference_dumps() {
     for (dump_name, mine, label) in [
         ("blk.0.hc_attn_base.weight (view)", base, "base"),
         ("blk.0.hc_ffn_base.weight (view)", base, "base vs FFN dump"),
-        ("blk.0.hc_attn_scale.weight (view)", scale.as_slice(), "scale"),
-        ("blk.0.hc_ffn_scale.weight (view)", scale.as_slice(), "scale vs FFN dump"),
+        (
+            "blk.0.hc_attn_scale.weight (view)",
+            scale.as_slice(),
+            "scale",
+        ),
+        (
+            "blk.0.hc_ffn_scale.weight (view)",
+            scale.as_slice(),
+            "scale vs FFN dump",
+        ),
     ] {
         if ref_f32_exists(&dir, dump_name) {
             let want = ref_f32(&dir, dump_name);
@@ -1732,16 +1810,28 @@ fn mhc_assembly_probe_against_reference_dumps() {
     let collapsed = blk_host.attn_hc.collapse(&seed, seq, &gates);
     for (dump_name, mine, label) in [
         ("hc_attn_pre-0", collapsed.as_slice(), "collapse"),
-        ("hc_pre-0", gates.pre.as_slice(), "pre gates (may hold the FFN's)"),
+        (
+            "hc_pre-0",
+            gates.pre.as_slice(),
+            "pre gates (may hold the FFN's)",
+        ),
     ] {
         if ref_f32_exists(&dir, dump_name) {
             let want = ref_f32(&dir, dump_name);
             if want.len() == mine.len() {
                 let (a, r) = rel_err(&want, mine);
                 eprintln!("[probe] arm G {label} vs {dump_name}: rel {r:.3e} max_abs {a:.3e}");
-                eprintln!("[probe] arm G {label}[0..4] tok0: mine {:?} ref {:?}", &mine[0..4], &want[0..4]);
+                eprintln!(
+                    "[probe] arm G {label}[0..4] tok0: mine {:?} ref {:?}",
+                    &mine[0..4],
+                    &want[0..4]
+                );
             } else {
-                eprintln!("[probe] arm G {dump_name} size mismatch ref {} mine {}", want.len(), mine.len());
+                eprintln!(
+                    "[probe] arm G {dump_name} size mismatch ref {} mine {}",
+                    want.len(),
+                    mine.len()
+                );
             }
         }
     }
@@ -1759,12 +1849,20 @@ fn mhc_assembly_probe_against_reference_dumps() {
             let (a, r) = rel_err(&want, &normed_in);
             eprintln!("[probe] arm H attn_norm vs reference: rel {r:.3e} max_abs {a:.3e}");
         } else {
-            eprintln!("[probe] arm H attn_norm-0 size mismatch ref {} mine {}", want.len(), normed_in.len());
+            eprintln!(
+                "[probe] arm H attn_norm-0 size mismatch ref {} mine {}",
+                want.len(),
+                normed_in.len()
+            );
         }
     }
 
     // ---- arm I: WHICH hc_fn matrix did grim load — attn's or ffn's? ----
-    let mine_w = blk_host.attn_hc.hc_fn_weight().to_vec_f32().expect("read hc_fn");
+    let mine_w = blk_host
+        .attn_hc
+        .hc_fn_weight()
+        .to_vec_f32()
+        .expect("read hc_fn");
     let ws_attn = grim_nn::WeightSource::root(&prov, grim_tensor::Device::Cpu)
         .pp("blk")
         .pp("0");
@@ -1780,7 +1878,9 @@ fn mhc_assembly_probe_against_reference_dumps() {
         match w {
             Some(w) if w.len() == mine_w.len() => {
                 let (a, r) = rel_err(&w, &mine_w);
-                eprintln!("[probe] arm I grim hc_fn vs GGUF hc_{label}_fn: rel {r:.3e} max_abs {a:.3e}");
+                eprintln!(
+                    "[probe] arm I grim hc_fn vs GGUF hc_{label}_fn: rel {r:.3e} max_abs {a:.3e}"
+                );
             }
             Some(w) => eprintln!(
                 "[probe] arm I hc_{label}_fn size mismatch: gguf {} mine {}",
@@ -1809,15 +1909,17 @@ fn mhc_chain_stage_bisect_blk0() {
     if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
         return;
     }
-    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else { return };
+    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else {
+        return;
+    };
     let Some(path) = gguf_path() else { return };
     let cfg = xing40_config();
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let flat = hc * hidden;
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = ids.len();
     let positions: Vec<u32> = (0..seq as u32).collect();
@@ -1854,10 +1956,18 @@ fn mhc_chain_stage_bisect_blk0() {
                 if want.len() == mine.len() {
                     let (a, r) = rel_err(&want, mine);
                     eprintln!("[bisect] {label} vs {name}: rel {r:.3e} max_abs {a:.3e}");
-                    eprintln!("[bisect]   [0..4] mine {:?} ref {:?}", &mine[0..4], &want[0..4]);
+                    eprintln!(
+                        "[bisect]   [0..4] mine {:?} ref {:?}",
+                        &mine[0..4],
+                        &want[0..4]
+                    );
                     return;
                 }
-                eprintln!("[bisect] {label} vs {name}: SIZE ref {} mine {}", want.len(), mine.len());
+                eprintln!(
+                    "[bisect] {label} vs {name}: SIZE ref {} mine {}",
+                    want.len(),
+                    mine.len()
+                );
             }
         }
         eprintln!("[bisect] {label}: dump {dump} not found in either naming");
@@ -1893,10 +2003,19 @@ fn mhc_chain_stage_bisect_blk0() {
         .ffn_norm
         .forward(&make_host_tensor(&ffn_collapsed_v, seq, hidden))
         .expect("ffn_norm");
-    cmp("ffn_in (ffn_norm @ ffn_hc collapse)", &ffn_in.to_vec_f32().expect("read"), "ffn_norm-0");
+    cmp(
+        "ffn_in (ffn_norm @ ffn_hc collapse)",
+        &ffn_in.to_vec_f32().expect("read"),
+        "ffn_norm-0",
+    );
 
     // 5. Dense FFN (blk.0 is dense).
-    let ffn_out = blk_host.mlp.as_ref().expect("dense blk.0 mlp").forward(&ffn_in).expect("mlp");
+    let ffn_out = blk_host
+        .mlp
+        .as_ref()
+        .expect("dense blk.0 mlp")
+        .forward(&ffn_in)
+        .expect("mlp");
     let ffn_out_v = ffn_out.to_vec_f32().expect("read ffn_out");
     cmp("ffn_out", &ffn_out_v, "ffn_out-0");
 
@@ -1923,28 +2042,37 @@ fn block_d2d_stage_bisect_blk0() {
     let cfg = xing40_config();
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let flat = hc * hidden;
-    let Some((blk_dev, _)) = load_block(0, grim_tensor::Device::Rocm(0)) else { return };
-    let Some((blk_host, _)) = load_block(0, grim_tensor::Device::Cpu) else { return };
+    let Some((blk_dev, _)) = load_block(0, grim_tensor::Device::Rocm(0)) else {
+        return;
+    };
+    let Some((blk_host, _)) = load_block(0, grim_tensor::Device::Cpu) else {
+        return;
+    };
 
     // REAL chain input: the parity repro (random +-0.02, seq=3) hides a
     // device defect that only shows at real embedding magnitudes — the chain
     // gate reads dev-vs-host 1.8e-1 at blk.0 while this bisect's random-input
     // repro reads 1.1e-3. Run the SAME stage arms on the real seed.
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let seq = ids.len();
     let positions: Vec<u32> = (0..seq as u32).collect();
-    let prov_x = grim_format::tprov::GgufProvider::open(gguf_path().unwrap().as_str()).expect("open gguf (bisect)");
+    let prov_x = grim_format::tprov::GgufProvider::open(gguf_path().unwrap().as_str())
+        .expect("open gguf (bisect)");
     let emb_x = grim_nn::modules::Embedding::load(
         &grim_nn::WeightSource::root(&prov_x, grim_tensor::Device::Cpu).scoped("token_embd"),
         cfg.vocab_size,
         hidden,
     )
     .expect("embedding (bisect)");
-    let x0_x = emb_x.forward(&ids, seq, hidden).expect("rows (bisect)").to_vec_f32().expect("read x0 (bisect)");
+    let x0_x = emb_x
+        .forward(&ids, seq, hidden)
+        .expect("rows (bisect)")
+        .to_vec_f32()
+        .expect("read x0 (bisect)");
     let mut x = vec![0f32; seq * flat];
     for t in 0..seq {
         for h in 0..hc {
@@ -1956,7 +2084,8 @@ fn block_d2d_stage_bisect_blk0() {
     let rocm = grim_backend_rocm::RocmDevice::shared(0);
     let x_dev = grim_tensor::Tensor::new(
         std::sync::Arc::from(
-            rocm.from_cpu(&x, &x_shape, grim_tensor::DType::F32).expect("upload"),
+            rocm.from_cpu(&x, &x_shape, grim_tensor::DType::F32)
+                .expect("upload"),
         ),
         x_shape.clone(),
         grim_tensor::DType::F32,
@@ -1969,12 +2098,20 @@ fn block_d2d_stage_bisect_blk0() {
     let cmp = |label: &str, host: &[f32], dev_t: &grim_tensor::Tensor| {
         let dev = dev_t.to_vec_f32().expect("readback");
         if host.len() != dev.len() {
-            eprintln!("[d2d-bisect] {label}: SIZE host {} dev {}", host.len(), dev.len());
+            eprintln!(
+                "[d2d-bisect] {label}: SIZE host {} dev {}",
+                host.len(),
+                dev.len()
+            );
             return;
         }
         let (a, r) = rel_err(host, &dev);
         eprintln!("[d2d-bisect] {label}: rel {r:.3e} max_abs {a:.3e}");
-        eprintln!("[d2d-bisect]   [0..4] host {:?} dev {:?}", &host[0..4], &dev[0..4]);
+        eprintln!(
+            "[d2d-bisect]   [0..4] host {:?} dev {:?}",
+            &host[0..4],
+            &dev[0..4]
+        );
         if r > 1e-2 {
             let mut f = first_red.borrow_mut();
             if f.is_none() {
@@ -1984,7 +2121,10 @@ fn block_d2d_stage_bisect_blk0() {
     };
 
     // ---- host chain ----
-    let (g_h, col_h) = blk_host.attn_hc.forward(&x_host_t, seq).expect("host attn hc");
+    let (g_h, col_h) = blk_host
+        .attn_hc
+        .forward(&x_host_t, seq)
+        .expect("host attn hc");
     let n_h = blk_host
         .attn_norm
         .forward(&make_host_tensor(&col_h, seq, hidden))
@@ -2004,7 +2144,12 @@ fn block_d2d_stage_bisect_blk0() {
         .forward(&make_host_tensor(&fc_h, seq, hidden))
         .expect("host ffn_norm");
     let fi_h_v = fi_h.to_vec_f32().expect("read");
-    let fo_h = blk_host.mlp.as_ref().expect("dense mlp").forward(&fi_h).expect("host mlp");
+    let fo_h = blk_host
+        .mlp
+        .as_ref()
+        .expect("dense mlp")
+        .forward(&fi_h)
+        .expect("host mlp");
     let fo_h_v = fo_h.to_vec_f32().expect("read");
     let out_h = blk_host.ffn_hc.write_back(&st_h, &fo_h_v, seq, &fg_h);
 
@@ -2047,7 +2192,10 @@ fn block_d2d_stage_bisect_blk0() {
         let post_d_t = make_dev_from(&rocm, &post_d, hc, seq);
         cmp("S0 post gates (stream-major)", &post_hm, &post_d_t);
     }
-    let col_d = blk_dev.attn_hc.collapse_d2d(&x_dev, &g_d).expect("dev collapse");
+    let col_d = blk_dev
+        .attn_hc
+        .collapse_d2d(&x_dev, &g_d)
+        .expect("dev collapse");
     cmp("S1 collapse", &col_h, &col_d);
     let n_d = blk_dev.attn_norm.forward(&col_d).expect("dev attn_norm");
     cmp("S2 attn_norm", &n_h_v, &n_d);
@@ -2057,7 +2205,10 @@ fn block_d2d_stage_bisect_blk0() {
         .forward(&n_d, &positions, &mut kv_d)
         .expect("dev attn");
     cmp("S3 self-attention", &ao_h_v, &ao_d);
-    let st_d = blk_dev.attn_hc.update_d2d(&x_dev, &ao_d, &g_d).expect("dev write-back");
+    let st_d = blk_dev
+        .attn_hc
+        .update_d2d(&x_dev, &ao_d, &g_d)
+        .expect("dev write-back");
     cmp("S4 attn write-back", &st_h, &st_d);
     // S4a: the SAME write-back fed the HOST attention output (uploaded), so
     // S3's attention difference cannot pollute it. Red here == the write-back
@@ -2069,13 +2220,24 @@ fn block_d2d_stage_bisect_blk0() {
         .expect("dev write-back (host attn input)");
     cmp("S4a write-back w/ host attn input", &st_h, &st_d2);
     let fg_d = blk_dev.ffn_hc.gates_d2d(&st_d).expect("dev ffn gates");
-    let fc_d = blk_dev.ffn_hc.collapse_d2d(&st_d, &fg_d).expect("dev ffn collapse");
+    let fc_d = blk_dev
+        .ffn_hc
+        .collapse_d2d(&st_d, &fg_d)
+        .expect("dev ffn collapse");
     cmp("S5 ffn collapse", &fc_h, &fc_d);
     let fi_d = blk_dev.ffn_norm.forward(&fc_d).expect("dev ffn_norm");
     cmp("S6 ffn_norm", &fi_h_v, &fi_d);
-    let fo_d = blk_dev.mlp.as_ref().expect("dense mlp").forward(&fi_d).expect("dev mlp");
+    let fo_d = blk_dev
+        .mlp
+        .as_ref()
+        .expect("dense mlp")
+        .forward(&fi_d)
+        .expect("dev mlp");
     cmp("S7 mlp", &fo_h_v, &fo_d);
-    let out_d = blk_dev.ffn_hc.update_d2d(&st_d, &fo_d, &fg_d).expect("dev ffn write-back");
+    let out_d = blk_dev
+        .ffn_hc
+        .update_d2d(&st_d, &fo_d, &fg_d)
+        .expect("dev ffn write-back");
     cmp("S8 ffn write-back == block out", &out_h, &out_d);
 
     if let Some(name) = first_red.borrow().as_ref() {
@@ -2093,7 +2255,8 @@ fn make_dev_from(
     let shape = grim_tensor::Shape::new(vec![rows, cols]);
     grim_tensor::Tensor::new(
         std::sync::Arc::from(
-            rocm.from_cpu(v, &shape, grim_tensor::DType::F32).expect("upload"),
+            rocm.from_cpu(v, &shape, grim_tensor::DType::F32)
+                .expect("upload"),
         ),
         shape,
         grim_tensor::DType::F32,
@@ -2120,9 +2283,9 @@ fn decode_step_self_consistency_blk0() {
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let flat = hc * hidden;
     let prompt: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     let cont: Vec<u32> = vec![975, 1119, 3070, 6891, 14836, 20002];
     let ids: Vec<u32> = [prompt.clone(), cont.clone()].concat();
@@ -2148,8 +2311,7 @@ fn decode_step_self_consistency_blk0() {
     let seed_row = |t: usize| -> Vec<f32> {
         let mut s = vec![0f32; flat];
         for h in 0..hc {
-            s[h * hidden..(h + 1) * hidden]
-                .copy_from_slice(&x0[t * hidden..(t + 1) * hidden]);
+            s[h * hidden..(h + 1) * hidden].copy_from_slice(&x0[t * hidden..(t + 1) * hidden]);
         }
         s
     };
@@ -2166,7 +2328,8 @@ fn decode_step_self_consistency_blk0() {
         let shape = grim_tensor::Shape::new(vec![rows, flat]);
         grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                rocm.from_cpu(v, &shape, grim_tensor::DType::F32).expect("up"),
+                rocm.from_cpu(v, &shape, grim_tensor::DType::F32)
+                    .expect("up"),
             ),
             shape,
             grim_tensor::DType::F32,
@@ -2175,8 +2338,12 @@ fn decode_step_self_consistency_blk0() {
         )
     };
 
-    let Some((blk_dev, _)) = load_block(0, grim_tensor::Device::Rocm(0)) else { return };
-    let Some((blk_host, _)) = load_block(0, grim_tensor::Device::Cpu) else { return };
+    let Some((blk_dev, _)) = load_block(0, grim_tensor::Device::Rocm(0)) else {
+        return;
+    };
+    let Some((blk_host, _)) = load_block(0, grim_tensor::Device::Cpu) else {
+        return;
+    };
 
     // Long prefill 0..total on both paths — ground truth per row.
     let mut kv_lh: Option<(grim_tensor::Tensor, grim_tensor::Tensor)> = None;
@@ -2229,7 +2396,8 @@ fn decode_step_self_consistency_blk0() {
             let (a, r) = rel_err(want, &dv);
             eprintln!(
                 "[decode-bisect] HOST step {k} (pos {pos}) vs long-prefill row: rel {r:.3e} max_abs {a:.3e} ref[0..4] {:?} got[0..4] {:?}",
-                &want[0..4], &dv[0..4]
+                &want[0..4],
+                &dv[0..4]
             );
             if r > 1e-2 && first_red.is_none() {
                 first_red = Some(format!("HOST step {k} (pos {pos}, rel {r:.3e})"));
@@ -2249,18 +2417,15 @@ fn decode_step_self_consistency_blk0() {
         for k in 0..n_steps {
             let pos = n_prompt + k;
             let out = blk_dev
-                .forward_device_for_oracle(
-                    &up(&seed_row(pos), 1),
-                    &[pos as u32],
-                    &mut kv,
-                )
+                .forward_device_for_oracle(&up(&seed_row(pos), 1), &[pos as u32], &mut kv)
                 .expect("dev decode");
             let dv = out.to_vec_f32().expect("read");
             let want = &long_h[pos * flat..(pos + 1) * flat];
             let (a, r) = rel_err(want, &dv);
             eprintln!(
                 "[decode-bisect] DEV step {k} (pos {pos}) vs long-prefill row: rel {r:.3e} max_abs {a:.3e} ref[0..4] {:?} got[0..4] {:?}",
-                &want[0..4], &dv[0..4]
+                &want[0..4],
+                &dv[0..4]
             );
             if r > 1e-2 && first_red.is_none() {
                 first_red = Some(format!("DEV step {k} (pos {pos}, rel {r:.3e})"));
@@ -2285,16 +2450,18 @@ fn full_model_logits_vs_reference() {
     if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
         return;
     }
-    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else { return };
+    let Ok(dir) = std::env::var("XING_REF_DUMP_DIR") else {
+        return;
+    };
     let Some(path) = gguf_path() else { return };
     let cfg = xing40_config();
     let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
     let flat = hc * hidden;
     let seq = 36usize;
     let ids: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
     ];
     assert_eq!(ids.len(), seq);
 
@@ -2302,12 +2469,9 @@ fn full_model_logits_vs_reference() {
     let prov = GgufProvider::open(path.as_str()).expect("open gguf");
     let ws = grim_nn::WeightSource::root(&prov, grim_tensor::Device::Rocm(0));
     eprintln!("[full-gate] loading full model on Rocm(0)…");
-    let model = grim_models_transformer::Xing40::load(
-        grim_tensor::Device::Rocm(0),
-        &ws,
-        cfg.clone(),
-    )
-    .expect("load full model");
+    let model =
+        grim_models_transformer::Xing40::load(grim_tensor::Device::Rocm(0), &ws, cfg.clone())
+            .expect("load full model");
     let emb = grim_nn::modules::Embedding::load(&ws.scoped("token_embd"), cfg.vocab_size, hidden)
         .expect("emb");
     let x0 = emb.forward(&ids, seq, hidden).expect("rows");
@@ -2348,7 +2512,11 @@ fn full_model_logits_vs_reference() {
             let (a, r) = rel_err(&want, mine_last);
             eprintln!("[full-gate] hc_mean (last row) vs reference: rel {r:.3e} max_abs {a:.3e}");
         } else {
-            eprintln!("[full-gate] hc_mean size ref {} mine-last {}", want.len(), mine_last.len());
+            eprintln!(
+                "[full-gate] hc_mean size ref {} mine-last {}",
+                want.len(),
+                mine_last.len()
+            );
         }
     }
     // The model's norm/output weights are Rocm-resident; the head must run on
@@ -2359,7 +2527,8 @@ fn full_model_logits_vs_reference() {
         let shape = grim_tensor::Shape::new(vec![rows, cols]);
         grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                rocm.from_cpu(v, &shape, grim_tensor::DType::F32).expect("up"),
+                rocm.from_cpu(v, &shape, grim_tensor::DType::F32)
+                    .expect("up"),
             ),
             shape,
             grim_tensor::DType::F32,
@@ -2378,9 +2547,15 @@ fn full_model_logits_vs_reference() {
         let mine_last = &normed[(seq - 1) * hidden..seq * hidden];
         if want.len() == mine_last.len() {
             let (a, r) = rel_err(&want, mine_last);
-            eprintln!("[full-gate] result_norm (last row) vs reference: rel {r:.3e} max_abs {a:.3e}");
+            eprintln!(
+                "[full-gate] result_norm (last row) vs reference: rel {r:.3e} max_abs {a:.3e}"
+            );
         } else {
-            eprintln!("[full-gate] result_norm size ref {} mine-last {}", want.len(), mine_last.len());
+            eprintln!(
+                "[full-gate] result_norm size ref {} mine-last {}",
+                want.len(),
+                mine_last.len()
+            );
         }
     }
     let logits = model
@@ -2392,7 +2567,11 @@ fn full_model_logits_vs_reference() {
     assert_eq!(logits.len(), seq * cfg.vocab_size);
     let last: Vec<f32> = logits[(seq - 1) * cfg.vocab_size..seq * cfg.vocab_size].to_vec();
     let want = ref_f32(&dir, "result_output");
-    assert_eq!(want.len(), cfg.vocab_size, "result_output is one logits row");
+    assert_eq!(
+        want.len(),
+        cfg.vocab_size,
+        "result_output is one logits row"
+    );
     let (a, r) = rel_err(&want, &last);
     eprintln!("[full-gate] last-row logits vs reference: rel {r:.3e} max_abs {a:.3e}");
     let mut top_mine: Vec<(usize, f32)> = last.iter().copied().enumerate().collect();
@@ -2411,7 +2590,10 @@ fn full_model_logits_vs_reference() {
         top_mine[0].0,
         rank(&top_ref, top_mine[0].0)
     );
-    assert!(r < 5e-2, "full-model logits diverge from the reference (rel {r:.3e})");
+    assert!(
+        r < 5e-2,
+        "full-model logits diverge from the reference (rel {r:.3e})"
+    );
 }
 
 /// Generation-state consistency for the FULL model: greedy-generate 12 tokens
@@ -2433,10 +2615,9 @@ fn full_model_generation_state_consistency() {
     let flat = hc * hidden;
     // The e2e chat prompt (system + user question + <_bot><think> + newline).
     let prompt: Vec<u32> = vec![
-        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
-        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
-        124395, 35, 35, 35, 4, 1144, 468, 407, 5756, 435, 8062, 124497, 42420, 26444, 124379,
-        5, 9, 124361, 35,
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415, 124621,
+        424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395, 124395, 35,
+        35, 35, 4, 1144, 468, 407, 5756, 435, 8062, 124497, 42420, 26444, 124379, 5, 9, 124361, 35,
     ];
     let n_prompt = prompt.len();
     let n_gen = 12;
@@ -2444,8 +2625,9 @@ fn full_model_generation_state_consistency() {
     use grim_format::tprov::GgufProvider;
     let prov = GgufProvider::open(gguf_path().unwrap().as_str()).expect("open gguf");
     let ws = grim_nn::WeightSource::root(&prov, grim_tensor::Device::Rocm(0));
-    let model = grim_models_transformer::Xing40::load(grim_tensor::Device::Rocm(0), &ws, cfg.clone())
-        .expect("load full model");
+    let model =
+        grim_models_transformer::Xing40::load(grim_tensor::Device::Rocm(0), &ws, cfg.clone())
+            .expect("load full model");
     let emb = grim_nn::modules::Embedding::load(&ws.scoped("token_embd"), cfg.vocab_size, hidden)
         .expect("emb");
     let rocm = grim_backend_rocm::RocmDevice::shared(0);
@@ -2462,7 +2644,8 @@ fn full_model_generation_state_consistency() {
         let shape = grim_tensor::Shape::new(vec![1, flat]);
         grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                rocm.from_cpu(&s, &shape, grim_tensor::DType::F32).expect("up"),
+                rocm.from_cpu(&s, &shape, grim_tensor::DType::F32)
+                    .expect("up"),
             ),
             shape,
             grim_tensor::DType::F32,
@@ -2483,7 +2666,8 @@ fn full_model_generation_state_consistency() {
         let shape = grim_tensor::Shape::new(vec![1, hidden]);
         let m = grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                rocm.from_cpu(&meaned, &shape, grim_tensor::DType::F32).expect("up"),
+                rocm.from_cpu(&meaned, &shape, grim_tensor::DType::F32)
+                    .expect("up"),
             ),
             shape,
             grim_tensor::DType::F32,
@@ -2498,7 +2682,13 @@ fn full_model_generation_state_consistency() {
             .to_vec_f32()
             .expect("read logits")
     };
-    let argmax = |lg: &[f32]| lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap().0;
+    let argmax = |lg: &[f32]| {
+        lg.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap()
+            .0
+    };
 
     // Per-layer stream states after the FIRST decode step, for the layer
     // bisect against the teacher-forced arm.
@@ -2586,7 +2776,11 @@ fn full_model_generation_state_consistency() {
             let (_, r) = rel_err(row, inc);
             eprintln!(
                 "[gen-consistency]   blk.{i} ({}): rel {r:.3e}",
-                if i < cfg.first_k_dense_replace { "DENSE" } else { "MoE" }
+                if i < cfg.first_k_dense_replace {
+                    "DENSE"
+                } else {
+                    "MoE"
+                }
             );
             if r > 1e-2 && first_bad.is_none() {
                 first_bad = Some((i, r));
@@ -2595,7 +2789,11 @@ fn full_model_generation_state_consistency() {
         match first_bad {
             Some((layer, r)) => eprintln!(
                 "[gen-consistency] FIRST diverging layer at gen pos {pos}: blk.{layer} rel {r:.3e} ({})",
-                if layer < cfg.first_k_dense_replace { "DENSE" } else { "MoE" }
+                if layer < cfg.first_k_dense_replace {
+                    "DENSE"
+                } else {
+                    "MoE"
+                }
             ),
             None => eprintln!("[gen-consistency] no per-layer divergence at gen pos {pos}"),
         }
@@ -2615,7 +2813,8 @@ fn full_model_generation_state_consistency() {
         let shape = grim_tensor::Shape::new(vec![1, hidden]);
         let m = grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                rocm.from_cpu(&meaned, &shape, grim_tensor::DType::F32).expect("up"),
+                rocm.from_cpu(&meaned, &shape, grim_tensor::DType::F32)
+                    .expect("up"),
             ),
             shape,
             grim_tensor::DType::F32,

@@ -28,7 +28,7 @@
 
 use grim_format::tprov::GgufProvider;
 use grim_models_transformer::qwen35::{Qwen35Block, Qwen35Config};
-use grim_tensor::{Device, DType, Shape};
+use grim_tensor::{DType, Device, Shape};
 
 const HIDDEN: usize = 4096;
 const NV: usize = 32; // ssm.time_step_rank
@@ -39,7 +39,9 @@ const HD: usize = 128; // ssm.state_size
 fn model_path() -> Option<std::path::PathBuf> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
         if p.exists() {
             return Some(p);
         }
@@ -154,10 +156,7 @@ fn q8_0_linear_forward_error_is_absolute_or_relative_artifact() {
         "[cpu] worst REL  {worst_rel:.6e} at col {worst_rel_at} (want {:+.6e}, got {:+.6e})",
         want[worst_rel_at], got[worst_rel_at]
     );
-    eprintln!(
-        "[cpu] worst ABS / output scale = {:.6e}",
-        worst_abs / scale
-    );
+    eprintln!("[cpu] worst ABS / output scale = {:.6e}", worst_abs / scale);
     // The one number that says whether the kernel is wrong: an error that is
     // negligible against the vector's own magnitude cannot corrupt the model.
     assert!(
@@ -196,7 +195,10 @@ fn q8_0_linear_forward_device_error_is_int8_quantisation_not_a_kernel_defect() {
     let ws = grim_nn::WeightSource::root(&prov, device.clone()).pp("blk.0");
     let bg = Qwen35Block::load_tp(&ws, &c, 0, grim_nn::TensorParallelConfig::default())
         .expect("load blk.0 on the GPU");
-    assert!(matches!(bg.device, Device::Rocm(_)), "not ROCm — false green");
+    assert!(
+        matches!(bg.device, Device::Rocm(_)),
+        "not ROCm — false green"
+    );
     let gl = bg.ssm_alpha.as_ref().expect("ssm_alpha");
 
     // Reference weight from a CPU copy: `to_vec_f32` on a DEVICE-resident
@@ -214,7 +216,8 @@ fn q8_0_linear_forward_device_error_is_int8_quantisation_not_a_kernel_defect() {
         let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
         let inp = grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                dev.from_cpu(&flat, &Shape::new(vec![m, HIDDEN]), DType::F32).expect("upload"),
+                dev.from_cpu(&flat, &Shape::new(vec![m, HIDDEN]), DType::F32)
+                    .expect("upload"),
             ),
             Shape::new(vec![m, HIDDEN]),
             DType::F32,
@@ -326,7 +329,8 @@ fn q8_0_fused_gemm_is_exact_where_activation_quantization_is_lossless() {
 
         let inp = grim_tensor::Tensor::new(
             std::sync::Arc::from(
-                dev.from_cpu(&x, &Shape::new(vec![1, HIDDEN]), DType::F32).expect("upload"),
+                dev.from_cpu(&x, &Shape::new(vec![1, HIDDEN]), DType::F32)
+                    .expect("upload"),
             ),
             Shape::new(vec![1, HIDDEN]),
             DType::F32,
@@ -360,5 +364,7 @@ fn q8_0_fused_gemm_is_exact_where_activation_quantization_is_lossless() {
              provably lossless here, so this is a real kernel defect"
         );
     }
-    eprintln!("[one-hot] PASS: kernel exact where quantization is lossless (worst {worst_all:.3e})");
+    eprintln!(
+        "[one-hot] PASS: kernel exact where quantization is lossless (worst {worst_all:.3e})"
+    );
 }

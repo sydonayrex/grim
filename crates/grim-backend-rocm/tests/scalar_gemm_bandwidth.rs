@@ -97,7 +97,9 @@ fn bench(dev: &RocmDevice, scheme: KQuantScheme, m: usize, n: usize, k: usize, i
         KQuantScheme::Q6K => "Q6K",
         _ => "?",
     };
-    eprintln!("[scalar-bw] {name} m={m:<3} n={n:<5} k={k:<5} per_launch={us:>9.1} us  weight_GBps={gbps:>7.1}");
+    eprintln!(
+        "[scalar-bw] {name} m={m:<3} n={n:<5} k={k:<5} per_launch={us:>9.1} us  weight_GBps={gbps:>7.1}"
+    );
 }
 
 fn launch(

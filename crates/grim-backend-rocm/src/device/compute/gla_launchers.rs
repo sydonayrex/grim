@@ -159,6 +159,7 @@ impl RocmDevice {
         eps: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         self.launch_gla_state_update_output_into(&GlaLaunchArgs {

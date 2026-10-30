@@ -135,6 +135,57 @@ impl RocmDevice {
         )
     }
 
+    /// Direct F16 dequantization of IQ4_NL for prefill rocBLAS GEMM.
+    /// Uses 64 threads per workgroup covering 8 blocks (256 elements).
+    pub(crate) fn launch_dequant_iq4nl_f16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        let grid_blocks = n_blocks.div_ceil(8);
+        self.launch_generic_dequant_with_grid(
+            "grim_dequant_iq4nl_f16",
+            packed_storage,
+            out_storage,
+            n_blocks,
+            grid_blocks,
+            64,
+        )
+    }
+
+    /// Direct F16 dequantization of IQ4_XS for prefill rocBLAS GEMM.
+    pub(crate) fn launch_dequant_iq4xs_f16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant(
+            "grim_dequant_iq4xs_f16",
+            packed_storage,
+            out_storage,
+            n_blocks,
+            IQ_SUPERBLOCK_THREADS,
+        )
+    }
+
+    /// Direct F16 dequantization of IQ3_S for prefill rocBLAS GEMM.
+    pub(crate) fn launch_dequant_iq3s_f16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant(
+            "grim_dequant_iq3s_f16",
+            packed_storage,
+            out_storage,
+            n_blocks,
+            IQ_SUPERBLOCK_THREADS,
+        )
+    }
+
     /// Generic helper for standalone dequant kernels that take (packed, out,
     /// n_blocks).
     ///
@@ -179,7 +230,67 @@ impl RocmDevice {
         )
     }
 
+    pub(crate) fn launch_generic_dequant_with_grid(
+        &self,
+        name: &str,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+        grid_x: usize,
+        threads_per_block: u32,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: packed has no device ptr", name)))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
+        if threads_per_block == 0 {
+            return Err(Error::Backend(format!(
+                "{name}: threads_per_block must be non-zero"
+            )));
+        }
+        let grid_u32: u32 = grid_x
+            .try_into()
+            .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_u32, 1, 1);
+        let block_dim = HipDim3::new(threads_per_block, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_blk = n_blocks as i32;
+        self.launch_compute_kernel(
+            name,
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_blk)],
+        )
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq2xxs(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq2xxs_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ2XXS oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq2xxs_scalar(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -220,6 +331,30 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq2xs_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ2XS oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq2xs_scalar(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xs", a, b, out, m, n, k, 1)
     }
 
@@ -243,7 +378,72 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1 A/B launcher: the codebook-cache LDS variant of the IQ2_S
+    /// grouped kernel. NOT the production dispatch.
+    pub fn launch_fused_dequant_gemm_iq2s_lds_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq2s_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// res0-T1 A/B wrapper: the PRODUCTION IQ2_S decode leg (grouped).
+    pub fn launch_fused_dequant_gemm_iq2s_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq2s(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq2s(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // res0-T1: the codebook-cache LDS variant is the DEFAULT — 2.04x at
+        // n=4096, 1.11x at n=17408, byte-identical both. GRIM_IQ_LDS=0 is
+        // the escape hatch; the scalar entry stays as the parity oracle.
+        static LDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lds = *LDS.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ_LDS").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let kernel_name = if lds {
+            "grim_fused_dequant_gemm_iq2s_grouped_lds"
+        } else {
+            "grim_fused_dequant_gemm_iq2s_grouped"
+        };
+        self.launch_fused_deq_gemm_simple(kernel_name, a, b, out, m, n, k, 1)
+    }
+
+    /// Scalar IQ2_S oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq2s_scalar(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -275,7 +475,74 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1 A/B launcher: the codebook-cache LDS variant of the IQ3_XXS
+    /// grouped kernel. NOT the production dispatch.
+    pub fn launch_fused_dequant_gemm_iq3xxs_lds_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq3xxs_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// res0-T1 A/B wrapper: the PRODUCTION IQ3_XXS decode leg (grouped).
+    pub fn launch_fused_dequant_gemm_iq3xxs_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq3xxs(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq3xxs(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // res0-T1: the codebook-cache LDS variant is the DEFAULT — it beat
+        // the plain grouped kernel at BOTH A/B shapes (1.81x at n=4096,
+        // 1.15x at n=17408, byte-identical both). GRIM_IQ_LDS=0 keeps the
+        // plain grouped kernel reachable as an escape hatch; the scalar
+        // entry stays as the parity oracle.
+        static LDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lds = *LDS.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ_LDS").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        let kernel_name = if lds {
+            "grim_fused_dequant_gemm_iq3xxs_grouped_lds"
+        } else {
+            "grim_fused_dequant_gemm_iq3xxs_grouped"
+        };
+        self.launch_fused_deq_gemm_simple(kernel_name, a, b, out, m, n, k, 1)
+    }
+
+    /// Scalar IQ3_XXS oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq3xxs_scalar(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -307,7 +574,71 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T1 A/B launcher: the codebook-cache LDS variant of the IQ3_S
+    /// grouped kernel. NOT the production dispatch.
+    pub fn launch_fused_dequant_gemm_iq3s_lds_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq3s_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// res0-T1 A/B wrapper: the PRODUCTION IQ3_S decode leg (grouped).
+    pub fn launch_fused_dequant_gemm_iq3s_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq3s(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_iq3s(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        // res0-T1: the LDS codebook variant was measured 1.18x FASTER at
+        // n=4096 but 0.78x SLOWER at n=17408 (preload + syncthreads beat by
+        // L2 amortization at large N), so it is NOT shipped here — the
+        // `_grouped_lds` launcher stays reachable as an A/B arm.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq3s_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ3_S oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq3s_scalar(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -328,10 +659,140 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // Prompt tiling when it can pay (see the tiled launcher), else the
+        // GROUP-HOISTED kernel (D2-2: grid-index math + IQ1S_GRID load hoisted
+        // out of each 8-weight group). Both are bit-identical to the scalar
+        // kernel — same values, same ascending accumulation order — which stays
+        // reachable for the parity gates via `..._iq1s_scalar`.
+        // PROMPT TILING IS MEASURED-NEUTRAL — DEFAULT OFF.
+        //
+        // `grim_fused_dequant_gemm_iq1s_tiled` stages a dequantized weight tile
+        // in LDS and reuses it across TILE_M=16 prompt rows, cutting weight
+        // traffic and dequant work 16x. Measured at the production shape
+        // (n=17408, k=5120), grouped vs tiled: **m=110 21.7 vs 21.7 ms, m=339
+        // 58.5 vs 60.0 ms** — i.e. 0.97-1.00x, no win. The reason: the kernel
+        // is COMPUTE-bound (scalar dequant + FMA at ~500 GFLOP/s), not
+        // weight-traffic-bound, and tiling does not reduce the FLOP count. The
+        // linear growth of prompt cost with m is simply m*n*k FLOPs, not the
+        // re-read. The tiled kernel and its bit-exact parity gate are kept as
+        // the record of that measurement (and as a base for real vectorization,
+        // which must change the accumulation order and therefore needs a
+        // tolerance/PPL gate, not the 0.0 parity this one holds).
+        // `GRIM_IQ_TILED_M_MIN=<m>` opts in for experiments.
+        let tiled_m_min: usize = std::env::var("GRIM_IQ_TILED_M_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        if m >= tiled_m_min && k % 256 == 0 {
+            return self.launch_fused_dequant_gemm_iq1s_tiled(a, b, out, m, n, k);
+        }
+        // MEASURED NEGATIVE — a bit-identical vec4 variant (float4 activation
+        // loads, same accumulation order) was tried and REMOVED: 52.0 vs 27.9 ms
+        // at m=110 (1.9x SLOWER) and slower at m=1 too, because the eight grid
+        // byte extractions cost more than the load issue they saved. Recorded
+        // here so it is not re-tried blind. The remaining levers are structural
+        // (matrix cores with a vectorized dequant, or a q8_1-act integer dot),
+        // both of which change the accumulation order and need a tolerance/PPL
+        // gate rather than the 0.0 parity this kernel holds.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq1s_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Prompt-tiled IQ1_S GEMM: TILE_M prompt rows share one LDS-staged
+    /// dequantized weight tile, so weight traffic and dequant work drop by
+    /// TILE_M. Grid (ceil(N/16), ceil(M/16)), block 256 (8 waves of 32).
+    ///
+    /// Only used when it can pay: `m >= TILE_M` (a partial tile wastes
+    /// (TILE_M - m) rows of work) and `k % 256 == 0` (super-block layout).
+    pub(crate) fn launch_fused_dequant_gemm_iq1s_tiled(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 16;
+        const TILE_N: usize = 16;
+        let mut aptr = a
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("iq1s_tiled: a has no ptr".into()))?;
+        let mut bptr = b
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("iq1s_tiled: b has no ptr".into()))?;
+        let mut optr = out
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("iq1s_tiled: out has no ptr".into()))?;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let grid = crate::HipDim3::new(n.div_ceil(TILE_N) as u32, m.div_ceil(TILE_M) as u32, 1);
+        let block = crate::HipDim3::new((TILE_M * TILE_N) as u32, 1, 1);
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_iq1s_tiled",
+            grid,
+            block,
+            &mut [
+                crate::arg(&mut aptr),
+                crate::arg(&mut bptr),
+                crate::arg(&mut optr),
+                crate::arg(&mut mm),
+                crate::arg(&mut nn),
+                crate::arg(&mut kk),
+            ],
+        )
+    }
+
+    /// The original per-weight scalar IQ1_S GEMM, kept as the parity oracle for
+    /// the grouped kernel (and as the fallback if the grouped one regresses).
+    /// Only the parity gate calls it in-tree, hence the allow.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq1s_scalar(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1s", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_gemm_iq1m(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq1m_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ1_M oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq1m_scalar(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -415,6 +876,19 @@ impl RocmDevice {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4nl", a, b, out, m, n, k, 1)
     }
 
+    /// Public A/B wrapper for the reference scalar fused IQ4_NL GEMV.
+    pub fn launch_fused_dequant_gemm_iq4nl_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq4nl(a, b, out, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_iq4nl(
         &self,
         dy: &RocmStorage,
@@ -444,7 +918,46 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq4xs_grouped",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// Scalar IQ4_XS oracle for the grouped kernel's parity gate.
+    #[allow(dead_code)]
+    pub(crate) fn launch_fused_dequant_gemm_iq4xs_scalar(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4xs", a, b, out, m, n, k, 1)
+    }
+
+    /// A/B wrapper around the PRODUCTION IQ4_XS decode leg (the group-hoisted
+    /// f32-act `_grouped` kernel), so the dot4-vs-grouped speed gate and the
+    /// parity harness drive the same launcher the dispatch runs.
+    pub fn launch_fused_dequant_gemm_iq4xs_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq4xs(a, b, out, m, n, k)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq4xs(
@@ -465,5 +978,343 @@ impl RocmDevice {
             n,
             k,
         )
+    }
+}
+
+#[cfg(test)]
+mod iq1s_grouped_parity {
+    use grim_tensor::{
+        ArithType, BackendStorage, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage,
+    };
+
+    fn packed_iq3xxs(n: usize, k: usize) -> Vec<u8> {
+        // block_iq3_xxs = d(2) + qs(64) + ss(32) = 98 B / 256 weights.
+        const BLK: usize = 98;
+        let row_bytes = (k / 256) * BLK;
+        let mut b = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..(k / 256) {
+                let off = row * row_bytes + blk * BLK;
+                b[off] = 0x00;
+                b[off + 1] = 0x3C; // d = 1.0f16
+                for i in 2..BLK {
+                    b[off + i] = ((row * 53 + blk * 29 + i * 11) & 0xFF) as u8;
+                }
+            }
+        }
+        b
+    }
+
+    fn packed_iq3s(n: usize, k: usize) -> Vec<u8> {
+        // block_iq3_s = d(2) + qs(64) + qh(8) + signs(32) + scales(4) = 110 B / 256.
+        const BLK: usize = 110;
+        let row_bytes = (k / 256) * BLK;
+        let mut b = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..(k / 256) {
+                let off = row * row_bytes + blk * BLK;
+                b[off] = 0x00;
+                b[off + 1] = 0x3C; // d = 1.0f16
+                for i in 2..BLK {
+                    b[off + i] = ((row * 97 + blk * 41 + i * 13) & 0xFF) as u8;
+                }
+            }
+        }
+        b
+    }
+
+    fn packed_iq2s(n: usize, k: usize) -> Vec<u8> {
+        // block_iq2_s = d(2) + qs(32) + signs(32) + qh(8) + scales(8) = 82 B / 256.
+        const BLK: usize = 82;
+        let row_bytes = (k / 256) * BLK;
+        let mut b = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..(k / 256) {
+                let off = row * row_bytes + blk * BLK;
+                b[off] = 0x00;
+                b[off + 1] = 0x3C;
+                for i in 2..BLK {
+                    b[off + i] = ((row * 71 + blk * 23 + i * 5) & 0xFF) as u8;
+                }
+            }
+        }
+        b
+    }
+
+    fn packed_fixed(n: usize, k: usize, blk_bytes: usize, seed: usize) -> Vec<u8> {
+        let row_bytes = (k / 256) * blk_bytes;
+        let mut b = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..(k / 256) {
+                let off = row * row_bytes + blk * blk_bytes;
+                b[off] = 0x00;
+                b[off + 1] = 0x3C; // d = 1.0f16
+                for i in 2..blk_bytes {
+                    b[off + i] = ((row * seed + blk * 23 + i * 5) & 0xFF) as u8;
+                }
+            }
+        }
+        b
+    }
+
+    fn packed_iq2xs(n: usize, k: usize) -> Vec<u8> {
+        packed_fixed(n, k, 74, 61)
+    }
+    fn packed_iq2xxs(n: usize, k: usize) -> Vec<u8> {
+        packed_fixed(n, k, 66, 43)
+    }
+
+    fn packed_iq4xs(n: usize, k: usize) -> Vec<u8> {
+        packed_fixed(n, k, 136, 29)
+    }
+
+    fn packed_iq1m(n: usize, k: usize) -> Vec<u8> {
+        packed_fixed(n, k, 56, 37)
+    }
+
+    fn packed_iq1s(n: usize, k: usize) -> Vec<u8> {
+        // Deterministic fabricated bytes in the real IQ1_S layout
+        // (block_iq1_s = 2 + 32 + 16 = 50 B / 256 weights). Values are
+        // arbitrary; the gate compares two KERNELS, not two values.
+        const BLK: usize = 50;
+        let row_bytes = (k / 256) * BLK;
+        let mut b = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..(k / 256) {
+                let off = row * row_bytes + blk * BLK;
+                b[off] = 0x00;
+                b[off + 1] = 0x3C; // d = 1.0f16
+                for i in 2..BLK {
+                    b[off + i] = ((row * 131 + blk * 17 + i * 7) & 0xFF) as u8;
+                }
+            }
+        }
+        b
+    }
+
+    /// D2-2 gate: the group-hoisted IQ1_S GEMM must be BIT-IDENTICAL to the
+    /// scalar per-weight kernel it replaces (same dequant values, same
+    /// ascending accumulation order). Any drift here is a kernel bug, not
+    /// reduction-order noise.
+    #[test]
+    fn grouped_iq1s_gemm_matches_the_scalar_kernel() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] device 0 unavailable");
+            return;
+        };
+        for (scheme, blk_bytes, packer) in [
+            (
+                KQuantScheme::IQ1S,
+                50usize,
+                packed_iq1s as fn(usize, usize) -> Vec<u8>,
+            ),
+            (KQuantScheme::IQ3XXS, 98usize, packed_iq3xxs),
+            (KQuantScheme::IQ3S, 110usize, packed_iq3s),
+            (KQuantScheme::IQ2S, 82usize, packed_iq2s),
+            (KQuantScheme::IQ2XS, 74usize, packed_iq2xs),
+            (KQuantScheme::IQ2XXS, 66usize, packed_iq2xxs),
+            (KQuantScheme::IQ4XS, 136usize, packed_iq4xs),
+            (KQuantScheme::IQ1M, 56usize, packed_iq1m),
+        ] {
+            let _ = blk_bytes;
+            let dt = DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(scheme),
+            };
+            for (n, k) in [(64usize, 512usize), (256, 5120)] {
+                let bytes = packer(n, k);
+                let w_box = dev
+                    .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), dt.clone())
+                    .expect("packed weight");
+                let w = w_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                let act: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.01).collect();
+                let a_box = dev
+                    .from_cpu(&act, &Shape::new(vec![1, k]), DType::F32)
+                    .expect("act");
+                let a = a_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                let out_scalar_box = dev
+                    .zeros(&Shape::new(vec![1, n]), DType::F32)
+                    .expect("out alloc");
+                let out_grouped_box = dev
+                    .zeros(&Shape::new(vec![1, n]), DType::F32)
+                    .expect("out alloc");
+                let out_scalar = out_scalar_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                let out_grouped = out_grouped_box
+                    .as_any()
+                    .downcast_ref::<crate::RocmStorage>()
+                    .expect("RocmStorage");
+                match scheme {
+                    KQuantScheme::IQ1S => {
+                        dev.launch_fused_dequant_gemm_iq1s_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq1s(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ3XXS => {
+                        dev.launch_fused_dequant_gemm_iq3xxs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq3xxs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ3S => {
+                        dev.launch_fused_dequant_gemm_iq3s_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq3s(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ2S => {
+                        dev.launch_fused_dequant_gemm_iq2s_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq2s(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ2XS => {
+                        dev.launch_fused_dequant_gemm_iq2xs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq2xs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ2XXS => {
+                        dev.launch_fused_dequant_gemm_iq2xxs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq2xxs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    KQuantScheme::IQ4XS => {
+                        dev.launch_fused_dequant_gemm_iq4xs_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq4xs(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                    _ => {
+                        dev.launch_fused_dequant_gemm_iq1m_scalar(&a, &w, &out_scalar, 1, n, k)
+                            .expect("scalar launch");
+                        dev.launch_fused_dequant_gemm_iq1m(&a, &w, &out_grouped, 1, n, k)
+                            .expect("grouped launch");
+                    }
+                }
+                dev.synchronize();
+                let s = out_scalar.to_cpu_vec_f32().expect("scalar readback");
+                let g = out_grouped.to_cpu_vec_f32().expect("grouped readback");
+                assert_eq!(s.len(), g.len());
+                let mut worst = 0.0f32;
+                let mut worst_i = 0usize;
+                for (i, (x, y)) in s.iter().zip(g.iter()).enumerate() {
+                    let d = (x - y).abs();
+                    if d > worst {
+                        worst = d;
+                        worst_i = i;
+                    }
+                }
+                eprintln!(
+                    "[iq-grouped-parity] {scheme:?} n={n} k={k}: worst abs {worst:.3e} at {worst_i}"
+                );
+                assert!(
+                    worst <= 1e-6,
+                    "grouped {scheme:?} GEMM diverges from the scalar kernel: worst {worst:.3e} at \
+                 {worst_i} (scalar {}, grouped {})",
+                    s[worst_i],
+                    g[worst_i]
+                );
+            }
+        }
+    }
+
+    /// D3-B gate: the PROMPT-TILED IQ1_S kernel (LDS-staged dequant reused
+    /// across TILE_M rows) must be bit-identical to the grouped kernel at
+    /// prompt shapes, including a PARTIAL final tile (m=40 with TILE_M=16) and
+    /// a non-multiple n (the store guard).
+    #[test]
+    fn tiled_iq1s_gemm_matches_the_grouped_kernel_at_prompt_shapes() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] device 0 unavailable");
+            return;
+        };
+        let dt = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ1S),
+        };
+        // (m, n, k): full tiles, a partial tile row block (40 = 2x16 + 8), a
+        // non-multiple n, and the production k.
+        for (m, n, k) in [
+            (16usize, 64usize, 512usize),
+            (40, 48, 512),
+            (16, 256, 5120),
+            (33, 80, 1024),
+        ] {
+            let bytes = packed_iq1s(n, k);
+            let w_box = dev
+                .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), dt.clone())
+                .expect("packed weight");
+            let w = w_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            let act: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.01)
+                .collect();
+            let a_box = dev
+                .from_cpu(&act, &Shape::new(vec![m, k]), DType::F32)
+                .expect("act");
+            let a = a_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            let out_g_box = dev
+                .zeros(&Shape::new(vec![m, n]), DType::F32)
+                .expect("out alloc");
+            let out_t_box = dev
+                .zeros(&Shape::new(vec![m, n]), DType::F32)
+                .expect("out alloc");
+            let out_g = out_g_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            let out_t = out_t_box
+                .as_any()
+                .downcast_ref::<crate::RocmStorage>()
+                .expect("RocmStorage");
+            dev.launch_fused_dequant_gemm_iq1s_scalar(&a, &w, &out_g, m, n, k)
+                .expect("grouped launch");
+            dev.launch_fused_dequant_gemm_iq1s_tiled(&a, &w, &out_t, m, n, k)
+                .expect("tiled launch");
+            dev.synchronize();
+            let g = out_g.to_cpu_vec_f32().expect("grouped readback");
+            let t = out_t.to_cpu_vec_f32().expect("tiled readback");
+            let mut worst = 0.0f32;
+            let mut at = 0usize;
+            for (i, (x, y)) in g.iter().zip(t.iter()).enumerate() {
+                let d = (x - y).abs();
+                if d > worst {
+                    worst = d;
+                    at = i;
+                }
+            }
+            eprintln!("[iq1s-tiled-parity] m={m} n={n} k={k}: worst abs {worst:.3e} at {at}");
+            assert!(
+                worst <= 1e-6,
+                "tiled IQ1_S GEMM diverges from the grouped kernel at m={m} n={n} k={k}: \
+                 worst {worst:.3e} at {at} (grouped {}, tiled {})",
+                g[at],
+                t[at]
+            );
+        }
     }
 }

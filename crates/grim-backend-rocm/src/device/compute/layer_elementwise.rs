@@ -49,6 +49,29 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// Fused gate: out *= sigmoid(gate) in one launch (Qwen3.5 attention
+    /// output gate epilogue).
+    pub fn sigmoid_mul_into(&self, gate: &dyn BackendStorage, out: &RocmStorage) -> Result<()> {
+        let g_s = as_rocm(gate)?;
+        if !g_s.device_ptr_is_valid() || !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "sigmoid_mul_into: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut out_ptr = dev_ptr(out)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_sigmoid_mul",
+            grid,
+            block,
+            &mut [arg(&mut g_ptr), arg(&mut out_ptr), arg(&mut n)],
+        )?;
+        Ok(())
+    }
+
     /// Broadcast a per-channel vector `in` [dk] across heads -> `out` [nh, dk].
     /// Used by the on-device GDL-2 gate path so the shared erase/write/decay
     /// gates reach the fused kernel without a host readback.
@@ -720,11 +743,14 @@ impl RocmDevice {
             let mut w_scales = (w_base_ptr as usize + 8 + w_elem + 8) as *mut c_void;
             let (mut b_codes, mut b_scales) = match bias {
                 Some(b) => {
-                    let bs = b.as_any().downcast_ref::<RocmStorage>()
-                        .filter(|bs| matches!(
+                    let bs = b.as_any().downcast_ref::<RocmStorage>().filter(|bs| {
+                        matches!(
                             bs.dtype().storage,
-                            grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
-                        ));
+                            grim_tensor::dtype::Storage::Block(
+                                grim_tensor::dtype::BlockDtype::Int8PerChannel
+                            )
+                        )
+                    });
                     match bs {
                         Some(bs) => {
                             let bbase = match dev_ptr_dyn(b) {
@@ -903,6 +929,7 @@ impl RocmDevice {
         clamp_min: f32,
         clamp_max: f32,
     ) -> Result<MhcGateTensors> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if seq == 0 {
             return Err(Error::Backend("mhc_gates_into: empty sequence".into()));
         }
@@ -1000,7 +1027,9 @@ impl RocmDevice {
         clamp_max: f32,
     ) -> Result<()> {
         if seq == 0 {
-            return Err(Error::Backend("mhc_gates_launch_into: empty sequence".into()));
+            return Err(Error::Backend(
+                "mhc_gates_launch_into: empty sequence".into(),
+            ));
         }
         if hc == 0 || hc > 8 {
             return Err(Error::Backend(format!(

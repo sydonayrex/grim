@@ -411,7 +411,7 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             // scales are framing overhead on a different denominator.
             BlockDtype::Int8PerChannel => 8,
             // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
-            BlockDtype::Q4_0 => 4,
+            BlockDtype::Q4_0 | BlockDtype::Q4_1 => 4,
         },
         Storage::FloatPack(scheme) => match scheme {
             FloatPackScheme::Fp4 => 4,

@@ -5,13 +5,13 @@
 
 use std::ffi::c_void;
 
+use grim_tensor::BackendStorage;
 use grim_tensor::dtype::{ArithType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::BackendStorage;
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, HipDim3};
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Returns `true` when the activation storage holds native FP16 data
@@ -54,6 +54,7 @@ impl RocmDevice {
             usize,
             usize,
         ) -> Result<*mut c_void>,
+        format_tag_hint: Option<&str>,
     ) -> Result<()> {
         let is_rdna34 = self.is_rdna34;
         // GRIM_WMMA=0 forces the scalar dequant-GEMM for every format. The
@@ -63,12 +64,60 @@ impl RocmDevice {
             std::env::var("GRIM_WMMA").as_deref(),
             Ok("0") | Ok("false") | Ok("off")
         );
-        if allow_wmma && is_rdna34 && m <= 4 && !wmma_off {
+        // Small-M threshold, env-tunable, default 0 = never prefer WMMA.
+        //
+        // It used to be hardcoded `m <= 4`, which routed exactly the SHORT
+        // PROMPT through WMMA — the case it is worst at. Measured on the 27B
+        // (4-token prompt, single device): the WMMA fused-dequant kernels cost
+        // 19.6 s of the run's 21.6 s of kernel time at ~40 ms PER TENSOR
+        // (~2.5 GFLOP/s), while the group-hoisted scalar kernels run the same
+        // shapes at ~0.5 ms. The scalar path is also the one with the bit-exact
+        // parity gate (the WMMA IQ3_S kernel measured rel 0.76 on real
+        // Xing4.0 weights), so preferring it at small m is both faster and
+        // safer. `GRIM_WMMA_M_MAX=<n>` restores a WMMA preference for m <= n.
+        let wmma_m_max: usize = std::env::var("GRIM_WMMA_M_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // Prefill dequant + rocBLAS F16 GEMM for large M (default ON for M >= 4 unless explicitly disabled).
+        let prefill_dequant_on = match std::env::var("GRIM_PREFILL_DEQUANT_GEMM").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        };
+        let prefill_dequant_min_m: usize = std::env::var("GRIM_PREFILL_DEQUANT_MIN_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        if prefill_dequant_on && m >= prefill_dequant_min_m {
+            if let Some(format_tag) = format_tag_hint {
+                self.launch_iq_prefill_dequant_rocblas_f16(a, b, out, m, n, k, format_tag)?;
+                return Ok(());
+            }
+        }
+        if allow_wmma && is_rdna34 && m <= wmma_m_max && !wmma_off {
             wmma_method(self, a, b, out, m, n, k)?;
         } else {
             scalar_method(self, a, b, out, m, n, k)?;
         }
         Ok(())
+    }
+
+    /// M7.2a: the SHAPE gate for the IQ recipe (the LDS-tiled prompt GEMM)
+    /// on a given format.
+    ///
+    /// The tiled kernel stages a 64x64 weight tile in LDS and reuses it
+    /// across TILE_M=4 prompt rows, so it pays off when the prompt has
+    /// enough rows to amortise the staging and the tile is expressible:
+    /// `n` must be a multiple of the 64-column tile and `k` a multiple of the
+    /// format's 256-element super-block.
+    ///
+    /// `m >= 2` is the floor: at m == 1 there is no row reuse to amortise,
+    /// and the decode shape has its own (faster) route.
+    ///
+    /// The per-format policy switch is `tiled_quant_enabled`, so every
+    /// format the recipe reaches can be turned off individually for an A/B.
+    pub(crate) fn tiled_quant_prompt_ok(tag: &str, m: usize, n: usize, k: usize) -> bool {
+        Self::tiled_quant_enabled(tag) && m >= 2 && n >= 64 && n % 64 == 0 && k % 256 == 0
     }
 
     /// SPEED-ROC-8: per-format opt-in flag (GRIM_Q5K_TILED, GRIM_IQ4XS_TILED,
@@ -91,7 +140,39 @@ impl RocmDevice {
             // 9B perf plan Step 3: default-ON for the measured k-quant
             // formats. The scalar kernel re-reads every weight block M times;
             // at the 9B prefill shape it ran at 0.2 GB/s (skinny_m gate).
-            // q2k/q3k stay opt-in until measured.
+            //
+            // M7.2a/f: q2k/q3k are NOT default-ON, and the reason is
+            // measured, not a missing measurement.
+            //
+            // The plain LDS-tiled recipe stages a 64(k) x 64(COLUMN) tile,
+            // so the 4096 weights it stages come from 64 DIFFERENT weight
+            // rows and each needs its own super-block header decoded: there
+            // is no header reuse to amortise, and Q3_K's header is a 12-byte
+            // aux shuffle into 16 scale bytes. Measured at the 27B's
+            // dominant shape (n=17408, k=5120): the plain tile ran 99.4 ms
+            // where the incumbent ran 7.8 ms — a 12.7x REGRESSION.
+            //
+            // M7.2f applied the IQ recipe's group hoist to that tile
+            // (GRIM_TILED_QUANT_FWD_BWD_GROUPED: the header is decoded once
+            // per 16-weight group, and the four codes of a group come out
+            // of one wide read). It is bit-identical to the scalar kernel,
+            // forward and backward, and it makes the TILE 6.5x faster
+            // (Q3_K 99.4 -> 15.3 ms, Q2_K 99.7 -> 11.6 ms) — so the recipe
+            // DOES transfer to the tiled route.
+            //
+            // But the tile is still 1.6-2.0x SLOWER than the incumbent at
+            // every M (Q3_K: 15.3 vs 7.6 ms at m=64, 59.7 vs 27.6 at m=256,
+            // 233 vs 111 at m=1024), so the route stays off. What the tile
+            // spends its time on is still not identified: with the header
+            // stubbed out it is 10.7 ms, against the plain macro's ~0.6 ms
+            // of staging at the same shape, and neither the thread mapping
+            // nor force-inlining the quad moves it.
+            //
+            // The incumbent for these two formats is the SCALAR dequant
+            // GEMM, and it is already at the L2 limit (38 MB of weights read
+            // M=64 times over is 2.4 GB in 7.6 ms = 320 GB/s). The headroom
+            // is the tile's 4x-lower traffic; the blocker is the tile's
+            // staging cost, which is the next thing to measure.
             matches!(tag, "q4k" | "q5k" | "q6k")
         })
     }
@@ -251,6 +332,60 @@ impl RocmDevice {
                 arg(&mut dyptr),
                 arg(&mut bptr),
                 arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// res0-T2-6 sweep launcher: same contract as
+    /// `launch_fused_deq_gemm_simple` but with an explicit block size, so the
+    /// launch-parameter sweep can run the SAME kernel at 64/128/256/512
+    /// threads (the kernel bodies are block-size agnostic: linear idx and
+    /// strided LDS preloads). Byte-identity must hold at every size — gate:
+    /// tests/iq_lds_codebook_ab.rs `iq_lds_block_sweep`.
+    pub fn launch_fused_deq_gemm_simple_block_for_ab(
+        &self,
+        name: &str,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: a has no device ptr", name)))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: b has no device ptr", name)))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
+        let total_elems = (m as u64) * (n as u64);
+        let grid_x: u32 = total_elems
+            .div_ceil(block_size as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(block_size as u32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
                 arg(&mut mm),
                 arg(&mut nn),
                 arg(&mut kk),
@@ -448,7 +583,9 @@ impl grim_format::convert::GpuDequant for RocmDevice {
         bytes: &[u8],
         elem_count: usize,
     ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
-        let _serial = dequant_serial_lock(self.ordinal).lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = dequant_serial_lock(self.ordinal)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
         match storage {
             Storage::KQuant(KQuantScheme::Q80) => {

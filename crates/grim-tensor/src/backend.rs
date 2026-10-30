@@ -1018,6 +1018,100 @@ pub trait AttentionOps {
         ))
     }
 
+    /// QKV attention over int8-quantized dense KV arenas (Phase-2 KV shrink).
+    ///
+    /// `k_codes`/`v_codes` are biased-u8 rows (`q+128`) with f32
+    /// per-(row, kv_head) `k_scales`/`v_scales`; `q` stays f32. Same
+    /// contract as [`Self::qkv_attention`] minus max/sum side outputs,
+    /// alibi, and fused-O. Backends without an int8 reader return
+    /// `Unimplemented` and callers fall back to the dense path.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_i8(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_codes: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_codes: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_i8 not implemented for this backend".into(),
+        ))
+    }
+
+    /// Phase 3 dense-arena attention: packed 4-bit nibbles + per-(row, kv_head) scales.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_i4(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_codes: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_codes: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_i4 not implemented for this backend".into(),
+        ))
+    }
+
+    /// WS-3A K2V4: dense-arena attention over a MIXED-WIDTH packed row — 2-bit
+    /// keys (4 codes/byte) with 4-bit values (2 codes/byte), each side carrying
+    /// its own per-(row, kv_head) scale. `qkv_attention_i4` is the `4/4` case;
+    /// this exists because the two sides need different packing strides.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_i2v4(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_codes: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_codes: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_i2v4 not implemented for this backend".into(),
+        ))
+    }
+
+    /// WhiteCrow (u4 group-128) dense-arena attention. `k_arena`/`v_arena` are
+    /// interleaved 67-byte blocks (64 B LE u4 nibbles + 2 B LE bf16 scale +
+    /// 1 B u8 zero point) with the scale inline — there is NO scale sidecar,
+    /// which is why this takes no `k_scales`/`v_scales`. Same contract as
+    /// [`Self::qkv_attention_i4`] otherwise. head_dim must be a multiple of
+    /// 128 (WhiteCrow groups align to head vectors) and <= 256. Backends
+    /// without a WhiteCrow reader return `Unimplemented` and callers fall
+    /// back to the dense path.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_whitecrow(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_arena: &dyn BackendStorage,
+        _v_arena: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_whitecrow not implemented for this backend".into(),
+        ))
+    }
+
     /// Paged (block-table) attention over a QUANTIZED KV cache.
     ///
     /// Distinct from [`Self::qkv_attention_paged`], whose kernel reads page rows
@@ -2022,6 +2116,65 @@ pub trait MemoryOps {
         Err(crate::error::Error::Unimplemented(
             "copy_slice_range not implemented for this backend".into(),
         ))
+    }
+
+    /// Gather selected rows of a 2-D (row-major) buffer into a contiguous
+    /// destination region.
+    ///
+    /// `src` and `dst` are row-major with `row_elems` elements per row. `rows`
+    /// lists the SOURCE row indices to keep, in output order; output row `i`
+    /// lands at destination row `dst_row_off + i`. This is the compaction step
+    /// of value-guided KV eviction: the survivors are chosen on the host (a
+    /// non-contiguous set) and must be laid down contiguously so the attention
+    /// kernels' contiguous-window assumption holds.
+    ///
+    /// Every index must be `< src` rows; an out-of-range index is a bug in the
+    /// selection pass and is an error, never a clamp — a clamp would silently
+    /// duplicate a row and corrupt the cache.
+    ///
+    /// The default implementation is one `copy_slice_range` per row: correct on
+    /// every backend that implements that, and used as the reference oracle for
+    /// a device kernel override (which collapses the N copies into one launch).
+    fn gather_rows_into(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_row_off: usize,
+        src: &dyn BackendStorage,
+        rows: &[u32],
+        row_elems: usize,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if row_elems == 0 {
+            return Err(crate::error::Error::Shape(
+                "gather_rows_into: row_elems must be non-zero".into(),
+            ));
+        }
+        let src_rows = src.shape().dims().first().copied().unwrap_or(0);
+        let dst_rows = dst.shape().dims().first().copied().unwrap_or(0);
+        if dst_row_off + rows.len() > dst_rows {
+            return Err(crate::error::Error::Shape(format!(
+                "gather_rows_into: {} rows at offset {dst_row_off} overflow dst ({dst_rows} rows)",
+                rows.len()
+            )));
+        }
+        for (i, &r) in rows.iter().enumerate() {
+            let r = r as usize;
+            if r >= src_rows {
+                return Err(crate::error::Error::Shape(format!(
+                    "gather_rows_into: source row {r} out of range (src has {src_rows} rows)"
+                )));
+            }
+            self.copy_slice_range(
+                dst,
+                (dst_row_off + i) * row_elems,
+                src,
+                r * row_elems,
+                row_elems,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -3096,8 +3249,20 @@ impl<T: RecurrentOps + ?Sized> RecurrentOps for std::sync::Arc<T> {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).kda_gated_delta_rule_scan(
-            conv_out, alpha, beta, dt_bias, ssm_a, norm_weight, z, state, seq_len,
-            num_value_heads, num_key_heads, head_dim, eps, out_shape,
+            conv_out,
+            alpha,
+            beta,
+            dt_bias,
+            ssm_a,
+            norm_weight,
+            z,
+            state,
+            seq_len,
+            num_value_heads,
+            num_key_heads,
+            head_dim,
+            eps,
+            out_shape,
         )
     }
 

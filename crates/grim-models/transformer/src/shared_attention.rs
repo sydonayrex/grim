@@ -465,6 +465,325 @@ pub fn fused_or_scalar_attention_arena(
     )
 }
 
+/// Phase-2 int8 dense-arena attention: [`fused_or_scalar_attention_arena_device`]
+/// for u8 code arenas with f32 per-(row, kv_head) scales.
+///
+/// Device-only by construction. The host reference reads arena rows as f32 and
+/// has no int8 dequant path, so a declined launch is an `Err` — never a silent
+/// reinterpret of the codes (which is the failure this whole phase exists to
+/// avoid). Callers must own the sidecars before entering here.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i8_arena_device(
+    q_st: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    // 3-D on purpose: the packed K codes' last axis is a head's BYTE count
+    // (`head_dim` for int8, `head_dim/2` for int4 and int2v4), so a reader that
+    // takes head_dim from the arena halves it on the 4-bit formats and
+    // misaligns every K/V read. Passing the geometry here is what makes the
+    // arena's shape free to describe the packed bytes. `qkv_attention_*`
+    // flattens the returned storage back to [steps, heads*dim].
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_i8(
+        q_st,
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// Phase-2 int8 dense-arena attention with a host-resident query:
+/// [`fused_or_scalar_attention_i8_arena_device`] after uploading `q`. The
+/// upload is the only D2H/H2D here; K/V history never leaves the device.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i8_arena(
+    q: &[f32],
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_i8_arena_device(
+        q_st.as_ref(),
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
+/// Phase-3 int4 dense-arena attention for device-resident query.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i4_arena_device(
+    q_st: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_i4(
+        q_st,
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// Phase-3 int4 dense-arena attention with a host-resident query.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i4_arena(
+    q: &[f32],
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_i4_arena_device(
+        q_st.as_ref(),
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
+/// WS-3A K2V4: mixed-width (2-bit K / 4-bit V) dense-arena attention for
+/// device-resident query. The K side packs four codes per byte, so `head_dim`
+/// must be a multiple of 4 (enforced by the launcher).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i2v4_arena_device(
+    q_st: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_i2v4(
+        q_st,
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// WS-3A K2V4: mixed-width dense-arena attention with a host-resident query.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i2v4_arena(
+    q: &[f32],
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_i2v4_arena_device(
+        q_st.as_ref(),
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
+/// WhiteCrow (u4 group-128) dense-arena attention for a device-resident
+/// query. `k_arena`/`v_arena` hold interleaved 67-byte blocks with the scale
+/// inline, so unlike the i8/i4/i2v4 wrappers there are no scale arguments.
+/// The arena's byte geometry is fixed by `head_dim` (must be a multiple of
+/// 128), which the backend re-validates.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_whitecrow_arena_device(
+    q_st: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    // 3-D on purpose, same as the i8 wrapper: the packed arena's last axis
+    // is a head's BYTE count ((head_dim/128)*67), so the geometry must come
+    // from here — deriving head_dim from the arena shape would misread bytes
+    // as elements. `qkv_attention_whitecrow` flattens the returned storage.
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_whitecrow(
+        q_st,
+        k_arena,
+        v_arena,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// WhiteCrow (u4 group-128) dense-arena attention with a host-resident
+/// query: [`fused_or_scalar_attention_whitecrow_arena_device`] after
+/// uploading `q`. The upload is the only H2D here; K/V history (the
+/// interleaved 67-byte blocks) never leaves the device.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_whitecrow_arena(
+    q: &[f32],
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_whitecrow_arena_device(
+        q_st.as_ref(),
+        k_arena,
+        v_arena,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
 /// Paged attention entry point (WI-X2): operates on device-resident KV pages via block tables,
 /// avoiding full-history CPU-to-GPU re-uploading on decode steps.
 #[allow(clippy::too_many_arguments)]

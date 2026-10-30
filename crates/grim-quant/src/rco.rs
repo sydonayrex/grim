@@ -67,9 +67,7 @@ pub fn rco_search(
     // caller supplied them, so a nominal target lands at the nominal file
     // size instead of drifting with the integer tier labels.
     let bpws_f64: Vec<f64> = match &config.costs {
-        Some(c) if c.len() == config.available_bpws.len() => {
-            c.iter().map(|&x| x as f64).collect()
-        }
+        Some(c) if c.len() == config.available_bpws.len() => c.iter().map(|&x| x as f64).collect(),
         _ => config.available_bpws.iter().map(|&b| b as f64).collect(),
     };
     let min_bpw = bpws_f64[0];
@@ -204,9 +202,7 @@ pub fn rco_search(
         });
 
         for &i in &indices {
-            while final_genes[i] > config.available_bpws[0]
-                && total_allocated_bits > target_bits
-            {
+            while final_genes[i] > config.available_bpws[0] && total_allocated_bits > target_bits {
                 let cur_k = config
                     .available_bpws
                     .iter()
@@ -304,7 +300,9 @@ mod tests {
         let realized: f64 = genes
             .iter()
             .zip(&sizes)
-            .map(|(&g, &s)| s as f64 * costs[cfg.available_bpws.iter().position(|&b| b == g).unwrap()])
+            .map(|(&g, &s)| {
+                s as f64 * costs[cfg.available_bpws.iter().position(|&b| b == g).unwrap()]
+            })
             .sum::<f64>()
             / total as f64;
         assert!(
@@ -359,7 +357,10 @@ mod tests {
         // More important tensors must never land BELOW the cheap tier that a
         // less important one took (monotone budget discipline, the paper's
         // premise).
-        assert!(genes.contains(&2) && genes.contains(&4), "both rungs should be used");
+        assert!(
+            genes.contains(&2) && genes.contains(&4),
+            "both rungs should be used"
+        );
     }
     use super::*;
 

@@ -79,7 +79,7 @@ impl Qwen2Moe {
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        ..Default::default()
+            ..Default::default()
         };
 
         // If num_experts > 0, wire through MoE blocks (Qwen2-MoE: 60 routed experts, 4 active, optional shared expert)
@@ -87,6 +87,7 @@ impl Qwen2Moe {
             use crate::moe_block::MoESpec;
             use grim_nn::moe::RouterKind;
             let spec = MoESpec {
+                renorm: false,
                 num_experts: cfg.num_experts,
                 top_k: cfg.num_experts_per_tok,
                 router_kind: RouterKind::SoftmaxTopK,

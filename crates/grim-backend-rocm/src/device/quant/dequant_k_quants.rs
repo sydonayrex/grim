@@ -6,10 +6,10 @@ use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
+use crate::HipDim3;
+use crate::arg;
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::arg;
-use crate::HipDim3;
 
 /// Largest M for which a quantized GEMM takes the u4-lane route instead of the
 /// LDS-tiled kernel.
@@ -132,9 +132,7 @@ impl RocmDevice {
         // GEMV instead grows the grid by M (grid_y = M), so the extra passes are
         // L2-served while the per-tensor slice (<= 28 MB here) stays resident.
         // `dot8_w4a4_gemv_parity_multi_row` pins that M > 1 is correct.
-        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
         if m <= lane_gemm_max_m()
             && w4a4_decode
             && k % 128 == 0
@@ -574,7 +572,9 @@ impl RocmDevice {
         // DECODE FAST PATH: same lane routing as Q4_K. The scalar q6k fused
         // kernel measures 18.5 ms/launch on the 9B decode (6.0 GB/s) while
         // the u4-lane GEMV runs at 70 us (485 GB/s). GRIM_DECODE_W4A4=0 opts out.
-        if let Some(stream) = self.try_u4_lane_decode(a, b, out, m, n, k, grim_tensor::dtype::KQuantScheme::Q6K)? {
+        if let Some(stream) =
+            self.try_u4_lane_decode(a, b, out, m, n, k, grim_tensor::dtype::KQuantScheme::Q6K)?
+        {
             return Ok(stream);
         }
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k, 4)
@@ -601,9 +601,7 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::dtype::KQuantScheme,
     ) -> Result<Option<*mut c_void>> {
-        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
         if !w4a4_decode
             || k % 128 != 0
             || crate::quantization::w4a4_ostquant_supported(
@@ -647,11 +645,56 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::dtype::KQuantScheme,
     ) -> Result<Option<*mut c_void>> {
-        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
+        // Q5K is excluded from the u4-lane GEMV at M=1. ROOT CAUSE (measured,
+        // not hypothesized): there is NO functional bug in either stage. The
+        // lane kernel is bit-exact against an activation-quant-aware host
+        // reference (residual 1.8e-7 on blk.3.attn_q; see
+        // `w4a4_gemv_matches_aq_aware_reference`), and the Q5K weight encode
+        // roundtrips at RMSE 1.8e-3 vs Q4K's 1.1e-3 on the same checkpoint
+        // (ratio tracks the ~2x larger Q5K weight magnitudes: amax 0.32 vs
+        // 0.17). The 0.13-0.31 M=1 divergence is inherent W4A4 format noise
+        // at that operating point — activation-quant noise (~0.1 at O(0.5)
+        // activations, identical for a host replica of the quantizer) plus
+        // the requant contribution — amplified past the 8e-2 parity gate by
+        // Q5K's larger weights. Single-hot/constant activations are exact
+        // (7e-9), confirming the kernel, the B-side reads, and the zero
+        // correction are all sound. Q5K M=1 therefore falls through to the
+        // exact dot4/WMMA legs (fidelity over throughput); the M>1 u4-GEMM
+        // route is unaffected and stays.
+        // Q6_K joins Q5_K here, for the same reason and with the same evidence
+        // class. Measured 2026-10-17 on the Swift-1.5 27B, real `blk.64.ffn_up`
+        // // Q6_K bytes, gfx1200, m=1 n=256 k=512:
+        //
+        //   u4-lane route (default):  max_diff 1.019e-1
+        //   GRIM_DECODE_W4A4=0:       max_diff 5.420e-7   <- fp32 epsilon
+        //
+        // and by shape sweep, holding n and k fixed:
+        //
+        //   m=1  -> FAIL (4.3e-3 .. 1.0e-1)
+        //   m=2  -> ok 2.4e-7   m=4 -> 5.6e-7   m=256 -> 5.5e-7
+        //
+        // `try_u4_lane_decode` gates on `m != 1`, so at the only shape that
+        // matters for decode the fused kernel `grim_fused_dequant_gemm_q6k`
+        // NEVER RAN. It is not broken — it agrees with the host dequant to
+        // 5.4e-7 once it is actually reached. The defect was entirely in the
+        // W4A4 requantization route standing in for it, which is a lossy
+        // format conversion rather than a decode.
+        //
+        // Q4_K was measured on the same axis and left alone deliberately: its
+        // lane route costs 20x fidelity (2.16e-1 -> 1.02e-2 with
+        // GRIM_DECODE_W4A4=0), but 1.02e-2 sits inside Q4_K's existing 0.15
+        // parity gate and Q4_K_M is the common default format, so opting it out
+        // would trade real throughput for accuracy nobody is currently losing.
+        // Q6_K has no such trade to protect: its 8 tensors are all in the MTP
+        // block, and it was 100x outside tolerance.
+        let q5k_decode_skip = matches!(
+            scheme,
+            grim_tensor::dtype::KQuantScheme::Q5K | grim_tensor::dtype::KQuantScheme::Q6K
+        );
         if m != 1
             || !w4a4_decode
+            || q5k_decode_skip
             || k % 128 != 0
             || crate::quantization::w4a4_ostquant_supported(
                 crate::quantization::gcn_arch(&self.gpu_target),
@@ -726,6 +769,32 @@ impl RocmDevice {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q2k", a, b, out, m, n, k, 1)
     }
 
+    /// M7.2g: the group-hoisted Q2_K scalar forward GEMM.
+    ///
+    /// Decodes the super-block header once per block instead of once per
+    /// weight; byte-identical to `grim_fused_dequant_gemm_q2k`. Not on any
+    /// dispatch path; only tests/q3k_q2k_scalar_grouped_parity.rs launches it.
+    pub fn launch_fused_dequant_gemm_q2k_grouped_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_q2k_grouped",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_q2k(
         &self,
         dy: &RocmStorage,
@@ -773,6 +842,121 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q3k", a, b, out, m, n, k, 1)
+    }
+
+    /// M7.2g: the group-hoisted Q3_K scalar forward GEMM.
+    ///
+    /// Decodes the super-block header once per block instead of once per
+    /// weight; byte-identical to `grim_fused_dequant_gemm_q3k`. Not on any
+    /// dispatch path; only tests/q3k_q2k_scalar_grouped_parity.rs launches it.
+    pub fn launch_fused_dequant_gemm_q3k_grouped_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_q3k_grouped",
+            a_storage,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            1,
+        )
+    }
+
+    /// M7.2a: the IQ recipe (the LDS-tiled prompt GEMM) for Q3_K.
+    ///
+    /// The scalar kernel re-reads every weight block M times; the tiled
+    /// kernel stages a 64x64 weight tile in LDS once and reuses it across
+    /// TILE_M prompt rows. The stamp is
+    /// `GRIM_TILED_QUANT_FWD_BWD(..., dequant_q3k_element, 256, 110)` in
+    /// `kernels::quant_tiled_gemm`, and the byte geometry mirrors the scalar
+    /// kernel: 110 B per 256-element super-block.
+    pub(crate) fn launch_fused_dequant_gemm_q3k_tiled(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q3k_tiled: a has no device ptr".into())
+        })?;
+        let b_ptr = b.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q3k_tiled: b has no device ptr".into())
+        })?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q3k_tiled: out has no device ptr".into())
+        })?;
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q3k_tiled",
+            crate::HipDim3::new((n as u32).div_ceil(64), (m as u32).div_ceil(4), 1),
+            crate::HipDim3::new(64, 4, 1),
+            &mut [
+                crate::arg(&mut aptr),
+                crate::arg(&mut bptr),
+                crate::arg(&mut optr),
+                crate::arg(&mut mm),
+                crate::arg(&mut nn),
+                crate::arg(&mut kk),
+            ],
+        )
+    }
+
+    /// M7.2a: the IQ recipe for Q2_K — see
+    /// [`Self::launch_fused_dequant_gemm_q3k_tiled`]. The byte geometry is
+    /// 84 B per 256-element super-block.
+    pub(crate) fn launch_fused_dequant_gemm_q2k_tiled(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q2k_tiled: a has no device ptr".into())
+        })?;
+        let b_ptr = b.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q2k_tiled: b has no device ptr".into())
+        })?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q2k_tiled: out has no device ptr".into())
+        })?;
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q2k_tiled",
+            crate::HipDim3::new((n as u32).div_ceil(64), (m as u32).div_ceil(4), 1),
+            crate::HipDim3::new(64, 4, 1),
+            &mut [
+                crate::arg(&mut aptr),
+                crate::arg(&mut bptr),
+                crate::arg(&mut optr),
+                crate::arg(&mut mm),
+                crate::arg(&mut nn),
+                crate::arg(&mut kk),
+            ],
+        )
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_q3k(

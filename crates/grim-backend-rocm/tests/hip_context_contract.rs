@@ -173,21 +173,19 @@ fn guard_module_still_provides_both_sanctioned_setters() {
 
 #[test]
 fn peer_access_save_restore_pair_stays_balanced() {
-    // WI-M1 audit result: peer_access manages its own prev/save pair around
-    // hipDeviceEnablePeerAccess (which acts on the CURRENT device). It must
-    // switch via raw_set_device exactly twice per grant: once to `src`, once
-    // to restore. A third switch here would be an unpinned drift source.
+    // WI-M1 audit result: peer_access uses DeviceGuard::set(src)
+    // around hipDeviceEnablePeerAccess.
     let body = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/peer_access.rs"),
     )
     .expect("peer_access.rs exists");
-    let switches = body
+    let guards = body
         .lines()
-        .filter(|l| l.contains("raw_set_device("))
+        .filter(|l| l.contains("DeviceGuard::set(src)"))
         .count();
     assert_eq!(
-        switches, 2,
-        "peer_access.rs must keep exactly the set(src)/restore(prev) pair"
+        guards, 1,
+        "peer_access.rs must keep DeviceGuard::set(src) guard"
     );
 }
 
@@ -337,7 +335,11 @@ fn raw_hip_ffi_outside_the_backend_crate_is_guarded() {
         .parent()
         .expect("crates/grim-backend-rocm -> crates/")
         .to_path_buf();
-    assert!(workspace.is_dir(), "expected crates dir at {}", workspace.display());
+    assert!(
+        workspace.is_dir(),
+        "expected crates dir at {}",
+        workspace.display()
+    );
 
     const RISKY: &[&str] = &[
         "hipMemcpyAsync(",

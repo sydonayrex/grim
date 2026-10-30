@@ -48,13 +48,19 @@ fn pack_columns(w: &[f32], n_cols: usize, k: usize) -> Vec<i32> {
 
 #[test]
 fn tree_pie_scheme_reaches_the_gemv_through_quantized_matmul() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev_owned = dev;
     let dev = &dev_owned;
 
     // Deterministic, non-degenerate weights and activations.
-    let w: Vec<f32> = (0..K * N).map(|i| ((i * 37) % 61) as f32 * 0.03125 - 0.9).collect();
-    let x: Vec<f32> = (0..K).map(|i| ((i * 13) % 17) as f32 * 0.0625 - 0.4).collect();
+    let w: Vec<f32> = (0..K * N)
+        .map(|i| ((i * 37) % 61) as f32 * 0.03125 - 0.9)
+        .collect();
+    let x: Vec<f32> = (0..K)
+        .map(|i| ((i * 13) % 17) as f32 * 0.0625 - 0.4)
+        .collect();
 
     // CPU oracle from the same f32 values, plus the natural scale of each dot
     // product. Dividing by |oracle| is wrong here: these columns largely cancel, so
@@ -72,7 +78,10 @@ fn tree_pie_scheme_reaches_the_gemv_through_quantized_matmul() -> TestResult {
         }
     }
 
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
     // Real f32 activations, so the dispatch's f32 -> f16 conversion is exercised
     // rather than bypassed. Declaring half-bytes under an F32 dtype is what made
     // the first run of this test report a flat 1.0 relative error -- the kernel was
@@ -81,7 +90,10 @@ fn tree_pie_scheme_reaches_the_gemv_through_quantized_matmul() -> TestResult {
     let x_t = MemoryOps::from_cpu_bytes(&dev_owned, &x_bytes, &Shape::new(vec![K]), f32ty.clone())
         .map_err(|e| format!("act h2d: {e}"))?;
     let packed = pack_columns(&w, N, K);
-    let b_bytes: Vec<u8> = packed.iter().flat_map(|w| w.to_le_bytes().to_vec()).collect();
+    let b_bytes: Vec<u8> = packed
+        .iter()
+        .flat_map(|w| w.to_le_bytes().to_vec())
+        .collect();
 
     // B under the TreePie dtype, so dispatch actually sees the scheme. This is the
     // step a direct launch cannot exercise.
@@ -99,11 +111,19 @@ fn tree_pie_scheme_reaches_the_gemv_through_quantized_matmul() -> TestResult {
 
     let out_shape = Shape::new(vec![N]);
     let (out, _handle) = dev
-        .quantized_matmul(&*x_t, &*b_t, &[], grim_tensor::QuantFormat::TreePie, &out_shape)
+        .quantized_matmul(
+            &*x_t,
+            &*b_t,
+            &[],
+            grim_tensor::QuantFormat::TreePie,
+            &out_shape,
+        )
         .map_err(|e| format!("quantized_matmul: {e}"))?;
     dev.synchronize();
 
-    let raw = grim_backend_rocm::as_rocm(out.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
+    let raw = grim_backend_rocm::as_rocm(out.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?;
     let got: Vec<f64> = raw
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
@@ -125,7 +145,10 @@ fn tree_pie_scheme_reaches_the_gemv_through_quantized_matmul() -> TestResult {
     // E2M2 is 2 mantissa bits, so a few percent per weight is expected; 0.05 is
     // loose enough not to flake and tight enough to catch a layout swap, which
     // would show up as an O(1) relative error rather than O(1e-2).
-    assert!(worst < 0.05, "TreePie dispatch is wrong (worst rel {worst:.3e} at n={worst_n})");
+    assert!(
+        worst < 0.05,
+        "TreePie dispatch is wrong (worst rel {worst:.3e} at n={worst_n})"
+    );
     Ok(())
 }
 
@@ -178,14 +201,18 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     // entirely. If the GEMM works there and faults with f32 activations, the
     // conversion path is confirmed as the cause rather than the kernel.
     let x_t = if std::env::var_os("GRIM_TP_F16_ACT").is_some() {
-        let bits: Vec<u8> = x.iter()
+        let bits: Vec<u8> = x
+            .iter()
             .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes().to_vec())
             .collect();
         MemoryOps::from_cpu_bytes(
             dev,
             &bits,
             &a_shape,
-            DType { arith: ArithType::F16, storage: Storage::Native },
+            DType {
+                arith: ArithType::F16,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("act f16 h2d: {e}"))?
     } else {
@@ -193,12 +220,18 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
             dev,
             &xb,
             &a_shape,
-            DType { arith: ArithType::F32, storage: Storage::Native },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("act h2d: {e}"))?
     };
     let packed = pack_columns(&w, n, k);
-    let b_bytes: Vec<u8> = packed.iter().flat_map(|w| w.to_le_bytes().to_vec()).collect();
+    let b_bytes: Vec<u8> = packed
+        .iter()
+        .flat_map(|w| w.to_le_bytes().to_vec())
+        .collect();
     let b_t = MemoryOps::from_cpu_bytes(
         dev,
         &b_bytes,
@@ -212,10 +245,18 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
 
     let o_shape = Shape::new(vec![m, n]);
     let (out, _) = dev
-        .quantized_matmul(&*x_t, &*b_t, &[], grim_tensor::QuantFormat::TreePie, &o_shape)
+        .quantized_matmul(
+            &*x_t,
+            &*b_t,
+            &[],
+            grim_tensor::QuantFormat::TreePie,
+            &o_shape,
+        )
         .map_err(|e| format!("prefill m={m}: {e}"))?;
     dev.synchronize();
-    let raw = grim_backend_rocm::as_rocm(out.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
+    let raw = grim_backend_rocm::as_rocm(out.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?;
     let got: Vec<f64> = raw
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
@@ -249,12 +290,21 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
 //      block is [0,0,0,0,signs]. O(1) fixtures (same as the m=1 branch) fix it.
 #[test]
 fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
 
     const N: usize = 64;
     // 1 is the GEMV path and must keep working; 8 exactly fills one tile; 13
     // straddles two; 16 fills two exactly.
-    for (m, k) in [(1usize, 128usize), (2, 128), (8, 128), (13, 128), (16, 128), (9, 256)] {
+    for (m, k) in [
+        (1usize, 128usize),
+        (2, 128),
+        (8, 128),
+        (13, 128),
+        (16, 128),
+        (9, 256),
+    ] {
         let worst = prefill_case(&dev, m, N, k)?;
         println!("prefill m={m:>2} k={k}: worst relative error {worst:.3e}");
         // Bar 0.15, not 0.05: the kernel is bit-exact vs the dequant oracle
@@ -263,7 +313,10 @@ fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
         // 0.0517, and worst-over-m*n dots of cancellating sums roughly doubles
         // it (m=13: 0.106 observed). A layout swap still reads O(1), an order
         // above this bar.
-        assert!(worst < 0.15, "prefill m={m} k={k}: worst relative error {worst:.3e}");
+        assert!(
+            worst < 0.15,
+            "prefill m={m} k={k}: worst relative error {worst:.3e}"
+        );
     }
     Ok(())
 }
@@ -276,7 +329,9 @@ fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
 /// above carries the format-noise bound. Both rows, ragged tile included.
 #[test]
 fn tree_pie_gemm_matches_dequant_oracle_exactly() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     // E2M2-exact magnitudes: subnormal row {0.5, 1.0, 1.5} and normal rows.
     let grid_vals = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let (m, n, k) = (13usize, 64usize, 128usize);
@@ -294,22 +349,34 @@ fn tree_pie_gemm_matches_dequant_oracle_exactly() -> TestResult {
         .iter()
         .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes().to_vec())
         .collect();
-    let f16ty = DType { arith: ArithType::F16, storage: Storage::Native };
+    let f16ty = DType {
+        arith: ArithType::F16,
+        storage: Storage::Native,
+    };
     let act_t = MemoryOps::from_cpu_bytes(&dev, &bits, &Shape::new(vec![m, k]), f16ty)
         .map_err(|e| format!("act h2d: {e}"))?;
     let packed = pack_columns(&w, n, k);
-    let b_bytes: Vec<u8> = packed.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
+    let b_bytes: Vec<u8> = packed
+        .iter()
+        .flat_map(|v| v.to_le_bytes().to_vec())
+        .collect();
     let b_t = MemoryOps::from_cpu_bytes(
         &dev,
         &b_bytes,
         &Shape::new(vec![n * (k / 32) * TREE_PIE_WORDS_PER_32]),
-        DType { arith: ArithType::U32, storage: Storage::Native },
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("b h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         &dev,
         &Shape::new(vec![m, n]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("out: {e}"))?;
     fn raw(t: &Box<dyn grim_tensor::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
@@ -352,22 +419,39 @@ fn tree_pie_gemm_matches_dequant_oracle_exactly() -> TestResult {
 
 #[test]
 fn tree_pie_still_refuses_ragged_k() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
     let tree_ty = DType {
         arith: ArithType::F32,
         storage: Storage::FloatPack(grim_tensor::FloatPackScheme::TreePie),
     };
-    let xb: Vec<u8> = vec![0.5f32; 33].iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
+    let xb: Vec<u8> = vec![0.5f32; 33]
+        .iter()
+        .flat_map(|v| v.to_le_bytes().to_vec())
+        .collect();
     let x = MemoryOps::from_cpu_bytes(&dev, &xb, &Shape::new(vec![1, 33]), f32ty)
         .map_err(|e| format!("x: {e}"))?;
     let b = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; 320], &Shape::new(vec![16]), tree_ty)
         .map_err(|e| format!("b: {e}"))?;
     let err = dev
-        .quantized_matmul(&*x, &*b, &[], grim_tensor::QuantFormat::TreePie, &Shape::new(vec![1, 16]))
+        .quantized_matmul(
+            &*x,
+            &*b,
+            &[],
+            grim_tensor::QuantFormat::TreePie,
+            &Shape::new(vec![1, 16]),
+        )
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
-    assert!(err.contains("k % 32 == 0"), "ragged K should be refused; got: {err}");
+    assert!(
+        err.contains("k % 32 == 0"),
+        "ragged K should be refused; got: {err}"
+    );
     Ok(())
 }

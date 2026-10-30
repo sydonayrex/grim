@@ -2341,11 +2341,16 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Block(grim_tensor::dtype::BlockDtype::Q4_0),
         },
-        GgufDType::Q4_1 | GgufDType::Q4_2 | GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
+        // Q4_1 now has a decoder (grim_quant::dequant_q4_1); it was Unsupported
+        // until the Llama-3.2-1B-Q4_1 fixture needed it (plan Phase M, cond 1).
+        GgufDType::Q4_1 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Q4_1),
+        },
+        GgufDType::Q4_2 | GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
                 name: match gguf_dtype {
-                    GgufDType::Q4_1 => "Q4_1",
                     GgufDType::Q4_2 => "Q4_2",
                     GgufDType::Q5_0 => "Q5_0",
                     _ => "Q5_1",
