@@ -27,10 +27,8 @@ libloading = "0.8"
 libc = "0.2"
 cubecl = { version = "0.10.0", features = ["hip"], optional = true }
 cubecl-hip = { version = "0.10.0", optional = true }
-# Direct dep (mirrors cubecl-hip's own) so we can read `gcnArchName`
-# via hipRTC FFI and gate the RDNA2 cold-start workarounds on arch.
-# NOTE: cubecl-hip-sys is ROCm-versioned (7.2.5321100), NOT 0.10.x.
-cubecl-hip-sys = { version = "7.2.5321100", optional = true }
+# Vendored HIP bindings (from cubecl-hip-sys) — see crates/grim-hip-sys/PROVENANCE.md.
+grim-hip-sys = { path = "../grim-hip-sys" }
 # Force cubecl-runtime's `std` feature on so its `std_io` cfg is active, which
 # compiles the on-disk kernel compilation cache (`cubecl::config::CacheConfig`).
 # Without this, `cubecl-hip`'s `cubecl-runtime` dep (default-features = false) keeps
@@ -70,7 +68,7 @@ rocm-aiter = ["rocm"]
 # against the vendored CK headers. grim is Rust-centric now: the
 # decode-GEMM kernel is an embedded HIP source literal in
 # `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime.
-cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys", "rocm"]
+cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "rocm"]
 rccl = ["rocm"]
 # Public test shims (device::gptq_test_shim) letting tests/ exercise the
 # GPTQ fused dequant-GEMM launchers without widening the production API.

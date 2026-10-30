@@ -4,7 +4,7 @@
 
 use cubecl::hip::{AmdDevice, HipRuntime};
 use cubecl::prelude::*;
-use cubecl_hip_sys::{hipDeviceProp_tR0600, hipGetDevicePropertiesR0600};
+use grim_hip_sys::{hipDeviceProp_tR0600, hipGetDevicePropertiesR0600};
 use std::sync::OnceLock;
 
 pub type Client = ComputeClient<HipRuntime>;
