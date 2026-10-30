@@ -937,33 +937,36 @@ impl DecodeGraphBuffers {
                 }
             }
             layer_totals.push(t);
-        }
-        let push_all = |dev: &RocmDevice,
-                        dt: &DType,
-                        moe_gate_logits: &mut Vec<RocmStorage>,
-                        moe_out: &mut Vec<RocmStorage>,
-                        sc_proj_buf: &mut Vec<RocmStorage>,
-                        sc_b: &mut Vec<RocmStorage>,
-                        sc_c: &mut Vec<RocmStorage>,
-                        sc_x: &mut Vec<RocmStorage>,
-                        sc_bx: &mut Vec<RocmStorage>,
-                        sc_sum: &mut Vec<RocmStorage>,
-                        sc_y: &mut Vec<RocmStorage>,
-                        sc_state: &mut Vec<RocmStorage>|
-         -> Result<()> {
-            for _ in 0..num_layers {
+
+            // Short-conv / MoE per-layer scratch on THIS layer's device.
+            // `push_all` allocates one layer's worth of buffers — called once
+            // per layer so each lands on `l_dev` (device 0 for single-device,
+            // split across cards for layer-split models).
+            let push_all = |l_dev: &RocmDevice,
+                            dt: &DType,
+                            moe_gate_logits: &mut Vec<RocmStorage>,
+                            moe_out: &mut Vec<RocmStorage>,
+                            sc_proj_buf: &mut Vec<RocmStorage>,
+                            sc_b: &mut Vec<RocmStorage>,
+                            sc_c: &mut Vec<RocmStorage>,
+                            sc_x: &mut Vec<RocmStorage>,
+                            sc_bx: &mut Vec<RocmStorage>,
+                            sc_sum: &mut Vec<RocmStorage>,
+                            sc_y: &mut Vec<RocmStorage>,
+                            sc_state: &mut Vec<RocmStorage>|
+             -> Result<()> {
                 if moe_layers {
                     moe_gate_logits.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch, n_expert]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     moe_out.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch, hidden_size]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                 }
                 if sc_layers {
@@ -971,74 +974,74 @@ impl DecodeGraphBuffers {
                     sc_proj_buf.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch, 3 * sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_b.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch * sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_c.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch * sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_x.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch * sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_bx.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch * sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_sum.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch * sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_y.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![batch, sc_h_dim]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     sc_state.push(RocmStorage::alloc_gpu(
                         &Shape::new(vec![sc_h_dim * kc]),
                         dt.clone(),
-                        &dev.allocator,
-                        dev.ordinal,
+                        &l_dev.allocator,
+                        l_dev.ordinal,
                     )?);
                     // The short-conv state is a STATE: a fresh session has no
                     // history, so it starts at zero and not at whatever the
                     // recycled block held.
                     let last = sc_state.last().expect("just pushed");
-                    Self::zero_device_buffer(dev, last)?;
+                    Self::zero_device_buffer(l_dev, last)?;
                 }
-            }
-            Ok(())
-        };
-        push_all(
-            dev,
-            &dt,
-            &mut moe_gate_logits,
-            &mut moe_out,
-            &mut sc_proj_buf,
-            &mut sc_b,
-            &mut sc_c,
-            &mut sc_x,
-            &mut sc_bx,
-            &mut sc_sum,
-            &mut sc_y,
-            &mut sc_state,
-        )?;
+                Ok(())
+            };
+            push_all(
+                &*l_dev,
+                &dt,
+                &mut moe_gate_logits,
+                &mut moe_out,
+                &mut sc_proj_buf,
+                &mut sc_b,
+                &mut sc_c,
+                &mut sc_x,
+                &mut sc_bx,
+                &mut sc_sum,
+                &mut sc_y,
+                &mut sc_state,
+            )?;
+        }
         let (moe_route_tokens, moe_route_experts, moe_route_weights) = if moe_layers {
             let np = batch * top_k;
             let udt = DType {
