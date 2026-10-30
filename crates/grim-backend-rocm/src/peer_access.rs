@@ -11,27 +11,14 @@ use grim_tensor::error::{Error, Result};
 use crate::device::helpers::check_hip;
 use crate::{HipErrorT, hipSuccess};
 
-// HIP symbols we call. We declare them locally rather than going through `crate::...` because the crate-root
-// FFI declarations have drift between ROCm releases - re-declaring at the call site keeps `peer_access` self-contained.
-unsafe extern "C" {
-    fn hipGetDeviceCount(count: *mut i32) -> HipErrorT;
-    fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
-    fn hipDeviceCanAccessPeer(
-        can_access_peer: *mut i32,
-        device: i32,
-        peer_device: i32,
-    ) -> HipErrorT;
-    fn hipDeviceEnablePeerAccess(peer_device: i32, flags: u32) -> HipErrorT;
-    fn hipDeviceDisablePeerAccess(peer_device: i32) -> HipErrorT;
-    fn hipMemcpyPeerAsync(
-        dst: *mut c_void,
-        dst_device: i32,
-        src: *const c_void,
-        src_device: i32,
-        count: usize,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-}
+// HIP symbols come from the crate's single FFI boundary
+// (`device::handles` — the grim-hip-sys adapter layer). The old local
+// re-declarations drifted between ROCm releases; there is exactly one
+// declaration site now.
+use crate::device::handles::{
+    hipDeviceCanAccessPeer, hipDeviceDisablePeerAccess, hipDeviceEnablePeerAccess,
+    hipGetDeviceCount, hipGetDeviceProperties, hipMemcpyPeerAsync,
+};
 
 /// Asynchronous Peer-to-Peer copy wrapping hipMemcpyPeerAsync directly (no RCCL feature dependency).
 pub fn p2p_memcpy_async(

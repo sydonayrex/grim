@@ -1,5 +1,7 @@
 //! Handle / dimension / property types for the ROCm/HIP backend, plus [see: `rust-ffi`, `rust-ai-ml-inference-guide`]
 
+#![allow(non_snake_case)]
+
 use std::ffi::c_void;
 
 use grim_tensor::error::Result;
@@ -108,175 +110,25 @@ pub struct HipGraphMemcpyNodeParams {
 /// Opaque HIP runtime-compiled program handle.
 pub type HiprtcProgram = *mut c_void;
 
-// ======== HIP / hiprtc FFI declarations ========
+// ======== HIP / hiprtc FFI (grim-hip-sys adapter layer) ========
+//
+// Every HIP declaration lives in the vendored `grim-hip-sys` crate
+// (bindgen output per HIP patch — see crates/grim-hip-sys/PROVENANCE.md).
+// The fns below are thin unsafe adapters keeping grim's loose
+// `c_void`/`i32` calling convention: they cast to the typed bindgen
+// signatures and cast `hipError_t` (c_uint) back to `HipErrorT` (i32).
+// No HIP symbol is hand-declared here except
+// `hipGraphExtendFromGlobalStream`, which the ROCm 7.16 headers do not
+// expose but the runtime provides (grim-specific graph-extension API).
+use std::os::raw::c_char;
 
-unsafe extern "C" {
-    pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
-    pub fn hipMallocManaged(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
-    pub fn hipFree(device: *mut c_void) -> HipErrorT;
-    /// Enqueue an async free on `stream`; the buffer is released once all prior work on that stream has completed.
-    /// Available from ROCm 5.4+.
-    pub fn hipFreeAsync(device: *mut c_void, stream: *mut c_void) -> HipErrorT;
-    pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
-    pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
-    pub fn hipHostRegister(hostPtr: *mut c_void, size: usize, flags: u32) -> HipErrorT;
-    pub fn hipHostUnregister(hostPtr: *mut c_void) -> HipErrorT;
-    #[link_name = "hipMemcpy"]
-    fn raw_hipMemcpy(
-        dst: *mut c_void,
-        src: *const c_void,
-        count: usize,
-        kind: HipMemcpyKind,
-    ) -> HipErrorT;
-    pub fn hipMemset(dst: *mut c_void, value: i32, size_bytes: usize) -> HipErrorT;
-    pub fn hipMemsetAsync(
-        dst: *mut c_void,
-        value: i32,
-        size_bytes: usize,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-    #[link_name = "hipDeviceSynchronize"]
-    fn raw_hipDeviceSynchronize() -> HipErrorT;
-    /// Returns the most recent asynchronous error reported on any API call
-    /// (including kernel launches), or success. Does not block.
-    pub fn hipGetLastError() -> HipErrorT;
-    pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
-    pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
-    pub fn hipDeviceGetPCIBusId(
-        pciBusId: *mut std::os::raw::c_char,
-        len: i32,
-        device: i32,
-    ) -> HipErrorT;
-    pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
-    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT;
-    pub fn hipDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> HipErrorT;
-    #[allow(non_snake_case)]
-    pub fn hipPointerGetAttributes(
-        attributes: *mut HipPointerAttribute,
-        ptr: *const std::ffi::c_void,
-    ) -> HipErrorT;
-    pub fn hipMemAdvise(devPtr: *const c_void, count: usize, advice: i32, device: i32)
-    -> HipErrorT;
+use grim_hip_sys as ffi;
 
-    // Graph and Stream FFI
-    pub fn hipStreamCreate(stream: *mut *mut c_void) -> HipErrorT;
-    /// Create a stream with flags. `HIP_STREAM_NON_BLOCKING` (0x1) makes the stream NOT synchronize with the
-    /// legacy default stream - required for long-lived persistent kernels that must never block control traffic.
-    pub fn hipStreamCreateWithFlags(
-        stream: *mut *mut c_void,
-        flags: u32,
-        priority: i32,
-    ) -> HipErrorT;
-    pub fn hipStreamDestroy(stream: *mut c_void) -> HipErrorT;
-    pub fn hipStreamSynchronize(stream: *mut c_void) -> HipErrorT;
-    /// Non-blocking query: `hipSuccess` when every operation on the stream has
-    /// completed, `hipErrorNotReady` while any is still in flight.
-    ///
-    /// This is the OBSERVABLE form of "has the kernel left": a bounded poll
-    /// can tell the difference between a kernel that finished and one that is
-    /// still spinning, without blocking the host forever.
-    pub fn hipStreamQuery(stream: *mut c_void) -> HipErrorT;
-    #[link_name = "hipMemcpyAsync"]
-    fn raw_hipMemcpyAsync(
-        dst: *mut c_void,
-        src: *const c_void,
-        count: usize,
-        kind: HipMemcpyKind,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-    fn raw_hipMemsetD8Async(
-        devPtr: *mut c_void,
-        value: u8,
-        count: usize,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-    fn raw_hipMemcpyDtoDAsync(
-        dst: *mut c_void,
-        src: *const c_void,
-        count: usize,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-    pub fn hipMemPrefetchAsync(
-        devPtr: *const c_void,
-        count: usize,
-        dstDevice: i32,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-    pub fn hipGraphCreate(graph: *mut *mut c_void, flags: u32) -> HipErrorT;
-    pub fn hipGraphDestroy(graph: *mut c_void) -> HipErrorT;
-    pub fn hipGraphInstantiate(
-        exec: *mut *mut c_void,
-        graph: *mut c_void,
-        errorNode: *mut *mut c_void,
-        logBuffer: *mut i8,
-        bufferSize: usize,
-    ) -> HipErrorT;
-    pub fn hipGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> HipErrorT;
-    pub fn hipGraphExecDestroy(exec: *mut c_void) -> HipErrorT;
-    pub fn hipGraphExtendFromGlobalStream(
-        exec: *mut *mut c_void,
-        stream: *mut c_void,
-        flags: u32,
-    ) -> HipErrorT;
-    pub fn hipGraphUpload(exec: *mut c_void, stream: *mut c_void) -> HipErrorT;
-    pub fn hipStreamBeginCapture(stream: *mut c_void, mode: u32) -> HipErrorT;
-    pub fn hipStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> HipErrorT;
-    // Graph kernel node parameter update (for scalar updates between replays)
-    pub fn hipGraphExecKernelNodeSetParams(
-        graphExec: *mut c_void,
-        node: *mut c_void,
-        nodeParams: *const c_void,
-    ) -> HipErrorT;
-    pub fn hipGraphAddKernelNode(
-        pGraphNode: *mut *mut c_void,
-        graph: *mut c_void,
-        pDependencies: *const c_void,
-        numDependencies: usize,
-        pNodeParams: *const c_void,
-    ) -> HipErrorT;
+pub use ffi::hipDeviceProp_tR0600;
 
-    // Event FFI for autotune benchmarking
-    pub fn hipEventCreate(event: *mut *mut c_void) -> HipErrorT;
-    pub fn hipEventDestroy(event: *mut c_void) -> HipErrorT;
-    pub fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> HipErrorT;
-    pub fn hipEventSynchronize(event: *mut c_void) -> HipErrorT;
-    // Cross-stream dependency: block `stream` until `event` (recorded on another stream) completes.
-    // Enables upload-on-transfer-stream to overlap with compute-on-active-stream (SPEED-ROC-1 decode-step overlap).
-    pub fn hipStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> HipErrorT;
-    pub fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT;
-
-    pub fn hipGetDevice(device: *mut i32) -> HipErrorT;
-    pub fn hipRuntimeGetVersion(version: *mut i32) -> HipErrorT;
-    pub fn hipModuleLoad(module: *mut *mut c_void, path: *const i8) -> HipErrorT;
-    pub fn hipModuleUnload(module: *mut c_void) -> HipErrorT;
-    pub fn hipModuleGetFunction(
-        func: *mut *mut c_void,
-        module: *mut c_void,
-        name: *const i8,
-    ) -> HipErrorT;
-    pub fn hipModuleLaunchKernel(
-        func: *mut c_void,
-        gridX: u32,
-        gridY: u32,
-        gridZ: u32,
-        blockX: u32,
-        blockY: u32,
-        blockZ: u32,
-        sharedMemBytes: u32,
-        stream: *mut c_void,
-        args: *mut *mut c_void,
-        extra: *mut c_void,
-    ) -> HipErrorT;
-    pub fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
-        numBlocks: *mut i32,
-        func: *mut c_void,
-        blockSize: i32,
-        dynamicSMemSize: usize,
-    ) -> HipErrorT;
-}
-
-/// Mirrors HIP's `hipPointerAttribute_t` (ROCm 7.x); only the device ordinal
-/// is material to our probes.
+/// Mirrors HIP's `hipPointerAttribute_t`; only the device ordinal is
+/// material to our probes. Layout asserted against the bindgen type in
+/// `handles_self_tests`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct HipPointerAttribute {
@@ -288,13 +140,137 @@ pub struct HipPointerAttribute {
     pub allocation_flags: u32,
 }
 
+// ---- memory ----
+pub unsafe fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT {
+    unsafe { ffi::hipMalloc(devPtr, size) as HipErrorT }
+}
+pub unsafe fn hipMallocManaged(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipMallocManaged(devPtr, size, flags) as HipErrorT }
+}
+pub unsafe fn hipFree(device: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipFree(device) as HipErrorT }
+}
+/// Enqueue an async free on `stream`; the buffer is released once all prior work on that stream has completed.
+/// Available from ROCm 5.4+.
+pub unsafe fn hipFreeAsync(device: *mut c_void, stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipFreeAsync(device, stream as _) as HipErrorT }
+}
+pub unsafe fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipHostMalloc(devPtr, size, flags) as HipErrorT }
+}
+pub unsafe fn hipHostFree(ptr: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipHostFree(ptr) as HipErrorT }
+}
+pub unsafe fn hipHostRegister(hostPtr: *mut c_void, size: usize, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipHostRegister(hostPtr, size, flags) as HipErrorT }
+}
+pub unsafe fn hipHostUnregister(hostPtr: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipHostUnregister(hostPtr) as HipErrorT }
+}
+pub unsafe fn hipMemset(dst: *mut c_void, value: i32, size_bytes: usize) -> HipErrorT {
+    unsafe { ffi::hipMemset(dst, value, size_bytes) as HipErrorT }
+}
+pub unsafe fn hipMemsetAsync(
+    dst: *mut c_void,
+    value: i32,
+    size_bytes: usize,
+    stream: *mut c_void,
+) -> HipErrorT {
+    unsafe { ffi::hipMemsetAsync(dst, value, size_bytes, stream as _) as HipErrorT }
+}
+
+// ---- sync / error ----
+/// Returns the most recent asynchronous error reported on any API call
+/// (including kernel launches), or success. Does not block.
+pub unsafe fn hipGetLastError() -> HipErrorT {
+    unsafe { ffi::hipGetLastError() as HipErrorT }
+}
+/// Blocks the calling thread until all previously enqueued work on the
+/// current device's streams has completed.
+///
+/// # Safety
+/// Enqueued kernels must not dereference freed or unmapped memory; this
+/// call surfaces such faults on the host.
+#[inline]
+pub unsafe fn hipDeviceSynchronize() -> HipErrorT {
+    if std::env::var("GRIM_HIP_TRACE").is_ok() {
+        eprintln!(
+            "[hipDeviceSync-trace]\n{:?}",
+            std::backtrace::Backtrace::capture()
+        );
+    }
+    unsafe { ffi::hipDeviceSynchronize() as HipErrorT }
+}
+
+// ---- device ----
+pub unsafe fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT {
+    unsafe { ffi::hipGetDeviceCount(count) as HipErrorT }
+}
+pub unsafe fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT {
+    unsafe { ffi::hipSetDevice(ordinal) as HipErrorT }
+}
+pub unsafe fn hipDeviceGetPCIBusId(pciBusId: *mut c_char, len: i32, device: i32) -> HipErrorT {
+    unsafe { ffi::hipDeviceGetPCIBusId(pciBusId, len, device) as HipErrorT }
+}
+/// The 7.16 headers expose only the versioned `hipGetDevicePropertiesR0600`;
+/// the unversioned symbol resolves to the same ABI. Callers pass an 8 KiB
+/// scratch buffer, well above `size_of::<hipDeviceProp_tR0600>()`.
+pub unsafe fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT {
+    unsafe { ffi::hipGetDevicePropertiesR0600(prop as *mut _, device) as HipErrorT }
+}
+pub unsafe fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT {
+    unsafe { ffi::hipMemGetInfo(free, total) as HipErrorT }
+}
+pub unsafe fn hipDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> HipErrorT {
+    unsafe { ffi::hipDeviceGetAttribute(value, attribute as _, device) as HipErrorT }
+}
+pub unsafe fn hipPointerGetAttributes(
+    attributes: *mut HipPointerAttribute,
+    ptr: *const std::ffi::c_void,
+) -> HipErrorT {
+    unsafe { ffi::hipPointerGetAttributes(attributes as *mut _, ptr) as HipErrorT }
+}
+pub unsafe fn hipMemAdvise(devPtr: *const c_void, count: usize, advice: i32, device: i32)
+-> HipErrorT {
+    unsafe { ffi::hipMemAdvise(devPtr, count, advice as _, device) as HipErrorT }
+}
+
+// ---- streams ----
+pub unsafe fn hipStreamCreate(stream: *mut *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipStreamCreate(stream as *mut _) as HipErrorT }
+}
+/// Create a stream with flags and priority. grim's historical declaration
+/// bound the 3-arg signature to the `hipStreamCreateWithFlags` symbol, which
+/// is 2-arg in the headers — a latent ABI mismatch. The 3-arg API is
+/// `hipStreamCreateWithPriority`; that is what we call now.
+pub unsafe fn hipStreamCreateWithFlags(
+    stream: *mut *mut c_void,
+    flags: u32,
+    priority: i32,
+) -> HipErrorT {
+    unsafe { ffi::hipStreamCreateWithPriority(stream as *mut _, flags, priority) as HipErrorT }
+}
+pub unsafe fn hipStreamDestroy(stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipStreamDestroy(stream as _) as HipErrorT }
+}
+pub unsafe fn hipStreamSynchronize(stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipStreamSynchronize(stream as _) as HipErrorT }
+}
+/// Non-blocking query: `hipSuccess` when every operation on the stream has
+/// completed, `hipErrorNotReady` while any is still in flight.
+///
+/// This is the OBSERVABLE form of "has the kernel left": a bounded poll
+/// can tell the difference between a kernel that finished and one that is
+/// still spinning, without blocking the host forever.
+pub unsafe fn hipStreamQuery(stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipStreamQuery(stream as _) as HipErrorT }
+}
 /// Blocking host-to-device or device-to-host copy of `count` bytes.
 ///
 /// # Safety
 /// Must run under a device context pinned to the ordinal owning both
 /// pointers; `dst`/`src` must be valid for `count` bytes.
 #[inline]
-#[allow(non_snake_case)]
 pub unsafe fn hipMemcpy(
     dst: *mut c_void,
     src: *const c_void,
@@ -307,15 +283,13 @@ pub unsafe fn hipMemcpy(
             kind, count, dst, src
         );
     }
-    unsafe { raw_hipMemcpy(dst, src, count, kind) }
+    unsafe { ffi::hipMemcpy(dst, src, count, kind as _) as HipErrorT }
 }
-
 /// Asynchronous memory copy on a specific stream.
 ///
 /// # Safety
 /// Caller must ensure pointers are valid for `count` bytes on the device/host.
 #[inline]
-#[allow(non_snake_case)]
 pub unsafe fn hipMemcpyAsync(
     dst: *mut c_void,
     src: *const c_void,
@@ -330,84 +304,281 @@ pub unsafe fn hipMemcpyAsync(
         );
     }
     crate::device::util::report_rocm_progress("hipMemcpyAsync:in-flight");
-    let ret = unsafe { raw_hipMemcpyAsync(dst, src, count, kind, stream) };
+    let ret = unsafe { ffi::hipMemcpyAsync(dst, src, count, kind as _, stream as _) as HipErrorT };
     crate::device::util::report_rocm_progress("hipMemcpyAsync:done");
     ret
 }
-
 /// Asynchronous byte memset on a specific stream (capture-safe: no sync, no
 /// allocation, issued on the stream that is recording).
 #[inline]
-#[allow(non_snake_case)]
 pub unsafe fn hipMemsetD8Async(
     devPtr: *mut c_void,
     value: u8,
     count: usize,
     stream: *mut c_void,
 ) -> HipErrorT {
-    unsafe { raw_hipMemsetD8Async(devPtr, value, count, stream) }
+    unsafe { ffi::hipMemsetD8Async(devPtr, value, count, stream as _) as HipErrorT }
 }
-
 /// Asynchronous device-to-device copy on a specific stream (capture-safe).
 #[inline]
-#[allow(non_snake_case)]
 pub unsafe fn hipMemcpyDtoDAsync(
     dst: *mut c_void,
     src: *const c_void,
     count: usize,
     stream: *mut c_void,
 ) -> HipErrorT {
-    unsafe { raw_hipMemcpyDtoDAsync(dst, src, count, stream) }
+    unsafe { ffi::hipMemcpyDtoDAsync(dst, src as _, count, stream as _) as HipErrorT }
+}
+pub unsafe fn hipMemPrefetchAsync(
+    devPtr: *const c_void,
+    count: usize,
+    dstDevice: i32,
+    stream: *mut c_void,
+) -> HipErrorT {
+    unsafe { ffi::hipMemPrefetchAsync(devPtr, count, dstDevice, stream as _) as HipErrorT }
+}
+/// Cross-device async copy (peer_access / rccl callers).
+pub unsafe fn hipMemcpyPeerAsync(
+    dst: *mut c_void,
+    dstDevice: i32,
+    src: *const c_void,
+    srcDevice: i32,
+    count: usize,
+    stream: *mut c_void,
+) -> HipErrorT {
+    unsafe { ffi::hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, count, stream as _) as HipErrorT }
 }
 
-/// Blocks the calling thread until all previously enqueued work on the
-/// current device's streams has completed.
-/// Blocks the calling thread until all previously enqueued work on the
-/// current device's streams has completed.
-///
-/// # Safety
-/// Enqueued kernels must not dereference freed or unmapped memory; this
-/// call surfaces such faults on the host.
-#[inline]
-#[allow(non_snake_case)]
-pub unsafe fn hipDeviceSynchronize() -> HipErrorT {
-    if std::env::var("GRIM_HIP_TRACE").is_ok() {
-        eprintln!(
-            "[hipDeviceSync-trace]\n{:?}",
-            std::backtrace::Backtrace::capture()
-        );
+// ---- graphs ----
+pub unsafe fn hipGraphCreate(graph: *mut *mut c_void, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipGraphCreate(graph as *mut _, flags) as HipErrorT }
+}
+pub unsafe fn hipGraphDestroy(graph: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipGraphDestroy(graph as _) as HipErrorT }
+}
+pub unsafe fn hipGraphInstantiate(
+    exec: *mut *mut c_void,
+    graph: *mut c_void,
+    errorNode: *mut *mut c_void,
+    logBuffer: *mut i8,
+    bufferSize: usize,
+) -> HipErrorT {
+    unsafe {
+        ffi::hipGraphInstantiate(
+            exec as *mut _,
+            graph as _,
+            errorNode as *mut _,
+            logBuffer,
+            bufferSize,
+        ) as HipErrorT
     }
-    unsafe { raw_hipDeviceSynchronize() }
+}
+pub unsafe fn hipGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipGraphLaunch(exec as _, stream as _) as HipErrorT }
+}
+pub unsafe fn hipGraphExecDestroy(exec: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipGraphExecDestroy(exec as _) as HipErrorT }
+}
+// Not in the ROCm 7.16 headers (bindgen emits nothing for it) but present in
+// the runtime; the one hand-declared symbol left in this crate.
+#[allow(non_snake_case)]
+unsafe extern "C" {
+    pub fn hipGraphExtendFromGlobalStream(
+        exec: *mut *mut c_void,
+        stream: *mut c_void,
+        flags: u32,
+    ) -> HipErrorT;
+}
+pub unsafe fn hipGraphUpload(exec: *mut c_void, stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipGraphUpload(exec as _, stream as _) as HipErrorT }
+}
+pub unsafe fn hipStreamBeginCapture(stream: *mut c_void, mode: u32) -> HipErrorT {
+    unsafe { ffi::hipStreamBeginCapture(stream as _, mode as _) as HipErrorT }
+}
+pub unsafe fn hipStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipStreamEndCapture(stream as _, graph as *mut _) as HipErrorT }
+}
+// Graph kernel node parameter update (for scalar updates between replays)
+pub unsafe fn hipGraphExecKernelNodeSetParams(
+    graphExec: *mut c_void,
+    node: *mut c_void,
+    nodeParams: *const c_void,
+) -> HipErrorT {
+    unsafe {
+        ffi::hipGraphExecKernelNodeSetParams(graphExec as _, node as _, nodeParams as *const _)
+            as HipErrorT
+    }
+}
+pub unsafe fn hipGraphAddKernelNode(
+    pGraphNode: *mut *mut c_void,
+    graph: *mut c_void,
+    pDependencies: *const c_void,
+    numDependencies: usize,
+    pNodeParams: *const c_void,
+) -> HipErrorT {
+    unsafe {
+        ffi::hipGraphAddKernelNode(
+            pGraphNode as *mut _,
+            graph as _,
+            pDependencies as *const _,
+            numDependencies,
+            pNodeParams as *const _,
+        ) as HipErrorT
+    }
 }
 
-// hiprtc lives in its own shared object, so it gets a separate link block.
-unsafe extern "C" {
-    pub fn hiprtcCreateProgram(
-        prog: *mut HiprtcProgram,
-        src: *const i8,
-        name: *const i8,
-        numHeaders: i32,
-        headers: *const *const i8,
-        headerNames: *const *const i8,
-    ) -> HipErrorT;
-    pub fn hiprtcCompileProgram(
-        prog: HiprtcProgram,
-        numOptions: i32,
-        options: *const *const i8,
-    ) -> HipErrorT;
-    pub fn hiprtcGetCode(prog: HiprtcProgram, code: *mut i8) -> HipErrorT;
-    pub fn hiprtcDestroyProgram(prog: *mut HiprtcProgram) -> HipErrorT;
-    pub fn hiprtcAddNameExpression(prog: HiprtcProgram, name: *const i8) -> HipErrorT;
-    pub fn hiprtcGetLoweredName(
-        prog: HiprtcProgram,
-        name: *const i8,
-        lowered_name: *mut *const i8,
-    ) -> HipErrorT;
-    pub fn hiprtcGetCodeSize(prog: HiprtcProgram, size: *mut usize) -> HipErrorT;
-    pub fn hiprtcVersion(major: *mut i32, minor: *mut i32) -> HipErrorT;
-    pub fn hiprtcGetErrorString(error: HipErrorT) -> *const i8;
-    pub fn hiprtcGetProgramLogSize(prog: HiprtcProgram, log_size: *mut usize) -> HipErrorT;
-    pub fn hiprtcGetProgramLog(prog: HiprtcProgram, log: *mut i8) -> HipErrorT;
+// ---- events (autotune benchmarking + cross-stream deps) ----
+pub unsafe fn hipEventCreate(event: *mut *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipEventCreate(event as *mut _) as HipErrorT }
+}
+pub unsafe fn hipEventCreateWithFlags(event: *mut *mut c_void, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipEventCreateWithFlags(event as *mut _, flags) as HipErrorT }
+}
+pub unsafe fn hipEventDestroy(event: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipEventDestroy(event as _) as HipErrorT }
+}
+pub unsafe fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipEventRecord(event as _, stream as _) as HipErrorT }
+}
+pub unsafe fn hipEventSynchronize(event: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipEventSynchronize(event as _) as HipErrorT }
+}
+/// Cross-stream dependency: block `stream` until `event` (recorded on another stream) completes.
+/// Enables upload-on-transfer-stream to overlap with compute-on-active-stream (SPEED-ROC-1 decode-step overlap).
+pub unsafe fn hipStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipStreamWaitEvent(stream as _, event as _, flags) as HipErrorT }
+}
+pub unsafe fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipEventElapsedTime(ms, start as _, stop as _) as HipErrorT }
+}
+
+// ---- device/version + modules ----
+pub unsafe fn hipGetDevice(device: *mut i32) -> HipErrorT {
+    unsafe { ffi::hipGetDevice(device) as HipErrorT }
+}
+pub unsafe fn hipRuntimeGetVersion(version: *mut i32) -> HipErrorT {
+    unsafe { ffi::hipRuntimeGetVersion(version) as HipErrorT }
+}
+pub unsafe fn hipModuleLoad(module: *mut *mut c_void, path: *const i8) -> HipErrorT {
+    unsafe { ffi::hipModuleLoad(module as *mut _, path) as HipErrorT }
+}
+pub unsafe fn hipModuleUnload(module: *mut c_void) -> HipErrorT {
+    unsafe { ffi::hipModuleUnload(module as _) as HipErrorT }
+}
+pub unsafe fn hipModuleGetFunction(
+    func: *mut *mut c_void,
+    module: *mut c_void,
+    name: *const i8,
+) -> HipErrorT {
+    unsafe { ffi::hipModuleGetFunction(func as *mut _, module as _, name) as HipErrorT }
+}
+pub unsafe fn hipModuleLaunchKernel(
+    func: *mut c_void,
+    gridX: u32,
+    gridY: u32,
+    gridZ: u32,
+    blockX: u32,
+    blockY: u32,
+    blockZ: u32,
+    sharedMemBytes: u32,
+    stream: *mut c_void,
+    args: *mut *mut c_void,
+    extra: *mut c_void,
+) -> HipErrorT {
+    unsafe {
+        ffi::hipModuleLaunchKernel(
+            func as _,
+            gridX,
+            gridY,
+            gridZ,
+            blockX,
+            blockY,
+            blockZ,
+            sharedMemBytes,
+            stream as _,
+            args,
+            extra as *mut *mut c_void,
+        ) as HipErrorT
+    }
+}
+pub unsafe fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+    numBlocks: *mut i32,
+    func: *mut c_void,
+    blockSize: i32,
+    dynamicSMemSize: usize,
+) -> HipErrorT {
+    unsafe {
+        ffi::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+            numBlocks,
+            func as _,
+            blockSize,
+            dynamicSMemSize,
+        ) as HipErrorT
+    }
+}
+
+// ---- peer access ----
+pub unsafe fn hipDeviceCanAccessPeer(can_access: *mut i32, device: i32, peer_device: i32) -> HipErrorT {
+    unsafe { ffi::hipDeviceCanAccessPeer(can_access, device, peer_device) as HipErrorT }
+}
+pub unsafe fn hipDeviceEnablePeerAccess(peer_device: i32, flags: u32) -> HipErrorT {
+    unsafe { ffi::hipDeviceEnablePeerAccess(peer_device, flags) as HipErrorT }
+}
+pub unsafe fn hipDeviceDisablePeerAccess(peer_device: i32) -> HipErrorT {
+    unsafe { ffi::hipDeviceDisablePeerAccess(peer_device) as HipErrorT }
+}
+
+// ---- hiprtc (own shared object; linked by build.rs alongside amdhip64) ----
+pub unsafe fn hiprtcCreateProgram(
+    prog: *mut HiprtcProgram,
+    src: *const i8,
+    name: *const i8,
+    numHeaders: i32,
+    headers: *const *const i8,
+    headerNames: *const *const i8,
+) -> HipErrorT {
+    unsafe {
+        ffi::hiprtcCreateProgram(prog as *mut _, src, name, numHeaders, headers, headerNames)
+            as HipErrorT
+    }
+}
+pub unsafe fn hiprtcCompileProgram(
+    prog: HiprtcProgram,
+    numOptions: i32,
+    options: *const *const i8,
+) -> HipErrorT {
+    unsafe { ffi::hiprtcCompileProgram(prog as _, numOptions, options) as HipErrorT }
+}
+pub unsafe fn hiprtcGetCode(prog: HiprtcProgram, code: *mut i8) -> HipErrorT {
+    unsafe { ffi::hiprtcGetCode(prog as _, code) as HipErrorT }
+}
+pub unsafe fn hiprtcDestroyProgram(prog: *mut HiprtcProgram) -> HipErrorT {
+    unsafe { ffi::hiprtcDestroyProgram(prog as *mut _) as HipErrorT }
+}
+pub unsafe fn hiprtcAddNameExpression(prog: HiprtcProgram, name: *const i8) -> HipErrorT {
+    unsafe { ffi::hiprtcAddNameExpression(prog as _, name) as HipErrorT }
+}
+pub unsafe fn hiprtcGetLoweredName(
+    prog: HiprtcProgram,
+    name: *const i8,
+    lowered_name: *mut *const i8,
+) -> HipErrorT {
+    unsafe { ffi::hiprtcGetLoweredName(prog as _, name, lowered_name) as HipErrorT }
+}
+pub unsafe fn hiprtcGetCodeSize(prog: HiprtcProgram, size: *mut usize) -> HipErrorT {
+    unsafe { ffi::hiprtcGetCodeSize(prog as _, size) as HipErrorT }
+}
+pub unsafe fn hiprtcVersion(major: *mut i32, minor: *mut i32) -> HipErrorT {
+    unsafe { ffi::hiprtcVersion(major, minor) as HipErrorT }
+}
+pub unsafe fn hiprtcGetErrorString(error: HipErrorT) -> *const i8 {
+    unsafe { ffi::hiprtcGetErrorString(error as _) }
+}
+pub unsafe fn hiprtcGetProgramLogSize(prog: HiprtcProgram, log_size: *mut usize) -> HipErrorT {
+    unsafe { ffi::hiprtcGetProgramLogSize(prog as _, log_size) as HipErrorT }
+}
+pub unsafe fn hiprtcGetProgramLog(prog: HiprtcProgram, log: *mut i8) -> HipErrorT {
+    unsafe { ffi::hiprtcGetProgramLog(prog as _, log) as HipErrorT }
 }
 
 // ======== Attribute / advice constants ======== Numbers verified against ROCm 7.x `hip_runtime_api.h` (`hipDeviceAttribute_t`) and probed live on gfx1201/gfx1200: the previous values here were CUDA
@@ -498,5 +669,23 @@ mod handles_self_tests {
         assert_eq!(HIP_DEVICE_ATTRIBUTE_WARP_SIZE, 87);
         assert_eq!(HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, 65);
         assert_eq!(HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC, 230);
+    }
+
+    #[test]
+    fn hip_pointer_attribute_layout_matches_ffi() {
+        // hipPointerGetAttributes casts grim's struct to the bindgen type;
+        // the cast is only sound if the layouts agree field-for-field.
+        assert_eq!(
+            std::mem::size_of::<HipPointerAttribute>(),
+            std::mem::size_of::<grim_hip_sys::hipPointerAttribute_t>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(HipPointerAttribute, device),
+            std::mem::offset_of!(grim_hip_sys::hipPointerAttribute_t, device)
+        );
+        assert_eq!(
+            std::mem::offset_of!(HipPointerAttribute, host_pointer),
+            std::mem::offset_of!(grim_hip_sys::hipPointerAttribute_t, hostPointer)
+        );
     }
 }

@@ -17,6 +17,7 @@ use grim_tensor::BackendStorage;
 
 use crate::DTypeStorage;
 use crate::HipMemcpyKind;
+use crate::device::handles::hipEventCreateWithFlags;
 use crate::device::roc_device::RocmDevice;
 use crate::device::util::dtype_f32;
 use crate::kernels::qkv_attention::KvRingPolicy;
@@ -2552,12 +2553,6 @@ impl DecodeGraph {
         // One event per boundary, created under a DeviceGuard on the PRODUCING
         // device (an event is a device-side object; hipStreamWaitEvent from
         // another device's stream must reference one from the producing side).
-        unsafe extern "C" {
-            fn hipEventCreateWithFlags(
-                event: *mut *mut std::ffi::c_void,
-                flags: u32,
-            ) -> crate::HipErrorT;
-        }
         let disable_timing = matches!(
             std::env::var("GRIM_BOUNDARY_DISABLE_TIMING").as_deref(),
             Ok("1" | "true" | "on")
