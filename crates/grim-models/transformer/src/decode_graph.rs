@@ -768,35 +768,62 @@ impl LlamaBlock {
                     grim_core::error::Error::Backend(format!("fused residual+gateup: {e}"))
                 })?;
             } else {
-                add_graph(
-                    &buffers.layer_input[layer_idx],
-                    &buffers.norm_buf[layer_idx],
-                    &buffers.layer_output[layer_idx],
-                    dev,
-                )?;
+                // Residual add + next-input norm: ONE fused node when the norm
+                // is RMS (grim_add_rms_norm; production route: 48 add + 60
+                // rms_norm/step, the 48 pairs collapse to 48 nodes). The fused
+                // kernel is BIT-EXACT vs the split path (gate:
+                // fused_add_rms_norm_into::fused_add_rms_norm_matches_split_path,
+                // tightened to to_bits equality) and norm_out aliases the
+                // residual input exactly as this site's buffers do.
+                // LayerNorm keeps the split path (no fused kernel for it).
+                let ffn_weight = ffn_w.storage();
+                let fused_ok = self.ffn_norm.kind == NormKind::Rms
+                    && ffn_weight
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .is_some();
+                if fused_ok {
+                    dev.fused_add_rms_norm_into(
+                        &buffers.layer_input[layer_idx],
+                        &buffers.norm_buf[layer_idx],
+                        &**ffn_weight,
+                        self.ffn_norm.eps,
+                        &buffers.layer_output[layer_idx],
+                        &buffers.norm_buf[layer_idx],
+                        &ffn_shape,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                } else {
+                    add_graph(
+                        &buffers.layer_input[layer_idx],
+                        &buffers.norm_buf[layer_idx],
+                        &buffers.layer_output[layer_idx],
+                        dev,
+                    )?;
 
-                match self.ffn_norm.kind {
-                    NormKind::Rms => {
-                        dev.rms_norm_into(
-                            &buffers.layer_output[layer_idx],
-                            &**ffn_w.storage(),
-                            self.ffn_norm.eps,
-                            &buffers.norm_buf[layer_idx],
-                            &ffn_shape,
-                        )
-                        .map_err(grim_core::error::Error::Tensor)?;
-                    }
-                    NormKind::LayerNorm => {
-                        let b = self.ffn_norm.bias.as_ref().map(|t| t.storage());
-                        dev.layer_norm_into(
-                            &buffers.layer_output[layer_idx],
-                            &**ffn_w.storage(),
-                            b.as_deref().map(|s| s.as_ref()),
-                            self.ffn_norm.eps,
-                            &buffers.norm_buf[layer_idx],
-                            &ffn_shape,
-                        )
-                        .map_err(grim_core::error::Error::Tensor)?;
+                    match self.ffn_norm.kind {
+                        NormKind::Rms => {
+                            dev.rms_norm_into(
+                                &buffers.layer_output[layer_idx],
+                                &**ffn_w.storage(),
+                                self.ffn_norm.eps,
+                                &buffers.norm_buf[layer_idx],
+                                &ffn_shape,
+                            )
+                            .map_err(grim_core::error::Error::Tensor)?;
+                        }
+                        NormKind::LayerNorm => {
+                            let b = self.ffn_norm.bias.as_ref().map(|t| t.storage());
+                            dev.layer_norm_into(
+                                &buffers.layer_output[layer_idx],
+                                &**ffn_w.storage(),
+                                b.as_deref().map(|s| s.as_ref()),
+                                self.ffn_norm.eps,
+                                &buffers.norm_buf[layer_idx],
+                                &ffn_shape,
+                            )
+                            .map_err(grim_core::error::Error::Tensor)?;
+                        }
                     }
                 }
 
