@@ -1633,3 +1633,114 @@ fn the_iq4nl_row_is_on_the_coverage_axis() {
     }
     unsafe { std::env::remove_var("GRIM_EMIT_TASK_GRAPH") };
 }
+
+/// Decode-chain cost precheck (the number before any profiling):
+///   1. NODES: count the captured graph's kernel nodes — that IS the
+///      launches-per-decode-step figure; x ~3.5us batched floor = the lower
+///      bound on what launch structure alone costs per step.
+///   2. REPLAY WALL: HIP-event-timed graph replay of the real dependent
+///      decode step, warm, median of 30.
+/// Compare the node count against the "sum of isolated batched kernel
+/// times" the launcher-level benches measure: the gap is ramp+drain+gap
+/// overhead that prologue fusion / quantization sharing can recover.
+#[test]
+fn qwen35_whitecrow_graph_decode_chain_precheck() {
+    let Some((device, _dev)) = gpu_device() else {
+        return;
+    };
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "whitecrow");
+        std::env::remove_var("GRIM_KV_ARENA_ROWS");
+    }
+
+    let provider = synth_weights_hybrid_hd(1, 1, false, 128);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, tiny_cfg_hd(128)).expect("load tiny qwen35 hd128");
+    let mut graph = model
+        .get_or_create_decode_graph(1024, 1)
+        .unwrap_or_else(|e| panic!("precheck: graph pool alloc failed: {e}"));
+
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    assert!(graph.is_captured, "precheck: capture must succeed");
+
+    // 1. Node count of the PRIMARY graph (single-device: the legacy path's
+    //    graph handle; segment graphs only exist for split placements).
+    let nodes = unsafe {
+        let mut n: usize = 0;
+        let st = grim_backend_rocm::hipGraphGetNodes(
+            graph.graph,
+            std::ptr::null_mut(),
+            &mut n,
+        );
+        assert_eq!(st as u32, 0, "hipGraphGetNodes(count) failed: {st}");
+        n
+    };
+    eprintln!(
+        "[decode-chain-precheck] graph kernel nodes = {nodes}  ->  launch-structure floor >= {:.1} us/step (nodes x 3.5us batched floor)",
+        nodes as f64 * 3.5
+    );
+    assert!(nodes > 0, "captured graph has no nodes");
+
+    // 2. Warm replay timing under HIP events (30 iters, median).
+    for tok in TOKENS {
+        model
+            .forward_replay(&mut graph, tok)
+            .expect("warm replay");
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+    let (ev_start, ev_stop) = unsafe {
+        let mut e0 = std::ptr::null_mut();
+        let mut e1 = std::ptr::null_mut();
+        assert_eq!(grim_backend_rocm::hipEventCreate(&mut e0) as u32, 0);
+        assert_eq!(grim_backend_rocm::hipEventCreate(&mut e1) as u32, 0);
+        (e0, e1)
+    };
+    let stream = graph.stream;
+    let mut samples_ms = Vec::with_capacity(30);
+    for i in 0..40 {
+        let tok = TOKENS[i % TOKENS.len()];
+        unsafe {
+            assert_eq!(
+                grim_backend_rocm::hipEventRecord(ev_start, stream) as u32, 0
+            );
+        }
+        model.forward_replay(&mut graph, tok).expect("timed replay");
+        unsafe {
+            assert_eq!(
+                grim_backend_rocm::hipEventRecord(ev_stop, stream) as u32, 0
+            );
+            assert_eq!(grim_backend_rocm::hipEventSynchronize(ev_stop) as u32, 0);
+            let mut ms = 0.0f32;
+            assert_eq!(
+                grim_backend_rocm::hipEventElapsedTime(&mut ms, ev_start, ev_stop) as u32,
+                0
+            );
+            if i >= 10 {
+                samples_ms.push(ms as f64 * 1000.0); // us
+            }
+        }
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+    samples_ms.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let median_us = samples_ms[samples_ms.len() / 2];
+    eprintln!(
+        "[decode-chain-precheck] graph replay wall = {:.1} us/step (median of {} HIP-event samples, dependent chain: ramp+drain+gaps INCLUDED)",
+        median_us,
+        samples_ms.len()
+    );
+    eprintln!(
+        "[decode-chain-precheck] per-node budget = {:.2} us/node (wall / nodes); the isolated-batched comparison is the launcher benches' sum",
+        median_us / nodes as f64
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+    }
+}

@@ -427,6 +427,15 @@ pub unsafe fn hipGraphAddKernelNode(
     }
 }
 
+/// Number of nodes in a captured graph (precheck: launches per replay).
+pub unsafe fn hipGraphGetNodes(
+    graph: *mut c_void,
+    nodes: *mut *mut c_void,
+    numNodes: *mut usize,
+) -> HipErrorT {
+    unsafe { ffi::hipGraphGetNodes(graph as _, nodes as *mut _, numNodes) as HipErrorT }
+}
+
 // ---- events (autotune benchmarking + cross-stream deps) ----
 pub unsafe fn hipEventCreate(event: *mut *mut c_void) -> HipErrorT {
     unsafe { ffi::hipEventCreate(event as *mut _) as HipErrorT }
