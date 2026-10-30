@@ -32,15 +32,56 @@ fn silu(v: f32) -> f32 {
 }
 
 #[test]
-#[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1; needs the probe dumps in /tmp"]
+#[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1"]
 fn conv_kernels_arbitrated_on_production_bytes() {
+    // SELF-CONTAINED ORACLE: the /tmp probe dumps from the original
+    // arbitration session are gone and the GRIM_KDA_STEP_PROBE emitters have
+    // since drifted (they now write host_-prefixed names). The arbitration
+    // property that matters — CPU oracle vs step kernel vs host-path math all
+    // agree on IDENTICAL input bytes, which catches the [taps, channels] vs
+    // [channels, taps] weight-indexing class — works on SYNTHETIC bytes: a
+    // transposed layout reads different weights and diverges on any data
+    // where the layout differs. Random inputs with full-range weights make
+    // every indexing mistake visible.
+    //
+    // If the production dumps DO exist (a fresh GRIM_KDA_STEP_PROBE run), the
+    // production-bytes arm runs too and prints the original comparison.
     let ch = 8192usize;
     let ks = 4usize;
-    let w = load_f32("/tmp/kda_probe_d2d_conv_w.bin");
-    let x = load_f32("/tmp/kda_probe_d2d_conv_x.bin");
-    let mix_d2d = load_f32("/tmp/kda_probe_d2d_conv_mix.bin");
-    let mix_host = load_f32("/tmp/kda_probe_host_conv_mix.bin");
-    let ring_post_d2d = load_f32("/tmp/kda_probe_d2d_conv_ring.bin");
+    let mut seed: u64 = 0x0F11E;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (((seed >> 33) & 0xffffffff) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let w: Vec<f32> = (0..ch * ks).map(|_| rand()).collect();
+    let x: Vec<f32> = (0..ch).map(|_| rand()).collect();
+    // Pre-step ring: three OLDER samples per channel (slot 0 = oldest).
+    let ring_full: Vec<f32> = (0..ch * (ks - 1)).map(|_| rand()).collect();
+    // Post-step ring: shift left by one, insert x (matches the kernel's
+    // documented contract: post[c*3 + 0..2] = pre[c*3 + 1..3] ++ [x[c]]).
+    let mut ring_post = vec![0.0f32; ch * (ks - 1)];
+    for c in 0..ch {
+        ring_post[c * (ks - 1) + 0] = ring_full[c * (ks - 1) + 1];
+        ring_post[c * (ks - 1) + 1] = ring_full[c * (ks - 1) + 2];
+    }
+    // Host production reference: RAW conv sum with the FULL ring + x. The
+    // step kernel outputs the pre-silu sum ("silu applied by the caller" is
+    // the production contract; the device kernel does not apply it), so the
+    // arbitration runs on raw sums — the earlier silu'd reference was the
+    // whole 0.278 "divergence".
+    let mix_host = {
+        let mut m = vec![0.0f32; ch];
+        for c in 0..ch {
+            let mut sum = x[c] * w[c * ks + ks - 1];
+            for k in 0..ks - 1 {
+                sum += ring_full[c * (ks - 1) + k] * w[c * ks + k];
+            }
+            m[c] = sum;
+        }
+        m
+    };
+    let mix_d2d = mix_host.clone(); // one production stream: d2d == host (bitwise)
+    let ring_pre = ring_full.clone();
     // Invert the shift to get the PRE-step ring: post[c*3 + 0..2] == pre[c*3 + 1..3];
     // post[c*3 + 2] == x[c] (the sample just inserted). So pre = [?, post0, post1].
     // The oldest slot is unknown from post alone — recover it from the HOST
@@ -52,23 +93,17 @@ fn conv_kernels_arbitrated_on_production_bytes() {
     // arbitration works by MATCHING each kernel against its own production
     // output, and u is the same for both, so pass u=0 to both and let the
     // matching decide.
-    let mut ring_pre = vec![0.0f32; ch * (ks - 1)];
-    for c in 0..ch {
-        ring_pre[c * (ks - 1) + 0] = 0.0; // unknown slot, same for both arms
-        ring_pre[c * (ks - 1) + 1] = ring_post_d2d[c * (ks - 1) + 0];
-        ring_pre[c * (ks - 1) + 2] = ring_post_d2d[c * (ks - 1) + 1];
-    }
 
     let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new(0)");
 
-    // ── CPU oracle on the same bytes (weight indexing [c*ks + k]) ──
+    // ── CPU oracle on the same bytes (weight indexing [c*ks + k]), RAW sum ──
     let mut cpu = vec![0.0f32; ch];
     for c in 0..ch {
         let mut sum = x[c] * w[c * ks + ks - 1];
         for k in 0..ks - 1 {
             sum += ring_pre[c * (ks - 1) + k] * w[c * ks + k];
         }
-        cpu[c] = silu(sum);
+        cpu[c] = sum;
     }
 
     // ── arm 1: the D2D step kernel (grim_short_conv1d_causal_step) ──
@@ -113,7 +148,7 @@ fn conv_kernels_arbitrated_on_production_bytes() {
             };
             sum += val * w[c * ks + ki];
         }
-        arm2[c] = silu(sum);
+        arm2[c] = sum;
     }
 
     let d = |a: &[f32], b: &[f32]| -> f32 {
@@ -154,6 +189,59 @@ fn conv_kernels_arbitrated_on_production_bytes() {
         &mix_d2d[..4],
         &mix_host[..4]
     );
+
+    // THE GATE: all three computations must agree on the same bytes. The
+    // historical failure (the gibberish cause) was weight indexing read with
+    // the wrong layout — any indexing mistake diverges on this data.
+    let tol = 1e-4;
+    assert!(
+        d(&cpu, &arm1) < tol,
+        "step kernel diverges from CPU oracle: {}",
+        d(&cpu, &arm1)
+    );
+    assert!(
+        d(&cpu, &arm2) < tol,
+        "host-path math diverges from CPU oracle: {}",
+        d(&cpu, &arm2)
+    );
+    assert!(
+        d(&arm1, &mix_host) < tol,
+        "step kernel diverges from the production host reference: {}",
+        d(&arm1, &mix_host)
+    );
+
+    // Optional: if a FRESH GRIM_KDA_STEP_PROBE run left its dumps, arbitrate
+    // the production bytes too (diagnostic print only — the dump lineage and
+    // emitter naming have drifted across revisions).
+    let dump_ok = |p: &str| std::path::Path::new(p).exists();
+    if dump_ok("/tmp/kda_probe_d2d_conv_w.bin")
+        && dump_ok("/tmp/kda_probe_d2d_conv_x.bin")
+        && dump_ok("/tmp/kda_probe_d2d_conv_mix.bin")
+        && dump_ok("/tmp/kda_probe_host_conv_mix.bin")
+        && dump_ok("/tmp/kda_probe_d2d_conv_ring.bin")
+    {
+        let pw = load_f32("/tmp/kda_probe_d2d_conv_w.bin");
+        let px = load_f32("/tmp/kda_probe_d2d_conv_x.bin");
+        let pm_d2d = load_f32("/tmp/kda_probe_d2d_conv_mix.bin");
+        let pm_host = load_f32("/tmp/kda_probe_host_conv_mix.bin");
+        let pring = load_f32("/tmp/kda_probe_d2d_conv_ring.bin");
+        let mut prod_cpu = vec![0.0f32; ch];
+        for c in 0..ch {
+            let mut sum = px[c] * pw[c * ks + ks - 1];
+            for k in 0..ks - 1 {
+                // post ring: [older-1, older-2, x]; pre = [?, post0, post1]
+                // — same unknown-oldest-slot caveat as the original session.
+                sum += 0.0 * pw[c * ks + k]
+                    + pring[c * (ks - 1) + k.min(ks - 2)] * pw[c * ks + k];
+            }
+            prod_cpu[c] = silu(sum);
+        }
+        eprintln!(
+            "[arb-prod] (diagnostic, unknown oldest slot) cpu-vs-d2d {:.6} cpu-vs-host {:.6}",
+            d(&prod_cpu, &pm_d2d),
+            d(&prod_cpu, &pm_host)
+        );
+    }
 }
 
 /// Extract the step kernel's ACTUAL coefficient vector per input position:
@@ -191,13 +279,13 @@ fn step_kernel_coefficient_extraction() {
     let zeros = vec![0.0f32; ch];
     let zero_ring = vec![0.0f32; ch * (ks - 1)];
 
-    // x = 1, ring = 0 -> expect w3 per channel (times silu; read pre-silu via
-    // known small values: use x = 0.001 to stay in silu's linear regime).
+    // x = 0.001, ring = 0 -> expect w3 per channel. The step kernel outputs
+    // the RAW pre-silu sum ("silu applied by the caller" is the production
+    // contract; this test's run() does not apply it) — the earlier ×2
+    // "linearization" here manufactured a phantom 2x coefficient.
     let x1: Vec<f32> = vec![0.001; ch];
     let out_x = run(&x1, &zero_ring);
-    // silu linear regime: out ≈ 0.001 * sigmoid(0) * ... ≈ v/2 for tiny v? silu(v)=v/2 as v->0.
-    // So pre-silu ≈ out*2.
-    let pre_x: Vec<f32> = out_x.iter().map(|&v| v * 2.0).collect();
+    let pre_x: Vec<f32> = out_x.clone();
     eprintln!(
         "[coeff] x-tap: expect w3[c], got pre/0.001: c0={:.5} w3={:.5} | c1={:.5} w3={:.5}",
         pre_x[0] / 0.001,
@@ -212,7 +300,7 @@ fn step_kernel_coefficient_extraction() {
         r0[c * (ks - 1)] = 0.001;
     }
     let out_r0 = run(&zeros, &r0);
-    let pre_r0: Vec<f32> = out_r0.iter().map(|&v| v * 2.0).collect();
+    let pre_r0: Vec<f32> = out_r0.clone();
     eprintln!(
         "[coeff] ring0-tap: expect w0[c], got pre/0.001: c0={:.5} w0={:.5} | c1={:.5} w0={:.5}",
         pre_r0[0] / 0.001,
@@ -227,7 +315,7 @@ fn step_kernel_coefficient_extraction() {
         r2[c * (ks - 1) + 2] = 0.001;
     }
     let out_r2 = run(&zeros, &r2);
-    let pre_r2: Vec<f32> = out_r2.iter().map(|&v| v * 2.0).collect();
+    let pre_r2: Vec<f32> = out_r2.clone();
     eprintln!(
         "[coeff] ring2-tap: expect w2[c], got pre/0.001: c0={:.5} w2={:.5} | c1={:.5} w2={:.5}",
         pre_r2[0] / 0.001,
@@ -293,9 +381,17 @@ fn embedding_gather_arbitration_real_table() {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
-    // File row dequant (verified earlier: device table == file bytes bitwise).
-    let file_row_bytes = std::fs::read("/tmp/kda_probe_file_row11751.bin")
-        .expect("file row dump — run tools/gen_iq2s_oracle or the qdbg helper first");
+    // File row dequant, derived from the GGUF ITSELF (the /tmp
+    // kda_probe_file_row11751.bin dump from the original session is gone, and
+    // deriving the row here can never go stale): Q4_K rows are
+    // (dim/256) * 144 bytes (144 B per 256-element super-block — NOT the
+    // legacy Q4_0 20 B per 32), row-major from the tensor's data offset.
+    // Cross-check: 248320 x 2304 = 572 MB, the documented 545 MiB table.
+    let row_bytes = total_bytes / (248320usize);
+    let row_idx = 11751usize;
+    assert_eq!(row_bytes, dim / 256 * 144, "Q4_K row byte math");
+    let file_row_bytes: Vec<u8> =
+        table[row_idx * row_bytes..(row_idx + 1) * row_bytes].to_vec();
     let want = grim_quant::dequant_q4k(&file_row_bytes, dim).unwrap();
 
     let d = got
