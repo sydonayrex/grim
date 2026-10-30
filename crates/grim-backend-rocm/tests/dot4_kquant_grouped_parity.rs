@@ -2887,8 +2887,15 @@ fn stream_read_dependent_chain_vs_batched() -> Result<(), String> {
 
     // Same 4x rotating buffers as the true-cold bench: DRAM-resident reads.
     let words: usize = 17_408 * 5120 / 8;
-    let copies = 4usize;
-    let chunks: usize = 26; // = decode graph node count
+    let copies = 4usize; // rotating buffers, > any L2, so reads stream DRAM
+    // Chain length is a PARAMETER: GRIM_CHAIN_NODES overrides the 26-node
+    // decode-graph reference, so the per-node structure price can be checked
+    // for linearity against production-scale (~1200) chains.
+    let chunks: usize = std::env::var("GRIM_CHAIN_NODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(26);
+    assert!(chunks >= 1 && chunks <= words, "chain length out of range");
     let chunk_words = words / chunks;
     let mut srcs = Vec::new();
     for c in 0..copies {
@@ -2896,12 +2903,6 @@ fn stream_read_dependent_chain_vs_batched() -> Result<(), String> {
         let mut bytes = Vec::with_capacity(v.len() * 4);
         for x in &v { bytes.extend_from_slice(&x.to_le_bytes()); }
         srcs.push(MemoryOps::from_cpu_bytes(&dev, &bytes, &Shape::new(vec![words]), u32ty.clone()).map_err(|e| e.to_string())?);
-    }
-    // One scratch chunk per chain node (chain writes feed the next read's
-    // XOR mask) + one out.
-    let mut scratch = Vec::new();
-    for _ in 0..chunks {
-        scratch.push(MemoryOps::alloc_storage(&dev, &Shape::new(vec![chunk_words]), f32ty.clone()).map_err(|e| e.to_string())?);
     }
     let out = MemoryOps::alloc_storage(&dev, &Shape::new(vec![chunk_words]), f32ty.clone()).map_err(|e| e.to_string())?;
 
