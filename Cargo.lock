@@ -2728,6 +2728,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "grim-hip-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "regex",
+]
+
+[[package]]
 name = "grim-kvquant"
 version = "0.1.0"
 dependencies = [

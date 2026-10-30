@@ -1,0 +1,30 @@
+[package]
+name = "grim-hip-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT OR Apache-2.0"
+description = "Vendored HIP FFI bindings (from tracel-ai/cubecl-hip) for grim-backend-rocm"
+categories = ["external-ffi-bindings"]
+links = "amdhip64"
+publish = false
+
+[features]
+default = []
+# Rewrite the committed bindgen output into libloading-based runtime-resolved
+# wrappers (no link-time dependency on libamdhip64.so / libhiprtc.so).
+dynamic = ["dep:libloading"]
+# One per committed bindings file; all empty. build.rs selects exactly one
+# via `cargo:rustc-cfg` from the installed HIP patch — never set manually.
+hip_26385 = []
+
+[dependencies]
+libc = "0.2"
+regex = "1"
+libloading = { version = "0.8", optional = true }
+
+[build-dependencies]
+regex = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
