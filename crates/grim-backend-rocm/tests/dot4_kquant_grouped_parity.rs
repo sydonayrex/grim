@@ -2806,3 +2806,138 @@ fn corvid_w4a4_v4_bit_exact_and_ab() -> Result<(), String> {
 
     Ok(())
 }
+
+/// TRUE-COLD A/B: rotating weight copies so every iteration streams from
+/// DRAM (4 copies x ~47 MB = 187 MB >> any on-card cache; iteration i uses
+/// copy i%4, so ~140 MB of intervening traffic evicts everything). Reports
+/// the MEDIAN of per-iteration times over multiple sweeps, for v2/v3/v4/v5.
+/// This is the number that matches real decode, where each token streams
+/// all layers' weights and nothing stays cached.
+#[test]
+#[ignore = "requires AMD GPU; run with GRIM_RUN_GPU_TEST=1 HIP_VISIBLE_DEVICES=1"]
+fn corvid_w4a4_true_cold_ab() -> Result<(), String> {
+    if std::env::var("GRIM_RUN_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set GRIM_RUN_GPU_TEST=1 to run");
+        return Ok(());
+    }
+    let dev = RocmDevice::try_new(0).map_err(|e| format!("no ROCm device: {e}"))?;
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] requires RDNA4");
+        return Ok(());
+    }
+    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let bf16ty = DType { arith: ArithType::BF16, storage: Storage::Native };
+    let u32ty = DType { arith: ArithType::U32, storage: Storage::Native };
+    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+
+    const COPIES: usize = 4;
+    const WARMUP: usize = 8;
+    const ITERS: usize = 32;
+    const SWEEPS: usize = 3;
+
+    for &(n, k) in &[(17408usize, 5120usize), (5120usize, 17408usize)] {
+        let m = 1usize;
+        let n_groups = k / 128;
+        let words_per_col = k / 8;
+        let row_bytes = words_per_col * 4 + n_groups * 2 + n_groups;
+        let bytes = (n * row_bytes + m * (n_groups * 64 + n_groups * 8) + m * n * 4) as f64;
+        let mut rng = Lcg(0xC0271D03 ^ (n * 31 + k) as u64);
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
+        let (qw, sc, zr) =
+            grim_quant::quant_ostquant_w4_group128(&w, n, k).map_err(|e| e.to_string())?;
+        let inter = grim_quant::interleave_w4a4_ostquant(&qw, &sc, &zr, n, k)
+            .map_err(|e| e.to_string())?;
+
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let act_codes = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups * 16]), u32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let act_scales = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let act_sums = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n_groups]), u32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let (ac_r, as_r, asum_r) = (
+            as_rocm(act_codes.as_ref()).unwrap(),
+            as_rocm(act_scales.as_ref()).unwrap(),
+            as_rocm(act_sums.as_ref()).unwrap(),
+        );
+        dev.launch_quantize_u4_group128(as_rocm(a_st.as_ref()).unwrap(), ac_r, as_r, asum_r, m, k)
+            .map_err(|e| e.to_string())?;
+
+        // COPIES distinct weight uploads; rotating across them keeps every
+        // iteration's B streaming from DRAM.
+        let mut qw_c = Vec::new();
+        let mut sc_c = Vec::new();
+        let mut zr_c = Vec::new();
+        let mut inter_c = Vec::new();
+        for _ in 0..COPIES {
+            qw_c.push(MemoryOps::from_cpu_bytes(&dev, &qw, &Shape::new(vec![n * words_per_col]), u32ty.clone()).map_err(|e| e.to_string())?);
+            sc_c.push(MemoryOps::from_cpu_bytes(&dev, &sc, &Shape::new(vec![n * n_groups]), bf16ty.clone()).map_err(|e| e.to_string())?);
+            zr_c.push(MemoryOps::from_cpu_bytes(&dev, &zr, &Shape::new(vec![n * n_groups]), u8ty.clone()).map_err(|e| e.to_string())?);
+            inter_c.push(MemoryOps::from_cpu_bytes(&dev, &inter, &Shape::new(vec![inter.len()]), u8ty.clone()).map_err(|e| e.to_string())?);
+        }
+        let mut outs = Vec::new();
+        for _ in 0..4 {
+            outs.push(MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?);
+        }
+        let (o1, o2, o3, o4) = (as_rocm(outs[0].as_ref()).unwrap(), as_rocm(outs[1].as_ref()).unwrap(), as_rocm(outs[2].as_ref()).unwrap(), as_rocm(outs[3].as_ref()).unwrap());
+
+        type Launch<'a> = dyn Fn(usize) -> Result<(), String> + 'a;
+        let kernels: Vec<(&str, Box<Launch<'_>>)> = vec![
+            ("v2", Box::new(|i: usize| {
+                dev.launch_dot8_w4a4_gemv_v2_for_ab(ac_r, as_r, asum_r,
+                    as_rocm(qw_c[i].as_ref()).unwrap(), as_rocm(sc_c[i].as_ref()).unwrap(),
+                    as_rocm(zr_c[i].as_ref()).unwrap(), o1, m, n, k).map_err(|e| e.to_string())?;
+                Ok(())
+            })),
+            ("v3", Box::new(|i: usize| {
+                dev.launch_dot8_w4a4_gemv_v3_for_ab(ac_r, as_r, asum_r,
+                    as_rocm(qw_c[i].as_ref()).unwrap(), as_rocm(sc_c[i].as_ref()).unwrap(),
+                    as_rocm(zr_c[i].as_ref()).unwrap(), o2, m, n, k).map_err(|e| e.to_string())?;
+                Ok(())
+            })),
+            ("v4", Box::new(|i: usize| {
+                dev.launch_dot8_w4a4_gemv_v4_for_ab(ac_r, as_r, asum_r,
+                    as_rocm(inter_c[i].as_ref()).unwrap(), o3, m, n, k).map_err(|e| e.to_string())?;
+                Ok(())
+            })),
+            ("v5", Box::new(|i: usize| {
+                dev.launch_dot8_w4a4_gemv_v5_for_ab(ac_r, as_r, asum_r,
+                    as_rocm(qw_c[i].as_ref()).unwrap(), as_rocm(sc_c[i].as_ref()).unwrap(),
+                    as_rocm(zr_c[i].as_ref()).unwrap(), o4, m, n, k).map_err(|e| e.to_string())?;
+                Ok(())
+            })),
+        ];
+
+        // Warmup every kernel on the rotation too.
+        for it in 0..WARMUP {
+            for (_, f) in &kernels {
+                f(it % COPIES)?;
+            }
+        }
+        dev.synchronize();
+
+        println!("\n=== true-cold W4A4 GEMV  n={n} k={k}  ({:.1} MB/weight x {COPIES} copies, median of {ITERS} iters x {SWEEPS} sweeps) ===", bytes / 1e6);
+        for (name, f) in &kernels {
+            let mut medians = Vec::new();
+            for _ in 0..SWEEPS {
+                let mut times = Vec::with_capacity(ITERS);
+                for it in 0..ITERS {
+                    let t = std::time::Instant::now();
+                    f(it % COPIES)?;
+                    dev.synchronize();
+                    times.push(t.elapsed().as_secs_f64());
+                }
+                times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                medians.push(bytes / times[ITERS / 2] / 1e9);
+            }
+            medians.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            println!(
+                "  {name}: median-of-medians {:>7.1} GB/s   (sweeps: {:?})",
+                medians[SWEEPS / 2], medians
+            );
+        }
+    }
+    Ok(())
+}
