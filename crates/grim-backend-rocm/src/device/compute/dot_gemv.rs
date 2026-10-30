@@ -3121,29 +3121,23 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v3 = *V3.get_or_init(|| {
-            matches!(
-                std::env::var("GRIM_WHITECROW_V3").as_deref(),
-                Ok("1" | "true" | "on")
-            )
-        });
+
+        // v5 is the SHIPPED kernel (bit-identical to v1/v2, predicated tail;
+        // truly cold the whole family sits at 96.8-98.4% of the 601 GB/s
+        // ceiling, so the routing choice is about warm behavior and code
+        // count, not cold GB/s). GRIM_WHITECROW_V2=1 keeps v2 reachable as
+        // the A/B arm; v1 remains the in-tree reference. v3/v4 were deleted:
+        // v3 because v5 is its strict superset, v4 because its lane-
+        // contiguous layout measured no cold benefit (see the true-cold bench).
         static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v2 = *V2.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_WHITECROW_V2").as_deref(),
-                Ok("0" | "false" | "off")
-            )
+            matches!(std::env::var("GRIM_WHITECROW_V2").as_deref(), Ok("1" | "true" | "on"))
         });
         self.launch_dot8_w4a4_gemv_named(
-            // v5 supersedes v3 (bit-identical outputs, predicated tail,
-            // measured 1.2-1.3x faster).
-            if v3 {
-                "grim_dot8_w4a4_gemv_v5"
-            } else if v2 {
+            if v2 {
                 "grim_dot8_w4a4_gemv_v2"
             } else {
-                "grim_dot8_w4a4_gemv"
+                "grim_dot8_w4a4_gemv_v5"
             },
             a_codes,
             a_scales,
@@ -3185,7 +3179,9 @@ impl RocmDevice {
             k,
         )
     }
-
+    /// v2 A/B launcher: kept as the rotation arm of the true-cold bench
+    /// (`corvid_w4a4_true_cold_ab`), reachable under GRIM_WHITECROW_V2=1.
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_dot8_w4a4_gemv_v2_for_ab(
         &self,
         a_codes: &RocmStorage,
@@ -3211,114 +3207,6 @@ impl RocmDevice {
             m,
             n,
             k,
-        )
-    }
-
-    pub fn launch_dot8_w4a4_gemv_v3_for_ab(
-        &self,
-        a_codes: &RocmStorage,
-        a_scales: &RocmStorage,
-        a_sums: &RocmStorage,
-        b_qweight: &RocmStorage,
-        b_scales: &RocmStorage,
-        b_zeros: &RocmStorage,
-        out_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        self.launch_dot8_w4a4_gemv_named(
-            "grim_dot8_w4a4_gemv_v3",
-            a_codes,
-            a_scales,
-            a_sums,
-            b_qweight,
-            b_scales,
-            b_zeros,
-            out_storage,
-            m,
-            n,
-            k,
-        )
-    }
-
-    /// v4 A/B launcher: `grim_dot8_w4a4_gemv_v4` over the INTERLEAVED weight
-    /// buffer (`grim_quant::interleave_w4a4_ostquant` output — one 1072-byte
-    /// record per (16-column block, 128-value group)). The A operands are the
-    /// same act-quant scratch the v1/v2/v3 launchers consume.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_dot8_w4a4_gemv_v4_for_ab(
-        &self,
-        a_codes: &RocmStorage,
-        a_scales: &RocmStorage,
-        a_sums: &RocmStorage,
-        b_inter: &RocmStorage,
-        out_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        let a_codes_ptr = a_codes
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv_v4: a_codes has no device ptr".into()))?;
-        let a_scales_ptr = a_scales
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv_v4: a_scales has no device ptr".into()))?;
-        let a_sums_ptr = a_sums
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv_v4: a_sums has no device ptr".into()))?;
-        let b_ptr = b_inter
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv_v4: b_inter has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv_v4: out has no device ptr".into()))?;
-
-        if k % 128 != 0 {
-            return Err(Error::Backend(format!(
-                "dot8_w4a4_gemv_v4: K={k} must be divisible by 128"
-            )));
-        }
-        let n_groups = k / 128;
-        let spans = n_groups.div_ceil(32);
-        let cnt_last = n_groups - (spans - 1) * 32;
-        let expected = n * ((spans - 1) * 2176 + cnt_last * 68);
-        if (b_inter.bytes() as usize) < expected {
-            return Err(Error::Backend(format!(
-                "dot8_w4a4_gemv_v4: b_inter {} bytes smaller than the lane-contiguous \
-                 plane layout's {} (n={n} k={k})",
-                b_inter.bytes(),
-                expected
-            )));
-        }
-
-        let grid_dim = HipDim3::new((n as u32).div_ceil(16), m as u32, 1);
-        let block_dim = HipDim3::new(128, 1, 1);
-
-        let mut a_c = a_codes_ptr;
-        let mut a_s = a_scales_ptr;
-        let mut a_sum = a_sums_ptr;
-        let mut b_i = b_ptr;
-        let mut optr = out_ptr;
-        let mut mm = m as i32;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-
-        crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
-        self.launch_compute_kernel(
-            "grim_dot8_w4a4_gemv_v4",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut a_c),
-                arg(&mut a_s),
-                arg(&mut a_sum),
-                arg(&mut b_i),
-                arg(&mut optr),
-                arg(&mut mm),
-                arg(&mut nn),
-                arg(&mut kk),
-            ],
         )
     }
 
@@ -3435,13 +3323,13 @@ impl RocmDevice {
             )));
         }
 
-        let grid_x = if kernel == "grim_dot8_w4a4_gemv_v3" || kernel == "grim_dot8_w4a4_gemv_v5" {
+        let grid_x = if kernel == "grim_dot8_w4a4_gemv_v5" {
             (n as u32).div_ceil(16)
         } else {
             (n as u32).div_ceil(4)
         };
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = if kernel == "grim_dot8_w4a4_gemv_v3" || kernel == "grim_dot8_w4a4_gemv_v5" {
+        let block_dim = if kernel == "grim_dot8_w4a4_gemv_v5" {
             HipDim3::new(128, 1, 1)
         } else {
             HipDim3::new(32, 1, 1)
