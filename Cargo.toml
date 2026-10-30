@@ -6,6 +6,7 @@ members = [
     "crates/grim-hip-sys",
     "crates/cubecl-hip-sys",
     "crates/grim-cl-hip",
+    "crates/cubecl-hip",
     "crates/grim-tensor",
     "crates/grim-backend-cpu",
     "crates/grim-backend-rocm",
@@ -114,3 +115,6 @@ convert_case = { path = "third-party/convert_case-0.10.1" }
 # (bindgen renamed the enum consts); grim-hip-sys carries a 7.16-generated
 # file with the full surface cubecl-hip 0.10 imports.
 cubecl-hip-sys = { path = "crates/cubecl-hip-sys" }
+# cubecl-hip 0.10: bind to grim's vendored source (grim-cl-hip) instead of the
+# crates.io registry copy. See crates/grim-cl-hip/PROVENANCE.md.
+cubecl-hip = { path = "crates/cubecl-hip" }

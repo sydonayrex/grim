@@ -1,0 +1,25 @@
+[package]
+name = "cubecl-hip"
+# Compat shim: [patch.crates-io] needs this exact name + a ^0.10.0 version so
+# grim-backend-rocm and the cubecl 0.10 umbrella bind to the vendored
+# grim-cl-hip source instead of the crates.io registry copy. Features forward
+# to grim-cl-hip (a `pub use` does not carry feature gates across crates).
+version = "0.10.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "cubecl-hip API surface re-exported from grim-cl-hip"
+repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-hip"
+publish = false
+
+[features]
+# Mirrors upstream cubecl-hip 0.10.0's feature names so every consumer
+# (cubecl umbrella's `cubecl-hip?/default`, grim-backend-rocm's default dep)
+# forwards to the corresponding grim-cl-hip feature.
+default = ["grim-cl-hip/default"]
+std = ["grim-cl-hip/std"]
+rocwmma = ["grim-cl-hip/rocwmma"]
+tracing = ["grim-cl-hip/tracing"]
+
+[dependencies]
+grim-cl-hip = { path = "../grim-cl-hip" }

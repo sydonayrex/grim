@@ -1328,20 +1328,8 @@ dependencies = [
 [[package]]
 name = "cubecl-hip"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c6b510a9348f06ecd56b32cf10eb6241639e927a87f5c09ec61cc7a7610d5a3"
 dependencies = [
- "bytemuck",
- "cubecl-common",
- "cubecl-core",
- "cubecl-cpp",
- "cubecl-hip-sys",
- "cubecl-runtime",
- "derive-new",
- "half",
- "log",
- "paste",
- "serde",
+ "grim-cl-hip",
 ]
 
 [[package]]
