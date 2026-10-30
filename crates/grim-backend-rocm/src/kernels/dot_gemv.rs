@@ -1235,23 +1235,32 @@ extern "C" __global__ void __launch_bounds__(32) grim_fp32_gemv_v2(
     const float* b0 = weight + (long long)col_base * K;
     const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
 
+    // v5-style predicated single loop: the fast loop + scalar tail collapse
+    // into one 4-wide step. Same 16-floats-in-flight batching and the same
+    // per-lane ascending K order; out-of-range loads read 0.0, and
+    // `facc + 0.0f` is an exact identity (facc starts +0.0 and never turns
+    // -0.0), so the output stays bit-identical to `grim_fp32_gemv`.
     float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    int blk = lane;
-    for (; blk + 96 < K; blk += 128) {
-        const float a0 = a_row[blk];
-        const float a1 = a_row[blk + 32];
-        const float a2 = a_row[blk + 64];
-        const float a3 = a_row[blk + 96];
+    for (int blk = lane; blk < K; blk += 128) {
+        const int b1 = blk + 32;
+        const int b2 = blk + 64;
+        const int b3 = blk + 96;
+        const float a_v[4] = {
+            a_row[blk],
+            (b1 < K) ? a_row[b1] : 0.0f,
+            (b2 < K) ? a_row[b2] : 0.0f,
+            (b3 < K) ? a_row[b3] : 0.0f,
+        };
 
         float b_v[4][4];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j < active_cols) {
-                const float* bj = b0 + (long long)j * K + blk;
-                b_v[j][0] = bj[0];
-                b_v[j][1] = bj[32];
-                b_v[j][2] = bj[64];
-                b_v[j][3] = bj[96];
+                const float* bj = b0 + (long long)j * K;
+                b_v[j][0] = bj[blk];
+                b_v[j][1] = (b1 < K) ? bj[b1] : 0.0f;
+                b_v[j][2] = (b2 < K) ? bj[b2] : 0.0f;
+                b_v[j][3] = (b3 < K) ? bj[b3] : 0.0f;
             } else {
                 b_v[j][0] = 0.0f;
                 b_v[j][1] = 0.0f;
@@ -1263,23 +1272,10 @@ extern "C" __global__ void __launch_bounds__(32) grim_fp32_gemv_v2(
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j >= active_cols) break;
-            facc[j] += a0 * b_v[j][0];
-            facc[j] += a1 * b_v[j][1];
-            facc[j] += a2 * b_v[j][2];
-            facc[j] += a3 * b_v[j][3];
-        }
-    }
-    for (; blk < K; blk += 32) {
-        const float a = a_row[blk];
-        float b_v[4];
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            b_v[j] = (j < active_cols) ? b0[(long long)j * K + blk] : 0.0f;
-        }
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j >= active_cols) break;
-            facc[j] += a * b_v[j];
+            facc[j] += a_v[0] * b_v[j][0];
+            facc[j] += a_v[1] * b_v[j][1];
+            facc[j] += a_v[2] * b_v[j][2];
+            facc[j] += a_v[3] * b_v[j][3];
         }
     }
 
@@ -1973,23 +1969,32 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot2_bf16_gemv_v2(
     const unsigned* b0 = (const unsigned*)(B + (long long)col_base * K);
     const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
 
+    // v5-style predicated single loop (see grim_fp32_gemv_v2): the fast loop
+    // + scalar tail collapse into one 4-wide step. Same 32-dword-in-flight
+    // batching and per-lane ascending order; out-of-range loads read 0u, and
+    // `fdot2(.., 0u, 0u, facc) = facc + 0.0f` is an exact identity, so the
+    // output stays bit-identical to `grim_dot2_bf16_gemv`.
     float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    int p = lane;
-    for (; p + 96 < n_pairs; p += 128) {
-        const unsigned a0 = a_row[p];
-        const unsigned a1 = a_row[p + 32];
-        const unsigned a2 = a_row[p + 64];
-        const unsigned a3 = a_row[p + 96];
+    for (int p = lane; p < n_pairs; p += 128) {
+        const int p1 = p + 32;
+        const int p2 = p + 64;
+        const int p3 = p + 96;
+        const unsigned a_v[4] = {
+            a_row[p],
+            (p1 < n_pairs) ? a_row[p1] : 0u,
+            (p2 < n_pairs) ? a_row[p2] : 0u,
+            (p3 < n_pairs) ? a_row[p3] : 0u,
+        };
 
         unsigned b_v[4][4];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j < active_cols) {
-                const unsigned* bj = b0 + (long long)j * n_pairs + p;
-                b_v[j][0] = bj[0];
-                b_v[j][1] = bj[32];
-                b_v[j][2] = bj[64];
-                b_v[j][3] = bj[96];
+                const unsigned* bj = b0 + (long long)j * n_pairs;
+                b_v[j][0] = bj[p];
+                b_v[j][1] = (p1 < n_pairs) ? bj[p1] : 0u;
+                b_v[j][2] = (p2 < n_pairs) ? bj[p2] : 0u;
+                b_v[j][3] = (p3 < n_pairs) ? bj[p3] : 0u;
             } else {
                 b_v[j][0] = 0u;
                 b_v[j][1] = 0u;
@@ -2001,23 +2006,10 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot2_bf16_gemv_v2(
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j >= active_cols) break;
-            facc[j] = grim_fdot2_f32_bf16(a0, b_v[j][0], facc[j]);
-            facc[j] = grim_fdot2_f32_bf16(a1, b_v[j][1], facc[j]);
-            facc[j] = grim_fdot2_f32_bf16(a2, b_v[j][2], facc[j]);
-            facc[j] = grim_fdot2_f32_bf16(a3, b_v[j][3], facc[j]);
-        }
-    }
-    for (; p < n_pairs; p += 32) {
-        const unsigned a2 = a_row[p];
-        unsigned b_v[4];
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            b_v[j] = (j < active_cols) ? b0[(long long)j * n_pairs + p] : 0u;
-        }
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j >= active_cols) break;
-            facc[j] = grim_fdot2_f32_bf16(a2, b_v[j], facc[j]);
+            facc[j] = grim_fdot2_f32_bf16(a_v[0], b_v[j][0], facc[j]);
+            facc[j] = grim_fdot2_f32_bf16(a_v[1], b_v[j][1], facc[j]);
+            facc[j] = grim_fdot2_f32_bf16(a_v[2], b_v[j][2], facc[j]);
+            facc[j] = grim_fdot2_f32_bf16(a_v[3], b_v[j][3], facc[j]);
         }
     }
 

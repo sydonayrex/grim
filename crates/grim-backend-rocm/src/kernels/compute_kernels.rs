@@ -1199,37 +1199,36 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
     // 120 at 4.0 us). The dependent load->FMA chain was never hidden: ~200
     // cycles x 128 iterations x 2 passes. Decode runs one row per layer, so
     // 64 of the 73 norms per token paid it (3.1 ms/token of 23.0).
-    int col = lane;
-    for (; col + 96 < row_len; col += 128) {
+    //
+    // v5-style predicated single loop: the fast loop + scalar tail collapse
+    // into one 4-wide step. Out-of-range loads read 0.0, and `ss + 0.0f` is
+    // an exact identity (ss starts +0.0 and never turns -0.0), so output
+    // stays bit-identical.
+    for (int col = lane; col < row_len; col += 128) {
+        const int c1 = col + 32;
+        const int c2 = col + 64;
+        const int c3 = col + 96;
         const float v0 = x_row[col];
-        const float v1 = x_row[col + 32];
-        const float v2 = x_row[col + 64];
-        const float v3 = x_row[col + 96];
+        const float v1 = (c1 < row_len) ? x_row[c1] : 0.0f;
+        const float v2 = (c2 < row_len) ? x_row[c2] : 0.0f;
+        const float v3 = (c3 < row_len) ? x_row[c3] : 0.0f;
         ss += v0 * v0;
         ss += v1 * v1;
         ss += v2 * v2;
         ss += v3 * v3;
     }
-    for (; col < row_len; col += 32) {
-        const float v = x_row[col];
-        ss += v * v;
-    }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         ss += __shfl_xor_sync(shfl_mask, ss, off);
     float rms = sqrtf(ss / (float)row_len + eps);
-    for (col = lane; col + 96 < row_len; col += 128) {
-        const float r0 = x_row[col] * w[col];
-        const float r1 = x_row[col + 32] * w[col + 32];
-        const float r2 = x_row[col + 64] * w[col + 64];
-        const float r3 = x_row[col + 96] * w[col + 96];
-        o_row[col] = r0 / rms;
-        o_row[col + 32] = r1 / rms;
-        o_row[col + 64] = r2 / rms;
-        o_row[col + 96] = r3 / rms;
-    }
-    for (; col < row_len; col += 32) {
+    for (int col = lane; col < row_len; col += 128) {
+        const int c1 = col + 32;
+        const int c2 = col + 64;
+        const int c3 = col + 96;
         o_row[col] = x_row[col] * w[col] / rms;
+        if (c1 < row_len) o_row[c1] = x_row[c1] * w[c1] / rms;
+        if (c2 < row_len) o_row[c2] = x_row[c2] * w[c2] / rms;
+        if (c3 < row_len) o_row[c3] = x_row[c3] * w[c3] / rms;
     }
 }
 
@@ -1253,38 +1252,34 @@ grim_rms_norm_i8(const float* __restrict__ x, const signed char* __restrict__ co
 
     float ss = 0.0f;
     // Same 4-wide unroll and same summation order as `grim_rms_norm` (see the
-    // comment there): identical output, unhidden-load latency removed.
-    int col = lane;
-    for (; col + 96 < row_len; col += 128) {
+    // comment there): identical output, unhidden-load latency removed. The
+    // fast loop + scalar tail likewise collapse into one predicated step —
+    // out-of-range loads read 0.0 and `ss + 0.0f` is an exact identity.
+    for (int col = lane; col < row_len; col += 128) {
+        const int c1 = col + 32;
+        const int c2 = col + 64;
+        const int c3 = col + 96;
         const float v0 = x_row[col];
-        const float v1 = x_row[col + 32];
-        const float v2 = x_row[col + 64];
-        const float v3 = x_row[col + 96];
+        const float v1 = (c1 < row_len) ? x_row[c1] : 0.0f;
+        const float v2 = (c2 < row_len) ? x_row[c2] : 0.0f;
+        const float v3 = (c3 < row_len) ? x_row[c3] : 0.0f;
         ss += v0 * v0;
         ss += v1 * v1;
         ss += v2 * v2;
         ss += v3 * v3;
     }
-    for (; col < row_len; col += 32) {
-        const float v = x_row[col];
-        ss += v * v;
-    }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         ss += __shfl_xor_sync(shfl_mask, ss, off);
     float rms = sqrtf(ss / (float)row_len + eps);
-    for (col = lane; col + 96 < row_len; col += 128) {
-        const float r0 = x_row[col] * (w_scale * (float)codes[col]);
-        const float r1 = x_row[col + 32] * (w_scale * (float)codes[col + 32]);
-        const float r2 = x_row[col + 64] * (w_scale * (float)codes[col + 64]);
-        const float r3 = x_row[col + 96] * (w_scale * (float)codes[col + 96]);
-        o_row[col] = r0 / rms;
-        o_row[col + 32] = r1 / rms;
-        o_row[col + 64] = r2 / rms;
-        o_row[col + 96] = r3 / rms;
-    }
-    for (; col < row_len; col += 32) {
+    for (int col = lane; col < row_len; col += 128) {
+        const int c1 = col + 32;
+        const int c2 = col + 64;
+        const int c3 = col + 96;
         o_row[col] = x_row[col] * (w_scale * (float)codes[col]) / rms;
+        if (c1 < row_len) o_row[c1] = x_row[c1] * (w_scale * (float)codes[c1]) / rms;
+        if (c2 < row_len) o_row[c2] = x_row[c2] * (w_scale * (float)codes[c2]) / rms;
+        if (c3 < row_len) o_row[c3] = x_row[c3] * (w_scale * (float)codes[c3]) / rms;
     }
 }
 
