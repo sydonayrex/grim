@@ -163,6 +163,7 @@ pub enum Device {
 
 - **`grim-backend-cpu`**: Vectorized execution using AVX2/AVX-512/NEON SIMD intrinsics with scalar fallback.
 - **`grim-backend-rocm`**: Primary GPU backend with rocBLAS bindings, HIP runtime FFI, Wave32/Wave64 kernel specialization, and JIT kernel compilation.
+- **`grim-hip-sys`**: The single HIP FFI boundary — vendored per-patch bindgen bindings (from tracel-ai/cubecl-hip, MIT OR Apache-2.0; see its PROVENANCE.md). Static-link by default (lib discovery via `build_rocm_detect.rs`, include!-ed without duplication); the `dynamic` feature swaps in runtime `libloading` resolution. `grim-backend-rocm/src/device/handles.rs` is the adapter layer keeping grim's loose `c_void`/`i32` convention over the typed bindgen signatures; no HIP symbol is declared anywhere else (except `hipGraphExtendFromGlobalStream`, absent from the 7.16 headers).
 - **`grim-backend-cuda`**: NVIDIA GPU backend with cuBLAS GEMM dispatch and runtime PTX compilation.
 - **`grim-backend-vulkan`**: Platform-portable compute shader backend dispatching SPIR-V pipelines.
 - **`grim-backend-metal`**: Apple Silicon GPU backend using Metal Performance Shaders and MSL shaders.

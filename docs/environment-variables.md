@@ -28,6 +28,8 @@ fails if any variable documented here stops being read in `crates/`.
 
 ## grim-backend-rocm
 
+Build-time discovery (`ROCM_PATH`, `HIP_PATH`) is honored by BOTH `grim-backend-rocm/build.rs` and the `grim-hip-sys` bindings build script (static arm); the `dynamic` feature of `grim-hip-sys` instead searches `ROCM_PATH`/`HIP_PATH` at runtime. `GRIM_TEST_GPU` selects the device ordinal for `grim-hip-sys`'s GPU-gated e2e test.
+
 | Variable | Polarity | Default | Owner(s) |
 |---|---|---|---|
 | `GRIM_ALLOC_NO_POOL` | `set` disables the caching pool (every free is a synchronized real release) | pool enabled | grim-backend-rocm |
