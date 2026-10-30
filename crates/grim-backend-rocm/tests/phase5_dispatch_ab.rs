@@ -215,10 +215,16 @@ fn phase5_dispatch_ab_benchmark() {
             (acc.0.max(m), acc.1.max(k), acc.2.max(n))
         });
         let b_bytes = encode_weights(fmt, n_max, k_max);
+        // Element-shaped [n_max, k_max], NOT a 1-D byte-length shape: the
+        // requant_kquant_to_whitecrow coherence guard computes
+        // expected_bytes(elem_count), and a 1-D byte-length shape makes it
+        // read packed BYTES as elements (7,208,960 B -> "expected"
+        // 3,097,600). Production weights are element-shaped [n, k]; with this
+        // label the guard's expectation equals the blob byte-for-byte.
         let b_dev = MemoryOps::from_cpu_bytes(
             &dev,
             &b_bytes,
-            &Shape::new(vec![b_bytes.len()]),
+            &Shape::new(vec![n_max, k_max]),
             fmt.dtype(),
         )
         .expect("upload weights");
