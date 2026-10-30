@@ -1,0 +1,14 @@
+[package]
+name = "cubecl-hip-sys"
+# Compat shim: [patch.crates-io] needs this exact name so `cubecl-hip` 0.10
+# binds to the vendored grim bindings instead of the crates.io 7.2 file that
+# does not compile against ROCm 7.16. Pure re-export of grim-hip-sys.
+version = "7.16.2638501"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT OR Apache-2.0"
+description = "cubecl-hip-sys API surface re-exported from grim-hip-sys"
+publish = false
+
+[dependencies]
+grim-hip-sys = { path = "../grim-hip-sys" }

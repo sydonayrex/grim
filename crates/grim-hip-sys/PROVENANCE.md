@@ -32,3 +32,12 @@ Apache-2.0 — both license texts ship in this directory.
 * static (default): missing `libamdhip64.so` = loader error before `main`.
 * `dynamic`: missing runtime = panic on the first HIP call; use
   `grim_hip_sys::is_available()` for a graceful probe. Off by default.
+
+## cubecl-hip compat shim
+
+`crates/cubecl-hip-sys/` is a one-file re-export shim named exactly
+`cubecl-hip-sys` (version 7.16.2638501, satisfying cubecl-hip 0.10's
+`^7.1.5280200` requirement). The workspace `[patch.crates-io]` entry binds
+upstream `cubecl-hip` to it because the crates.io `cubecl-hip-sys` 7.2 file
+does not compile against ROCm 7.16 headers (bindgen renamed the enum consts).
+

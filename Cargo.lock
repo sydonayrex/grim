@@ -1342,13 +1342,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-hip-sys"
-version = "7.14.6085001"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ba92853ebdf935ce68fdf96e4631a121ab72ce078201371ce7ace26603597f6"
+version = "7.16.2638501"
 dependencies = [
- "libc",
- "libloading 0.8.9",
- "regex",
+ "grim-hip-sys",
 ]
 
 [[package]]
@@ -2729,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "grim-hip-sys"
-version = "0.1.0"
+version = "7.16.2638501"
 dependencies = [
  "libc",
  "libloading 0.8.9",

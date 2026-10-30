@@ -1,6 +1,9 @@
 [package]
 name = "grim-hip-sys"
-version = "0.1.0"
+# Version tracks the HIP patch the bindings were generated for (cubecl scheme:
+# <major>.<minor>.<patch><seq>) so the workspace [patch.crates-io] entry can
+# replace crates.io cubecl-hip-sys (required "^7.2") for the `cubecl-hip` crate.
+version = "7.16.2638501"
 edition = "2021"
 rust-version = "1.81"
 license = "MIT OR Apache-2.0"
