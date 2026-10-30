@@ -614,6 +614,10 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
+        // Route GROUP name: both the v1 and v2 forest kernels record under the
+        // family name, so dispatch gates that count "grim_dot4_forest_gemv"
+        // see either variant (same pattern as the w4a4 family's group route).
+        crate::device::compute::kernel_infra::record_kernel_route("grim_dot4_forest_gemv");
         self.launch_compute_kernel(
             kernel_name,
             grid_dim,
