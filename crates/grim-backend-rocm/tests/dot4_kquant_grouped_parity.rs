@@ -2972,25 +2972,24 @@ fn corvid_w4a4_true_cold_ab() -> Result<(), String> {
         }
         ceil_batched.sort_by(|x, y| x.partial_cmp(y).unwrap());
 
-        // ── v5 BATCHED: 16 back-to-back GEMVs across the rotating copies,
-        //    one sync — launch overhead amortized, weights still DRAM ────
-        let mut v5_batched = Vec::new();
-        for _ in 0..SWEEPS {
-            let t = std::time::Instant::now();
-            for it in 0..16 {
-                dev.launch_dot8_w4a4_gemv_v5_for_ab(
-                    ac_r, as_r, asum_r,
-                    as_rocm(qw_c[it % COPIES].as_ref()).unwrap(),
-                    as_rocm(sc_c[it % COPIES].as_ref()).unwrap(),
-                    as_rocm(zr_c[it % COPIES].as_ref()).unwrap(),
-                    o4, m, n, k,
-                )
-                .map_err(|e| e.to_string())?;
+        // ── BATCHED-16 for EVERY variant: 16 back-to-back GEMVs across the
+        //    rotating copies, one sync — launch overhead amortized, weights
+        //    still DRAM. This is the number that covers each kernel's
+        //    at-ceiling claim AND prices the whole v2->v5 effort. ──────────
+        let mut batched: Vec<(&str, Vec<f64>)> = Vec::new();
+        for (name, f) in &kernels {
+            let mut meds = Vec::new();
+            for _ in 0..SWEEPS {
+                let t = std::time::Instant::now();
+                for it in 0..16 {
+                    f(it % COPIES)?;
+                }
+                dev.synchronize();
+                meds.push(bytes * 16.0 / t.elapsed().as_secs_f64() / 1e9);
             }
-            dev.synchronize();
-            v5_batched.push(bytes * 16.0 / t.elapsed().as_secs_f64() / 1e9);
+            meds.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            batched.push((name, meds));
         }
-        v5_batched.sort_by(|x, y| x.partial_cmp(y).unwrap());
 
         println!("--- harness calibration (n={n} k={k}) ---");
         println!(
@@ -3003,10 +3002,14 @@ fn corvid_w4a4_true_cold_ab() -> Result<(), String> {
             ceil_single[ITERS / 2],
             ceil_batched[SWEEPS / 2]
         );
-        println!(
-            "  v5 batched16: {:.1} GB/s (median-of-sweeps)  <- compare against the batched ceiling",
-            v5_batched[SWEEPS / 2]
-        );
+        let ceiling = ceil_batched[SWEEPS / 2];
+        for (name, meds) in &batched {
+            println!(
+                "  {name} batched16: {:>6.1} GB/s (median-of-sweeps)  = {:>5.1}% of ceiling",
+                meds[SWEEPS / 2],
+                meds[SWEEPS / 2] / ceiling * 100.0
+            );
+        }
 
         println!("\n=== true-cold W4A4 GEMV  n={n} k={k}  ({:.1} MB/weight x {COPIES} copies, median of {ITERS} iters x {SWEEPS} sweeps) ===", bytes / 1e6);
         for (name, f) in &kernels {
