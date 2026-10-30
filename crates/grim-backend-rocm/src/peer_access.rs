@@ -72,20 +72,28 @@ pub fn boundary_host_sync_count() -> u64 {
 /// non-blocking one). That cycle is broken by the wave's IDLE budget, and the
 /// allocation ordering it exposed is now the ring's documented rule.
 ///
-/// `GRIM_RING_HANDOFF=0` turns it OFF, which restores A6's host-issued peer
-/// copy + event for a bisect.
+/// Opt-in per the decode-graph contract ("OFF unless `GRIM_RING_HANDOFF=1`"),
+/// with explicit-over-implicit precedence between the two knobs:
+///
+///   * `GRIM_RING_HANDOFF=1` + `GRIM_P2P_HOST_BOUNCE` UNSET -> ON. The old
+///     code read the bounce default (on) FIRST, so an explicit handoff
+///     request silently lost to an implicit bounce default and the handoff
+///     never ran — the M6 gate failed with "got 3" host syncs.
+///   * `GRIM_P2P_HOST_BOUNCE=1` (explicit) -> OFF even with the handoff
+///     asked for: broken PCIe atomics / P2P DMA is a hardware statement,
+///     and the handoff's device-side copy cannot run over it. A6's ordered
+///     host-staged copy is used instead.
+///   * Both unset -> OFF (the documented default).
 pub fn ring_handoff_enabled() -> bool {
-    // When host bounce is active (broken PCIe atomics / P2P DMA across motherboard bridge),
-    // ring handoff device-polling is disabled; A6's ordered host-staged copy is used instead.
-    let host_bounce = std::env::var("GRIM_P2P_HOST_BOUNCE")
-        .map(|v| v != "0" && v != "false")
-        .unwrap_or(true);
-    if host_bounce {
-        return false;
-    }
-    match std::env::var("GRIM_RING_HANDOFF") {
-        Ok(v) => v != "0",
-        Err(_) => true,
+    let handoff = std::env::var("GRIM_RING_HANDOFF").ok().map(|v| v != "0");
+    let bounce_on = std::env::var("GRIM_P2P_HOST_BOUNCE")
+        .ok()
+        .map(|v| v != "0" && v != "false");
+    match (handoff, bounce_on) {
+        (Some(false), _) => false,
+        (_, Some(true)) => false,   // explicit host bounce wins
+        (Some(true), _) => true,    // explicit handoff beats implicit bounce
+        (None, _) => false,         // documented default: OFF
     }
 }
 
