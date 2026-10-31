@@ -3657,6 +3657,53 @@ impl RocmDevice {
                 self.launch_wmma_gemm_fp8_e4m3_blocked(&converted, w, out, m, n, k)?;
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
+            // Marlin-style W4A4OstQuant resident blob (convert-on-load):
+            // quantize the activation to u4 group-128 scratch and run the
+            // blob GEMV. Capture-safe: the scratch buffers are device fields
+            // grown during the EAGER warmup walks that precede capture —
+            // with them sized, need_alloc is false inside the bracket and
+            // nothing allocates. First-ever use must be eager (the warmup
+            // walks guarantee it); a cold capture would fail loud on the
+            // alloc, not silently.
+            DTypeStorage::W4A4OstQuant(cfg) => {
+                let n_groups = k / cfg.group_size.max(1);
+                let a_rocm = a
+                    .as_any()
+                    .downcast_ref::<RocmStorage>()
+                    .ok_or_else(|| Error::Backend("linear_decode_into: act not RocmStorage".into()))?;
+                let scratch = self.act_u4_quant_scratch(a_rocm, m, n_groups)?;
+                let mut a_c = scratch.codes_ptr as *mut c_void;
+                let mut a_s = scratch.scales_ptr as *mut c_void;
+                let mut a_sum = scratch.sums_ptr as *mut c_void;
+                let b_w = w
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("linear_decode_into: w4a4 blob has no device ptr".into()))?;
+                let o_ptr = out
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("linear_decode_into: out has no device ptr".into()))?;
+                let mut b_i = b_w;
+                let mut optr = o_ptr;
+                let mut mm = m as i32;
+                let mut nn = n as i32;
+                let mut kk = k as i32;
+                crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
+                self.launch_compute_kernel(
+                    "grim_dot8_w4a4_gemv_v5",
+                    HipDim3::new((n as u32).div_ceil(16), m as u32, 1),
+                    HipDim3::new(128, 1, 1),
+                    &mut [
+                        arg(&mut a_c),
+                        arg(&mut a_s),
+                        arg(&mut a_sum),
+                        arg(&mut b_i),
+                        arg(&mut optr),
+                        arg(&mut mm),
+                        arg(&mut nn),
+                        arg(&mut kk),
+                    ],
+                )?;
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+            }
             _ => Err(Error::Unimplemented(format!(
                 "linear_decode_into: unsupported weight dtype for graph decode: {:?}",
                 w.dtype()

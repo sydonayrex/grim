@@ -70,7 +70,7 @@ pub use device::util::{ensure_rocm_watchdog_started, report_rocm_progress};
 // exactly the place it exists to serve.
 pub use device::compute::gemm_launchers::BLASLT_ROUTE;
 pub use device::compute::kernel_infra::{
-    kernel_route_snapshot, record_kernel_route, reset_kernel_route_counters,
+    kernel_route_snapshot, kernel_times_snapshot, record_kernel_route, reset_kernel_route_counters,
     rocm_kernel_route_counter,
 };
 

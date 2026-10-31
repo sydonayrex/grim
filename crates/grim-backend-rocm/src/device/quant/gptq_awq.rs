@@ -655,7 +655,7 @@ impl RocmDevice {
     /// and v4 blob launchers. The guards are held by the returned struct until
     /// the caller's launch completes: dropping them would let a concurrent
     /// larger allocation replace (and free) the buffers mid-launch.
-    fn act_u4_quant_scratch(
+    pub(crate) fn act_u4_quant_scratch(
         &self,
         a_storage: &RocmStorage,
         m: usize,

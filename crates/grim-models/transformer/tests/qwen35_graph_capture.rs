@@ -1887,6 +1887,11 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         std::env::set_var("GRIM_KV_ARENA", std::env::var("GRIM_TEST_ARENA").unwrap_or_else(|_| "whitecrow".into()));
         std::env::remove_var("GRIM_KV_ARENA_ROWS");
         std::env::set_var("GRIM_CONTEXT", "1024");
+        // Both cards are 16304 MB — the planner's bandwidth-weighted 25/39
+        // split overloads rocm:1 (12-14 layers managed, ordinal-1 module
+        // loads 209 at 0.00 free). Pin the even split: both cards sit at
+        // 2.00 GiB free post-prewarm and the capture is stable.
+        std::env::set_var("GRIM_SPLIT_LAYERS", "32,32");
     }
 
     eprintln!("[27B] loading (16.5 GB)...");
@@ -1940,6 +1945,40 @@ fn qwen35_production_27b_route_wall_and_utilization() {
     // merge-era regression (aeeecac1 dual-GPU placement), attribution pending.
     // Fall through to the EAGER measurement, which is the real dependent chain
     // (620 launches) and the utilization denominator we can get today.
+    // DECOMPOSITION (review order item 1): one eager record walk with
+    // GRIM_KERNEL_TIMES=1 gives per-kernel-type event totals.
+    unsafe { std::env::set_var("GRIM_KERNEL_TIMES", "1") };
+    let times_before = grim_backend_rocm::kernel_times_snapshot();
+    // The walk can die mid-layer (KDA module load 209 once ordinal 1 fills —
+    // the mirror's own damage). Catch it and decompose whatever ran.
+    let walk_r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = model.forward_capture(&mut graph, 11);
+    }));
+    let times_after = grim_backend_rocm::kernel_times_snapshot();
+    unsafe { std::env::remove_var("GRIM_KERNEL_TIMES") };
+    if walk_r.is_err() {
+        eprintln!("[decomp] record walk PANICKED mid-walk (mirror-filled ordinal 1) — partial decomposition below");
+    }
+    let mut per_kernel: Vec<(String, u64, u64)> = times_after
+        .iter()
+        .map(|(k3, c, us3)| {
+            let before = times_before
+                .iter()
+                .find(|(k2, _, _)| k2 == k3)
+                .map(|(_, _, v2)| *v2)
+                .unwrap_or(0);
+            (k3.clone(), c.saturating_sub(before), us3.saturating_sub(before))
+        })
+        .filter(|(_, c, us)| *c > 0 || *us > 0)
+        .collect();
+    per_kernel.sort_by(|a, b| b.2.cmp(&a.2));
+    let total_us: u64 = per_kernel.iter().map(|(_, _, us)| *us).sum();
+    eprintln!("[decomp] per-kernel busy totals (one eager walk):");
+    for (name, count, us) in &per_kernel {
+        eprintln!("[decomp]   {count:>4}x {name:<44} {us:>9} us");
+    }
+    eprintln!("[decomp] kernel busy total = {total_us} us");
+
     let capture_note = {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             graph.begin_capture().expect("begin capture");
@@ -2090,4 +2129,5 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         std::env::set_var("GRIM_KV_ARENA", "f32");
         std::env::remove_var("GRIM_CONTEXT");
     }
+    unsafe { std::env::remove_var("GRIM_SPLIT_LAYERS"); }
 }

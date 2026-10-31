@@ -435,6 +435,32 @@ impl RocmDevice {
                 stream
             );
         }
+        // DIAGNOSTIC (GRIM_KERNEL_TIMES=1): per-entry event timing for the
+        // stream-bound walk launches (same accumulation as the cached path).
+        let timed_on_stream = std::env::var("GRIM_KERNEL_TIMES").is_ok();
+        let (tev0, tev1) = if timed_on_stream {
+            use crate::device::handles::hipEventCreate;
+            let d = self.ordinal as usize;
+            let pair = kernel_time_events()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(d)
+                .or_insert_with(|| {
+                    let (mut a, mut b) = (std::ptr::null_mut(), std::ptr::null_mut());
+                    unsafe {
+                        let _ = hipEventCreate(&mut a);
+                        let _ = hipEventCreate(&mut b);
+                    }
+                    (a as usize, b as usize)
+                })
+                .clone();
+            unsafe {
+                let _ = crate::device::handles::hipEventRecord(pair.0 as *mut c_void, stream);
+            }
+            (pair.0 as *mut c_void, pair.1 as *mut c_void)
+        } else {
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        };
         let args_ptr = args.as_mut_ptr();
         crate::device::util::report_rocm_progress("hipModuleLaunchKernel:in-flight");
         check_hip("hipModuleLaunchKernel (stream)", unsafe {
@@ -452,6 +478,20 @@ impl RocmDevice {
                 std::ptr::null_mut(),
             )
         })?;
+        if timed_on_stream {
+            use crate::device::handles::{hipEventElapsedTime, hipEventRecord, hipEventSynchronize};
+            let mut ms = 0.0f32;
+            unsafe {
+                let _ = hipEventRecord(tev1, stream);
+                let _ = hipEventSynchronize(tev1);
+                let _ = hipEventElapsedTime(&mut ms, tev0, tev1);
+            }
+            if let Ok(mut acc) = kernel_time_map().lock() {
+                let e = acc.entry(entry.to_string()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += (ms * 1000.0) as u64;
+            }
+        }
         crate::device::util::report_rocm_progress("hipModuleLaunchKernel:done");
         Ok(stream)
     }
@@ -1024,6 +1064,33 @@ impl RocmDevice {
                         stream
                     );
                 }
+                // DIAGNOSTIC (GRIM_KERNEL_TIMES=1): per-entry event timing.
+                // Serializes each launch (event sync after) — inflates the
+                // wall; the per-entry totals are the output, not the wall.
+                let timed = std::env::var("GRIM_KERNEL_TIMES").is_ok();
+                let (ev0, ev1) = if timed {
+                    use crate::device::handles::{hipEventCreate, hipEventRecord};
+                    let d = self.ordinal as usize;
+                    let pair = kernel_time_events()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(d)
+                        .or_insert_with(|| {
+                            let (mut a, mut b) = (std::ptr::null_mut(), std::ptr::null_mut());
+                            unsafe {
+                                let _ = hipEventCreate(&mut a);
+                                let _ = hipEventCreate(&mut b);
+                            }
+                            (a as usize, b as usize)
+                        })
+                        .clone();
+                    unsafe {
+                        let _ = hipEventRecord(pair.0 as *mut c_void, stream);
+                    }
+                    (pair.0 as *mut c_void, pair.1 as *mut c_void)
+                } else {
+                    (std::ptr::null_mut(), std::ptr::null_mut())
+                };
                 let args_ptr = args.as_mut_ptr();
                 check_hip("hipModuleLaunchKernel (cached)", unsafe {
                     hipModuleLaunchKernel(
@@ -1042,6 +1109,28 @@ impl RocmDevice {
                 })?;
                 self.launch_counter.fetch_add(1, Ordering::Relaxed);
                 record_kernel_route(entry);
+                if timed {
+                    use crate::device::handles::{hipEventElapsedTime, hipEventRecord, hipEventSynchronize};
+                    static TIMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>> =
+                        std::sync::OnceLock::new();
+                    let m = TIMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    let mut ms = 0.0f32;
+                    unsafe {
+                        let _ = hipEventRecord(ev1, stream);
+                        let _ = hipEventSynchronize(ev1);
+                        let _ = hipEventElapsedTime(&mut ms, ev0, ev1);
+                    }
+                    if let Ok(mut acc) = m.lock() {
+                        let e = acc.entry(entry.to_string()).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += (ms * 1000.0) as u64;
+                    }
+                    if let Ok(mut acc) = m.lock() {
+                        let e = acc.entry(entry.to_string()).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += (ms * 1000.0) as u64;
+                    }
+                }
                 drop(_dev_guard);
                 return Ok(stream);
             }
@@ -1296,6 +1385,32 @@ pub fn rocm_kernel_route_counter(entry: &str) -> u64 {
 ///
 /// Sorted so a multi-kernel failure message is stable across runs; unsorted
 /// output is the sort of noise that gets a real regression dismissed.
+/// Per-entry cumulative kernel time for the GRIM_KERNEL_TIMES diagnostic.
+/// (entry -> count, total microseconds). Snapshot returns entries sorted.
+fn kernel_time_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>> {
+    static TIMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>> =
+        std::sync::OnceLock::new();
+    TIMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn kernel_times_snapshot() -> Vec<(String, u64, u64)> {
+    let m = kernel_time_map();
+    let mut v: Vec<(String, u64, u64)> = m
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, (c, us))| (k.clone(), *c, *us))
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v
+}
+
+fn kernel_time_events() -> &'static std::sync::Mutex<std::collections::HashMap<usize, (usize, usize)>> {
+    static EV: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, (usize, usize)>>> =
+        std::sync::OnceLock::new();
+    EV.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub fn kernel_route_snapshot() -> Vec<(String, u64)> {
     let Ok(m) = route_counters().read() else {
         return Vec::new();
