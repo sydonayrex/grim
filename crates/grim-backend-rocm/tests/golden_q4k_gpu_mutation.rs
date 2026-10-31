@@ -28,6 +28,13 @@ fn gpu_device() -> Option<RocmDevice> {
 #[test]
 #[ignore]
 fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
+    // The mutation target is the Q4K DECODE itself. The dispatch's u4-lane
+    // arm (GRIM_DECODE_W4A4, default ON) lossily requants Q4K weights to
+    // CityCrow u4 lanes and bypasses Q4K decode entirely — a separate,
+    // documented route. Force it OFF here so the golden oracle (exact Q4K
+    // dequant) is the right reference for every routing config below.
+    // SAFETY: single-threaded test process; no other readers of this knob.
+    unsafe { std::env::set_var("GRIM_DECODE_W4A4", "0") };
     // Non-square asymmetric dimensions: M=2, K=256, N=128
     let (m, k, n) = (2usize, 256usize, 128usize);
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
