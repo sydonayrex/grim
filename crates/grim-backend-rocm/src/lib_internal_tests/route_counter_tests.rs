@@ -43,8 +43,18 @@ use crate::device::compute::kernel_infra::{
 ///
 /// If this fails, either a kernel launched during test setup — which would mean
 /// some other test is not isolating — or the map is being pre-populated.
+/// The counter map is GLOBAL process state, and these tests both mutate it
+/// (reset) and assert on it (snapshot). Run in parallel they race each other's
+/// resets - serializing the file is the isolation the doc comment demands.
+static COUNTER_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    COUNTER_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn route_counters_start_at_zero() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     assert_eq!(
         rocm_kernel_route_counter("grim_wmma_gemm_fp8_e4m3"),
@@ -65,6 +75,7 @@ fn route_counters_start_at_zero() {
 /// accidentally created entries would make the *next* test's assertion pass.
 #[test]
 fn an_unknown_kernel_reads_zero_without_creating_an_entry() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     assert_eq!(rocm_kernel_route_counter("grim_definitely_not_a_kernel"), 0);
     assert_eq!(
@@ -82,7 +93,7 @@ fn an_unknown_kernel_reads_zero_without_creating_an_entry() {
 fn reset_clears_every_counter() {
     // Nothing to clear on a fresh process, but the call must be safe and the
     // snapshot must still be empty afterwards.
-    reset_kernel_route_counters();
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     assert_eq!(rocm_kernel_route_counter("grim_wmma_gemm_fp8_e4m3"), 0);
     assert!(kernel_route_snapshot().is_empty());
@@ -94,6 +105,7 @@ fn reset_clears_every_counter() {
 /// which is exactly the sort of noise that gets a real regression dismissed.
 #[test]
 fn the_snapshot_is_sorted_by_name() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     // The snapshot is empty here (no GPU launches), so this asserts the
     // contract on an empty collection and the ordering is exercised whenever a
@@ -114,6 +126,7 @@ fn the_snapshot_is_sorted_by_name() {
 /// visibility, not a total order across kernels.
 #[test]
 fn concurrent_increments_are_exact() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 
     const THREADS: u64 = 8;
@@ -139,6 +152,7 @@ fn concurrent_increments_are_exact() {
         THREADS * PER_THREAD,
         "concurrent increments must not lose updates"
     );
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
@@ -148,6 +162,7 @@ fn concurrent_increments_are_exact() {
 /// assertion pass regardless of which kernel ran.
 #[test]
 fn distinct_kernels_are_counted_independently() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     for _ in 0..3 {
         crate::device::compute::kernel_infra::record_kernel_route("grim_alpha");
@@ -160,6 +175,7 @@ fn distinct_kernels_are_counted_independently() {
 
     let snap = kernel_route_snapshot();
     assert_eq!(snap.len(), 2, "only launched kernels appear: {snap:?}");
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
@@ -171,6 +187,7 @@ fn distinct_kernels_are_counted_independently() {
 /// the counter exists to rule out.
 #[test]
 fn long_similar_names_do_not_collide() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     let a = "grim_wmma_gemm_fp8_e4m3";
     let b = "grim_wmma_gemm_fp8_e4m3_something_else_entirely";
@@ -185,6 +202,7 @@ fn long_similar_names_do_not_collide() {
         1,
         "prefix-sharing names must not merge"
     );
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
@@ -197,12 +215,14 @@ fn long_similar_names_do_not_collide() {
 /// bound, which would be over-specifying.
 #[test]
 fn repeated_names_reuse_one_entry() {
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
     for _ in 0..1000 {
         crate::device::compute::kernel_infra::record_kernel_route("grim_repeat");
     }
     assert_eq!(kernel_route_snapshot().len(), 1);
     assert_eq!(rocm_kernel_route_counter("grim_repeat"), 1000);
+    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
