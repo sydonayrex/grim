@@ -74,7 +74,15 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
 
     // 2. Warm up pipeline eagerly to ensure kernels and rocBLAS GEMMs are compiled/cached
     {
-        let (mm, _) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+        let skip_mm = std::env::var("GRIM_BISECT_SKIP_MM").is_ok();
+        let (mm, _mh) = if skip_mm {
+            // Stand-in allocation of the same size so the sequence shape holds.
+            let st = CoreTensorOps::from_cpu(&dev, &vec![0.0f32; 64], &out_shape, DType::F32)?;
+            (st, None::<Box<dyn grim_tensor::backend::ComputeHandle>>)
+        } else {
+            let (st, h) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+            (st, Some(h))
+        };
         let (biased, _) = CoreTensorOps::add(&dev, mm.as_ref(), bias_dev.as_ref(), &out_shape)?;
         let (normed, _) =
             CoreTensorOps::rms_norm(&dev, biased.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape)?;
@@ -154,12 +162,97 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
         }
     }
 
-    // 5. Clean up graph
-    dev.drop_captured_graph(graph_key)?;
-    assert!(!dev.has_captured_graph(graph_key));
-
-    // Keep captured buffers alive until after graph is dropped
-    drop((mm_cap, biased_cap, normed_cap, scaled_cap));
+    // 5. Clean up graph — BISECT: skipped unless GRIM_BISECT_KEEP_TAIL=1
+    let mode = std::env::var("GRIM_BISECT_TAIL_MODE").unwrap_or_else(|_| "both".into());
+    if mode == "exec_only" || mode == "graph_only" {
+        // Manual capture of the same 4-op pipeline, then destroy exactly ONE
+        // of the two handles: isolates which driver destroy corrupts the heap.
+        use grim_backend_rocm::{
+            hipGraphDestroy, hipGraphExecDestroy, hipGraphInstantiate,
+            hipStreamBeginCapture, hipStreamEndCapture,
+        };
+        use std::os::raw::c_void;
+        let stream = dev.get_stream_from_pool(0).unwrap();
+        let _ = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape).unwrap();
+        dev.synchronize();
+        unsafe {
+            let mut g: *mut c_void = std::ptr::null_mut();
+            assert_eq!(hipStreamBeginCapture(stream, 2) as u32, 0);
+            // Re-issue the 4 ops under capture.
+            let (mm, _) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape).unwrap();
+            let (biased, _) = CoreTensorOps::add(&dev, mm.as_ref(), bias_dev.as_ref(), &out_shape).unwrap();
+            let (normed, _) = CoreTensorOps::rms_norm(&dev, biased.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape).unwrap();
+            let (_scaled, _) = CoreTensorOps::mul(&dev, normed.as_ref(), scale_dev.as_ref(), &out_shape).unwrap();
+            assert_eq!(hipStreamEndCapture(stream, &mut g) as u32, 0);
+            let mut exec: *mut c_void = std::ptr::null_mut();
+            assert_eq!(hipGraphInstantiate(&mut exec, g, std::ptr::null_mut(), std::ptr::null_mut(), 0) as u32, 0);
+            dev.synchronize();
+            eprintln!("[tail] manual capture + instantiate done");
+            if mode == "replay_only" {
+                for step in 0..10 {
+                    let a_data: Vec<f32> = (0..64)
+                        .map(|i| (((step + 1) * 17 + i) as f32 * 0.03).sin())
+                        .collect();
+                    dev.write_f32_into(a_dev.as_ref(), &a_data).unwrap();
+                    assert_eq!(grim_backend_rocm::hipGraphLaunch(exec, stream) as u32, 0);
+                    dev.synchronize();
+                }
+                eprintln!("[tail] 10 replays done");
+            }
+            if mode == "exec_only" || mode == "replay_only" {
+                assert_eq!(hipGraphExecDestroy(exec) as u32, 0);
+                dev.synchronize();
+                eprintln!("[tail] exec destroyed — alive");
+                // keep graph alive: leak the raw handle (test process exits anyway)
+                let _leak_graph = g;
+            } else {
+                assert_eq!(hipGraphDestroy(g) as u32, 0);
+                eprintln!("[tail] graph destroyed — alive");
+                // keep exec alive
+                let _leak_exec = exec;
+            }
+        }
+        eprintln!("[tail] post-destroy allocations:");
+        let probe = vec![0u8; 4096];
+        eprintln!("[tail] probe alloc ok len={}", probe.len());
+        return Ok(());
+    }
+    if mode == "rebind" {
+        // Sync + rebind BEFORE destroy.
+        dev.synchronize();
+        if let Ok(h) = dev.get_rocblas_handle() {
+            unsafe { grim_backend_rocm::rocblas_set_stream(h, dev.active_stream()) };
+        }
+        dev.synchronize();
+        eprintln!("[tail] synced + rebound");
+        dev.drop_captured_graph(graph_key)?;
+        assert!(!dev.has_captured_graph(graph_key));
+        eprintln!("[tail] drop_captured_graph done (after rebind)");
+    } else if mode == "exec_only_dev" {
+        // Destroy ONLY the exec (keep the graph handle alive) via the device
+        // cache — isolates hipGraphExecDestroy vs hipGraphDestroy.
+        let exec = dev.captured_graph_exec(graph_key).expect("exec");
+        unsafe { grim_backend_rocm::hipGraphExecDestroy(exec) };
+        eprintln!("[tail] exec-only destroy done");
+    } else if mode == "graph_only_dev" {
+        let graph = dev.captured_graph_handle(graph_key).expect("graph");
+        unsafe { grim_backend_rocm::hipGraphDestroy(graph) };
+        eprintln!("[tail] graph-only destroy done");
+    } else if mode == "dropgraph" || mode == "both" {
+        dev.drop_captured_graph(graph_key)?;
+        assert!(!dev.has_captured_graph(graph_key));
+        eprintln!("[tail] drop_captured_graph done");
+    }
+    if mode == "dropbufs" || mode == "both" {
+        drop(mm_cap);
+        eprintln!("[tail] dropped mm_cap");
+        drop(biased_cap);
+        eprintln!("[tail] dropped biased_cap");
+        drop(normed_cap);
+        eprintln!("[tail] dropped normed_cap");
+        drop(scaled_cap);
+        eprintln!("[tail] dropped scaled_cap");
+    }
 
     Ok(())
 }
@@ -246,3 +339,82 @@ fn test_hip_graph_poison_then_eager_then_recapture() -> TestResult {
     let _ = poisoned;
     Ok(())
 }
+
+#[test]
+fn scratch_e_in_original_binary() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("[skip] no gpu");
+        return;
+    };
+    let m = 1usize;
+    let k = 64usize;
+    let n = 64usize;
+    let a_shape = Shape::from_slice(&[m, k]);
+    let b_shape = Shape::from_slice(&[n, k]);
+    let out_shape = Shape::from_slice(&[m, n]);
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01) + 0.1).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let b_dev = CoreTensorOps::from_cpu(&dev, &b_data, &b_shape, DType::F32).unwrap();
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32).unwrap();
+    let bias_data: Vec<f32> = (0..m * n).map(|i| ((i % 7) as f32) * 0.02).collect();
+    let bias_dev = CoreTensorOps::from_cpu(&dev, &bias_data, &out_shape, DType::F32).unwrap();
+    let norm_w_data: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32 * 0.005)).collect();
+    let norm_w_dev = CoreTensorOps::from_cpu(&dev, &norm_w_data, &out_shape, DType::F32).unwrap();
+    let scale_data: Vec<f32> = (0..m * n).map(|i| 0.5 + ((i % 5) as f32 * 0.1)).collect();
+    let scale_dev = CoreTensorOps::from_cpu(&dev, &scale_data, &out_shape, DType::F32).unwrap();
+    {
+        let (mm, _) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape).unwrap();
+        let (biased, _) = CoreTensorOps::add(&dev, mm.as_ref(), bias_dev.as_ref(), &out_shape).unwrap();
+        let (normed, _) =
+            CoreTensorOps::rms_norm(&dev, biased.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape).unwrap();
+        let (_scaled, _) =
+            CoreTensorOps::mul(&dev, normed.as_ref(), scale_dev.as_ref(), &out_shape).unwrap();
+        dev.synchronize();
+    }
+    eprintln!("[D-trunc] warmup done");
+    // ── stage 2: capture (the corruption suspect) ──
+    let graph_key = "test_hip_graph_decode_pipeline";
+    dev.begin_graph_capture(graph_key).unwrap();
+    eprintln!("[D-trunc] capture begun");
+    let (mm_cap, _) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape).unwrap();
+    eprintln!("[D-trunc] captured mm");
+    let (biased_cap, _) = CoreTensorOps::add(&dev, mm_cap.as_ref(), bias_dev.as_ref(), &out_shape).unwrap();
+    eprintln!("[D-trunc] captured add");
+    let (normed_cap, _) =
+        CoreTensorOps::rms_norm(&dev, biased_cap.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape).unwrap();
+    eprintln!("[D-trunc] captured rms");
+    let (scaled_cap, _) =
+        CoreTensorOps::mul(&dev, normed_cap.as_ref(), scale_dev.as_ref(), &out_shape).unwrap();
+    eprintln!("[D-trunc] captured mul");
+    dev.end_graph_capture(graph_key).unwrap();
+    eprintln!("[D-trunc] capture ended");
+    eprintln!("[D-trunc] capture done — entering loop");
+    for step in 0..10 {
+        let a_data: Vec<f32> = (0..64)
+            .map(|i| (((step + 1) * 17 + i) as f32 * 0.03).sin())
+            .collect();
+        dev.write_f32_into(a_dev.as_ref(), &a_data).unwrap();
+        eprintln!("[D-trunc] step {step} write done");
+        assert!(dev.replay_graph(graph_key).unwrap());
+        eprintln!("[D-trunc] step {step} replay done");
+        dev.synchronize();
+        eprintln!("[D-trunc] step {step} sync done");
+        let graph_out = scaled_cap.to_cpu_vec_f32().unwrap();
+        eprintln!("[D-trunc] step {step} read done");
+        let a_eager = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32).unwrap();
+        let (mm_eag, _) = CoreTensorOps::matmul(&dev, a_eager.as_ref(), b_dev.as_ref(), &out_shape).unwrap();
+        let (bias_eag, _) = CoreTensorOps::add(&dev, mm_eag.as_ref(), bias_dev.as_ref(), &out_shape).unwrap();
+        let (norm_eag, _) =
+            CoreTensorOps::rms_norm(&dev, bias_eag.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape).unwrap();
+        let (scale_eag, _) =
+            CoreTensorOps::mul(&dev, norm_eag.as_ref(), scale_dev.as_ref(), &out_shape).unwrap();
+        dev.synchronize();
+        let eager_out = scale_eag.to_cpu_vec_f32().unwrap();
+        for i in 0..eager_out.len() {
+            assert!((eager_out[i] - graph_out[i]).abs() < 1e-4, "step {step} idx {i}");
+        }
+        eprintln!("[D-trunc] step {step} parity ok");
+    }
+    eprintln!("[D-trunc] done");
+}
+

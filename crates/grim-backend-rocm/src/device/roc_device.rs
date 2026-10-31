@@ -309,6 +309,10 @@ pub struct RocmDevice {
     capture_active: AtomicBool,
     /// Keyed cache of captured + instantiated graphs. A graph is recorded exactly once [see: `replay_graph`]
     captured_graphs: Mutex<HashMap<String, CapturedGraph>>,
+    /// Exec handles evicted without hipGraphExecDestroy (gfx1201 driver bug —
+    /// see drop_captured_graph). Never drained in-process; bounded by the
+    /// number of capture/evict cycles.
+    exec_graveyard: Mutex<Vec<*mut c_void>>,
     /// GraphCaptureManager for decode-step graph capture/replay. Lazily initialized.
     graph_capture_mgr: Mutex<Option<crate::graph_capture::GraphCaptureManager>>,
     /// Whether batched GEMM rocBLAS handle has been warmed up.
@@ -797,6 +801,16 @@ impl RocmDevice {
         CACHE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// Lookup-only variant of [`Self::shared`]: the live device for
+    /// `ordinal`, or `None` if none was ever constructed. For hot-path checks
+    /// (the capture fail-fast in copy_from_host) that must not fabricate a
+    /// device as a side effect.
+    pub fn shared_if_alive(ordinal: usize) -> Option<Arc<RocmDevice>> {
+        let cache = Self::device_cache();
+        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get(&ordinal).cloned()
+    }
+
     /// Return the process-wide shared device for `ordinal`, constructing it on first use.
     /// Prefer this over `RocmDevice::new` anywhere a device is obtained repeatedly (per tensor, per token, per.
     pub fn shared(ordinal: usize) -> Arc<RocmDevice> {
@@ -941,6 +955,7 @@ impl RocmDevice {
             capture_stream: RwLock::new(None),
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
+            exec_graveyard: Mutex::new(Vec::new()),
             batched_gemm_warmed: AtomicBool::new(false),
             decode_gemm_config: Mutex::new(DecodeGemmConfig {
                 enabled: true,
@@ -1560,15 +1575,54 @@ impl RocmDevice {
     /// a whole-decode-step graph is keyed on the session/generation, and buffers
     /// change each turn/session, so the stale graph must be evicted on turn start
     /// (or when device buffers are reallocated) and re-captured fresh.
+    /// Test/diagnostic accessors for the cached graph handles (B7 heap-corruption
+    /// bisect): which of hipGraphExecDestroy / hipGraphDestroy corrupts.
+    pub fn captured_graph_exec(&self, key: &str) -> Option<*mut c_void> {
+        self.captured_graphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|g| g.exec)
+    }
+
+    pub fn captured_graph_handle(&self, key: &str) -> Option<*mut c_void> {
+        self.captured_graphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|g| g.graph)
+    }
+
     pub fn drop_captured_graph(&self, key: &str) -> Result<()> {
+        // GFX1201 DRIVER BUG (B7 heap corruption, bisected 2026-10-30):
+        // hipGraphExecDestroy on a REPLAYED graph containing a rocBLAS-captured
+        // GEMM node corrupts the driver heap — "malloc(): unsorted double
+        // linked list corrupted", SIGABRT at the next host allocation. Isolated
+        // empirically: exec-only destroy corrupts, graph-only destroy is clean,
+        // both after 10 replays. hipGraphDestroy (the template) is safe.
+        //
+        // Fix: destroy the template, GRAVEYARD the exec (its handle lives to
+        // process exit — node metadata, KBs; the buffers it referenced are the
+        // caller's storages and stay alive independently). A future driver that
+        // fixes exec-destroy can opt in via GRIM_GRAPH_EXEC_DESTROY=1.
         let mut cache = self
             .captured_graphs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(g) = cache.remove(key) {
-            unsafe {
-                let _ = hipGraphExecDestroy(g.exec);
-                let _ = hipGraphDestroy(g.graph);
+            if std::env::var("GRIM_GRAPH_EXEC_DESTROY").as_deref() == Ok("1") {
+                unsafe {
+                    let _ = hipGraphExecDestroy(g.exec);
+                    let _ = hipGraphDestroy(g.graph);
+                }
+            } else {
+                unsafe {
+                    let _ = hipGraphDestroy(g.graph);
+                }
+                self.exec_graveyard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(g.exec);
             }
         }
         Ok(())

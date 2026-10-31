@@ -122,6 +122,13 @@ pub fn memcpy_with_xnack_fallback(
 /// JIT compile HIP source to .hsaco binary, returning the compiled code and the *lowered* (possibly C++-mangled) kernel name that `hipModuleGetFunction` requires.
 /// Some `__global__` kernels (e.g.
 pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(Vec<u8>, String)> {
+    // Diagnostic: GRIM_JIT_DUMP=<dir> writes the EXACT unit string compiled
+    // for each entry, so a hiprtc parse error's line numbers can be read
+    // against the real concatenated source.
+    if let Ok(dir) = std::env::var("GRIM_JIT_DUMP") {
+        let path = format!("{dir}/unit_{entry_name}.hipsrc");
+        let _ = std::fs::write(&path, source);
+    }
     let mut prog: HiprtcProgram = std::ptr::null_mut();
     // HIPRTC does not expose <stdint.h> on every code-object path (observed
     // on gfx1036: `uint8_t`/`int8_t` unknown type names in kernels that use

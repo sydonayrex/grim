@@ -647,6 +647,10 @@ impl RocmDevice {
                     self.ordinal, entry, cache_key
                 );
             }
+        if let Ok(dir) = std::env::var("GRIM_JIT_DUMP") {
+            let path = format!("{dir}/unit_{entry}.hipsrc");
+            let _ = std::fs::write(&path, source);
+        }
             let (code, lowered) = jit_compile_hsaco(source, entry, &self.gpu_target)?;
             let p = self
                 .hsaco_cache
