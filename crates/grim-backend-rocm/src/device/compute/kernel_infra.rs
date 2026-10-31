@@ -1111,21 +1111,13 @@ impl RocmDevice {
                 record_kernel_route(entry);
                 if timed {
                     use crate::device::handles::{hipEventElapsedTime, hipEventRecord, hipEventSynchronize};
-                    static TIMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>> =
-                        std::sync::OnceLock::new();
-                    let m = TIMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
                     let mut ms = 0.0f32;
                     unsafe {
                         let _ = hipEventRecord(ev1, stream);
                         let _ = hipEventSynchronize(ev1);
                         let _ = hipEventElapsedTime(&mut ms, ev0, ev1);
                     }
-                    if let Ok(mut acc) = m.lock() {
-                        let e = acc.entry(entry.to_string()).or_insert((0, 0));
-                        e.0 += 1;
-                        e.1 += (ms * 1000.0) as u64;
-                    }
-                    if let Ok(mut acc) = m.lock() {
+                    if let Ok(mut acc) = kernel_time_map().lock() {
                         let e = acc.entry(entry.to_string()).or_insert((0, 0));
                         e.0 += 1;
                         e.1 += (ms * 1000.0) as u64;
