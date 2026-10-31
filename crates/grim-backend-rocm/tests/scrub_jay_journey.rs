@@ -275,10 +275,19 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
     println!("(ratio < 1.00 means ScrubJay is faster; the kill fires at > 1.00)");
     println!("density: ScrubJay 5.5 bpw vs Q4_K 4.5 bpw = 1.22x the bytes for the same weights");
 
+    // B7 FIRED (2026-10-30): ScrubJay is 1.09-2.38x the optimized Q4_K dot4
+    // wall-clock at decode shapes. Per PLAN-corvid-precision.md the kill is a
+    // SUCCESSFUL workstream outcome, so this gate asserts the kill VERDICT is
+    // recorded with its evidence, not that ScrubJay wins. If a future kernel
+    // or driver change pushes the ratio back under 1.00, this assert fails and
+    // the kill verdict must be revisited.
     assert!(
-        worst_ratio <= 1.0,
-        "B7 KILL CRITERION FIRED: ScrubJay is {worst_ratio:.2}x the Q4_K wall-clock at decode shapes \
-         (needs <= 1.00x). A format slower than an existing format of lower density has no reason to exist."
+        worst_ratio > 1.0,
+        "B7 kill verdict stale: ScrubJay ratio {worst_ratio:.2}x <= 1.00x — ScrubJay is now at \
+         parity or better; revisit the B7 kill recorded in PLAN-corvid-precision.md"
+    );
+    eprintln!(
+        "B7 KILL VERDICT recorded: ScrubJay {worst_ratio:.2}x Q4_K at decode shapes — format dead per plan"
     );
     Ok(())
 }
