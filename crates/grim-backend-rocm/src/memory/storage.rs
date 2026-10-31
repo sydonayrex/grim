@@ -316,6 +316,20 @@ impl RocmStorage {
                 shape.dims()
             );
         }
+        // FAIL FAST under graph capture: a synchronous hipMemcpy on a stream
+        // that is capturing is illegal, and on gfx1201 the driver's own 906
+        // detection corrupts its host heap after the refused call (the
+        // poison-gate SIGABRT family). Refuse HERE, before the driver sees the
+        // call: the capture contract is identical (H2D inside capture is an
+        // error) but the process survives to say so.
+        if let Some(dev) = crate::RocmDevice::shared_if_alive(ordinal) {
+            if dev.is_capturing() {
+                return Err(Error::Backend(format!(
+                    "copy_from_host: H2D upload refused - a graph-capture session is active on \
+                     ordinal {ordinal} (fail-closed before the driver's capture check)"
+                )));
+            }
+        }
         let arith = dtype.arith;
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
         let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
