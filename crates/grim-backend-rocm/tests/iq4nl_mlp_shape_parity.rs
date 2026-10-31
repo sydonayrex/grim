@@ -132,6 +132,108 @@ fn check(dev: &RocmDevice, m: usize, n: usize, k: usize, label: &str) -> f32 {
             got[r * n + c]
         );
     }
+
+    // ── THE DISCRIMINATOR: the device route quantizes ACTIVATIONS to Q8_1
+    // by design (the dot4 A operand is packed q8_1; grim_quantize_q8_1 runs
+    // first in the dispatch). The host reference above multiplies RAW f32
+    // activations, so device-vs-host includes that BY-DESIGN quantization
+    // error, amplified by sqrt(K) — the old fixed 1e-4 bound was written
+    // pre-Q8_1-route and misreads design error as decode error.
+    //
+    // GATE A (decode algebra): mirror the device path host-side — quantize
+    // a_host to the same Q8_1 grid (d = amax/127, qi = round(a/d)), then run
+    // the SAME host GEMM over the dequantized activations. Device vs mirror
+    // now differs only in dot order + weight decode → tight bound.
+    let mut a_q81 = vec![0.0f32; a_host.len()];
+    let mut q81_max_err = 0.0f32;
+    for blk_start in (0..a_host.len()).step_by(32) {
+        let blk_end = (blk_start + 32).min(a_host.len());
+        let amax = a_host[blk_start..blk_end]
+            .iter()
+            .fold(0.0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 127.0;
+        // The device STORES the Q8_1 scale as f16 and reads it back f16->f32
+        // (fp16_to_float_device on a_blk[0..2]) — mirror that rounding, or the
+        // f16 rounding of d shows up as a per-term error in the residual.
+        let d_h = half::f16::from_f32(d);
+        let d_dev = f32::from(d_h);
+        for (i, &v) in a_host[blk_start..blk_end].iter().enumerate() {
+            let qi = if d > 1e-9 {
+                (v / d).round().clamp(-127.0, 127.0)
+            } else {
+                0.0
+            };
+            let deq = qi * d_dev;
+            q81_max_err = q81_max_err.max((v - deq).abs());
+            a_q81[blk_start + i] = deq;
+        }
+    }
+    let mirror_out = grim_quant::gemm_iq4nl_packed(&a_q81, &w_packed, m, n, k)
+        .expect("host gemm over q8_1 activations");
+    let scale_mirror = mirror_out.iter().fold(0.0f32, |acc, w| acc.max(w.abs())).max(1.0);
+    let mut worst_dev_vs_mirror = 0.0f32;
+    for r in 0..m {
+        for c in 0..n {
+            let rel = ((got[r * n + c] - mirror_out[r * n + c]).abs() / scale_mirror) as f32;
+            worst_dev_vs_mirror = worst_dev_vs_mirror.max(rel);
+        }
+    }
+    eprintln!(
+        "[iq4nl-mlp] {label}: device vs Q8_1-mirrored host (decode+order only): {worst_dev_vs_mirror:.6}"
+    );
+    // Gate A bound: device-vs-mirror residual = dot ORDER noise (f32
+    // accumulation over K terms in different orders). The random-walk bound
+    // is eps32 * sqrt(K) * (per-term magnitude = max|a_q81| x max|w_ref|);
+    // a real decode error (wrong nibble/table) exceeds this ~1000x.
+    let a_q81_max = a_q81.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let w_max_ref = w_ref.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let gate_a = 4.0f32 * (1.2e-7 * (k as f32).sqrt() + 1e-6) * a_q81_max * w_max_ref;
+    assert!(
+        worst_dev_vs_mirror < gate_a,
+        "{label}: device diverges from the Q8_1-mirrored host by {worst_dev_vs_mirror} \
+         (bound {gate_a:.3e}) — REAL decode/dot error beyond order noise"
+    );
+
+    // GATE B (accuracy statement): device vs RAW-f64 oracle is bounded by the
+    // Q8_1 activation quantization the mirror absorbed — EXACTLY, per output:
+    // |Σ a_i×w_i − Σ a'_i×w_i| <= Σ |Δa_i × w_i| (triangle inequality, Δa =
+    // a − a_q81). The a_host ramp makes per-block amax grow with i, so the
+    // sqrt(K) uniform-error model underestimates; the exact term sum does not.
+    // Normalized by the same max|f64| the host comparison uses.
+    let w_f64: Vec<f64> = w_ref.iter().map(|&v| v as f64).collect();
+    let mut worst_dev_vs_f64 = 0.0f64;
+    let mut worst_q81_ratio = 0.0f64;
+    let mut scale_f64 = 0.0f64;
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0.0f64;
+            let mut q81_abs = 0.0f64;
+            for i in 0..k {
+                let a = a_host[r * k + i] as f64;
+                let aq = a_q81[r * k + i] as f64;
+                let w = w_f64[c * k + i];
+                acc += a * w;
+                q81_abs += (a - aq).abs() * w.abs();
+            }
+            scale_f64 = scale_f64.max(acc.abs());
+            let d_dev = (got[r * n + c] as f64 - acc).abs();
+            worst_dev_vs_f64 = worst_dev_vs_f64.max(d_dev);
+            // The ratio must hold even for cancelling outputs: normalize the
+            // residual by the row's OWN q81 term bound, floored by 1e-3 of the
+            // set scale (a pure-zero row can't be ratio-bounded).
+            let denom = q81_abs.max(scale_f64 * 1e-3);
+            worst_q81_ratio = worst_q81_ratio.max(d_dev / denom);
+        }
+    }
+    let rel_dev_vs_f64 = worst_dev_vs_f64 / scale_f64.max(1.0);
+    eprintln!(
+        "[iq4nl-mlp] {label}: device vs raw-f64 {rel_dev_vs_f64:.3e} (normalized); worst residual / own Q8_1 bound {worst_q81_ratio:.3} (q81_max_err {q81_max_err:.4})"
+    );
+    assert!(
+        worst_q81_ratio <= 1.05,
+        "{label}: device residual exceeds its own Q8_1 activation-quantization bound \
+         (ratio {worst_q81_ratio:.3} > 1.05) — REAL decode error beyond activation quantization"
+    );
     eprintln!(
         "[iq4nl-mlp] {label} (m={m} n={n} k={k}): worst relative error {worst_rel:.6} \
          at row {} col {}",
@@ -165,13 +267,7 @@ fn iq4nl_matmul_matches_host_at_the_mlp_shape() {
             worst_label = label.to_string();
         }
     }
-    // F32 accumulation over K terms: the error is relative to the SUM's
-    // scale, and the device and host sum in different orders. The bound is
-    // the F32 epsilon (1.2e-7) times sqrt(K) (~100 at K=10240), with room
-    // for the different summation order.
-    let bound = 1e-4f32;
-    assert!(
-        worst < bound,
-        "device IQ4_NL matmul diverges from the host by {worst} (bound {bound}) at {worst_label}"
+    eprintln!(
+        "[iq4nl-mlp] worst same-order-vs-host relative error across shapes: {worst:.6} at {worst_label} (the f64-oracle gate in check() is the decode-error discriminator)"
     );
 }
