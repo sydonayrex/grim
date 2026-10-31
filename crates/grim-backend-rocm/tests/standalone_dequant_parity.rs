@@ -302,7 +302,10 @@ fn iq_kernels_run_and_report_deviation() {
     run_iq("iq2xxs", 66, 256, &|b, n| dequant_iq2xxs(b, n));
     run_iq("iq2xs", 74, 256, &|b, n| dequant_iq2xs(b, n));
     run_iq("iq2s", 82, 256, &|b, n| dequant_iq2s(b, n));
-    run_iq("iq3xxs", 96, 256, &|b, n| dequant_iq3xxs(b, n));
+    // IQ3_XXS is 98 bytes per 256-elem super-block (2 + 96) — the 96 the old
+    // encoder emitted was the bug iq3xxs_quant fixed; this gate still passed
+    // 96 and made the kernel (98/block) return 1 block for 2 requested.
+    run_iq("iq3xxs", 98, 256, &|b, n| dequant_iq3xxs(b, n));
     run_iq("iq3s", 110, 256, &|b, n| dequant_iq3s(b, n));
     run_iq("iq4nl", 18, 32, &|b, n| dequant_iq4nl(b, n));
     run_iq("iq4xs", 136, 256, &|b, n| dequant_iq4xs(b, n));
