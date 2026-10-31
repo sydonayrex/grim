@@ -509,6 +509,46 @@ fn w4a16_expert_bank_moe_forward_matches_reference() {
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
                 eprintln!("[W4A16-stage1] expert {e} down dequant max diff {mdd}");
+                // SPLIT DIAGNOSTIC: is the bank's per-expert blob the fixture's
+                // expert-e slice? Codes and scales compared byte-level.
+                {
+                    let words_per_row = INTER / 8;
+                    let groups_per_row = INTER.div_ceil(GROUP);
+                    let exp_codes = HIDDEN * words_per_row * 4;
+                    let exp_scales = HIDDEN * groups_per_row * 4;
+                    eprintln!(
+                        "[split-diag] expert {e}: bank blob {} B (expect codes {exp_codes} + scales {exp_scales} = {})",
+                        blob_d.bytes(),
+                        exp_codes + exp_scales
+                    );
+                    let bank_bytes = {
+                        let b = blob_d.copy_to_host().unwrap();
+                        b
+                    };
+                    // Rebuild the fixture slice for expert e from ref_down.
+                    // ref_down[e] is the DEQUANTized [HIDDEN, INTER]; re-quantize
+                    // it exactly as w4a16_quantize_rowmajor does to get the
+                    // expected codes/scales for this expert.
+                    let mut w2 = fx.ref_down[e].clone();
+                    let mut fixture_slice = w4a16_quantize_rowmajor(&mut w2, HIDDEN, INTER, GROUP);
+                    let same_len = bank_bytes.len() == fixture_slice.len();
+                    let mut first_diff = None;
+                    if same_len {
+                        for (i, (a, b)) in bank_bytes.iter().zip(fixture_slice.iter()).enumerate() {
+                            if a != b {
+                                first_diff = Some((i, *a, *b));
+                                break;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[split-diag] len match: {same_len} (bank {} vs fixture {}), first byte diff: {:?}",
+                        bank_bytes.len(),
+                        fixture_slice.len(),
+                        first_diff
+                    );
+                    let _ = &mut fixture_slice;
+                }
                 assert!(mdd < 1e-3, "expert {e} DOWN split+dequant diverged: {mdd}");
 
                 let w = &bank.gate[e].weight;

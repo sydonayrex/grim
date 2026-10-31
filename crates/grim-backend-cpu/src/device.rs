@@ -1778,6 +1778,62 @@ impl QuantOps for CpuDevice {
                                 .to_string(),
                         ))
                     }
+                    // Marlin-style W4A16: [codes u32 LE (low nibble = even
+                    // element, value = nib - 8)][f32 per-(row, group) scale],
+                    // B stored [n, k], group-major. Decode + plain matmul —
+                    // the same math the marlin GEMM runs on-device.
+                    grim_tensor::QuantFormat::W4A16 => {
+                        // Group size: read from the storage's own W4A16Config
+                        // (the provider tags it), defaulting to 128 (the
+                        // marlin/GGUF convention) when untagged.
+                        let group_size = b_packed
+                            .dtype()
+                            .storage
+                            .w4a16_group_size()
+                            .unwrap_or(128);
+                        let rows = n;
+                        let words_per_row = k / 8;
+                        let groups_per_row = k.div_ceil(group_size);
+                        let codes_len = rows * words_per_row * 4;
+                        let scales_len = rows * groups_per_row * 4;
+                        if b_bytes.len() < codes_len + scales_len {
+                            return Err(Error::Backend(format!(
+                                "CPU W4A16: blob {} B smaller than codes+scales ({codes_len} + {scales_len})",
+                                b_bytes.len()
+                            )));
+                        }
+                        let mut out_w4 = vec![0.0f32; n * k];
+                        for col in 0..n {
+                            for g in 0..groups_per_row {
+                                let sc_off = codes_len + (col * groups_per_row + g) * 4;
+                                let scale = f32::from_le_bytes(
+                                    b_bytes[sc_off..sc_off + 4].try_into().unwrap(),
+                                );
+                                let lo = g * group_size;
+                                let hi = (lo + group_size).min(k);
+                                for c in lo..hi {
+                                    let w_off = col * words_per_row * 4 + (c / 8) * 4;
+                                    let word = u32::from_le_bytes(
+                                        b_bytes[w_off..w_off + 4].try_into().unwrap(),
+                                    );
+                                    let nib = (word >> ((c % 8) * 4)) & 0x0F;
+                                    out_w4[col * k + c] = ((nib as i32) - 8) as f32 * scale;
+                                }
+                            }
+                        }
+                        // C = A @ B_decoded^T (B is [n, k] row-major).
+                        let mut c_out = vec![0.0f32; m * n];
+                        for mi in 0..m {
+                            for ni in 0..n {
+                                let mut sum = 0.0f32;
+                                for ki in 0..k {
+                                    sum += a_data[mi * k + ki] * out_w4[ni * k + ki];
+                                }
+                                c_out[mi * n + ni] = sum;
+                            }
+                        }
+                        c_out
+                    }
                     grim_tensor::QuantFormat::Fp8Blocked16 => {
                         grim_quant::dequant_fp8_blocked16(&b_bytes, n, k).map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul FP8-blocked dequant: {e}"))

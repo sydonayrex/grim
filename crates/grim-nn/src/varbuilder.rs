@@ -802,7 +802,11 @@ fn materialize_vulkan(
 /// instead — the same policy `Embedding::load` applies through
 /// `embedding_has_packed_gather`.
 fn has_packed_matmul(storage: &Storage) -> bool {
-    grim_tensor::QuantFormat::try_from(storage).is_ok()
+    // W4A16 is resident-eligible by design (the MoE expert banks must stay
+    // packed so quantized_matmul -> marlin reads real codes; dequantizing at
+    // load turned the bank into f32 and broke every downstream consumer).
+    matches!(storage, Storage::W4A16(_))
+        || grim_tensor::QuantFormat::try_from(storage).is_ok()
 }
 
 fn materialize(

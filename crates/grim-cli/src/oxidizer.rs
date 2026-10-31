@@ -1227,6 +1227,12 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         QuantFormat::Fp8Sparse24 => {
             Err("GreyRaven 2:4 has no GGUF type tag and cannot be written by the oxidizer".into())
         }
+        // W4A16 is a GPU-residency format tied to a [rows, k] shape (the
+        // marlin GEMM derives its per-(row, group) scale indexing from the
+        // geometry); a GGUF type tag cannot express that binding.
+        QuantFormat::W4A16 => {
+            Err("W4A16 is a GPU-residency format and cannot be written by the oxidizer".into())
+        }
         QuantFormat::Fp8Sparse24Hw => {
             Err("GreyRaven-HW (tag 673) is grim-native and not portable: use the .grim format".into())
         }

@@ -4265,6 +4265,18 @@ fn quant_packed_symmetric(
 /// This is the first Pass 4 substrate: it materializes the tensor into a logical f32.
 pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<RewrittenTensorData> {
     let rewritten_bytes = match plan.target {
+        // W4A16 is a RESIDENCY format (GPU-resident packed banks for the
+        // marlin GEMM), not a CPU-side rewrite target: its layout is
+        // [codes u32 LE][f32 per-group scales] tied to a [rows, k] shape the
+        // rewrite plan does not carry. Refuse loud rather than emit a
+        // shape-less blob no decoder honours.
+        QuantFormat::W4A16 => {
+            return Err(Error::Backend(
+                "rewrite_tensor_data: QuantFormat::W4A16 is a GPU-residency format; \
+                 quantize per (row, group) at load instead"
+                    .to_string(),
+            ))
+        }
         QuantFormat::Q8_0 => quant_q80(data)?,
         QuantFormat::Q4K => quant_q4k(data)?,
         QuantFormat::Q5K => quant_q5k(data)?,

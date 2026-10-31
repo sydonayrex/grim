@@ -324,6 +324,8 @@ pub enum QuantFormat {
     Fp8Blocked16,
     /// WhiteCrow: W4A4 OSTQuant u4×u4, group-128, feeds `V_DOT8_I32_IU4`.
     W4A4OstQuant,
+    /// Marlin-style 4-bit weight / f16 activation: [codes u32 LE][f32 per-(row,group) scales], w = (nib - 8) * scale.
+    W4A16,
     /// ForestRaven: symmetric per-output-row absmax INT8, feeds
     /// `V_DOT4_I32_IU8`. See `BlockDtype::Int8PerChannel` for why this is not
     /// Q8_0 under another name.
@@ -555,6 +557,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
             QuantFormat::Fp8Blocked16 => Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
             QuantFormat::W4A4OstQuant => Storage::W4A4OstQuant(OstQuantConfig { group_size: 128 }),
+            QuantFormat::W4A16 => Storage::W4A16(W4A16Config { group_size: 128 }),
             QuantFormat::Int8PerChannel => Storage::Block(BlockDtype::Int8PerChannel),
             QuantFormat::Fp8Sparse24Hw => Storage::Block(BlockDtype::Fp8Sparse24Hw),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
@@ -570,6 +573,18 @@ impl From<QuantFormat> for Storage {
             QuantFormat::GsqRco3p5 => Storage::KQuant(KQuantScheme::GsqRco3p5),
             QuantFormat::Iq1S => Storage::KQuant(KQuantScheme::IQ1S),
             QuantFormat::Iq1M => Storage::KQuant(KQuantScheme::IQ1M),
+        }
+    }
+}
+
+impl Storage {
+    /// The group_size of a `Storage::W4A16` storage, or `None` for other
+    /// storages. The marlin W4A16 GEMM and its host dequant derive the
+    /// per-(row, group) scale indexing from this.
+    pub fn w4a16_group_size(&self) -> Option<usize> {
+        match self {
+            Storage::W4A16(cfg) => Some(cfg.group_size),
+            _ => None,
         }
     }
 }
@@ -635,6 +650,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 BlockDtype::Q4_0 | BlockDtype::Q4_1 => Err(()),
             },
             Storage::W4A4OstQuant(_) => Ok(QuantFormat::W4A4OstQuant),
+            Storage::W4A16(_) => Ok(QuantFormat::W4A16),
             _ => Err(()),
         }
     }

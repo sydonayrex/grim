@@ -23,6 +23,13 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.03,
                 max_delta_ppl: 0.015,
             },
+            // Marlin-style 4-bit weight / f16 act, per-group f32 scale — same
+            // weight-only 4-bit tolerance class as the k-quant arms.
+            QuantFormat::W4A16 => Self {
+                min_cosine_similarity: 0.999,
+                max_relative_l2_error: 0.05,
+                max_delta_ppl: 0.03,
+            },
             // Same E4M3 codes as `Fp8`, different byte arrangement: a storage
             // permutation, not a coarser quantizer, so it inherits Fp8's
             // tolerances exactly.
