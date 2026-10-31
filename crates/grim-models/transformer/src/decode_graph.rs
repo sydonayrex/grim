@@ -2673,6 +2673,11 @@ impl Qwen35Block {
             // the eager path exactly (qwen35.rs builds the same RopeConfig):
             // the base kernel rotates only the first `rotary_dim` dims and
             // passes the rest through.
+            // WhiteCrow arenas fuse the K rope into the append (see
+            // grim_rope_append_whitecrow_k): determine the arena format HERE
+            // so the K rope can be skipped for this layer.
+            let arena_whitecrow_early =
+                buffers.kv_arena_packed_width() == Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW);
             let steps = 1usize;
             let mut rope_cfg = RopeConfig::new(hd, self.rope_theta);
             rope_cfg.rotary_dim = self.rotary_dim;
@@ -2694,20 +2699,29 @@ impl Qwen35Block {
                 e.launch(grim_backend_rocm::task_graph::op::FALLBACK, [0u32; 16], &[]);
             }
 
-            let k3 = Shape::new(vec![batch, nkv * steps, hd]);
-            dev.rope_dev_base_into(
-                &buffers.k_buf[layer_idx],
-                buffers.pos_dev_for(dev.ordinal()),
-                &buffers.k_buf[layer_idx],
-                &rope_cfg,
-                &k3,
-                nkv,
-                steps,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-            // M7.1: the K RoPE is its own node.
-            if let Some(e) = emit.as_deref_mut() {
-                e.launch(grim_backend_rocm::task_graph::op::FALLBACK, [0u32; 16], &[]);
+            // WhiteCrow arenas: the K rope is FUSED into the append
+            // (grim_rope_append_whitecrow_k reads PRE-rope K from k_buf,
+            // rotates in-register, quantizes into the arena). Skip the
+            // standalone K rope node; the append site below takes the fused
+            // launcher. Q keeps its own rope (feeds attention); V has no
+            // rope. rope_cfg stays in scope for the fused append call.
+            let k_rope_fused = arena_whitecrow_early;
+            if !k_rope_fused {
+                let k3 = Shape::new(vec![batch, nkv * steps, hd]);
+                dev.rope_dev_base_into(
+                    &buffers.k_buf[layer_idx],
+                    buffers.pos_dev_for(dev.ordinal()),
+                    &buffers.k_buf[layer_idx],
+                    &rope_cfg,
+                    &k3,
+                    nkv,
+                    steps,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                // M7.1: the K RoPE is its own node.
+                if let Some(e) = emit.as_deref_mut() {
+                    e.launch(grim_backend_rocm::task_graph::op::FALLBACK, [0u32; 16], &[]);
+                }
             }
 
             // 5. KV append to arenas
@@ -2862,15 +2876,40 @@ impl Qwen35Block {
                 // BYTES (the `KV_ARENA_BITS_WHITECROW` arm above); `kv_stride`
                 // stays in ELEMENTS — it is the f32 source row the quantizer
                 // reads, not the packed destination row.
-                for (src, dst, tag) in [
-                    (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], "k"),
-                    (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], "v"),
-                ] {
+                // K arm: FUSED rope+append when the K rope was skipped
+                // (k_rope_fused) — one launch reads PRE-rope K, rotates
+                // in-register, quantizes into the arena. V arm: plain append
+                // (no rope).
+                if k_rope_fused {
+                    let mut rope_cfg_f = RopeConfig::new(hd, self.rope_theta);
+                    rope_cfg_f.rotary_dim = self.rotary_dim;
+                    rope_cfg_f.interleaved = false;
+                    grim_backend_rocm::launch_rope_append_whitecrow_k(
+                        dev,
+                        &buffers.k_buf[layer_idx],
+                        buffers.pos_dev_for(dev.ordinal()),
+                        &buffers.k_arena[layer_idx],
+                        kv_stride,
+                        nkv,
+                        hd,
+                        steps,
+                        batch,
+                        arena_slot_stride,
+                        buffers.kv_ring,
+                        rope_cfg_f.base,
+                        rope_cfg_f.interleaved,
+                        rope_cfg_f.rotary_dim,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!(
+                            "rope_append_whitecrow_k: {e}"
+                        ))
+                    })?;
                     grim_backend_rocm::launch_kv_append_whitecrow(
                         dev,
-                        src,
+                        &buffers.v_buf[layer_idx],
                         &buffers.layer_totals[layer_idx],
-                        dst,
+                        &buffers.v_arena[layer_idx],
                         kv_stride,
                         nkv,
                         hd,
@@ -2880,8 +2919,34 @@ impl Qwen35Block {
                         buffers.kv_ring,
                     )
                     .map_err(|e| {
-                        grim_core::error::Error::Backend(format!("kv_append_whitecrow {tag}: {e}"))
+                        grim_core::error::Error::Backend(format!(
+                            "kv_append_whitecrow v: {e}"
+                        ))
                     })?;
+                } else {
+                    for (src, dst, tag) in [
+                        (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], "k"),
+                        (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], "v"),
+                    ] {
+                        grim_backend_rocm::launch_kv_append_whitecrow(
+                            dev,
+                            src,
+                            &buffers.layer_totals[layer_idx],
+                            dst,
+                            kv_stride,
+                            nkv,
+                            hd,
+                            steps,
+                            batch,
+                            arena_slot_stride,
+                            buffers.kv_ring,
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "kv_append_whitecrow {tag}: {e}"
+                            ))
+                        })?;
+                    }
                 }
             } else {
                 grim_backend_rocm::launch_kv_append_batch(

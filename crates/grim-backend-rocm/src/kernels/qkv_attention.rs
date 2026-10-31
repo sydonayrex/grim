@@ -6566,6 +6566,7 @@ pub fn launch_rope_append_whitecrow_k(
     interleaved: bool,
     rotary_dim: usize,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
     use crate::memory::storage::RocmStorage;
     use grim_tensor::dtype::ArithType;
     let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
