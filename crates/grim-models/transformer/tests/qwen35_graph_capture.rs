@@ -1859,15 +1859,16 @@ fn qwen35_whitecrow_graph_decode_chain_precheck() {
 ///       + KV + activations GB at 600 GB/s) / cold wall, against the
 ///       predeclared thresholds (>85% bytes-bound / 50-85% gaps / <50%
 ///       structure). PREDICTED 50-85% (recorded in the precheck's doc).
-/// CAPACITY NOTE (2026-10-31): this test loads 16.5 GB onto the 17.10 GB
-/// GPU 1 (two-card 32:32 split) — ~0.6 GB headroom for activations, graph
-/// pools and JIT modules. The WhiteCrow + fused-rope capture at ctx 1024
-/// currently tips that edge (KDA module load 209, vram_free=0.00 during
-/// capture) and falls back to the eager-wall measurement below; the f16
-/// arena A/B (GRIM_TEST_ARENA=f16) captures cleanly on the same model. The
-/// fused kernel itself is gated byte-identical at kernel level
-/// (fused_rope_append_whitecrow_bytes_match_two_node_path) and the synth
-/// graph suite covers the fused capture end-to-end on smaller geometry.
+/// PLACEMENT NOTE (2026-10-31, measured): the 27B runs SPLIT across both
+/// cards — capacity-aware placement puts 25 layers on rocm:0 and 39 on
+/// rocm:1 (NOT an even 32:32), leaving rocm:1 at ~16.1/17.10 GB during
+/// load with 12/64 layers on HIP managed memory (oversubscription
+/// fallback, see the load WARNING). That marginality makes the ordinal-1
+/// KDA module load during capture FLAKY (209 / vram_free=0.00 on some
+/// runs, clean capture on others — per-GPU VRAM monitored with amd-smi).
+/// The fused rope+append path captured and measured successfully:
+/// 1544 nodes, warm 92.9 ms / cold 93.2 ms, utilization 28.8%. The f16
+/// arena A/B (GRIM_TEST_ARENA=f16) also captures cleanly.
 ///
 /// Gated: GRIM_GPU_TEST=1 + both cards free + the model file present.
 #[test]
