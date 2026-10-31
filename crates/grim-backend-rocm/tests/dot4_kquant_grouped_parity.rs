@@ -2886,7 +2886,7 @@ fn stream_read_dependent_chain_vs_batched() -> Result<(), String> {
     let u32ty = DType { arith: ArithType::U32, storage: Storage::Native };
 
     // Same 4x rotating buffers as the true-cold bench: DRAM-resident reads.
-    let words: usize = 17_408 * 5120 / 8;
+    let words: usize = 17_408usize * 5120 / 8;
     let copies = 4usize; // rotating buffers, > any L2, so reads stream DRAM
     // Chain length is a PARAMETER: GRIM_CHAIN_NODES overrides the 26-node
     // decode-graph reference, so the per-node structure price can be checked
@@ -2899,7 +2899,7 @@ fn stream_read_dependent_chain_vs_batched() -> Result<(), String> {
     let chunk_words = words / chunks;
     let mut srcs = Vec::new();
     for c in 0..copies {
-        let v: Vec<u32> = (0..words).map(|i| (i as u32) ^ (c as u32 * 0x9E37_79B9)).collect();
+        let v: Vec<u32> = (0..words).map(|i| (i as u32) ^ (c as u32).wrapping_mul(0x9E37_79B9)).collect();
         let mut bytes = Vec::with_capacity(v.len() * 4);
         for x in &v { bytes.extend_from_slice(&x.to_le_bytes()); }
         srcs.push(MemoryOps::from_cpu_bytes(&dev, &bytes, &Shape::new(vec![words]), u32ty.clone()).map_err(|e| e.to_string())?);
