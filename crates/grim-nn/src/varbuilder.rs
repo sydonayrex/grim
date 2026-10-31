@@ -1101,6 +1101,53 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
 
             grim_quant::dequant_ostquant_w4a4(&qweight, &scales, &zeros, &raw.shape, cfg.group_size)
         }
+        Storage::W4A16(cfg) => {
+            // Layout contract (matches the marlin W4A16 GEMM + the MoE gate
+            // fixture w4a16_quantize_rowmajor): [u32 codes LE][f32 scales LE]
+            // where codes = n*k/2 bytes (2 nibbles/byte, LOW nibble = even
+            // element), scale per (row, group) f32, w = (code - 8) * scale.
+            // Shape must be [rows, k] so the row/group indexing is derivable.
+            let dims = &raw.shape;
+            if dims.len() != 2 {
+                return Err(Error::Backend(format!(
+                    "dequant_to_f32: W4A16 needs [rows, k] shape, got {dims:?}"
+                )));
+            }
+            let (rows, k) = (dims[0], dims[1]);
+            let gs = cfg.group_size.max(1);
+            let words_per_row = k / 8;
+            let groups_per_row = k.div_ceil(gs);
+            let codes_len = rows * words_per_row * 4;
+            let scales_len = rows * groups_per_row * 4;
+            if raw.bytes.len() < codes_len + scales_len {
+                return Err(Error::Backend(format!(
+                    "dequant_to_f32: W4A16 blob {} B smaller than codes+scales \
+                     ({codes_len} + {scales_len})",
+                    raw.bytes.len()
+                )));
+            }
+            let mut out = vec![0.0f32; rows * k];
+            for row in 0..rows {
+                for g in 0..groups_per_row {
+                    let sc_off = codes_len + (row * groups_per_row + g) * 4;
+                    let scale = f32::from_le_bytes(
+                        raw.bytes[sc_off..sc_off + 4].try_into().unwrap(),
+                    );
+                    let lo = g * gs;
+                    let hi = (lo + gs).min(k);
+                    for c in lo..hi {
+                        let word =
+                            u32::from_le_bytes(raw.bytes[row * words_per_row * 4 + (c / 8) * 4
+                                ..row * words_per_row * 4 + (c / 8) * 4 + 4]
+                                .try_into()
+                                .unwrap());
+                        let nib = (word >> ((c % 8) * 4)) & 0x0F;
+                        out[row * k + c] = ((nib as i32) - 8) as f32 * scale;
+                    }
+                }
+            }
+            Ok(out)
+        }
         Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
             // These W8A8 formats are resident-capable on ROCm/CUDA and reach the
             // fused dequant GEMM; host dequant isn't wired for them on the CPU fallback.
