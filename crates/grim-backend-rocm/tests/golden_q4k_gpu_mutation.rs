@@ -73,6 +73,54 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let actual_c = out.to_cpu_vec_f32()?;
 
         assert_eq!(actual_c.len(), expected_c.len());
+
+        // The M=2 Q4K route is the WMMA fused-dequant path: BOTH operands are
+        // quantized to f16 inside the kernel (lds_a cast, dequantized-B cast
+        // to _Float16 before mma_sync) and the fragments accumulate in f32.
+        // The by-design error vs the f32 oracle is therefore the f16
+        // quantization of every product, bounded EXACTLY per output:
+        //   |sum f16(a)*f16(w) - sum a*w| <= sum |f16(a)*f16(w) - a*w|
+        // (the device's f32 accumulation from exact f16 products adds only
+        // sub-ulp noise vs the f64 sum of the same f16 products). A decode
+        // error (wrong nibble/scale) exceeds this envelope ~1000x — that is
+        // what "mutation-resistant" means for this path.
+        let w_f16: Vec<f32> = b_dequant
+            .iter()
+            .map(|&v| f32::from(half::f16::from_f32(v)))
+            .collect();
+        let a_f16: Vec<f32> = a_data
+            .iter()
+            .map(|&v| f32::from(half::f16::from_f32(v)))
+            .collect();
+        let mut worst_ratio: f64 = 0.0;
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc_f64 = 0.0f64;
+                let mut envelope = 0.0f64;
+                for ki in 0..k {
+                    let exact = a_data[mi * k + ki] as f64 * b_dequant[ni * k + ki] as f64;
+                    let f16_prod = a_f16[mi * k + ki] as f64 * w_f16[ni * k + ki] as f64;
+                    acc_f64 += exact;
+                    envelope += (f16_prod - exact).abs();
+                }
+                let denom = envelope.max(acc_f64.abs() * 1e-3).max(1e-6);
+                worst_ratio = worst_ratio.max(
+                    (actual_c[mi * n + ni] as f64 - acc_f64).abs() / denom,
+                );
+            }
+        }
+        eprintln!(
+            "[golden] worst |device - f64| / own f16 envelope: {worst_ratio:.3} (<= 1.05 = WMMA f16 by-design)"
+        );
+        assert!(
+            worst_ratio <= 1.05,
+            "device residual {worst_ratio:.3}x its own f16 quantization envelope — \
+             REAL decode error beyond WMMA f16 by-design precision"
+        );
+
+        // Mutation-resistant max-error record vs the f32 oracle, kept for the
+        // journey log: the WMMA f16 path moves outputs off the 1e-3 f32 scale
+        // BY DESIGN (the old fixed assert fired on design error).
         let mut max_err: f32 = 0.0;
         for (act, exp) in actual_c.iter().zip(expected_c.iter()) {
             let err = (act - exp).abs();
@@ -80,10 +128,7 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
                 max_err = err;
             }
         }
-        assert!(
-            max_err < 1e-3,
-            "Q4_K GPU matmul max error {max_err} exceeds 1e-3 threshold"
-        );
+        eprintln!("[golden] max_err vs f32 oracle: {max_err} (WMMA f16 path by design)");
 
         // --- GpuDequant path (used by grim-format conversion) ---
         // Routes `KQuant::Q4K` through `RocmDevice::dequantize` →
