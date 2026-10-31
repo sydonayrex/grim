@@ -2598,6 +2598,165 @@ extern "C" __global__ void grim_kv_append_i4(
 //     batch * steps * nkv * (head_dim/128).
 //   * NO scales sidecar: the bf16 scale + u8 zero ride inline in each 67-byte
 //     block; `arena_slot_stride` and the row stride are in BYTES.
+// ── FUSED K-rope + WhiteCrow append (one node replaces two) ───────────────
+//
+// Per attention layer per decode step, the route ran grim_rope_dev_base (K
+// arm) and grim_kv_append_whitecrow (K arm) back to back: rope reads k_buf
+// and writes k_buf in place, then the append reads k_buf and quantizes into
+// the arena. This kernel does both in one launch: each thread reads its PRE-
+// rope K value directly from k_buf, applies the NeoX rotation to its pair
+// (both pair members re-read from k_pre, which stays read-only for the whole
+// launch), then quantizes the ROTATED group into the 67-byte arena block
+// with byte-identical encode to grim_kv_append_whitecrow (affine bf16 scale,
+// u8 zero, even/odd lane nibble pairing through shared memory).
+//
+// Geometry and ring/duplicate-skip semantics are identical to
+// grim_kv_append_whitecrow. Only the K arm is fused: Q rope feeds attention
+// (no append), V append has no rope — both keep their existing nodes.
+//
+// Graph-capture safe: caller-owned buffers + device pos only.
+extern "C" __global__ void grim_rope_append_whitecrow_k(
+    const float* __restrict__ k_pre,          // [batch, kv_stride] PRE-rope K (k_buf)
+    const unsigned int* __restrict__ pos_base, // [batch] per-slot base positions
+    unsigned char* __restrict__ dst,          // WhiteCrow arena (67-byte blocks)
+    int kv_stride,                            // elements (nkv * head_dim)
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,                    // BYTES per slot region
+    int cap_rows,
+    int sink_rows,
+    float rope_base,
+    int interleaved,
+    int rotary_dim)
+{
+    const int groups_per_head = head_dim / 128;
+    const int g = blockIdx.x;
+    const int per_slot = steps * nkv_heads * groups_per_head;
+    if (g >= batch * per_slot) return;
+    const int slot = g / per_slot;
+    const int r = g - slot * per_slot;
+    const int step = r / (nkv_heads * groups_per_head);
+    const int rem = r - step * nkv_heads * groups_per_head;
+    const int kh = rem / groups_per_head;
+    const int gi = rem - kh * groups_per_head;
+    const int tid = threadIdx.x;        // 0..127, one per value
+
+    const int past = pos_base[slot];
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    for (int _j = step + 1; _j < steps; ++_j)
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) return;
+
+    const long long src_base = ((long long)slot * steps + step) * kv_stride
+                             + (long long)kh * head_dim + (long long)gi * 128;
+    const long long row_bytes = (long long)nkv_heads * groups_per_head * 67;
+    const long long dst_base = (long long)slot * arena_slot_stride
+                             + (long long)abs_row * row_bytes
+                             + (long long)kh * groups_per_head * 67
+                             + (long long)gi * 67;
+
+    // ── NeoX/interleaved RoPE: per-ELEMENT rotation (pair re-read) ──
+    // rope_dev_base has one thread per PAIR writing both out[a] and out[b];
+    // here every tid owns exactly ONE element and computes its own rotated
+    // value, reading the partner from k_pre (read-only for the whole launch):
+    //   NeoX:       tid < rhalf            -> a-side, partner = tid + rhalf,
+    //                                        v = x[t]*cos(f_t) - x[p]*sin(f_t)
+    //               rhalf <= tid < 2*rhalf -> b-side, partner = tid - rhalf,
+    //                                        v = x[t]*cos(f_p) + x[p]*sin(f_p)
+    //   interleaved: even tid a-side (partner t+1), odd tid b-side (t-1),
+    //                                        freq index = tid / 2
+    //   tail [rotary_dim, head_dim) passes through.
+    const int i = tid;
+    const int rhalf = rotary_dim / 2;
+    // rn-intrinsics force non-FMA mul/add so the in-register rotation is
+    // BIT-identical to grim_rope_dev_base's memory-round-tripped result —
+    // without them, FMA contraction shifts the last ulp and the quantizer's
+    // roundf flips nibbles at rounding boundaries.
+    float v;
+    if (interleaved) {
+        const int pair = i / 2;
+        const float posf = (float)(past + step);
+        const float freq = 1.0f / powf(rope_base, (2.0f * (float)pair) / (float)head_dim);
+        const float ang = posf * freq;
+        const float cos_v = __cosf(ang);
+        const float sin_v = __sinf(ang);
+        const bool a_side = (i % 2) == 0;
+        const int p_off = a_side ? (i + 1) : (i - 1);
+        const float xs = k_pre[src_base + i];
+        const float xp = k_pre[src_base + p_off];
+        v = a_side ? (__fadd_rn(__fmul_rn(xs, cos_v), -__fmul_rn(xp, sin_v)))
+                   : (__fadd_rn(__fmul_rn(xp, cos_v), __fmul_rn(xs, sin_v)));
+    } else if (i < rhalf) {
+        const float posf = (float)(past + step);
+        const float freq = 1.0f / powf(rope_base, (2.0f * (float)i) / (float)head_dim);
+        const float ang = posf * freq;
+        const float cos_v = __cosf(ang);
+        const float sin_v = __sinf(ang);
+        const float xs = k_pre[src_base + i];
+        const float xp = k_pre[src_base + i + rhalf];
+        v = __fadd_rn(__fmul_rn(xs, cos_v), -__fmul_rn(xp, sin_v));
+    } else if (i < 2 * rhalf) {
+        const int pi = i - rhalf;
+        const float posf = (float)(past + step);
+        const float freq = 1.0f / powf(rope_base, (2.0f * (float)pi) / (float)head_dim);
+        const float ang = posf * freq;
+        const float cos_v = __cosf(ang);
+        const float sin_v = __sinf(ang);
+        const float xs = k_pre[src_base + i];
+        const float xp = k_pre[src_base + pi];
+        // out[b] = x[b]*cos + x[a]*sin — the B element is xs, not xp.
+        v = __fadd_rn(__fmul_rn(xs, cos_v), __fmul_rn(xp, sin_v));
+    } else {
+        v = k_pre[src_base + i];
+    }
+
+    // ── Affine bf16 quantization: byte-identical to grim_kv_append_whitecrow ──
+    __shared__ float s_min[128];
+    __shared__ float s_max[128];
+    s_min[tid] = v;
+    s_max[tid] = v;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float mn = s_min[0];
+    float mx = s_max[0];
+
+    float d = fmaxf((mx - mn) / 15.0f, 1e-30f);
+    unsigned int dbits = __float_as_uint(d);
+    unsigned short sc16 = (unsigned short)(dbits >> 16);
+    float d_bf16 = __uint_as_float(((unsigned int)sc16) << 16);
+    float zero_f = __builtin_roundf(-mn / d_bf16);
+    zero_f = fminf(fmaxf(zero_f, 0.0f), 15.0f);
+    unsigned char zero = (unsigned char)zero_f;
+
+    int nib = (int)__builtin_roundf(v / d_bf16) + (int)zero;
+    nib = nib < 0 ? 0 : (nib > 15 ? 15 : nib);
+
+    __shared__ unsigned char s_codes[64];
+    if ((tid & 1) == 0) {
+        s_codes[tid >> 1] = (unsigned char)(nib & 0x0F);
+    }
+    __syncthreads();
+    if ((tid & 1) == 1) {
+        s_codes[tid >> 1] |= (unsigned char)((nib & 0x0F) << 4);
+    }
+    __syncthreads();
+
+    if (tid < 64) {
+        dst[dst_base + tid] = s_codes[tid];
+    } else if (tid == 64) {
+        dst[dst_base + 64] = (unsigned char)(sc16 & 0xFF);
+        dst[dst_base + 65] = (unsigned char)(sc16 >> 8);
+        dst[dst_base + 66] = zero;
+    }
+}
+
 extern "C" __global__ void grim_kv_append_whitecrow(
     const float* __restrict__ k_rot,
     const int* __restrict__ past_dev,
@@ -6384,6 +6543,97 @@ pub fn launch_kv_append_i4(
 /// in BYTES (`max_ctx * nkv * (head_dim/128) * 67`), `kv_stride` stays in
 /// ELEMENTS (`nkv * head_dim`) for the f32 source rows, and `head_dim` must be
 /// a positive multiple of 128 so groups align to head vectors.
+/// Fused K-rope + WhiteCrow append launcher: one launch replaces
+/// [`Self::rope_dev_base_into`] (K arm) + [`Self::launch_kv_append_whitecrow`]
+/// (K arm). `k_pre` is the PRE-rope K buffer (k_buf); the kernel applies the
+/// NeoX rotation in-register and quantizes the rotated row straight into the
+/// arena. `rope_base`/`interleaved`/`rotary_dim` are the same rope params the
+/// K rope call passed. Capture-safe: caller-owned buffers + device pos only.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_rope_append_whitecrow_k(
+    dev: &crate::RocmDevice,
+    k_pre: &dyn BackendStorage,
+    pos_base_dev: &dyn BackendStorage,
+    dst: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+    rope_base: f32,
+    interleaved: bool,
+    rotary_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("rope_append_whitecrow_k: dst must be RocmStorage".into())
+    })?;
+    if dst_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "rope_append_whitecrow_k: dst arena must be U8 (byte storage for 67B blocks)".into(),
+        ));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_pre, "k_pre_rope_append")?;
+    let past_s = pos_base_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("rope_append_whitecrow_k: pos_base must be RocmStorage".into())
+        })?;
+    let mut dst_ptr = dst_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("rope_append_whitecrow_k: dst has no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| {
+            crate::Error::Backend("rope_append_whitecrow_k: pos_base has no device ptr".into())
+        })?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend("rope_append_whitecrow_k: arena_slot_stride exceeds i32::MAX".into())
+    })?;
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    let mut base_f = rope_base;
+    let mut inter_i = if interleaved { 1 } else { 0 };
+    let mut rotary_i = rotary_dim.min(head_dim) as i32;
+    let groups_per_head = head_dim / 128;
+    let grid = crate::HipDim3::new(
+        (batch.max(1) * steps * nkv_heads * groups_per_head) as u32,
+        1,
+        1,
+    );
+    let block = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_rope_append_whitecrow_k",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut dst_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
+            arg(&mut base_f),
+            arg(&mut inter_i),
+            arg(&mut rotary_i),
+        ],
+    )
+}
+
 pub fn launch_kv_append_whitecrow(
     dev: &crate::RocmDevice,
     k_rot: &dyn BackendStorage,

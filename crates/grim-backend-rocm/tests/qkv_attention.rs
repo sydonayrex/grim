@@ -3623,3 +3623,301 @@ fn graph_i4_multirow_matches_eager_and_corruption_control() {
         "perturbing a K element did not change the attention output — the kernel is not reading the arena"
     );
 }
+
+/// FUSED K-rope + WhiteCrow append gate: grim_rope_append_whitecrow_k must
+/// produce byte-identical arena bytes to the TWO-NODE path it replaces
+/// (rope_dev_base_into on the K arm, then launch_kv_append_whitecrow).
+/// Same pre-rope K bytes fed to both paths; the only allowed difference is
+/// none — the fused kernel's rope math (NeoX pairs, partial rotary,
+/// passthrough tail, pos = past + step) and its affine encode are byte-
+/// for-byte copies of the two originals. Pair-off-diagonal differences would
+/// indicate a wrong pair mapping; uniform differences would indicate a wrong
+/// rope angle. Also covers the duplicate-skip ordering (steps > 1).
+#[test]
+#[ignore]
+fn fused_rope_append_whitecrow_bytes_match_two_node_path() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (nkv, hd, steps, batch) = (2usize, 128usize, 2usize, 1usize);
+    let stride = nkv * hd;
+    let rows = steps; // append consumes `steps` rows per call
+    let mut seed = 0x3F3Fu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let k_pre: Vec<f32> = (0..rows * stride).map(|_| rand()).collect();
+
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let alloc = |n: usize, dt: DType| {
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
+    };
+    let arena_bytes = rows * nkv * (hd / 128) * 67;
+    let k_pre_dev = dev
+        .from_cpu(
+            &k_pre,
+            &Shape::from_slice(&[rows, stride]),
+            DType::F32,
+        )
+        .unwrap();
+
+    // Rope params matching the synth Qwen35 graph (NeoX, full rotary, base
+    // 10000; rotary_dim = head_dim).
+    let rope_base = 10_000.0f32;
+    let interleaved = false;
+    let rotary_dim = hd;
+
+    // ── Path 1 (two-node): rope_dev_base_into the K arm, then append ──
+    let k_rope_dst = alloc(rows * stride, DType::F32);
+    let pos = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[batch]), DType::F32)
+        .unwrap();
+    {
+        // rope_dev_base_into is a RocmDevice method; the K arm passes
+        // num_heads = nkv (the K heads are the KV heads).
+        let k_shape = Shape::from_slice(&[batch, nkv * steps, hd]);
+        let k_rope_rocm = grim_backend_rocm::as_rocm(&k_rope_dst).unwrap();
+        let k_pre_rocm = grim_backend_rocm::as_rocm(k_pre_dev.as_ref()).unwrap();
+        let pos_rocm = grim_backend_rocm::as_rocm(pos.as_ref()).unwrap();
+        let cfg = grim_tensor::RopeConfig {
+            dim: hd,
+            base: rope_base,
+            rotary_dim,
+            interleaved,
+            yarn: None,
+        };
+        dev.rope_dev_base_into(
+            k_pre_rocm,
+            pos_rocm,
+            k_rope_rocm,
+            &cfg,
+            &k_shape,
+            nkv,
+            steps,
+        )
+        .expect("k-arm rope");
+    }
+    dev.synchronize();
+
+    // PROBE: host NeoX rotation of the same pre-rope values vs the device
+    // rope output — isolates whether the two-node ROPE matches host math.
+    {
+        let rhalf = rotary_dim / 2;
+        for si in 0..(nkv * steps) {
+            let base = si * hd;
+            let step_idx = si / nkv;
+            let mut host = vec![0.0f32; 6];
+            for (j, &i) in [0usize, 1, 2, 64, 65, 66].iter().enumerate() {
+                if i < rhalf {
+                    let freq = (std::f64::consts::PI * 2.0).recip()
+                        * (rope_base as f64).powf((2.0 * i as f64) / hd as f64)
+                        * 0.0
+                        + (1.0f64 / (rope_base as f64).powf((2.0 * i as f64) / hd as f64));
+                    let ang = (step_idx as f64) * freq;
+                    host[j] = (k_pre[base + i] as f64 * ang.cos()
+                        - k_pre[base + i + rhalf] as f64 * ang.sin()) as f32;
+                } else if i < 2 * rhalf {
+                    let pi = i - rhalf;
+                    let freq = 1.0f64 / (rope_base as f64).powf((2.0 * pi as f64) / hd as f64);
+                    let ang = (step_idx as f64) * freq;
+                    host[j] = (k_pre[base + i] as f64 * ang.cos()
+                        + k_pre[base + pi] as f64 * ang.sin()) as f32;
+                } else {
+                    host[j] = k_pre[base + i];
+                }
+            }
+            let dev_vals: Vec<f32> = (0..6)
+                .map(|i| k_rope_dst.to_cpu_vec_f32().unwrap()[base + i])
+                .collect();
+            let pre: Vec<f32> = (0..6)
+                .map(|i| k_pre[base + [0usize, 1, 2, 64, 65, 66][i]])
+                .collect();
+            eprintln!(
+                "[rope-probe] si {si}: host {:?} | device {:?} | pre[0,1,2,64,65,66] {:?}",
+                &host,
+                &dev_vals,
+                &pre
+            );
+        }
+    }
+
+    let arena_two_node = alloc(arena_bytes, u8dt.clone());
+    let pos_dev = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[batch]), DType::F32)
+        .unwrap();
+    let k_rope_rocm2 = &k_rope_dst;
+    grim_backend_rocm::launch_kv_append_whitecrow(
+        &dev,
+        k_rope_rocm2,
+        pos_dev.as_ref(),
+        &arena_two_node,
+        stride,
+        nkv,
+        hd,
+        steps,
+        batch,
+        arena_bytes,
+        grim_backend_rocm::KvRingPolicy::UNLIMITED,
+    )
+    .expect("two-node append");
+    dev.synchronize();
+
+    // ── Path 2 (fused): ONE launch from the SAME pre-rope bytes ──
+    let arena_fused = alloc(arena_bytes, u8dt.clone());
+    grim_backend_rocm::launch_rope_append_whitecrow_k(
+        &dev,
+        k_pre_dev.as_ref(),
+        pos_dev.as_ref(),
+        &arena_fused,
+        stride,
+        nkv,
+        hd,
+        steps,
+        batch,
+        arena_bytes,
+        grim_backend_rocm::KvRingPolicy::UNLIMITED,
+        rope_base,
+        interleaved,
+        rotary_dim,
+    )
+    .expect("fused rope+append");
+    dev.synchronize();
+
+    let a = arena_two_node.to_cpu_vec_f32().unwrap();
+    let b = arena_fused.to_cpu_vec_f32().unwrap();
+    let ab: Vec<u8> = a.iter().map(|f| *f as u8).collect();
+    let bb: Vec<u8> = b.iter().map(|f| *f as u8).collect();
+    let diffs = ab
+        .iter()
+        .zip(&bb)
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .count();
+    // DIAGNOSTIC: dequant both arenas' block 0 (scale/zero/nibbles) and print
+    // per-element deltas for the first differing block.
+    let deq_block = |arena: &[u8], blk: usize| -> (f32, f32, Vec<f32>) {
+        let base = blk * 67;
+        let d = f32::from_bits(
+            ((arena[base + 64] as u32 | ((arena[base + 65] as u32) << 8)) << 16)
+                as u32,
+        ) ;
+        let zero = arena[base + 66] as f32;
+        let mut v = vec![0.0f32; 128];
+        for i in 0..128 {
+            let nib = if i % 2 == 0 {
+                arena[base + i / 2] & 0x0F
+            } else {
+                arena[base + i / 2] >> 4
+            };
+            v[i] = d * (nib as f32) - zero;
+        }
+        (d, zero, v)
+    };
+    let (d0a, z0a, va) = deq_block(&ab, 0);
+    let (d0b, z0b, vb) = deq_block(&bb, 0);
+    eprintln!(
+        "[fused-diag] block0: two-node d={d0a:.6} z={z0a:.0} | fused d={d0b:.6} z={z0b:.0}"
+    );
+    for i in 0..128.min(va.len()) {
+        let dd = (va[i] - vb[i]).abs();
+        if dd > 1e-4 {
+            eprintln!("[fused-diag] elem {i}: two-node {:.5} fused {:.5} delta {dd:.5}", va[i], vb[i]);
+        }
+    }
+
+    assert_eq!(
+        diffs, 0,
+        "fused rope+append arena bytes differ from the two-node path: \\
+         {diffs} of {} bytes (first: {:?})",
+        ab.len(),
+        ab.iter()
+            .zip(&bb)
+            .enumerate()
+            .find(|(_, (x, y))| x != y)
+            .map(|(i, (x, y))| (i, x, y))
+    );
+    eprintln!(
+        "[fused-rope-append] arena bytes byte-identical to the two-node path ({} bytes)",
+        ab.len()
+    );
+}
+
+/// MINIMAL PROBE: rope_dev_base_into at pos=0 must be identity (ang=0 for
+/// every pair). Dumps which elements move.
+#[test]
+#[ignore]
+fn probe_rope_dev_base_pos0_identity() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let (nkv, hd, steps) = (2usize, 128usize, 2usize);
+    let mut seed = 0xA11CEu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let k_pre: Vec<f32> = (0..nkv * steps * hd).map(|_| rand()).collect();
+    let k_dev = dev
+        .from_cpu(&k_pre, &Shape::from_slice(&[nkv * steps, hd]), DType::F32)
+        .unwrap();
+    let out = dev
+        .from_cpu(
+            &vec![0.0f32; k_pre.len()],
+            &Shape::from_slice(&[1, nkv * steps, hd]),
+            DType::F32,
+        )
+        .unwrap();
+    let pos = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
+    let cfg = grim_tensor::RopeConfig {
+        dim: hd,
+        base: 10_000.0,
+        rotary_dim: hd,
+        interleaved: false,
+        yarn: None,
+    };
+    let out_rocm = grim_backend_rocm::as_rocm(out.as_ref()).unwrap();
+    dev.rope_dev_base_into(
+        k_dev.as_ref(),
+        pos.as_ref(),
+        out_rocm,
+        &cfg,
+        &Shape::from_slice(&[1, nkv * steps, hd]),
+        nkv,
+        steps,
+    )
+    .expect("rope");
+    dev.synchronize();
+    let got = out.to_cpu_vec_f32().unwrap();
+    let mut moved = 0usize;
+    for (si, step, kh, i) in (0..nkv * steps)
+        .flat_map(|si| (0..hd).map(move |i| (si, si / nkv, si % nkv, i)))
+    {
+        let idx = si * hd + i;
+        if k_pre[idx].to_bits() != got[idx].to_bits() {
+            if moved < 8 {
+                eprintln!(
+                    "[probe] moved: si {si} (step {step} kh {kh}) i {i}: pre {:.5} got {:.5}",
+                    k_pre[idx], got[idx]
+                );
+            }
+            moved += 1;
+        }
+    }
+    eprintln!("[probe] total moved at pos=0: {moved} (expect 0 if identity)");
+}
