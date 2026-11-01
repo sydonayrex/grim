@@ -619,11 +619,46 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // Decode fast path: at m == 1, 1-thread-per-column leaves the GPU idle
+        // (e.g. at down-proj n=5120, k=17408, each thread serially walks 68 super-blocks).
+        // grim_fused_dequant_gemm_iq3s_decode distributes the K/256 super-blocks across
+        // 32 lanes of a warp per column, reducing via shuffle.
+        if m == 1 && !matches!(std::env::var("GRIM_IQ3S_DECODE").as_deref(), Ok("0" | "false" | "off")) {
+            let a_ptr = a
+                .device_ptr
+                .ok_or_else(|| Error::Backend("launch_fused_dequant_gemm_iq3s: a has no device ptr".into()))?;
+            let b_ptr = b
+                .device_ptr
+                .ok_or_else(|| Error::Backend("launch_fused_dequant_gemm_iq3s: b has no device ptr".into()))?;
+            let out_ptr = out
+                .device_ptr
+                .ok_or_else(|| Error::Backend("launch_fused_dequant_gemm_iq3s: out has no device ptr".into()))?;
+            // 256 threads per block = 8 warps = 8 columns per block
+            let grid_x = (n as u32).div_ceil(8);
+            let mut aptr = a_ptr;
+            let mut bptr = b_ptr;
+            let mut optr = out_ptr;
+            let mut mm = m as i32;
+            let mut nn = n as i32;
+            let mut kk = k as i32;
+            return self.launch_compute_kernel(
+                "grim_fused_dequant_gemm_iq3s_decode",
+                HipDim3::new(grid_x, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [
+                    arg(&mut aptr),
+                    arg(&mut bptr),
+                    arg(&mut optr),
+                    arg(&mut mm),
+                    arg(&mut nn),
+                    arg(&mut kk),
+                ],
+            );
+        }
         // D2-2: group-hoisted kernel; scalar entry kept as the parity oracle.
-        // res0-T1: the LDS codebook variant was measured 1.18x FASTER at
-        // n=4096 but 0.78x SLOWER at n=17408 (preload + syncthreads beat by
-        // L2 amortization at large N), so it is NOT shipped here — the
-        // `_grouped_lds` launcher stays reachable as an A/B arm.
+        // Re-benchmarked 2026-10-31 with warmup on RDNA4 (iq_lds_codebook_ab):
+        // LDS codebook is 1.21x faster at n=4096 (155 vs 188 us) and 1.16x faster
+        // at n=17408 (216 vs 250 us). Pre-decode / general dispatch retains grouped.
         self.launch_fused_deq_gemm_simple(
             "grim_fused_dequant_gemm_iq3s_grouped",
             a,
@@ -1172,7 +1207,7 @@ mod iq1s_grouped_parity {
                     KQuantScheme::IQ3S => {
                         dev.launch_fused_dequant_gemm_iq3s_scalar(&a, &w, &out_scalar, 1, n, k)
                             .expect("scalar launch");
-                        dev.launch_fused_dequant_gemm_iq3s(&a, &w, &out_grouped, 1, n, k)
+                        dev.launch_fused_dequant_gemm_iq3s_stock_for_ab(&a, &w, &out_grouped, 1, n, k)
                             .expect("grouped launch");
                     }
                     KQuantScheme::IQ2S => {
@@ -1231,6 +1266,91 @@ mod iq1s_grouped_parity {
                 );
             }
         }
+    }
+
+    #[test]
+    fn iq3s_decode_kernel_matches_grouped_oracle_within_tolerance() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let _lock = crate::device::util::gpu_test_lock();
+        let dev = crate::device::roc_device::RocmDevice::try_new(0).expect("device");
+        // Test 27B down_proj shape (n=5120, k=17408) where 68 super-blocks are reduced across warp lanes
+        let (n, k) = (5120usize, 17408usize);
+        let block_bytes = 110;
+        let blocks = (n * k) / 256;
+        let mut seed = 0xD3C0DEu64;
+        let mut rand_byte = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as u8
+        };
+        let mut bytes = vec![0u8; blocks * block_bytes];
+        for b in 0..blocks {
+            let offset = b * block_bytes;
+            // Valid fp16 scale
+            bytes[offset] = 0x00;
+            bytes[offset + 1] = 0x3c; // 1.0 in fp16
+            for i in 2..block_bytes {
+                bytes[offset + i] = rand_byte();
+            }
+        }
+        let dt = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ3S),
+        };
+        let w_box = dev
+            .from_cpu_bytes(&bytes, &Shape::new(vec![n, k]), dt)
+            .expect("packed weight");
+        let w = w_box
+            .as_any()
+            .downcast_ref::<crate::RocmStorage>()
+            .expect("RocmStorage");
+        let act: Vec<f32> = (0..k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+        let a_box = dev
+            .from_cpu(&act, &Shape::new(vec![1, k]), DType::F32)
+            .expect("act");
+        let a = a_box
+            .as_any()
+            .downcast_ref::<crate::RocmStorage>()
+            .expect("RocmStorage");
+
+        let out_decode_box = dev.zeros(&Shape::new(vec![1, n]), DType::F32).expect("out decode");
+        let out_oracle_box = dev.zeros(&Shape::new(vec![1, n]), DType::F32).expect("out oracle");
+        let out_decode = out_decode_box.as_any().downcast_ref::<crate::RocmStorage>().unwrap();
+        let out_oracle = out_oracle_box.as_any().downcast_ref::<crate::RocmStorage>().unwrap();
+
+        // Run default (routes to grim_fused_dequant_gemm_iq3s_decode when m==1)
+        dev.launch_fused_dequant_gemm_iq3s(a, w, out_decode, 1, n, k).expect("launch decode");
+
+        // Run grouped oracle via A/B stock launcher
+        dev.launch_fused_dequant_gemm_iq3s_stock_for_ab(a, w, out_oracle, 1, n, k).expect("launch oracle");
+        dev.synchronize();
+
+        let got_decode = out_decode.to_cpu_vec_f32().expect("read decode");
+        let got_oracle = out_oracle.to_cpu_vec_f32().expect("read oracle");
+        assert_eq!(got_decode.len(), n);
+
+        let mut max_abs_diff = 0.0f32;
+        let mut max_rel_diff = 0.0f32;
+        for i in 0..n {
+            let diff = (got_decode[i] - got_oracle[i]).abs();
+            let ref_val = got_oracle[i].abs().max(1e-4);
+            let rel = diff / ref_val;
+            if diff > max_abs_diff {
+                max_abs_diff = diff;
+            }
+            if rel > max_rel_diff {
+                max_rel_diff = rel;
+            }
+        }
+        eprintln!(
+            "[iq3s_decode_test] n={n} k={k}: max_abs_diff={max_abs_diff:.4e}, max_rel_diff={max_rel_diff:.4e}"
+        );
+        // Tolerance gate: relative difference <= 1e-4 (f32 reduction order changes across 68 blocks)
+        assert!(
+            max_rel_diff <= 1e-4,
+            "max relative error {max_rel_diff} exceeded 1e-4 tolerance gate"
+        );
     }
 
     /// D3-B gate: the PROMPT-TILED IQ1_S kernel (LDS-staged dequant reused
