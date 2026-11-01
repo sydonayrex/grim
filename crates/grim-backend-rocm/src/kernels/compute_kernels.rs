@@ -1224,7 +1224,7 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
 // bit-exact parity with fused dot_gemv prologues is NOT preserved, so this is used strictly
 // on standalone decode norm sites where tolerance parity (<= 1e-6) holds.
 extern "C" __global__ void __launch_bounds__(256)
-grim_rms_norm_decode(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
+grim_rms_norm_decode(const float* x, const float* __restrict__ w, float* out,
                      int row_len, float eps) {
     __shared__ float s_warp_sums[8];
     const int tid = threadIdx.x;
@@ -1419,8 +1419,8 @@ grim_layer_norm(const float* __restrict__ x, const float* __restrict__ w, const 
 
 // Warp-per-row fused residual-add + RMS norm (same 4-wide unroll and reduction structure as grim_rms_norm).
 extern "C" __global__ void __launch_bounds__(256)
-grim_add_rms_norm(const float* __restrict__ x, const float* __restrict__ residual,
-                  const float* __restrict__ w, float* __restrict__ y_out, float* __restrict__ norm_out,
+grim_add_rms_norm(const float* x, const float* residual,
+                  const float* __restrict__ w, float* y_out, float* norm_out,
                   int row_len, float eps, int total) {
     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
@@ -1473,9 +1473,13 @@ grim_add_rms_norm(const float* __restrict__ x, const float* __restrict__ residua
 // 4-wide unroll (stride 1024, offsets +256/+512/+768) and warp+LDS reduction tree as
 // grim_rms_norm_decode, preserving bit-exact parity (`to_bits()`) against the split
 // `add_into` + `rms_norm_into` path.
+// NOTE: `y_out` and `norm_out` may alias (`y_out == norm_out` on layer 63's Residual 2 +
+// output_norm fusion where both point to `head_input`), or `r` and `norm_out` may alias
+// (`r == norm_out` on Residual 1 where both point to `norm_buf[layer_idx]`). Do NOT mark
+// output pointers `__restrict__`.
 extern "C" __global__ void __launch_bounds__(256)
-grim_add_rms_norm_decode(const float* __restrict__ x, const float* __restrict__ residual,
-                         const float* __restrict__ w, float* __restrict__ y_out, float* __restrict__ norm_out,
+grim_add_rms_norm_decode(const float* x, const float* residual,
+                         const float* __restrict__ w, float* y_out, float* norm_out,
                          int row_len, float eps) {
     __shared__ float s_warp_sums[8];
     const int tid = threadIdx.x;

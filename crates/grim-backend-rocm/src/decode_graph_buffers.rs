@@ -1572,8 +1572,44 @@ impl DecodeGraphBuffers {
     /// with the prefill length, plus the KV rows themselves.
     pub fn reset_for_replay(&mut self) -> Result<()> {
         self.write_layer_totals(0)?;
+        for s in &self.sc_state {
+            let ord = s.device_ordinal();
+            let dev = crate::RocmDevice::shared(ord);
+            let _g = crate::device::util::DeviceGuard::set(ord as i32);
+            if let Some(ptr) = s.device_ptr_u64() {
+                unsafe {
+                    let _ = crate::hipMemsetAsync(
+                        ptr as *mut c_void,
+                        0,
+                        s.bytes(),
+                        dev.active_stream(),
+                    );
+                }
+            }
+        }
+        for kda in self.kda.iter().flatten() {
+            let ord = kda.state.device_ordinal();
+            let dev = crate::RocmDevice::shared(ord);
+            let _g = crate::device::util::DeviceGuard::set(ord as i32);
+            if let Some(ptr) = kda.state.device_ptr_u64() {
+                unsafe {
+                    let _ = crate::hipMemsetAsync(
+                        ptr as *mut c_void,
+                        0,
+                        kda.state.bytes(),
+                        dev.active_stream(),
+                    );
+                }
+            }
+        }
         // `write_pos_async` also updates the `current_pos` host mirror.
-        self.write_pos_all_segments(0)
+        self.write_pos_all_segments(0)?;
+        for ord in [0usize, 1usize] {
+            if self.layer_devices.contains(&ord) {
+                crate::RocmDevice::shared(ord).synchronize();
+            }
+        }
+        Ok(())
     }
 
     /// D1-2a: seed EVERY layer's KV total to `rows` (the prefill length),
@@ -2940,6 +2976,23 @@ impl DecodeGraph {
         // interior boundaries are advanced by the model's forward_capture;
         // end_capture closes the last open segment.
         if self.split_capture() {
+            for seg in 0..self.segments.len() {
+                let (graph, exec) = (self.segments[seg].graph, self.segments[seg].exec);
+                if !graph.is_null() || !exec.is_null() {
+                    let _guard =
+                        crate::device::util::DeviceGuard::set(self.segments[seg].device as i32);
+                    unsafe {
+                        if !exec.is_null() {
+                            let _ = hipGraphExecDestroy(exec);
+                        }
+                        if !graph.is_null() {
+                            let _ = hipGraphDestroy(graph);
+                        }
+                    }
+                    self.segments[seg].graph = std::ptr::null_mut();
+                    self.segments[seg].exec = std::ptr::null_mut();
+                }
+            }
             // Publish the padded-fp8 act scratch for the duration of the
             // capture (WhiteRaven blocked leg needs it and cannot allocate
             // inside a capture).

@@ -645,6 +645,21 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::dtype::KQuantScheme,
     ) -> Result<Option<*mut c_void>> {
+        self.try_u4_lane_decode_prequant(a, b, out, m, n, k, scheme, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_u4_lane_decode_prequant(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::dtype::KQuantScheme,
+        u4_ready: bool,
+    ) -> Result<Option<*mut c_void>> {
         let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
         // Q5K is excluded from the u4-lane GEMV at M=1. ROOT CAUSE (measured,
         // not hypothesized): there is NO functional bug in either stage. The
@@ -705,7 +720,7 @@ impl RocmDevice {
             return Ok(None);
         }
         if let Some(lanes) = Self::u4_lane_weights_budgeted(self, b, n, k, scheme, true)? {
-            self.launch_w4a4_ostquant_gemv(
+            self.launch_w4a4_ostquant_gemv_prequant(
                 a,
                 lanes.qweight_rocm()?,
                 lanes.scales_rocm()?,
@@ -714,6 +729,7 @@ impl RocmDevice {
                 m,
                 n,
                 k,
+                u4_ready,
             )?;
             return Ok(Some(self.active_stream()));
         }

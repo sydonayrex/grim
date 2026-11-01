@@ -1917,7 +1917,7 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         graph.segments.len()
     );
 
-    let run_arm = |arm_name: &str, graph: &mut grim_backend_rocm::FullDecodeGraph| -> (f64, f64, usize) {
+    let run_arm = |arm_name: &str, graph: &mut grim_backend_rocm::FullDecodeGraph| -> (f64, f64, usize, Vec<f32>) {
         for ord in [0usize, 1usize] {
             grim_backend_rocm::RocmDevice::shared(ord).synchronize();
         }
@@ -2114,7 +2114,16 @@ fn qwen35_production_27b_route_wall_and_utilization() {
             step(graph, tok);
         }
         unsafe { std::env::remove_var("GRIM_SEGMENT_TIMING") };
-        (warm_us, cold_us, total_nodes)
+        graph.buffers.reset_for_replay().expect("reset_for_replay");
+        model
+            .forward_replay(graph, 3)
+            .unwrap_or_else(|e| panic!("27B {arm_name} logit replay: {e}"));
+        let logits = graph.read_logits_f32().expect("read_logits_f32");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "27B {arm_name} produced non-finite logits"
+        );
+        (warm_us, cold_us, total_nodes, logits)
     };
 
     // Warmup both devices before measuring either arm.
@@ -2125,24 +2134,74 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         .forward_capture(&mut graph, 11)
         .expect("27B warmup walk 2");
 
-    // Same-session A/B: Arm A = OLD baseline (pre-rms_norm_decode, pre-iq3s_decode, pre-Residual1 fusion)
+    // Same-session 4-arm progression:
+    // Arm 1: OLD-AE75E0C6 (1544 nodes)
     unsafe {
         std::env::set_var("GRIM_RMS_NORM_DECODE", "0");
         std::env::set_var("GRIM_IQ3S_DECODE", "0");
         std::env::set_var("GRIM_FUSED_RESIDUAL1", "0");
+        std::env::set_var("GRIM_FUSED_RESIDUAL2", "0");
+        std::env::set_var("GRIM_DEDUP_QUANT", "0");
     }
-    let (old_warm_us, old_cold_us, old_nodes) = run_arm("OLD-AE75E0C6", &mut graph);
+    let (old_warm_us, old_cold_us, old_nodes, old_logits) = run_arm("OLD-AE75E0C6", &mut graph);
 
-    // Arm B = NEW build (grim_rms_norm_decode + grim_add_rms_norm_decode + grim_fused_dequant_gemm_iq3s_decode + Residual1 fusion)
+    // Arm 2: STEP1-RES1 (1480 nodes: +rms_norm_decode, +add_rms_norm_decode, +iq3s_decode, +Residual1 fusion)
     unsafe {
         std::env::remove_var("GRIM_RMS_NORM_DECODE");
         std::env::remove_var("GRIM_IQ3S_DECODE");
         std::env::remove_var("GRIM_FUSED_RESIDUAL1");
     }
-    let (warm_us, cold_us, new_nodes) = run_arm("NEW-CURRENT", &mut graph);
+    let (res1_warm_us, res1_cold_us, res1_nodes, res1_logits) = run_arm("STEP1-RES1", &mut graph);
+
+    // Arm 3: STEP2-RES2 (+Residual2 fusion)
+    unsafe {
+        std::env::remove_var("GRIM_FUSED_RESIDUAL2");
+    }
+    let (res2_warm_us, res2_cold_us, res2_nodes, res2_logits) = run_arm("STEP2-RES2", &mut graph);
+
+    // Arm 4: STEP3-DEDUP (+Sibling quantize prologue dedup)
+    unsafe {
+        std::env::remove_var("GRIM_DEDUP_QUANT");
+    }
+    let (warm_us, cold_us, new_nodes, new_logits) = run_arm("STEP3-DEDUP", &mut graph);
     let nodes = new_nodes as u64;
+    let (_, _, max_abs_old_res1) = worst_scaled(&old_logits, &res1_logits);
+    let (_, _, max_abs_res1_res2) = worst_scaled(&res1_logits, &res2_logits);
+    let (_, _, max_abs_res2_dedup) = worst_scaled(&res2_logits, &new_logits);
+    let (worst_rel_old_new, worst_at, max_abs_old_new) = worst_scaled(&old_logits, &new_logits);
+    let top1 = |v: &[f32]| -> (usize, f32) {
+        v.iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap()
+    };
     eprintln!(
-        "[27B:A/B] OLD ({old_nodes} nodes): warm {old_warm_us:.0} us / cold {old_cold_us:.0} us  ->  NEW ({new_nodes} nodes): warm {warm_us:.0} us ({:+.0} us) / cold {cold_us:.0} us ({:+.0} us)",
+        "[27B:LOGITS-GATE]\n  OLD vs STEP1-RES1:  max_abs_diff = {max_abs_old_res1:.3e}  top1={:?} vs {:?}\n  STEP1 vs STEP2-RES2: max_abs_diff = {max_abs_res1_res2:.3e}  top1={:?}\n  STEP2 vs STEP3-DEDUP: max_abs_diff = {max_abs_res2_dedup:.3e}  top1={:?}\n  OLD vs STEP3-DEDUP:  max_abs_diff = {max_abs_old_new:.3e} (worst_rel {worst_rel_old_new:.3e} at {worst_at})",
+        top1(&old_logits),
+        top1(&res1_logits),
+        top1(&res2_logits),
+        top1(&new_logits),
+    );
+    assert_eq!(
+        max_abs_res1_res2, 0.0,
+        "Residual 2 fusion must be bit-exact (0.0 diff) against split add+rms_norm_decode"
+    );
+    assert_eq!(
+        max_abs_res2_dedup, 0.0,
+        "Sibling quantize prologue dedup must be bit-exact (0.0 diff) against duplicate quantize"
+    );
+    assert_eq!(
+        top1(&old_logits).0,
+        top1(&new_logits).0,
+        "Top-1 token must match between OLD and STEP3-DEDUP"
+    );
+    eprintln!(
+        "[27B:PROGRESSION]\n  OLD-AE75E0C6 ({old_nodes} nodes): warm {old_warm_us:.0} us / cold {old_cold_us:.0} us\n  STEP1-RES1   ({res1_nodes} nodes): warm {res1_warm_us:.0} us ({:+.0} us) / cold {res1_cold_us:.0} us ({:+.0} us)\n  STEP2-RES2   ({res2_nodes} nodes): warm {res2_warm_us:.0} us ({:+.0} us) / cold {res2_cold_us:.0} us ({:+.0} us)\n  STEP3-DEDUP  ({new_nodes} nodes): warm {warm_us:.0} us ({:+.0} us) / cold {cold_us:.0} us ({:+.0} us)",
+        res1_warm_us - old_warm_us,
+        res1_cold_us - old_cold_us,
+        res2_warm_us - old_warm_us,
+        res2_cold_us - old_cold_us,
         warm_us - old_warm_us,
         cold_us - old_cold_us
     );

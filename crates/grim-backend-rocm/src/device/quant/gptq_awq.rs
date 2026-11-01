@@ -932,6 +932,32 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        self.launch_w4a4_ostquant_gemv_prequant(
+            a_storage,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_w4a4_ostquant_gemv_prequant(
+        &self,
+        a_storage: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        u4_ready: bool,
+    ) -> Result<*mut c_void> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if k % 128 != 0 {
             return Err(Error::Backend(format!(
@@ -1012,8 +1038,10 @@ impl RocmDevice {
         let act_scales = scales_guard.as_ref().unwrap();
         let act_sums = sums_guard.as_ref().unwrap();
 
-        // Quantize activations to u4 groups
-        self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, k)?;
+        // Quantize activations to u4 groups (skipped when sibling projection already quantized `a_storage`)
+        if !u4_ready {
+            self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, k)?;
+        }
 
         // Launch sudot8 W4A4 GEMV
         self.launch_dot8_w4a4_gemv(

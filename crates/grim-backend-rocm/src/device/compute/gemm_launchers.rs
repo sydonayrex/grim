@@ -3073,6 +3073,94 @@ impl RocmDevice {
     /// - Anything else (IQ schemes, F16/BF16 acts, legacy/env-gated paths that
     ///   need their own scratch) -> `Unimplemented`, caller falls back eager.
     /// - `GRIM_DOT_GEMV=0` honored (forces WMMA legs).
+    /// Query which activation quantization a weight will perform inside `linear_decode_into`:
+    /// returns `(uses_q81, uses_u4)`.
+    pub fn linear_decode_quant_kind(&self, w: &RocmStorage, m: usize, n: usize, k: usize) -> (bool, bool) {
+        use grim_tensor::KQuantScheme;
+        let dot_disabled = matches!(
+            std::env::var("GRIM_DOT_GEMV").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        match &w.dtype().storage {
+            DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
+                let iq4nl_disabled = dot_disabled
+                    || matches!(
+                        std::env::var("GRIM_IQ4NL_DOT4").as_deref(),
+                        Ok("0" | "false" | "off")
+                    );
+                (self.is_dot4_arch && !iq4nl_disabled && k % 32 == 0, false)
+            }
+            DTypeStorage::KQuant(
+                scheme @ (KQuantScheme::Q4K
+                | KQuantScheme::Q5K
+                | KQuantScheme::Q6K
+                | KQuantScheme::Q2K
+                | KQuantScheme::Q3K
+                | KQuantScheme::IQ3S
+                | KQuantScheme::IQ4XS
+                | KQuantScheme::IQ2S
+                | KQuantScheme::IQ2XS
+                | KQuantScheme::IQ2XXS
+                | KQuantScheme::IQ3XXS
+                | KQuantScheme::IQ1S
+                | KQuantScheme::IQ1M),
+            ) => {
+                if !(self.is_dot4_arch && !dot_disabled && k % 256 == 0) {
+                    return (true, false);
+                }
+                if matches!(scheme, KQuantScheme::Q4K) {
+                    let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
+                    if m == 1
+                        && w4a4_decode
+                        && k % 128 == 0
+                        && crate::quantization::w4a4_ostquant_supported(
+                            crate::quantization::gcn_arch(&self.gpu_target),
+                            k,
+                        )
+                        .is_ok()
+                        && Self::u4_lane_weights_budgeted(self, w, n, k, *scheme, true)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                    {
+                        return (false, true);
+                    }
+                }
+                if crate::device::quant::exact_decode_gemv()
+                    && matches!(scheme, KQuantScheme::Q4K | KQuantScheme::IQ3S)
+                {
+                    return (false, false);
+                }
+                let needs_q81 = match scheme {
+                    KQuantScheme::IQ3S
+                    | KQuantScheme::IQ1S
+                    | KQuantScheme::IQ1M
+                    | KQuantScheme::IQ2S
+                    | KQuantScheme::IQ2XS
+                    | KQuantScheme::IQ2XXS
+                    | KQuantScheme::IQ3XXS => false,
+                    KQuantScheme::Q6K => {
+                        !matches!(
+                            std::env::var("GRIM_Q6K_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) && crate::device::quant::kquant_dot4_ok_for(n)
+                    }
+                    KQuantScheme::IQ4XS => {
+                        let xs_disabled = dot_disabled
+                            || matches!(
+                                std::env::var("GRIM_IQ4XS_DOT4").as_deref(),
+                                Ok("0" | "false" | "off")
+                            );
+                        self.is_dot4_arch && !xs_disabled && k % 256 == 0
+                    }
+                    _ => true,
+                };
+                (needs_q81, false)
+            }
+            _ => (false, false),
+        }
+    }
+
     pub fn linear_decode_into(
         &self,
         a: &dyn BackendStorage,
@@ -3080,6 +3168,28 @@ impl RocmDevice {
         out: &RocmStorage,
         act_q81: &RocmStorage,
     ) -> Result<Box<dyn ComputeHandle>> {
+        self.linear_decode_into_prequant(a, w, out, act_q81, false, false)
+    }
+
+    /// Decode GEMV with optional pre-quantized activation flags (`q81_ready`, `u4_ready`).
+    /// When `q81_ready` is true, `act_q81` already holds the `grim_quantize_q8_1(a)` output.
+    /// When `u4_ready` is true, `self.act_u4_{codes,scales,sums}_buf` already hold the
+    /// `grim_quantize_u4_group128(a)` output.
+    pub fn linear_decode_into_prequant(
+        &self,
+        a: &dyn BackendStorage,
+        w: &RocmStorage,
+        out: &RocmStorage,
+        act_q81: &RocmStorage,
+        q81_ready: bool,
+        u4_ready: bool,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let dedup_enabled = !matches!(
+            std::env::var("GRIM_DEDUP_QUANT").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        let q81_ready = q81_ready && dedup_enabled;
+        let u4_ready = u4_ready && dedup_enabled;
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::KQuantScheme;
         let a_dims = a.shape().dims();
@@ -3333,7 +3443,9 @@ impl RocmDevice {
                             act_q81.bytes
                         )));
                     }
-                    self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
+                    if !q81_ready {
+                        self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
+                    }
                     self.launch_dot4_iq4nl_q81_gemv(act_q81, w, out, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_iq4nl(a_rocm, w, out, m, n, k)?;
@@ -3449,7 +3561,9 @@ impl RocmDevice {
                     scheme,
                     KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K
                 ) {
-                    if let Some(stream) = self.try_u4_lane_decode(a_s, w, out, m, n, k, *scheme)? {
+                    if let Some(stream) =
+                        self.try_u4_lane_decode_prequant(a_s, w, out, m, n, k, *scheme, u4_ready)?
+                    {
                         return Ok(Box::new(RocmHandle::new(Some(stream))));
                     }
                 }
@@ -3488,7 +3602,35 @@ impl RocmDevice {
                         _ => {}
                     }
                 }
-                self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
+                let needs_q81 = match scheme {
+                    KQuantScheme::IQ3S
+                    | KQuantScheme::IQ1S
+                    | KQuantScheme::IQ1M
+                    | KQuantScheme::IQ2S
+                    | KQuantScheme::IQ2XS
+                    | KQuantScheme::IQ2XXS
+                    | KQuantScheme::IQ3XXS => false,
+                    KQuantScheme::Q6K => {
+                        !matches!(
+                            std::env::var("GRIM_Q6K_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) && crate::device::quant::kquant_dot4_ok_for(n)
+                    }
+                    KQuantScheme::IQ4XS => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ4XS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
+                    _ => true,
+                };
+                if needs_q81 && !q81_ready {
+                    self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
+                }
                 match scheme {
                     KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,
                     KQuantScheme::Q5K => self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?,
