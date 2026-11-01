@@ -490,6 +490,9 @@ impl RocmDevice {
                 let e = acc.entry(entry.to_string()).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += (ms * 1000.0) as u64;
+                let de = acc.entry(format!("__dev{}_total__", self.ordinal)).or_insert((0, 0));
+                de.0 += 1;
+                de.1 += (ms * 1000.0) as u64;
             }
         }
         crate::device::util::report_rocm_progress("hipModuleLaunchKernel:done");
@@ -1121,6 +1124,9 @@ impl RocmDevice {
                         let e = acc.entry(entry.to_string()).or_insert((0, 0));
                         e.0 += 1;
                         e.1 += (ms * 1000.0) as u64;
+                        let de = acc.entry(format!("__dev{}_total__", self.ordinal)).or_insert((0, 0));
+                        de.0 += 1;
+                        de.1 += (ms * 1000.0) as u64;
                     }
                 }
                 drop(_dev_guard);

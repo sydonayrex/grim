@@ -2646,6 +2646,24 @@ impl DecodeGraph {
         self.build_boundary_handoffs();
     }
 
+    /// Enable per-segment start/stop HIP events on an existing segmented graph
+    /// without resetting captured segment graphs.
+    pub fn enable_segment_timing_events(&mut self) {
+        if !self.segment_timing_evs.is_empty() {
+            return;
+        }
+        for s in &self.segments {
+            let _guard = crate::device::util::DeviceGuard::set(s.device as i32);
+            let mut start: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut stop: *mut std::ffi::c_void = std::ptr::null_mut();
+            unsafe {
+                let _ = crate::hipEventCreate(&mut start);
+                let _ = crate::hipEventCreate(&mut stop);
+            }
+            self.segment_timing_evs.push((start, stop));
+        }
+    }
+
     /// M6: build one handoff per device boundary, when the handoff is enabled.
     ///
     /// The handoff replaces A6's host-issued peer copy + cross-stream event
@@ -2795,6 +2813,11 @@ impl DecodeGraph {
     /// Close segment `seg`'s bracket: end capture, lower its gate, instantiate
     /// and upload ITS graph on ITS stream.
     pub fn end_capture_segment(&mut self, seg: usize) -> Result<()> {
+        if !self.capturing {
+            return Err(Error::Backend(format!(
+                "end_capture_segment({seg}) called without an active capture (capturing=false)"
+            )));
+        }
         {
             let s = &self.segments[seg];
             let _guard = crate::device::util::DeviceGuard::set(s.device as i32);

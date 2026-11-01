@@ -4801,7 +4801,7 @@ impl DecodeGraphModel for Qwen35 {
             // A6: advance an interior device boundary per the A2 capture
             // contract — close segment k (whose last layer is i) and open
             // segment k+1. Legacy single-graph graphs have no segments.
-            if graph.segments.len() > 1 {
+            if graph.segments.len() > 1 && graph.capturing {
                 if let Some(si) = graph.segments.iter().position(|s| s.layers.contains(&i)) {
                     if i + 1 == graph.segments[si].layers.end && si + 1 < graph.segments.len() {
                         graph.end_capture_segment(si)?;

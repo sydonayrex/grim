@@ -1918,11 +1918,17 @@ fn qwen35_production_27b_route_wall_and_utilization() {
     );
 
     // Warmup executes eager; capture records.
-    let _ = model.forward_capture(&mut graph, 11);
-    let _ = model.forward_capture(&mut graph, 11);
+    model
+        .forward_capture(&mut graph, 11)
+        .expect("27B warmup walk 1");
+    model
+        .forward_capture(&mut graph, 11)
+        .expect("27B warmup walk 2");
     // (a) ROUTE: counters around ONE more eager walk.
     grim_backend_rocm::reset_kernel_route_counters();
-    let _ = model.forward_capture(&mut graph, 11);
+    model
+        .forward_capture(&mut graph, 11)
+        .expect("27B route walk");
     let mut route = grim_backend_rocm::kernel_route_snapshot();
     route.sort_by(|a, b| b.1.cmp(&a.1));
     let total: u64 = route.iter().map(|(_, v)| v).sum();
@@ -1936,43 +1942,33 @@ fn qwen35_production_27b_route_wall_and_utilization() {
     }
     eprintln!("[27B] quantize-prologue nodes = {quant_nodes}");
 
-    // CAPTURE attempt: at HEAD the 27B capture faults at the dev1 boundary —
-    // linear_decode issues a WEIGHT-STORAGE upload (RocmStorage raw-bytes H2D,
-    // sync hipMemcpy) inside the capture bracket (layer 24 kda.attn_gate,
-    // WhiteCrow arena; layer usize::MAX + gate/up 17408x5120, f16 arena).
-    // Same failure with GRIM_TEST_ARENA=f16 -> NOT the WhiteCrow split arm;
-    // the failure is a weight upload, untouched by this session's commits ->
-    // merge-era regression (aeeecac1 dual-GPU placement), attribution pending.
-    // Fall through to the EAGER measurement, which is the real dependent chain
-    // (620 launches) and the utilization denominator we can get today.
     // DECOMPOSITION (review order item 1): one eager record walk with
     // GRIM_KERNEL_TIMES=1 gives per-kernel-type event totals.
     unsafe { std::env::set_var("GRIM_KERNEL_TIMES", "1") };
     let times_before = grim_backend_rocm::kernel_times_snapshot();
-    // The walk can die mid-layer (KDA module load 209 once ordinal 1 fills —
-    // the mirror's own damage). Catch it and decompose whatever ran.
-    let walk_r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = model.forward_capture(&mut graph, 11);
-    }));
+    model
+        .forward_capture(&mut graph, 11)
+        .expect("27B decomposition walk");
     let times_after = grim_backend_rocm::kernel_times_snapshot();
     unsafe { std::env::remove_var("GRIM_KERNEL_TIMES") };
-    if walk_r.is_err() {
-        eprintln!("[decomp] record walk PANICKED mid-walk (mirror-filled ordinal 1) — partial decomposition below");
-    }
     let mut per_kernel: Vec<(String, u64, u64)> = times_after
         .iter()
         .map(|(k3, c, us3)| {
-            let before = times_before
+            let (before_c, before_us) = times_before
                 .iter()
                 .find(|(k2, _, _)| k2 == k3)
-                .map(|(_, _, v2)| *v2)
-                .unwrap_or(0);
-            (k3.clone(), c.saturating_sub(before), us3.saturating_sub(before))
+                .map(|(_, c2, v2)| (*c2, *v2))
+                .unwrap_or((0, 0));
+            (k3.clone(), c.saturating_sub(before_c), us3.saturating_sub(before_us))
         })
         .filter(|(_, c, us)| *c > 0 || *us > 0)
         .collect();
     per_kernel.sort_by(|a, b| b.2.cmp(&a.2));
-    let total_us: u64 = per_kernel.iter().map(|(_, _, us)| *us).sum();
+    let total_us: u64 = per_kernel
+        .iter()
+        .filter(|(k, _, _)| !k.starts_with("__dev"))
+        .map(|(_, _, us)| *us)
+        .sum();
     eprintln!("[decomp] per-kernel busy totals (one eager walk):");
     for (name, count, us) in &per_kernel {
         eprintln!("[decomp]   {count:>4}x {name:<44} {us:>9} us");
@@ -2004,7 +2000,8 @@ fn qwen35_production_27b_route_wall_and_utilization() {
                     );
                     total = n;
                 } else {
-                    for seg in &graph.segments {
+                    let mut seg_counts = Vec::new();
+                    for (si, seg) in graph.segments.iter().enumerate() {
                         let mut n: usize = 0;
                         assert_eq!(
                             unsafe {
@@ -2017,7 +2014,9 @@ fn qwen35_production_27b_route_wall_and_utilization() {
                             0
                         );
                         total += n;
+                        seg_counts.push(format!("seg{si}(dev{})={n}", seg.device));
                     }
+                    eprintln!("[27B] segment nodes: {}", seg_counts.join(", "));
                 }
                 format!("captured OK, {total} nodes across {} segments", graph.segments.len())
             }
@@ -2083,8 +2082,6 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         samples[samples.len() / 2]
     };
 
-    let warm_us = wall(None);
-
     // (c) COLD: 128 MB flush between replays.
     let flush_words = 128 * 1024 * 1024 / 4 / 16 * 16; // u32 words, 16/thread aligned
     let flush_buf = grim_backend_rocm::MemoryOps::alloc_storage(
@@ -2097,8 +2094,41 @@ fn qwen35_production_27b_route_wall_and_utilization() {
     )
     .expect("flush buffer");
     let flush_r = grim_backend_rocm::as_rocm(flush_buf.as_ref()).expect("flush rocm");
-    let cold_us = wall(Some((flush_r, flush_words)));
+    let mut warm_runs = Vec::with_capacity(5);
+    let mut cold_runs = Vec::with_capacity(5);
+    for r in 0..5 {
+        let w = wall(None);
+        let c = wall(Some((flush_r, flush_words)));
+        eprintln!("[27B] run {r}/5: warm {w:.0} us   cold(flush) {c:.0} us");
+        warm_runs.push(w);
+        cold_runs.push(c);
+    }
+    warm_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    cold_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let warm_us = warm_runs[2];
+    let cold_us = cold_runs[2];
+    eprintln!(
+        "[27B] 5-run warm: median {warm_us:.0} us (min {:.0}, max {:.0}, spread {:.0} us)",
+        warm_runs[0],
+        warm_runs[4],
+        warm_runs[4] - warm_runs[0]
+    );
+    eprintln!(
+        "[27B] 5-run cold: median {cold_us:.0} us (min {:.0}, max {:.0}, spread {:.0} us)",
+        cold_runs[0],
+        cold_runs[4],
+        cold_runs[4] - cold_runs[0]
+    );
     eprintln!("[27B] replay wall: warm {warm_us:.0} us   cold(flush) {cold_us:.0} us   delta {:+.0} us", cold_us - warm_us);
+
+    // Per-segment timing breakdown on the captured graph (5 replays)
+    unsafe { std::env::set_var("GRIM_SEGMENT_TIMING", "1") };
+    graph.enable_segment_timing_events();
+    for tok in [3u32, 7, 11, 3, 7] {
+        model.forward_replay(&mut graph, tok).expect("replay step");
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+    unsafe { std::env::remove_var("GRIM_SEGMENT_TIMING") };
 
     // (d) UTILIZATION vs the composed roofline (ctx 1024: 16.09 GB -> 26.8 ms).
     let roofline_us = 26_820.0;
