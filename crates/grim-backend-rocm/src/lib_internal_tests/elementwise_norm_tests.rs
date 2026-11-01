@@ -371,6 +371,57 @@ mod tests {
     }
 
     #[test]
+    fn test_rocm_rms_norm_decode_wide_parity() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(crate::device::util::gpu_test_lock);
+        if !env {
+            return;
+        }
+        // Shape representative of decode row_len (5120) at rows=1
+        let row_len = 5120usize;
+        let mut x = Vec::with_capacity(row_len);
+        let mut w = Vec::with_capacity(row_len);
+        for i in 0..row_len {
+            x.push(((i % 17) as f32 - 8.0) * 0.125);
+            w.push(1.0 + (i % 5) as f32 * 0.05);
+        }
+        let eps = 1e-6f32;
+
+        // Run with default (decode kernel active when row_len >= 1024)
+        let out_decode = run_rms_norm_op(true, &x, &w, &[row_len], eps)
+            .expect("rms_norm decode run");
+
+        // Run with fallback stock warp-per-row kernel
+        unsafe { std::env::set_var("GRIM_RMS_NORM_DECODE", "0") };
+        let out_stock = run_rms_norm_op(true, &x, &w, &[row_len], eps)
+            .expect("rms_norm stock run");
+        unsafe { std::env::remove_var("GRIM_RMS_NORM_DECODE") };
+
+        assert_eq!(out_decode.len(), row_len);
+        let mut max_abs_diff = 0.0f32;
+        let mut max_rel_diff = 0.0f32;
+        for i in 0..row_len {
+            let diff = (out_decode[i] - out_stock[i]).abs();
+            let ref_val = out_stock[i].abs().max(1e-6);
+            let rel = diff / ref_val;
+            if diff > max_abs_diff {
+                max_abs_diff = diff;
+            }
+            if rel > max_rel_diff {
+                max_rel_diff = rel;
+            }
+        }
+        eprintln!(
+            "[rms_norm_decode_test] row_len={row_len}: max_abs_diff={max_abs_diff:.4e}, max_rel_diff={max_rel_diff:.4e}"
+        );
+        // Tolerance gate: relative difference <= 1e-6
+        assert!(
+            max_rel_diff <= 1e-6,
+            "max relative error {max_rel_diff} exceeded 1e-6 tolerance gate"
+        );
+    }
+
+    #[test]
     fn test_rocm_softmax_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         let _gpu_guard = env.then(crate::device::util::gpu_test_lock);

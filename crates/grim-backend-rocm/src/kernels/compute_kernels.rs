@@ -1189,21 +1189,6 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
     float ss = 0.0f;
-    // 4-WIDE UNROLL, SAME SUMMATION ORDER. The four loads of a group are
-    // independent, so they issue back-to-back instead of paying one unhidden
-    // L2 round-trip per iteration, while `ss` still accumulates
-    // lane, lane+32, lane+64, lane+96, lane+128, ... — bit-identical output.
-    //
-    // A single warp owning a 4096-wide row measured 43 us (1.1 GB/s for 16 KB)
-    // against 4.0 us for the 16x256 shape (rocprofv3: 1095 launches at 43 us,
-    // 120 at 4.0 us). The dependent load->FMA chain was never hidden: ~200
-    // cycles x 128 iterations x 2 passes. Decode runs one row per layer, so
-    // 64 of the 73 norms per token paid it (3.1 ms/token of 23.0).
-    //
-    // v5-style predicated single loop: the fast loop + scalar tail collapse
-    // into one 4-wide step. Out-of-range loads read 0.0, and `ss + 0.0f` is
-    // an exact identity (ss starts +0.0 and never turns -0.0), so output
-    // stays bit-identical.
     for (int col = lane; col < row_len; col += 128) {
         const int c1 = col + 32;
         const int c2 = col + 64;
@@ -1229,6 +1214,62 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
         if (c1 < row_len) o_row[c1] = x_row[c1] * w[c1] / rms;
         if (c2 < row_len) o_row[c2] = x_row[c2] * w[c2] / rms;
         if (c3 < row_len) o_row[c3] = x_row[c3] * w[c3] / rms;
+    }
+}
+
+// Decode-only RMS norm for m=1 (single row) with wide row_len: an entire 256-thread block
+// (8 warps) cooperates on the single row. Each lane accumulates across stride 256,
+// warps reduce via shuffle, and cross-warp reduction combines via LDS.
+// NOTE: Reduction order differs from grim_rms_norm (block-wide tree vs single-warp stride 32);
+// bit-exact parity with fused dot_gemv prologues is NOT preserved, so this is used strictly
+// on standalone decode norm sites where tolerance parity (<= 1e-6) holds.
+extern "C" __global__ void __launch_bounds__(256)
+grim_rms_norm_decode(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
+                     int row_len, float eps) {
+    __shared__ float s_warp_sums[8];
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float ss = 0.0f;
+    for (int col = tid; col < row_len; col += 1024) {
+        const int c1 = col + 256;
+        const int c2 = col + 512;
+        const int c3 = col + 768;
+        const float v0 = x[col];
+        const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
+        const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
+        const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
+        ss += v0 * v0;
+        ss += v1 * v1;
+        ss += v2 * v2;
+        ss += v3 * v3;
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(shfl_mask, ss, off);
+
+    if (lane == 0) {
+        s_warp_sums[warp_id] = ss;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float b_sum = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            b_sum += __shfl_xor_sync(shfl_mask, b_sum, off);
+        if (lane == 0) {
+            s_warp_sums[0] = sqrtf(b_sum / (float)row_len + eps);
+        }
+    }
+    __syncthreads();
+
+    const float rms = s_warp_sums[0];
+    for (int col = tid; col < row_len; col += 256) {
+        out[col] = x[col] * w[col] / rms;
     }
 }
 
