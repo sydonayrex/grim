@@ -1427,8 +1427,36 @@ impl RocmDevice {
         let mut row_len_i = row_len as i32;
         let mut eps_f = eps;
         let mut total_i = total as i32;
+        let rows = total / row_len.max(1);
+        if rows == 1
+            && row_len >= 1024
+            && !matches!(
+                std::env::var("GRIM_RMS_NORM_DECODE").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        {
+            self.launch_compute_kernel(
+                "grim_add_rms_norm_decode",
+                crate::HipDim3::new(1, 1, 1),
+                crate::HipDim3::new(256, 1, 1),
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut res_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut y_out_ptr),
+                    arg(&mut norm_out_ptr),
+                    arg(&mut row_len_i),
+                    arg(&mut eps_f),
+                ],
+            )?;
+            return Ok((
+                Box::new(y_storage),
+                Box::new(norm_storage),
+                Box::new(RocmHandle::new(Some(self.active_stream()))),
+            ));
+        }
         // grim_add_rms_norm is warp-per-row (32 lanes reduce with shuffles).
-        let (grid, block) = warp_rows_launch(total / row_len.max(1));
+        let (grid, block) = warp_rows_launch(rows);
         self.launch_compute_kernel(
             "grim_add_rms_norm",
             grid,

@@ -1917,218 +1917,235 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         graph.segments.len()
     );
 
-    // Warmup executes eager; capture records.
+    let run_arm = |arm_name: &str, graph: &mut grim_backend_rocm::FullDecodeGraph| -> (f64, f64, usize) {
+        for ord in [0usize, 1usize] {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        grim_backend_rocm::reset_kernel_route_counters();
+        model
+            .forward_capture(graph, 11)
+            .unwrap_or_else(|e| panic!("27B {arm_name} route walk: {e}"));
+        for ord in [0usize, 1usize] {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        let mut route = grim_backend_rocm::kernel_route_snapshot();
+        route.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = route.iter().map(|(_, v)| v).sum();
+        eprintln!("[27B:{arm_name}] per-step kernel route ({total} launches):");
+        for (name, count) in &route {
+            eprintln!("    {count:>3}x {name}");
+        }
+
+        unsafe { std::env::set_var("GRIM_KERNEL_TIMES", "1") };
+        let times_before = grim_backend_rocm::kernel_times_snapshot();
+        model
+            .forward_capture(graph, 11)
+            .unwrap_or_else(|e| panic!("27B {arm_name} decomposition walk: {e}"));
+        for ord in [0usize, 1usize] {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        let times_after = grim_backend_rocm::kernel_times_snapshot();
+        unsafe { std::env::remove_var("GRIM_KERNEL_TIMES") };
+        let mut per_kernel: Vec<(String, u64, u64)> = times_after
+            .iter()
+            .map(|(k3, c, us3)| {
+                let (before_c, before_us) = times_before
+                    .iter()
+                    .find(|(k2, _, _)| k2 == k3)
+                    .map(|(_, c2, v2)| (*c2, *v2))
+                    .unwrap_or((0, 0));
+                (k3.clone(), c.saturating_sub(before_c), us3.saturating_sub(before_us))
+            })
+            .filter(|(_, c, us)| *c > 0 || *us > 0)
+            .collect();
+        per_kernel.sort_by(|a, b| b.2.cmp(&a.2));
+        let total_us: u64 = per_kernel
+            .iter()
+            .filter(|(k, _, _)| !k.starts_with("__dev"))
+            .map(|(_, _, us)| *us)
+            .sum();
+        eprintln!("[decomp:{arm_name}] per-kernel busy totals (one eager walk):");
+        for (name, count, us) in &per_kernel {
+            eprintln!("[decomp:{arm_name}]   {count:>4}x {name:<44} {us:>9} us");
+        }
+        eprintln!("[decomp:{arm_name}] kernel busy total = {total_us} us");
+
+        if graph.is_captured {
+            let _ = graph.abort_capture();
+        }
+        graph.begin_capture().expect("begin capture");
+        model.forward_capture(graph, 11).expect("record");
+        graph.end_capture().expect("end capture");
+        let mut total_nodes = 0usize;
+        let mut seg_counts = Vec::new();
+        for (si, seg) in graph.segments.iter().enumerate() {
+            let mut n: usize = 0;
+            assert_eq!(
+                unsafe {
+                    grim_backend_rocm::hipGraphGetNodes(
+                        seg.graph,
+                        std::ptr::null_mut(),
+                        &mut n,
+                    )
+                } as u32,
+                0
+            );
+            total_nodes += n;
+            seg_counts.push(format!("seg{si}(dev{})={n}", seg.device));
+        }
+        eprintln!(
+            "[27B:{arm_name}] captured OK, {total_nodes} nodes ({})",
+            seg_counts.join(", ")
+        );
+        graph.buffers.reset_for_replay().expect("reset_for_replay");
+
+        let step = |g: &mut grim_backend_rocm::FullDecodeGraph, tok: u32| {
+            model.forward_replay(g, tok).expect("replay step");
+            g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
+        };
+        let wall = |g: &mut grim_backend_rocm::FullDecodeGraph,
+                    flush: Option<(&grim_backend_rocm::RocmStorage, usize)>|
+         -> f64 {
+            g.buffers.reset_for_replay().expect("reset_for_replay");
+            for tok in [3u32, 7, 11] {
+                step(g, tok);
+            }
+            dev.synchronize();
+            let mut samples = Vec::new();
+            for i in 0..40u32 {
+                if let Some((fb, words)) = flush {
+                    let _ = dev.launch_stream_read_probe(fb, fb, words);
+                }
+                dev.synchronize();
+                let t = std::time::Instant::now();
+                step(g, [3u32, 7, 11][(i as usize) % 3]);
+                dev.synchronize();
+                if i >= 10 {
+                    samples.push(t.elapsed().as_secs_f64() * 1e6);
+                }
+            }
+            samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            samples[samples.len() / 2]
+        };
+
+        let flush_words = 128 * 1024 * 1024 / 4 / 16 * 16;
+        let flush_buf = grim_backend_rocm::MemoryOps::alloc_storage(
+            &dev,
+            &grim_tensor::Shape::new(vec![flush_words]),
+            grim_tensor::DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: grim_tensor::Storage::Native,
+            },
+        )
+        .expect("flush buffer");
+        let flush_r = grim_backend_rocm::as_rocm(flush_buf.as_ref()).expect("flush rocm");
+
+        let log_gpu_clocks = |label: &str| {
+            for (card, name) in [("card1", "rocm:0(RX9070XT)"), ("card0", "rocm:1(RX9060XT)")] {
+                let sclk = std::fs::read_to_string(format!("/sys/class/drm/{card}/device/pp_dpm_sclk"))
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|l| l.contains('*'))
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                let mclk = std::fs::read_to_string(format!("/sys/class/drm/{card}/device/pp_dpm_mclk"))
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|l| l.contains('*'))
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                let pwr = std::fs::read_dir(format!("/sys/class/drm/{card}/device/hwmon"))
+                    .ok()
+                    .and_then(|mut d| d.next())
+                    .and_then(|e| e.ok())
+                    .and_then(|e| std::fs::read_to_string(e.path().join("power1_average")).ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|uw| format!("{:.1}W", uw as f64 / 1e6))
+                    .unwrap_or_else(|| "?".into());
+                let temp = std::fs::read_dir(format!("/sys/class/drm/{card}/device/hwmon"))
+                    .ok()
+                    .and_then(|mut d| d.next())
+                    .and_then(|e| e.ok())
+                    .and_then(|e| std::fs::read_to_string(e.path().join("temp2_input")).ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|mc| format!("{:.0}C", mc as f64 / 1e3))
+                    .unwrap_or_else(|| "?".into());
+                eprintln!("[clocks:{arm_name}:{label}] {name}: sclk=[{sclk}] mclk=[{mclk}] power={pwr} junc={temp}");
+            }
+        };
+
+        log_gpu_clocks("pre-wall");
+        let mut warm_runs = Vec::with_capacity(5);
+        let mut cold_runs = Vec::with_capacity(5);
+        for r in 0..5 {
+            let w = wall(graph, None);
+            let c = wall(graph, Some((flush_r, flush_words)));
+            eprintln!("[27B:{arm_name}] run {r}/5: warm {w:.0} us   cold(flush) {c:.0} us");
+            if r == 2 {
+                log_gpu_clocks("mid-wall");
+            }
+            warm_runs.push(w);
+            cold_runs.push(c);
+        }
+        log_gpu_clocks("post-wall");
+        warm_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        cold_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let warm_us = warm_runs[2];
+        let cold_us = cold_runs[2];
+        eprintln!(
+            "[27B:{arm_name}] 5-run warm: median {warm_us:.0} us (min {:.0}, max {:.0}, spread {:.0} us)",
+            warm_runs[0],
+            warm_runs[4],
+            warm_runs[4] - warm_runs[0]
+        );
+        eprintln!(
+            "[27B:{arm_name}] 5-run cold: median {cold_us:.0} us (min {:.0}, max {:.0}, spread {:.0} us)",
+            cold_runs[0],
+            cold_runs[4],
+            cold_runs[4] - cold_runs[0]
+        );
+
+        unsafe { std::env::set_var("GRIM_SEGMENT_TIMING", "1") };
+        graph.enable_segment_timing_events();
+        graph.buffers.reset_for_replay().expect("reset_for_replay");
+        for tok in [3u32, 7, 11, 3, 7] {
+            step(graph, tok);
+        }
+        unsafe { std::env::remove_var("GRIM_SEGMENT_TIMING") };
+        (warm_us, cold_us, total_nodes)
+    };
+
+    // Warmup both devices before measuring either arm.
     model
         .forward_capture(&mut graph, 11)
         .expect("27B warmup walk 1");
     model
         .forward_capture(&mut graph, 11)
         .expect("27B warmup walk 2");
-    // (a) ROUTE: counters around ONE more eager walk.
-    grim_backend_rocm::reset_kernel_route_counters();
-    model
-        .forward_capture(&mut graph, 11)
-        .expect("27B route walk");
-    let mut route = grim_backend_rocm::kernel_route_snapshot();
-    route.sort_by(|a, b| b.1.cmp(&a.1));
-    let total: u64 = route.iter().map(|(_, v)| v).sum();
-    eprintln!("[27B] per-step kernel route ({total} launches):");
-    let mut quant_nodes = 0u64;
-    for (name, count) in &route {
-        eprintln!("    {count:>3}x {name}");
-        if name.contains("quantize") || name.contains("u4_group") || name.contains("q81") {
-            quant_nodes += count;
-        }
+
+    // Same-session A/B: Arm A = OLD baseline (pre-rms_norm_decode, pre-iq3s_decode, pre-Residual1 fusion)
+    unsafe {
+        std::env::set_var("GRIM_RMS_NORM_DECODE", "0");
+        std::env::set_var("GRIM_IQ3S_DECODE", "0");
+        std::env::set_var("GRIM_FUSED_RESIDUAL1", "0");
     }
-    eprintln!("[27B] quantize-prologue nodes = {quant_nodes}");
+    let (old_warm_us, old_cold_us, old_nodes) = run_arm("OLD-AE75E0C6", &mut graph);
 
-    // DECOMPOSITION (review order item 1): one eager record walk with
-    // GRIM_KERNEL_TIMES=1 gives per-kernel-type event totals.
-    unsafe { std::env::set_var("GRIM_KERNEL_TIMES", "1") };
-    let times_before = grim_backend_rocm::kernel_times_snapshot();
-    model
-        .forward_capture(&mut graph, 11)
-        .expect("27B decomposition walk");
-    let times_after = grim_backend_rocm::kernel_times_snapshot();
-    unsafe { std::env::remove_var("GRIM_KERNEL_TIMES") };
-    let mut per_kernel: Vec<(String, u64, u64)> = times_after
-        .iter()
-        .map(|(k3, c, us3)| {
-            let (before_c, before_us) = times_before
-                .iter()
-                .find(|(k2, _, _)| k2 == k3)
-                .map(|(_, c2, v2)| (*c2, *v2))
-                .unwrap_or((0, 0));
-            (k3.clone(), c.saturating_sub(before_c), us3.saturating_sub(before_us))
-        })
-        .filter(|(_, c, us)| *c > 0 || *us > 0)
-        .collect();
-    per_kernel.sort_by(|a, b| b.2.cmp(&a.2));
-    let total_us: u64 = per_kernel
-        .iter()
-        .filter(|(k, _, _)| !k.starts_with("__dev"))
-        .map(|(_, _, us)| *us)
-        .sum();
-    eprintln!("[decomp] per-kernel busy totals (one eager walk):");
-    for (name, count, us) in &per_kernel {
-        eprintln!("[decomp]   {count:>4}x {name:<44} {us:>9} us");
+    // Arm B = NEW build (grim_rms_norm_decode + grim_add_rms_norm_decode + grim_fused_dequant_gemm_iq3s_decode + Residual1 fusion)
+    unsafe {
+        std::env::remove_var("GRIM_RMS_NORM_DECODE");
+        std::env::remove_var("GRIM_IQ3S_DECODE");
+        std::env::remove_var("GRIM_FUSED_RESIDUAL1");
     }
-    eprintln!("[decomp] kernel busy total = {total_us} us");
-
-    let capture_note = {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            graph.begin_capture().expect("begin capture");
-            model.forward_capture(&mut graph, 11).expect("record");
-            graph.end_capture().expect("end capture");
-        }));
-        match r {
-            Ok(()) => {
-                // Split model: the legacy `graph` handle is empty; nodes live
-                // in the per-segment graphs.
-                let mut total = 0usize;
-                if graph.segments.is_empty() {
-                    let mut n: usize = 0;
-                    assert_eq!(
-                        unsafe {
-                            grim_backend_rocm::hipGraphGetNodes(
-                                graph.graph,
-                                std::ptr::null_mut(),
-                                &mut n,
-                            )
-                        } as u32,
-                        0
-                    );
-                    total = n;
-                } else {
-                    let mut seg_counts = Vec::new();
-                    for (si, seg) in graph.segments.iter().enumerate() {
-                        let mut n: usize = 0;
-                        assert_eq!(
-                            unsafe {
-                                grim_backend_rocm::hipGraphGetNodes(
-                                    seg.graph,
-                                    std::ptr::null_mut(),
-                                    &mut n,
-                                )
-                            } as u32,
-                            0
-                        );
-                        total += n;
-                        seg_counts.push(format!("seg{si}(dev{})={n}", seg.device));
-                    }
-                    eprintln!("[27B] segment nodes: {}", seg_counts.join(", "));
-                }
-                format!("captured OK, {total} nodes across {} segments", graph.segments.len())
-            }
-            Err(_) => {
-                let _ = graph.abort_capture();
-                "CAPTURE FAULTED (weight upload inside capture at dev1 boundary) -> eager wall below".to_string()
-            }
-        }
-    };
-    eprintln!("[27B] capture: {capture_note}");
-    let nodes: u64 = if graph.is_captured { 620 } else { 620 }; // route launches as the node proxy
-
-    // (b) WALL, warm — EAGER decode steps (CausalLm::forward): the real
-    // dependent chain of 620 launches. If capture succeeds this undercounts
-    // nothing; if it faulted this IS the production path today.
-    let mut session = model.new_session();
-    let mut pos_counter: u32 = 0;
-    let captured = graph.is_captured;
-    let mut step = |tok: u32| {
-        if captured {
-            // Graph replay: the production path. Zero eager launches.
-            model.forward_replay(&mut graph, tok).expect("replay step");
-        } else {
-            let ids = dev_tensor(dev.as_ref(), &device, &[tok as f32]);
-            let pos = dev_tensor(dev.as_ref(), &device, &[pos_counter as f32]);
-            let out = grim_core::model::CausalLm::forward(
-                model,
-                session.as_mut(),
-                &ids,
-                &pos,
-                &[] as &[AdapterHandle],
-            )
-            .expect("eager step");
-            std::mem::forget(out); // logits not needed; avoid the D2H
-        }
-        pos_counter += 1;
-        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
-    };
-    // Host-clock wall (Instant + full-device sync): split replay spans two
-    // streams on two devices, so a single-stream event pair would undercount.
-    // Host overhead (~5-10 us/step enqueue) is inside the wall — the
-    // utilization denominator is deliberately the WORST case.
-    let mut wall = |flush: Option<(&grim_backend_rocm::RocmStorage, usize)>| -> f64 {
-        for tok in [3u32, 7, 11] {
-            step(tok);
-        }
-        dev.synchronize();
-        let mut samples = Vec::new();
-        for i in 0..40u32 {
-            if let Some((fb, words)) = flush {
-                let _ = dev.launch_stream_read_probe(fb, fb, words);
-            }
-            dev.synchronize();
-            let t = std::time::Instant::now();
-            step([3u32, 7, 11][(i as usize) % 3]);
-            // Split replay spans both devices: full-device sync is the wall.
-            dev.synchronize();
-            if i >= 10 {
-                samples.push(t.elapsed().as_secs_f64() * 1e6);
-            }
-        }
-        samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        samples[samples.len() / 2]
-    };
-
-    // (c) COLD: 128 MB flush between replays.
-    let flush_words = 128 * 1024 * 1024 / 4 / 16 * 16; // u32 words, 16/thread aligned
-    let flush_buf = grim_backend_rocm::MemoryOps::alloc_storage(
-        &dev,
-        &grim_tensor::Shape::new(vec![flush_words]),
-        grim_tensor::DType {
-            arith: grim_tensor::ArithType::U32,
-            storage: grim_tensor::Storage::Native,
-        },
-    )
-    .expect("flush buffer");
-    let flush_r = grim_backend_rocm::as_rocm(flush_buf.as_ref()).expect("flush rocm");
-    let mut warm_runs = Vec::with_capacity(5);
-    let mut cold_runs = Vec::with_capacity(5);
-    for r in 0..5 {
-        let w = wall(None);
-        let c = wall(Some((flush_r, flush_words)));
-        eprintln!("[27B] run {r}/5: warm {w:.0} us   cold(flush) {c:.0} us");
-        warm_runs.push(w);
-        cold_runs.push(c);
-    }
-    warm_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
-    cold_runs.sort_by(|x, y| x.partial_cmp(y).unwrap());
-    let warm_us = warm_runs[2];
-    let cold_us = cold_runs[2];
+    let (warm_us, cold_us, new_nodes) = run_arm("NEW-CURRENT", &mut graph);
+    let nodes = new_nodes as u64;
     eprintln!(
-        "[27B] 5-run warm: median {warm_us:.0} us (min {:.0}, max {:.0}, spread {:.0} us)",
-        warm_runs[0],
-        warm_runs[4],
-        warm_runs[4] - warm_runs[0]
+        "[27B:A/B] OLD ({old_nodes} nodes): warm {old_warm_us:.0} us / cold {old_cold_us:.0} us  ->  NEW ({new_nodes} nodes): warm {warm_us:.0} us ({:+.0} us) / cold {cold_us:.0} us ({:+.0} us)",
+        warm_us - old_warm_us,
+        cold_us - old_cold_us
     );
-    eprintln!(
-        "[27B] 5-run cold: median {cold_us:.0} us (min {:.0}, max {:.0}, spread {:.0} us)",
-        cold_runs[0],
-        cold_runs[4],
-        cold_runs[4] - cold_runs[0]
-    );
-    eprintln!("[27B] replay wall: warm {warm_us:.0} us   cold(flush) {cold_us:.0} us   delta {:+.0} us", cold_us - warm_us);
-
-    // Per-segment timing breakdown on the captured graph (5 replays)
-    unsafe { std::env::set_var("GRIM_SEGMENT_TIMING", "1") };
-    graph.enable_segment_timing_events();
-    for tok in [3u32, 7, 11, 3, 7] {
-        model.forward_replay(&mut graph, tok).expect("replay step");
-        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
-    }
-    unsafe { std::env::remove_var("GRIM_SEGMENT_TIMING") };
 
     // (d) UTILIZATION vs the composed roofline (ctx 1024: 16.09 GB -> 26.8 ms).
     let roofline_us = 26_820.0;

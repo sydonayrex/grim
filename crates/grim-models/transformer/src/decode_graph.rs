@@ -3391,7 +3391,10 @@ impl Qwen35Block {
             // Residual 1 add + FFN norm: ONE fused node when post_attention_norm is RMS
             // (grim_add_rms_norm; eliminates 64 separate add nodes on 64-layer models).
             let ffn_weight = ffn_w.storage();
-            let fused_ok = ffn_weight
+            let fused_ok = !matches!(
+                std::env::var("GRIM_FUSED_RESIDUAL1").as_deref(),
+                Ok("0" | "false" | "off")
+            ) && ffn_weight
                 .as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
                 .is_some();
@@ -4800,12 +4803,46 @@ impl DecodeGraphModel for Qwen35 {
             }
             // A6: advance an interior device boundary per the A2 capture
             // contract — close segment k (whose last layer is i) and open
-            // segment k+1. Legacy single-graph graphs have no segments.
-            if graph.segments.len() > 1 && graph.capturing {
+            // segment k+1. When not capturing (eager warmup/route/decomp walk),
+            // copy boundary_out[si] -> layer_input[i+1] across devices so
+            // subsequent layers read finite activations instead of uninitialized memory.
+            if graph.segments.len() > 1 {
                 if let Some(si) = graph.segments.iter().position(|s| s.layers.contains(&i)) {
                     if i + 1 == graph.segments[si].layers.end && si + 1 < graph.segments.len() {
-                        graph.end_capture_segment(si)?;
-                        graph.begin_capture_segment(si + 1)?;
+                        if graph.capturing {
+                            graph.end_capture_segment(si)?;
+                            graph.begin_capture_segment(si + 1)?;
+                        } else {
+                            let s = &graph.segments[si];
+                            let n = &graph.segments[si + 1];
+                            let ev = graph
+                                .boundary_evs
+                                .get(si)
+                                .copied()
+                                .unwrap_or(std::ptr::null_mut());
+                            if !ev.is_null() {
+                                let src = &graph.buffers.boundary_out[si];
+                                let dst = &graph.buffers.layer_input[n.layers.start];
+                                let staging_ptr = graph
+                                    .boundary_staging
+                                    .get(si)
+                                    .and_then(|st| st.as_ref())
+                                    .map(|st| st.as_device_ptr());
+                                grim_backend_rocm::peer_access::copy_boundary_ordered_with_staging(
+                                    src,
+                                    dst,
+                                    s.stream,
+                                    n.stream,
+                                    ev,
+                                    staging_ptr,
+                                )
+                                .map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "eager boundary copy {si}: {e}"
+                                    ))
+                                })?;
+                            }
+                        }
                     }
                 }
             }

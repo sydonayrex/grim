@@ -1417,7 +1417,7 @@ grim_layer_norm(const float* __restrict__ x, const float* __restrict__ w, const 
     }
 }
 
-// Warp-per-row fused residual-add + RMS norm (same reduction structure).
+// Warp-per-row fused residual-add + RMS norm (same 4-wide unroll and reduction structure as grim_rms_norm).
 extern "C" __global__ void __launch_bounds__(256)
 grim_add_rms_norm(const float* __restrict__ x, const float* __restrict__ residual,
                   const float* __restrict__ w, float* __restrict__ y_out, float* __restrict__ norm_out,
@@ -1432,20 +1432,99 @@ grim_add_rms_norm(const float* __restrict__ x, const float* __restrict__ residua
     float* n_row = norm_out + (size_t)warp_id * row_len;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
-    // Pass 1: y = x + residual (write-through) + strided sum of squares.
+    // Pass 1: y = x + residual (write-through) + 4-wide unrolled sum of squares
+    // matching grim_rms_norm reduction order bit-for-bit.
     float ss = 0.0f;
-    for (int col = lane; col < row_len; col += 32) {
-        float y = x_row[col] + r_row[col];
-        y_row[col] = y;
-        ss += y * y;
+    for (int col = lane; col < row_len; col += 128) {
+        const int c1 = col + 32;
+        const int c2 = col + 64;
+        const int c3 = col + 96;
+        const float y0 = x_row[col] + r_row[col];
+        y_row[col] = y0;
+        const float y1 = (c1 < row_len) ? (x_row[c1] + r_row[c1]) : 0.0f;
+        if (c1 < row_len) y_row[c1] = y1;
+        const float y2 = (c2 < row_len) ? (x_row[c2] + r_row[c2]) : 0.0f;
+        if (c2 < row_len) y_row[c2] = y2;
+        const float y3 = (c3 < row_len) ? (x_row[c3] + r_row[c3]) : 0.0f;
+        if (c3 < row_len) y_row[c3] = y3;
+        ss += y0 * y0;
+        ss += y1 * y1;
+        ss += y2 * y2;
+        ss += y3 * y3;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         ss += __shfl_xor_sync(shfl_mask, ss, off);
     float rms = sqrtf(ss / (float)row_len + eps);
     // Pass 2: normalize (y_row is L1/L2-hot from pass 1).
-    for (int col = lane; col < row_len; col += 32) {
+    for (int col = lane; col < row_len; col += 128) {
+        const int c1 = col + 32;
+        const int c2 = col + 64;
+        const int c3 = col + 96;
         n_row[col] = y_row[col] * w[col] / rms;
+        if (c1 < row_len) n_row[c1] = y_row[c1] * w[c1] / rms;
+        if (c2 < row_len) n_row[c2] = y_row[c2] * w[c2] / rms;
+        if (c3 < row_len) n_row[c3] = y_row[c3] * w[c3] / rms;
+    }
+}
+
+// Decode-only fused residual-add + RMS norm for m=1 (single row) with wide row_len (>= 1024):
+// an entire 256-thread block (8 warps) cooperates on the single row with the EXACT same
+// 4-wide unroll (stride 1024, offsets +256/+512/+768) and warp+LDS reduction tree as
+// grim_rms_norm_decode, preserving bit-exact parity (`to_bits()`) against the split
+// `add_into` + `rms_norm_into` path.
+extern "C" __global__ void __launch_bounds__(256)
+grim_add_rms_norm_decode(const float* __restrict__ x, const float* __restrict__ residual,
+                         const float* __restrict__ w, float* __restrict__ y_out, float* __restrict__ norm_out,
+                         int row_len, float eps) {
+    __shared__ float s_warp_sums[8];
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float ss = 0.0f;
+    for (int col = tid; col < row_len; col += 1024) {
+        const int c1 = col + 256;
+        const int c2 = col + 512;
+        const int c3 = col + 768;
+        const float y0 = x[col] + residual[col];
+        y_out[col] = y0;
+        const float y1 = (c1 < row_len) ? (x[c1] + residual[c1]) : 0.0f;
+        if (c1 < row_len) y_out[c1] = y1;
+        const float y2 = (c2 < row_len) ? (x[c2] + residual[c2]) : 0.0f;
+        if (c2 < row_len) y_out[c2] = y2;
+        const float y3 = (c3 < row_len) ? (x[c3] + residual[c3]) : 0.0f;
+        if (c3 < row_len) y_out[c3] = y3;
+        ss += y0 * y0;
+        ss += y1 * y1;
+        ss += y2 * y2;
+        ss += y3 * y3;
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(shfl_mask, ss, off);
+
+    if (lane == 0) {
+        s_warp_sums[warp_id] = ss;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float b_sum = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            b_sum += __shfl_xor_sync(shfl_mask, b_sum, off);
+        if (lane == 0) {
+            s_warp_sums[0] = sqrtf(b_sum / (float)row_len + eps);
+        }
+    }
+    __syncthreads();
+
+    const float rms = s_warp_sums[0];
+    for (int col = tid; col < row_len; col += 256) {
+        norm_out[col] = y_out[col] * w[col] / rms;
     }
 }
 

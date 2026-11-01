@@ -89,8 +89,16 @@ fn fused_add_rms_norm_matches_split_path() {
         eprintln!("skipping: GPU test gate off");
         return;
     };
-    // LFM2 hidden=1024 (decode row), plus an odd row_len to flush lane tails.
-    for (rows, row_len) in [(1usize, 1024usize), (4, 1024), (1, 3072), (3, 100)] {
+    // LFM2 hidden=1024, Qwen3.5 27B hidden=5120, non-multiple-of-1024 decode row (2560),
+    // multi-row warp path (4x1024), and odd row_len (3x100) to flush lane tails.
+    for (rows, row_len) in [
+        (1usize, 1024usize),
+        (1, 2560),
+        (1, 3072),
+        (1, 5120),
+        (4, 1024),
+        (3, 100),
+    ] {
         run_case(&dev, rows, row_len);
     }
 }
