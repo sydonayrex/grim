@@ -3388,23 +3388,43 @@ impl Qwen35Block {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("fused residual+gateup: {e}")))?;
         } else {
-            // Residual 1 add: layer_input + branch_proj -> layer_output
-            add_graph(
-                &buffers.layer_input[layer_idx],
-                &buffers.norm_buf[layer_idx],
-                &buffers.layer_output[layer_idx],
-                dev,
-            )?;
+            // Residual 1 add + FFN norm: ONE fused node when post_attention_norm is RMS
+            // (grim_add_rms_norm; eliminates 64 separate add nodes on 64-layer models).
+            let ffn_weight = ffn_w.storage();
+            let fused_ok = ffn_weight
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .is_some();
+            if fused_ok {
+                dev.fused_add_rms_norm_into(
+                    &buffers.layer_input[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    &**ffn_weight,
+                    self.post_attention_norm.eps,
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    &ffn_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            } else {
+                // Residual 1 add: layer_input + branch_proj -> layer_output
+                add_graph(
+                    &buffers.layer_input[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    &buffers.layer_output[layer_idx],
+                    dev,
+                )?;
 
-            // 8. FFN sublayer
-            dev.rms_norm_into(
-                &buffers.layer_output[layer_idx],
-                &**ffn_w.storage(),
-                self.post_attention_norm.eps,
-                &buffers.norm_buf[layer_idx],
-                &ffn_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+                // 8. FFN sublayer
+                dev.rms_norm_into(
+                    &buffers.layer_output[layer_idx],
+                    &**ffn_w.storage(),
+                    self.post_attention_norm.eps,
+                    &buffers.norm_buf[layer_idx],
+                    &ffn_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
             let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
 
             let use_fused_silu =
