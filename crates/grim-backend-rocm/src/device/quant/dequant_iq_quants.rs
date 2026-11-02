@@ -642,8 +642,8 @@ impl RocmDevice {
             let out_ptr = out
                 .device_ptr
                 .ok_or_else(|| Error::Backend("launch_fused_dequant_gemm_iq3s: out has no device ptr".into()))?;
-            // 256 threads per block = 8 warps = 8 columns per block
-            let grid_x = (n as u32).div_ceil(8);
+            // 64 threads per block (80 blocks at N=5120 across 64 CUs) + LDS codebook
+            let grid_x = (n as u32).div_ceil(64);
             let mut aptr = a_ptr;
             let mut bptr = b_ptr;
             let mut optr = out_ptr;
@@ -653,7 +653,7 @@ impl RocmDevice {
             return self.launch_compute_kernel(
                 "grim_fused_dequant_gemm_iq3s_decode",
                 HipDim3::new(grid_x, 1, 1),
-                HipDim3::new(256, 1, 1),
+                HipDim3::new(64, 1, 1),
                 &mut [
                     arg(&mut aptr),
                     arg(&mut bptr),

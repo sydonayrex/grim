@@ -2567,29 +2567,33 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         C[row * N + col] = acc;
     }
 
-    // Decode-only M=1 warp-per-column cooperative GEMV for IQ3_S.
-    // 1 warp (32 threads) processes 1 output column. The K/256 super-blocks (e.g. 68 at K=17408)
-    // are partitioned across the 32 warp lanes (lane, lane+32, ...).
-    // The 32 partial sums are reduced via __shfl_xor_sync to produce the final dot product.
-    // Preserves numerical fidelity within standard f32 summation tolerance (<= 1e-5 relative).
-    __global__ void __launch_bounds__(256)
+    // Decode-only M=1 LDS codebook GEMV for IQ3_S.
+    // Launches 64 threads per block (80 blocks at N=5120 across 64 CUs on RDNA4)
+    // and stages the 2 KB IQ3S_GRID_B codebook in LDS as u32 words.
+    // Preserves exact 0.000e0 bit-identity with grim_fused_dequant_gemm_iq3s_grouped.
+    __global__ void __launch_bounds__(64)
     grim_fused_dequant_gemm_iq3s_decode(
         const float* __restrict__ A,
         const unsigned char* __restrict__ B_iq3s,
         float* __restrict__ C,
         int M, int N, int K)
     {
-        const int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-        const int lane = threadIdx.x & 31;
-        if (global_warp_id >= N) return;
-        const int col = global_warp_id;
+        __shared__ unsigned int s_grid32[512];
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            s_grid32[i] = (unsigned int)IQ3S_GRID_B[i][0]
+                        | ((unsigned int)IQ3S_GRID_B[i][1] << 8)
+                        | ((unsigned int)IQ3S_GRID_B[i][2] << 16)
+                        | ((unsigned int)IQ3S_GRID_B[i][3] << 24);
+        }
+        __syncthreads();
+
+        const int col = blockIdx.x * blockDim.x + threadIdx.x;
+        if (col >= N) return;
         const int blocks_per_row = K / 256;
         const int row_bytes = blocks_per_row * 110;
         const unsigned char* row_b_ptr = B_iq3s + col * row_bytes;
-        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-
         float acc = 0.0f;
-        for (int sb_idx = lane; sb_idx < blocks_per_row; sb_idx += 32) {
+        for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
             const unsigned char* blk = row_b_ptr + sb_idx * 110;
             const int k0 = sb_idx * 256;
             const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
@@ -2602,30 +2606,26 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
                 const unsigned char sc = scales[kk];
                 const float db = d * (1.0f + 2.0f * (float)((t % 2 == 0) ? (sc & 0xF) : (sc >> 4)));
                 for (int l = 0; l < 4; ++l) {
-                    const unsigned char* g_lo = IQ3S_GRID_B[qs[t * 8 + 2 * l]
+                    const unsigned int w_lo = s_grid32[qs[t * 8 + 2 * l]
                         | ((((int)qh[t] >> (2 * l)) & 1) << 8)];
-                    const unsigned char* g_hi = IQ3S_GRID_B[qs[t * 8 + 2 * l + 1]
+                    const unsigned int w_hi = s_grid32[qs[t * 8 + 2 * l + 1]
                         | ((((int)qh[t] >> (2 * l + 1)) & 1) << 8)];
                     const unsigned char sg = signs[t * 4 + l];
                     const int base = k0 + t * 32 + l * 8;
                     #pragma unroll
                     for (int m = 0; m < 8; ++m) {
-                        const unsigned char g = (m < 4) ? g_lo[m] : g_hi[m - 4];
-                        const float gv = (float)(signed char)g;
+                        const unsigned int wv = (m < 4) ? w_lo : w_hi;
+                        const int mm = (m < 4) ? m : m - 4;
+                        const signed char g =
+                            (signed char)((wv >> (8 * mm)) & 0xFFu);
+                        const float gv = (float)g;
                         const float sign = ((sg >> m) & 1) ? -1.0f : 1.0f;
                         acc += A[base + m] * (db * gv * sign);
                     }
                 }
             }
         }
-
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_xor_sync(shfl_mask, acc, off);
-
-        if (lane == 0) {
-            C[col] = acc;
-        }
+        C[col] = acc;
     }
 
     __global__ void grim_fused_dequant_backward_gemm_iq3s(

@@ -1226,48 +1226,40 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
 extern "C" __global__ void __launch_bounds__(256)
 grim_rms_norm_decode(const float* x, const float* __restrict__ w, float* out,
                      int row_len, float eps) {
-    __shared__ float s_warp_sums[8];
+    __shared__ float s_lane_sums[32];
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
-    float ss = 0.0f;
-    for (int col = tid; col < row_len; col += 1024) {
-        const int c1 = col + 256;
-        const int c2 = col + 512;
-        const int c3 = col + 768;
-        const float v0 = x[col];
-        const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
-        const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
-        const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
-        ss = __builtin_fmaf(v0, v0, ss);
-        ss = __builtin_fmaf(v1, v1, ss);
-        ss = __builtin_fmaf(v2, v2, ss);
-        ss = __builtin_fmaf(v3, v3, ss);
-    }
-
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        ss += __shfl_xor_sync(shfl_mask, ss, off);
-
-    if (lane == 0) {
-        s_warp_sums[warp_id] = ss;
-    }
-    __syncthreads();
-
+    // Warp 0 reduces in the EXACT same 4-wide stride-128 order as grim_rms_norm
+    // so that rms is bit-identical to the single-warp kernel, while all 256 threads
+    // (8 warps) cooperate on the pass-2 normalization write.
     if (warp_id == 0) {
-        float b_sum = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        float ss = 0.0f;
+        for (int col = lane; col < row_len; col += 128) {
+            const int c1 = col + 32;
+            const int c2 = col + 64;
+            const int c3 = col + 96;
+            const float v0 = x[col];
+            const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
+            const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
+            const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
+            ss = __builtin_fmaf(v0, v0, ss);
+            ss = __builtin_fmaf(v1, v1, ss);
+            ss = __builtin_fmaf(v2, v2, ss);
+            ss = __builtin_fmaf(v3, v3, ss);
+        }
         #pragma unroll
-        for (int off = 4; off > 0; off >>= 1)
-            b_sum += __shfl_xor_sync(shfl_mask, b_sum, off);
+        for (int off = 16; off > 0; off >>= 1)
+            ss += __shfl_xor_sync(shfl_mask, ss, off);
         if (lane == 0) {
-            s_warp_sums[0] = sqrtf(b_sum / (float)row_len + eps);
+            s_lane_sums[0] = sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float rms = s_warp_sums[0];
+    const float rms = s_lane_sums[0];
     for (int col = tid; col < row_len; col += 256) {
         out[col] = x[col] * w[col] / rms;
     }
@@ -1481,52 +1473,47 @@ extern "C" __global__ void __launch_bounds__(256)
 grim_add_rms_norm_decode(const float* x, const float* residual,
                          const float* __restrict__ w, float* y_out, float* norm_out,
                          int row_len, float eps) {
-    __shared__ float s_warp_sums[8];
+    __shared__ float s_rms;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
-    float ss = 0.0f;
-    for (int col = tid; col < row_len; col += 1024) {
-        const int c1 = col + 256;
-        const int c2 = col + 512;
-        const int c3 = col + 768;
-        const float y0 = x[col] + residual[col];
-        y_out[col] = y0;
-        const float y1 = (c1 < row_len) ? (x[c1] + residual[c1]) : 0.0f;
-        if (c1 < row_len) y_out[c1] = y1;
-        const float y2 = (c2 < row_len) ? (x[c2] + residual[c2]) : 0.0f;
-        if (c2 < row_len) y_out[c2] = y2;
-        const float y3 = (c3 < row_len) ? (x[c3] + residual[c3]) : 0.0f;
-        if (c3 < row_len) y_out[c3] = y3;
-        ss = __builtin_fmaf(y0, y0, ss);
-        ss = __builtin_fmaf(y1, y1, ss);
-        ss = __builtin_fmaf(y2, y2, ss);
-        ss = __builtin_fmaf(y3, y3, ss);
-    }
-
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        ss += __shfl_xor_sync(shfl_mask, ss, off);
-
-    if (lane == 0) {
-        s_warp_sums[warp_id] = ss;
+    // Pass 1: All 256 threads write y_out[col] = x[col] + residual[col] except warp 0
+    // handles both y_out write and the exact stride-128 4-wide reduction matching grim_rms_norm.
+    // Wait: if all 256 threads write y_out in stride 256 first, then __syncthreads(), or warp 0
+    // computes y0..y3 in stride 128: since y_out may alias norm_out (not x or residual),
+    // all 256 threads writing y_out[col] = x[col] + residual[col] in stride 256 is completely race-free!
+    for (int col = tid; col < row_len; col += 256) {
+        y_out[col] = x[col] + residual[col];
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float b_sum = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        float ss = 0.0f;
+        for (int col = lane; col < row_len; col += 128) {
+            const int c1 = col + 32;
+            const int c2 = col + 64;
+            const int c3 = col + 96;
+            const float y0 = y_out[col];
+            const float y1 = (c1 < row_len) ? y_out[c1] : 0.0f;
+            const float y2 = (c2 < row_len) ? y_out[c2] : 0.0f;
+            const float y3 = (c3 < row_len) ? y_out[c3] : 0.0f;
+            ss = __builtin_fmaf(y0, y0, ss);
+            ss = __builtin_fmaf(y1, y1, ss);
+            ss = __builtin_fmaf(y2, y2, ss);
+            ss = __builtin_fmaf(y3, y3, ss);
+        }
         #pragma unroll
-        for (int off = 4; off > 0; off >>= 1)
-            b_sum += __shfl_xor_sync(shfl_mask, b_sum, off);
+        for (int off = 16; off > 0; off >>= 1)
+            ss += __shfl_xor_sync(shfl_mask, ss, off);
         if (lane == 0) {
-            s_warp_sums[0] = sqrtf(b_sum / (float)row_len + eps);
+            s_rms = sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float rms = s_warp_sums[0];
+    const float rms = s_rms;
     for (int col = tid; col < row_len; col += 256) {
         norm_out[col] = y_out[col] * w[col] / rms;
     }

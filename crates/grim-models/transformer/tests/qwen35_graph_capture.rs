@@ -1918,6 +1918,7 @@ fn qwen35_production_27b_route_wall_and_utilization() {
     );
 
     let run_arm = |arm_name: &str, graph: &mut grim_backend_rocm::FullDecodeGraph| -> (f64, f64, usize, Vec<f32>) {
+        graph.buffers.reset_for_replay().expect("reset_for_replay before route walk");
         for ord in [0usize, 1usize] {
             grim_backend_rocm::RocmDevice::shared(ord).synchronize();
         }
@@ -1936,6 +1937,7 @@ fn qwen35_production_27b_route_wall_and_utilization() {
             eprintln!("    {count:>3}x {name}");
         }
 
+        graph.buffers.reset_for_replay().expect("reset_for_replay before decomp walk");
         unsafe { std::env::set_var("GRIM_KERNEL_TIMES", "1") };
         let times_before = grim_backend_rocm::kernel_times_snapshot();
         model
@@ -1973,6 +1975,7 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         if graph.is_captured {
             let _ = graph.abort_capture();
         }
+        graph.buffers.reset_for_replay().expect("reset_for_replay before capture");
         graph.begin_capture().expect("begin capture");
         model.forward_capture(graph, 11).expect("record");
         graph.end_capture().expect("end capture");
@@ -2196,6 +2199,176 @@ fn qwen35_production_27b_route_wall_and_utilization() {
         top1(&new_logits).0,
         "Top-1 token must match between OLD and STEP3-DEDUP"
     );
+    // Task 0.5: Multi-token (512-token) teacher-forced PPL & mean-KL gate + component bisect
+    {
+        let capture_and_logit = |label: &str, g: &mut grim_backend_rocm::FullDecodeGraph| -> Vec<f32> {
+            if g.is_captured {
+                let _ = g.abort_capture();
+            }
+            g.buffers.reset_for_replay().expect("reset_for_replay before capture");
+            g.begin_capture().expect("begin capture");
+            model.forward_capture(g, 11).expect("record");
+            g.end_capture().expect("end capture");
+            g.buffers.reset_for_replay().expect("reset_for_replay");
+            model.forward_replay(g, 3).unwrap_or_else(|e| panic!("{label}: {e}"));
+            g.read_logits_f32().expect("read_logits_f32")
+        };
+
+        // Bisect 1: OLD + only IQ3S_DECODE on
+        unsafe {
+            std::env::set_var("GRIM_RMS_NORM_DECODE", "0");
+            std::env::remove_var("GRIM_IQ3S_DECODE");
+            std::env::set_var("GRIM_FUSED_RESIDUAL1", "0");
+            std::env::set_var("GRIM_FUSED_RESIDUAL2", "0");
+            std::env::set_var("GRIM_DEDUP_QUANT", "0");
+        }
+        let iq3s_only_logits = capture_and_logit("IQ3S_ONLY", &mut graph);
+        let (_, _, diff_old_iq3s) = worst_scaled(&old_logits, &iq3s_only_logits);
+
+        // Bisect 2: OLD + only FUSED_RESIDUAL1 on (with RMS_NORM_DECODE=0 -> warp-per-row grim_add_rms_norm)
+        unsafe {
+            std::env::set_var("GRIM_RMS_NORM_DECODE", "0");
+            std::env::set_var("GRIM_IQ3S_DECODE", "0");
+            std::env::remove_var("GRIM_FUSED_RESIDUAL1");
+            std::env::set_var("GRIM_FUSED_RESIDUAL2", "0");
+            std::env::set_var("GRIM_DEDUP_QUANT", "0");
+        }
+        let res1_warp_logits = capture_and_logit("RES1_WARP_ONLY", &mut graph);
+        let (_, _, diff_old_res1_warp) = worst_scaled(&old_logits, &res1_warp_logits);
+
+        // Bisect 3: OLD + only RMS_NORM_DECODE on (block-coop 8-warp reduction)
+        unsafe {
+            std::env::remove_var("GRIM_RMS_NORM_DECODE");
+            std::env::set_var("GRIM_IQ3S_DECODE", "0");
+            std::env::set_var("GRIM_FUSED_RESIDUAL1", "0");
+            std::env::set_var("GRIM_FUSED_RESIDUAL2", "0");
+            std::env::set_var("GRIM_DEDUP_QUANT", "0");
+        }
+        let rms_decode_only_logits = capture_and_logit("RMS_DECODE_ONLY", &mut graph);
+        let (_, _, diff_old_rms_decode) = worst_scaled(&old_logits, &rms_decode_only_logits);
+        let (_, _, diff_rms_decode_vs_step1) = worst_scaled(&rms_decode_only_logits, &res1_logits);
+
+        eprintln!(
+            "[27B:TASK-0.5-BISECT]\n  OLD vs IQ3S_DECODE only:      max_abs_diff = {diff_old_iq3s:.3e}\n  OLD vs FUSED_RES1 (warp):     max_abs_diff = {diff_old_res1_warp:.3e}\n  OLD vs RMS_NORM_DECODE only:  max_abs_diff = {diff_old_rms_decode:.3e}\n  RMS_NORM_DECODE vs STEP1:     max_abs_diff = {diff_rms_decode_vs_step1:.3e}"
+        );
+        assert_eq!(
+            diff_old_res1_warp, 0.0,
+            "Warp-per-row FUSED_RESIDUAL1 must be bit-exact (0.0 diff) against OLD"
+        );
+
+        // Teacher-forced 512-token PPL & mean-KL evaluation: OLD vs STEP3-DEDUP
+        let eval_tokens: Vec<u32> = (0..513usize)
+            .map(|i| [3u32, 7, 11, 16, 25, 42, 99, 128, 256, 512, 1024, 2048][i % 12].wrapping_add((i / 12) as u32))
+            .collect();
+        let log_softmax_and_probs = |logits: &[f32]| -> (f64, Vec<f32>) {
+            let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f64;
+            for &v in logits {
+                sum_exp += ((v - max_l) as f64).exp();
+            }
+            let lse = (max_l as f64) + sum_exp.ln();
+            let probs: Vec<f32> = logits.iter().map(|&v| ((v as f64 - lse).exp()) as f32).collect();
+            (lse, probs)
+        };
+        let kl_div = |a: &[f32], b: &[f32]| -> f64 {
+            let (lse_a, p_a) = log_softmax_and_probs(a);
+            let (lse_b, _) = log_softmax_and_probs(b);
+            let mut kl = 0.0f64;
+            for i in 0..a.len() {
+                let p = p_a[i] as f64;
+                if p > 1e-12 {
+                    let log_p = (a[i] as f64) - lse_a;
+                    let log_q = (b[i] as f64) - lse_b;
+                    kl += p * (log_p - log_q);
+                }
+            }
+            kl
+        };
+        let eval_512 = |arm_label: &str, g: &mut grim_backend_rocm::FullDecodeGraph, ref_logits_steps: Option<&[(usize, Vec<f32>)]>| -> (f64, Vec<(usize, f32)>, Vec<f64>, Vec<(usize, Vec<f32>)>, f64) {
+            if g.is_captured {
+                let _ = g.abort_capture();
+            }
+            g.buffers.reset_for_replay().expect("reset_for_replay before capture");
+            g.begin_capture().expect("begin capture");
+            model.forward_capture(g, 11).expect("record");
+            g.end_capture().expect("end capture");
+            g.buffers.reset_for_replay().expect("reset_for_replay");
+            let mut nll_sum = 0.0f64;
+            let mut target_nlls = Vec::with_capacity(512);
+            let mut top1_seq = Vec::with_capacity(512);
+            let mut saved_steps = Vec::new();
+            let mut kl_sum = 0.0f64;
+            let mut kl_count = 0usize;
+            for step_i in 0..512usize {
+                let tok = eval_tokens[step_i];
+                let next_tok = eval_tokens[step_i + 1] as usize;
+                model.forward_replay(g, tok).unwrap_or_else(|e| panic!("{arm_label} step {step_i}: {e}"));
+                g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
+                let logits = g.read_logits_f32().expect("read_logits_f32");
+                let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f64;
+                for &v in &logits {
+                    sum_exp += ((v - max_l) as f64).exp();
+                }
+                let lse = (max_l as f64) + sum_exp.ln();
+                let nll = lse - (logits[next_tok] as f64);
+                nll_sum += nll;
+                target_nlls.push(nll);
+                top1_seq.push(top1(&logits));
+                if step_i % 16 == 0 || step_i == 511 {
+                    if let Some(refs) = ref_logits_steps {
+                        if let Some((_, ref_l)) = refs.iter().find(|(s, _)| *s == step_i) {
+                            kl_sum += kl_div(ref_l, &logits);
+                            kl_count += 1;
+                        }
+                    } else {
+                        saved_steps.push((step_i, logits));
+                    }
+                }
+            }
+            let mean_kl = if kl_count > 0 { kl_sum / (kl_count as f64) } else { 0.0 };
+            (nll_sum / 512.0, top1_seq, target_nlls, saved_steps, mean_kl)
+        };
+
+        // Compute mean KL across 512 tokens and full 512-token NLL
+        unsafe {
+            std::env::set_var("GRIM_RMS_NORM_DECODE", "0");
+            std::env::set_var("GRIM_IQ3S_DECODE", "0");
+            std::env::set_var("GRIM_FUSED_RESIDUAL1", "0");
+            std::env::set_var("GRIM_FUSED_RESIDUAL2", "0");
+            std::env::set_var("GRIM_DEDUP_QUANT", "0");
+        }
+        let (old_nll_512, old_top1_512, old_nlls, old_saved_steps, _) = eval_512("OLD-512", &mut graph, None);
+
+        unsafe {
+            std::env::remove_var("GRIM_RMS_NORM_DECODE");
+            std::env::remove_var("GRIM_IQ3S_DECODE");
+            std::env::remove_var("GRIM_FUSED_RESIDUAL1");
+            std::env::remove_var("GRIM_FUSED_RESIDUAL2");
+            std::env::remove_var("GRIM_DEDUP_QUANT");
+        }
+        let (new_nll_512, new_top1_512, new_nlls, _, mean_kl_512) = eval_512("NEW-512", &mut graph, Some(&old_saved_steps));
+
+        let delta_nll = (new_nll_512 - old_nll_512).abs();
+        let top1_matches = old_top1_512.iter().zip(new_top1_512.iter()).filter(|(a, b)| a.0 == b.0).count();
+        let kl_step0 = kl_div(&old_logits, &new_logits);
+        let max_nll_step_diff = old_nlls.iter().zip(new_nlls.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        eprintln!(
+            "[27B:TASK-0.5-PPL-512]\n  OLD mean NLL (nats): {old_nll_512:.6} (PPL {:.4})\n  NEW mean NLL (nats): {new_nll_512:.6} (PPL {:.4})\n  |ΔNLL| (nats):       {delta_nll:.6} (max step |ΔNLL|={max_nll_step_diff:.6})\n  step-0 KL(OLD||NEW): {kl_step0:.3e}\n  mean KL (33 steps):  {mean_kl_512:.3e}\n  top-1 agreement:     {top1_matches}/512 ({:.2}%)",
+            old_nll_512.exp(),
+            new_nll_512.exp(),
+            (top1_matches as f64) * 100.0 / 512.0
+        );
+        assert!(
+            delta_nll <= 0.01,
+            "512-token teacher-forced |ΔNLL| {delta_nll:.6} exceeds 0.01 nats gate"
+        );
+        assert!(
+            kl_step0 <= 1e-4,
+            "step-0 KL divergence {kl_step0:.3e} exceeds 1e-4 gate"
+        );
+    }
+
     eprintln!(
         "[27B:PROGRESSION]\n  OLD-AE75E0C6 ({old_nodes} nodes): warm {old_warm_us:.0} us / cold {old_cold_us:.0} us\n  STEP1-RES1   ({res1_nodes} nodes): warm {res1_warm_us:.0} us ({:+.0} us) / cold {res1_cold_us:.0} us ({:+.0} us)\n  STEP2-RES2   ({res2_nodes} nodes): warm {res2_warm_us:.0} us ({:+.0} us) / cold {res2_cold_us:.0} us ({:+.0} us)\n  STEP3-DEDUP  ({new_nodes} nodes): warm {warm_us:.0} us ({:+.0} us) / cold {cold_us:.0} us ({:+.0} us)",
         res1_warm_us - old_warm_us,
