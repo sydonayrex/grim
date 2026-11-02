@@ -5816,6 +5816,17 @@ fn plan_layer_devices(
     }
 
     if unplaced > 0 {
+        let policy = std::env::var("GRIM_OOM_POLICY")
+            .unwrap_or_else(|_| "degrade".to_string())
+            .to_ascii_lowercase();
+        if policy == "fail" {
+            let total_weights: u64 = layer_cost.iter().sum();
+            let total_remaining: u64 = remaining.iter().sum();
+            panic!(
+                "OOM policy=fail: {}/{} layers exceed aggregate plannable VRAM (required weights: {:.2} GB, remaining headroom: {:.2} GB across {} devices). Model does not fit without managed memory spill.",
+                unplaced, num_layers, total_weights as f64 / 1e9, total_remaining as f64 / 1e9, devices.len()
+            );
+        }
         // Do NOT fail here: managed memory is slow but correct, and the loader
         // already warns when it engages. Surface it loudly and continue.
         eprintln!(
