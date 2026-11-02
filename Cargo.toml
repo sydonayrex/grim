@@ -38,6 +38,7 @@ members = [
     "crates/grim-compress",
     "crates/grim-compressed-tensors",
     "crates/grim-backend-tests",
+    "crates/grim-graph",
 ]
 
 [workspace.package]
