@@ -3274,6 +3274,21 @@ fn load_model_with_providers(
             ModelArchitecture::from_str(arch_str)
         );
     }
+
+    // Task 4.3: Supported-family matrix consultation
+    // Green: qwen35, lfm2 (1B+)
+    // Experimental: llama (MoE divergence / PM-3)
+    // Unsupported: xing40 .grim chain (open NaN)
+    let arch_lower = arch_str.to_ascii_lowercase();
+    if path.ends_with(".grim") && (arch_lower.contains("xing") || path.contains("xing40")) {
+        return Err(Error::Config(format!(
+            "Architecture '{arch_str}' (.grim format) is currently unsupported (tier: UNSUPPORTED, open NaN in Xing4.0 chain)"
+        )));
+    } else if arch_lower.contains("llama") && arch_lower.contains("moe") {
+        eprintln!(
+            "[grim] NOTICE: Architecture '{arch_str}' is tier: EXPERIMENTAL (known MoE routing divergence)"
+        );
+    }
     let mut model_arch = ModelArchitecture::from_str(arch_str);
     if model_arch == ModelArchitecture::Llama {
         let name_lower = lookup
