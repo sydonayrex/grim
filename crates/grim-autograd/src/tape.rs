@@ -32,6 +32,8 @@ pub enum TapeKind {
     Softmax,
     /// Token embedding lookup: `output = embedding(ids, weight)`. Arity is 1.
     Embedding,
+    /// Mamba selective scan: `output = selective_scan(x, a_log, b, c, d, state)`. Arity is 5.
+    SelectiveScan,
 }
 
 /// A single recorded operation on the tape.
@@ -94,6 +96,12 @@ pub enum TapeMetadata {
         vocab_size: usize,
         hidden_dim: usize,
         weight_param: Option<ParamId>,
+    },
+    /// Mamba selective scan single-step.
+    SelectiveScan {
+        batch_index: i32,
+        d_inner: i32,
+        d_state: i32,
     },
 }
 
@@ -417,6 +425,35 @@ impl Tape {
                 vocab_size,
                 hidden_dim,
                 weight_param,
+            },
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
+        });
+        out_id
+    }
+
+    /// Record a Mamba selective scan single-step forward op (Task 10.9).
+    pub fn record_selective_scan(
+        &mut self,
+        x: TensorId,
+        a_log: TensorId,
+        b: TensorId,
+        d: TensorId,
+        output: Tensor,
+        batch_index: i32,
+        d_inner: i32,
+        d_state: i32,
+    ) -> TensorId {
+        let out_id = self.register(output);
+        self.entries.push(TapeEntry {
+            kind: TapeKind::SelectiveScan,
+            inputs: vec![x, a_log, b, d],
+            output: out_id,
+            param_id: None,
+            metadata: TapeMetadata::SelectiveScan {
+                batch_index,
+                d_inner,
+                d_state,
             },
             segment_idx: self.current_segment,
             is_checkpoint: false,

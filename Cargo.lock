@@ -2765,6 +2765,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "grim-graph"
+version = "0.1.0"
+dependencies = [
+ "grim-core",
+ "grim-tensor",
+]
+
+[[package]]
 name = "grim-hip-sys"
 version = "7.16.2638501"
 dependencies = [

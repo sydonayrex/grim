@@ -1884,6 +1884,27 @@ pub trait RecurrentOps {
         ))
     }
 
+    /// Single-step backward pass for Mamba selective scan (Task 10.9).
+    /// Computes gradients `d_x` w.r.t. input x and `d_h_prev` w.r.t. prior recurrent state h_{t-1}.
+    #[allow(clippy::too_many_arguments)]
+    fn selective_scan_backward(
+        &self,
+        _a_log: &dyn BackendStorage,
+        _b: &dyn BackendStorage,
+        _d: &dyn BackendStorage,
+        _d_y: &dyn BackendStorage,
+        _x: &dyn BackendStorage,
+        _batch_index: i32,
+        _d_inner: i32,
+        _d_state: i32,
+        _d_x_shape: &Shape,
+        _d_h_prev_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "selective_scan_backward not implemented for this backend".into(),
+        ))
+    }
+
     /// Falcon-H1 / Mamba-2-style selective scan (WI-D, `ssm-conv-device-integration-plan.md`) - one decode step.
     /// Unlike [`BackendDevice::selective_scan`] (per-channel scalar B/C, precomputed `a = exp(a_log+1)`), this variant matches the llama.cpp `build_mamba2_layer`.
     #[allow(clippy::too_many_arguments)]
@@ -3282,6 +3303,33 @@ impl<T: RecurrentOps + ?Sized> RecurrentOps for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).selective_scan(
             x, a, b, c, d, state, batch, dim_dstate, dim_dinner, seq_len, out_shape,
+        )
+    }
+
+    fn selective_scan_backward(
+        &self,
+        a_log: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        d_y: &dyn BackendStorage,
+        x: &dyn BackendStorage,
+        batch_index: i32,
+        d_inner: i32,
+        d_state: i32,
+        d_x_shape: &Shape,
+        d_h_prev_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).selective_scan_backward(
+            a_log,
+            b,
+            d,
+            d_y,
+            x,
+            batch_index,
+            d_inner,
+            d_state,
+            d_x_shape,
+            d_h_prev_shape,
         )
     }
 

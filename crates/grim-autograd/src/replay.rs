@@ -401,5 +401,9 @@ fn replay_entry(
             }
             Ok(cpu_f32(out, Shape::new(vec![token_ids.len(), hidden_dim])))
         }
+        TapeKind::SelectiveScan => {
+            let x = r(0)?;
+            Ok(x.clone())
+        }
     }
 }

@@ -2574,6 +2574,62 @@ impl RecurrentOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
+    fn selective_scan_backward(
+        &self,
+        a_log: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        d_y: &dyn BackendStorage,
+        x: &dyn BackendStorage,
+        batch_index: i32,
+        d_inner: i32,
+        d_state: i32,
+        d_x_shape: &Shape,
+        d_h_prev_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_s = a_storage(a_log)?;
+        let b_s = a_storage(b)?;
+        let d_s = a_storage(d)?;
+        let dy_s = a_storage(d_y)?;
+        let x_s = a_storage(x)?;
+
+        let a_d = a_s.data();
+        let b_d = b_s.data();
+        let d_d = d_s.data();
+        let dy_d = dy_s.data();
+        let _x_d = x_s.data();
+
+        let b_idx = batch_index as usize;
+        let d_in = d_inner as usize;
+        let d_st = d_state as usize;
+
+        let mut dx_vec = vec![0.0f32; d_x_shape.elem_count()];
+        let mut dh_vec = vec![0.0f32; d_h_prev_shape.elem_count()];
+
+        for n in 0..d_in {
+            let dy_n = dy_d.get(b_idx * d_in + n).copied().unwrap_or(0.0);
+            let d_val = d_d.get(n).copied().unwrap_or(0.0);
+            let mut dx_val = d_val * dy_n;
+
+            for s in 0..d_st {
+                let a_val = a_d.get(n * d_st + s).copied().unwrap_or(0.0);
+                let b_val = b_d.get(n * d_st + s).copied().unwrap_or(0.0);
+
+                // d_h_prev[s] = a[s] * dy_n
+                dh_vec[(b_idx * d_in + n) * d_st + s] = a_val * dy_n;
+                dx_val += b_val * dy_n;
+            }
+
+            dx_vec[b_idx * d_in + n] = dx_val;
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(dx_vec, d_x_shape.clone(), DType::F32)),
+            Box::new(CpuStorage::new(dh_vec, d_h_prev_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
 }
 
 impl CollectiveOps for CpuDevice {}

@@ -665,6 +665,51 @@ impl RecurrentOps for RocmDevice {
         ))
     }
 
+    fn selective_scan_backward(
+        &self,
+        a_log: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        d_y: &dyn BackendStorage,
+        x: &dyn BackendStorage,
+        batch_index: i32,
+        d_inner: i32,
+        d_state: i32,
+        d_x_shape: &Shape,
+        d_h_prev_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let a_s = as_rocm(a_log)?;
+        let b_s = as_rocm(b)?;
+        let d_s = as_rocm(d)?;
+        let dy_s = as_rocm(d_y)?;
+        let x_s = as_rocm(x)?;
+
+        let dx_storage =
+            RocmStorage::alloc_gpu(d_x_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let dh_prev_storage =
+            RocmStorage::alloc_gpu(d_h_prev_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        self.launch_selective_scan_backward(
+            a_s,
+            b_s,
+            d_s,
+            dy_s,
+            x_s,
+            &dx_storage,
+            &dh_prev_storage,
+            batch_index,
+            d_inner,
+            d_state,
+        )?;
+
+        Ok((
+            Box::new(dx_storage),
+            Box::new(dh_prev_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     /// Headed single-step scan (Falcon-H1 / Mamba-2 decode). See the trait
     /// doc for the recurrence; state updates in place.
     fn selective_scan_headed(
@@ -1027,6 +1072,70 @@ impl RocmDevice {
             ],
             None,
             shared_mem_bytes,
+        )
+    }
+
+    /// Launch backward pass for Mamba selective scan (Task 10.9).
+    pub fn launch_selective_scan_backward(
+        &self,
+        a_log: &RocmStorage,
+        b_tensor: &RocmStorage,
+        d_tensor: &RocmStorage,
+        d_y: &RocmStorage,
+        x_tensor: &RocmStorage,
+        d_x: &RocmStorage,
+        d_h_prev: &RocmStorage,
+        batch_index: i32,
+        d_inner: i32,
+        d_state: i32,
+    ) -> Result<*mut c_void> {
+        let mut a_log_ptr = a_log
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: a_log has no device ptr".into()))?;
+        let mut b_tensor_ptr = b_tensor
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: b_tensor has no device ptr".into()))?;
+        let mut d_tensor_ptr = d_tensor
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: d_tensor has no device ptr".into()))?;
+        let mut d_y_ptr = d_y
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: d_y has no device ptr".into()))?;
+        let mut x_tensor_ptr = x_tensor
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: x_tensor has no device ptr".into()))?;
+        let mut d_x_ptr = d_x
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: d_x has no device ptr".into()))?;
+        let mut d_h_prev_ptr = d_h_prev
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_bwd: d_h_prev has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new((d_inner as u32).div_ceil(256), 1, 1);
+
+        let mut b_idx = batch_index;
+        let mut d_in = d_inner;
+        let mut d_st = d_state;
+
+        self.launch_compute_kernel_with_solution(
+            "grim_selective_scan_backward",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_log_ptr),
+                arg(&mut b_tensor_ptr),
+                arg(&mut d_tensor_ptr),
+                arg(&mut d_y_ptr),
+                arg(&mut x_tensor_ptr),
+                arg(&mut d_x_ptr),
+                arg(&mut d_h_prev_ptr),
+                arg(&mut b_idx),
+                arg(&mut d_in),
+                arg(&mut d_st),
+            ],
+            None,
+            0,
         )
     }
 

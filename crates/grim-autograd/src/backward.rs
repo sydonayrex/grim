@@ -232,6 +232,32 @@ pub fn backward(
 
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dw)?;
             }
+            TapeMetadata::SelectiveScan {
+                batch_index,
+                d_inner,
+                d_state,
+            } => {
+                let x = get_any(tape, &overlay, entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing selective_scan x".into()))?;
+                let a_log = get_any(tape, &overlay, entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing selective_scan a_log".into()))?;
+                let b = get_any(tape, &overlay, entry.inputs[2])
+                    .ok_or_else(|| Error::Backend("missing selective_scan b".into()))?;
+                let d = get_any(tape, &overlay, entry.inputs[3])
+                    .ok_or_else(|| Error::Backend("missing selective_scan d".into()))?;
+
+                let (dx, _dh) = crate::ops::selective_scan_backward(
+                    &out_grad,
+                    a_log,
+                    b,
+                    d,
+                    x,
+                    *batch_index,
+                    *d_inner,
+                    *d_state,
+                )?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+            }
         }
     }
 
@@ -445,6 +471,32 @@ pub fn backward_step(
                 }
 
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dw)?;
+            }
+            TapeMetadata::SelectiveScan {
+                batch_index,
+                d_inner,
+                d_state,
+            } => {
+                let x = get_any(tape, &overlay, entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing selective_scan x".into()))?;
+                let a_log = get_any(tape, &overlay, entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing selective_scan a_log".into()))?;
+                let b = get_any(tape, &overlay, entry.inputs[2])
+                    .ok_or_else(|| Error::Backend("missing selective_scan b".into()))?;
+                let d = get_any(tape, &overlay, entry.inputs[3])
+                    .ok_or_else(|| Error::Backend("missing selective_scan d".into()))?;
+
+                let (dx, _dh) = crate::ops::selective_scan_backward(
+                    &out_grad,
+                    a_log,
+                    b,
+                    d,
+                    x,
+                    *batch_index,
+                    *d_inner,
+                    *d_state,
+                )?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
             }
         }
     }

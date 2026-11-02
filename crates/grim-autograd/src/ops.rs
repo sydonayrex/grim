@@ -1726,6 +1726,101 @@ pub fn embedding_backward(
     ))
 }
 
+/// Reverse-mode autodiff for Mamba selective scan single-step (Task 10.9).
+/// Computes gradients `d_x` w.r.t input `x` and `d_h_prev` w.r.t prior hidden state `h_{t-1}`.
+pub fn selective_scan_backward(
+    out_grad: &Tensor,
+    a_log: &Tensor,
+    b: &Tensor,
+    d: &Tensor,
+    x: &Tensor,
+    batch_index: i32,
+    d_inner: i32,
+    d_state: i32,
+) -> Result<(Tensor, Tensor)> {
+    let dev = crate::pick_device_for_tensor(out_grad);
+    let dx_shape = x.shape().clone();
+    let dh_shape = grim_tensor::Shape::new(vec![
+        out_grad.shape().dims()[0],
+        d_inner as usize,
+        d_state as usize,
+    ]);
+
+    if let Ok((dx_st, dh_st, _handle)) = dev.selective_scan_backward(
+        a_log.storage().as_ref(),
+        b.storage().as_ref(),
+        d.storage().as_ref(),
+        out_grad.storage().as_ref(),
+        x.storage().as_ref(),
+        batch_index,
+        d_inner,
+        d_state,
+        &dx_shape,
+        &dh_shape,
+    ) {
+        let dx = Tensor::new(
+            Arc::from(dx_st),
+            dx_shape,
+            DType::F32,
+            out_grad.provenance().clone(),
+            out_grad.device().clone(),
+        );
+        let dh = Tensor::new(
+            Arc::from(dh_st),
+            dh_shape,
+            DType::F32,
+            out_grad.provenance().clone(),
+            out_grad.device().clone(),
+        );
+        return Ok((dx, dh));
+    }
+
+    // CPU fallback path
+    let a_vec = a_log.to_vec_f32()?;
+    let b_vec = b.to_vec_f32()?;
+    let d_vec = d.to_vec_f32()?;
+    let dy_vec = out_grad.to_vec_f32()?;
+
+    let b_idx = batch_index as usize;
+    let d_in = d_inner as usize;
+    let d_st = d_state as usize;
+
+    let mut dx_vec = vec![0.0f32; dx_shape.elem_count()];
+    let mut dh_vec = vec![0.0f32; dh_shape.elem_count()];
+
+    for n in 0..d_in {
+        let dy_n = dy_vec.get(b_idx * d_in + n).copied().unwrap_or(0.0);
+        let d_val = d_vec.get(n).copied().unwrap_or(0.0);
+        let mut dx_val = d_val * dy_n;
+
+        for s in 0..d_st {
+            let a_val = a_vec.get(n * d_st + s).copied().unwrap_or(0.0);
+            let b_val = b_vec.get(n * d_st + s).copied().unwrap_or(0.0);
+
+            dh_vec[(b_idx * d_in + n) * d_st + s] = a_val * dy_n;
+            dx_val += b_val * dy_n;
+        }
+
+        dx_vec[b_idx * d_in + n] = dx_val;
+    }
+
+    let dx = Tensor::new(
+        Arc::from(dev.from_cpu(&dx_vec, &dx_shape, DType::F32)?),
+        dx_shape,
+        DType::F32,
+        out_grad.provenance().clone(),
+        out_grad.device().clone(),
+    );
+    let dh = Tensor::new(
+        Arc::from(dev.from_cpu(&dh_vec, &dh_shape, DType::F32)?),
+        dh_shape,
+        DType::F32,
+        out_grad.provenance().clone(),
+        out_grad.device().clone(),
+    );
+    Ok((dx, dh))
+}
+
 /// Backward: STE - gradient passes through as identity (gradient of quantize+dequant w.r.t.
 /// input is 1.0 everywhere in the STE approximation, ignoring the non-differentiable clamp/round).
 pub fn fake_quant_int4_backward(_args: &FakeQuantInt4Args, grad_output: &Tensor) -> Result<Tensor> {
