@@ -322,13 +322,21 @@ impl HyperparameterExtractor {
             .or_else(|| metadata.get_f32("rope_theta"))
             .unwrap_or(10000.0);
 
-        let max_seq_len = metadata
+        let max_seq_len = match metadata
             .get_u32(&format!("{arch_name}.context_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.max_position_embeddings")))
             .or_else(|| metadata.get_u32("llama.context_length"))
             .or_else(|| metadata.get_u32("llama.max_position_embeddings"))
             .map(|v| v as usize)
-            .unwrap_or(2048);
+        {
+            Some(len) => len,
+            None => {
+                eprintln!(
+                    "context_length missing from model; defaulting to 2048 (set grim.toml [model] context or GRIM_CONTEXT)"
+                );
+                2048
+            }
+        };
 
         let expert_count = metadata
             .get_u32(&format!("{arch_name}.expert_count"))

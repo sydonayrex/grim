@@ -5,6 +5,10 @@ max_num_seqs = 64
 target_ttft_ms = 200
 target_itl_ms = 30
 
+[model]
+# Context window size in tokens. Defaults to model context_length if present, or 2048 if omitted.
+context = 2048
+
 [train]
 dataset = ["./data/train.jsonl"]
 mix_weights = []
