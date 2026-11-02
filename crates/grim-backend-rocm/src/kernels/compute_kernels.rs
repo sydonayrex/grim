@@ -1197,10 +1197,10 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
         const float v1 = (c1 < row_len) ? x_row[c1] : 0.0f;
         const float v2 = (c2 < row_len) ? x_row[c2] : 0.0f;
         const float v3 = (c3 < row_len) ? x_row[c3] : 0.0f;
-        ss += v0 * v0;
-        ss += v1 * v1;
-        ss += v2 * v2;
-        ss += v3 * v3;
+        ss = __builtin_fmaf(v0, v0, ss);
+        ss = __builtin_fmaf(v1, v1, ss);
+        ss = __builtin_fmaf(v2, v2, ss);
+        ss = __builtin_fmaf(v3, v3, ss);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -1241,10 +1241,10 @@ grim_rms_norm_decode(const float* x, const float* __restrict__ w, float* out,
         const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
         const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
         const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
-        ss += v0 * v0;
-        ss += v1 * v1;
-        ss += v2 * v2;
-        ss += v3 * v3;
+        ss = __builtin_fmaf(v0, v0, ss);
+        ss = __builtin_fmaf(v1, v1, ss);
+        ss = __builtin_fmaf(v2, v2, ss);
+        ss = __builtin_fmaf(v3, v3, ss);
     }
 
     #pragma unroll
@@ -1447,10 +1447,10 @@ grim_add_rms_norm(const float* x, const float* residual,
         if (c2 < row_len) y_row[c2] = y2;
         const float y3 = (c3 < row_len) ? (x_row[c3] + r_row[c3]) : 0.0f;
         if (c3 < row_len) y_row[c3] = y3;
-        ss += y0 * y0;
-        ss += y1 * y1;
-        ss += y2 * y2;
-        ss += y3 * y3;
+        ss = __builtin_fmaf(y0, y0, ss);
+        ss = __builtin_fmaf(y1, y1, ss);
+        ss = __builtin_fmaf(y2, y2, ss);
+        ss = __builtin_fmaf(y3, y3, ss);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -1500,10 +1500,10 @@ grim_add_rms_norm_decode(const float* x, const float* residual,
         if (c2 < row_len) y_out[c2] = y2;
         const float y3 = (c3 < row_len) ? (x[c3] + residual[c3]) : 0.0f;
         if (c3 < row_len) y_out[c3] = y3;
-        ss += y0 * y0;
-        ss += y1 * y1;
-        ss += y2 * y2;
-        ss += y3 * y3;
+        ss = __builtin_fmaf(y0, y0, ss);
+        ss = __builtin_fmaf(y1, y1, ss);
+        ss = __builtin_fmaf(y2, y2, ss);
+        ss = __builtin_fmaf(y3, y3, ss);
     }
 
     #pragma unroll

@@ -25,83 +25,105 @@ fn run_case(dev: &RocmDevice, rows: usize, row_len: usize) {
     let x = fill(n, 0.1);
     let r = fill(n, 2.7);
     let w: Vec<f32> = (0..row_len).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
-    let eps = 1e-5f32;
+    for eps in [1e-5f32, 1e-6f32] {
+        // Split reference: add_into then rms_norm_into (fresh output buffers).
+        let x_s = dev.from_cpu(&x, &shape, DType::F32).unwrap();
+        let r_s = dev.from_cpu(&r, &shape, DType::F32).unwrap();
+        let w_s = dev
+            .from_cpu(&w, &Shape::new(vec![row_len]), DType::F32)
+            .unwrap();
+        let sum_ref = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        let norm_ref = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        let sum_ref_r = as_rocm(sum_ref.as_ref()).unwrap();
+        let norm_ref_r = as_rocm(norm_ref.as_ref()).unwrap();
+        dev.add_into(x_s.as_ref(), r_s.as_ref(), sum_ref_r).unwrap();
+        dev.rms_norm_into(sum_ref.as_ref(), w_s.as_ref(), eps, norm_ref_r, &shape)
+            .unwrap();
 
-    // Split reference: add_into then rms_norm_into (fresh output buffers).
-    let x_s = dev.from_cpu(&x, &shape, DType::F32).unwrap();
-    let r_s = dev.from_cpu(&r, &shape, DType::F32).unwrap();
-    let w_s = dev
-        .from_cpu(&w, &Shape::new(vec![row_len]), DType::F32)
+        // Fused, with norm_out ALIASING residual (Residual 1 pattern):
+        // the norm output buffer is the exact same allocation as the residual input.
+        let sum_f = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        let norm_f = dev.from_cpu(&r, &shape, DType::F32).unwrap();
+        let norm_f_r = as_rocm(norm_f.as_ref()).unwrap();
+        dev.fused_add_rms_norm_into(
+            x_s.as_ref(),
+            norm_f.as_ref(),
+            w_s.as_ref(),
+            eps,
+            as_rocm(sum_f.as_ref()).unwrap(),
+            norm_f_r,
+            &shape,
+        )
         .unwrap();
-    let sum_ref = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
-    let norm_ref = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
-    let sum_ref_r = as_rocm(sum_ref.as_ref()).unwrap();
-    let norm_ref_r = as_rocm(norm_ref.as_ref()).unwrap();
-    dev.add_into(x_s.as_ref(), r_s.as_ref(), sum_ref_r).unwrap();
-    dev.rms_norm_into(sum_ref.as_ref(), w_s.as_ref(), eps, norm_ref_r, &shape)
+
+        // Fused, with norm_out ALIASING sum_out (Residual 2 + output_norm pattern):
+        let sum_norm_f = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        let sum_norm_r = as_rocm(sum_norm_f.as_ref()).unwrap();
+        dev.fused_add_rms_norm_into(
+            x_s.as_ref(),
+            r_s.as_ref(),
+            w_s.as_ref(),
+            eps,
+            sum_norm_r,
+            sum_norm_r,
+            &shape,
+        )
         .unwrap();
 
-    // Fused, with norm_out ALIASING residual (Residual 1 pattern):
-    // the norm output buffer is the exact same allocation as the residual input.
-    let sum_f = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
-    let norm_f = dev.from_cpu(&r, &shape, DType::F32).unwrap();
-    let norm_f_r = as_rocm(norm_f.as_ref()).unwrap();
-    dev.fused_add_rms_norm_into(
-        x_s.as_ref(),
-        norm_f.as_ref(),
-        w_s.as_ref(),
-        eps,
-        as_rocm(sum_f.as_ref()).unwrap(),
-        norm_f_r,
-        &shape,
-    )
-    .unwrap();
+        // Fused, with DISTINCT buffers (Residual 2 standard pattern):
+        let sum_dist_f = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        let norm_dist_f = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        dev.fused_add_rms_norm_into(
+            x_s.as_ref(),
+            r_s.as_ref(),
+            w_s.as_ref(),
+            eps,
+            as_rocm(sum_dist_f.as_ref()).unwrap(),
+            as_rocm(norm_dist_f.as_ref()).unwrap(),
+            &shape,
+        )
+        .unwrap();
 
-    // Fused, with norm_out ALIASING sum_out (Residual 2 + output_norm pattern):
-    let sum_norm_f = dev.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
-    let sum_norm_r = as_rocm(sum_norm_f.as_ref()).unwrap();
-    dev.fused_add_rms_norm_into(
-        x_s.as_ref(),
-        r_s.as_ref(),
-        w_s.as_ref(),
-        eps,
-        sum_norm_r,
-        sum_norm_r,
-        &shape,
-    )
-    .unwrap();
+        let got_sum = sum_f.to_cpu_vec_f32().unwrap();
+        let want_sum = sum_ref.to_cpu_vec_f32().unwrap();
+        let got_norm = norm_f.to_cpu_vec_f32().unwrap();
+        let got_sum_norm = sum_norm_f.to_cpu_vec_f32().unwrap();
+        let got_dist_norm = norm_dist_f.to_cpu_vec_f32().unwrap();
+        let want_norm = norm_ref.to_cpu_vec_f32().unwrap();
 
-    let got_sum = sum_f.to_cpu_vec_f32().unwrap();
-    let want_sum = sum_ref.to_cpu_vec_f32().unwrap();
-    let got_norm = norm_f.to_cpu_vec_f32().unwrap();
-    let got_sum_norm = sum_norm_f.to_cpu_vec_f32().unwrap();
-    let want_norm = norm_ref.to_cpu_vec_f32().unwrap();
-
-    // BIT-exact (review requirement): the fused kernel reads the same fp32
-    // sum values the split path stores, so any bit diff means a different
-    // reduction order — a divergence the decode graph must not inherit.
-    for i in 0..n {
-        assert_eq!(
-            got_sum[i].to_bits(),
-            want_sum[i].to_bits(),
-            "rows={rows} sum bit mismatch at {i}: {} vs {}",
-            got_sum[i],
-            want_sum[i]
-        );
-        assert_eq!(
-            got_norm[i].to_bits(),
-            want_norm[i].to_bits(),
-            "rows={rows} norm (alias residual) bit mismatch at {i}: {} vs {}",
-            got_norm[i],
-            want_norm[i]
-        );
-        assert_eq!(
-            got_sum_norm[i].to_bits(),
-            want_norm[i].to_bits(),
-            "rows={rows} norm (alias sum_out) bit mismatch at {i}: {} vs {}",
-            got_sum_norm[i],
-            want_norm[i]
-        );
+        // BIT-exact (review requirement): the fused kernel reads the same fp32
+        // sum values the split path stores, so any bit diff means a different
+        // reduction order — a divergence the decode graph must not inherit.
+        for i in 0..n {
+            assert_eq!(
+                got_sum[i].to_bits(),
+                want_sum[i].to_bits(),
+                "rows={rows} sum bit mismatch at {i}: {} vs {}",
+                got_sum[i],
+                want_sum[i]
+            );
+            assert_eq!(
+                got_norm[i].to_bits(),
+                want_norm[i].to_bits(),
+                "rows={rows} norm (alias residual) bit mismatch at {i}: {} vs {}",
+                got_norm[i],
+                want_norm[i]
+            );
+            assert_eq!(
+                got_sum_norm[i].to_bits(),
+                want_norm[i].to_bits(),
+                "rows={rows} norm (alias sum_out) bit mismatch at {i}: {} vs {}",
+                got_sum_norm[i],
+                want_norm[i]
+            );
+            assert_eq!(
+                got_dist_norm[i].to_bits(),
+                want_norm[i].to_bits(),
+                "rows={rows} norm (distinct) bit mismatch at {i}: {} vs {}",
+                got_dist_norm[i],
+                want_norm[i]
+            );
+        }
     }
 }
 
