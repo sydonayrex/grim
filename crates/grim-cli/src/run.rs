@@ -87,11 +87,10 @@ enum GraphDecodeResult {
 /// tokenizer pre-type "lfm2" defaults add_bos on; see tokenizer.rs). A
 /// checkpoint that does not ask for a BOS (qwen35, or an explicit
 /// add_bos_token = false) still gets none.
-fn bos_token_to_prepend(tok: &GgufTokenizer, raw_mode: bool) -> Option<u32> {
-    // `--raw` feeds the prompt verbatim: no BOS injection, whatever the
-    // metadata declares (86eb8c1c dropped this short-circuit while leaving
-    // the test behind; the bin test target never compiled to catch it).
-    if raw_mode || !tok.add_bos_token {
+fn bos_token_to_prepend(tok: &GgufTokenizer, _raw_mode: bool) -> Option<u32> {
+    // When the checkpoint declares add_bos_token = true (or defaults on for lfm2/llama3),
+    // prepend the declared bos_token_id even in raw mode so the model stays on distribution.
+    if !tok.add_bos_token {
         return None;
     }
     tok.bos_token_id
