@@ -1264,3 +1264,40 @@ warranted on this stack.
 now ships **`amd-smi`** (`amd-smi list`, `amd-smi metric -g N` for activity;
 `process list` unsupported here). The GPU-busy gate for future sessions
 uses `amd-smi metric` GFX_ACTIVITY plus `pgrep -x` for known binaries.
+
+
+---
+
+## 8. Qwen3.5 27B 4-Arm Progression & Bit-Exact Parity (2026-11-01, Task 1.1 / Task 0.5)
+
+### Execution Summary & Baseline Progression
+Measurements taken on dual RDNA4 system:
+- `rocm:0`: AMD Radeon RX 9070 XT (`gfx1201`, 16 GB, card0)
+- `rocm:1`: AMD Radeon RX 9060 XT (`gfx1200`, 16 GB, card1)
+- DPM performance level: pinned to `high` (`power_dpm_force_performance_level`)
+- Target model: `qwen35_production_27b` (64 layers, 16 full-attention, 48 KDA, hidden 5120, vocab 248320)
+- Layer split: 32 layers on `rocm:0`, 32 layers on `rocm:1`
+
+| Step / Arm | Wall (warm / cold) | Kernel Busy | HIP Graph Nodes | Total Launches | Key Transformations | Logit Diff vs OLD |
+|:---|:---:|:---:|:---:|:---:|:---|:---:|
+| **OLD** (`ae75e0c6`) | 75.4 ms / 75.3 ms | 66.9 ms | 1543 (769 dev0 / 774 dev1) | 1614 | Baseline unfused split graphs | Reference |
+| **STEP1-RES1** | 70.1 ms / 69.9 ms | 60.8 ms | 1479 (737 dev0 / 742 dev1) | 1550 | Fused Res1 (`grim_add_rms_norm_decode`), fast warp-0 stride-128 norm, `iq3s_decode` LDS | **0.000e0** |
+| **STEP2-RES2** | 69.9 ms / 69.9 ms | 60.2 ms | 1416 (706 dev0 / 710 dev1) | 1487 | Fused Res2 into next-layer norm, explicit FMA contraction alignment | **0.000e0** |
+| **STEP3-DEDUP** | 69.6 ms / 69.6 ms | 59.6 ms | 1327 (662 dev0 / 665 dev1) | 1398 | Sibling quantize dedup: q8_1 285→217, u4 103→82 | **0.000e0** |
+
+### Per-Kernel Launch & Busy Decomposition (STEP3 vs OLD)
+- `grim_quantize_q8_1`: 285 → 217 launches (2597 µs → 1984 µs)
+- `grim_quantize_u4_group128`: 103 → 82 launches (924 µs → 735 µs)
+- `grim_rms_norm`: 161 → 32 launches (7424 µs → 359 µs)
+- `grim_add_rms_norm_decode`: 0 → 127 launches (0 µs → 3444 µs)
+- `grim_rms_norm_decode`: 0 → 2 launches (0 µs → 49 µs)
+- `grim_add`: 128 → 1 launches (1251 µs → 8 µs)
+- `grim_fused_dequant_gemm_iq3s_decode`: 4 launches, 1039 µs (259 µs/launch vs 565 µs/launch grouped)
+
+### Numerics & Parity Gates
+- Logits gate: Bit-identical `0.000e0` across all 248,320 logits for OLD, STEP1, STEP2, STEP3.
+- Teacher-forced 512-token evaluation:
+  - Mean NLL: OLD 10.597459 vs NEW 10.597459 (`|ΔNLL| = 0.000000 nats`, threshold $\le 0.01$)
+  - Step-0 KL divergence: `0.000e0`
+  - Mean KL (33-step window): `0.000e0`
+  - Top-1 token agreement: **512 / 512 (100.00%)**

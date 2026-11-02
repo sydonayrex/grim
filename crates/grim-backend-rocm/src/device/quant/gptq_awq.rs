@@ -729,13 +729,13 @@ impl RocmDevice {
             )?);
         }
 
-        let act_codes = codes_guard.as_ref().unwrap();
-        let act_scales = scales_guard.as_ref().unwrap();
-        let act_sums = sums_guard.as_ref().unwrap();
+        let act_codes = codes_guard.as_ref().ok_or_else(|| Error::Backend("quantize_act_u4: act_codes unallocated".into()))?;
+        let act_scales = scales_guard.as_ref().ok_or_else(|| Error::Backend("quantize_act_u4: act_scales unallocated".into()))?;
+        let act_sums = sums_guard.as_ref().ok_or_else(|| Error::Backend("quantize_act_u4: act_sums unallocated".into()))?;
         self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, n_groups * 128)?;
-        let codes_ptr = act_codes.device_ptr.unwrap();
-        let scales_ptr = act_scales.device_ptr.unwrap();
-        let sums_ptr = act_sums.device_ptr.unwrap();
+        let codes_ptr = act_codes.device_ptr.ok_or_else(|| Error::Backend("quantize_act_u4: act_codes missing device_ptr".into()))?;
+        let scales_ptr = act_scales.device_ptr.ok_or_else(|| Error::Backend("quantize_act_u4: act_scales missing device_ptr".into()))?;
+        let sums_ptr = act_sums.device_ptr.ok_or_else(|| Error::Backend("quantize_act_u4: act_sums missing device_ptr".into()))?;
         Ok(ActU4QuantScratch {
             _codes: codes_guard,
             _scales: scales_guard,
