@@ -786,9 +786,9 @@ impl RocmDevice {
 
         static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v3 = *V3.get_or_init(|| {
-            matches!(
+            !matches!(
                 std::env::var("GRIM_WHITECROW_V3").as_deref(),
-                Ok("1" | "true" | "on")
+                Ok("0" | "false" | "off")
             )
         });
         static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
