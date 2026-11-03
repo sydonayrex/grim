@@ -214,6 +214,13 @@ fn llama_q41_loads_emits_and_replays_like_eager() {
         }
     }
 
+    // PM-3 closure gate (Task 5B.4): Llama graphs must contain 0 attention-gate or sigmoid_mul nodes.
+    // Llama attention has no sigmoid gate; leaking Qwen's attention gate into Llama corrupted logits.
+    assert!(
+        !ops.contains(&op::ELEMENTWISE) || ops.iter().filter(|&&o| o == op::ELEMENTWISE).count() == 1,
+        "only embedding gather may be ELEMENTWISE; no sigmoid_mul nodes allowed in Llama"
+    );
+
     // The warmups executed against this arena and bumped each layer's live-row
     // total and the position, so reset the replay state to "empty arena" — the
     // same history the eager session started from. One API, because the three
