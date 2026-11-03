@@ -451,6 +451,25 @@ fn axpy_graph(
     Ok(())
 }
 
+struct DevNormEmitter<'a>(pub &'a Dev);
+
+impl<'a> grim_graph::NormEmitter for DevNormEmitter<'a> {
+    fn record_norm(&mut self, _kind: grim_graph::NormKind, _eps: f32) {
+        let _ = self.0;
+    }
+}
+
+struct DevLinearEmitter<'a>(pub &'a Dev);
+
+impl<'a> grim_graph::LinearEmitter for DevLinearEmitter<'a> {
+    fn record_quant_q81(&mut self) {
+        let _ = self.0;
+    }
+    fn record_gemv(&mut self, _what: &str) {
+        let _ = self.0;
+    }
+}
+
 // ─── Llama Block Graph Forward ────────────────────────────────────────────
 
 impl LlamaBlock {
@@ -500,13 +519,30 @@ impl LlamaBlock {
                 // Exact same predicate the linears will apply later: fuse
                 // iff ANY of q/k/v consumes q8_1 (then the dual kernel's
                 // q8_1 output is consumed; non-q81 consumers are unaffected).
-                for t in [self.wq.weight(), self.wk.weight(), self.wv.weight()] {
+                let trace = std::env::var("GRIM_FUSE_TRACE").as_deref() == Ok("1");
+                for (name, t) in [
+                    ("q", self.wq.weight()),
+                    ("k", self.wk.weight()),
+                    ("v", self.wv.weight()),
+                ] {
                     let w = match rocm_storage(t) {
                         Ok(w) => w,
-                        Err(_) => return false,
+                        Err(e) => {
+                            if trace {
+                                eprintln!("[fuse-trace] layer {layer_idx} {name}: rocm_storage ERR {e}");
+                            }
+                            return false;
+                        }
                     };
                     let n = t.shape().dims().first().copied().unwrap_or(0);
-                    if dev.linear_decode_quant_kind(w, 1, n, hidden).0 {
+                    let (q81, u4) = dev.linear_decode_quant_kind(w, 1, n, hidden);
+                    if trace {
+                        eprintln!(
+                            "[fuse-trace] layer {layer_idx} {name}: dtype={:?} n={n} hidden={hidden} q81={q81} u4={u4}",
+                            w.dtype().storage
+                        );
+                    }
+                    if q81 {
                         return true;
                     }
                 }
@@ -518,6 +554,14 @@ impl LlamaBlock {
             // norm + first quantize. Byte-identity to the split path is
             // pinned by rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity.
             // m == 1 only: the dual kernel is decode-shaped (single row).
+            // Task 5B.4: Validate norm via grim_graph
+            let norm_spec = grim_graph::NormSpec {
+                weight: Some(&attn_w),
+                eps: self.attn_norm.eps,
+            };
+            let batch_m = buffers.batch.max(1);
+            let _norm_kind_graph = grim_graph::emit_norm(&mut DevNormEmitter(dev), &norm_spec, batch_m, hidden)?;
+
             match self.attn_norm.kind {
                 NormKind::Rms if fuse_norm_quant => {
                     let norm_w = rocm_storage(&attn_w)?;
@@ -610,39 +654,36 @@ impl LlamaBlock {
             )
                 .map_err(|e| grim_core::error::Error::Backend(format!("fused norm qkv dot4: {e}")))?;
         } else if fuse_norm_quant {
-            // Task 2.6: `act` already holds q8_1(normed) from the dual
-            // norm kernel; pass q81_ready so q81-consuming linears skip
-            // their own quantize (non-q81 consumers ignore the flag).
+            // Task 2.6 / 5B.4: Track via grim_graph linear dedup emitter
+            let mut q_flags = grim_graph::QuantFlags { q81_ready: true, u4_ready: false };
+            let mut linear_emitter = DevLinearEmitter(dev);
+            grim_graph::emit_linear_dedup(&mut linear_emitter, "attn_q", &mut q_flags)?;
             linear_into_named_ready(
-                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, true,
+                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, q_flags.q81_ready,
             )?;
+            grim_graph::emit_linear_dedup(&mut linear_emitter, "attn_k", &mut q_flags)?;
+            linear_into_named_ready(
+                dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, q_flags.q81_ready,
+            )?;
+            grim_graph::emit_linear_dedup(&mut linear_emitter, "attn_v", &mut q_flags)?;
+            linear_into_named_ready(
+                dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, q_flags.q81_ready,
+            )?;
+        } else {
+            let mut q_flags = grim_graph::QuantFlags { q81_ready: false, u4_ready: false };
+            let mut linear_emitter = DevLinearEmitter(dev);
+            grim_graph::emit_linear_dedup(&mut linear_emitter, "attn_q", &mut q_flags)?;
+            linear_into_named_ready(
+                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, false,
+            )?;
+            q_flags.q81_ready = true;
+            grim_graph::emit_linear_dedup(&mut linear_emitter, "attn_k", &mut q_flags)?;
             linear_into_named_ready(
                 dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, true,
             )?;
+            grim_graph::emit_linear_dedup(&mut linear_emitter, "attn_v", &mut q_flags)?;
             linear_into_named_ready(
                 dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, true,
-            )?;
-        } else {
-            linear_into(
-                dev,
-                normed,
-                self.wq.weight(),
-                &buffers.q_buf[layer_idx],
-                act,
-            )?;
-            linear_into(
-                dev,
-                normed,
-                self.wk.weight(),
-                &buffers.k_buf[layer_idx],
-                act,
-            )?;
-            linear_into(
-                dev,
-                normed,
-                self.wv.weight(),
-                &buffers.v_buf[layer_idx],
-                act,
             )?;
         }
 
@@ -920,6 +961,13 @@ impl LlamaBlock {
                         &buffers.layer_output[layer_idx],
                         dev,
                     )?;
+
+                    // Task 5B.4: Validate ffn norm via grim_graph
+                    let ffn_norm_spec = grim_graph::NormSpec {
+                        weight: Some(&ffn_w),
+                        eps: self.ffn_norm.eps,
+                    };
+                    let _ffn_norm_kind_graph = grim_graph::emit_norm(&mut DevNormEmitter(dev), &ffn_norm_spec, batch, hidden)?;
 
                     match self.ffn_norm.kind {
                         NormKind::Rms => {
@@ -5971,14 +6019,55 @@ impl ChameleonBlock {
 
         // 1. Pre-attention RMSNorm into norm_buf
         let h_shape = buffers.layer_input[layer_idx].shape().clone();
-        dev.rms_norm_into(
-            &buffers.layer_input[layer_idx],
-            &**self.attn_norm.weight.storage(),
-            self.attn_norm.eps,
-            &buffers.norm_buf[layer_idx],
-            &h_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        let hidden = h_shape.dims().last().copied().unwrap_or(0);
+        // Task 2.6: fuse the q8_1 quantize into the norm launch when any
+        // qkv consumer needs q8_1 — one dual-output kernel replaces
+        // norm + first quantize. Byte-identity to the split path is pinned
+        // by rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity.
+        // m == 1 only: the dual kernel is decode-shaped (single row).
+        let fuse_norm_quant = batch == 1
+            && !matches!(
+                std::env::var("GRIM_FUSE_NORM_QUANT").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+            && (|| {
+                // Exact same predicate the linears will apply later: fuse
+                // iff ANY of q/k/v consumes q8_1 (non-q81 consumers ignore
+                // the ready flag, so over-fusing is safe, under-fusing
+                // merely skips the win).
+                for t in [self.wq.weight(), self.wk.weight(), self.wv.weight()] {
+                    let w = match rocm_storage(t) {
+                        Ok(w) => w,
+                        Err(_) => return false,
+                    };
+                    let n = t.shape().dims().first().copied().unwrap_or(0);
+                    if dev.linear_decode_quant_kind(w, 1, n, hidden).0 {
+                        return true;
+                    }
+                }
+                false
+            })();
+        if fuse_norm_quant {
+            let norm_w = dst_downcast(self.attn_norm.weight.storage().as_ref())?;
+            dev.launch_rms_norm_quant_q81_dual(
+                dst_downcast(&buffers.layer_input[layer_idx])?,
+                norm_w,
+                &buffers.norm_buf[layer_idx],
+                act,
+                hidden,
+                self.attn_norm.eps,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused norm+q81: {e}")))?;
+        } else {
+            dev.rms_norm_into(
+                &buffers.layer_input[layer_idx],
+                &**self.attn_norm.weight.storage(),
+                self.attn_norm.eps,
+                &buffers.norm_buf[layer_idx],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
         let hd = self.head_dim;
@@ -5993,10 +6082,14 @@ impl ChameleonBlock {
         {
             let norm_rocm = dst_downcast(normed)?;
             let m = batch;
-            dev.launch_quantize_q8_1(norm_rocm, act, m, fused.hidden)
-                .map_err(|e| {
-                    grim_core::error::Error::Backend(format!("chameleon qkv quant: {e}"))
-                })?;
+            // Task 2.6: when the dual norm kernel already filled `act`,
+            // this quantize is redundant — skip it.
+            if !fuse_norm_quant {
+                dev.launch_quantize_q8_1(norm_rocm, act, m, fused.hidden)
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("chameleon qkv quant: {e}"))
+                    })?;
+            }
             dev.launch_fused_qkv_dot4_into(
                 act,
                 &fused.storage,
@@ -6020,6 +6113,18 @@ impl ChameleonBlock {
                 fused.n_v,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+        } else if fuse_norm_quant {
+            // Task 2.6: `act` already holds q8_1(normed); q81-consuming
+            // linears skip their own quantize (others ignore the flag).
+            linear_into_named_ready(
+                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, true,
+            )?;
+            linear_into_named_ready(
+                dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, true,
+            )?;
+            linear_into_named_ready(
+                dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, true,
+            )?;
         } else {
             linear_into(
                 dev,
