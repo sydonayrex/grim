@@ -6302,6 +6302,113 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v2
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Task 2.2 (fast decode): IQ4_XS sub-block-per-lane GEMV v7.
+//
+// v7 is v2 with EXACTLY ONE change: the IQ4_XS nibble -> codebook decode is
+// done WORD-WIDE (grim_kv4_iq4xs_valu_fast) instead of BYTE-WIDE
+// (grim_kv4_iq4xs_valu). Geometry, load pattern, arithmetic order and the
+// per-lane superblock walk are untouched, so v7 is bit-exact vs v2.
+//
+// Why it matters: the load probes (grim_iq4xs_q81_gemv_load_probe) show v2's
+// A+B access pattern already runs at 97-99% of the measured DRAM stream
+// ceiling. The 20-25% shortfall is a COMPUTE bubble: the wave issues its
+// A+B loads, waits, then runs ~810 VALU decode instructions per superblock
+// iteration with no memory request in flight.
+//
+// SASS of the per-column decode block in v2:
+//   303 instructions, 72 v_perm_b32, 34 s_wait_alu
+// The 72 v_perm are 8 per 32-bit word (2 per byte -- see the helper comment):
+// the old helper computes 4 identical lookups per v_perm and discards 3.
+//
+// v7's block: ~120 instructions, 16 v_perm. That is a 2.5x cut of the only
+// phase that keeps DRAM idle, which is the whole gap to the ceiling.
+//
+// Same trick applies to the low/high nibble pair: the high path is
+// `qw >> 4` because only bits 0..3 of each byte are consumed, so the
+// contamination from the next byte's low nibble cannot reach the decode.
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v7(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+        const float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        int a4[8];
+        __builtin_memcpy(a4, a_blk + 4, 32);
+
+        uint2 hdr_col[4];
+        uint2 qv0_col[4];
+        uint2 qv1_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 136;
+                hdr_col[j] = ((const uint2*)b_sb)[0];
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+                qv0_col[j] = qs2[0];
+                qv1_col[j] = qs2[1];
+            } else {
+                hdr_col[j] = make_uint2(0u, 0u);
+                qv0_col[j] = make_uint2(0u, 0u);
+                qv1_col[j] = make_uint2(0u, 0u);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned hdr = hdr_col[j].x;
+            const unsigned sc_l4 = hdr_col[j].y;
+            const float d = fp16_to_float_device((unsigned short)(hdr & 0xFFFFu));
+            const unsigned scales_h = hdr >> 16;
+            const int ls = (int)((sc_l4 >> (4 * sub)) & 0x0Fu)
+                         | (((int)((scales_h >> (2 * sub)) & 3u)) << 4);
+            const float dl = d * (float)(ls - 32);
+
+            const unsigned qw[4] = {qv0_col[j].x, qv0_col[j].y, qv1_col[j].x, qv1_col[j].y};
+            int pos = 0;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                pos = grim_sdot4(a4[w],     grim_kv4_iq4xs_valu_fast(qw[w]),       pos);
+                pos = grim_sdot4(a4[w + 4], grim_kv4_iq4xs_valu_fast(qw[w] >> 4), pos);
+            }
+            facc[j] += dl * d_a * (float)pos;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Task 2.3 diagnostics: decompose the v2 -> measured-stream-ceiling gap.
 //
 // Measured facts (Dev0/gfx1201, k=5120 n=17408, 8 rotating cold weight blobs):

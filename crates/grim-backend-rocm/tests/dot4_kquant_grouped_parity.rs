@@ -3058,6 +3058,7 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         let out_v4 = mk_out();
         let out_v5 = mk_out();
         let out_v5b = mk_out();
+        let out_v7 = mk_out();
 
         let a_r = as_rocm(q81_st.as_ref()).unwrap();
         let b_r = as_rocm(b_st.as_ref()).unwrap();
@@ -3066,6 +3067,7 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         let o_v4 = as_rocm(out_v4.as_ref()).unwrap();
         let o_v5 = as_rocm(out_v5.as_ref()).unwrap();
         let o_v5b = as_rocm(out_v5b.as_ref()).unwrap();
+        let o_v7 = as_rocm(out_v7.as_ref()).unwrap();
 
         // v2 = the production dispatch (sub_v2 default).
         // v2 = the production sub_v2 arm, driven through the A/B entry that
@@ -3079,6 +3081,8 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         dev.launch_dot4_iq4xs_q81_gemv_v5_for_ab(a_r, b_r, o_v5, m, n, k).map_err(|e| format!("v5: {e}")).unwrap();
         // v5b (register-reuse pipelined v2).
         dev.launch_dot4_iq4xs_q81_gemv_v5b_for_ab(a_r, b_r, o_v5b, m, n, k).map_err(|e| format!("v5b: {e}")).unwrap();
+        // v7 (v2 with word-wide IQ4_XS nibble decode).
+        dev.launch_dot4_iq4xs_q81_gemv_v7_for_ab(a_r, b_r, o_v7, m, n, k).map_err(|e| format!("v7: {e}")).unwrap();
         dev.synchronize();
 
         let got_v2 = f32_vec(&out_v2).unwrap();
@@ -3086,6 +3090,7 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         let got_v4 = f32_vec(&out_v4).unwrap();
         let got_v5 = f32_vec(&out_v5).unwrap();
         let got_v5b = f32_vec(&out_v5b).unwrap();
+        let got_v7 = f32_vec(&out_v7).unwrap();
         for (i, (x, y)) in got_v2.iter().zip(got_v3.iter()).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(),
                 "k={k} n={n}: v3 diverged from v2 at [{i}]: {x} vs {y}");
@@ -3101,6 +3106,10 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         for (i, (x, y)) in got_v2.iter().zip(got_v5b.iter()).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(),
                 "k={k} n={n}: v5b diverged from v2 at [{i}]: {x} vs {y}");
+        }
+        for (i, (x, y)) in got_v2.iter().zip(got_v7.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(),
+                "k={k} n={n}: v7 diverged from v2 at [{i}]: {x} vs {y}");
         }
 
         // f16 envelope vs the host dequant oracle (row 0, m=1).
@@ -3169,12 +3178,15 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
             DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
         let out_f = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
             DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let out_g = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
         let o_a = as_rocm(out_a.as_ref()).unwrap();
         let o_b = as_rocm(out_b.as_ref()).unwrap();
         let o_c = as_rocm(out_c.as_ref()).unwrap();
         let o_d = as_rocm(out_d.as_ref()).unwrap();
         let o_e = as_rocm(out_e.as_ref()).unwrap();
         let o_f = as_rocm(out_f.as_ref()).unwrap();
+        let o_g = as_rocm(out_g.as_ref()).unwrap();
 
         // bytes per launch = weights + activations + output (output written once per launch)
         let bytes_moved = (n * row_bytes + q81_len + m * n * 4) as f64;
