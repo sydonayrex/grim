@@ -3011,6 +3011,7 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
