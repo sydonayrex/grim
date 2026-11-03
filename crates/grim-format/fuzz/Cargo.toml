@@ -1,0 +1,36 @@
+[package]
+name = "grim-format-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+grim-format = { path = ".." }
+
+[[bin]]
+name = "gguf_header"
+path = "fuzz_targets/gguf_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "safetensors_header"
+path = "fuzz_targets/safetensors_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "torch_pickle"
+path = "fuzz_targets/torch_pickle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tokenizer_json"
+path = "fuzz_targets/tokenizer_json.rs"
+test = false
+doc = false
