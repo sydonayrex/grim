@@ -17,12 +17,30 @@ use crate::{RocmStorage, hipGetDeviceProperties};
 static WATCHDOG_STARTED: OnceLock<()> = OnceLock::new();
 static LAST_PROGRESS_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_OP_DESC: std::sync::RwLock<&'static str> = std::sync::RwLock::new("idle");
+static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
+static LOADING_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn current_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Notify the watchdog of active model loading bytes to extend the timeout floor (1s per GiB).
+pub fn notify_model_loading_bytes(bytes: u64) {
+    LOADING_BYTES.fetch_max(bytes, Ordering::Release);
+}
+
+/// Arm the watchdog for execution. Called after first successful inference step or once model load completes.
+pub fn arm_rocm_watchdog() {
+    WATCHDOG_ARMED.store(true, Ordering::Release);
+    report_rocm_progress("armed");
+}
+
+/// Disarm the watchdog (e.g. during planned long sync or model weight streaming).
+pub fn disarm_rocm_watchdog() {
+    WATCHDOG_ARMED.store(false, Ordering::Release);
 }
 
 /// Notify the ROCm progress watchdog of an active operation or successful completion.
@@ -35,14 +53,15 @@ pub fn report_rocm_progress(op: &'static str) {
 
 /// Ensure the background watchdog thread is running.
 /// Configurable via `GRIM_WATCHDOG_TIMEOUT_SECS` (default 30s).
+/// Task 6.2: Load exemption — watchdog only enforces timeout when armed or adjusts timeout floor (≥ 1s/GiB).
 pub fn ensure_rocm_watchdog_started() {
     WATCHDOG_STARTED.get_or_init(|| {
-        let timeout_secs: u64 = std::env::var("GRIM_WATCHDOG_TIMEOUT_SECS")
+        let base_timeout_secs: u64 = std::env::var("GRIM_WATCHDOG_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
 
-        if timeout_secs == 0 {
+        if base_timeout_secs == 0 {
             return;
         }
 
@@ -52,9 +71,22 @@ pub fn ensure_rocm_watchdog_started() {
             .name("grim-rocm-watchdog".into())
             .spawn(move || {
                 let interval = Duration::from_millis(1000);
-                let timeout_ms = timeout_secs * 1000;
                 loop {
                     std::thread::sleep(interval);
+
+                    // If not armed yet and no explicit override forces arming, skip deadlock kill
+                    let is_armed = WATCHDOG_ARMED.load(Ordering::Acquire);
+                    let force_arm = std::env::var("GRIM_WATCHDOG_STRICT").as_deref() == Ok("1");
+
+                    if !is_armed && !force_arm {
+                        continue;
+                    }
+
+                    let load_bytes = LOADING_BYTES.load(Ordering::Acquire);
+                    let gib_floor = (load_bytes / (1024 * 1024 * 1024)).saturating_mul(1);
+                    let effective_timeout_secs = base_timeout_secs.max(gib_floor).max(30);
+                    let timeout_ms = effective_timeout_secs * 1000;
+
                     let last = LAST_PROGRESS_MS.load(Ordering::Acquire);
                     let now = current_epoch_ms();
                     if last > 0 && now.saturating_sub(last) > timeout_ms {
@@ -64,8 +96,9 @@ pub fn ensure_rocm_watchdog_started() {
                              [ROCM WATCHDOG TIMEOUT] No progress detected for {} seconds!\n\
                              Last recorded in-flight ROCm operation: {:?}\n\
                              A kernel or runtime call has stalled or deadlocked.\n\
+                             (Exit code 101: GPU deadlock / unrecoverable driver stall)\n\
                              =======================================================\n",
-                            timeout_secs, op
+                            effective_timeout_secs, op
                         );
                         // Loud preflight/deadlock exit
                         std::process::exit(101);

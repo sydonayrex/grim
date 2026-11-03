@@ -61,7 +61,10 @@ pub use device::capability_profiler::{
     free_device_memory, vram_info, vram_info_detailed,
 };
 pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
-pub use device::util::{ensure_rocm_watchdog_started, report_rocm_progress};
+pub use device::util::{
+    arm_rocm_watchdog, disarm_rocm_watchdog, ensure_rocm_watchdog_started,
+    notify_model_loading_bytes, report_rocm_progress,
+};
 
 // S4: the dispatch route counter. Re-exported at the crate root because the T2
 // journey tests that consume it live in `tests/`, and an integration test can
