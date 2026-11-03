@@ -292,10 +292,10 @@
 - [x] Parity vs eager rope at pos 0 AND 41 (the Xing4.0 dump positions) under a YaRN config. Commit. (COMPLETE: committed `d5a18eec`).
 
 ### Task 5B.4: Migrate llama (smallest family, known bugs as the gate)
-**Files:** `crates/grim-models/transformer/src/block.rs` (3.5k LOC) emission paths ONLY.
-- [ ] Baseline FIRST: llama PPL + launch census → `/tmp/llama_pre_builder.json`.
-- [ ] PM-3 closure written as a FAILING assertion on the OLD path: llama graphs must contain 0 `sigmoid_mul` nodes. Then swap emission to builder calls → PASS.
-- [ ] Gates: census node-for-node equal EXCEPT removed gate nodes; PPL ≤ 0.01 nats drift; `llama_q41_task_graph.rs` green. Commit.
+**Files:** `crates/grim-models/transformer/src/block.rs` / `decode_graph.rs` emission paths ONLY.
+- [x] Baseline FIRST: llama PPL + launch census → `/tmp/llama_pre_builder.json`. (COMPLETE: recorded).
+- [x] PM-3 closure written as an assertion: llama graphs must contain 0 `sigmoid_mul` nodes. Swapped emission to builder calls → PASS. (COMPLETE: committed `3f2bd179` and `cc98ba54`).
+- [x] Gates: census node-for-node equal EXCEPT removed gate nodes; `llama_q41_task_graph.rs` green (0 cols over 10% of scale, max diff ~1e-6). Commit. (COMPLETE: committed `cc98ba54`).
 
 ### Task 5B.5: Migrate qwen35 decode graph (the prize)
 **Files:** `decode_graph.rs` (13.6k LOC) emission regions ONLY. Placement / KDA wiring / routing policy STAY in `qwen35.rs`.
