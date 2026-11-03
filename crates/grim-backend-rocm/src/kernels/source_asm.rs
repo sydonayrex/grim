@@ -10,6 +10,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::charon_backward::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
+    s.push_str(crate::kernels::log_softmax_vjp::LOG_SOFTMAX_VJP_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rho_microbench::KERNEL_SOURCE);
     // GRAVE Phase 4: fused GDN-2 state-update + output + gated norm, one

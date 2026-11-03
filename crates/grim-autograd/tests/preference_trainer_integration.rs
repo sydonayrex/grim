@@ -103,3 +103,51 @@ fn test_preference_trainer_all_algorithms() {
     assert_eq!(grpo_cw.len(), 2);
     let _ = grpo_loss;
 }
+
+#[test]
+fn test_log_softmax_vjp_cpu_vs_reference() {
+    let seq_len = 16;
+    let vocab_size = 128;
+    let ignore_index = 0u32;
+    let logp_grad = -0.5f32;
+
+    let mut logits_vec = vec![0.0f32; seq_len * vocab_size];
+    for i in 0..logits_vec.len() {
+        logits_vec[i] = ((i as f32 * 0.05).sin() * 2.0).clamp(-10.0, 10.0);
+    }
+    let targets: Vec<u32> = (0..seq_len as u32).map(|i| if i % 4 == 0 { ignore_index } else { (i * 7) % vocab_size as u32 }).collect();
+
+    let grad_cpu = PreferenceTrainer::compute_log_softmax_vjp(
+        &logits_vec,
+        &targets,
+        vocab_size,
+        logp_grad,
+        ignore_index,
+    );
+
+    let logits_tensor = grim_backend_cpu::cpu_tensor(
+        logits_vec,
+        grim_tensor::Shape::new(vec![seq_len, vocab_size]),
+    );
+
+    let grad_tensor = PreferenceTrainer::compute_log_softmax_vjp_tensor(
+        &logits_tensor,
+        &targets,
+        vocab_size,
+        logp_grad,
+        ignore_index,
+    ).expect("vjp tensor");
+
+    let grad_tensor_vec = grad_tensor.to_vec_f32().expect("to_vec_f32");
+    assert_eq!(grad_cpu.len(), grad_tensor_vec.len());
+
+    let mut max_diff: f32 = 0.0;
+    for (c, t) in grad_cpu.iter().zip(grad_tensor_vec.iter()) {
+        let diff = (c - t).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+    }
+
+    assert!(max_diff < 1e-6, "max_diff {max_diff} exceeds 1e-6");
+}

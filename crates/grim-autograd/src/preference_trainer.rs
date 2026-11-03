@@ -296,6 +296,34 @@ impl PreferenceTrainer {
         logp_grad: f32,
         ignore_index: u32,
     ) -> Result<grim_tensor::Tensor> {
+        let seq_len = targets.len();
+        let dev = crate::pick_device_for_tensor(logits);
+
+        if let grim_tensor::Device::Rocm(_) = logits.device() {
+            // Upload targets to device and invoke fused GPU log-softmax VJP kernel
+            let targets_f32: Vec<f32> = targets.iter().map(|&t| t as f32).collect();
+            let targets_shape = grim_tensor::Shape::new(vec![seq_len]);
+            let targets_storage = dev.from_cpu(&targets_f32, &targets_shape, grim_tensor::DType::F32)?;
+
+            if let Ok((grad_storage, handle)) = dev.log_softmax_vjp(
+                logits.storage().as_ref(),
+                targets_storage.as_ref(),
+                logp_grad,
+                ignore_index,
+                vocab_size,
+                seq_len,
+            ) {
+                handle.synchronize()?;
+                return Ok(grim_tensor::Tensor::new(
+                    std::sync::Arc::from(grad_storage),
+                    grim_tensor::Shape::new(vec![seq_len, vocab_size]),
+                    grim_tensor::DType::F32,
+                    logits.provenance().clone(),
+                    logits.device().clone(),
+                ));
+            }
+        }
+
         let logits_vec = logits
             .to_vec_f32()
             .map_err(|e| Error::Backend(format!("Tensor to_vec_f32 failed: {e}")))?;

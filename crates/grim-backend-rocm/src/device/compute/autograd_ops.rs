@@ -282,4 +282,85 @@ impl AutogradOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
+
+    fn log_softmax_vjp(
+        &self,
+        logits: &dyn BackendStorage,
+        targets: &dyn BackendStorage,
+        d_loss_d_logp: f32,
+        ignore_index: u32,
+        vocab_size: usize,
+        seq_len: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let logits_s = as_rocm(logits)?;
+        let targets_s = as_rocm(targets)?;
+        let grad_shape = Shape::new(vec![seq_len, vocab_size]);
+        let grad_out =
+            RocmStorage::alloc_gpu(&grad_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        self.launch_log_softmax_vjp(
+            logits_s,
+            targets_s,
+            &grad_out,
+            d_loss_d_logp,
+            ignore_index,
+            vocab_size,
+            seq_len,
+        )?;
+
+        Ok((
+            Box::new(grad_out),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+}
+
+impl RocmDevice {
+    /// Launch GPU-native fused log-softmax VJP kernel (Task 10.4).
+    pub fn launch_log_softmax_vjp(
+        &self,
+        logits: &RocmStorage,
+        targets: &RocmStorage,
+        grad_out: &RocmStorage,
+        d_loss_d_logp: f32,
+        ignore_index: u32,
+        vocab_size: usize,
+        seq_len: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        let logits_ptr = logits
+            .device_ptr
+            .ok_or_else(|| Error::Backend("log_softmax_vjp: logits has no device ptr".into()))?;
+        let targets_ptr = targets
+            .device_ptr
+            .ok_or_else(|| Error::Backend("log_softmax_vjp: targets has no device ptr".into()))?;
+        let grad_out_ptr = grad_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("log_softmax_vjp: grad_out has no device ptr".into()))?;
+
+        let grid_dim = crate::HipDim3::new(seq_len as u32, 1, 1);
+        let block_dim = crate::HipDim3::new(256, 1, 1);
+
+        let mut lptr = logits_ptr;
+        let mut tptr = targets_ptr;
+        let mut gptr = grad_out_ptr;
+        let mut loss_factor = d_loss_d_logp;
+        let mut ign_idx = ignore_index;
+        let mut vs = vocab_size as i32;
+        let mut sl = seq_len as i32;
+
+        self.launch_compute_kernel(
+            "grim_log_softmax_vjp_kernel",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut lptr),
+                arg(&mut tptr),
+                arg(&mut gptr),
+                arg(&mut loss_factor),
+                arg(&mut ign_idx),
+                arg(&mut vs),
+                arg(&mut sl),
+            ],
+        )
+    }
 }

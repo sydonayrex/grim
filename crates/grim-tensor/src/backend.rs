@@ -1560,6 +1560,21 @@ pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
             ))
         }
     }
+
+    /// GPU-native fused log-softmax VJP (vector-Jacobian product) for cross-entropy & preference training.
+    fn log_softmax_vjp(
+        &self,
+        _logits: &dyn BackendStorage,
+        _targets: &dyn BackendStorage,
+        _d_loss_d_logp: f32,
+        _ignore_index: u32,
+        _vocab_size: usize,
+        _seq_len: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "log_softmax_vjp not implemented for this backend".into(),
+        ))
+    }
 }
 
 /// Device-resident fused optimizer steps (AdamW, Lion, M-Adam).
@@ -3033,6 +3048,18 @@ impl<T: AutogradOps + ?Sized> AutogradOps for std::sync::Arc<T> {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).lora_accumulate(base, x, a, b, scale, out_shape)
+    }
+
+    fn log_softmax_vjp(
+        &self,
+        logits: &dyn BackendStorage,
+        targets: &dyn BackendStorage,
+        d_loss_d_logp: f32,
+        ignore_index: u32,
+        vocab_size: usize,
+        seq_len: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).log_softmax_vjp(logits, targets, d_loss_d_logp, ignore_index, vocab_size, seq_len)
     }
 }
 
