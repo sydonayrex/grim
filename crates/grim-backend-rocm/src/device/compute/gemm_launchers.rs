@@ -1004,7 +1004,12 @@ impl RocmDevice {
                 )?),
             );
         }
-        let dst = guard.get(&self.ordinal).expect("just inserted");
+        let dst = guard.get(&self.ordinal).ok_or_else(|| {
+            Error::Backend(format!(
+                "cvt buffer for ordinal {} missing immediately after insert",
+                self.ordinal
+            ))
+        })?;
         let mut sptr = a
             .device_ptr
             .ok_or_else(|| Error::Backend("cvt: src ptr".into()))?;

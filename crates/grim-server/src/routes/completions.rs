@@ -149,10 +149,14 @@ pub(crate) async fn text_completions_route(
                                 "finish_reason": null
                             }]
                         });
-                        let _ = tx.send(Ok(format!(
-                            "data: {}\n\n",
-                            serde_json::to_string(&chunk).unwrap()
-                        )));
+                        let chunk_str = match serde_json::to_string(&chunk) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = tx.send(Err(format!("JSON serialization error: {e}")));
+                                break;
+                            }
+                        };
+                        let _ = tx.send(Ok(format!("data: {chunk_str}\n\n")));
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e));
@@ -179,10 +183,9 @@ pub(crate) async fn text_completions_route(
                     "finish_reason": "stop"
                 }]
             });
-            let _ = tx.send(Ok(format!(
-                "data: {}\n\n",
-                serde_json::to_string(&final_chunk).unwrap()
-            )));
+            let final_str = serde_json::to_string(&final_chunk)
+                .unwrap_or_else(|_| "{}".to_string());
+            let _ = tx.send(Ok(format!("data: {final_str}\n\n")));
             let _ = tx.send(Ok("data: [DONE]\n\n".to_string()));
         });
 
