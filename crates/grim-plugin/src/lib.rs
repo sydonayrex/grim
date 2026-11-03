@@ -240,7 +240,12 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
             max_memory_mb: lt
                 .get("max_memory_mb")
                 .and_then(|v| v.as_integer())
-                .map(|v| v as u32),
+                .map(|v| v as u32)
+                .or_else(|| {
+                    lt.get("memory_mb")
+                        .and_then(|v| v.as_integer())
+                        .map(|v| v as u32)
+                }),
         })
     });
 

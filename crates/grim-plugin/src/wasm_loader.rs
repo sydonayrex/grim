@@ -12,6 +12,12 @@ pub const WIT_SAMPLER_INTERFACE: &str = include_str!("wit/sampler.wit");
 pub const WIT_TOKENIZER_INTERFACE: &str = include_str!("wit/tokenizer.wit");
 pub const WIT_PROCESSOR_INTERFACE: &str = include_str!("wit/processor.wit");
 
+/// Host state stored inside wasmtime::Store to enforce resource limits.
+#[cfg(feature = "wasm-sandbox")]
+pub struct WasmHostState {
+    pub limits: wasmtime::StoreLimits,
+}
+
 /// Wrapper for a WASM-based sampler plugin.
 pub struct WasmSampler {
     name: String,
@@ -23,7 +29,7 @@ pub struct WasmSampler {
     /// The store is behind a Mutex because `Func::call` and
     /// `Memory::write` require `AsContextMut` (mutable access), but `Sampler::sample` takes `&self`.
     #[cfg(feature = "wasm-sandbox")]
-    store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
+    store: Option<std::sync::Mutex<wasmtime::Store<WasmHostState>>>,
 }
 
 /// Wrapper for a WASM-based tokenizer plugin.
@@ -33,7 +39,7 @@ pub struct WasmTokenizer {
     #[cfg(feature = "wasm-sandbox")]
     instance: Option<wasmtime::Instance>,
     #[cfg(feature = "wasm-sandbox")]
-    store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
+    store: Option<std::sync::Mutex<wasmtime::Store<WasmHostState>>>,
 }
 
 /// Wrapper for a WASM-based pre/post-processor plugin.
@@ -43,7 +49,7 @@ pub struct WasmProcessor {
     #[cfg(feature = "wasm-sandbox")]
     instance: Option<wasmtime::Instance>,
     #[cfg(feature = "wasm-sandbox")]
-    store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
+    store: Option<std::sync::Mutex<wasmtime::Store<WasmHostState>>>,
 }
 
 /// WASM plugin loader — enforces fuel, memory, and capability grants.
@@ -125,7 +131,18 @@ impl WasmPluginLoader {
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| Error::Backend(format!("failed to compile WASM module: {e}")))?;
 
-        let mut store = Store::new(&engine, ());
+        let memory_bytes = self
+            .limits
+            .max_memory_mb
+            .unwrap_or(64) as usize * 1024 * 1024;
+        let store_limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(memory_bytes)
+            .build();
+        let host_state = WasmHostState {
+            limits: store_limits,
+        };
+        let mut store = Store::new(&engine, host_state);
+        store.limiter(|state| &mut state.limits);
 
         // Add fuel to the store before instantiation so the module can run
         // its start function without immediately trapping.
@@ -136,7 +153,7 @@ impl WasmPluginLoader {
         }
 
         // Build the linker. Nothing is linked - deny-by-default.
-        let linker: Linker<()> = Linker::new(&engine);
+        let linker: Linker<WasmHostState> = Linker::new(&engine);
 
         // Instantiate — any unlinked import causes a trap here, not at call time.
         // This is the correct place to fail: before the plugin runs any user code.
@@ -197,13 +214,25 @@ impl WasmPluginLoader {
             .map_err(|e| Error::Backend(format!("failed to create wasmtime engine: {e}")))?;
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| Error::Backend(format!("failed to compile WASM module: {e}")))?;
-        let mut store = Store::new(&engine, ());
+        let memory_bytes = self
+            .limits
+            .max_memory_mb
+            .unwrap_or(64) as usize * 1024 * 1024;
+        let store_limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(memory_bytes)
+            .build();
+        let host_state = WasmHostState {
+            limits: store_limits,
+        };
+        let mut store = Store::new(&engine, host_state);
+        store.limiter(|state| &mut state.limits);
+
         if let Some(fuel) = self.limits.fuel_per_invocation {
             store
                 .set_fuel(fuel)
                 .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
         }
-        let linker: Linker<()> = Linker::new(&engine);
+        let linker: Linker<WasmHostState> = Linker::new(&engine);
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| Error::Backend(format!("failed to instantiate WASM module: {e}")))?;
@@ -258,13 +287,25 @@ impl WasmPluginLoader {
             .map_err(|e| Error::Backend(format!("failed to create wasmtime engine: {e}")))?;
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| Error::Backend(format!("failed to compile WASM module: {e}")))?;
-        let mut store = Store::new(&engine, ());
+        let memory_bytes = self
+            .limits
+            .max_memory_mb
+            .unwrap_or(64) as usize * 1024 * 1024;
+        let store_limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(memory_bytes)
+            .build();
+        let host_state = WasmHostState {
+            limits: store_limits,
+        };
+        let mut store = Store::new(&engine, host_state);
+        store.limiter(|state| &mut state.limits);
+
         if let Some(fuel) = self.limits.fuel_per_invocation {
             store
                 .set_fuel(fuel)
                 .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
         }
-        let linker: Linker<()> = Linker::new(&engine);
+        let linker: Linker<WasmHostState> = Linker::new(&engine);
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| Error::Backend(format!("failed to instantiate WASM module: {e}")))?;
@@ -674,5 +715,74 @@ mod tests {
         );
         let token = sampler.sample(&dummy_tensor, &[]).expect("sample call");
         assert_eq!(token, 99);
+    }
+
+    #[cfg(feature = "wasm-sandbox")]
+    #[test]
+    fn test_wasm_store_limits_memory_cap() {
+        // Module tries to allocate 1025 pages (64 MiB + 64 KiB > 64 MiB)
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1025)
+                (func (export "sample") (param i32 i32 i32 i32) (result i32)
+                    i32.const 42
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat_src).expect("valid WAT");
+        let limits = PluginLimits {
+            fuel_per_invocation: Some(10000),
+            max_memory_mb: Some(64),
+        };
+        let loader = WasmPluginLoader::new("oob-mem-sampler", limits);
+        let res = loader.create_sampler(&wasm_bytes);
+        assert!(res.is_err(), "Instantiation of module exceeding StoreLimits must fail");
+
+        // Module tries to dynamically grow memory beyond limit
+        let wat_grow_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "sample") (param i32 i32 i32 i32) (result i32)
+                    ;; 1 page = 64 KiB. 2048 pages = 128 MiB.
+                    (drop (memory.grow (i32.const 2048)))
+                    i32.const 77
+                )
+            )
+        "#;
+        let wasm_grow_bytes = wat::parse_str(wat_grow_src).expect("valid WAT");
+        let loader_grow = WasmPluginLoader::new("grow-mem-sampler", PluginLimits {
+            fuel_per_invocation: Some(10000),
+            max_memory_mb: Some(64),
+        });
+        let _sampler = loader_grow.create_sampler(&wasm_grow_bytes).expect("create_sampler ok for initial 1 page");
+        let cpu_dev = grim_backend_cpu::device::CpuDevice::new();
+        let shape = grim_tensor::shape::Shape::new(vec![1]);
+        let storage = cpu_dev
+            .from_cpu(&[1.0f32], &shape, grim_tensor::DType::F32)
+            .unwrap();
+        let dummy_tensor = grim_tensor::Tensor::new(
+            storage.into(),
+            shape,
+            grim_tensor::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            grim_tensor::Device::Cpu,
+        );
+        // memory.grow returns -1 on failure when StoreLimits prevents growth
+        // Let's also check a function that traps on grow failure:
+        let wat_trap_grow = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "sample") (param i32 i32 i32 i32) (result i32)
+                    (if (i32.eq (memory.grow (i32.const 2048)) (i32.const -1))
+                        (then (unreachable))
+                    )
+                    i32.const 88
+                )
+            )
+        "#;
+        let wasm_trap_grow = wat::parse_str(wat_trap_grow).expect("valid WAT");
+        let sampler_trap = loader_grow.create_sampler(&wasm_trap_grow).expect("create_sampler");
+        let sample_res = sampler_trap.sample(&dummy_tensor, &[]);
+        assert!(sample_res.is_err(), "memory.grow beyond StoreLimits must cause unreachable trap");
     }
 }
