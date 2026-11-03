@@ -131,6 +131,68 @@ extern "C" __global__ void blend_kv_rope_kernel(
 }
 "#;
 
+use crate::device::roc_device::RocmDevice;
+use crate::memory::storage::RocmStorage;
+use std::ffi::c_void;
+
+/// Launch GPU-accelerated fused RoPE + scatter KV cache blending kernel (Task 10.7).
+pub fn launch_blend_kv_rope(
+    dev: &RocmDevice,
+    cfg: &BlendConfig,
+    k_src: &RocmStorage,
+    v_src: &RocmStorage,
+    k_dst: &RocmStorage,
+    v_dst: &RocmStorage,
+    base_pos: i32,
+    rope_theta: f32,
+) -> Result<*mut c_void> {
+    let k_src_ptr = k_src
+        .device_ptr
+        .ok_or_else(|| Error::Backend("blend_kv_rope: k_src has no device ptr".into()))?;
+    let v_src_ptr = v_src
+        .device_ptr
+        .ok_or_else(|| Error::Backend("blend_kv_rope: v_src has no device ptr".into()))?;
+    let k_dst_ptr = k_dst
+        .device_ptr
+        .ok_or_else(|| Error::Backend("blend_kv_rope: k_dst has no device ptr".into()))?;
+    let v_dst_ptr = v_dst
+        .device_ptr
+        .ok_or_else(|| Error::Backend("blend_kv_rope: v_dst has no device ptr".into()))?;
+
+    let total_elems = cfg.block_size * cfg.num_heads * cfg.head_dim;
+    let block_dim = crate::HipDim3::new(256, 1, 1);
+    let grid_dim = crate::HipDim3::new((total_elems as u32).div_ceil(256), 1, 1);
+
+    let mut ks = k_src_ptr;
+    let mut vs = v_src_ptr;
+    let mut kd = k_dst_ptr;
+    let mut vd = v_dst_ptr;
+    let mut bs = cfg.block_size as i32;
+    let mut nh = cfg.num_heads as i32;
+    let mut hd = cfg.head_dim as i32;
+    let mut dt = cfg.divergence_token as i32;
+    let mut bp = base_pos;
+    let mut theta = rope_theta;
+
+    dev.launch_compute_kernel(
+        "blend_kv_rope_kernel",
+        grid_dim,
+        block_dim,
+        &mut [
+            crate::arg(&mut ks),
+            crate::arg(&mut vs),
+            crate::arg(&mut kd),
+            crate::arg(&mut vd),
+            crate::arg(&mut bs),
+            crate::arg(&mut nh),
+            crate::arg(&mut hd),
+            crate::arg(&mut dt),
+            crate::arg(&mut bp),
+            crate::arg(&mut theta),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +227,66 @@ mod tests {
 
         // Tokens 2..4 in K should be rotated and finite
         assert!(k_dst[16..].iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_blend_kv_rope_gpu_parity() {
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let cfg = BlendConfig {
+            block_size: 4,
+            num_heads: 2,
+            head_dim: 4,
+            divergence_token: 2,
+        };
+
+        let total_len = cfg.block_size * cfg.num_heads * cfg.head_dim;
+        let k_src = vec![1.0f32; total_len];
+        let v_src = vec![2.0f32; total_len];
+
+        let mut k_dst_cpu = vec![0.0f32; total_len];
+        let mut v_dst_cpu = vec![0.0f32; total_len];
+        k_dst_cpu[..16].fill(7.0);
+        v_dst_cpu[..16].fill(8.0);
+
+        let k_dst_gpu_init = k_dst_cpu.clone();
+        let v_dst_gpu_init = v_dst_cpu.clone();
+
+        blend_kv_rope_cpu(&cfg, &k_src, &v_src, &mut k_dst_cpu, &mut v_dst_cpu, 0, 10000.0).unwrap();
+
+        use crate::as_rocm;
+        use grim_tensor::backend::CoreTensorOps;
+        let shape = grim_tensor::Shape::new(vec![total_len]);
+        let k_src_dev = CoreTensorOps::from_cpu(&dev, &k_src, &shape, grim_tensor::DType::F32).unwrap();
+        let v_src_dev = CoreTensorOps::from_cpu(&dev, &v_src, &shape, grim_tensor::DType::F32).unwrap();
+        let k_dst_dev = CoreTensorOps::from_cpu(&dev, &k_dst_gpu_init, &shape, grim_tensor::DType::F32).unwrap();
+        let v_dst_dev = CoreTensorOps::from_cpu(&dev, &v_dst_gpu_init, &shape, grim_tensor::DType::F32).unwrap();
+
+        let k_src_s = as_rocm(k_src_dev.as_ref()).unwrap();
+        let v_src_s = as_rocm(v_src_dev.as_ref()).unwrap();
+        let k_dst_s = as_rocm(k_dst_dev.as_ref()).unwrap();
+        let v_dst_s = as_rocm(v_dst_dev.as_ref()).unwrap();
+
+        launch_blend_kv_rope(&dev, &cfg, k_src_s, v_src_s, k_dst_s, v_dst_s, 0, 10000.0).unwrap();
+        dev.synchronize();
+
+        let k_dst_gpu = k_dst_dev.to_cpu_vec_f32().unwrap();
+        let v_dst_gpu = v_dst_dev.to_cpu_vec_f32().unwrap();
+
+        assert_eq!(k_dst_cpu.len(), k_dst_gpu.len());
+        assert_eq!(v_dst_cpu.len(), v_dst_gpu.len());
+
+        for (i, (&c, &g)) in k_dst_cpu.iter().zip(k_dst_gpu.iter()).enumerate() {
+            let diff = (c - g).abs();
+            assert!(diff < 1e-5, "k_dst mismatch at {i}: cpu {c} vs gpu {g}");
+        }
+        for (i, (&c, &g)) in v_dst_cpu.iter().zip(v_dst_gpu.iter()).enumerate() {
+            let diff = (c - g).abs();
+            assert!(diff < 1e-5, "v_dst mismatch at {i}: cpu {c} vs gpu {g}");
+        }
     }
 }
