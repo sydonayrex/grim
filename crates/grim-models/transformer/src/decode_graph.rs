@@ -1683,6 +1683,7 @@ impl DecodeGraphModel for Llama {
         let dev = dev_for_llama(self)?;
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
 
+        let pos = graph.buffers.current_pos;
         // TEMP-DIAG (GRIM_TOTALS_TRACE): dump per-layer totals at replay start.
         if std::env::var("GRIM_TOTALS_TRACE").as_deref() == Ok("1") {
             if let Some(t0) = graph.buffers.layer_totals.first() {
@@ -1700,7 +1701,6 @@ impl DecodeGraphModel for Llama {
                 }
             }
         }
-        let pos = graph.buffers.current_pos;
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
         }
