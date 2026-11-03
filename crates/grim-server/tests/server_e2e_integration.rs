@@ -162,6 +162,58 @@ async fn test_server_chat_completions_non_streaming() {
 }
 
 #[tokio::test]
+async fn test_health_responsive_during_continuous_generation() {
+    let state = create_test_state();
+    let app = build_router(state);
+
+    // Launch heavy generation in background
+    let app_gen = app.clone();
+    let gen_handle = tokio::spawn(async move {
+        let body = json!({
+            "model": "default",
+            "messages": [
+                { "role": "user", "content": "generate a long response" }
+            ],
+            "max_tokens": 16,
+            "temperature": 0.0
+        });
+        app_gen
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    // Concurrently poll health endpoints multiple times — all must respond < 2s
+    for _ in 0..8 {
+        let t0 = std::time::Instant::now();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(elapsed < std::time::Duration::from_secs(2), "health check stalled ({:?}) during generation", elapsed);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let gen_resp = gen_handle.await.unwrap();
+    assert_eq!(gen_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_server_chat_completions_streaming() {
     let state = create_test_state();
     let app = build_router(state);

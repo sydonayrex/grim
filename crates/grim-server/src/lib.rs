@@ -813,6 +813,85 @@ fn sample_next_token(
     Ok(token)
 }
 
+/// Request sent to the dedicated inference worker thread.
+pub struct InferenceStepRequest {
+    pub request_id: u64,
+    pub step: u64,
+    pub sampler: std::sync::Arc<dyn grim_core::sampler::Sampler>,
+    pub prompt_tokens: Option<Vec<u32>>,
+    pub vocab_size: usize,
+    pub model_id: Option<String>,
+    pub respond_to: tokio::sync::oneshot::Sender<std::result::Result<u32, String>>,
+}
+
+/// Dedicated inference channel sender per AppState.
+static INFERENCE_CHANNELS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, tokio::sync::mpsc::UnboundedSender<InferenceStepRequest>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Initialize the background inference thread for this AppState instance if not already running.
+pub fn ensure_inference_thread_started(state: Arc<AppState>) -> tokio::sync::mpsc::UnboundedSender<InferenceStepRequest> {
+    let key = Arc::as_ptr(&state) as usize;
+    let mut guard = INFERENCE_CHANNELS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = guard.get(&key) {
+        return tx.clone();
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InferenceStepRequest>();
+    let state_worker = state.clone();
+    std::thread::Builder::new()
+        .name(format!("grim-inf-{key:x}"))
+        .spawn(move || {
+            tracing::info!("[grim-server] Dedicated inference worker thread started for state {key:x}");
+            while let Some(req) = rx.blocking_recv() {
+                let res = {
+                    let mut engine = state_worker.lock_engine();
+                    sample_next_token(
+                        &mut engine,
+                        req.request_id,
+                        req.step,
+                        req.sampler.as_ref(),
+                        req.prompt_tokens.as_deref(),
+                        req.vocab_size,
+                        req.model_id,
+                    )
+                };
+                let _ = req.respond_to.send(res);
+            }
+            tracing::info!("[grim-server] Dedicated inference worker thread stopped for state {key:x}");
+        })
+        .expect("failed to spawn grim-inference thread");
+    guard.insert(key, tx.clone());
+    tx
+}
+
+/// Dispatches an inference step to the dedicated background thread, awaiting the token via oneshot channel.
+/// Keeps CPU/GPU inference work completely off Tokio worker threads.
+pub async fn sample_next_token_async(
+    state: &Arc<AppState>,
+    request_id: u64,
+    step: u64,
+    sampler: std::sync::Arc<dyn grim_core::sampler::Sampler>,
+    prompt_tokens: Option<Vec<u32>>,
+    vocab_size: usize,
+    model_id: Option<String>,
+) -> std::result::Result<u32, String> {
+    let tx = ensure_inference_thread_started(state.clone());
+    let (respond_to, rx) = tokio::sync::oneshot::channel();
+    let req = InferenceStepRequest {
+        request_id,
+        step,
+        sampler,
+        prompt_tokens,
+        vocab_size,
+        model_id,
+        respond_to,
+    };
+    if tx.send(req).is_err() {
+        return Err("inference worker channel closed".to_string());
+    }
+    rx.await.map_err(|_| "inference worker dropped response channel".to_string())?
+}
+
 /// Trim the first matched stop sequence from the end of `text`.
 /// Returns the trimmed text and whether a stop sequence was found and removed.
 fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
@@ -2124,25 +2203,20 @@ async fn stream_chat_completion(state: Arc<AppState>, parts: ChatRequestParts) -
                     });
                 }
 
-                let sampled = {
-                    let mut engine = match state.engine.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    sample_next_token(
-                        &mut engine,
-                        request_id,
-                        step,
-                        sampler.as_ref(),
-                        if step == 0 {
-                            Some(&prompt_tokens)
-                        } else {
-                            None
-                        },
-                        vocab_size,
-                        Some(req_model),
-                    )
-                };
+                let sampled = sample_next_token_async(
+                    &state,
+                    request_id,
+                    step,
+                    sampler.clone(),
+                    if step == 0 {
+                        Some(prompt_tokens.clone())
+                    } else {
+                        None
+                    },
+                    vocab_size,
+                    Some(req_model),
+                )
+                .await;
                 // WI-1: a generation failure ends the stream with a terminal OpenAI-shaped error
                 // event; the chained `[DONE]` sentinel still fires because the task does not unwind.
                 let token_id = match sampled {
@@ -2368,25 +2442,20 @@ async fn non_stream_chat_completion(state: Arc<AppState>, parts: ChatRequestPart
     let prompt_tokens = prompt_tokens.clone();
     // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
     for step in 0..max_tokens {
-        let sampled = {
-            let mut engine = match state.engine.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            sample_next_token(
-                &mut engine,
-                request_id,
-                step,
-                sampler.as_ref(),
-                if step == 0 {
-                    Some(&prompt_tokens)
-                } else {
-                    None
-                },
-                vocab_size,
-                Some(requested_model.to_string()),
-            )
-        };
+        let sampled = sample_next_token_async(
+            &state,
+            request_id,
+            step,
+            sampler.clone(),
+            if step == 0 {
+                Some(prompt_tokens.clone())
+            } else {
+                None
+            },
+            vocab_size,
+            Some(requested_model.to_string()),
+        )
+        .await;
         // WI-1: propagate a clean OpenAI-shaped 500 instead of panicking
         // inside the handler while holding the engine mutex.
         let token_id = match sampled {

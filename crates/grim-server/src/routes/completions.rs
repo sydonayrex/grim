@@ -1,6 +1,7 @@
 use crate::{
     AdmissionTicket, AppState, CompletionRequest, REQUEST_ID_COUNTER, REQUEST_SAMPLER_PARAMS,
-    SamplerParams, request_timeout_secs, sample_next_token, take_request_sampler_params,
+    SamplerParams, request_timeout_secs, sample_next_token_async,
+    take_request_sampler_params,
 };
 use axum::{
     Json,
@@ -109,25 +110,20 @@ pub(crate) async fn text_completions_route(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             for step in 0..max_tokens {
-                let sampled = {
-                    let mut engine = match state_clone.engine.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    sample_next_token(
-                        &mut engine,
-                        req_id,
-                        step as u64,
-                        sampler_clone.as_ref(),
-                        if step == 0 {
-                            Some(&prompt_tokens)
-                        } else {
-                            None
-                        },
-                        vocab_size,
-                        Some(model_clone.clone()),
-                    )
-                };
+                let sampled = sample_next_token_async(
+                    &state_clone,
+                    req_id,
+                    step as u64,
+                    sampler_clone.clone(),
+                    if step == 0 {
+                        Some(prompt_tokens.clone())
+                    } else {
+                        None
+                    },
+                    vocab_size,
+                    Some(model_clone.clone()),
+                )
+                .await;
                 match sampled {
                     Ok(token_id) => {
                         if Some(token_id) == eos_token_id {
@@ -211,25 +207,20 @@ pub(crate) async fn text_completions_route(
         let run_completion = async move {
             let mut gen_tokens = Vec::new();
             for step in 0..max_tokens {
-                let sampled = {
-                    let mut engine = match state_clone.engine.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    sample_next_token(
-                        &mut engine,
-                        req_id,
-                        step as u64,
-                        sampler_clone.as_ref(),
-                        if step == 0 {
-                            Some(&prompt_tokens_clone)
-                        } else {
-                            None
-                        },
-                        vocab_size,
-                        Some(model_name_clone.clone()),
-                    )
-                };
+                let sampled = sample_next_token_async(
+                    &state_clone,
+                    req_id,
+                    step as u64,
+                    sampler_clone.clone(),
+                    if step == 0 {
+                        Some(prompt_tokens_clone.clone())
+                    } else {
+                        None
+                    },
+                    vocab_size,
+                    Some(model_name_clone.clone()),
+                )
+                .await;
                 match sampled {
                     Ok(token_id) => {
                         if Some(token_id) == eos_token_id {
