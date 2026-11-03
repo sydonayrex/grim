@@ -1477,3 +1477,219 @@ fn graph_int4_kv_arena_is_half_of_int8() {
         "graph int4 arena must be half of int8 ({i4_b} vs {i8_b})"
     );
 }
+
+/// Phase 3 (plan) Step 1 REPRO: arena content must be byte-stable across
+/// eviction capacities for every row that no cap in the sweep can evict.
+///
+/// For `t < cap` the ring maps token `t` to arena row `t`; tokens `t >= cap`
+/// wrap into rows `sinks + (t - sinks) % (cap - sinks)`. With 64 steps the
+/// wrap therefore rewrites a KNOWN prefix of rows in every capped run
+/// (cap 46: rows 2..19; 47: 2..18; 48: 2..17; 49: 2..16). The only rows a
+/// fair cross-cap comparison may look at are rows 20..45 — tokens below the
+/// smallest cap that no wrap in the sweep can reach. Divergence THERE is
+/// corruption (allocator adjacency / ring-mapping defect); divergence in the
+/// wrapped prefix is eviction semantics working as specified.
+#[test]
+fn qwen35_kv_eviction_arena_rows_byte_stable_across_caps_46_to_49() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let sinks = 2usize;
+    let steps = 64usize;
+    let stride = c.num_kv_heads * c.head_dim;
+    let (safe_lo, safe_hi) = (20usize, 46usize); // above every wrap, below every cap
+
+    let run = |rows: Option<&str>| -> Vec<Vec<f32>> {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+            match rows {
+                Some(r) => std::env::set_var("GRIM_KV_ARENA_ROWS", r),
+                None => std::env::remove_var("GRIM_KV_ARENA_ROWS"),
+            }
+            std::env::set_var("GRIM_KV_SINKS", &sinks.to_string());
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..steps {
+            let x = w(30 + step, HIDDEN);
+            outs.push(
+                blk.forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read"),
+            );
+            cache.current_pos += 1;
+        }
+        assert!(!outs.is_empty());
+        let arena = cache
+            .k_device
+            .as_ref()
+            .expect("k arena")
+            .to_cpu_vec_f32()
+            .expect("d2h k arena");
+        unsafe {
+            std::env::remove_var("GRIM_KV_ARENA_ROWS");
+            std::env::remove_var("GRIM_KV_SINKS");
+        }
+        let live_rows = arena.len() / stride;
+        assert!(
+            live_rows >= safe_hi,
+            "arena grew only {live_rows} rows, need {safe_hi}"
+        );
+        (safe_lo..safe_hi)
+            .map(|r| arena[r * stride..(r + 1) * stride].to_vec())
+            .collect()
+    };
+
+    fn fnv(row: &[f32]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for v in row {
+            h ^= v.to_bits() as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    let reference = run(None);
+    let mut failures: Vec<String> = Vec::new();
+    for cap in [46usize, 47, 48, 49] {
+        let capped = run(Some(&cap.to_string()));
+        for r in 0..capped.len() {
+            let want = fnv(&reference[r]);
+            let got = fnv(&capped[r]);
+            if want != got {
+                let maxdiff = reference[r]
+                    .iter()
+                    .zip(capped[r].iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                failures.push(format!(
+                    "cap={cap} row={r}: FNV {want:#018x} vs {got:#018x} (max elem diff {maxdiff:.3e})"
+                ));
+            }
+        }
+        let before = failures.len();
+        let _ = before;
+        eprintln!("[kv-evict-repro] cap={cap}: {} diverging SAFE rows", failures.len());
+    }
+    assert!(
+        failures.is_empty(),
+        "arena SAFE rows (20..46) diverged across capacities — corruption, not eviction:\n{}",
+        failures.join("\n")
+    );
+    eprintln!("[kv-evict-repro] safe rows 20..46 byte-stable across caps 46/47/48/49");
+}
+
+/// Phase 3 (plan) Step 4 SWEEP, churn arm: 3x-cap run with FULL ring-spec
+/// verification. For every arena row `r`, the ring map is a deterministic
+/// function of (cap, sinks, steps); the last absolute token that maps to `r`
+/// is `last_writer(r)`. A capped arena under heavy churn must hold, BIT FOR
+/// BIT, the uncapped reference's `last_writer(r)` row in EVERY row — sinks,
+/// never-written tail, and the fully wrapped ring alike. This is the gate the
+/// "eager arena corrupts under eviction" hypothesis (plan Phase 3) actually
+/// needed: the earlier per-row FNV cross-cap comparison compared rows inside
+/// the wrap window, whose contents differ across caps BY SPECIFICATION.
+#[test]
+fn qwen35_kv_eviction_churn_3x_cap_matches_last_writer_spec() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let sinks = 2usize;
+    let stride = c.num_kv_heads * c.head_dim;
+
+    let run = |rows: Option<&str>, steps: usize| -> Vec<f32> {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+            match rows {
+                Some(r) => std::env::set_var("GRIM_KV_ARENA_ROWS", r),
+                None => std::env::remove_var("GRIM_KV_ARENA_ROWS"),
+            }
+            std::env::set_var("GRIM_KV_SINKS", &sinks.to_string());
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        for step in 0..steps {
+            let x = w(30 + step, HIDDEN);
+            let _ = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            cache.current_pos += 1;
+        }
+        let arena = cache
+            .k_device
+            .as_ref()
+            .expect("k arena")
+            .to_cpu_vec_f32()
+            .expect("d2h k arena");
+        unsafe {
+            std::env::remove_var("GRIM_KV_ARENA_ROWS");
+            std::env::remove_var("GRIM_KV_SINKS");
+        }
+        arena
+    };
+
+    for cap in [46usize, 47, 48, 49] {
+        let steps = 3 * cap; // full churn: every ring row wraps >= 2 times
+        let reference = run(None, steps);
+        let capped = run(Some(&cap.to_string()), steps);
+        let ref_rows = reference.len() / stride;
+        let cap_rows = capped.len() / stride;
+        assert_eq!(
+            cap_rows,
+            cap,
+            "cap={cap}: arena must be exactly {cap} rows under eviction, got {cap_rows}"
+        );
+        assert!(ref_rows >= steps, "reference arena truncated: {ref_rows} < {steps}");
+
+        // last_writer(r): largest t < steps with ring_row(t) == r, per the
+        // ONE host mapping (KvRingPolicy::row semantics inlined here; the
+        // host/device twin is pinned by kv_ring_row_host_matches_device).
+        let ring_row = |t: usize| -> usize {
+            if t < cap {
+                t
+            } else {
+                let span = cap - sinks;
+                sinks + (t - sinks) % span
+            }
+        };
+        let mut last_writer = vec![usize::MAX; cap];
+        for t in 0..steps {
+            last_writer[ring_row(t)] = t;
+        }
+
+        let mut checked = 0usize;
+        for r in 0..cap {
+            let t = last_writer[r];
+            assert_ne!(t, usize::MAX, "cap={cap} row {r}: never written (ring map hole)");
+            let got = &capped[r * stride..(r + 1) * stride];
+            let want = &reference[t * stride..(t + 1) * stride];
+            for e in 0..stride {
+                assert_eq!(
+                    got[e].to_bits(),
+                    want[e].to_bits(),
+                    "cap={cap} churn={steps}: row {r} holds {:?} of token {t}, elem {e} diverged",
+                    if r < sinks { "SINK" } else if t >= cap { "WRAPPED" } else { "direct" }
+                );
+            }
+            checked += 1;
+        }
+        eprintln!(
+            "[kv-evict-churn] cap={cap} steps={steps}: all {checked} rows bit-match the last-writer spec"
+        );
+    }
+}
