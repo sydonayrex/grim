@@ -2296,10 +2296,44 @@ impl QuantOps for RocmDevice {
                         self.ordinal,
                     )?
                 };
-                self.launch_mxfp4_backward_gemm(
+                let codes_ptr = b_storage
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("mxfp4 backward: b has no device ptr".into()))?;
+                let exps_ptr = exps_storage
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("mxfp4 backward: exps has no device ptr".into()))?;
+
+                self.launch_fused_dequant_backward_gemm_mxfp4(
                     dy_storage,
-                    b_storage,
-                    &exps_storage,
+                    codes_ptr,
+                    exps_ptr,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
+                let dummy_exps = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![(k * n).max(32) / 32]),
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                let fp8_ptr = b_storage
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("mxfp8 backward: b has no device ptr".into()))?;
+                let exps_ptr = dummy_exps
+                    .device_ptr
+                    .ok_or_else(|| Error::Backend("mxfp8 backward: exps has no device ptr".into()))?;
+
+                self.launch_fused_dequant_backward_gemm_mxfp8(
+                    dy_storage,
+                    fp8_ptr,
+                    exps_ptr,
                     &dx_storage,
                     m,
                     n,

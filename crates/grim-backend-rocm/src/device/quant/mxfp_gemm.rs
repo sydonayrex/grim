@@ -356,6 +356,7 @@ impl RocmDevice {
     }
 
     /// Launch the JIT compiled backward MXFP4 GEMM kernel (dA = dY @ B^T).
+    #[allow(dead_code)]
     pub(crate) fn launch_mxfp4_backward_gemm(
         &self,
         dy_storage: &RocmStorage,
@@ -570,6 +571,108 @@ impl RocmDevice {
             ],
             None,
             64 * std::mem::size_of::<f32>(),
+        )
+    }
+
+    /// Launch fused dequant backward GEMM for MXFP4: dA = dY @ B^T (Task 10.3).
+    /// `b_codes_ptr` and `b_exps_ptr` are raw device pointers to packed 4-bit codes and E8M0 exponents.
+    pub fn launch_fused_dequant_backward_gemm_mxfp4(
+        &self,
+        dy: &RocmStorage,
+        b_codes_ptr: u64,
+        b_exps_ptr: u64,
+        da: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k == 0 || k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_fused_dequant_backward_gemm_mxfp4: K must be a non-zero multiple of 32, got {k}"
+            )));
+        }
+        let dy_ptr = dy
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dy has no device ptr".into()))?;
+        let da_ptr = da
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: da has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new((m * k).div_ceil(256) as u32, 1, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bcodesptr = b_codes_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut daptr = da_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_backward_gemm_mxfp4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bcodesptr),
+                arg(&mut bexpsptr),
+                arg(&mut daptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch fused dequant backward GEMM for MXFP8: dA = dY @ B^T (Task 10.3).
+    /// `b_fp8_ptr` and `b_exps_ptr` are raw device pointers to FP8 E4M3 codes and E8M0 exponents.
+    pub fn launch_fused_dequant_backward_gemm_mxfp8(
+        &self,
+        dy: &RocmStorage,
+        b_fp8_ptr: u64,
+        b_exps_ptr: u64,
+        da: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k == 0 || k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_fused_dequant_backward_gemm_mxfp8: K must be a non-zero multiple of 32, got {k}"
+            )));
+        }
+        let dy_ptr = dy
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp8_backward_gemm: dy has no device ptr".into()))?;
+        let da_ptr = da
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp8_backward_gemm: da has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new((m * k).div_ceil(256) as u32, 1, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bfp8ptr = b_fp8_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut daptr = da_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_backward_gemm_mxfp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bfp8ptr),
+                arg(&mut bexpsptr),
+                arg(&mut daptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 }
