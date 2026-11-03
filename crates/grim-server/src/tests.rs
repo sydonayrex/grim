@@ -1,5 +1,7 @@
 use super::*;
 
+static GLOBAL_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::test]
 async fn test_bearer_auth_rejects_without_key_and_exempts_health() {
     let state = Arc::new(AppState {
@@ -2020,6 +2022,7 @@ async fn test_reasoning_effort_accepted_and_parsed() {
 /// RED before the fix: the streaming path drops the stop-triggering token's delta entirely while the.
 #[tokio::test]
 async fn test_stop_sequence_stream_matches_non_streaming_content() {
+    let _lock = GLOBAL_TEST_MUTEX.lock().unwrap();
     let state = test_app_state();
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -2835,4 +2838,143 @@ fn test_appstate_engine_is_mutex() {
         .engine
         .lock()
         .expect("engine mutex should not be poisoned");
+}
+
+#[tokio::test]
+async fn test_request_limits_context_length_and_queue_admission() {
+    let _lock = GLOBAL_TEST_MUTEX.lock().unwrap();
+    let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+    let mock_model = Box::new(grim_models_transformer::Llama::random(
+        grim_tensor::Device::Cpu,
+        grim_models_transformer::LlamaConfig {
+            vocab_size: 32000,
+            hidden_size: 512,
+            num_heads: 8,
+            num_kv_heads: 2,
+            head_dim: 64,
+            num_layers: 4,
+            intermediate_size: 1024,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 20,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+            ..Default::default()
+        },
+    ));
+    engine.register_model("default", mock_model);
+
+    let state = Arc::new(AppState {
+        engine: Mutex::new(engine),
+        tokenizer: Mutex::new(None),
+        model_path: None,
+        model_arch: std::sync::Mutex::new(None),
+        plugin_registry: None,
+    });
+    let app = crate::build_router(state.clone());
+
+    // (a) POST /v1/completions with prompt token count > model_context_length -> 400 with "code": "context_length_exceeded"
+    let long_prompt = "a".repeat(25);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "default",
+                        "prompt": long_prompt,
+                        "max_tokens": 10
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "context_length_exceeded");
+
+    // (a2) POST /v1/chat/completions with prompt token count > model_context_length -> 400 with "code": "context_length_exceeded"
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "default",
+                        "messages": [{"role": "user", "content": long_prompt}],
+                        "max_tokens": 10
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "context_length_exceeded");
+
+    // (b) POST with max_tokens: 999_999 -> clamped to model_context_length - prompt_len
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "default",
+                        "prompt": "hello",
+                        "max_tokens": 999_999,
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Context length is 20, prompt "hello" is 5 bytes -> clamped max_tokens is 15 (runs 15 tokens fast)
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["usage"]["completion_tokens"], 15);
+
+    // (c) admission queue cap GRIM_MAX_QUEUE -> 503 Service Unavailable with Retry-After: 1
+    // Set MAX_QUEUE_OVERRIDE to 1 so saturation only requires 1 request / ticket, then saturate.
+    crate::MAX_QUEUE_OVERRIDE.store(1, Ordering::SeqCst);
+    let ticket = crate::AdmissionTicket::try_acquire().expect("acquire 1 should succeed");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "default",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("1"));
+    drop(ticket);
+    crate::MAX_QUEUE_OVERRIDE.store(0, Ordering::SeqCst);
 }

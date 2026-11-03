@@ -105,6 +105,7 @@ pub struct RequestCleanupGuard {
     dropped: bool,
     request_id: u64,
     state: Arc<AppState>,
+    _ticket: Option<AdmissionTicket>,
 }
 
 impl RequestCleanupGuard {
@@ -114,6 +115,17 @@ impl RequestCleanupGuard {
             dropped: false,
             request_id,
             state,
+            _ticket: None,
+        }
+    }
+
+    pub fn with_ticket(state: Arc<AppState>, request_id: u64, ticket: AdmissionTicket) -> Self {
+        LIVE_CLEANUP_GUARDS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            dropped: false,
+            request_id,
+            state,
+            _ticket: Some(ticket),
         }
     }
 }
@@ -152,6 +164,68 @@ impl Drop for RequestCleanupGuard {
 /// used by tests to assert exactly-once cleanup.
 pub static LIVE_CLEANUP_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
+/// Active/queued request counter for admission control.
+pub static ADMISSION_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-instance override for admission queue cap, primarily for tests.
+pub static MAX_QUEUE_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the maximum admitted queue length from `GRIM_MAX_QUEUE` (default: 64).
+pub fn max_queue_limit() -> usize {
+    let ov = MAX_QUEUE_OVERRIDE.load(Ordering::Relaxed);
+    if ov > 0 {
+        return ov;
+    }
+    std::env::var("GRIM_MAX_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+}
+
+/// Get non-streaming request timeout in seconds from `GRIM_REQUEST_TIMEOUT_SECS` (default: 300).
+pub fn request_timeout_secs() -> u64 {
+    std::env::var("GRIM_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+/// RAII admission ticket: decrements ADMISSION_COUNTER on drop.
+pub struct AdmissionTicket;
+
+impl AdmissionTicket {
+    pub fn try_acquire() -> std::result::Result<Self, Response> {
+        let max_q = max_queue_limit();
+        let current = ADMISSION_COUNTER.fetch_add(1, Ordering::SeqCst);
+        if current >= max_q {
+            ADMISSION_COUNTER.fetch_sub(1, Ordering::SeqCst);
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Server queue is full (max: {max_q} in-flight/queued requests)"),
+                        "type": "service_unavailable",
+                        "code": "queue_full"
+                    }
+                })),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            return Err(resp);
+        }
+        Ok(AdmissionTicket)
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        ADMISSION_COUNTER.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Shared engine state for the HTTP server.
 /// `tokenizer` is populated from the active model's GGUF metadata when `serve()` is called with a.
 pub struct AppState {
@@ -174,6 +248,30 @@ impl AppState {
     }
     pub fn lock_tokenizer(&self) -> std::sync::MutexGuard<'_, Option<grim_format::GgufTokenizer>> {
         self.tokenizer.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub fn get_context_limit(&self) -> usize {
+        let engine = self.lock_engine();
+        let ctx = engine
+            .loaded_models()
+            .iter()
+            .filter_map(|name| engine.model(name))
+            .next()
+            .map(|m| {
+                let cl = m.config.context_length();
+                if cl > 0 {
+                    cl
+                } else if let Some(ref hp) = m.arch_hyperparams {
+                    hp.max_seq_len as u64
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        if ctx > 0 {
+            ctx as usize
+        } else {
+            8192
+        }
     }
 }
 
@@ -978,6 +1076,11 @@ async fn chat_completions(
         .unwrap_or("default")
         .to_string();
 
+    let ticket = match AdmissionTicket::try_acquire() {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
     if let Some(resp) = ensure_model_available(&state, &requested_model) {
         return resp;
     }
@@ -1028,7 +1131,7 @@ async fn chat_completions(
         stream_requested,
         thinking_level: sampling.thinking_level,
         sampler: sampling.sampler,
-        max_tokens: sampling.max_tokens,
+        max_tokens: prompt.clamped_max_tokens,
         stop_sequences: sampling.stop_sequences,
         messages,
         tools_active,
@@ -1036,12 +1139,32 @@ async fn chat_completions(
         prompt_tokens: prompt.tokens,
         vocab_size: prompt.vocab_size,
         eos_token_id: prompt.eos_token_id,
+        ticket,
     };
 
     if parts.stream_requested {
         stream_chat_completion(state, parts).await
     } else {
-        non_stream_chat_completion(state, parts).await
+        let timeout_secs = request_timeout_secs();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            non_stream_chat_completion(state, parts),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Request timed out after {timeout_secs} seconds"),
+                        "type": "timeout",
+                        "code": "request_timeout"
+                    }
+                })),
+            )
+                .into_response(),
+        }
     }
 }
 
@@ -1063,6 +1186,7 @@ struct ChatRequestParts {
     prompt_tokens: Vec<u32>,
     vocab_size: usize,
     eos_token_id: Option<u32>,
+    ticket: AdmissionTicket,
 }
 
 /// Sampling/length controls resolved from the request body.
@@ -1076,6 +1200,7 @@ struct ChatSampling {
 /// Prompt rendered from the messages and validated against the model context window.
 struct ChatPrompt {
     tokens: Vec<u32>,
+    clamped_max_tokens: u64,
     vocab_size: usize,
     eos_token_id: Option<u32>,
     template_family: Option<String>,
@@ -1642,11 +1767,12 @@ fn render_chat_prompt(
     };
     let prompt_tokens: Vec<u32> = {
         let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
-        let tokens = tok
-            .as_ref()
-            .map(|t| t.encode(&prompt_text))
-            .unwrap_or_default();
-        if tokens.is_empty() { vec![1] } else { tokens }
+        if let Some(ref t) = *tok {
+            let tokens = t.encode(&prompt_text);
+            if tokens.is_empty() { vec![1] } else { tokens }
+        } else {
+            prompt_text.bytes().map(|b| b as u32).collect()
+        }
     };
     if std::env::var("GRIM_DEBUG_PROMPT").as_deref() == Ok("1") {
         eprintln!(
@@ -1701,7 +1827,15 @@ fn render_chat_prompt(
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|t| t.tokens.len())
-        .unwrap_or(65536);
+        .unwrap_or_else(|| {
+            let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+            engine
+                .loaded_models()
+                .iter()
+                .filter_map(|name| engine.model(name))
+                .find_map(|m| m.arch_hyperparams.as_ref().map(|hp| hp.vocab_size))
+                .unwrap_or(32000)
+        });
 
     // EOS token ID for early termination. When the model emits this token,
     // generation stops immediately (the EOS token is not included in the returned content).
@@ -1714,34 +1848,18 @@ fn render_chat_prompt(
 
     // Enforce the model's context window: reject requests whose total token count (prompt + max_tokens) exceeds the model's reported context_length.
     // Models that don't report context_length (return 0) fall back to a best-effort warning for obviously.
-    let model_context_length = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine
-            .loaded_models()
-            .iter()
-            .filter_map(|name| engine.model(name))
-            .next()
-            .map(|m| m.config.context_length())
-            .unwrap_or(0)
-    };
-    let context_limit = if model_context_length > 0 {
-        model_context_length as usize
-    } else {
-        8192
-    };
-    let total_requested = prompt_tokens.len().saturating_add(max_tokens as usize);
-    if total_requested > context_limit {
+    let context_limit = state.get_context_limit();
+
+    // If prompt tokens exceed context limit, reject immediately
+    if prompt_tokens.len() > context_limit {
         return Err((
             StatusCode::BAD_REQUEST,
             Json({
                 let mut body = request_error(
                     ErrorCode::InvalidRequest,
                     format!(
-                        "prompt ({} tokens) + max_tokens ({}) = {} tokens exceeds \
-                         model context limit ({} tokens)",
+                        "prompt ({} tokens) exceeds model context limit ({} tokens)",
                         prompt_tokens.len(),
-                        max_tokens,
-                        total_requested,
                         context_limit,
                     ),
                 );
@@ -1749,24 +1867,32 @@ fn render_chat_prompt(
                 body["error"]["context_length"] = serde_json::json!(context_limit);
                 body["error"]["prompt_tokens"] = serde_json::json!(prompt_tokens.len());
                 body["error"]["max_tokens"] = serde_json::json!(max_tokens);
-                body["error"]["total_requested"] = serde_json::json!(total_requested);
+                body["error"]["total_requested"] = serde_json::json!(prompt_tokens.len());
                 body
             }),
         )
             .into_response());
-    } else if total_requested > 1_000_000 {
+    }
+
+    // Clamp max_tokens to remaining context window
+    let remaining = context_limit.saturating_sub(prompt_tokens.len());
+    let clamped_max_tokens = max_tokens.min(remaining as u64);
+
+    let total_requested = prompt_tokens.len().saturating_add(clamped_max_tokens as usize);
+    if total_requested > 1_000_000 {
         eprintln!(
             "[Server] WARNING: prompt ({} tokens) + max_tokens ({}) = {} tokens \
-             exceeds 1M. Model context_length = {} (enforcement skipped if 0).",
+             exceeds 1M. Model context_limit = {}.",
             prompt_tokens.len(),
-            max_tokens,
+            clamped_max_tokens,
             total_requested,
-            model_context_length
+            context_limit
         );
     }
 
     Ok(ChatPrompt {
         tokens: prompt_tokens,
+        clamped_max_tokens,
         vocab_size,
         eos_token_id,
         template_family,
@@ -1792,6 +1918,7 @@ async fn stream_chat_completion(state: Arc<AppState>, parts: ChatRequestParts) -
         prompt_tokens,
         vocab_size,
         eos_token_id,
+        ticket,
     } = parts;
     let state_clone = state.clone();
     let adapter_ids: Vec<u32> = {
@@ -1831,7 +1958,7 @@ async fn stream_chat_completion(state: Arc<AppState>, parts: ChatRequestParts) -
 
     // WI-CANCEL-2: RAII guard that calls finish_request on drop - fires on every exit path
     // (max_tokens, stop-sequence, explicit cancel, client disconnect) since it's threaded through the unfold state tuple.
-    let cleanup_guard = RequestCleanupGuard::new(state.clone(), session_request_id);
+    let cleanup_guard = RequestCleanupGuard::with_ticket(state.clone(), session_request_id, ticket);
 
     let stream = futures::stream::unfold(
         (
@@ -2128,6 +2255,7 @@ async fn non_stream_chat_completion(state: Arc<AppState>, parts: ChatRequestPart
         prompt_tokens,
         vocab_size,
         eos_token_id,
+        ticket: _ticket,
     } = parts;
     let mut content = String::new();
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);

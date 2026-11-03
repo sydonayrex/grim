@@ -113,6 +113,8 @@ LRU — never a correctness difference.
 | `GRIM_HOST` | String | `127.0.0.1` | `grim-server`, `grim-cli` | Network IP address to bind HTTP API server. |
 | `GRIM_PORT` | Number | `11434` | `grim-server`, `grim-cli` | TCP port number for HTTP server. |
 | `GRIM_ALLOW_PUBLIC_METRICS` | Flag (`1`/`true`) | Unset | `grim-server` | Explicit opt-in required to expose Prometheus `/metrics` on public IP interfaces. |
+| `GRIM_MAX_QUEUE` | Number | `64` | `grim-server` | Maximum concurrent requests before HTTP 429 admission shed. |
+| `GRIM_REQUEST_TIMEOUT_SECS` | Number | `300` | `grim-server` | Maximum request duration in seconds before HTTP 504 timeout. |
 | `GRIM_TP_SIZE` | Number | `0` | `grim-core`, `grim-engine` | Tensor-parallel world size across identical GPUs. |
 | `GRIM_TP_RANK` | Number | `0` | `grim-core`, `grim-engine` | Tensor-parallel rank for distributed rank execution. |
 

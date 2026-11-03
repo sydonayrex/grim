@@ -153,6 +153,8 @@ Build-time discovery (`ROCM_PATH`, `HIP_PATH`) is honored by BOTH `grim-backend-
 | `GRIM_COMPRESS_PROMPT` | `== "1"` enables extractive prompt compression | off | grim-server |
 | `GRIM_CONFIG_PATH` | config-file path for model defaults and TLS | `grim.toml` search | grim-server |
 | `GRIM_DEBUG_PROMPT` | `== "1"` logs prompt tokens and text to stderr | off | grim-server |
+| `GRIM_MAX_QUEUE` | integer max active requests before HTTP 429 admission shed | `64` | grim-server |
+| `GRIM_REQUEST_TIMEOUT_SECS` | integer seconds before HTTP 504 deadline abort | `300` | grim-server |
 | `GRIM_SAMPLE_SEED` | integer base seed | `0x9E3779B97F4A7C15` | grim-server |
 | `GRIM_SAMPLE_TEMPERATURE` | float | `0.7` | grim-server |
 | `GRIM_SAMPLE_TOP_K` | integer | `0` | grim-server |

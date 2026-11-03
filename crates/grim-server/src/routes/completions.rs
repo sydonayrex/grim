@@ -1,6 +1,6 @@
 use crate::{
-    AppState, CompletionRequest, REQUEST_ID_COUNTER, REQUEST_SAMPLER_PARAMS, SamplerParams,
-    sample_next_token, take_request_sampler_params,
+    AdmissionTicket, AppState, CompletionRequest, REQUEST_ID_COUNTER, REQUEST_SAMPLER_PARAMS,
+    SamplerParams, request_timeout_secs, sample_next_token, take_request_sampler_params,
 };
 use axum::{
     Json,
@@ -16,6 +16,11 @@ pub(crate) async fn text_completions_route(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CompletionRequest>,
 ) -> Response {
+    let _ticket = match AdmissionTicket::try_acquire() {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
     let raw_prompt = if let Some(s) = payload.prompt.as_str() {
         s.to_string()
     } else if let Some(arr) = payload.prompt.as_array() {
@@ -36,7 +41,31 @@ pub(crate) async fn text_completions_route(
         }
     };
 
-    let max_tokens = payload.max_tokens.unwrap_or(16);
+    let context_limit = state.get_context_limit();
+    if prompt_tokens.len() > context_limit {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "prompt ({} tokens) exceeds model context limit ({} tokens)",
+                        prompt_tokens.len(),
+                        context_limit
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "context_length": context_limit,
+                    "prompt_tokens": prompt_tokens.len(),
+                    "total_requested": prompt_tokens.len()
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let remaining = context_limit.saturating_sub(prompt_tokens.len());
+    let requested_max_tokens = payload.max_tokens.unwrap_or(16);
+    let max_tokens = (requested_max_tokens as usize).min(remaining);
     let stream_requested = payload.stream.unwrap_or(false);
     let model_name = payload
         .model
@@ -173,88 +202,119 @@ pub(crate) async fn text_completions_route(
             .body(Body::from_stream(stream))
             .unwrap()
     } else {
-        let mut gen_tokens = Vec::new();
-        for step in 0..max_tokens {
-            let sampled = {
+        let timeout_secs = request_timeout_secs();
+        let state_clone = state.clone();
+        let prompt_tokens_clone = prompt_tokens.clone();
+        let model_name_clone = model_name.clone();
+        let sampler_clone = sampler.clone();
+
+        let run_completion = async move {
+            let mut gen_tokens = Vec::new();
+            for step in 0..max_tokens {
+                let sampled = {
+                    let mut engine = match state_clone.engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    sample_next_token(
+                        &mut engine,
+                        req_id,
+                        step as u64,
+                        sampler_clone.as_ref(),
+                        if step == 0 {
+                            Some(&prompt_tokens_clone)
+                        } else {
+                            None
+                        },
+                        vocab_size,
+                        Some(model_name_clone.clone()),
+                    )
+                };
+                match sampled {
+                    Ok(token_id) => {
+                        if Some(token_id) == eos_token_id {
+                            break;
+                        }
+                        gen_tokens.push(token_id);
+                    }
+                    Err(e) => {
+                        let mut engine = match state_clone.engine.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        engine.finish_request(req_id);
+                        take_request_sampler_params(req_id);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": { "message": e, "type": "server_error" }
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            let mut engine = match state_clone.engine.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            engine.finish_request(req_id);
+            take_request_sampler_params(req_id);
+            drop(engine);
+
+            let gen_text = {
+                let tok_guard = state_clone.lock_tokenizer();
+                if let Some(ref tok) = *tok_guard {
+                    tok.decode(&gen_tokens)
+                } else {
+                    gen_tokens
+                        .iter()
+                        .map(|t| format!("{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            };
+            let res = serde_json::json!({
+                "id": format!("cmpl-{req_id}"),
+                "object": "text_completion",
+                "created": 1700000000,
+                "model": model_name_clone,
+                "choices": [{
+                    "text": gen_text,
+                    "index": 0,
+                    "logprobs": null,
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens_clone.len(),
+                    "completion_tokens": gen_tokens.len(),
+                    "total_tokens": prompt_tokens_clone.len() + gen_tokens.len()
+                }
+            });
+            (StatusCode::OK, Json(res)).into_response()
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_completion).await {
+            Ok(resp) => resp,
+            Err(_) => {
                 let mut engine = match state.engine.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                sample_next_token(
-                    &mut engine,
-                    req_id,
-                    step as u64,
-                    sampler.as_ref(),
-                    if step == 0 {
-                        Some(&prompt_tokens)
-                    } else {
-                        None
-                    },
-                    vocab_size,
-                    Some(model_name.clone()),
+                engine.finish_request(req_id);
+                take_request_sampler_params(req_id);
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": format!("Request timed out after {timeout_secs} seconds"),
+                            "type": "timeout",
+                            "code": "request_timeout"
+                        }
+                    })),
                 )
-            };
-            match sampled {
-                Ok(token_id) => {
-                    if Some(token_id) == eos_token_id {
-                        break;
-                    }
-                    gen_tokens.push(token_id);
-                }
-                Err(e) => {
-                    let mut engine = match state.engine.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    engine.finish_request(req_id);
-                    take_request_sampler_params(req_id);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": { "message": e, "type": "server_error" }
-                        })),
-                    )
-                        .into_response();
-                }
+                    .into_response()
             }
         }
-        let mut engine = match state.engine.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        engine.finish_request(req_id);
-        take_request_sampler_params(req_id);
-        drop(engine);
-
-        let gen_text = {
-            let tok_guard = state.lock_tokenizer();
-            if let Some(ref tok) = *tok_guard {
-                tok.decode(&gen_tokens)
-            } else {
-                gen_tokens
-                    .iter()
-                    .map(|t| format!("{t}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
-        };
-        let res = serde_json::json!({
-            "id": format!("cmpl-{req_id}"),
-            "object": "text_completion",
-            "created": 1700000000,
-            "model": model_name,
-            "choices": [{
-                "text": gen_text,
-                "index": 0,
-                "logprobs": null,
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens.len(),
-                "completion_tokens": gen_tokens.len(),
-                "total_tokens": prompt_tokens.len() + gen_tokens.len()
-            }
-        });
-        (StatusCode::OK, Json(res)).into_response()
     }
 }
