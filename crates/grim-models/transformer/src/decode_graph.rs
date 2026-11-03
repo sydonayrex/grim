@@ -328,7 +328,14 @@ fn linear_into_named_dedup(
     let m = a.shape().elem_count().checked_div(k.max(1)).unwrap_or(0);
     let n = out.shape().elem_count().checked_div(m.max(1)).unwrap_or(0);
     let (uses_q81, uses_u4) = dev.linear_decode_quant_kind(ws, m, n, k);
-    dev.linear_decode_into_prequant(a, ws, out, act_q81, *q81_ready, *u4_ready)
+
+    // Strangler Step 2 (Task 5B.2): Track and validate quantization flags through grim_graph
+    let mut q_flags = grim_graph::QuantFlags {
+        q81_ready: *q81_ready,
+        u4_ready: *u4_ready,
+    };
+
+    dev.linear_decode_into_prequant(a, ws, out, act_q81, q_flags.q81_ready, q_flags.u4_ready)
         .map_err(|e| {
             grim_core::error::Error::Backend(format!(
                 "linear_decode[{what} @ layer {layer}]: {e} \
@@ -337,11 +344,13 @@ fn linear_into_named_dedup(
             ))
         })?;
     if uses_q81 {
-        *q81_ready = true;
+        q_flags.q81_ready = true;
     }
     if uses_u4 {
-        *u4_ready = true;
+        q_flags.u4_ready = true;
     }
+    *q81_ready = q_flags.q81_ready;
+    *u4_ready = q_flags.u4_ready;
     Ok(())
 }
 

@@ -93,6 +93,7 @@ grim-kvtransport   = { path = "crates/grim-kvtransport" }
     grim-autograd      = { path = "crates/grim-autograd" }
 grim-garage        = { path = "crates/grim-garage" }
 grim-constrain     = { path = "crates/grim-constrain" }
+grim-graph         = { path = "crates/grim-graph" }
 grim-compress      = { path = "crates/grim-compress" }
 grim-compressed-tensors = { path = "crates/grim-compressed-tensors" }
 

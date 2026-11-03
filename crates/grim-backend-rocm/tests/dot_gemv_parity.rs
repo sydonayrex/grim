@@ -690,6 +690,81 @@ fn dot4_q6k_gemv_parity() {
     }
 }
 
+/// Task 2.4: Q6_K LM head GEMV parity test vs CPU dequant oracle.
+/// Verifies `q6k_head_parity` at realistic head shape (k=512, n=512).
+#[test]
+fn q6k_head_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+
+    let m = 1usize;
+    let n = 512usize;
+    let k = 512usize;
+
+    let mut seed = 0x9070_5120u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q6k(&b_f32).expect("quant_q6k");
+
+    let q6k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q6K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_bytes, &Shape::new(vec![b_bytes.len()]), q6k_dtype)
+        .expect("upload q6k head weights");
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q6K,
+            &out_shape,
+        )
+        .expect("quantized_matmul q6k head");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    assert_eq!(c_dev.len(), m * n);
+
+    // Compute CPU oracle: dequantize Q6_K weights then matmul
+    let mut c_cpu = vec![0.0f32; m * n];
+    let row_bytes = (k / 256) * 210;
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q6k(brow, k).expect("cpu dequant_q6k");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+
+    let scale = c_cpu.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+    let mut worst_rel = 0.0f32;
+    for i in 0..c_cpu.len() {
+        let rel = (c_dev[i] - c_cpu[i]).abs() / scale;
+        if rel > worst_rel {
+            worst_rel = rel;
+        }
+    }
+    eprintln!("[q6k-head-parity] worst relative error vs host oracle: {worst_rel:.6e} (scale: {scale:.3})");
+    assert!(
+        worst_rel <= 5e-3,
+        "q6k head diverges from oracle: worst_rel={worst_rel} > 5e-3"
+    );
+}
+
 /// SPEED-DOT-FUSED (Phase 4c): `launch_fused_gate_up_dot4` matches CPU reference.
 #[test]
 fn fused_gate_up_gemv_parity() {

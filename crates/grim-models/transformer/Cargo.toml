@@ -15,6 +15,7 @@ grim-backend-rocm = { workspace = true }
 grim-models-vision = { workspace = true }
 grim-quant = { workspace = true }
 grim-memory = { workspace = true }
+grim-graph = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
