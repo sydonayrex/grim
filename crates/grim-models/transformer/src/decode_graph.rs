@@ -3665,6 +3665,13 @@ impl Qwen35Block {
                 )?;
 
                 // 8. FFN sublayer
+                let ffn_norm_spec = grim_graph::NormSpec {
+                    weight: Some(&ffn_w),
+                    eps: self.post_attention_norm.eps,
+                };
+                let mut norm_emitter = DevNormEmitter(dev);
+                let _ = grim_graph::emit_norm(&mut norm_emitter, &ffn_norm_spec, batch, self.hidden_size)?;
+
                 dev.rms_norm_into(
                     &buffers.layer_output[layer_idx],
                     &**ffn_w.storage(),
@@ -3691,8 +3698,12 @@ impl Qwen35Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup silu: {e}")))?;
             } else {
-                let mut q81_ready = false;
-                let mut u4_ready = false;
+                let mut q_flags = grim_graph::QuantFlags {
+                    q81_ready: false,
+                    u4_ready: false,
+                };
+                let mut linear_emitter = DevLinearEmitter(dev);
+                grim_graph::emit_linear_dedup(&mut linear_emitter, "ffn.gate", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed_ffn,
@@ -3701,9 +3712,10 @@ impl Qwen35Block {
                     act,
                     "ffn.gate",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    &mut q_flags.q81_ready,
+                    &mut q_flags.u4_ready,
                 )?;
+                grim_graph::emit_linear_dedup(&mut linear_emitter, "ffn.up", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed_ffn,
@@ -3712,8 +3724,8 @@ impl Qwen35Block {
                     act,
                     "ffn.up",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    &mut q_flags.q81_ready,
+                    &mut q_flags.u4_ready,
                 )?;
 
                 dev.silu_mul_into(
