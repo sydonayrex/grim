@@ -1412,6 +1412,11 @@ pub async fn cmd_run(
             // INT4: 0.5 bytes/elem + scale sidecars = 8,448 bytes/row
             let _int4_row_bytes = (elems_per_token_row / 2) + (attn_layers_per_card * 4 * 4 * 2);
 
+            // Task 2.3 ON-FAILURE (2026-11-03): int8's decode-graph replay
+            // serves garbage at real 27B geometry, so the promotion ladder
+            // stays f16-first; int8 is reachable only via an explicit
+            // GRIM_KV_ARENA / GRIM_KV_DTYPE and the capture layer refuses it
+            // into the correct eager path.
             let chosen_format =
                 if (total_budget_needed as u64) * f16_row_bytes <= min_headroom_bytes {
                     "f16"

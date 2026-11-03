@@ -4280,12 +4280,24 @@ impl DecodeGraphModel for Qwen35 {
         // Refuse capture for any arena whose DEVICE-TOTAL kernel pair does not
         // exist. Asked of the resolved FORMAT, not of an env spelling list.
         //
-        // int8 IS allowed: `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8`
-        // are the captured pair, and they are gated by
-        // `graph_i8_append_and_attend_match_eager_f32` in
-        // grim-backend-rocm/tests/qkv_attention.rs. That test is what caught the
-        // launcher's argument-order defect (it wrote attention output into the
-        // scale sidecar and faulted) before capture was enabled.
+        // Task 2.3 ON-FAILURE (2026-11-03): the int8 kernel PAIR is gated
+        // green at the tiny-cfg geometry, but the seeded int8 REPLAY serves
+        // garbage/early-EOS at real 27B geometry (GRIM_CONTEXT>=4096,
+        // hd=256/nkv=4: greedy output flips to "<|im_end|>" while the same
+        // int8 EAGER path answers correctly). Until that is root-caused,
+        // refuse int8 capture so an explicit int8 opt-in gets the CORRECT
+        // eager path (loud notice) instead of a silently corrupt replay.
+        // `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8` remain
+        // gated by graph_i8_append_and_attend_match_eager_f32 for the day the
+        // geometry defect lands.
+        if crate::qwen35::kv_arena_format_qwen(&self.device)
+            == grim_backend_rocm::KvArenaFormat::Int8
+        {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: int8 KV replay is disabled (serves garbage at 27B geometry;                  eager int8 is correct) — falling back to eager"
+                    .into(),
+            ));
+        }
         refuse_uncapturable_kv_arena(&self.device)?;
         // A per-layer KV budget table (`GRIM_KV_ARENA_ROWS=4096,2048,...`) cannot
         // be honored by the graph, which captures ONE ring for every layer:

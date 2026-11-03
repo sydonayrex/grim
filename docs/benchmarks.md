@@ -1379,3 +1379,39 @@ byte-identity. RED (pre-existing at baseline d780bd54, recorded): the SYNTHETIC
 appends land in row 0. Production eager KV maps rows on the HOST (bit-exact under the
 Phase-3 churn gates), so blast radius is this test only; the device-mapped
 `launch_kv_append` direct path is a Phase 7 item 8g deletion candidate.
+
+## 11. Task 2.3 — paged/quantized KV default (2026-11-03): Step 1 CLOSED ON-FAILURE
+
+Census (Step 0, commit 7fb3d9ec): the EAGER attention path defaults to **WhiteCrow paged
+quantized** (qwen35.rs:5424 `_ => Some(WhiteCow)` — typo'd above; the code says WhiteCrow);
+the decode GRAPH path routes WhiteCrow device kernels
+(`grim_kv_append_whitecrow` + `qkv_attention_dev_whitecrow_split/merge`); the dense-arena
+resolver's default was f16. `GRIM_KV_DTYPE` did not exist before this task.
+
+Step 1 first landed int8 as the default (resolver + CLI promotion ladder). Step 2 A/B on the
+27B two-card harness (`GRIM_TEST_ARENA=int8` vs `=f16`, 32/32, ctx 1024, teacher-forced
+512-token gate):
+- int8: mean NLL **9.549155** (PPL 14032.83), wall 82.8-83.0 ms
+- f16:  mean NLL **9.579963** (PPL 14471.89), wall 85.1-85.5 ms
+- |dNLL| = 0.031 <= 0.05 gate PASS (int8 slightly BETTER); int8 ~2.3 ms/step faster;
+  8x grim_kv_append_i8 engaged, 0 whitecrow. VRAM identical at ctx 1024 (delta < GiB
+  granularity); at ctx 8192 the CLI capacity probe doubled max-fit
+  (435,856 -> 857,163 tokens).
+
+BUT the full-pipeline check caught a real defect: **the int8 DECODE-GRAPH replay serves
+garbage/early-EOS at real 27B geometry** (GRIM_CONTEXT >= 4096, hd=256/nkv=4: greedy output
+collapses to "<|im_end|>", incoherent continuation), while (a) the same int8 EAGER path
+answers correctly at every geometry tested and (b) the tiny-cfg
+`graph_i8_append_and_attend_match_eager_f32` gate stays green — so the defect is
+geometry- or seeding-dependent, exactly the "width literal correct for the sibling model"
+class. Per the plan's ON-FAILURE clause:
+- f16 is KEPT as the default (resolver + CLI promotion ladder reverted);
+- int8 is opt-in via `GRIM_KV_DTYPE=int8` / `GRIM_KV_ARENA=int8`;
+- the capture layer REFUSES int8 (decode_graph.rs get_or_create_decode_graph) so opt-ins
+  get the correct eager path loudly instead of a silently corrupt replay;
+- known-red tests unchanged: qwen35_perf::phase0_cpu_parity_baseline and
+  qwen35_attention_device_path_engages_and_matches_host both fail at committed HEAD with
+  the pre-existing CPU "k page append: expected [268], got [67]" defect (unrelated to KV
+  format; both verified failing without this task's changes).
+OPEN: root-cause the int8 seeded-replay geometry defect (dumps: GRIM_KV_SEEDCHECK_ROW_HASH
+protocol), then re-land int8 default.

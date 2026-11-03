@@ -4948,6 +4948,7 @@ pub(crate) fn kv_eviction_policy(device: &Device) -> KvEvictionPolicy {
 pub(crate) fn resolve_kv_arena_format_qwen(
     arena: Option<&str>,
     f16_kv: Option<&str>,
+    kv_dtype: Option<&str>,
 ) -> grim_backend_rocm::KvArenaFormat {
     use grim_backend_rocm::KvArenaFormat as F;
     match arena {
@@ -4955,21 +4956,30 @@ pub(crate) fn resolve_kv_arena_format_qwen(
             Some(f) => f,
             None => {
                 eprintln!(
-                    "[qwen35] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using f16 default"
+                    "[qwen35] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using the f16 default"
                 );
                 F::F16
             }
         },
         None => {
-            // The model's default is f16, so the flag is read in the
-            // DISABLED sense: only an explicit off spelling opts out. (The
-            // backend's f32 default reads the same flag in the ENABLED
-            // sense; `f16_kv_explicitly_disabled` is the complement of
-            // `parse_f16_kv_env`, pinned by the backend's own test.)
-            if grim_backend_rocm::f16_kv_explicitly_disabled(f16_kv) {
-                F::F32
-            } else {
-                F::F16
+            // Task 2.3 Step 1, ON-FAILURE posture (2026-11-03): int8 measured
+            // BETTER than f16 on the 27B teacher-forced gate (dNLL -0.031
+            // nats, wall 82.8 vs 85.1 ms) and its EAGER path is correct at
+            // every geometry — but the int8 DECODE-GRAPH replay serves
+            // garbage/early-EOS at real 27B geometry (the tiny-cfg
+            // graph_i8_append_and_attend gate stays green, so the defect is
+            // geometry- or seeding-dependent). Per the plan: f16 stays the
+            // DEFAULT; int8 is opt-in via `GRIM_KV_DTYPE=int8` (or
+            // `GRIM_KV_ARENA=int8`), and the capture layer refuses int8 so
+            // opt-ins get the correct eager path loudly (see
+            // get_or_create_decode_graph). An explicit off spelling of
+            // `GRIM_F16_KV` still drops to f32 (DISABLED sense, complement
+            // of `parse_f16_kv_env`).
+            match kv_dtype {
+                Some(v) if v.eq_ignore_ascii_case("int8") || v.eq_ignore_ascii_case("i8") => F::Int8,
+                Some(v) if v.eq_ignore_ascii_case("f32") => F::F32,
+                _ if grim_backend_rocm::f16_kv_explicitly_disabled(f16_kv) => F::F32,
+                _ => F::F16,
             }
         }
     }
@@ -4982,6 +4992,7 @@ pub(crate) fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvAren
     resolve_kv_arena_format_qwen(
         std::env::var("GRIM_KV_ARENA").ok().as_deref(),
         std::env::var("GRIM_F16_KV").ok().as_deref(),
+        std::env::var("GRIM_KV_DTYPE").ok().as_deref(),
     )
 }
 
@@ -6368,7 +6379,7 @@ mod tests {
             ("q4", F::Int4),
         ] {
             assert_eq!(
-                resolve_kv_arena_format_qwen(Some(s), None),
+                resolve_kv_arena_format_qwen(Some(s), None, None),
                 want,
                 "model resolver GRIM_KV_ARENA={s}"
             );
@@ -6388,27 +6399,42 @@ mod tests {
     fn qwen35_arena_format_default_and_f16_flag() {
         use grim_backend_rocm::KvArenaFormat as F;
         // Unset arena -> the Qwen35 f16 default.
-        assert_eq!(resolve_kv_arena_format_qwen(None, None), F::F16);
+        assert_eq!(
+            resolve_kv_arena_format_qwen(None, None, None),
+            F::F16,
+            "Task 2.3 ON-FAILURE: the unset default stays f16 (int8 graph replay is broken at 27B geometry)"
+        );
+        assert_eq!(
+            resolve_kv_arena_format_qwen(None, None, Some("int8")),
+            F::Int8,
+            "GRIM_KV_DTYPE=int8 opts into the certified int8 arena"
+        );
+        assert_eq!(
+            resolve_kv_arena_format_qwen(None, None, Some("f16")),
+            F::F16,
+            "GRIM_KV_DTYPE=f16 keeps the f16 arenas"
+        );
         // The legacy flag is shared with the backend, so its disabled
         // spellings mean f32 here too (this is the drift WS-0 closed).
         for s in ["0", "false", "off", "no"] {
             assert_eq!(
-                resolve_kv_arena_format_qwen(None, Some(s)),
+                resolve_kv_arena_format_qwen(None, Some(s), None),
                 F::F32,
                 "GRIM_F16_KV={s} should disable f16"
             );
         }
+        // The legacy flag's enabled spellings are inert under the f16 default.
         for s in ["1", "true", "yes"] {
             assert_eq!(
-                resolve_kv_arena_format_qwen(None, Some(s)),
+                resolve_kv_arena_format_qwen(None, Some(s), None),
                 F::F16,
-                "GRIM_F16_KV={s} should enable f16"
+                "GRIM_F16_KV={s} is inert under the f16 default"
             );
         }
         // An unrecognized explicit value uses the model's f16 default (the
         // backend warns and uses f32); the divergence is documented and only
         // reachable on a typo.
-        assert_eq!(resolve_kv_arena_format_qwen(Some("q7"), None), F::F16);
+        assert_eq!(resolve_kv_arena_format_qwen(Some("q7"), None, None), F::F16);
     }
 
     /// Uniform capability rows: every device measures identically, so placement
