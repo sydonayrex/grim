@@ -433,7 +433,10 @@ fn qwen35_layer_split_model_replays_like_eager() {
         return;
     }
     let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f16");
+        std::env::set_var("GRIM_CAPABILITY_PLACEMENT", "0");
+    };
 
     let mut cfg = tiny_cfg();
     cfg.num_layers = 4;
@@ -555,7 +558,10 @@ fn pos_replicas_exist_per_segment_device_and_start_aligned() {
         return;
     }
     let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f16");
+        std::env::set_var("GRIM_CAPABILITY_PLACEMENT", "0");
+    };
 
     let mut cfg = tiny_cfg();
     cfg.num_layers = 4;
@@ -1186,7 +1192,10 @@ fn the_ring_handoff_matches_a6_and_removes_a_host_sync_per_token() {
         return;
     }
     let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f16");
+        std::env::set_var("GRIM_CAPABILITY_PLACEMENT", "0");
+    };
 
     // One split hybrid, replayed N tokens, returning the logits and the number
     // of host-visible boundary synchronisations the replay issued.
@@ -1315,7 +1324,10 @@ fn the_qwen35_ring_walk_matches_the_launcher_path() {
         return;
     };
     let _lock = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { std::env::set_var("GRIM_KV_ARENA", "f16") };
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f16");
+        std::env::set_var("GRIM_CAPABILITY_PLACEMENT", "0");
+    };
     // The IR is only PUBLISHED when the emitter is on, and the ring's plan is
     // derived from that published IR.
     unsafe { std::env::set_var("GRIM_EMIT_TASK_GRAPH", "1") };
