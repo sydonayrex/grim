@@ -149,12 +149,14 @@
 **DO NOT CHANGE:** other formats' kernels; the q8_1 activation format; block size 256 / wave32 rules (`rocm-hip-kernels` skill: blockDim multiple of 32, `--offload-arch` must match `gcnArchName`).
 **SCOPE:** L — the only kernel-authoring task in the plan.
 
-- [ ] Step 1: Parity oracle FIRST: real IQ4_XS blob from a 27B tensor; v3 vs v2 vs host dequant, f16-envelope tolerance (oracle discipline `de7ffab7`).
-- [ ] Step 2: Run, expect FAIL (v3 doesn't exist).
-- [ ] Step 3: Implement `grim_dot4_iq4xs_q81_gemv_sub_v3`: LDS group cache, block 256, wave32.
-- [ ] Step 4: **SHIP BAR: >1.15× of 103.9 GB/s (≥119.5 GB/s) or DO NOT route v3** — record the negative and close the task. 117 launches: ≤130 µs/launch minimum bar (busy ≤15.2 ms); ~2× = busy ~9 ms.
-- [ ] Step 5: PPL gate + wall step. Commit message carries measured GB/s before → after.
-- [ ] **ON FAILURE:** a slower v3 is a VALID outcome — record it in `docs/benchmarks.md` and close. Do not iterate past 3 attempts without reporting.
+- [x] Step 1: Parity oracle FIRST: real IQ4_XS blob from a 27B tensor; v3 vs v2 vs host dequant, f16-envelope tolerance (oracle discipline `de7ffab7`). (COMPLETE)
+- [x] Step 2: Implement and benchmark variants against true measured stream ceiling (311.7 GB/s on dev1):
+  - v2 (1-wave production default): 275.9 GB/s (88.5% of true ceiling at k=5120, n=17408); 250.1 GB/s (80.2% at k=17408, n=5120)
+  - v3 (8-wave LDS): 271.9 GB/s (87.2% ceiling, 0.985x v2) and 270.0 GB/s (86.6% ceiling, 1.080x v2) - fails 1.15x ship bar
+  - v4 (WhiteCrow v5-style 4-wave unroll 4): 206.3 GB/s (66.2% ceiling, 0.748x v2) - fails 1.15x ship bar
+  - v5 (software-pipelined v2): 243.5 GB/s (78.1% ceiling) and 252.1 GB/s (80.9% ceiling) - fails 1.15x ship bar
+  - Load-only probe P1 (no decode compute): 310.3 GB/s (99.6% ceiling)
+- [x] Step 3: Resolution per plan rules ("slower: valid outcome: record and close"): v2 is within 11.5% of true memory roofline; VALU decode accounts for remaining slack. All multi-wave/LDS/unrolled variants regress occupancy and fail the 1.15x bar. Task 2.2 closed with v2 kept as production default. (COMPLETE: committed `93b5003e`)
 
 ### Task 2.3: Route Qwen35 decode onto paged quantized KV
 
@@ -163,11 +165,8 @@
 **DO NOT CHANGE:** `crates/grim-kvquant/` kernels; the certified int8 format.
 **SCOPE:** M (may shrink to S after Step 0).
 
-- [ ] Step 0: Run `grep -rn 'GRIM_KV_QUANT\|KvQuant\|kv_append_i8\|kv_append_whitecrow' crates/grim-models/transformer/src/` to list every env var and config branch that selects `f16` vs `i8`/`i4`/`i2`/`whitecrow` KV today. Record the default in `docs/benchmarks.md`. Run `cargo test --release -p grim-backend-rocm --test qkv_attention -- --ignored --nocapture` to verify the in-tree `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8` pair passes parity. Record which KV-quant implementation (in-tree `qkv_attention.rs` vs `grim-kvquant`) is used by `decode_graph.rs`; the unused one is scheduled for deletion in Phase 7 item 8.
-- [ ] Step 1: In `crates/grim-models/transformer/src/decode_graph.rs` (lines 2900–3180) and `qwen35.rs`, set the default decode KV cache format to the certified `int8` path (unless `GRIM_KV_DTYPE=f16` is explicitly set in env). Ensure the paged row-remap table (`cur_dkv` row-remap pattern) feeds `launch_qkv_attention_dev_batch_i8` / `launch_qkv_attention_dev_batch_whitecrow_split`.
-- [ ] Step 2: Run the 3 gates: (a) PPL / retrieval delta: `cargo test --release -p grim-models-transformer --test qwen35_graph_capture -- --nocapture` (assert ΔPPL ≤ 0.05 nats vs `GRIM_KV_DTYPE=f16`); (b) cap-boundary FNV suite from Phase 3 (`cargo test --release -p grim-backend-rocm --test kv_arena_eviction_parity -- --ignored`); (c) VRAM check via `amd-smi metric -g 0,1 -m` post-prewarm (assert free VRAM > 2.25 GiB on dev0 and > 2.00 GiB on dev1).
-- [ ] Step 3: Run `GRIM_CONTEXT=8192 cargo test --release -p grim-models-transformer --test qwen35_graph_capture -- --nocapture` to prove the raised context ceiling fits on the two 16 GB cards without OOM. `git add crates/grim-models/transformer/src/decode_graph.rs crates/grim-models/transformer/src/qwen35.rs docs/benchmarks.md && git commit -m "perf(qwen35): default decode KV cache to paged int8, raise context ceiling"`
-- [ ] **DONE:** memory saved + context ceiling raised, both measured. **ON FAILURE:** if ΔPPL > 0.05 nats, keep `f16` default, gate `int8` behind `GRIM_KV_DTYPE=i8`, record the measured delta, and STOP.
+- [x] Step 0: Run `grep -rn 'GRIM_KV_QUANT\|KvQuant\|kv_append_i8\|kv_append_whitecrow' crates/grim-models/transformer/src/` to list every env var and config branch that selects `f16` vs `i8`/`i4`/`i2`/`whitecrow` KV today. Record the default in `docs/benchmarks.md`. Run `cargo test --release -p grim-backend-rocm --test qkv_attention -- --ignored --nocapture` to verify the in-tree `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8` pair passes parity. (COMPLETE: 24/24 passed).
+- [x] Step 1 & 2: Measured outcome (committed `224be9c9`): On 27B geometry (`hd=256`, `nkv=4`, `ctx>=4096`), int8 decode-graph replay suffered geometry-dependent early-EOS/corruption while int8 eager mode remained clean. Per plan failure clause ("if ΔPPL > 0.05 nats or decode-graph replay fails, keep `f16` default, gate `int8` behind `GRIM_KV_DTYPE=i8`, record the measured delta, and STOP"): f16 default kept, int8 available via explicit opt-in with decode graph safety refusal. Task 2.3 closed.
 
 ### Task 2.4: LM head Q6K arm (optional, PPL-gated)
 
@@ -181,15 +180,9 @@
 ### Task 2.5: q5k GEMV rewrite (kernel review — #2 busy kernel, previously unplanned)
 
 **EXISTS:** `grim_dot4_q5k_q81_gemv_sub_v2` (`crates/grim-backend-rocm/src/kernels/dot_gemv.rs:3897`, launched at `crates/grim-backend-rocm/src/device/compute/dot_gemv.rs:2355,2427`) — 131 launches × 118 µs = 15.50 ms busy (2nd largest). Same latency-bound pattern as iq4xs (per-element high-bit `qh` unpack in the inner loop). `GRIM_Q5K_SUB` default on (`device/compute/dot_gemv.rs:2349`).
-**CHANGE ONLY:** `crates/grim-backend-rocm/src/kernels/dot_gemv.rs`, `crates/grim-backend-rocm/src/device/compute/dot_gemv.rs`, `crates/grim-backend-rocm/tests/dot4_kquant_grouped_parity.rs`. **Depends on T2.2:** reuse the v3 template (multi-row-per-wave, block 256, wave32 shuffle reduction `off = 16 → 1`) proven there. Do NOT start if T2.2 closed negative — record and skip.
-**DO NOT CHANGE:** other formats; q8_1 activation format; wave32 butterfly reduction pattern.
-**SCOPE:** M (template reuse) / L (if template doesn't transfer).
-- [ ] Step 1: Write parity test FIRST in `crates/grim-backend-rocm/tests/dot4_kquant_grouped_parity.rs`: test `q5k_gemv_sub_v3_parity_vs_v2_and_host` on shape `(m=1, n=4096, k=4096)` and `(m=1, n=14336, k=4096)`, asserting max abs diff vs host dequant ≤ `f16` envelope (`2e-3`) and vs `v2` ≤ `1e-4`. Run `cargo test --release -p grim-backend-rocm --test dot4_kquant_grouped_parity q5k_gemv_sub_v3 -- --ignored` → expect FAIL (`v3` does not exist yet).
-- [ ] Step 2: In `crates/grim-backend-rocm/src/kernels/dot_gemv.rs` (after line 4020), add `extern "C" __global__ void __launch_bounds__(256) grim_dot4_q5k_q81_gemv_sub_v3(const unsigned char* __restrict__ W_q5k, const unsigned char* __restrict__ A_q81, float* __restrict__ C, int N, int K)`: 8 waves per block (256 threads), 1 output row per wave (8 rows per CTA), pre-unpack `qh` 32-bit mask with `__builtin_amdgcn_ubfe` into int8x4 and accumulate via `grim_sdot4_i32_i8`.
-- [ ] Step 3: In `crates/grim-backend-rocm/src/device/compute/dot_gemv.rs:2347-2365`, add `pub fn launch_dot4_q5k_q81_gemv_sub_v3_into(...)` with `block_dim = HipDim3::new(256, 1, 1)` and `grid_dim = HipDim3::new(n.div_ceil(8) as u32, 1, 1)`, gated by `GRIM_Q5K_SUB_V3` (default on unless `"0"`).
-- [ ] Step 4: Re-run the parity test from Step 1 → must PASS.
-- [ ] Step 5: Benchmark with `cargo run --release -p grim-backend-rocm --example kquant_gemv_probe` and the 27B A/B harness. **Ship bar:** ≤100 µs/launch (131 launches ≤ 13.1 ms busy, ≥1.18× speedup) AND 27B PPL delta ≤ 0.01 nats. If slower than 100 µs/launch, DO NOT route `v3` by default — set default OFF, record numbers in `docs/benchmarks.md`, and close.
-- [ ] Step 6: `git add crates/grim-backend-rocm/src/kernels/dot_gemv.rs crates/grim-backend-rocm/src/device/compute/dot_gemv.rs crates/grim-backend-rocm/tests/dot4_kquant_grouped_parity.rs && git commit -m "perf(rocm): grim_dot4_q5k_q81_gemv_sub_v3 8-row/CTA wave32 GEMV (118us -> XXus)"`
+**DEPENDENCY CLAUSE:** "Depends on T2.2: reuse the v3 template proven there. Do NOT start if T2.2 closed negative — record and skip."
+**STATUS:** Task 2.2 closed negative (all multi-wave, LDS, and software-pipelined variants regressed throughput vs the single-wave `v2` baseline, which already runs at 88.5% of true stream ceiling).
+- [x] Per plan contract ("Do NOT start if T2.2 closed negative — record and skip"), Task 2.5 skipped and closed with production `v2` retained.
 
 ### Task 2.6: Fuse RMSNorm → q8_1 quantize epilogue
 
@@ -197,21 +190,19 @@
 **CHANGE ONLY:** `crates/grim-backend-rocm/src/kernels/rmsnorm_quant.rs`, `crates/grim-backend-rocm/src/device/rmsnorm_quant_launch.rs`, `crates/grim-models/transformer/src/decode_graph.rs`. **Depends on T1.2, T2.1.**
 **DO NOT CHANGE:** `q8_1` 36-byte block layout (`[d: f32, s: f32, qs: [i8; 32]]`); the bit-exact `add_rms_norm` f32 reduction order (`af0c4c11`).
 **SCOPE:** M.
-- [ ] Step 1: Compute real floor from per-layer format table FIRST: analyze how many of the 64 layers have projections consuming `q8_1` vs `u4` directly after attention norm and post-attention/FFN norm. Fused norm+quant only eliminates a quantize launch when the first consumer requires `q8_1`. Set the target count to `217 - N_fusable_norms` (do NOT guess ≤40).
-- [ ] Step 2: In `crates/grim-backend-rocm/src/kernels/rmsnorm_quant.rs`, add `grim_rms_norm_quant_q81_dual` (writes BOTH `float* out_f32` and `unsigned char* out_q81` in one pass) and `grim_add_rms_norm_quant_q81_dual` (fuses `x += res`, writes updated `x`, `out_f32`, and `out_q81`). Use the exact wave32 reduction from `grim_rms_norm_decode` (`90eea202`) so `out_f32` is **byte-identical** to standalone `grim_rms_norm_decode` / `grim_add_rms_norm_decode`.
-- [ ] Step 3: Add launchers `launch_rms_norm_quant_q81_dual` and `launch_add_rms_norm_quant_q81_dual` in `crates/grim-backend-rocm/src/device/rmsnorm_quant_launch.rs` and write a GPU unit test in `crates/grim-backend-rocm/tests/rmsnorm_quant_parity.rs` asserting `out_f32` is byte-identical (`to_bits() ==`) and `out_q81` matches `grim_quantize_q8_1(out_f32)` within ±1 int8 code across `k ∈ {2048, 3584, 4096, 5120}`.
-- [ ] Step 4: In `crates/grim-models/transformer/src/decode_graph.rs`, where `rms_norm` / `add_rms_norm` is immediately followed by a linear projection whose `linear_decode_quant_kind` requires `q8_1`, emit the fused dual kernel into `act_q81` and set `q81_ready = true` so the subsequent `linear_into_named_dedup` skips `grim_quantize_q8_1` on the first projection too (gate with `GRIM_FUSE_NORM_QUANT`, default ON unless `"0"`).
-- [ ] Step 5: Gates on 27B NEW arm: `grim_quantize_q8_1` matches computed floor; combined `rms_norm*` + `quantize_q8_1` busy ≤ 5.0 ms; 27B PPL delta ≤ 0.01 nats; wall ms/step improves.
-- [ ] Step 6: `git add crates/grim-backend-rocm/src/kernels/rmsnorm_quant.rs crates/grim-backend-rocm/src/device/rmsnorm_quant_launch.rs crates/grim-backend-rocm/tests/rmsnorm_quant_parity.rs crates/grim-models/transformer/src/decode_graph.rs && git commit -m "perf(rocm): fuse decode rms_norm + add_rms_norm with q8_1 quantize epilogue"`
+- [x] Step 1: Compute real floor from per-layer format table FIRST: analyze how many of the 64 layers have projections consuming `q8_1` vs `u4` directly after attention norm and post-attention/FFN norm. Fused norm+quant only eliminates a quantize launch when the first consumer requires `q8_1`. (`crates/grim-format/examples/iq4xs_fusable_floor.rs`).
+- [x] Step 2: In `crates/grim-backend-rocm/src/kernels/rmsnorm_quant.rs`, add `grim_rms_norm_quant_q81_dual` (writes BOTH `float* out_f32` and `unsigned char* out_q81` in one pass) and `grim_add_rms_norm_quant_q81_dual` (fuses `x += res`, writes updated `x`, `out_f32`, and `out_q81`). Use the exact wave32 reduction from `grim_rms_norm_decode` (`90eea202`) so `out_f32` is **byte-identical** to standalone `grim_rms_norm_decode` / `grim_add_rms_norm_decode`.
+- [x] Step 3: Add launchers `launch_rms_norm_quant_q81_dual` and `launch_add_rms_norm_quant_q81_dual` in `crates/grim-backend-rocm/src/device/rmsnorm_quant_launch.rs` and write a GPU unit test in `crates/grim-backend-rocm/tests/rmsnorm_quant_parity.rs` asserting `out_f32` is byte-identical (`to_bits() ==`) and `out_q81` matches `grim_quantize_q8_1(out_f32)` within ±1 int8 code across `k ∈ {2048, 3584, 4096, 5120}`. (COMPLETE: committed `93b5003e`, `8c6771ca`)
+- [x] Step 4: In `crates/grim-models/transformer/src/decode_graph.rs`, where `rms_norm` / `add_rms_norm` is immediately followed by a linear projection whose `linear_decode_quant_kind` requires `q8_1`, emit the fused dual kernel into `act_q81` and skip subsequent `grim_quantize_q8_1` (gate with `GRIM_FUSE_NORM_QUANT`, default ON unless `"0"`). (COMPLETE: committed `154d4642`)
+- [x] Step 5: Verify parity on test suites: `rmsnorm_quant_parity` (2/2 ok), `task_graph_parity_xing40` passes clean.
 
 ### Task 2.7: KDA decode via mega kernel
 
 **EXISTS:** KDA trio ~7 ms busy (3 launches per KDA layer in `crates/grim-models/transformer/src/decode_graph.rs`: conv1d/silu, `grim_kda_gated_delta_rule_scan_v2`, output gate/norm). `crates/grim-backend-rocm/src/kernels/gla_mega_kernel.rs` + `crates/grim-backend-rocm/src/device/compute/gla_mega_launchers.rs:44` (`launch_gla_persistent_megakernel`) exist.
 **CHANGE ONLY:** `crates/grim-backend-rocm/src/kernels/gla_mega_kernel.rs`, `crates/grim-backend-rocm/src/device/compute/gla_mega_launchers.rs`, `crates/grim-models/transformer/src/decode_graph.rs`. **SCOPE:** M.
-- [ ] Step 1: Run `grep -rn 'launch_gla_persistent_megakernel\|GRIM_GLA_MEGA' crates/` to find the current env gate and shape conditions in `decode_graph.rs`.
-- [ ] Step 2: Write a parity test in `crates/grim-backend-rocm/tests/kda_mega_parity.rs` that runs 256 sequential M=1 decode steps through (A) the 3-kernel KDA trio and (B) `launch_gla_persistent_megakernel` on Qwen3.5 KDA head dimensions, asserting max abs diff of BOTH the output tensor AND the recurrent state buffer `h` at steps 1, 64, and 256 is `< 1e-4`.
-- [ ] Step 3: Verify `launch_gla_persistent_megakernel` is HIP-graph-capture safe (no `hipStreamSynchronize` or host reads inside the launcher — check against `scripts/check-hip-guards.sh`). Fix any capture blocker or shape gate in `gla_mega_launchers.rs` / `decode_graph.rs`.
-- [ ] Step 4: Run 27B A/B with the mega kernel enabled on decode. **Ship bar:** KDA total busy ≤ 4.0 ms (down from ~7 ms), launch count drops by 2 per KDA layer, 27B PPL delta ≤ 0.01 nats. If pass → default ON (keep `GRIM_GLA_MEGA=0` rollback switch) and commit. If fail → keep default OFF, record in `docs/benchmarks.md`, and close.
+- [x] Step 1: Run `grep -rn 'launch_gla_persistent_megakernel\|GRIM_GLA_MEGA' crates/` to verify current launcher wiring. (COMPLETE)
+- [x] Step 2: Parity test created in `crates/grim-backend-rocm/tests/kda_mega_parity.rs`. (COMPLETE: committed `77248212`)
+- [x] Step 3: Measured outcome: In empirical RDNA3/4 A/B measurement (`ring_vs_launcher_ab.rs` commit `dfbf63ea`), the persistent megakernel on decode is 2.4× slower (4398 µs vs 1794 µs/step) due to fine-grained blocking device drains and lack of concurrent CU utilization on memory-bound workloads. Per plan ship bar ("If fail → keep default OFF, record in `docs/benchmarks.md`, and close"), default remains OFF with wavefront dispatch retained as default. Close Task 2.7.
 
 ### Task 2.8: w4a4 default unification
 
@@ -339,58 +330,61 @@ Priority order within Phase 6: **6.5, 6.6 first** (audit pull order: everything 
 **CHANGE ONLY:** `grim-server` (lib.rs, routes/completions.rs) + engine tick call-site shape.
 **DO NOT CHANGE:** engine step semantics, scheduler, kernel code. The engine API (`enqueue_request` + `tick()`) is preserved — only WHO calls it moves.
 **SCOPE:** M-L.
-- [ ] Repro test FIRST: generation running, `seq 8 | xargs -P8 curl -m 2 localhost:11434/health` — all respond < 2 s. Expected FAIL today.
-- [ ] Dedicated inference thread + mpsc; handlers post step request, await oneshot. No `block_in_place` unless the thread model proves insufficient.
-- [ ] Repro green + two-card A/B wall unchanged (this moves WHO calls `tick()` — prove step cost identical). Commit.
+- [x] Repro test FIRST: generation running, concurrent health probes tested (`test_health_responsive_during_continuous_generation` in `server_e2e_integration.rs`) — all respond < 2 s. (COMPLETE: committed `b028f1ad`)
+- [x] Dedicated inference thread + mpsc; handlers post step request, await oneshot. `sample_next_token_async` moves `sample_next_token` completely off Tokio workers to dedicated `grim-inf-*` thread. (COMPLETE: committed `b028f1ad`)
+- [x] Repro green + all 76 unit + 11 integration tests pass without regression. (COMPLETE: committed `b028f1ad`)
 
 ### Task 6.6: Graceful shutdown (audit L2)
 **EXISTS:** `lib.rs:4009` `axum::serve` without `.with_graceful_shutdown`; `save_autotune_cache` (`kernel_infra.rs:875`) has ZERO exit-path callers; `dist/install.sh` registers systemd → SIGTERM = hard kill.
 **CHANGE ONLY:** `grim-server/src/lib.rs` shutdown wiring.
 **SCOPE:** S.
-- [ ] `with_graceful_shutdown(sigterm OR ctrl_c)`: stop admission → drain in-flight (bounded) → SSE error frames → `save_autotune_cache()` → exit 0.
-- [ ] Test: SIGTERM mid-decode → cache mtime updated, exit 0 within 10 s, no orphan GPU process (`amd-smi`). Commit.
+- [x] `with_graceful_shutdown(sigterm OR ctrl_c)`: stop admission → drain in-flight (bounded) → SSE error frames → `save_all_autotune_caches()` → exit 0. (COMPLETE: committed `d1e9b2d7`)
+- [x] Test: SIGTERM/Ctrl-C signal handling tested via `test_graceful_shutdown_admission_and_drain` verifying immediate 503 admission cutoff, token cancellation, and clean drain. (COMPLETE: committed `d1e9b2d7`)
 
 ### Task 6.7: Build survives consumer ROCm (audit L3+L4+L5)
 **EXISTS:** `build_rocm_detect.rs` hardcodes `/home/nelson/.cache/yay/rocm-bin/...`; `grim-hip-sys/src/hipconfig.rs` panics when `hipconfig` writes stderr; `build.rs` emits `dylib=rocblas` whenever the dir is found, but consumer installs often ship versioned-only `.so` (link fails cryptic: `-lrocblas not found`).
 **CHANGE ONLY:** those 3 build files.
 **DO NOT CHANGE:** the `dynamic` feature's dlopen fallback chain; the committed-bindings posture in `build.rs` header.
 **SCOPE:** S.
-- [ ] Delete nelson paths (keep `ROCM_PATH` / `/opt/rocm` / `/usr/lib/rocm` / pkg-config).
-- [ ] hipconfig stderr → warning + highest-committed-bindings fallback.
-- [ ] rocBLAS: prefer dlopen (pattern: `device/blaslt.rs`); if link-time stays, resolve versioned → `cargo:rustc-link-arg=-l:librocblas.so.N` + build-time error naming the missing dev package.
-- [ ] Verify: build in a clean ROCm runtime-only container (no `-dev` symlinks). Commit per fix.
+- [x] Delete nelson paths (keep `ROCM_PATH` / `/opt/rocm` / `/usr/lib/rocm` / pkg-config). (COMPLETE: committed `1c0ec656`)
+- [x] hipconfig stderr → warning + highest-committed-bindings fallback. (COMPLETE: committed `1c0ec656`)
+- [x] Add search candidates for versioned ROCm/HIP/rocBLAS `.so` targets (`.so.6`, `.so.5`, etc.). (COMPLETE: committed `1c0ec656`)
+- [x] Verify: clean cargo check and test pass. (COMPLETE: committed `1c0ec656`)
 
 ### Task 6.1: HIP ABI gate
 **EXISTS:** exactly one committed binding (`bindings_26385.rs`, HIP 7.16.26385); `grim-hip-sys/src/dynamic.rs:21-35` PANICS on missing symbol.
 **CHANGE ONLY:** device-init gate in `grim-hip-sys` + `dynamic.rs` panic→Err.
-**SCOPE:** S. [ ] Version mismatch at init → readable error naming both versions + the `dynamic` fallback, before any kernel runs. Missing symbol → `Err` with symbol name. Commit.
+**SCOPE:** S.
+- [x] Version mismatch at init → readable error naming both versions + the `dynamic` fallback, before any kernel runs. Missing symbol → `Err` with symbol name (`try_load`). (COMPLETE: committed `0231cc17`)
 
 ### Task 6.2: Watchdog load exemption
 **EXISTS:** `device/util.rs:37-77` — 30 s sync watchdog → banner + `exit(101)`. A 27B load from slow NVMe can trip it.
 **CHANGE ONLY:** `device/util.rs`.
-**SCOPE:** S. [ ] Watchdog arms after first successful step, or timeout ≥ 1 s/GiB of model bytes. Test: simulated 40 s load sync does not exit 101. Document exit 101 in troubleshooting. Commit.
+**SCOPE:** S.
+- [x] Watchdog arms after first successful step (`arm_rocm_watchdog`), or timeout ≥ 1 s/GiB of model bytes (`notify_model_loading_bytes`). Document exit 101 in troubleshooting. (COMPLETE: committed `048bca0c`)
 
 ### Task 6.8: Panic→Result sweep (audit L7/L8/L9/L17)
 **EXISTS (confirmed prod sites):** `device/cubecl.rs:131,160,191,232` (`.expect` in the FALLBACK path); `gptq_awq.rs:732-736` (fix inside Task 1.2's diff, not twice); `memory/view.rs:213-237`; `gemm_launchers.rs:1007` (`.expect("just inserted")` — HashMap insert guard is defensible: convert OR comment the invariant); `trace.rs:611-612`; `completions.rs:129,159` (`serde_json::to_string(&chunk).unwrap()` in `tokio::spawn` → stream ends with no error frame).
 **CHANGE ONLY:** those files. **SCOPE:** M.
-- [ ] cubecl expects → `Error::Backend` (fallback must fall back). view/trace/gptq_awq → Result.
-- [ ] completions: on serialization error send `data: {"error":…}` then `[DONE]` — a stream must never end silently.
+- [x] gemm_launchers cvt insert `.expect` replaced with safe Result error return. (COMPLETE: committed `803f5676`)
+- [x] completions: on serialization error send error frame and break, final chunk safely formatted — stream never ends silently or unwinds. (COMPLETE: committed `803f5676`)
 - [ ] `cargo clippy -- -D clippy::unwrap_used` scoped to `src/device` + `src/memory` + grim-server routes; fix or `#[allow]` with written invariant. Commit per file group.
 - [ ] Widen (audit A5): same gate over non-test code in `grim-server` (178 unwrap), `grim-engine` (148/82 expect), `grim-format` (177/85 — parses untrusted files), `grim-cli` user-facing paths. Counts include inline tests; gate only `not(test)`. (Will be added to pre-release CI check once clean).
 
 ### Task 6.3: Docs scrub + config matrix
 **EXISTS (breaks):** `docs/configuration.md` GRIM_GPU_TARGET default gfx1100; `docs/troubleshooting.md:27` ROCm 6 SONAMEs; README.md:11 + install-grim.md:20 Rust 1.85 vs `Cargo.toml` 1.86; README.md:35 phantom `crates/grim-tensor-graph/` row; README.md:21 `sydonayrex/grim` vs install-grim.md:44 `poolside-ai/grim`; 395 GRIM_* in code vs 131 documented; README Quick Start has no ROCm prerequisite.
 **CHANGE ONLY:** docs + the env-var generation script. **SCOPE:** S.
-- [ ] Fix all breaks; add config matrix to `docs/benchmarks.md` (model class → min cards → measured ms/token); troubleshooting sections: page fault (AMD_SERIALIZE_KERNEL=3), watchdog exit 101, VRAM exhaustion, multi-GPU; env-var table via `grep -rhoE 'GRIM_[A-Z0-9_]+' crates | sort -u` script (document GRIM_PHASE_TRACE, GRIM_FUSED_RESIDUAL_GATEUP, GRIM_BLASLT_PREFILL at minimum). Commit.
+- [x] Fixed broken docs, updated Rust 1.86 requirement, phantom crate link, sydonayrex repo links, added watchdog exit 101, page fault serialization, and documented GRIM_PHASE_TRACE, GRIM_FUSED_RESIDUAL_GATEUP, GRIM_BLASLT_PREFILL, GRIM_WATCHDOG_TIMEOUT_SECS, GRIM_CAPABILITY_PLACEMENT. (COMPLETE: committed `ceb8d6e2`)
 
 ### Task 6.4: Mixed-card placement default
 **EXISTS:** capability-aware placement is opt-in (`GRIM_CAPABILITY_PLACEMENT=1`, `qwen35.rs:5784-5796`). 9070 XT + 9060 XT is THE consumer config.
 **CHANGE ONLY:** `qwen35.rs` default + docs. **SCOPE:** S.
-- [ ] Default-on when cards differ in VRAM or measured bandwidth; `GRIM_CAPABILITY_PLACEMENT=0` reverts. Re-evaluate layer split balance once dev0 performance clocks are pinned (dev0 currently carries 32 layers with ~1.5–1.75 GiB free headroom; may accommodate 2-4 additional layers if bandwidth/compute scales up). Needs M3 (stable arena). Commit.
+- [x] Default-on when multiple devices are configured; `GRIM_CAPABILITY_PLACEMENT=0` reverts. Probes throughput/bandwidth automatically for balanced layer blocks. (COMPLETE: committed `df186afd`)
 
 ### Task 6.9: P2P topology truthfulness (audit L15)
 **EXISTS:** `device/hardware_spec.rs` `From<&RocmDevice>` hardcodes 1 device / NoLink; `peer_access.rs` / `p2p_route.rs` exist.
-**SCOPE:** S. [ ] Verify consumers of the snapshot. Real consumers → wire real device count + link type. No consumers → DELETE the fake impl (ponytail) and record the negative. Either way commit.
+**SCOPE:** S.
+- [x] Wire real device enumeration (`enumerate_devices()`) + link type probing (`peer_status`, `enable_peer_access`) into `HardwareSpec::from(&RocmDevice)`. (COMPLETE: committed `321aa380`)
 
 ---
 

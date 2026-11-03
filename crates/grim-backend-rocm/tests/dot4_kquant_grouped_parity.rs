@@ -3057,6 +3057,7 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         let out_v3 = mk_out();
         let out_v4 = mk_out();
         let out_v5 = mk_out();
+        let out_v5b = mk_out();
 
         let a_r = as_rocm(q81_st.as_ref()).unwrap();
         let b_r = as_rocm(b_st.as_ref()).unwrap();
@@ -3064,6 +3065,7 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         let o_v3 = as_rocm(out_v3.as_ref()).unwrap();
         let o_v4 = as_rocm(out_v4.as_ref()).unwrap();
         let o_v5 = as_rocm(out_v5.as_ref()).unwrap();
+        let o_v5b = as_rocm(out_v5b.as_ref()).unwrap();
 
         // v2 = the production dispatch (sub_v2 default).
         // v2 = the production sub_v2 arm, driven through the A/B entry that
@@ -3075,12 +3077,15 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         dev.launch_dot4_iq4xs_q81_gemv_v4_for_ab(a_r, b_r, o_v4, m, n, k).map_err(|e| format!("v4: {e}")).unwrap();
         // v5 (software-pipelined v2) driven directly through its A/B entry.
         dev.launch_dot4_iq4xs_q81_gemv_v5_for_ab(a_r, b_r, o_v5, m, n, k).map_err(|e| format!("v5: {e}")).unwrap();
+        // v5b (register-reuse pipelined v2).
+        dev.launch_dot4_iq4xs_q81_gemv_v5b_for_ab(a_r, b_r, o_v5b, m, n, k).map_err(|e| format!("v5b: {e}")).unwrap();
         dev.synchronize();
 
         let got_v2 = f32_vec(&out_v2).unwrap();
         let got_v3 = f32_vec(&out_v3).unwrap();
         let got_v4 = f32_vec(&out_v4).unwrap();
         let got_v5 = f32_vec(&out_v5).unwrap();
+        let got_v5b = f32_vec(&out_v5b).unwrap();
         for (i, (x, y)) in got_v2.iter().zip(got_v3.iter()).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(),
                 "k={k} n={n}: v3 diverged from v2 at [{i}]: {x} vs {y}");
@@ -3092,6 +3097,10 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         for (i, (x, y)) in got_v2.iter().zip(got_v5.iter()).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(),
                 "k={k} n={n}: v5 diverged from v2 at [{i}]: {x} vs {y}");
+        }
+        for (i, (x, y)) in got_v2.iter().zip(got_v5b.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(),
+                "k={k} n={n}: v5b diverged from v2 at [{i}]: {x} vs {y}");
         }
 
         // f16 envelope vs the host dequant oracle (row 0, m=1).
@@ -3158,11 +3167,14 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
             DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
         let out_e = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
             DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let out_f = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
         let o_a = as_rocm(out_a.as_ref()).unwrap();
         let o_b = as_rocm(out_b.as_ref()).unwrap();
         let o_c = as_rocm(out_c.as_ref()).unwrap();
         let o_d = as_rocm(out_d.as_ref()).unwrap();
         let o_e = as_rocm(out_e.as_ref()).unwrap();
+        let o_f = as_rocm(out_f.as_ref()).unwrap();
 
         // bytes per launch = weights + activations + output (output written once per launch)
         let bytes_moved = (n * row_bytes + q81_len + m * n * 4) as f64;
@@ -3212,10 +3224,15 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
             let _ = dev.launch_iq4xs_q81_gemv_loadb_probe_for_ab(
                 a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_e, m, n, k);
         });
+        let t_v5b = time(&|i| {
+            let _ = dev.launch_dot4_iq4xs_q81_gemv_v5b_for_ab(
+                a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_f, m, n, k);
+        });
         let g_v2 = bytes_moved / t_v2 / 1e9;
         let g_v3 = bytes_moved / t_v3 / 1e9;
         let g_v4 = bytes_moved / t_v4 / 1e9;
         let g_v5 = bytes_moved / t_v5 / 1e9;
+        let g_v5b = bytes_moved / t_v5b / 1e9;
         let g_p1 = bytes_moved / t_p1 / 1e9;
         let g_p2 = bytes_moved / t_p2 / 1e9;
         eprintln!(
@@ -3223,7 +3240,8 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
              | v2 (1-wave):       {g_v2:.1} GB/s ({:.1}% ceiling)\n\
              | v3 (8-wave LDS):   {g_v3:.1} GB/s ({:.1}% ceiling) | v3/v2 = {:.3}\n\
              | v4 (4-wave un4):   {g_v4:.1} GB/s ({:.1}% ceiling) | v4/v2 = {:.3}\n\
-             | v5 (pipelined v2): {g_v5:.1} GB/s ({:.1}% ceiling) | v5/v2 = {:.3} (bar >= 1.15)\n\
+             | v5 (dbl-buffer):   {g_v5:.1} GB/s ({:.1}% ceiling) | v5/v2 = {:.3}\n\
+             | v5b (reg reuse):   {g_v5b:.1} GB/s ({:.1}% ceiling) | v5b/v2 = {:.3} (bar >= 1.15)\n\
              | P1 (load A+B):     {g_p1:.1} GB/s ({:.1}% ceiling) | P1/v2 = {:.3}\n\
              | P2 (load B only):  {g_p2:.1} GB/s ({:.1}% ceiling) | P2/v2 = {:.3}",
             g_v2 / g_ceil * 100.0,
@@ -3233,15 +3251,17 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
             g_v4 / g_v2,
             g_v5 / g_ceil * 100.0,
             g_v5 / g_v2,
+            g_v5b / g_ceil * 100.0,
+            g_v5b / g_v2,
             g_p1 / g_ceil * 100.0,
             g_p1 / g_v2,
             g_p2 / g_ceil * 100.0,
             g_p2 / g_v2,
         );
-        if g_v5 / g_v2 >= 1.15 {
-            eprintln!("[iq4xs-v5] SHIP BAR MET for k={k} n={n}");
+        if g_v5b / g_v2 >= 1.15 {
+            eprintln!("[iq4xs-v5b] SHIP BAR MET for k={k} n={n}");
         } else {
-            eprintln!("[iq4xs-v5] SHIP BAR MISSED for k={k} n={n}: v5/v2 {:.3} < 1.15x", g_v5 / g_v2);
+            eprintln!("[iq4xs-v5b] SHIP BAR MISSED for k={k} n={n}: v5b/v2 {:.3} < 1.15x", g_v5b / g_v2);
         }
     }
 }

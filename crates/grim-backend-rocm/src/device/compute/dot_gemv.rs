@@ -1990,6 +1990,29 @@ impl RocmDevice {
         )
     }
 
+    /// Task 2.3 A/B: v5b — pipelined v2 that refills each column's registers
+    /// with the next superblock's data as soon as the column is consumed
+    /// (no second buffer, so occupancy is preserved).
+    pub fn launch_dot4_iq4xs_q81_gemv_v5b_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub_v5b",
+        )
+    }
+
     pub(crate) fn launch_dot4_iq4xs_q81_gemv(
         &self,
         act_q81: &RocmStorage,

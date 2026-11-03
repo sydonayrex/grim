@@ -6515,6 +6515,123 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v5
 }
 
 
+// Task 2.3 v5b: pipelined v2 that REUSES the consumed column registers
+// instead of allocating a second buffer.
+//
+// v5 (above) allocates a full second B+A buffer: 57 -> 94 VGPR, which drops
+// occupancy from 8 waves/SIMD to 5 (512 VGPR file / 94) and loses more than
+// the overlap wins. v5b keeps v2's 57-VGPR footprint:
+//
+//   cur[j] holds the B data for (superblock sb, column j). Column j is
+//   consumed at the top of the column loop; the register set is then
+//   REFILLED with the B data for (sb+4, column j) -- i.e. the next
+//   superblock's column. The refill loads are issued spread across the
+//   ~810 VALU instructions of the decode, so the memory system always has
+//   requests in flight instead of idling for the whole compute phase.
+//
+// The A row keeps v2's behaviour (loaded at the top of the iteration): A is
+// L2-resident and tiny, and the outstanding B refill requests cover its
+// latency.
+//
+// Same arithmetic, same per-lane superblock order => bit-exact vs v2.
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v5b(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint2 hdr[4];
+    uint2 qv0[4];
+    uint2 qv1[4];
+    int   a4[8];
+    float da;
+
+    // Prologue: the first superblock this lane owns (sb = slot).
+    {
+        const unsigned char* a_blk = a_row + (slot * 8 + sub) * GRIM_Q8_1_BYTES;
+        da = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        __builtin_memcpy(a4, a_blk + 4, 32);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const unsigned char* b_sb = b0 + j * col_stride + (long long)slot * 136;
+        hdr[j] = ((const uint2*)b_sb)[0];
+        const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+        qv0[j] = qs2[0];
+        qv1[j] = qs2[1];
+    }
+
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        const int sb_n = sb + 4;
+        const bool has_next = (sb_n < n_sb);
+
+        const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+        da = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        __builtin_memcpy(a4, a_blk + 4, 32);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned hdr_v = hdr[j].x;
+            const unsigned sc_l4 = hdr[j].y;
+            const float d = fp16_to_float_device((unsigned short)(hdr_v & 0xFFFFu));
+            const unsigned scales_h = hdr_v >> 16;
+            const int ls = (int)((sc_l4 >> (4 * sub)) & 0x0Fu)
+                         | (((int)((scales_h >> (2 * sub)) & 3u)) << 4);
+            const float dl = d * (float)(ls - 32);
+
+            const unsigned qw[4] = {qv0[j].x, qv0[j].y, qv1[j].x, qv1[j].y};
+            int pos = 0;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                pos = grim_sdot4(a4[w],     grim_kv4_iq4xs_valu(qw[w] & 0x0F0F0F0Fu),        pos);
+                pos = grim_sdot4(a4[w + 4], grim_kv4_iq4xs_valu((qw[w] >> 4) & 0x0F0F0F0Fu), pos);
+            }
+            facc[j] += dl * da * (float)pos;
+
+            // Refill this column's registers with the NEXT superblock's data.
+            // The store depends on the load, but nothing else in this
+            // iteration reads these registers, so the load issues without
+            // stalling the decode.
+            if (has_next) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb_n * 136;
+                hdr[j] = ((const uint2*)b_sb)[0];
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+                qv0[j] = qs2[0];
+                qv1[j] = qs2[1];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+
 // Task 2.2 v4: WhiteCrow v5-style 4-wave CTA (128 threads) with 4-superblock
 // unroll stride and ZERO LDS / zero __syncthreads.
 //
