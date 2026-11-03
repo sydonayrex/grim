@@ -931,6 +931,120 @@ impl AttentionOps for CpuDevice {
         )
     }
 
+    /// Task 2.3 follow-up: CPU paged-quant attention. Dequantizes the packed
+    /// KV pages on the host (WhiteCrow/Int8/Fp8E4M3 — the formats with host
+    /// dequants), then runs standard causal GQA attention for the single
+    /// decode query. Correctness-first; the CPU paged path is a correctness
+    /// reference for the ROCm kernels, not a performance path.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_paged_quant(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        _max_blocks: usize,
+        _page_size: usize,
+        kv_seq_len: usize,
+        _cache_offset: u32,
+        out_shape: &Shape,
+        quant_format: grim_tensor::PagedKvQuantFormat,
+        k_scale: f32,
+        v_scale: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        use grim_tensor::PagedKvQuantFormat as F;
+        let q_st = a_storage(q)?;
+        let head_dim = out_shape.dims().last().copied().unwrap_or(0);
+        let num_heads = out_shape.dims().get(1).copied().unwrap_or(0);
+        let kv_dim = num_kv_heads * head_dim;
+        let n_values = kv_seq_len * kv_dim;
+
+        // Physical row of logical position p from the (u32-word) block table.
+        let table_bits = block_tables.to_cpu_vec_f32()?;
+        let word = |i: usize| -> usize {
+            table_bits[i].to_bits() as usize
+        };
+        let phys_row = |p: usize| -> usize {
+            // Table entries are (block_id, page_size) u32 pairs; logical p
+            // lives at block_table[p / page_size] * page_size + (p % page_size)
+            // (see gather_paged_history). The second word is the PAGE SIZE,
+            // not a slot index.
+            let (block_id, ps) = (word(p * 2), word(p * 2 + 1));
+            block_id * ps + (p % ps.max(1))
+        };
+
+        // Dequantize the first n_values of each page buffer into f32 rows.
+        let kb = a_storage(k_pages)?.raw_bytes.as_deref().ok_or_else(|| {
+            Error::Backend("paged_quant(cpu): k_pages has no raw_bytes".into())
+        })?;
+        let vb = a_storage(v_pages)?.raw_bytes.as_deref().ok_or_else(|| {
+            Error::Backend("paged_quant(cpu): v_pages has no raw_bytes".into())
+        })?;
+        let deq = |bytes: &[u8], scale: f32| -> Result<Vec<f32>> {
+            let vals = match quant_format {
+                F::WhiteCrow => grim_quant::dequant_whitecrow(bytes, n_values)?,
+                F::Int8 => bytes[..n_values]
+                    .iter()
+                    .map(|&c| (c as i8 as f32) * scale)
+                    .collect(),
+                F::Fp8E4M3 => grim_quant::dequant_fp8(bytes, n_values)?
+                    .into_iter()
+                    .map(|x| x * scale)
+                    .collect(),
+                other => {
+                    return Err(Error::Backend(format!(
+                        "paged_quant(cpu): format {other:?} has no host dequant"
+                    )))
+                }
+            };
+            Ok(vals)
+        };
+        let k_vals = deq(kb, k_scale)?;
+        let v_vals = deq(vb, v_scale)?;
+
+        let q_data = q_st.data();
+        let heads_per_kv = (num_heads / num_kv_heads).max(1);
+        let inv_sqrt = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; num_heads * head_dim];
+        for h in 0..num_heads {
+            let h_kv = h / heads_per_kv;
+            let q_row = &q_data[h * head_dim..(h + 1) * head_dim];
+            // Scores over the causal history.
+            let mut scores = vec![0.0f32; kv_seq_len];
+            let mut max_s = f32::NEG_INFINITY;
+            for s in 0..kv_seq_len {
+                let row = phys_row(s) * kv_dim + h_kv * head_dim;
+                let k_row = &k_vals[row..row + head_dim];
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_row[d] * k_row[d];
+                }
+                let sc = dot * inv_sqrt;
+                scores[s] = sc;
+                max_s = max_s.max(sc);
+            }
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max_s).exp();
+                sum += *s;
+            }
+            let inv = 1.0 / sum;
+            for (s, sc) in scores.iter().enumerate() {
+                let row = phys_row(s) * kv_dim + h_kv * head_dim;
+                let v_row = &v_vals[row..row + head_dim];
+                let w = sc * inv;
+                for d in 0..head_dim {
+                    out[h * head_dim + d] += w * v_row[d];
+                }
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn rope(
         &self,
         x: &dyn BackendStorage,
@@ -2641,6 +2755,20 @@ impl MemoryOps for CpuDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
+        // U8 arith is BYTE-addressed on every backend: the packed KV pages
+        // (WhiteCrow 67 B per 128-value group, int4 half-byte codes, ...)
+        // upload staging buffers whose length need not be a multiple of 4.
+        // Keying on `Storage::Native` alone interpreted U8 blobs as f32 and
+        // rejected any non-multiple-of-4 length; the ROCm dispatcher checks
+        // `arith` first, so the same call succeeded there while the CPU
+        // paged-quant path faulted with "expected [268], got [67]".
+        if dtype.arith == grim_tensor::ArithType::U8 {
+            return Ok(Box::new(CpuStorage::from_raw_bytes(
+                data.to_vec(),
+                shape.clone(),
+                dtype,
+            )));
+        }
         // Native f32: interpret bytes as f32.
         match dtype.storage {
             grim_tensor::dtype::Storage::Native => {
@@ -2667,6 +2795,16 @@ impl MemoryOps for CpuDevice {
     fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
         let n = shape.elem_count();
+        // Task 2.3 follow-up: U8 arith is BYTE-addressed (packed KV pages).
+        // Allocate a zeroed raw-byte buffer, not an f32 vec, so
+        // `copy_bytes_into` has a raw_bytes target to write into.
+        if dtype.arith == grim_tensor::ArithType::U8 {
+            return Ok(Box::new(CpuStorage::from_raw_bytes(
+                vec![0u8; n],
+                shape.clone(),
+                dtype,
+            )));
+        }
         Ok(Box::new(CpuStorage::new(
             vec![0.0f32; n],
             shape.clone(),
@@ -2712,6 +2850,50 @@ impl MemoryOps for CpuDevice {
             let dst_ptr = dst_st.data.as_ptr() as *mut f32;
             let dst_slice = std::slice::from_raw_parts_mut(dst_ptr.add(dst_elem_offset), count);
             dst_slice.copy_from_slice(&src_data[src_elem_offset..src_elem_offset + count]);
+        }
+        Ok(())
+    }
+
+    /// Task 2.3 follow-up: byte-exact copy for PACKED KV pages. The paged
+    /// quant path stages raw bytes (WhiteCrow 67 B groups, int4 half-bytes)
+    /// whose length is not a multiple of 4 and whose dst is a `raw_bytes`
+    /// storage — the f32-indexed `copy_slice_range` cannot serve it.
+    /// Byte-counted offsets and count, same raw-pointer mutation through the
+    /// Arc as `copy_slice_range` above.
+    fn copy_bytes_into(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_byte_offset: usize,
+        src: &dyn BackendStorage,
+        src_byte_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let dst_st = a_storage(dst)?;
+        let src_st = a_storage(src)?;
+        let dst_rb = dst_st.raw_bytes.as_deref().ok_or_else(|| {
+            Error::Backend("copy_bytes_into: dst has no raw_bytes buffer".into())
+        })?;
+        let src_rb = src_st.raw_bytes.as_deref().ok_or_else(|| {
+            Error::Backend("copy_bytes_into: src has no raw_bytes buffer".into())
+        })?;
+        if src_byte_offset + count > src_rb.len() {
+            return Err(Error::ShapeMismatch {
+                expected: vec![src_byte_offset + count],
+                got: vec![src_rb.len()],
+            });
+        }
+        if dst_byte_offset + count > dst_rb.len() {
+            return Err(Error::IndexOutOfBounds(format!(
+                "copy_bytes_into: dst [{}, {}) out of bounds for {} raw bytes",
+                dst_byte_offset,
+                dst_byte_offset + count,
+                dst_rb.len()
+            )));
+        }
+        unsafe {
+            let dst_ptr = dst_rb.as_ptr() as *mut u8;
+            let dst_slice = std::slice::from_raw_parts_mut(dst_ptr.add(dst_byte_offset), count);
+            dst_slice.copy_from_slice(&src_rb[src_byte_offset..src_byte_offset + count]);
         }
         Ok(())
     }

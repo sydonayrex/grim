@@ -996,55 +996,72 @@ pub fn fused_or_scalar_attention_paged_quant(
     )
     .map_err(|e| grim_core::error::Error::Backend(format!("v page append: {e}")))?;
 
-    // Identity block table: one page per token, so logical page == physical page.
-    //
-    // The kernel reads this as `BlockTableEntry*`, NOT as f32: each entry is two
+    // Identity block table (block_id, page_size) pairs are built PER QUERY in
+    // the causal loop below: token t sees history rows [0, start + t]. The
+    // kernel reads this as `BlockTableEntry*`, NOT as f32: each entry is two
     // u32 words (block_id, page_size), so the table needs an 8-byte stride per
     // page. Uploading `[0.0, 1.0, 2.0, ...]` as f32 makes page 1 read f32[2]
     // and decode 1.0f32's bit pattern (1065353216) as a block_id, which then
-    // computes an astronomical `elem_offset` and faults the GPU. The parity test
-    // passes because it builds the table as real (block_id, page_size) pairs.
-    let mut block_table_words: Vec<u32> = Vec::with_capacity(n_after * 2);
-    for i in 0..n_after {
-        block_table_words.push(i as u32); // block_id: identity mapping
-        block_table_words.push(1); // page_size: one token per page
-    }
-    let table_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            block_table_words.as_ptr() as *const f32,
-            block_table_words.len(),
-        )
-    };
-    let table = dev
-        .from_cpu(table_f32, &Shape::new(vec![1, n_after, 2]), DType::F32)
-        .map_err(|e| grim_core::error::Error::Backend(format!("block table upload: {e}")))?;
+    // computes an astronomical `elem_offset` and faults the GPU.
 
     cache.current_pos = n_after;
 
-    let out_shape = Shape::new(vec![1, num_heads, head_dim]);
-    let q_dev = dev
-        .from_cpu(q, &out_shape, DType::F32)
-        .map_err(|e| grim_core::error::Error::Backend(format!("q upload: {e}")))?;
-    let (storage, _handle) = dev
-        .qkv_attention_paged_quant(
-            q_dev.as_ref(),
-            table.as_ref(),
-            cache.k_pages.as_ref().unwrap().as_ref(),
-            cache.v_pages.as_ref().unwrap().as_ref(),
-            num_kv_heads,
-            n_after, // max_blocks
-            1,       // page_size: one token per page
-            n_after, // kv_seq_len
-            0,       // cache_offset
-            &out_shape,
-            fmt,
-            k_scale,
-            v_scale,
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("paged quant attention: {e}")))?;
+    // The paged kernel is decode-shaped (ONE query, out [1, heads, hd]) but
+    // this fn returns [steps, heads*hd] — a multi-token prefill must attend
+    // CAUSALLY per position: token t (absolute `start + t`) sees history
+    // rows [0, start + t]. Append all KV once (above), then loop queries.
+    // steps == 1 is the decode case and takes the same single-iteration path.
+    let q_dim = num_heads * head_dim;
+    let mut outs: Vec<f32> = Vec::with_capacity(steps * q_dim);
+    for t in 0..steps {
+        let kv_len = start + t + 1;
+        let mut block_table_words: Vec<u32> = Vec::with_capacity(kv_len * 2);
+        for i in 0..kv_len {
+            block_table_words.push(i as u32); // block_id: identity mapping
+            block_table_words.push(1); // page_size: one token per page
+        }
+        let table_f32: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                block_table_words.as_ptr() as *const f32,
+                block_table_words.len(),
+            )
+        };
+        let table = dev
+            .from_cpu(table_f32, &Shape::new(vec![1, kv_len, 2]), DType::F32)
+            .map_err(|e| grim_core::error::Error::Backend(format!("block table upload: {e}")))?;
+
+        let out_shape = Shape::new(vec![1, num_heads, head_dim]);
+        let q_dev = dev
+            .from_cpu(&q[t * q_dim..(t + 1) * q_dim], &out_shape, DType::F32)
+            .map_err(|e| grim_core::error::Error::Backend(format!("q upload: {e}")))?;
+        let (storage, _handle) = dev
+            .qkv_attention_paged_quant(
+                q_dev.as_ref(),
+                table.as_ref(),
+                cache.k_pages.as_ref().unwrap().as_ref(),
+                cache.v_pages.as_ref().unwrap().as_ref(),
+                num_kv_heads,
+                kv_len,  // max_blocks
+                1,       // page_size: one token per page
+                kv_len,  // kv_seq_len: causal — token t sees rows [0, start+t]
+                0,       // cache_offset
+                &out_shape,
+                fmt,
+                k_scale,
+                v_scale,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("paged quant attention: {e}")))?;
+        outs.extend_from_slice(&storage.to_cpu_vec_f32().map_err(|e| {
+            grim_core::error::Error::Backend(format!("paged quant attention readback: {e}"))
+        })?);
+    }
 
     Ok(Tensor::new(
-        Arc::from(storage),
+        Arc::from(dev.from_cpu(
+            &outs,
+            &Shape::new(vec![steps, num_heads * head_dim]),
+            DType::F32,
+        )?),
         Shape::new(vec![steps, num_heads * head_dim]),
         DType::F32,
         grim_tensor::QuantProvenance::default(),
