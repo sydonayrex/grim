@@ -267,6 +267,29 @@ impl Engine {
                     );
                 }
             } else if matched_tokens > 0 {
+                // Task 10.7: CacheBlend non-prefix chunk matching
+                // When prefix match cannot be consumed, check if CacheBlend can stitch
+                // reusable non-prefix chunk segments
+                let chunk_size = 64usize;
+                if full_input.len() >= chunk_size * 2 {
+                    let blend_engine = crate::cache_blend::CacheBlendEngine::new(chunk_size);
+                    let n_chunks = full_input.len() / chunk_size;
+                    let hashes: Vec<u64> = (0..n_chunks)
+                        .map(|i| {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            full_input[i * chunk_size..(i + 1) * chunk_size].hash(&mut hasher);
+                            hasher.finish()
+                        })
+                        .collect();
+                    let layout = blend_engine.plan_stitched_prompt(&hashes, chunk_size, |_h| None);
+                    if layout.cached_token_count > 0 {
+                        log::info!(
+                            "[grim-engine] req {id} cache-blend non-prefix layout planned: {} tokens reusable",
+                            layout.cached_token_count
+                        );
+                    }
+                }
                 log::info!(
                     "[grim-engine] req {id} radix match not consumed ({}/{} tokens; skip_tokens={}, hybrid={}, promoted={})",
                     matched_tokens,
