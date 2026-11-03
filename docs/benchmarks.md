@@ -1301,3 +1301,25 @@ Measurements taken on dual RDNA4 system:
   - Step-0 KL divergence: `0.000e0`
   - Mean KL (33-step window): `0.000e0`
   - Top-1 token agreement: **512 / 512 (100.00%)**
+
+## 9. KV-eviction capacity sweep — the "cap 47/48 corruption" refuted (2026-11-02, Task Phase 3)
+
+The plan's P0 ("eager KV arena corruption under eviction; caps 47/48 fail, 46/49 pass, row 25
+diverges") was a misread of ring semantics: rows inside the wrap window
+(`sinks + (t - sinks) % (cap - sinks)` for `t >= cap`) hold different tokens at different caps
+BY SPECIFICATION. Gates (device 1, gfx1201, `qwen35_attn_d2d_parity.rs`, commit `2313bfdf`):
+
+- Safe rows 20..46 (below every wrap, above sinks): bit-stable across caps 46/47/48/49 and vs
+  the uncapped reference — 0 diverging rows.
+- Churn at steps = 3 x cap (138/141/144/147): every arena row (sinks, direct, fully wrapped)
+  bit-matches the uncapped reference's last-writer row under the single host ring map.
+- Graph replay: `qwen35_graph_serves_curdvk_eviction_like_eager` green.
+- 9B end-to-end (Qwen3.5-9B-Q4_K_M, greedy): all caps fluent; cap-49 output token-identical to
+  uncapped for the first 36 generated tokens, diverging only after eviction bites.
+
+BLOCKER found en route (NEW P0, unrelated to eviction): 27B two-card decode is broken on HEAD.
+Default split (24/40) leaves dev1 at 0.25 GiB post-prewarm and the decode workspace
+(178,257,920 B) is denied (`GRIM_ROCM_MANAGED_FALLBACK=deny`); forced `GRIM_SPLIT_LAYERS=32,32`
+page-faults at the vocab-wide kernel (grid [248320,1,1], workgroup 256) with and without
+`AMD_SERIALIZE_KERNEL=3`. Baseline (AE75E0C6) ran 32/32 with 2.25/2.00 GiB free — regression
+landed between the baseline and HEAD. The 27B PPL-at-cap gate is blocked on this.
