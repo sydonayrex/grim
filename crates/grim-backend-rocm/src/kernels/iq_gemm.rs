@@ -3373,17 +3373,6 @@ extern "C" __global__ void grim_moe_pairs_reduce(
 }
 
 // out[toks[r]] += wts[r] * in[r] (pair-compact scaled scatter-add).
-extern "C" __global__ void grim_moe_scatter_add_rows(
-    float* __restrict__ out, const int* __restrict__ toks,
-    const float* __restrict__ wts, const float* __restrict__ in, int hidden)
-{
-    const int r = blockIdx.x;
-    const int tok = toks[r];
-    const float w = wts[r];
-    for (int i = threadIdx.x; i < hidden; i += blockDim.x)
-        atomicAdd(out + (long long)tok * hidden + i, w * in[(long long)r * hidden + i]);
-}
-
 // DETERMINISTIC variant: write w*in[r] to out[idx[r]] (plain store, no
 // atomics). idx[r] is the pair's position in TOKEN-sorted order, so the
 // subsequent per-token reduction sums in a fixed order.

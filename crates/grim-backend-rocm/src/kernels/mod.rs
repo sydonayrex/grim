@@ -50,7 +50,6 @@ pub mod moe_mega_kernel;
 pub mod mrope;
 pub mod mxfp4_gemm;
 pub mod mxfp_standalone;
-pub mod prefill_compact;
 pub mod preshuffled_attention;
 pub mod q2_0_gemm;
 pub mod q2k_gemm;

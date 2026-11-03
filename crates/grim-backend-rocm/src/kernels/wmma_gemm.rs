@@ -426,31 +426,6 @@ extern "C" __global__ void grim_wmma_gemm_b_transposed_rdna4(
 
 // ---------- Raven FP8 Kernels ----------
 
-// Native FP8 WMMA / Scalar Fallback GEMM
-extern "C" __global__ void grim_wmma_gemm_fp8(
-    const unsigned char* __restrict__ A,
-    const unsigned char* __restrict__ B,
-    float* __restrict__ C,
-    int M, int N, int K,
-    int stride_a, int stride_b, int stride_c)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
-    if (idx >= total) return;
-
-    const int row = idx / N;
-    const int col = idx % N;
-
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        float a_val = fp8_e4m3_to_float_hip(A[row * stride_a + k]);
-        float b_val = fp8_e4m3_to_float_hip(B[k * stride_b + col]);
-        acc += a_val * b_val;
-    }
-
-    C[row * stride_c + col] = acc;
-}
-
 // FP8 Fused Dequant GEMM Forward
 extern "C" __global__ void grim_fused_dequant_gemm_fp8(
     const float* __restrict__ A,

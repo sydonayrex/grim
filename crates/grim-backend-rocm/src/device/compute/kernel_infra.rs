@@ -499,93 +499,6 @@ impl RocmDevice {
         Ok(stream)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn launch_madam_update_f32(
-        &self,
-        dx_storage: &RocmStorage,
-        weight_storage: &RocmStorage,
-        scale_storage: Option<&RocmStorage>,
-        m_buffer: &RocmStorage,
-        v_buffer: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        step: i32,
-    ) -> Result<*mut c_void> {
-        let dx_ptr = dx_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("madam_update: dX has no device ptr".into()))?;
-        let w_ptr = weight_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("madam_update: weight has no device ptr".into()))?;
-        let m_ptr = m_buffer
-            .device_ptr
-            .ok_or_else(|| Error::Backend("madam_update: m_buffer has no device ptr".into()))?;
-        let v_ptr = v_buffer
-            .device_ptr
-            .ok_or_else(|| Error::Backend("madam_update: v_buffer has no device ptr".into()))?;
-        let scale_ptr: *const std::ffi::c_void = scale_storage
-            .and_then(|s| s.device_ptr)
-            .map(|p| p as *const std::ffi::c_void)
-            .unwrap_or(std::ptr::null());
-
-        const BLOCK_SIZE: usize = 256;
-        let total_elems: u64 = (m as u64)
-            .checked_mul(k as u64)
-            .ok_or_else(|| Error::Backend("madam_update: m*k overflow".into()))?;
-        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
-            .try_into()
-            .map_err(|_| {
-                Error::Backend(format!(
-                    "madam_update: grid too large for u32 ({} blocks)",
-                    total_elems / BLOCK_SIZE as u64
-                ))
-            })?;
-
-        let grid_dim = HipDim3::new(grid_x, 1, 1);
-        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
-
-        let mut dxptr = dx_ptr;
-        let mut wptr = w_ptr;
-        let mut sptr = scale_ptr;
-        let mut mptr = m_ptr;
-        let mut vptr = v_ptr;
-        let mut mm = m as i32;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-        let mut lr_f = lr;
-        let mut b1 = beta1;
-        let mut b2 = beta2;
-        let mut ep = eps;
-        let mut stp = step;
-
-        self.launch_compute_kernel(
-            "grim_madam_update_f32",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut dxptr),
-                arg(&mut wptr),
-                arg(&mut sptr),
-                arg(&mut mptr),
-                arg(&mut vptr),
-                arg(&mut mm),
-                arg(&mut nn),
-                arg(&mut kk),
-                arg(&mut lr_f),
-                arg(&mut b1),
-                arg(&mut b2),
-                arg(&mut ep),
-                arg(&mut stp),
-            ],
-        )?;
-        Ok(std::ptr::null_mut())
-    }
-
     /// Launch the JIT compiled SplitK reduction kernel (WI-D).
     pub(crate) fn launch_split_k_reduction(
         &self,
@@ -656,7 +569,7 @@ impl RocmDevice {
     ) -> Result<(std::path::PathBuf, String)> {
         // Set the device before compiling or loading, exactly as every other launch
         // path in this file does (see launch_compute_kernel_on_stream,
-        // launch_madam_update_f32, launch_compute_kernel_with_solution). Without it
+        // launch_compute_kernel_with_solution). Without it
         // the module is loaded and launched against whatever device happens to be
         // ambient, and on a device where these buffers are not mapped that surfaces
         // as a "page not present" memory access fault at launch -- not as a launch
