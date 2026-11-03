@@ -878,6 +878,16 @@ impl RocmDevice {
         autotuner.save_to_file(path)
     }
 
+    /// Persist the in-memory autotune cache to the default location `.autotune_cache/{gpu_target}.json`.
+    pub fn save_default_autotune_cache(&self) -> Result<()> {
+        let dir = std::path::Path::new(".autotune_cache");
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let path = dir.join(format!("{}.json", self.gpu_target));
+        self.save_autotune_cache(&path)
+    }
+
     /// Return a fresh HardwareSpec snapshot describing this device.
     pub fn hardware_spec(&self) -> crate::device::hardware_spec::HardwareSpec {
         crate::device::hardware_spec::HardwareSpec::from(self)

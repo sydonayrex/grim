@@ -2966,3 +2966,39 @@ async fn test_request_limits_context_length_and_queue_admission() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"]["code"], "queue_full");
 }
+
+#[tokio::test]
+async fn test_graceful_shutdown_admission_and_drain() {
+    use crate::{AdmissionTicket, SHUTDOWN_REQUESTED, cancel_all_active_requests, register_cancel_token};
+    use axum::http::StatusCode;
+
+    // 1. Admission succeeds normally when not shutting down
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    let ticket = AdmissionTicket::try_acquire().expect("admission should succeed when not shutting down");
+
+    // 2. Register a cancel token for a dummy request
+    let token = register_cancel_token(99999);
+    assert!(!token.is_cancelled());
+
+    // 3. Initiate shutdown
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+
+    // 4. Subsequent admission is immediately rejected with 503 and Retry-After
+    let resp = match AdmissionTicket::try_acquire() {
+        Ok(_) => panic!("admission must be refused during shutdown"),
+        Err(r) => r,
+    };
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("5"));
+
+    // 5. Active requests get cancelled
+    cancel_all_active_requests();
+    assert!(token.is_cancelled());
+
+    // 6. Dropping the in-flight ticket decrements admission counter
+    drop(ticket);
+
+    // 7. Reset state for other tests
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    crate::take_cancel_token(99999);
+}

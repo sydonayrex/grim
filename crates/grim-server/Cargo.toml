@@ -27,7 +27,7 @@ grim-disagg = { workspace = true }
 thiserror = { workspace = true }
 axum = "0.7"
 serde_json = "1"
-tokio = { version = "1", features = ["net", "rt", "time", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "time", "macros", "signal"] }
 tokio-util = { version = "0.7" }
 futures = "0.3"
 axum-server = { version = "0.8", features = ["tls-rustls"] }

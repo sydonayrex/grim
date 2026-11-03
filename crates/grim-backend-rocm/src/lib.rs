@@ -174,6 +174,19 @@ pub use crate::device::util::{
 };
 pub use crate::peer_access::{enable_peer_access, enumerate_devices, p2p_memcpy_async};
 
+/// Save autotune cache for all enumerated ROCm devices.
+/// Safe to call on shutdown; logs warnings rather than panicking.
+pub fn save_all_autotune_caches() {
+    let count = enumerate_devices().unwrap_or(0);
+    for ord in 0..count {
+        if let Ok(dev) = RocmDevice::try_new(ord) {
+            if let Err(e) = dev.save_default_autotune_cache() {
+                eprintln!("[grim-backend-rocm] Failed saving autotune cache for device {ord}: {e}");
+            }
+        }
+    }
+}
+
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.
 #[cfg(feature = "training")]

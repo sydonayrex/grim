@@ -164,6 +164,73 @@ impl Drop for RequestCleanupGuard {
 /// used by tests to assert exactly-once cleanup.
 pub static LIVE_CLEANUP_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
+/// Flag indicating whether server shutdown has been initiated.
+/// When true, admission is closed and new incoming requests are rejected immediately.
+pub static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Signal handler listening for SIGTERM or SIGINT (Ctrl+C).
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("[grim-server] Received Ctrl+C; beginning graceful shutdown");
+        },
+        _ = terminate => {
+            tracing::info!("[grim-server] Received SIGTERM; beginning graceful shutdown");
+        },
+    }
+
+    // 1. Mark shutdown requested so admission stops immediately
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+
+    // 2. Cancel all active streaming requests
+    cancel_all_active_requests();
+
+    // 3. Drain in-flight requests (bounded up to 10s)
+    let drain_start = std::time::Instant::now();
+    while ADMISSION_COUNTER.load(Ordering::SeqCst) > 0 {
+        if drain_start.elapsed().as_secs() >= 10 {
+            tracing::warn!(
+                "[grim-server] Shutdown drain timeout reached ({} requests still in flight); proceeding",
+                ADMISSION_COUNTER.load(Ordering::SeqCst)
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // 4. Persist autotune caches to disk
+    tracing::info!("[grim-server] Persisting autotune caches...");
+    grim_backend_rocm::save_all_autotune_caches();
+    tracing::info!("[grim-server] Graceful shutdown cleanup complete");
+}
+
+/// Cancel all active streaming requests via their registered cancellation tokens.
+pub fn cancel_all_active_requests() {
+    if let Ok(tokens) = CANCEL_TOKENS.lock() {
+        for token in tokens.values() {
+            token.cancel();
+        }
+    }
+}
+
 /// Active/queued request counter for admission control.
 pub static ADMISSION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -200,6 +267,25 @@ impl AdmissionTicket {
         counter: &AtomicUsize,
         max_q: usize,
     ) -> std::result::Result<Self, Response> {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "Server is shutting down",
+                        "type": "service_unavailable",
+                        "code": "server_shutting_down"
+                    }
+                })),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+            return Err(resp);
+        }
+
         let current = counter.fetch_add(1, Ordering::SeqCst);
         if current >= max_q {
             counter.fetch_sub(1, Ordering::SeqCst);
@@ -4139,6 +4225,7 @@ pub async fn serve(
             .await
             .map_err(|e| grim_core::Error::Config(format!("bind failed: {e}")))?;
         axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| grim_core::Error::Config(format!("serve HTTP failed: {e}")))?;
     }
