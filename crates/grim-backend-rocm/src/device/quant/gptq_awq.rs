@@ -784,27 +784,41 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("ostquant gemv: out has no device ptr".into()))?;
 
-        static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v3 = *V3.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_WHITECROW_V3").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
+        // Default is v5 (unified with dot_gemv.rs). GRIM_WHITECROW_V2=1 keeps v2 reachable as an A/B rollback arm.
+        // v1 (grim_dot8_w4a4_gemv) is selected only when explicitly requested (GRIM_WHITECROW_V1=1 or GRIM_WHITECROW_V5=0 / V3=0).
         static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v2 = *V2.get_or_init(|| {
-            !matches!(
+            matches!(
                 std::env::var("GRIM_WHITECROW_V2").as_deref(),
-                Ok("0" | "false" | "off")
+                Ok("1" | "true" | "on")
             )
         });
-        let grid_x = if v3 {
+        static V3_OR_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_v5 = *V3_OR_V5.get_or_init(|| {
+            if v2 {
+                false
+            } else if matches!(
+                std::env::var("GRIM_WHITECROW_V1").as_deref(),
+                Ok("1" | "true" | "on")
+            ) {
+                false
+            } else {
+                !matches!(
+                    std::env::var("GRIM_WHITECROW_V3").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) && !matches!(
+                    std::env::var("GRIM_WHITECROW_V5").as_deref(),
+                    Ok("0" | "false" | "off")
+                )
+            }
+        });
+        let grid_x = if use_v5 {
             (n as u32).div_ceil(16)
         } else {
             (n as u32).div_ceil(4)
         };
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = if v3 {
+        let block_dim = if use_v5 {
             HipDim3::new(128, 1, 1)
         } else {
             HipDim3::new(32, 1, 1)
@@ -821,16 +835,13 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
-        if v2 || v3 {
+        if v2 || use_v5 {
             crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
         }
-        // GRIM_WHITECROW_V3=1 routes to v5: v3's layout and loads with the
-        // scalar tail replaced by the predicated 4-group structure — outputs
-        // bit-identical, measured 1.2-1.3x faster warm (K=5120/17408) and
-        // faster cold. See the v5 kernel comment and
-        // corvid_w4a4_v4_bit_exact_and_ab for the evidence.
+        // Default routes to v5: v3's layout and loads with the
+        // scalar tail replaced by the predicated 4-group structure.
         self.launch_compute_kernel(
-            if v3 {
+            if use_v5 {
                 "grim_dot8_w4a4_gemv_v5"
             } else if v2 {
                 "grim_dot8_w4a4_gemv_v2"

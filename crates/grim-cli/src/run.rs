@@ -3234,16 +3234,17 @@ mod tests {
         assert_eq!(bos_token_to_prepend(&tok, false), None);
     }
 
-    /// `--raw` means verbatim: never inject a BOS, whatever the metadata says.
+    /// Even in raw mode, if the checkpoint explicitly asks for add_bos_token (like LFM2.5 / Llama),
+    /// we prepend BOS so the model stays on-distribution. Verbatim prompts without declared BOS do not get one.
     #[test]
-    fn raw_mode_never_prepends_bos() {
+    fn raw_mode_prepends_bos_if_checkpoint_requests() {
         let mut tok = GgufTokenizer::default();
         tok.add_bos_token = true;
         tok.bos_token_id = Some(1);
         assert_eq!(
             bos_token_to_prepend(&tok, true),
-            None,
-            "raw mode must feed the prompt verbatim"
+            Some(1),
+            "raw mode prepends declared BOS when add_bos_token is true"
         );
     }
 
