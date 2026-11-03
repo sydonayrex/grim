@@ -301,26 +301,58 @@ impl CollectiveOps for RocmDevice {
             let out_ptr_val = dev_ptr(&out_storage)?;
             let out_ptr_usize = out_ptr_val as usize;
 
-            // Place each partial at its column offset, row by row (D2D memcpy).
+            // Task 10.8: assemble with the fused P2P epilogue kernel — one
+            // launch per partial instead of m synchronous per-row D2D
+            // memcpys. The kernel atomicAdd-accumulates into the zeroed
+            // assembly buffer, so ranges stay disjoint-correct like the copy
+            // path. F16/BF16 keep the D2D loop (the kernel reads f32 only).
             let mut col_offset = 0usize;
-            for (storage, _placement) in partials {
-                let s = as_rocm(*storage)?;
-                let partial_ptr = dev_ptr(s)? as usize;
-                let n_cols = s.shape().dims().get(1).copied().unwrap_or(0);
-                for row in 0..m {
-                    let src = (partial_ptr + row * n_cols * elem_bytes) as *const c_void;
-                    let dst =
-                        (out_ptr_usize + (row * n_total + col_offset) * elem_bytes) as *mut c_void;
-                    check_hip("hipMemcpy(D2D) comm_fuse", unsafe {
-                        crate::hipMemcpy(
-                            dst,
-                            src,
-                            n_cols * elem_bytes,
-                            crate::HipMemcpyKind::DeviceToDevice,
-                        )
-                    })?;
+            if dtype.arith == ArithType::F32 {
+                check_hip("hipMemsetAsync comm_fuse zero", unsafe {
+                    crate::device::handles::hipMemsetAsync(
+                        out_ptr_val as *mut c_void,
+                        0,
+                        m * n_total * elem_bytes,
+                        stream,
+                    )
+                })?;
+                for (storage, _placement) in partials {
+                    let s = as_rocm(*storage)?;
+                    let n_cols = s.shape().dims().get(1).copied().unwrap_or(0);
+                    if n_cols > 0 {
+                        crate::kernels::comm_fuse::launch_comm_fuse_p2p_epilogue(
+                            self,
+                            s,
+                            &out_storage,
+                            col_offset as u32,
+                            m as u32,
+                            n_cols as u32,
+                            n_total as u32,
+                        )?;
+                    }
+                    col_offset += n_cols;
                 }
-                col_offset += n_cols;
+            } else {
+                for (storage, _placement) in partials {
+                    let s = as_rocm(*storage)?;
+                    let partial_ptr = dev_ptr(s)? as usize;
+                    let n_cols = s.shape().dims().get(1).copied().unwrap_or(0);
+                    for row in 0..m {
+                        let src = (partial_ptr + row * n_cols * elem_bytes) as *const c_void;
+                        let dst = (out_ptr_usize
+                            + (row * n_total + col_offset) * elem_bytes)
+                            as *mut c_void;
+                        check_hip("hipMemcpy(D2D) comm_fuse", unsafe {
+                            crate::hipMemcpy(
+                                dst,
+                                src,
+                                n_cols * elem_bytes,
+                                crate::HipMemcpyKind::DeviceToDevice,
+                            )
+                        })?;
+                    }
+                    col_offset += n_cols;
+                }
             }
 
             // Optional RCCL cross-GPU all-reduce on the assembled buffer.
