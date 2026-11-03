@@ -71,6 +71,30 @@ impl From<&RocmDevice> for HardwareSpec {
             (cap.tflops_fp16 as f64) * 1e12,
         );
 
+        // Query real device count and inter-device topology
+        let count = crate::peer_access::enumerate_devices().unwrap_or(1).max(1);
+        let mut links = vec![vec![LinkType::NoLink; count]; count];
+        for i in 0..count {
+            for j in 0..count {
+                if i == j {
+                    links[i][j] = LinkType::PeerDirect;
+                } else {
+                    let status = crate::peer_access::peer_status(i as i32, j as i32)
+                        .unwrap_or(crate::peer_access::P2PStatus::Host);
+                    links[i][j] = match status {
+                        crate::peer_access::P2PStatus::P2P | crate::peer_access::P2PStatus::Pcie => {
+                            if crate::peer_access::enable_peer_access(i as i32, j as i32).unwrap_or(false) {
+                                LinkType::PeerDirect
+                            } else {
+                                LinkType::HostBounce
+                            }
+                        }
+                        crate::peer_access::P2PStatus::Host => LinkType::HostBounce,
+                    };
+                }
+            }
+        }
+
         HardwareSpec {
             gcn_arch: arch,
             wavefront_size: wf,
@@ -81,8 +105,8 @@ impl From<&RocmDevice> for HardwareSpec {
             mem_bandwidth_gb_s: bandwidth,
             peak_flops_fp16: peak_flops,
             p2p_topology: P2PTopology {
-                device_count: 1,
-                links: vec![vec![LinkType::NoLink]],
+                device_count: count,
+                links,
             },
         }
     }
