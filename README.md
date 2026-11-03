@@ -8,7 +8,7 @@ Grim provides execution and fine-tuning of neural network models without relianc
 
 ## Prerequisites
 
-- **Rust toolchain**: Edition 2024, version 1.85 or higher (`rustup update 1.85`)
+- **Rust toolchain**: Edition 2024, version 1.86.0 or higher (`rustup update 1.86.0`)
 - **System C compiler / LLVM**: `clang` and `llvm-dev` (required for ROCm JIT kernel compilation)
 - **ROCm runtime**: `libhipblas.so` and `librocblas.so` (required for AMD GPU execution)
 - **CUDA toolkit**: Version 11.8 or higher (optional, for NVIDIA GPU support)

@@ -45,7 +45,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "EPL-2.0"
-rust-version = "1.86"
+rust-version = "1.86.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

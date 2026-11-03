@@ -16,7 +16,7 @@ Install Grim, build it from source, and optionally register it as a background s
 nvcc --version
 nvidia-smi
 
-# Rust 1.85+ is required for both:
+# Rust 1.86.0+ is required for both:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
