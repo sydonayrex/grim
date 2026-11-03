@@ -29,7 +29,12 @@ const HIP_SO_CANDIDATES: &[&str] = &[
     "libamdhip64.so.6",
     "libamdhip64.so.5",
     "libhiprtc.so",
+    "libhiprtc.so.6",
+    "libhiprtc.so.5",
     "librocblas.so",
+    "librocblas.so.5",
+    "librocblas.so.4",
+    "librocblas.so.3",
 ];
 
 /// Candidate ROCm lib-dir roots in priority order. `workspace_root` is the
@@ -56,8 +61,8 @@ fn candidate_lib_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
     for fixed in [
         "/opt/rocm/lib",
         "/usr/lib/rocm/lib",
-        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/core/lib",
-        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/lib",
+        "/usr/lib/rocm",
+        "/usr/lib64",
     ] {
         let p = PathBuf::from(fixed);
         if p.is_dir() {
@@ -119,8 +124,7 @@ fn candidate_include_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
     for fixed in [
         "/opt/rocm/include",
         "/usr/include/rocm",
-        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/core/include",
-        "/home/nelson/.cache/yay/rocm-bin/src/opt/rocm/include",
+        "/usr/include",
     ] {
         let p = PathBuf::from(fixed);
         if p.is_dir() {

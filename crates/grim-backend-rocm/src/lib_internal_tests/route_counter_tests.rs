@@ -152,7 +152,6 @@ fn concurrent_increments_are_exact() {
         THREADS * PER_THREAD,
         "concurrent increments must not lose updates"
     );
-    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
@@ -175,7 +174,6 @@ fn distinct_kernels_are_counted_independently() {
 
     let snap = kernel_route_snapshot();
     assert_eq!(snap.len(), 2, "only launched kernels appear: {snap:?}");
-    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
@@ -202,7 +200,6 @@ fn long_similar_names_do_not_collide() {
         1,
         "prefix-sharing names must not merge"
     );
-    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 
@@ -222,7 +219,6 @@ fn repeated_names_reuse_one_entry() {
     }
     assert_eq!(kernel_route_snapshot().len(), 1);
     assert_eq!(rocm_kernel_route_counter("grim_repeat"), 1000);
-    let _counter_lock = counter_test_lock();
     reset_kernel_route_counters();
 }
 

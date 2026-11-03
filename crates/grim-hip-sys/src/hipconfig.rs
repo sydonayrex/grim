@@ -51,23 +51,30 @@ pub fn extract_latest_hip_feature_from_path<P: AsRef<std::path::Path>>(
 fn exec_hipconfig(args: &[&str]) -> std::io::Result<String> {
     match Command::new(HIPCONFIG).args(args).output() {
         Ok(output) => {
-            if output.stderr.is_empty() {
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            } else {
-                panic!(
-                    "Error executing {HIPCONFIG}. The process returned:\n{}",
+            if !output.stderr.is_empty() {
+                println!(
+                    "cargo::warning=hipconfig printed stderr: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                Ok(stdout)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("{HIPCONFIG} returned empty stdout"),
+                ))
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             println!("cargo::warning=Could not find '{HIPCONFIG}' in your PATH. You should install ROCm HIP or ensure '{HIPCONFIG}' is available. For more information please visit https://rocm.docs.amd.com/projects/install-on-linux/en/latest/.");
             Err(e)
         }
-        Err(e) => panic!(
-            "Failed to run '{HIPCONFIG}' with args '{args:?}', reason: {}",
-            e
-        ),
+        Err(e) => {
+            println!("cargo::warning=Failed to run '{HIPCONFIG}' with args '{args:?}': {e}");
+            Err(e)
+        }
     }
 }
 
