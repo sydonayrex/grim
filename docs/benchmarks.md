@@ -1317,9 +1317,20 @@ BY SPECIFICATION. Gates (device 1, gfx1201, `qwen35_attn_d2d_parity.rs`, commit 
 - 9B end-to-end (Qwen3.5-9B-Q4_K_M, greedy): all caps fluent; cap-49 output token-identical to
   uncapped for the first 36 generated tokens, diverging only after eviction bites.
 
-BLOCKER found en route (NEW P0, unrelated to eviction): 27B two-card decode is broken on HEAD.
-Default split (24/40) leaves dev1 at 0.25 GiB post-prewarm and the decode workspace
-(178,257,920 B) is denied (`GRIM_ROCM_MANAGED_FALLBACK=deny`); forced `GRIM_SPLIT_LAYERS=32,32`
-page-faults at the vocab-wide kernel (grid [248320,1,1], workgroup 256) with and without
-`AMD_SERIALIZE_KERNEL=3`. Baseline (AE75E0C6) ran 32/32 with 2.25/2.00 GiB free — regression
-landed between the baseline and HEAD. The 27B PPL-at-cap gate is blocked on this.
+BLOCKER found en route (NEW P0, unrelated to eviction): 27B two-card CLI decode faults on HEAD.
+REFINED 2026-11-02 (bisect round 2, supersedes the VRAM-pressure reading above): the fault is
+DETERMINISTIC and NOT memory-pressure-bound. At `GRIM_SPLIT_LAYERS=32,32
+GRIM_PREFILL_CHUNK_SIZE=256` (2.25/2.50 GiB free post-prewarm — the baseline numbers), HEAD
+faults 3/3 runs; baseline commit `d780bd54` is clean 3/3 in the identical env. `git bisect`
+(automated, real-hardware probe) lands the boundary at `3eb500a6` (clean x2) |
+`87d9adcf` (faults x2+) — but `87d9adcf` is PURELY ADDITIVE (419 insertions, 0 deletions; new
+speculative launchers + trait defaults + an uncalled fn). A round-1 bisect under a different
+env named `17cbfafe` instead: the boundary MOVES with environment, which means the additive
+commits are layout TRIGGERS, not the root cause. Root cause: a latent fault in the 27B
+prefill-logits kernel — the faulting launch is grid [248320,1,1] x block [256,1,1] =
+exactly chunk_len x vocab / 256 elements — that a binary-layout shift exposes. The baseline
+(d780bd54) binary hides it by layout luck, not by correctness.
+No workaround found at HEAD: chunk 64/128/256/1024, splits 24/40-26/38-32/32, ctx 768-4096,
+graph on/off all fault (or the graph-pool alloc is cleanly denied -> Error).
+NEXT: debug the [chunk,vocab] logits kernel directly (kernarg geometry / scratch sizing) on a
+d780bd54-vs-HEAD kernarg dump; unblocks Tasks 2.3, 6.4 and the 27B PPL-at-cap gate.
