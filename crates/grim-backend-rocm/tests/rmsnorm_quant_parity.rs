@@ -103,7 +103,7 @@ fn rmsnorm_quant_fused_parity() {
 #[ignore]
 fn rmsnorm_quant_q81_dual_parity() {
     use grim_backend_rocm::as_rocm;
-    use grim_tensor::{ArithType, MemoryOps};
+    use grim_tensor::{ArithType, BackendStorage, MemoryOps};
 
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
@@ -185,7 +185,7 @@ fn rmsnorm_quant_q81_dual_parity() {
             as_rocm(s.as_ref()).unwrap().to_cpu_vec_f32().unwrap()
                 .iter().map(|v| v.to_bits()).collect()
         };
-        for (i, (&r, &d)) in bits(&out_ref).iter().zip(bits(&out_dual)).enumerate() {
+        for (i, (&r, &d)) in bits(&out_ref).iter().zip(bits(&out_dual).iter()).enumerate() {
             assert_eq!(r, d, "rms dual out_f32 diverged at [{i}] (k={k})");
         }
         let rq = as_rocm(q81_ref.as_ref()).unwrap().copy_to_host().unwrap();
@@ -228,10 +228,10 @@ fn rmsnorm_quant_q81_dual_parity() {
         ).expect("quantize_q8_1 (add)");
         dev.synchronize();
 
-        for (i, (&r, &d)) in bits(&norm_ref).iter().zip(bits(&norm_dual)).enumerate() {
+        for (i, (&r, &d)) in bits(&norm_ref).iter().zip(bits(&norm_dual).iter()).enumerate() {
             assert_eq!(r, d, "add dual norm_out diverged at [{i}] (k={k})");
         }
-        for (i, (&r, &d)) in bits(&sum_ref).iter().zip(bits(&sum_dual)).enumerate() {
+        for (i, (&r, &d)) in bits(&sum_ref).iter().zip(bits(&sum_dual).iter()).enumerate() {
             assert_eq!(r, d, "add dual y_out diverged at [{i}] (k={k})");
         }
         let rq = as_rocm(q81_ref.as_ref()).unwrap().copy_to_host().unwrap();
