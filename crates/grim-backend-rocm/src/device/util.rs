@@ -43,6 +43,11 @@ pub fn disarm_rocm_watchdog() {
     WATCHDOG_ARMED.store(false, Ordering::Release);
 }
 
+/// Whether the watchdog is currently armed (observable for tests / diagnostics).
+pub fn watchdog_armed() -> bool {
+    WATCHDOG_ARMED.load(Ordering::Acquire)
+}
+
 /// Notify the ROCm progress watchdog of an active operation or successful completion.
 pub fn report_rocm_progress(op: &'static str) {
     LAST_PROGRESS_MS.store(current_epoch_ms(), Ordering::Release);
@@ -516,6 +521,27 @@ pub fn pointer_owning_device(ptr: *const std::ffi::c_void) -> i32 {
 #[cfg(test)]
 mod util_self_tests {
     use super::*;
+
+    #[test]
+    fn watchdog_arm_disarm_roundtrip() {
+        // CPU-only: pin the arming contract Task 6.2 wires — the engine arms
+        // after the first successful step and the timeout loop honors the flag.
+        disarm_rocm_watchdog();
+        assert!(!watchdog_armed());
+        arm_rocm_watchdog();
+        assert!(watchdog_armed());
+        disarm_rocm_watchdog();
+        assert!(!watchdog_armed());
+    }
+
+    #[test]
+    fn notify_model_loading_bytes_raises_floor() {
+        // fetch_max semantics: a larger load never lowers the recorded floor.
+        notify_model_loading_bytes(1);
+        notify_model_loading_bytes(4 * 1024 * 1024 * 1024);
+        assert!(LOADING_BYTES.load(Ordering::Acquire) >= 4 * 1024 * 1024 * 1024);
+        LOADING_BYTES.store(0, Ordering::Release);
+    }
 
     #[test]
     fn linear_launch_uses_default_block_of_256() {

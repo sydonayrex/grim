@@ -3283,6 +3283,12 @@ fn load_model_with_providers(
         "[alias] load_model_with_providers called, arch={:?}",
         provider.architecture()
     );
+    // Task 6.2: tell the ROCm watchdog how many model bytes this load will
+    // stream, so its timeout floor scales at ≥1 s/GiB even while it is armed
+    // (slow-NVMe loads must not trip a fixed 30 s kill).
+    if let Ok(model_bytes) = std::fs::metadata(path).map(|m| m.len()) {
+        grim_backend_rocm::notify_model_loading_bytes(model_bytes);
+    }
     // Extract architecture from GGUF metadata
     let arch_str = provider.architecture().ok_or_else(|| {
         Error::Config(

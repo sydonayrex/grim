@@ -167,6 +167,11 @@ impl Engine {
         grim_backend_rocm::set_prefill_in_flight(true);
         let outcome = self.drive_prefill_inner(id);
         grim_backend_rocm::set_prefill_in_flight(false);
+        // Task 6.2: a completed prefill is a successful GPU step — arm the
+        // watchdog so any later stall trips the banner + exit 101.
+        if outcome.is_ok() {
+            grim_backend_rocm::arm_rocm_watchdog();
+        }
         outcome
     }
 
@@ -480,6 +485,9 @@ impl Engine {
     /// Drives a decode step for sequence `id`, recording the outcome step.
     pub fn drive_decode(&mut self, id: u64) -> Result<()> {
         let outcome = self.drive_decode_with_outcome(id)?;
+        // Task 6.2: first successful decode step arms the watchdog — from here
+        // on, a no-progress window trips the banner + exit 101.
+        grim_backend_rocm::arm_rocm_watchdog();
         if let Some(outcome) = outcome {
             self.last_outcomes.insert(id, outcome);
         }

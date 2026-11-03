@@ -63,7 +63,7 @@ pub use device::capability_profiler::{
 pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
 pub use device::util::{
     arm_rocm_watchdog, disarm_rocm_watchdog, ensure_rocm_watchdog_started,
-    notify_model_loading_bytes, report_rocm_progress,
+    notify_model_loading_bytes, report_rocm_progress, watchdog_armed,
 };
 
 // S4: the dispatch route counter. Re-exported at the crate root because the T2
