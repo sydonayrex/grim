@@ -1,0 +1,36 @@
+name: Pre-release CPU CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-ci:
+    name: CPU CI & Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy check
+        run: cargo clippy -p grim-core -p grim-tensor -p grim-format -p grim-quant -p grim-scheduler -p grim-backend-cpu -p grim-server -p grim-engine --lib --no-default-features -- -D warnings
+
+      - name: Cargo test CPU crates
+        run: cargo test -p grim-core -p grim-tensor -p grim-format -p grim-quant -p grim-scheduler -p grim-backend-cpu -p grim-server
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Check supply chain (licenses & advisories)
+        run: cargo deny check licenses advisories
