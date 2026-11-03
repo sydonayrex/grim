@@ -2323,8 +2323,18 @@ pub async fn cmd_run(
                     && matches!(device, Device::Rocm(_));
 
                 let device_token: Option<u32> = if gpu_sample_ok {
+                    // Sample on the LOGITS' own device, not the model's first
+                    // device. On a two-card split the LM head lives on the
+                    // last card, so `device` (rocm:0) and the logits storage
+                    // (rocm:1) disagree; launching grim_argmax_stage1 /
+                    // grim_sample_logits_stochastic on rocm:0 against rocm:1
+                    // pointers faults the queue ("Page not present"). The
+                    // graph path above already samples on the storage's
+                    // ordinal — mirror it here.
+                    let logits_device =
+                        Device::Rocm(logits.storage().as_ref().device_ordinal() as usize);
                     sample_on_rocm(
-                        &device,
+                        &logits_device,
                         &logits,
                         vocab,
                         &sampling_params,
