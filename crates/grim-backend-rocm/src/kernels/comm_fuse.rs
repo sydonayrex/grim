@@ -137,6 +137,56 @@ fn assemble_shard(
     }
 }
 
+use crate::device::roc_device::RocmDevice;
+use crate::memory::storage::RocmStorage;
+use std::ffi::c_void;
+
+/// Launch GPU-accelerated P2P epilogue kernel for CommFuse (Task 10.8).
+pub fn launch_comm_fuse_p2p_epilogue(
+    dev: &RocmDevice,
+    local_out: &RocmStorage,
+    peer_out: &RocmStorage,
+    col_offset: u32,
+    m: u32,
+    n_local: u32,
+    n_total: u32,
+) -> Result<*mut c_void> {
+    let local_ptr = local_out
+        .device_ptr
+        .ok_or_else(|| Error::Backend("comm_fuse_p2p_epilogue: local_out has no device ptr".into()))?;
+    let peer_ptr = peer_out
+        .device_ptr
+        .ok_or_else(|| Error::Backend("comm_fuse_p2p_epilogue: peer_out has no device ptr".into()))?;
+
+    let block_dim = crate::HipDim3::new(16, 16, 1);
+    let grid_dim = crate::HipDim3::new(
+        n_local.div_ceil(16),
+        m.div_ceil(16),
+        1,
+    );
+
+    let mut lp = local_ptr;
+    let mut pp = peer_ptr;
+    let mut coff = col_offset;
+    let mut m_val = m;
+    let mut nl = n_local;
+    let mut nt = n_total;
+
+    dev.launch_compute_kernel(
+        "grim_comm_fuse_p2p_epilogue",
+        grid_dim,
+        block_dim,
+        &mut [
+            crate::arg(&mut lp),
+            crate::arg(&mut pp),
+            crate::arg(&mut coff),
+            crate::arg(&mut m_val),
+            crate::arg(&mut nl),
+            crate::arg(&mut nt),
+        ],
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -199,5 +249,53 @@ mod tests {
     fn test_kernel_source_nonempty() {
         assert!(!COMM_FUSE_KERNEL_SOURCE.is_empty());
         assert!(COMM_FUSE_KERNEL_SOURCE.contains("grim_comm_fuse_p2p_epilogue"));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_comm_fuse_p2p_epilogue_gpu_parity() {
+        use crate::device::roc_device::RocmDevice;
+        use crate::as_rocm;
+        use grim_tensor::backend::CoreTensorOps;
+        use grim_tensor::Shape;
+
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let m = 2usize;
+        let n_local = 3usize;
+        let n_total = 6usize;
+        let col_offset = 3usize;
+
+        let local_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut peer_data = vec![0.0f32; m * n_total];
+        peer_data[col_offset] = 10.0;
+
+        let mut expected = peer_data.clone();
+        for r in 0..m {
+            for c in 0..n_local {
+                expected[r * n_total + col_offset + c] += local_data[r * n_local + c];
+            }
+        }
+
+        let local_shape = Shape::new(vec![m, n_local]);
+        let peer_shape = Shape::new(vec![m, n_total]);
+
+        let local_dev = CoreTensorOps::from_cpu(&dev, &local_data, &local_shape, grim_tensor::DType::F32).unwrap();
+        let peer_dev = CoreTensorOps::from_cpu(&dev, &peer_data, &peer_shape, grim_tensor::DType::F32).unwrap();
+
+        let local_s = as_rocm(local_dev.as_ref()).unwrap();
+        let peer_s = as_rocm(peer_dev.as_ref()).unwrap();
+
+        launch_comm_fuse_p2p_epilogue(&dev, local_s, peer_s, col_offset as u32, m as u32, n_local as u32, n_total as u32).unwrap();
+        dev.synchronize();
+
+        let got = peer_dev.to_cpu_vec_f32().unwrap();
+        assert_eq!(got.len(), expected.len());
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-5, "mismatch at {i}: got {g} vs exp {e}");
+        }
     }
 }
