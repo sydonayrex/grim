@@ -13,27 +13,33 @@ pub fn is_available() -> bool {
     libraries().is_ok()
 }
 
-/// Resolve a HIP symbol without making the HIP libraries link-time dependencies.
-///
-/// This function is called by the generated bindings. A missing runtime is a
-/// runtime error because the public binding functions cannot return one common
-/// error type for all of their C signatures.
-pub(crate) unsafe fn load<T: Copy>(name: &[u8]) -> T {
-    let libraries = libraries()
-        .as_ref()
-        .unwrap_or_else(|error| panic!("{error}"));
+/// Try resolving a HIP symbol without panicking.
+pub unsafe fn try_load<T: Copy>(name: &[u8]) -> Result<T, String> {
+    let libraries = libraries().as_ref().map_err(|e| e.clone())?;
     let library = if name.starts_with(b"hiprtc") {
         &libraries.hiprtc
     } else {
         &libraries.hip
     };
 
-    let symbol: Symbol<'_, T> = unsafe { library.get(name) }.unwrap_or_else(|error| {
+    let symbol: Symbol<'_, T> = unsafe { library.get(name) }.map_err(|error| {
         let symbol_name = name.strip_suffix(&[0]).unwrap_or(name);
         let symbol = String::from_utf8_lossy(symbol_name);
-        panic!("HIP symbol `{symbol}` is unavailable: {error}");
-    });
-    *symbol
+        format!("HIP symbol `{symbol}` is unavailable: {error}")
+    })?;
+    Ok(*symbol)
+}
+
+/// Resolve a HIP symbol without making the HIP libraries link-time dependencies.
+///
+/// This function is called by the generated bindings. A missing runtime is a
+/// runtime error because the public binding functions cannot return one common
+/// error type for all of their C signatures.
+pub(crate) unsafe fn load<T: Copy>(name: &[u8]) -> T {
+    match try_load(name) {
+        Ok(s) => s,
+        Err(e) => panic!("{e}"),
+    }
 }
 
 fn libraries() -> &'static Result<Libraries, String> {

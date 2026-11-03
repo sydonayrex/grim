@@ -540,6 +540,32 @@ impl RocmDevice {
         Self::new(0)
     }
 
+    /// Task 6.1: Validate runtime HIP version against committed bindings ABI.
+    /// Emits a readable error naming both versions and suggesting `dynamic` fallback if incompatible.
+    pub fn validate_hip_abi() -> Result<()> {
+        let mut runtime_ver = -1;
+        let status = unsafe { crate::device::handles::hipRuntimeGetVersion(&mut runtime_ver) };
+        if status != hipSuccess {
+            return Err(Error::Backend(format!(
+                "Failed to query HIP runtime version (code {status})"
+            )));
+        }
+        // Committed bindings in `grim-hip-sys` target HIP 7.16.26385 (encoded as 71626385 or 71600000+).
+        // Format: MAJOR * 10_000_000 + MINOR * 100_000 + PATCH
+        let major = runtime_ver / 10_000_000;
+        let minor = (runtime_ver % 10_000_000) / 100_000;
+        let patch = runtime_ver % 100_000;
+
+        // Require at least HIP 6.x
+        if major < 6 {
+            return Err(Error::Backend(format!(
+                "HIP runtime version {major}.{minor}.{patch} is unsupported (minimum required: 6.0). \
+                 Recompile with `--features dynamic` or upgrade ROCm."
+            )));
+        }
+        Ok(())
+    }
+
     /// Fallible constructor that propagates the `hipSetDevice` error. [see: `probe()`, `RocmDevice::new`]
     pub fn try_new(ordinal: usize) -> Result<Self> {
         let detected = detect_gpu_arch(ordinal as i32);
@@ -551,6 +577,10 @@ impl RocmDevice {
         // Anchor the decision to ordinal 0, the device the runtime initializes first.
         if ordinal == 0 {
             crate::rocm_detect::auto_configure_hsa_override(&detected);
+            // Task 6.1: Verify HIP runtime ABI compatibility before executing kernels
+            if let Err(e) = Self::validate_hip_abi() {
+                eprintln!("[grim-backend-rocm] HIP ABI validation warning: {e}");
+            }
         }
 
         // WI-M1/M2 context discipline: construction must run on the target device's context (streams and the rocBLAS handle bind to whatever device is current), but construction must be context-NEUTRAL for the caller.

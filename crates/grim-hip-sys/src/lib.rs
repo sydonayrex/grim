@@ -24,7 +24,7 @@ pub use hipconfig::*;
 #[cfg(feature = "dynamic")]
 mod dynamic;
 #[cfg(feature = "dynamic")]
-pub use dynamic::is_available;
+pub use dynamic::{is_available, try_load};
 #[cfg(not(feature = "dynamic"))]
 /// Static arm: the loader resolved libamdhip64 at process start, so if this
 /// crate is running at all the HIP runtime is available.
