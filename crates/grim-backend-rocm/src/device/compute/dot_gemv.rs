@@ -2022,6 +2022,51 @@ impl RocmDevice {
         )
     }
 
+    /// Task 2.2 v4: WhiteCrow v5-style 4-wave CTA (128 threads, 16 cols/block)
+    /// with 4-superblock unroll and ZERO LDS.
+    pub fn launch_dot4_iq4xs_q81_gemv_v4_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq4xs_q81_gemv_v4: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv_v4: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv_v4: out has no device ptr".into()))?;
+        // v4 geometry: 16 columns per CTA (4 waves x 4), 128 threads.
+        let grid_x = (n as u32).div_ceil(16);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_iq4xs_q81_gemv_sub_v4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     fn launch_dot4_iq4xs_q81_gemv_with(
         &self,
         act_q81: &RocmStorage,

@@ -1046,32 +1046,42 @@ streaming (`dot4_kquant_grouped_parity.rs::iq4xs_gemv_sub_v3_parity_and_speed`):
   - Device 0: AMD Radeon RX 9070 XT (`gfx1201`, 64 CUs, 64 MB L3, ~511 GB/s roofline)
   - Device 1: AMD Radeon RX 9060 XT (`gfx1200`, 32 CUs, 32 MB L3, ~284 GB/s roofline)
 
-### 2. Cold Benchmark Measurements vs Roofline
+### 2. Cold Benchmark Measurements vs Measured Stream Ceiling
 
-| Device | Model Shape | Kernel | Time (µs) | Effective GB/s | % of Device Roofline | Ratio v3/v2 |
+Hardware streaming ceiling directly measured via `stream_read_probe` over identical rotating weight buffers:
+- Dev 0: **584.4 – 610.2 GB/s** measured ceiling (91–95% of theoretical 640 GB/s)
+- Dev 1: **311.6 – 311.7 GB/s** measured ceiling (97.4% of theoretical 320 GB/s)
+
+| Device | Model Shape | Kernel | Effective GB/s | % of Measured Ceiling | Ratio vs `v2` | Ship Bar (>=1.15x) |
 |---|---|---|---|---|---|---|
-| **Dev 0 (RX 9070 XT)** | `k=5120, n=17408` (Gate/Up) | `v2` (1-wave CTA) | 96.9 | **488.4 GB/s** | **95.6%** | Baseline |
-| | | `v3` (8-wave LDS) | 107.7 | 439.6 GB/s | 86.0% | **0.900×** (FAIL) |
-| | `k=17408, n=5120` (Down) | `v2` (1-wave CTA) | 109.4 | **432.8 GB/s** | **84.7%** | Baseline |
-| | | `v3` (8-wave LDS) | 99.0 | 478.0 GB/s | 93.5% | 1.104× (FAIL bar) |
-| **Dev 1 (RX 9060 XT)** | `k=5120, n=17408` (Gate/Up) | `v2` (1-wave CTA) | 171.9 | **275.4 GB/s** | **97.0%** | Baseline |
-| | | `v3` (8-wave LDS) | 174.1 | 271.9 GB/s | 95.7% | **0.988×** (FAIL) |
-| | `k=17408, n=5120` (Down) | `v2` (1-wave CTA) | 188.9 | **250.6 GB/s** | **88.2%** | Baseline |
-| | | `v3` (8-wave LDS) | 175.3 | 270.1 GB/s | 95.1% | 1.078× (FAIL bar) |
+| **Dev 0 (RX 9070 XT)** | `k=5120, n=17408` (Gate/Up) | **Stream Ceiling** | **584.4 GB/s** | 100.0% | — | — |
+| | | `v2` (1-wave CTA) | **446.9 GB/s** | 76.5% | Baseline | — |
+| | | `v3` (8-wave LDS) | 476.3 GB/s | 81.5% | 1.066× | FAIL |
+| | | `v4` (4-wave unroll-4) | 370.6 GB/s | 63.4% | 0.829× | FAIL |
+| | `k=17408, n=5120` (Down) | **Stream Ceiling** | **610.2 GB/s** | 100.0% | — | — |
+| | | `v2` (1-wave CTA) | **457.0 GB/s** | 74.9% | Baseline | — |
+| | | `v3` (8-wave LDS) | 449.4 GB/s | 73.6% | 0.983× | FAIL |
+| | | `v4` (4-wave unroll-4) | 328.9 GB/s | 53.9% | 0.720× | FAIL |
+| **Dev 1 (RX 9060 XT)** | `k=5120, n=17408` (Gate/Up) | **Stream Ceiling** | **311.6 GB/s** | 100.0% | — | — |
+| | | `v2` (1-wave CTA) | **275.9 GB/s** | 88.5% | Baseline | — |
+| | | `v3` (8-wave LDS) | 272.1 GB/s | 87.3% | 0.986× | FAIL |
+| | | `v4` (4-wave unroll-4) | 202.2 GB/s | 64.9% | 0.733× | FAIL |
+| | `k=17408, n=5120` (Down) | **Stream Ceiling** | **311.7 GB/s** | 100.0% | — | — |
+| | | `v2` (1-wave CTA) | **250.4 GB/s** | 80.4% | Baseline | — |
+| | | `v3` (8-wave LDS) | 270.2 GB/s | 86.7% | 1.079× | FAIL |
+| | | `v4` (4-wave unroll-4) | 173.8 GB/s | 55.8% | 0.694× | FAIL |
 
-*Ship Bar Requirement: `v3 / v2 >= 1.15×` across dominant shapes.*
+*Ship Bar Requirement: `kernel / v2 >= 1.15×` across dominant shapes.*
 
 ### 3. Root Cause & Architectural Headroom Analysis
 
-1. **No Memory Headroom on Dominant Shapes**: On the dominant gate/up shape (`k=5120, n=17408`, 2× weight volume of down-proj), `v2` achieves **488.4 GB/s on Dev 0 (95.6% of 511 GB/s roofline)** and **275.4 GB/s on Dev 1 (97.0% of 284 GB/s roofline)**. Weight streaming in `v2` is already bandwidth-saturated; there is zero headroom left for algorithmic or LDS caching speedups.
-2. **v3 Architectural Penalties**:
-   - Staging the activation row in LDS (`s_act[20480]`) saves only 5.7 KB of activation traffic against 47.3 MB of weight streaming (<0.012% of memory traffic).
-   - Serialized prologue barrier (`__syncthreads()`) forces all 8 waves to wait on cooperative activation staging before any global weight loads issue.
-   - Coarser granularity (32 cols/CTA vs 4 cols/CTA in v2) reduces grid occupancy on 64 CUs, causing tail-wave latency penalties on gate/up projections.
-3. **Task 2.2 Resolution**:
-   - `v3` failed the ship bar (`v3 / v2 >= 1.15×`).
+1. **v3 & v4 Miss Ship Bar**:
+   - `v3` (LDS) saves minimal activation traffic (<0.012%) while incurring cooperative synchronization stalls.
+   - `v4` (WhiteCrow v5 adaptation: 4-wave CTA with 4× unroll) increases register pressure (holding 4 sets of unpacked activations, headers, and quants), reducing wave occupancy and thrashing L1 cache, causing throughput to drop to 0.69× – 0.83× of `v2`.
+2. **Task 2.2 Resolution**:
+   - Neither `v3` nor `v4` meets the ship bar (`>= 1.15×`).
    - `v2` remains the production default dispatch.
-   - Task 2.2 is CLOSED as a valid negative outcome per plan ON-FAILURE clause.
+   - Task 2.2 is officially CLOSED as a valid negative outcome per plan ON-FAILURE clause.
 
 ## The IQ4_XS decode census: the 17.2 GB/s premise is refuted (2026-10-22, PLAN-iq-family-decode T1)
 
