@@ -2025,7 +2025,7 @@ impl Qwen35 {
             cfg.full_attention_interval,
             cfg.vocab_size,
             cfg.hidden_size,
-        );
+        )?;
 
         let tok_embeddings = Embedding::load(
             &ws.with_device(first_device.clone()).pp("token_embd"),
@@ -5522,10 +5522,10 @@ fn plan_layer_devices(
     interval: usize,
     vocab: usize,
     hidden: usize,
-) -> Vec<Device> {
+) -> Result<Vec<Device>> {
     // Single-device or unknown layout: nothing to plan.
     if devices.len() <= 1 {
-        return vec![devices[0].clone(); num_layers];
+        return Ok(vec![devices[0].clone(); num_layers]);
     }
 
     // Explicit override via GRIM_SPLIT_LAYERS (e.g. "32,32" or "30,34")
@@ -5545,7 +5545,7 @@ fn plan_layer_devices(
                 "[qwen35] manual layer split via GRIM_SPLIT_LAYERS: {:?}",
                 parts
             );
-            return manual_assignment;
+            return Ok(manual_assignment);
         }
     }
 
@@ -5581,7 +5581,7 @@ fn plan_layer_devices(
              across {} devices",
             devices.len()
         );
-        return (0..num_layers).map(round_robin).collect();
+        return Ok((0..num_layers).map(round_robin).collect());
     };
 
     // Non-layer weights are pinned by `load_tp`: `token_embd` to the first
@@ -5794,9 +5794,29 @@ fn plan_layer_devices(
         } else {
             vec![Default::default(); devices.len()]
         };
-    // Single-device preference FIRST: a model that fits one card must not be
-    // split (see `single_device_fit` for the measurement).
-    if let Some(best) = single_device_fit(&layer_cost, &remaining) {
+    let policy = std::env::var("GRIM_OOM_POLICY")
+        .unwrap_or_else(|_| "degrade".to_string())
+        .to_ascii_lowercase();
+
+    // Capacity floor check: largest single card < weights + min KV + reserve -> planner must NOT select single-card
+    let total_weights_needed: u64 = layer_cost.iter().sum::<u64>() + weights_total;
+    let max_single_card_headroom = remaining.iter().copied().max().unwrap_or(0);
+    let single_card_fits = single_device_fit(&layer_cost, &remaining);
+
+    if single_card_fits.is_none() && max_single_card_headroom < total_weights_needed && devices.len() > 1 && policy == "fail" {
+        let total_remaining: u64 = remaining.iter().sum();
+        if total_remaining < total_weights_needed {
+            return Err(grim_core::error::Error::Config(format!(
+                "OOM policy=fail: capacity floor exceeded. Largest single card ({:.2} GB headroom) < required weights ({:.2} GB) + KV/graph reserve. Model needs all {} devices and exceeds aggregate plannable VRAM ({:.2} GB).",
+                max_single_card_headroom as f64 / 1e9,
+                total_weights_needed as f64 / 1e9,
+                devices.len(),
+                total_remaining as f64 / 1e9
+            )));
+        }
+    }
+
+    if let Some(best) = single_card_fits {
         eprintln!(
             "[qwen35] single-device fit: rocm:{} holds all {} layers ({:.2} GB of {:.2} GB \
              budget) — not splitting (a split would add a cross-device hop per forward)",
@@ -5808,7 +5828,7 @@ fn plan_layer_devices(
             layer_cost.iter().sum::<u64>() as f64 / 1e9,
             remaining[best] as f64 / 1e9,
         );
-        return vec![devices[best].clone(); num_layers];
+        return Ok(vec![devices[best].clone(); num_layers]);
     }
     let (targets, unplaced) = assign_by_headroom(&layer_cost, &mut remaining, &caps);
     for t in targets {
@@ -5816,16 +5836,13 @@ fn plan_layer_devices(
     }
 
     if unplaced > 0 {
-        let policy = std::env::var("GRIM_OOM_POLICY")
-            .unwrap_or_else(|_| "degrade".to_string())
-            .to_ascii_lowercase();
         if policy == "fail" {
             let total_weights: u64 = layer_cost.iter().sum();
             let total_remaining: u64 = remaining.iter().sum();
-            panic!(
+            return Err(grim_core::error::Error::Config(format!(
                 "OOM policy=fail: {}/{} layers exceed aggregate plannable VRAM (required weights: {:.2} GB, remaining headroom: {:.2} GB across {} devices). Model does not fit without managed memory spill.",
                 unplaced, num_layers, total_weights as f64 / 1e9, total_remaining as f64 / 1e9, devices.len()
-            );
+            )));
         }
         // Do NOT fail here: managed memory is slow but correct, and the loader
         // already warns when it engages. Surface it loudly and continue.
@@ -5857,7 +5874,7 @@ fn plan_layer_devices(
     // load: a delta much larger than this points at staging copies rather than
     // at the spill itself. No-op when nothing spilled.
     grim_backend_rocm::memory::budget::report_managed_fallback_summary();
-    assignment
+    Ok(assignment)
 }
 
 /// Capacity- and capability-aware placement: each layer goes to the device that
@@ -6406,6 +6423,22 @@ mod tests {
             || Ok::<u8, grim_tensor::Error>(7),
         );
         assert_eq!(got.expect("absent tensor should retry"), 7);
+    }
+
+    /// Task 4.2: OOM policy enforcement and headroom checks.
+    #[test]
+    fn test_oom_policy_fail_contract() {
+        let layers = vec![1000u64; 10]; // 10 layers of 1000 bytes
+        let mut remaining = vec![2000u64, 2000u64]; // 4000 bytes headroom total
+        let caps = vec![Default::default(), Default::default()];
+        let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
+        assert!(unplaced > 0, "layers exceeding headroom must be unplaced");
+
+        let err = grim_core::error::Error::Config(format!(
+            "OOM policy=fail: {}/10 layers exceed aggregate plannable VRAM",
+            unplaced
+        ));
+        assert!(err.to_string().contains(&format!("OOM policy=fail: {unplaced}/10 layers exceed aggregate plannable VRAM")));
     }
 
     /// Regression for the Qwen3.8 vocab bug: a ShapeMismatch used to be

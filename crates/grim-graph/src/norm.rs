@@ -6,7 +6,8 @@ pub enum NormKind {
     Fallback,
 }
 
-pub struct NormSpec {
+pub struct NormSpec<'a> {
+    pub weight: Option<&'a grim_tensor::Tensor>,
     pub eps: f32,
 }
 
@@ -17,11 +18,11 @@ pub trait NormEmitter {
 /// The eps -> NORM / FALLBACK rule (|eps - 1e-5| < f32::EPSILON).
 pub fn emit_norm<E: NormEmitter>(
     emitter: &mut E,
-    spec: &NormSpec,
+    spec: &NormSpec<'_>,
     _m: usize,
     _k: usize,
 ) -> Result<NormKind> {
-    let kind = if (spec.eps - 1e-5f32).abs() <= f32::EPSILON {
+    let kind = if (spec.eps - 1e-5f32).abs() < f32::EPSILON {
         NormKind::Norm
     } else {
         NormKind::Fallback
@@ -48,12 +49,12 @@ mod tests {
     fn test_emit_norm_eps_routing() {
         let mut emitter = TestEmitter { recorded: vec![] };
 
-        let spec_exact = NormSpec { eps: 1e-5 };
+        let spec_exact = NormSpec { weight: None, eps: 1e-5 };
         let res = emit_norm(&mut emitter, &spec_exact, 1, 1).unwrap();
         assert_eq!(res, NormKind::Norm);
         assert_eq!(emitter.recorded[0], (NormKind::Norm, 1e-5));
 
-        let spec_fallback = NormSpec { eps: 9e-6 };
+        let spec_fallback = NormSpec { weight: None, eps: 9e-6 };
         let res2 = emit_norm(&mut emitter, &spec_fallback, 1, 1).unwrap();
         assert_eq!(res2, NormKind::Fallback);
         assert_eq!(emitter.recorded[1], (NormKind::Fallback, 9e-6));

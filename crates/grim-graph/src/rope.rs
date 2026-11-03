@@ -64,32 +64,39 @@ mod tests {
         let head_dim = 64usize;
         let rotary_dim = 64usize;
 
-        let compute_angles = |pos: usize| -> Vec<f32> {
-            let mut angles = Vec::with_capacity(rotary_dim / 2);
+        let mut emitter = TestRopeEmitter { emitted: vec![] };
+        let yarn_args = RopeArgs::yarn(base, (1.0, 32.0), mscale);
+        emit_rope(&mut emitter, &yarn_args).expect("emit_rope");
+        assert_eq!(emitter.emitted.len(), 1);
+        assert_eq!(emitter.emitted[0], yarn_args);
+
+        // Apply YaRN RoPE on an eager vector and compare against reference rotated values
+        let apply_rope = |x: &[f32], pos: usize| -> Vec<f32> {
+            let mut out = x.to_vec();
             for i in 0..(rotary_dim / 2) {
                 let freq = 1.0f32 / base.powf((2 * i) as f32 / head_dim as f32);
-                angles.push(pos as f32 * freq);
+                let angle = pos as f32 * freq;
+                let (sin_a, cos_a) = (angle.sin() * mscale, angle.cos() * mscale);
+                let x0 = x[i];
+                let x1 = x[i + rotary_dim / 2];
+                out[i] = x0 * cos_a - x1 * sin_a;
+                out[i + rotary_dim / 2] = x0 * sin_a + x1 * cos_a;
             }
-            angles
+            out
         };
 
-        let angles_pos0 = compute_angles(0);
-        let angles_pos41 = compute_angles(41);
+        let x = vec![1.0f32; rotary_dim];
+        let y_pos0 = apply_rope(&x, 0);
+        let y_pos41 = apply_rope(&x, 41);
 
-        // At pos 0: cos is 1.0 * mscale, sin is 0.0 * mscale
-        for &a in &angles_pos0 {
-            let cos_val = a.cos() * mscale;
-            let sin_val = a.sin() * mscale;
-            assert!((cos_val - mscale).abs() < 1e-6);
-            assert!(sin_val.abs() < 1e-6);
+        // At pos 0: cos is mscale, sin is 0.0 -> out = x * mscale
+        for i in 0..rotary_dim {
+            assert!((y_pos0[i] - mscale).abs() < 1e-6);
         }
 
-        // At pos 41: non-trivial rotation, magnitude strictly scaled by mscale
-        for &a in &angles_pos41 {
-            let cos_val = a.cos() * mscale;
-            let sin_val = a.sin() * mscale;
-            let norm = (cos_val * cos_val + sin_val * sin_val).sqrt();
-            assert!((norm - mscale).abs() < 1e-6, "norm {norm} vs mscale {mscale}");
-        }
+        // At pos 41: rotated vector has norm = ||x|| * mscale
+        let norm_x: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let norm_41: f32 = y_pos41.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm_41 - norm_x * mscale).abs() < 1e-5);
     }
 }

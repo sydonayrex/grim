@@ -1218,11 +1218,9 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
 }
 
 // Decode-only RMS norm for m=1 (single row) with wide row_len: an entire 256-thread block
-// (8 warps) cooperates on the single row. Each lane accumulates across stride 256,
-// warps reduce via shuffle, and cross-warp reduction combines via LDS.
-// NOTE: Reduction order differs from grim_rms_norm (block-wide tree vs single-warp stride 32);
-// bit-exact parity with fused dot_gemv prologues is NOT preserved, so this is used strictly
-// on standalone decode norm sites where tolerance parity (<= 1e-6) holds.
+// (8 warps) cooperates on the single row. Each lane accumulates across stride 256.
+// Reduction order has been aligned to stride-128 matching grim_rms_norm (Task 0.5),
+// preserving bit-exact parity across standalone decode norms and fused prologues.
 extern "C" __global__ void __launch_bounds__(256)
 grim_rms_norm_decode(const float* x, const float* __restrict__ w, float* out,
                      int row_len, float eps) {

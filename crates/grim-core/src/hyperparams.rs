@@ -724,6 +724,20 @@ mod extract_reference_tests {
         assert_eq!(hp.num_layers, 53);
         assert_eq!(hp.hidden_size, 2688);
     }
+
+    /// Task 4.1: Missing context length defaults to 2048.
+    #[test]
+    fn missing_context_length_defaults_to_2048() {
+        let meta = MockMeta::default()
+            .u32(&[
+                ("llama.embedding_length", 2048),
+                ("llama.block_count", 16),
+                ("llama.feed_forward_length", 5632),
+                ("llama.attention.head_count", 16),
+            ]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Llama, &meta);
+        assert_eq!(hp.max_seq_len, 2048, "missing context length must default to 2048");
+    }
 }
 
 #[cfg(test)]

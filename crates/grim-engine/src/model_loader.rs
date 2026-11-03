@@ -47,6 +47,30 @@ use std::path::Path;
 /// `Lfm2Config` struct default stays `false` (F32 golden reference); only the
 /// loader opts in. The fused path additionally requires a ROCm device at
 /// `Lfm2::load` time (`lfm2.rs`), so CPU loads are unaffected by this flag.
+/// Support tier for model architectures (Task 4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSupportTier {
+    Green,
+    Experimental,
+    Unsupported,
+}
+
+impl ModelSupportTier {
+    pub fn classify(arch_str: &str, path: &str) -> (Self, &'static str) {
+        let arch_lower = arch_str.to_ascii_lowercase();
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.ends_with(".grim") && (arch_lower.contains("xing") || path_lower.contains("xing40")) {
+            (Self::Unsupported, "open NaN in Xing4.0 chain")
+        } else if arch_lower.contains("llama") && (arch_lower.contains("moe") || path_lower.contains("moe")) {
+            (Self::Experimental, "known MoE routing divergence")
+        } else if arch_lower.contains("qwen") || arch_lower.contains("lfm") || arch_lower.contains("bitnet") {
+            (Self::Green, "fully validated production support")
+        } else {
+            (Self::Green, "standard architecture support")
+        }
+    }
+}
+
 pub(crate) fn lfm2_mxfp4_qkv_enabled() -> bool {
     std::env::var("GRIM_LFM2_MXFP4_QKV")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
@@ -3276,22 +3300,21 @@ fn load_model_with_providers(
     }
 
     // Task 4.3: Supported-family matrix consultation
-    // Green: qwen35, lfm2 (1B+), bitnet (Task 10.5)
-    // Experimental: llama (MoE divergence / PM-3)
-    // Unsupported: xing40 .grim chain (open NaN)
-    let arch_lower = arch_str.to_ascii_lowercase();
-    if path.ends_with(".grim") && (arch_lower.contains("xing") || path.contains("xing40")) {
-        return Err(Error::Config(format!(
-            "Architecture '{arch_str}' (.grim format) is currently unsupported (tier: UNSUPPORTED, open NaN in Xing4.0 chain)"
-        )));
-    } else if arch_lower.contains("llama") && arch_lower.contains("moe") {
-        eprintln!(
-            "[grim] NOTICE: Architecture '{arch_str}' is tier: EXPERIMENTAL (known MoE routing divergence)"
-        );
-    } else if arch_lower.contains("bitnet") {
-        eprintln!(
-            "[grim] NOTICE: Architecture '{arch_str}' is tier: GREEN (BitNet b1.58 ROCm kernels wired)"
-        );
+    let (tier, reason) = ModelSupportTier::classify(arch_str, path);
+    match tier {
+        ModelSupportTier::Unsupported => {
+            return Err(Error::Config(format!(
+                "Architecture '{arch_str}' (.grim format) is currently unsupported (tier: UNSUPPORTED, {reason})"
+            )));
+        }
+        ModelSupportTier::Experimental => {
+            eprintln!("[grim] NOTICE: Architecture '{arch_str}' is tier: EXPERIMENTAL ({reason})");
+        }
+        ModelSupportTier::Green => {
+            if arch_str.to_ascii_lowercase().contains("bitnet") {
+                eprintln!("[grim] NOTICE: Architecture '{arch_str}' is tier: GREEN ({reason})");
+            }
+        }
     }
     let mut model_arch = ModelArchitecture::from_str(arch_str);
     if model_arch == ModelArchitecture::Llama {
@@ -7013,5 +7036,25 @@ mod tests {
         let caps_zero = vec![(0, 0.0f32), (1, 500.0f32)];
         sort_devices_by_bandwidth(&mut devices_zero, &caps_zero);
         assert_eq!(devices_zero, vec![Device::Rocm(0), Device::Rocm(1)]);
+    }
+
+    #[test]
+    fn test_model_support_tier_classification() {
+        assert_eq!(
+            ModelSupportTier::classify("xing40", "model.grim").0,
+            ModelSupportTier::Unsupported
+        );
+        assert_eq!(
+            ModelSupportTier::classify("llama_moe", "model.gguf").0,
+            ModelSupportTier::Experimental
+        );
+        assert_eq!(
+            ModelSupportTier::classify("qwen35", "model.gguf").0,
+            ModelSupportTier::Green
+        );
+        assert_eq!(
+            ModelSupportTier::classify("bitnet", "model.gguf").0,
+            ModelSupportTier::Green
+        );
     }
 }
