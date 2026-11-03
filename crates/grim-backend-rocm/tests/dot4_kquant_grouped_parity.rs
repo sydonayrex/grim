@@ -3186,7 +3186,7 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         let o_d = as_rocm(out_d.as_ref()).unwrap();
         let o_e = as_rocm(out_e.as_ref()).unwrap();
         let o_f = as_rocm(out_f.as_ref()).unwrap();
-        let o_g = as_rocm(out_g.as_ref()).unwrap();
+        let _o_g = as_rocm(out_g.as_ref()).unwrap(); // peer in-flight v6 arm — wired when the v6 timing body lands
 
         // bytes per launch = weights + activations + output (output written once per launch)
         let bytes_moved = (n * row_bytes + q81_len + m * n * 4) as f64;
