@@ -1173,6 +1173,7 @@ fn request_error(code: ErrorCode, message: impl Into<String>) -> serde_json::Val
 fn build_constrained_sampler(
     inner: std::sync::Arc<dyn grim_core::sampler::Sampler>,
     body: &serde_json::Map<String, serde_json::Value>,
+    #[cfg_attr(not(feature = "constrained-gen"), allow(unused_variables))]
     vocab: Option<std::sync::Arc<[String]>>,
 ) -> std::result::Result<std::sync::Arc<dyn grim_core::sampler::Sampler>, String> {
     let Some(rf) = body.get("response_format") else {
@@ -1186,6 +1187,7 @@ fn build_constrained_sampler(
     })?;
     match ty {
         "text" | "text/plain" => Ok(inner),
+        #[cfg(feature = "constrained-gen")]
         "json_object" => {
             let v = vocab.ok_or_else(|| {
                 "constrained generation ('json_object') requires an attached model vocabulary; none available"
@@ -1195,6 +1197,12 @@ fn build_constrained_sampler(
             let s = constrained_json_object(inner).with_vocab(v);
             Ok(std::sync::Arc::new(s))
         }
+        #[cfg(not(feature = "constrained-gen"))]
+        "json_object" => Err(
+            "response_format 'json_object' requires building grim-server with --features constrained-gen"
+                .to_string(),
+        ),
+        #[cfg(feature = "constrained-gen")]
         "json_schema" => {
             let schema = obj.get("json_schema").cloned().ok_or_else(|| {
                 "response_format.json_schema is required when type='json_schema'".to_string()
@@ -1208,6 +1216,11 @@ fn build_constrained_sampler(
             let s = ConstrainedSampler::new(inner, constraint).with_vocab(v);
             Ok(std::sync::Arc::new(s))
         }
+        #[cfg(not(feature = "constrained-gen"))]
+        "json_schema" => Err(
+            "response_format 'json_schema' requires building grim-server with --features constrained-gen"
+                .to_string(),
+        ),
         other => Err(format!(
             "unsupported response_format.type '{other}'; expected 'text', 'json_object', or 'json_schema'"
         )),
@@ -1957,6 +1970,7 @@ fn render_chat_prompt(
     // KV cache pressure. Uses extractive compression (TextRank + TF-IDF +
     // position weighting + novelty scoring) — no neural inference, preserves
     // original tokens verbatim. Gate: GRIM_COMPRESS_PROMPT=1.
+    #[cfg(feature = "prompt-compress")]
     let prompt_tokens: Vec<u32> = if std::env::var("GRIM_COMPRESS_PROMPT").as_deref() == Ok("1") {
         let budget = grim_compress::DEFAULT_TOKEN_BUDGET;
         if prompt_text.len() > budget * 4 {
