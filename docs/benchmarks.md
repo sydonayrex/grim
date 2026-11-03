@@ -1351,3 +1351,31 @@ nodes / STEP3-DEDUP 1327), LOGITS-GATE and Task-0.5 PPL-512 bit-identical
 (|dNLL| = 0.000000, PPL 41221.9574 both arms), STEP3-DEDUP warm wall
 82.9 ms / cold 82.7 ms (vs the 92.6 ms AE75E0C6 baseline), structure
 share 4.1% (<50% band: node reduction remains the lever).
+
+## 10. Task 2.3 Step 0 — KV-quant census (2026-11-03)
+
+Env vars / branches selecting the KV representation (crates/grim-models/transformer/src/):
+- `GRIM_KV_QUANT` (qwen35.rs:5407): `int8|q8_0|q8` -> Int8, `fp8` -> Fp8E4M3, `nutcracker` ->
+  NutFp4, `nvfp4` -> NvFp4, `whitecrow|w4a4` -> WhiteCrow, `off|none|f32|dense` -> None
+  (dense arena). **DEFAULT (unset) = WhiteCrow paged quantized** on the eager-attention
+  entry (`_ => Some(WhiteCrow)`, qwen35.rs:5424) — NOT the dense f16 arena the banner
+  reports; `GRIM_KV_QUANT=f16` is deliberately rejected (dense f16 has its own validated
+  reader).
+- `GRIM_KV_ARENA` (dense): f32 | f16 | int8 — Qwen35 default F16 (dynamic-kv promotes
+  f16 at high free VRAM); `GRIM_F16_KV` is the legacy alias.
+- `GRIM_KV_ARENA_ROWS` / `GRIM_KV_SINKS` / `GRIM_KV_EVICT_MODE` (positional|curdkv):
+  eviction ring on the dense arenas.
+- Decode GRAPH path: dense arenas + ring policy; per-format device kernels
+  `launch_kv_append_{i8,whitecrow,...}` + `launch_qkv_attention_dev_batch_*` in
+  decode_graph.rs. The EAGER per-step path: paged quant (WhiteCrow default) vs dense.
+
+In-tree parity gate (`cargo test --release -p grim-backend-rocm --test qkv_attention
+-- --ignored`): 23 passed / 1 failed. GREEN: the certified int8 pair —
+`graph_i8_append_and_attend_match_eager_f32` (max_abs_diff 0.0019), i8-append row parity
+(worst 0.0039 vs amax), int4 attend, k2v4 quantize parity, whitecrow fused rope+append
+byte-identity. RED (pre-existing at baseline d780bd54, recorded): the SYNTHETIC
+`kv_append_ring_pins_sinks_and_cycles_newest` test — 25 un-synced loop iterations of a
+4-byte `past` H2D + kernel launch race so the kernel reads past=0 every step and all
+appends land in row 0. Production eager KV maps rows on the HOST (bit-exact under the
+Phase-3 churn gates), so blast radius is this test only; the device-mapped
+`launch_kv_append` direct path is a Phase 7 item 8g deletion candidate.
