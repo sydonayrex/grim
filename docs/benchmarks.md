@@ -1521,3 +1521,25 @@ layer (0 fusions vs the Step-1 floor of 35 attn sites). Suspect: weight
 dtype/provenance at predicate time differs from the GGUF probe (35/65
 attn sites showed a q81 consumer). OPEN: debug the predicate (dump
 linear_decode_quant_kind per qkv weight at capture), then re-measure.
+
+## 14. Task 2.6 CLOSED — fusion headroom already consumed (2026-11-03)
+
+The dual norm+q81 kernels (Step 2) and byte-identity parity (Step 3, 8/8
+green) are real and committed. The engagement investigation (trace added,
+predicate ported from the wrong LlamaBlock site :493 to the real
+Qwen35Block::forward_graph :2510) ended in a legitimate negative:
+
+The 27B production emission NO LONGER HAS the norm sites the floor probe
+counted. The d780bd54 Residual2 fusion already fused layers 1..63's
+attention norms into the preceding residual add (norm_already_fused;
+STEP1->STEP2 node drop 1479->1416 = 63 = one norm launch per layer), and
+the FFN post-attention norm is fused into gate_up_silu dot4. Remaining
+standalone norm sites on the production arm: layer 0 only — max 1 of 217
+quantize launches, not 94.
+
+Verdict: 27B harness bit-exact green, node counts unchanged (1543/1479/
+1416/1327) — the wiring is correct but the opportunity is gone. Task 2.6
+CLOSED per the plan's honest-negative rule. The dual kernels + wiring
+stay in-tree: byte-exact, gated (GRIM_FUSE_NORM_QUANT), and live for any
+model geometry where a standalone m=1 norm precedes a q81 consumer
+(e.g. layer 0, non-Qwen35 families). Do not credit a perf win.

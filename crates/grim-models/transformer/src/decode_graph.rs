@@ -2520,9 +2520,60 @@ impl Qwen35Block {
         let batch = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
 
+        // Task 2.6: fuse the q8_1 quantize into the attention-norm launch
+        // when any qkv consumer needs q8_1 — one dual-output kernel
+        // (grim_rms_norm_quant_q81_dual) replaces rms_norm + first quantize.
+        // Byte-identity to the split path is pinned by
+        // rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity. Production
+        // graph path only (emit.is_none()): the task-ring IR keeps the
+        // split NORM + FALLBACK nodes, so ring replay stays consistent.
+        // m == 1 only (decode-shaped kernel); impossible when the norm was
+        // already fused into the previous Residual 2 add.
+        let fuse_norm_quant = self.is_full_attention
+            && emit.is_none()
+            && batch == 1
+            && !norm_already_fused
+            && !matches!(
+                std::env::var("GRIM_FUSE_NORM_QUANT").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+            && (|| {
+                // Exact same predicate the linears will apply later: fuse
+                // iff ANY of q/k/v consumes q8_1 (non-q81 consumers ignore
+                // the ready flag, so over-fusing is safe).
+                for w_opt in [&self.wq, &self.wk, &self.wv] {
+                    let t = match w_opt.as_ref() {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let w = match rocm_storage(t.weight()) {
+                        Ok(w) => w,
+                        Err(_) => return false,
+                    };
+                    let n = t.weight().shape().dims().first().copied().unwrap_or(0);
+                    if dev.linear_decode_quant_kind(w, 1, n, self.hidden_size).0 {
+                        return true;
+                    }
+                }
+                false
+            })();
+
         // 1. RMSNorm into norm_buf (skipped when fused into the preceding layer's Residual 2 add)
         let h_shape = buffers.layer_input[layer_idx].shape().clone();
-        if !norm_already_fused {
+        if fuse_norm_quant {
+            let norm_w = dst_downcast(self.attn_norm.weight.storage().as_ref())?;
+            dev.launch_rms_norm_quant_q81_dual(
+                dst_downcast(&buffers.layer_input[layer_idx])?,
+                norm_w,
+                &buffers.norm_buf[layer_idx],
+                act,
+                self.hidden_size,
+                self.attn_norm.eps,
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 fused norm+q81: {e}"))
+            })?;
+        } else if !norm_already_fused {
             dev.rms_norm_into(
                 &buffers.layer_input[layer_idx],
                 &**self.attn_norm.weight.storage(),
@@ -2581,10 +2632,14 @@ impl Qwen35Block {
             if let Some(fused) = fused_qkv {
                 let norm_rocm = dst_downcast(normed)?;
                 let m = buffers.batch.max(1);
-                dev.launch_quantize_q8_1(norm_rocm, act, m, self.hidden_size)
-                    .map_err(|e| {
-                        grim_core::error::Error::Backend(format!("qwen35 qkv quant: {e}"))
-                    })?;
+                // Task 2.6: when the dual norm kernel already filled `act`,
+                // this quantize is redundant — skip it.
+                if !fuse_norm_quant {
+                    dev.launch_quantize_q8_1(norm_rocm, act, m, self.hidden_size)
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("qwen35 qkv quant: {e}"))
+                        })?;
+                }
                 // M7.1: the quantize is its own node. The ring has no
                 // QUANTIZE arm, so it is a FALLBACK node — a node that
                 // names a launch the ring cannot run, which is exactly what
@@ -2678,7 +2733,7 @@ impl Qwen35Block {
                 let wv = self.wv.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wv in full attention block".into())
                 })?;
-                let mut q81_ready = false;
+                let mut q81_ready = fuse_norm_quant;
                 let mut u4_ready = false;
                 linear_into_named_dedup(
                     dev,
