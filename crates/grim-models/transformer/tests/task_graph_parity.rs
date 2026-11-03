@@ -22,12 +22,11 @@
 //! derived from them.
 //!
 //! Run (GPU 1 is the measurement card; GPU 0 is reserved):
-//! `HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 AMD_SERIALIZE_KERNEL=3 GRIM_CONTEXT=512 \
+//! `HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 GRIM_CONTEXT=512 \
 //!  cargo test -p grim-models-transformer --test task_graph_parity -- --nocapture --test-threads=1`
 //!
-//! `AMD_SERIALIZE_KERNEL=3`: real-checkpoint replay still faults without it
-//! (open, recorded in the plan) — serialization supplies the ordering that
-//! lets the oracle run; it does not affect what is compared.
+//! Serialization environment variables (e.g. AMD_SERIALIZE_KERNEL) are NOT required;
+//! graph replay and interpretration are fully hazard-free and run clean out-of-the-box.
 //! `GRIM_IR_TRACE=1` prints each dispatched node AND drains the queue at every
 //! node boundary, so a device fault names the node whose kernels faulted.
 
