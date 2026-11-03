@@ -5785,15 +5785,12 @@ fn plan_layer_devices(
 
     // Measured per-device capability, in `devices` order.
     //
-    // Gated rather than always-on: `CapabilityProfiler::new()` runs a rocBLAS
-    // calibration GEMM and a malloc/free on every visible GPU, and this function
-    // is called *while* the loader is deciding how much VRAM it may spend. Doing
-    // that unconditionally would perturb the very free-VRAM numbers being read
-    // here, on a path that has not yet been run against real hardware. With the
-    // gate off every row is zero and `assign_by_headroom` degrades to exactly
-    // the headroom-only split it has always used.
+    // Task 6.4: Default-on when multiple devices are configured, unless explicitly
+    // disabled via GRIM_CAPABILITY_PLACEMENT=0.
+    // Probing hardware throughput and memory allows mixed consumer setups (e.g.
+    // RX 9070 XT + RX 9060 XT) to balance layer allocation by compute and bandwidth.
     let caps: Vec<grim_tensor::backend::GpuCapability> =
-        if std::env::var("GRIM_CAPABILITY_PLACEMENT").as_deref() == Ok("1") {
+        if devices.len() > 1 && std::env::var("GRIM_CAPABILITY_PLACEMENT").as_deref() != Ok("0") {
             let measured = grim_backend_rocm::CapabilityProfiler::new().capabilities();
             devices
                 .iter()
