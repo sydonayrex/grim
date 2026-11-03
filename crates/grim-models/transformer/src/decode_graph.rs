@@ -2583,12 +2583,15 @@ impl Qwen35Block {
             )
             .map_err(grim_core::error::Error::Tensor)?;
         }
-        // M7.1: the norm is its own node. It is a NORM node only when the
-        // ring's arm would compute the SAME answer — and the ring's NORM arm
-        // fixes eps at 1e-5 (the Llama-family value), so a model whose
-        // epsilon differs is a FALLBACK node, not a NORM node wearing the
-        // wrong constant.
+        // Task 5B.5: validate norm emission through grim_graph builder
         if !norm_already_fused {
+            let norm_spec = grim_graph::NormSpec {
+                weight: Some(&self.attn_norm.weight),
+                eps: self.attn_norm.eps,
+            };
+            let mut norm_emitter = DevNormEmitter(dev);
+            let _ = grim_graph::emit_norm(&mut norm_emitter, &norm_spec, batch, self.hidden_size)?;
+
             if let Some(e) = emit.as_deref_mut() {
                 let eps_ok = (self.attn_norm.eps - 1e-5).abs() < f32::EPSILON;
                 let opcode = if eps_ok {
@@ -2733,8 +2736,12 @@ impl Qwen35Block {
                 let wv = self.wv.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wv in full attention block".into())
                 })?;
-                let mut q81_ready = fuse_norm_quant;
-                let mut u4_ready = false;
+                let mut q_flags = grim_graph::QuantFlags {
+                    q81_ready: fuse_norm_quant,
+                    u4_ready: false,
+                };
+                let mut linear_emitter = DevLinearEmitter(dev);
+                grim_graph::emit_linear_dedup(&mut linear_emitter, "attn.q", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed,
@@ -2743,9 +2750,10 @@ impl Qwen35Block {
                     act,
                     "attn.q",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    &mut q_flags.q81_ready,
+                    &mut q_flags.u4_ready,
                 )?;
+                grim_graph::emit_linear_dedup(&mut linear_emitter, "attn.k", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed,
@@ -2754,9 +2762,10 @@ impl Qwen35Block {
                     act,
                     "attn.k",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    &mut q_flags.q81_ready,
+                    &mut q_flags.u4_ready,
                 )?;
+                grim_graph::emit_linear_dedup(&mut linear_emitter, "attn.v", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed,
@@ -2765,8 +2774,8 @@ impl Qwen35Block {
                     act,
                     "attn.v",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    &mut q_flags.q81_ready,
+                    &mut q_flags.u4_ready,
                 )?;
                 // M7.1: the three plain projections are three GEMM nodes —
                 // the ring's GEMM arm computes in f32, so a NATIVE weight is
