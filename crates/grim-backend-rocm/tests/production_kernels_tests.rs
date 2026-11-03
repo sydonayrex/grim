@@ -589,3 +589,74 @@ fn test_bitnet_gemm_w158a8_parity() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+#[ignore]
+fn test_bitnet_gemm_w158a8_int8_parity() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
+
+    let m = 2usize;
+    let n = 16usize;
+    let k = 32usize;
+
+    let a_int8_data: Vec<i8> = (0..m * k).map(|i| (((i % 7) as i8) - 3) * 10).collect();
+    let b_ternary_packed: Vec<u8> = vec![0b10010010; (n * k) / 4];
+    let scales_b: Vec<f32> = (0..n).map(|i| 0.1 * (1.0 + i as f32)).collect();
+    let scale_a = 0.05f32;
+
+    // CPU Reference
+    let mut expected_c = vec![0.0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut sum_val = 0;
+            for ki in 0..k {
+                let a_val = a_int8_data[mi * k + ki] as i32;
+                let elem_idx = ni * k + ki;
+                let byte_idx = elem_idx / 4;
+                let shift = (elem_idx % 4) * 2;
+                let code = (b_ternary_packed[byte_idx] >> shift) & 0x3;
+                let w_val = match code {
+                    1 => 1,
+                    2 => -1,
+                    _ => 0,
+                };
+                sum_val += a_val * w_val;
+            }
+            expected_c[mi * n + ni] = (sum_val as f32) * scale_a * scales_b[ni];
+        }
+    }
+
+    let a_shape = Shape::from_slice(&[m, k]);
+    let b_shape = Shape::from_slice(&[(n * k) / 4]);
+    let scales_shape = Shape::from_slice(&[n]);
+    let out_shape = Shape::from_slice(&[m, n]);
+
+    let a_bytes: Vec<u8> = a_int8_data.iter().map(|&x| x as u8).collect();
+    let a_dev = MemoryOps::from_cpu_bytes(&dev, &a_bytes, &a_shape, DType::U8)?;
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_ternary_packed, &b_shape, DType::U8)?;
+    let scales_dev = CoreTensorOps::from_cpu(&dev, &scales_b, &scales_shape, DType::F32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::F32)?;
+
+    let a_s = grim_backend_rocm::device::util::as_rocm(a_dev.as_ref())?;
+    let b_s = grim_backend_rocm::device::util::as_rocm(b_dev.as_ref())?;
+    let scales_s = grim_backend_rocm::device::util::as_rocm(scales_dev.as_ref())?;
+    let out_s = grim_backend_rocm::device::util::as_rocm(out_dev.as_ref())?;
+
+    dev.launch_bitnet_gemm_int8(a_s, b_s, scales_s, out_s, m, n, k, scale_a)?;
+    dev.synchronize();
+
+    let actual_c = out_dev.to_cpu_vec_f32()?;
+    assert_eq!(actual_c.len(), expected_c.len());
+
+    for (i, (&act, &exp)) in actual_c.iter().zip(expected_c.iter()).enumerate() {
+        let err = (act - exp).abs();
+        assert!(
+            err < 1e-4,
+            "BitNet INT8 GEMM mismatch at index {i}: actual={act}, expected={exp}, err={err}"
+        );
+    }
+
+    Ok(())
+}

@@ -3276,7 +3276,7 @@ fn load_model_with_providers(
     }
 
     // Task 4.3: Supported-family matrix consultation
-    // Green: qwen35, lfm2 (1B+)
+    // Green: qwen35, lfm2 (1B+), bitnet (Task 10.5)
     // Experimental: llama (MoE divergence / PM-3)
     // Unsupported: xing40 .grim chain (open NaN)
     let arch_lower = arch_str.to_ascii_lowercase();
@@ -3287,6 +3287,10 @@ fn load_model_with_providers(
     } else if arch_lower.contains("llama") && arch_lower.contains("moe") {
         eprintln!(
             "[grim] NOTICE: Architecture '{arch_str}' is tier: EXPERIMENTAL (known MoE routing divergence)"
+        );
+    } else if arch_lower.contains("bitnet") {
+        eprintln!(
+            "[grim] NOTICE: Architecture '{arch_str}' is tier: GREEN (BitNet b1.58 ROCm kernels wired)"
         );
     }
     let mut model_arch = ModelArchitecture::from_str(arch_str);

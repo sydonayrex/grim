@@ -1332,4 +1332,58 @@ impl RocmDevice {
             ],
         )
     }
+
+    /// Launch BitNet GEMM with INT8 activations (Task 10.5).
+    pub fn launch_bitnet_gemm_int8(
+        &self,
+        a_int8_storage: &RocmStorage,
+        b_ternary_storage: &RocmStorage,
+        scale_b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        scale_a: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_int8_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm_int8: A has no device ptr".into()))?;
+        let b_ptr = b_ternary_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm_int8: B has no device ptr".into()))?;
+        let sb_ptr = scale_b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm_int8: scale_b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm_int8: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_dim = HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut sbptr = sb_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut sa = scale_a;
+
+        self.launch_compute_kernel(
+            "grim_bitnet_gemm_w158a8_int8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut sbptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sa),
+            ],
+        )
+    }
 }
