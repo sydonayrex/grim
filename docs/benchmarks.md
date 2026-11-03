@@ -1471,3 +1471,37 @@ class. Per the plan's ON-FAILURE clause:
   format; both verified failing without this task's changes).
 OPEN: root-cause the int8 seeded-replay geometry defect (dumps: GRIM_KV_SEEDCHECK_ROW_HASH
 protocol), then re-land int8 default.
+
+## 12. iq4xs v4 + measured stream ceiling — Task 2.2 CLOSED (2026-11-03)
+
+Ported the w4a4 true-cold methodology into the iq4xs harness: empty-launch
+floor removed, rotating 8 distinct weight blobs (>128 MB total, past the
+64 MB Infinity Cache), plus a `grim_stream_read_probe` arm measuring the
+HARDWARE STREAM CEILING on the same blobs, same day, same timing pattern.
+
+**Measured stream ceiling (device 1, gfx1200, rotating blobs): 311.7 GB/s**
+— not the 511/601 GB/s theoretical numbers; the streaming pattern these
+GEMVs actually issue tops out at 311.7.
+
+| kernel | gate/up (k=5120,n=17408) | down-proj (k=17408,n=5120) |
+|---|---|---|
+| stream ceiling | 311.7 GB/s | 311.7 GB/s |
+| v2 (1-wave) | **275.7 (88.4%)** | 250.2 (80.3%) |
+| v3 (8-wave LDS) | 271.9 (87.2%) | 270.0 (86.6%) |
+| v4 (4-wave, 4x unroll, no LDS) | 202.8 (65.0%) | 172.2 (55.2%) |
+
+Verdicts:
+- **v4 SHIP BAR MISSED** (0.735x / 0.688x of v2; bar >= 1.15x). The
+  128-thread CTA + 4x superblock unroll REDUCED throughput 26-31% — fewer,
+  larger CTAs cut memory-level parallelism for the streaming reads. Measured,
+  not asserted.
+- **v2 is at 88.4% of the measured ceiling at gate/up.** There is no kernel
+  headroom: the 17.5 ms iq4xs busy time is DRAM weight streaming, not
+  inefficiency. v3's 86.6% at down-proj confirms even the LDS rewrite only
+  recovers ~6 points of the remaining 20.
+- Task 2.2 CLOSED per plan ON-FAILURE clause: a slower variant is a valid
+  outcome. v2 remains the production default; v3/v4 stay as opt-in A/B arms
+  (`GRIM_IQ4XS_V3=1` / `GRIM_IQ4XS_V4=1`), parity-pinned bit-exact vs v2.
+
+Do not iterate further on iq4xs dot4: v2 at 88% of measured ceiling is the
+practical roofline for this access pattern on gfx1200.

@@ -1959,6 +1959,17 @@ impl RocmDevice {
         if v3 {
             return self.launch_dot4_iq4xs_q81_gemv_v3_for_ab(act_q81, b_storage, out_storage, m, n, k);
         }
+        // Task 2.2 v4 (opt-in): v2's body on a 128-thread CTA (4 waves, 16
+        // columns) with a 4x superblock unroll — no LDS, no barrier. K gate
+        // is just the format's alignment requirement.
+        static V4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v4 = *V4.get_or_init(|| {
+            matches!(std::env::var("GRIM_IQ4XS_V4").as_deref(), Ok("1" | "true" | "on"))
+                && k % 256 == 0
+        });
+        if v4 {
+            return self.launch_dot4_iq4xs_q81_gemv_v4_for_ab(act_q81, b_storage, out_storage, m, n, k);
+        }
         self.launch_dot4_iq4xs_q81_gemv_with(
             act_q81,
             b_storage,
