@@ -3948,8 +3948,12 @@ impl Qwen35Block {
                     "missing KDA graph buffers for layer {layer_idx}"
                 ))
             })?;
-        let mut q81_ready = false;
-        let mut u4_ready = false;
+        let mut q_flags = grim_graph::QuantFlags {
+            q81_ready: false,
+            u4_ready: false,
+        };
+        let mut linear_emitter = DevLinearEmitter(dev);
+        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.attn_qkv", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3958,9 +3962,10 @@ impl Qwen35Block {
             act,
             "kda.attn_qkv",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            &mut q_flags.q81_ready,
+            &mut q_flags.u4_ready,
         )?;
+        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.alpha", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3969,9 +3974,10 @@ impl Qwen35Block {
             act,
             "kda.alpha",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            &mut q_flags.q81_ready,
+            &mut q_flags.u4_ready,
         )?;
+        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.beta", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3980,9 +3986,10 @@ impl Qwen35Block {
             act,
             "kda.beta",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            &mut q_flags.q81_ready,
+            &mut q_flags.u4_ready,
         )?;
+        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.attn_gate", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3991,8 +3998,8 @@ impl Qwen35Block {
             act,
             "kda.attn_gate",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            &mut q_flags.q81_ready,
+            &mut q_flags.u4_ready,
         )?;
         Ok(())
     }
