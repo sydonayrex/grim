@@ -5794,29 +5794,21 @@ fn plan_layer_devices(
         } else {
             vec![Default::default(); devices.len()]
         };
-    let policy = std::env::var("GRIM_OOM_POLICY")
-        .unwrap_or_else(|_| "degrade".to_string())
-        .to_ascii_lowercase();
+    let policy = oom_policy();
 
-    // Capacity floor check: largest single card < weights + min KV + reserve -> planner must NOT select single-card
-    let total_weights_needed: u64 = layer_cost.iter().sum::<u64>() + weights_total;
-    let max_single_card_headroom = remaining.iter().copied().max().unwrap_or(0);
-    let single_card_fits = single_device_fit(&layer_cost, &remaining);
-
-    if single_card_fits.is_none() && max_single_card_headroom < total_weights_needed && devices.len() > 1 && policy == "fail" {
-        let total_remaining: u64 = remaining.iter().sum();
-        if total_remaining < total_weights_needed {
-            return Err(grim_core::error::Error::Config(format!(
-                "OOM policy=fail: capacity floor exceeded. Largest single card ({:.2} GB headroom) < required weights ({:.2} GB) + KV/graph reserve. Model needs all {} devices and exceeds aggregate plannable VRAM ({:.2} GB).",
-                max_single_card_headroom as f64 / 1e9,
-                total_weights_needed as f64 / 1e9,
-                devices.len(),
-                total_remaining as f64 / 1e9
-            )));
+    // Task 4.2 capacity floor. `layer_cost` already carries the resident
+    // weights, the per-attention-layer KV arena and the per-layer graph
+    // workspace share, so the decision is made against the FULL placement
+    // bill. Under policy=fail an unplannable model is a hard Error::Config
+    // BEFORE any assignment, naming every card; under the default `degrade`
+    // the managed-memory fallback further down stays reachable.
+    if policy == "fail" {
+        if let Some(msg) = capacity_floor_error(&layer_cost, &remaining) {
+            return Err(grim_core::error::Error::Config(msg));
         }
     }
 
-    if let Some(best) = single_card_fits {
+    if let Some(best) = single_device_fit(&layer_cost, &remaining) {
         eprintln!(
             "[qwen35] single-device fit: rocm:{} holds all {} layers ({:.2} GB of {:.2} GB \
              budget) — not splitting (a split would add a cross-device hop per forward)",
@@ -5939,6 +5931,49 @@ fn placement_layer_costs(
                 .saturating_add(attn)
         })
         .collect()
+}
+
+/// Task 4.2 OOM policy. `degrade` (default) keeps the HIP managed-memory
+/// fallback; `fail` turns an unplannable model into a hard `Error::Config`.
+fn oom_policy() -> &'static str {
+    match std::env::var("GRIM_OOM_POLICY").as_deref() {
+        Ok(v) if v.eq_ignore_ascii_case("fail") => "fail",
+        _ => "degrade",
+    }
+}
+
+/// Task 4.2 capacity floor. Pure so it is unit-testable without hardware.
+///
+/// `needed` is the full placement bill (resident weights + per-attention-layer
+/// KV arena + per-layer graph reserve). When the aggregate of all cards cannot
+/// hold it, NO layout — single-card or split — avoids a managed spill, and
+/// that is the error the plan demands: per-card numbers, not a silent
+/// degradation. When the aggregate fits, a split exists and None is returned;
+/// `single_device_fit` remains the only path that picks one card, and it only
+/// picks a card that truly holds everything, so the "single-card via managed
+/// spill" hole is closed by construction.
+fn capacity_floor_error(layer_cost: &[u64], remaining: &[u64]) -> Option<String> {
+    let needed: u64 = layer_cost.iter().sum();
+    let total: u64 = remaining.iter().sum();
+    if total >= needed {
+        return None;
+    }
+    let per_card = remaining
+        .iter()
+        .enumerate()
+        .map(|(i, b)| format!("rocm:{}: {:.2} GB plannable", i, *b as f64 / 1e9))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "OOM policy=fail: capacity floor exceeded — model needs {:.2} GB \
+         (weights + per-layer KV + graph reserve) but the {} device(s) only \
+         plannable {:.2} GB in aggregate ({}). No placement, single-card or \
+         split, fits without a HIP managed-memory spill.",
+        needed as f64 / 1e9,
+        remaining.len(),
+        total as f64 / 1e9,
+        per_card
+    ))
 }
 
 fn single_device_fit(layer_bytes: &[u64], remaining: &[u64]) -> Option<usize> {
@@ -6425,20 +6460,55 @@ mod tests {
         assert_eq!(got.expect("absent tensor should retry"), 7);
     }
 
-    /// Task 4.2: OOM policy enforcement and headroom checks.
+    /// Task 4.2: the assigner must count layers nothing can hold as unplaced
+    /// (that count is what triggers the policy branch in `plan_layer_devices`).
     #[test]
-    fn test_oom_policy_fail_contract() {
-        let layers = vec![1000u64; 10]; // 10 layers of 1000 bytes
-        let mut remaining = vec![2000u64, 2000u64]; // 4000 bytes headroom total
+    fn assign_by_headroom_counts_unplaceable_layers() {
+        let layers = vec![1000u64; 10]; // 10 layers of 1000 bytes = 10,000 bytes needed
+        let mut remaining = vec![1500u64, 1500u64]; // 3000 bytes headroom total
         let caps = vec![Default::default(), Default::default()];
         let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
-        assert!(unplaced > 0, "layers exceeding headroom must be unplaced");
+        assert_eq!(
+            unplaced, 8,
+            "2 layers placed (1 per 1500B device under target share), 8 unplaced"
+        );
+    }
 
-        let err = grim_core::error::Error::Config(format!(
-            "OOM policy=fail: {}/10 layers exceed aggregate plannable VRAM",
-            unplaced
-        ));
-        assert!(err.to_string().contains(&format!("OOM policy=fail: {unplaced}/10 layers exceed aggregate plannable VRAM")));
+    /// Task 4.2 capacity floor, real fixture: a model that no layout can hold
+    /// must produce the per-card error, and one a split CAN hold must not.
+    #[test]
+    fn capacity_floor_error_fires_only_when_aggregate_cannot_hold_model() {
+        let layer_cost = vec![1_000_000_000u64; 10]; // 10,000,000,000 bytes (10.00 GB) needed
+
+        // Aggregate 4,000,000,000 < 10,000,000,000: no placement exists -> per-card error.
+        let err = capacity_floor_error(&layer_cost, &[2_000_000_000, 2_000_000_000])
+            .expect("aggregate smaller than the model must be a floor violation");
+        assert!(err.contains("capacity floor exceeded"), "{err}");
+        assert!(err.contains("10.00 GB"), "must name the needed bytes: {err}");
+        assert!(err.contains("rocm:0") && err.contains("rocm:1"), "must name every card: {err}");
+        assert!(err.contains("2.00 GB"), "must name per-card plannable bytes: {err}");
+
+        // Aggregate exactly equals the bill: a (tight) split exists -> None.
+        assert_eq!(capacity_floor_error(&layer_cost, &[5_000_000_000, 5_000_000_000]), None);
+
+        // One card alone holds everything: single-card fit exists -> None.
+        assert_eq!(capacity_floor_error(&layer_cost, &[20_000_000_000, 100_000_000]), None);
+    }
+
+    /// Task 4.2: policy mapping. Serial because it mutates process env.
+    #[test]
+    fn oom_policy_maps_env_fail_and_defaults_to_degrade() {
+        unsafe {
+            std::env::remove_var("GRIM_OOM_POLICY");
+            assert_eq!(oom_policy(), "degrade");
+            std::env::set_var("GRIM_OOM_POLICY", "degrade");
+            assert_eq!(oom_policy(), "degrade", "any non-`fail` value degrades");
+            std::env::set_var("GRIM_OOM_POLICY", "fail");
+            assert_eq!(oom_policy(), "fail");
+            std::env::set_var("GRIM_OOM_POLICY", "FAIL");
+            assert_eq!(oom_policy(), "fail", "case-insensitive");
+            std::env::remove_var("GRIM_OOM_POLICY");
+        }
     }
 
     /// Regression for the Qwen3.8 vocab bug: a ShapeMismatch used to be
