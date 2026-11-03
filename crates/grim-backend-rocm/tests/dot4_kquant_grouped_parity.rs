@@ -3090,51 +3090,85 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         eprintln!("[iq4xs-v3] k={k} n={n}: parity green (bit-exact vs v2, envelope vs host)");
     }
 
-    // SHIP BAR timing at the 27B's #1 shape (n=4096, k=5120; the 117-launch
-    // tensor family). v2 baseline: 103.9 GB/s (150 us/launch). v3 ships only
-    // above 1.15x (>= 119.5 GB/s / <= ~130 us).
-    let (k, n, m, iters) = (5120usize, 4096usize, 1usize, 200usize);
-    let (blk_bytes, quant, _deq) = scheme("iq4xs");
-    let row_bytes = (k / 256) * blk_bytes;
-    let mut rng = Lcg(0xBEEF_1234);
-    let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
-    let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
-    let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![m * k]), f32ty).unwrap();
-    let q81_len = m * (k / 32) * 36;
-    let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone()).unwrap();
-    dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81_st.as_ref()).unwrap(), m, k).unwrap();
-    dev.synchronize();
-    let mut bq = vec![0u8; n * row_bytes];
-    for col in 0..n {
-        let packed = quant(&b[col * k..(col + 1) * k]).unwrap();
-        bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
-    }
-    let b_st = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty).unwrap();
-    let mk_out = || MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
-        DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
-    let out_a = mk_out();
-    let out_b = mk_out();
-    let a_r = as_rocm(q81_st.as_ref()).unwrap();
-    let b_r = as_rocm(b_st.as_ref()).unwrap();
+    // SHIP BAR timing — COLD weights (rotate past Infinity Cache).
+    // The 9070 XT has 64 MB Infinity Cache; a single weight blob for
+    // k=5120,n=4096 is ~10.6 MB and for k=5120,n=17408 is ~45 MB, so one
+    // blob stays resident and every launch after the first reads from cache,
+    // not DRAM. We rotate N distinct copies (> 128 MB total) so every launch
+    // fetches uncached weights, matching the 27B per-token streaming pattern.
+    // Real 27B shapes: gate/up (k=5120,n=17408) and down-proj (k=17408,n=5120).
+    // Bar: v3 >= 1.15x of 103.9 GB/s (= 119.5 GB/s). Slower v3 = valid outcome,
+    // record negative and close Task 2.2 per plan.
+    let n_copies = 8usize;
+    let iters = 200usize;
+    let shapes = [(5120usize, 17408usize), (17408usize, 5120usize)]; // (k, n): gate/up, down-proj
+    for (k, n) in shapes {
+        let (blk_bytes, quant, _deq) = scheme("iq4xs");
+        let row_bytes = (k / 256) * blk_bytes;
+        let q81_len = 1 * (k / 32) * 36;
+        // Build n_copies distinct weight blobs.
+        let mut rng = Lcg(0xBEEF_1234u64 ^ k as u64 ^ n as u64);
+        let mut weight_blobs: Vec<Vec<u8>> = Vec::with_capacity(n_copies);
+        for _ in 0..n_copies {
+            let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
+            let mut packed = vec![0u8; n * row_bytes];
+            for col in 0..n {
+                let p = quant(&b[col * k..(col + 1) * k]).unwrap();
+                packed[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
+            }
+            weight_blobs.push(packed);
+        }
+        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let m = 1usize;
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![m * k]), f32ty).unwrap();
+        let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone()).unwrap();
+        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81_st.as_ref()).unwrap(), m, k).unwrap();
+        dev.synchronize();
+        let a_r = as_rocm(q81_st.as_ref()).unwrap();
+        let b_sts: Vec<_> = weight_blobs.iter().map(|wb| {
+            MemoryOps::from_cpu_bytes(&dev, wb, &Shape::new(vec![wb.len()]), u8ty.clone()).unwrap()
+        }).collect();
+        let out_a = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let out_b = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let o_a = as_rocm(out_a.as_ref()).unwrap();
+        let o_b = as_rocm(out_b.as_ref()).unwrap();
 
-    let bytes_moved = (n * row_bytes + q81_len + m * n * 4) as f64;
-    let time = |f: &dyn Fn()| {
-        // warmup
-        for _ in 0..20 { f(); }
-        dev.synchronize();
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters { f(); }
-        dev.synchronize();
-        t0.elapsed().as_secs_f64() / iters as f64
-    };
-    let t_v2 = time(&|| { let _ = dev.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(a_r, b_r, as_rocm(out_a.as_ref()).unwrap(), m, n, k); });
-    let t_v3 = time(&|| { let _ = dev.launch_dot4_iq4xs_q81_gemv_v3_for_ab(a_r, b_r, as_rocm(out_b.as_ref()).unwrap(), m, n, k); });
-    let g_v2 = bytes_moved / t_v2 / 1e9;
-    let g_v3 = bytes_moved / t_v3 / 1e9;
-    eprintln!(
-        "[iq4xs-v3 SHIP BAR] n={n} k={k}: v2 {t_v2:.1?} = {g_v2:.1} GB/s | v3 {t_v3:.1?} = {g_v3:.1} GB/s | ratio {:.3} (bar >= 1.15)",
-        g_v3 / g_v2
-    );
+        // bytes per launch = weights + activations + output (output written once per launch)
+        let bytes_moved = (n * row_bytes + q81_len + m * n * 4) as f64;
+        let time = |f: &dyn Fn(usize)| {
+            // warmup
+            for i in 0..20 { f(i % n_copies); }
+            dev.synchronize();
+            let t0 = std::time::Instant::now();
+            for i in 0..iters { f(i % n_copies); }
+            dev.synchronize();
+            t0.elapsed().as_secs_f64() / iters as f64
+        };
+        let t_v2 = time(&|i| {
+            let _ = dev.launch_dot4_iq4xs_q81_gemv_sub_v2_for_ab(
+                a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_a, m, n, k);
+        });
+        let t_v3 = time(&|i| {
+            let _ = dev.launch_dot4_iq4xs_q81_gemv_v3_for_ab(
+                a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_b, m, n, k);
+        });
+        let g_v2 = bytes_moved / t_v2 / 1e9;
+        let g_v3 = bytes_moved / t_v3 / 1e9;
+        let g_v2_ratio = g_v2 / 103.9;
+        let g_v3_ratio = g_v3 / 103.9;
+        eprintln!(
+            "[iq4xs-v3 SHIP BAR] k={k} n={n}: v2 {t_v2:.1?} us = {g_v2:.1} GB/s ({g_v2_ratio:.2}x baseline) \
+             | v3 {t_v3:.1?} us = {g_v3:.1} GB/s ({g_v3_ratio:.2}x baseline) | v3/v2 ratio {:.3} (bar >= 1.15)",
+            g_v3 / g_v2
+        );
+        if g_v3_ratio >= 1.15 {
+            eprintln!("[iq4xs-v3] SHIP BAR MET for k={k} n={n}");
+        } else {
+            eprintln!("[iq4xs-v3] SHIP BAR MISSED for k={k} n={n}: v3 {g_v3:.1} GB/s < 119.5 GB/s");
+        }
+    }
 }
