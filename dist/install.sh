@@ -11,12 +11,69 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Search locations for pre-built grim binary
+GRIM_VERSION="${GRIM_VERSION:-0.1.0}"
+DOWNLOAD_BASE_URL="${GRIM_DOWNLOAD_URL:-https://github.com/grim-org/grim/releases/download/v${GRIM_VERSION}}"
+
+# ---------------------------------------------------------------------------
+# Download pre-built release tarball and verify SHA-256 before extraction
+# ---------------------------------------------------------------------------
+download_and_verify_release() {
+    local tarball_name="grim-${GRIM_VERSION}-linux-x86_64-rocm.tar.gz"
+    local sha_name="${tarball_name}.sha256"
+    local tmp_dir
+    tmp_dir="$(mktemp -d /tmp/grim-install.XXXXXX)"
+
+    echo "[grim] Downloading release v${GRIM_VERSION} (${tarball_name})..."
+    if ! curl -fsSL "${DOWNLOAD_BASE_URL}/${tarball_name}" -o "${tmp_dir}/${tarball_name}"; then
+        echo "[grim] Failed to download binary tarball from ${DOWNLOAD_BASE_URL}"
+        rm -rf "${tmp_dir}"
+        return 1
+    fi
+
+    echo "[grim] Downloading SHA-256 checksum (${sha_name})..."
+    if ! curl -fsSL "${DOWNLOAD_BASE_URL}/${sha_name}" -o "${tmp_dir}/${sha_name}"; then
+        echo "[grim] ERROR: Failed to download checksum file ${sha_name}"
+        rm -rf "${tmp_dir}"
+        exit 1
+    fi
+
+    echo "[grim] Verifying SHA-256 checksum..."
+    if ! (cd "${tmp_dir}" && sha256sum -c "${sha_name}"); then
+        echo "[grim] ERROR: SHA-256 checksum verification failed! Tarball may be corrupted or tampered."
+        rm -rf "${tmp_dir}"
+        exit 1
+    fi
+    echo "[grim] Checksum OK."
+
+    echo "[grim] Extracting release..."
+    mkdir -p "${tmp_dir}/extracted"
+    tar -xzf "${tmp_dir}/${tarball_name}" -C "${tmp_dir}/extracted"
+    if [ -f "${tmp_dir}/extracted/bin/grim" ]; then
+        GRIM_BINARY="${tmp_dir}/extracted/bin/grim"
+    elif [ -f "${tmp_dir}/extracted/grim" ]; then
+        GRIM_BINARY="${tmp_dir}/extracted/grim"
+    fi
+}
+
 if [ -n "$GRIM_BINARY_PATH" ] && [ -f "$GRIM_BINARY_PATH" ]; then
     GRIM_BINARY="$GRIM_BINARY_PATH"
 elif [ -f "${PROJECT_ROOT}/target/release/grim" ]; then
     GRIM_BINARY="${PROJECT_ROOT}/target/release/grim"
 elif [ -f "./grim" ]; then
     GRIM_BINARY="./grim"
+elif [ -f "${SCRIPT_DIR}/grim-${GRIM_VERSION}-linux-x86_64-rocm.tar.gz" ]; then
+    # Local release tarball available
+    tarball_name="grim-${GRIM_VERSION}-linux-x86_64-rocm.tar.gz"
+    echo "[grim] Verifying local release checksum in ${SCRIPT_DIR}..."
+    if [ -f "${SCRIPT_DIR}/${tarball_name}.sha256" ]; then
+        (cd "${SCRIPT_DIR}" && sha256sum -c "${tarball_name}.sha256") || {
+            echo "[grim] ERROR: Local release tarball checksum failed."
+            exit 1
+        }
+    fi
+    TMP_EXTRACT="$(mktemp -d /tmp/grim-extract.XXXXXX)"
+    tar -xzf "${SCRIPT_DIR}/${tarball_name}" -C "${TMP_EXTRACT}"
+    GRIM_BINARY="${TMP_EXTRACT}/bin/grim"
 else
     GRIM_BINARY="${PROJECT_ROOT}/target/release/grim"
 fi
