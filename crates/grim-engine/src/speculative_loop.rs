@@ -1,6 +1,9 @@
 //! GPU-Native Speculative Decoding Generation Loop.
 //! Orchestrates draft token generation, target model verification, and device-side rejection sampling with minimal host-GPU synchronization.
 
+use grim_tensor::backend::SamplingOps;
+use grim_tensor::{CoreTensorOps, DType, MemoryOps, Shape, Tensor};
+
 /// Configuration for the Speculative Decoding Engine.
 #[derive(Debug, Clone)]
 pub struct SpeculativeLoopConfig {
@@ -98,6 +101,60 @@ impl SpeculativeLoop {
 
         self.verify_draft_step(draft_tokens, 0, accepted.len());
         accepted
+    }
+
+    /// GPU-accelerated speculative rejection sampling on ROCm/device tensors (Task 10.6).
+    pub fn verify_tokens_gpu(
+        &mut self,
+        target_probs: &Tensor,
+        draft_probs: &Tensor,
+        draft_tokens: &[u32],
+        uniform_rands: &[f32],
+        vocab_size: usize,
+    ) -> grim_core::error::Result<Vec<u32>> {
+        let batch_size = 1;
+        let num_draft = draft_tokens.len();
+
+        let dev = match target_probs.device() {
+            grim_tensor::Device::Rocm(ord) => grim_backend_rocm::device::roc_device::RocmDevice::try_new(*ord as usize)
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?,
+            _ => {
+                // Fall back to CPU verification
+                let p_t = target_probs.to_vec_f32().map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+                let p_d = draft_probs.to_vec_f32().map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+                return Ok(self.verify_tokens_with_rejection_sampling(draft_tokens, &p_d, &p_t, uniform_rands));
+            }
+        };
+
+        let dt_i32: Vec<i32> = draft_tokens.iter().map(|&t| t as i32).collect();
+        let dt_storage = dev.from_cpu(&dt_i32.iter().map(|&x| x as f32).collect::<Vec<_>>(), &Shape::new(vec![batch_size, num_draft]), DType::F32)
+            .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+        let ur_storage = dev.from_cpu(uniform_rands, &Shape::new(vec![batch_size, num_draft + 1]), DType::F32)
+            .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+        let at_storage = dev.alloc_storage(&Shape::new(vec![batch_size, num_draft + 1]), DType::F32)
+            .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+        let al_storage = dev.alloc_storage(&Shape::new(vec![batch_size]), DType::F32)
+            .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+
+        dev.speculative_rejection_sample(
+            target_probs.storage().as_ref(),
+            draft_probs.storage().as_ref(),
+            dt_storage.as_ref(),
+            ur_storage.as_ref(),
+            at_storage.as_ref(),
+            al_storage.as_ref(),
+            batch_size,
+            num_draft,
+            vocab_size,
+        ).map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+
+        let al_vec = al_storage.to_cpu_vec_f32().map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+        let accepted_len = al_vec.get(0).copied().unwrap_or(0.0) as usize;
+        let at_vec = at_storage.to_cpu_vec_f32().map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+
+        let accepted: Vec<u32> = at_vec.into_iter().take(accepted_len).map(|t| t as u32).collect();
+        self.verify_draft_step(draft_tokens, 0, accepted.len());
+        Ok(accepted)
     }
 
     /// Multi-head Medusa / Eagle tree speculative verification.

@@ -677,6 +677,43 @@ pub trait SamplingOps {
             "sample_on_device_with_penalty not implemented for this backend".into(),
         ))
     }
+
+    /// Speculative decoding rejection sampling (Task 10.6).
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_rejection_sample(
+        &self,
+        _target_probs: &dyn BackendStorage,
+        _draft_probs: &dyn BackendStorage,
+        _draft_tokens: &dyn BackendStorage,
+        _uniform_rands: &dyn BackendStorage,
+        _accepted_tokens: &dyn BackendStorage,
+        _accepted_lens: &dyn BackendStorage,
+        _batch_size: usize,
+        _num_draft_tokens: usize,
+        _vocab_size: usize,
+    ) -> Result<()> {
+        Err(crate::error::Error::Unimplemented(
+            "speculative_rejection_sample not implemented for this backend".into(),
+        ))
+    }
+
+    /// Speculative decoding tree verification (Task 10.6).
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_tree_verify(
+        &self,
+        _candidate_paths: &dyn BackendStorage,
+        _target_logits: &dyn BackendStorage,
+        _path_lens: &dyn BackendStorage,
+        _best_path_idx: &dyn BackendStorage,
+        _best_accepted_len: &dyn BackendStorage,
+        _num_paths: usize,
+        _max_path_len: usize,
+        _vocab_size: usize,
+    ) -> Result<()> {
+        Err(crate::error::Error::Unimplemented(
+            "speculative_tree_verify not implemented for this backend".into(),
+        ))
+    }
 }
 
 /// Attention kernel family: RoPE application, dense/ALiBi/paged/tree/
@@ -2546,6 +2583,75 @@ impl<T: SamplingOps + ?Sized> SamplingOps for std::sync::Arc<T> {
         seed: u64,
     ) -> Result<u32> {
         (**self).sample_on_device(logits, temperature, top_p, top_k, seed)
+    }
+
+    fn sample_on_device_with_penalty(
+        &self,
+        logits: &dyn BackendStorage,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        seed: u64,
+        repeat_penalty: f32,
+        history: &[u32],
+    ) -> Result<u32> {
+        (**self).sample_on_device_with_penalty(
+            logits,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            repeat_penalty,
+            history,
+        )
+    }
+
+    fn speculative_rejection_sample(
+        &self,
+        target_probs: &dyn BackendStorage,
+        draft_probs: &dyn BackendStorage,
+        draft_tokens: &dyn BackendStorage,
+        uniform_rands: &dyn BackendStorage,
+        accepted_tokens: &dyn BackendStorage,
+        accepted_lens: &dyn BackendStorage,
+        batch_size: usize,
+        num_draft_tokens: usize,
+        vocab_size: usize,
+    ) -> Result<()> {
+        (**self).speculative_rejection_sample(
+            target_probs,
+            draft_probs,
+            draft_tokens,
+            uniform_rands,
+            accepted_tokens,
+            accepted_lens,
+            batch_size,
+            num_draft_tokens,
+            vocab_size,
+        )
+    }
+
+    fn speculative_tree_verify(
+        &self,
+        candidate_paths: &dyn BackendStorage,
+        target_logits: &dyn BackendStorage,
+        path_lens: &dyn BackendStorage,
+        best_path_idx: &dyn BackendStorage,
+        best_accepted_len: &dyn BackendStorage,
+        num_paths: usize,
+        max_path_len: usize,
+        vocab_size: usize,
+    ) -> Result<()> {
+        (**self).speculative_tree_verify(
+            candidate_paths,
+            target_logits,
+            path_lens,
+            best_path_idx,
+            best_accepted_len,
+            num_paths,
+            max_path_len,
+            vocab_size,
+        )
     }
 }
 
