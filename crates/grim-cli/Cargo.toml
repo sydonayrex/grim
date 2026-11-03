@@ -48,6 +48,8 @@ zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 rand = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 ratatui = "0.30"
 crossterm = "0.28"
 pulldown-cmark = "0.12"

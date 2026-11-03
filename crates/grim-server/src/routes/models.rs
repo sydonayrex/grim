@@ -62,7 +62,7 @@ pub async fn load_model_route(
     };
 
     #[cfg(debug_assertions)]
-    eprintln!("[grim-server] Loading model from: {}", model_path.display());
+    tracing::debug!("[grim-server] Loading model from: {}", model_path.display());
     let model_path_str = model_path.to_string_lossy().to_string();
     let loaded_kind = if model_path_str.ends_with(".grim") {
         "grim"
@@ -107,7 +107,7 @@ pub async fn load_model_route(
             )
         }
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[grim-server] ERROR: failed to load model '{}': {}",
                 model_path.display(),
                 e
@@ -284,13 +284,13 @@ pub async fn grim_upload_route(
         apply_gguf_enrichment(&mut entry, &dest_path);
     }
     if let Err(e) = entry.save(&dest_path) {
-        eprintln!(
+        tracing::warn!(
             "[grim-server] WARNING: uploaded '{}' saved but sidecar write failed: {e}",
             safe_name
         );
     }
 
-    eprintln!(
+    tracing::info!(
         "[grim-server] Uploaded model '{}' ({:.2} MB) -> {}",
         safe_name,
         body.len() as f64 / 1_048_576.0,

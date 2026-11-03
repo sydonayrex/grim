@@ -533,8 +533,8 @@ impl ScytheRingExec {
             let rs = grim_backend_rocm::hip_stream_synchronize(self.control_stream_ptr());
             if diag {
                 match rs {
-                    Ok(()) => eprintln!("[cc-diag] synced t={}ms", t0.elapsed().as_millis()),
-                    Err(e) => eprintln!("[cc-diag] sync ERR {e}"),
+                    Ok(()) => tracing::debug!("[cc-diag] synced t={}ms", t0.elapsed().as_millis()),
+                    Err(e) => tracing::warn!("[cc-diag] sync ERR {e}"),
                 }
             }
         }

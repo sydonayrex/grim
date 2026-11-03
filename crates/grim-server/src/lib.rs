@@ -581,7 +581,7 @@ fn sample_on_device(
         ) {
             Ok(tok) => return Ok(tok),
             Err(e) => {
-                eprintln!("[grim-server] penalty sampler miss ({e}); trying legacy device path")
+                tracing::debug!("[grim-server] penalty sampler miss ({e}); trying legacy device path")
             }
         }
     }
@@ -654,7 +654,7 @@ fn sample_next_token(
         .and_then(|h| h.get(&request_id).cloned())
         .unwrap_or_default();
     let outcome = engine.last_outcome(request_id);
-    eprintln!(
+    tracing::debug!(
         "[sample_next_token] req {request_id} step {step} outcome is_some: {}, models: {:?}",
         outcome.is_some(),
         engine.loaded_models()
@@ -672,7 +672,7 @@ fn sample_next_token(
                         .partial_cmp(&last[a])
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                eprintln!(
+                tracing::debug!(
                     "[grim-server] step0 logits_len={} width={} top5={:?}",
                     all.len(),
                     width,
@@ -1220,7 +1220,7 @@ fn ensure_model_available(state: &Arc<AppState>, requested_model: &str) -> Optio
         let token = grim_core::client::load_login_token(provider_key)
             .ok()
             .flatten();
-        eprintln!(
+        tracing::info!(
             "[grim-server] Routing request for model '{}' to remote provider '{}' (token present: {})",
             requested_model,
             provider_key,
@@ -1242,7 +1242,7 @@ fn ensure_model_available(state: &Arc<AppState>, requested_model: &str) -> Optio
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
                     engine.register_model_with_farm(requested_model, model, &farm_path);
-                    eprintln!(
+                    tracing::info!(
                         "[grim-server] Loaded model '{}' on demand.",
                         requested_model
                     );
@@ -1251,7 +1251,7 @@ fn ensure_model_available(state: &Arc<AppState>, requested_model: &str) -> Optio
                     }
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[grim-server] Cannot load model '{}': {}",
                         requested_model, e
                     );
@@ -1513,7 +1513,7 @@ fn build_chat_sampling(
                 .as_ref()
                 .and_then(|r| r.get_sampler(name))
                 .unwrap_or_else(|| {
-                    eprintln!(
+                    tracing::warn!(
                         "[grim-server] WARNING: sampler '{name}' not found in plugin registry; \
                          falling back to SamplingParams-built sampler."
                     );
@@ -1779,7 +1779,7 @@ fn render_chat_prompt(
         }
     };
     if std::env::var("GRIM_DEBUG_PROMPT").as_deref() == Ok("1") {
-        eprintln!(
+        tracing::debug!(
             "[grim-server] prompt tokens ({}): {:?}\n[grim-server] prompt text: {:?}",
             prompt_tokens.len(),
             prompt_tokens,
@@ -1798,7 +1798,7 @@ fn render_chat_prompt(
             // Only compress if the raw text is substantially larger than the budget
             let compressed = grim_compress::compress_prompt(&prompt_text, budget);
             if compressed != prompt_text {
-                eprintln!(
+                tracing::info!(
                     "[grim-server] prompt compressed: {} chars -> {} chars",
                     prompt_text.len(),
                     compressed.len()
@@ -1884,7 +1884,7 @@ fn render_chat_prompt(
 
     let total_requested = prompt_tokens.len().saturating_add(clamped_max_tokens as usize);
     if total_requested > 1_000_000 {
-        eprintln!(
+        tracing::warn!(
             "[Server] WARNING: prompt ({} tokens) + max_tokens ({}) = {} tokens \
              exceeds 1M. Model context_limit = {}.",
             prompt_tokens.len(),
@@ -3600,7 +3600,7 @@ async fn grim_generate(
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
-                                eprintln!(
+                                tracing::debug!(
                                     "[trace] generate content chunk, eval_count={eval_count}"
                                 );
                                 return Some((
@@ -3939,7 +3939,7 @@ pub async fn serve(
     let api_keys = load_api_keys_from_env();
     let auth_enabled = !api_keys.is_empty();
     if auth_enabled {
-        eprintln!(
+        tracing::info!(
             "[grim-server] Bearer auth enabled ({} API key(s)).",
             api_keys.len()
         );
@@ -4031,12 +4031,12 @@ pub async fn serve(
                         .and_then(|s| s.to_str())
                         .unwrap_or("model")
                         .to_string();
-                    eprintln!(
+                    tracing::info!(
                         "[grim-server] Tip: convert '{}' to a ROCm-tuned .grim for better \
                          performance on this GPU (detected profile: {}):",
                         name, profile
                     );
-                    eprintln!(
+                    tracing::info!(
                         "[grim-server]      grim oxidize convert {} --rocml-profile {}",
                         name, profile
                     );
@@ -4049,10 +4049,10 @@ pub async fn serve(
     };
 
     if tokenizer.is_none() {
-        eprintln!(
+        tracing::warn!(
             "[grim-server] WARNING: No tokenizer found. Run 'grim pull <model>' to download a model."
         );
-        eprintln!(
+        tracing::warn!(
             "[grim-server]          Text responses will show raw token IDs until a model is loaded."
         );
     }
@@ -4074,7 +4074,7 @@ pub async fn serve(
         "default",
         "text",
     ) {
-        eprintln!("[Server] Model capability check failed: {e}");
+        tracing::warn!("[Server] Model capability check failed: {e}");
     }
 
     let app = build_router_with_auth(state, api_keys);
@@ -4105,7 +4105,7 @@ pub async fn serve(
         let bind_addr = listener
             .local_addr()
             .map_err(|e| grim_core::Error::Config(format!("failed to get local addr: {e}")))?;
-        eprintln!(
+        tracing::info!(
             "[grim-server] Serving over HTTPS (SSL enabled) on {}",
             bind_addr
         );
@@ -4119,20 +4119,20 @@ pub async fn serve(
         let is_wildcard = host_part == "0.0.0.0" || host_part == "::";
         let is_non_loopback = !host_part.starts_with("127.") && !is_wildcard;
         if is_wildcard || is_non_loopback {
-            eprintln!(
+            tracing::warn!(
                 "[grim-server] WARNING: Binding to {addr} exposes the server on a \
                  non-loopback interface without TLS. This is a security risk on \
                  untrusted networks."
             );
             if !auth_enabled {
-                eprintln!(
+                tracing::warn!(
                     "[grim-server] WARNING: No API keys configured (set GRIM_API_KEY \
                      or GRIM_API_KEYS). Any reachable client can run models and read files."
                 );
             }
         }
-        eprintln!(
-            "[grim-server] WARNING: No TLS config found; serving over HTTP on {}",
+        tracing::info!(
+            "[grim-server] No TLS config found; serving over HTTP on {}",
             addr
         );
         let listener = tokio::net::TcpListener::bind(addr)

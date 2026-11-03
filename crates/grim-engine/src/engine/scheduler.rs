@@ -171,7 +171,7 @@ impl Engine {
     }
 
     pub(crate) fn drive_prefill_inner(&mut self, id: u64) -> Result<usize> {
-        eprintln!(
+        tracing::debug!(
             "[pin-dbg] prefill req {id} session_recorded={}",
             self.request_session.contains_key(&id)
         );
@@ -439,7 +439,7 @@ impl Engine {
                 if !block_ids.is_empty() {
                     let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                     pool.pin_blocks(&block_ids, pin_secs);
-                    eprintln!(
+                    tracing::debug!(
                         "[pin-dbg] prefill pinned {block_ids:?} for {pin_secs}s; is_pinned now: {:?}",
                         block_ids
                             .iter()
@@ -966,7 +966,7 @@ impl Engine {
                             Ok(())
                         })();
                         if let Err(e) = seed_ok {
-                            eprintln!(
+                            tracing::warn!(
                                 "[grim] decode-graph: KV seed failed for request {request_id} ({e}); eager fallback"
                             );
                             grim_core::emit_fallback(
@@ -1059,7 +1059,7 @@ impl Engine {
                     Ok(())
                 })();
                 if let Err(e) = seed_ok {
-                    eprintln!(
+                    tracing::warn!(
                         "[grim] decode-graph: slot re-seed failed for {graph_slot_key} ({e}); eager step"
                     );
                     grim_core::emit_fallback(
@@ -1142,7 +1142,7 @@ impl Engine {
         // with no fallback, killing the request. Degrade to the eager step
         // instead; a clean capture path (LFM2) is unaffected.
         if rocm.begin_graph_capture(capture_key).is_err() {
-            eprintln!("[grim] graph capture: begin failed for {capture_key}; eager step");
+            tracing::warn!("[grim] graph capture: begin failed for {capture_key}; eager step");
             grim_core::emit_fallback(
                 "grim-engine/scheduler",
                 grim_core::FallbackReason::GraphCaptureBegin,
@@ -1170,7 +1170,7 @@ impl Engine {
             (out, acc, running)
         };
         if rocm.end_graph_capture(capture_key).is_err() {
-            eprintln!("[grim] graph capture: end failed for {capture_key}; eager step");
+            tracing::warn!("[grim] graph capture: end failed for {capture_key}; eager step");
             grim_core::emit_fallback(
                 "grim-engine/scheduler",
                 grim_core::FallbackReason::GraphCaptureEnd,
@@ -1180,7 +1180,7 @@ impl Engine {
         }
         // Replay immediately to execute the captured graph.
         if rocm.replay_graph(capture_key).is_err() {
-            eprintln!("[grim] graph capture: replay failed for {capture_key}; eager step");
+            tracing::warn!("[grim] graph capture: replay failed for {capture_key}; eager step");
             grim_core::emit_fallback(
                 "grim-engine/scheduler",
                 grim_core::FallbackReason::GraphCaptureReplay,
@@ -1195,7 +1195,7 @@ impl Engine {
             .insert(capture_key.to_string(), Arc::new(logits.clone()));
         let _ = running;
         if let Some(t0) = _step_t0 {
-            eprintln!(
+            tracing::debug!(
                 "[grim] step trace: total {:?} (generic capture bracket)",
                 t0.elapsed()
             );

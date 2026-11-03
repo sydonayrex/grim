@@ -2618,6 +2618,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
  "windows-service",
  "zstd",
 ]
@@ -2705,6 +2707,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -2997,6 +3000,7 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tower",
+ "tracing",
  "wat",
 ]
 

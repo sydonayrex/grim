@@ -1071,6 +1071,11 @@ fn gcn_to_rocml_profile_str(gcn: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Task 8.2: initialize structured logging with EnvFilter
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve {

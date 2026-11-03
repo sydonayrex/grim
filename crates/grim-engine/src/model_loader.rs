@@ -251,7 +251,7 @@ pub fn sort_devices_by_bandwidth(devices: &mut [Device], caps: &[(usize, f32)]) 
                 .map(|(_, b)| *b)
                 .unwrap_or(0.0);
             if !(bw > 0.0 && bw.is_finite()) {
-                eprintln!("[placement] WARNING: bandwidth unmeasured, keeping ordinal order");
+                tracing::warn!("[placement] WARNING: bandwidth unmeasured, keeping ordinal order");
                 return;
             }
             bws.push((bw, d.clone()));
@@ -314,11 +314,11 @@ pub fn resolve_discrete_rocm_devices(fallback: &Device) -> Vec<Device> {
 }
 
 /// Debug-only logging macro. Compiles to a no-op in release builds so that
-/// diagnostic  calls do not pollute production stderr (sims.md issue #7).
+/// diagnostic calls do not pollute production stderr.
 macro_rules! dbg_eprintln {
     ($($arg:tt)*) => {
         #[cfg(debug_assertions)]
-        { eprintln!($($arg)*) }
+        { tracing::debug!($($arg)*) }
     };
 }
 /// Probe the host GPU's actual wavefront size for a ROCm `Device`.
@@ -1153,7 +1153,7 @@ fn qwen35_forward_layer_count<'a>(
         .min();
     match first_nextn {
         Some(first_nextn) if first_nextn < block_count => {
-            eprintln!(
+            tracing::info!(
                 "[qwen35] excluding {} MTP layer(s) from the forward: block_count={} but \
                  blk.{} carries nextn.* tensors",
                 block_count - first_nextn,
@@ -2258,7 +2258,7 @@ fn load_model_from_config(
                                 })?;
                         }
                     }
-                    eprintln!(
+                    tracing::info!(
                         "[grim] GRAVE sidecar applied: {} layer gate triples{} from {sidecar_path}",
                         sc.layers,
                         if proj.is_some() {
@@ -3293,7 +3293,7 @@ fn load_model_with_providers(
 
     let lookup = GgufMetadataLookup(provider);
     if std::env::var_os("GRIM_LOADER_TRACE").is_some() {
-        eprintln!(
+        tracing::debug!(
             "[loader-trace] arch_str={arch_str:?} -> {:?}",
             ModelArchitecture::from_str(arch_str)
         );
@@ -3308,11 +3308,11 @@ fn load_model_with_providers(
             )));
         }
         ModelSupportTier::Experimental => {
-            eprintln!("[grim] NOTICE: Architecture '{arch_str}' is tier: EXPERIMENTAL ({reason})");
+            tracing::info!("[grim] NOTICE: Architecture '{arch_str}' is tier: EXPERIMENTAL ({reason})");
         }
         ModelSupportTier::Green => {
             if arch_str.to_ascii_lowercase().contains("bitnet") {
-                eprintln!("[grim] NOTICE: Architecture '{arch_str}' is tier: GREEN ({reason})");
+                tracing::info!("[grim] NOTICE: Architecture '{arch_str}' is tier: GREEN ({reason})");
             }
         }
     }
@@ -4394,7 +4394,7 @@ fn load_model_with_providers(
                                 })?;
                         }
                     }
-                    eprintln!(
+                    tracing::info!(
                         "[grim] GRAVE sidecar applied: {} layer gate triples{} from {sidecar_path}",
                         sc.layers,
                         if proj.is_some() {

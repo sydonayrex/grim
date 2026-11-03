@@ -55,7 +55,7 @@ impl Engine {
                                     cfg.group_size
                                 );
                             }
-                            None => eprintln!(
+                            None => tracing::warn!(
                                 "[grim-engine] GRIM_KV_QUANT='{spec}' not recognized (expected int8|int4|off|{})",
                                 grim_kvquant::NAMED_PROFILES.join("|")
                             ),
