@@ -41,7 +41,7 @@ rustup update stable
    Clone the repository and build the CLI.
 
    ```bash
-   git clone https://github.com/poolside-ai/grim.git
+   git clone https://github.com/sydonayrex/grim.git
    cd grim
    cargo build --release -p grim-cli
    ```

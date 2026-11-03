@@ -32,7 +32,7 @@ cargo test --workspace
 | Crate | Scope |
 |---|---|
 | [`grim-tensor`](crates/grim-tensor/README.md) | Core tensor structures, shape handling, data types (including AWQ, CompressedTensors W8A8 Int8/Fp8, W4A16, GPTQ, MXFP4), and device storage traits. |
-| [`grim-tensor-graph`](crates/grim-tensor-graph/README.md) | Computation graph representation and subgraph optimization passes. |
+| [`grim-graph`](crates/grim-graph/README.md) | Computation graph representation and subgraph optimization passes. |
 | [`grim-backend-cpu`](crates/grim-backend-cpu/README.md) | CPU compute backend using SIMD vector primitives and scalar execution fallback. |
 | [`grim-backend-rocm`](crates/grim-backend-rocm/README.md) | AMD ROCm/HIP primary GPU backend with JIT kernel compilation, rocBLAS integration, Charon grouped fused MoE kernels (AWQ, W8A8, MXFP4, IQK), and fused dequant-GEMMs. |
 | [`grim-backend-cuda`](crates/grim-backend-cuda/README.md) | NVIDIA CUDA compatibility backend using cuBLAS and CUDA runtime APIs. |

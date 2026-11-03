@@ -86,7 +86,7 @@ LRU — never a correctness difference.
 |---|---|---|---|---|
 | `GRIM_BACKEND` | String | `auto` | `grim-core`, `grim-cli` | Target backend: `rocm`, `cuda`, `vulkan`, `metal`, `cpu`, or `auto`. |
 | `GRIM_FORCE_DEVICE` | String | Unset | `grim-engine`, `grim-cli` | Forces a specific device ordinal (e.g. `rocm:0`). |
-| `GRIM_GPU_TARGET` | String | `gfx1100` | `grim-backend-rocm` | Target AMD GCN architecture (e.g. `gfx1030`, `gfx1100`, `gfx1200`, `gfx90a`, `gfx942`). |
+| `GRIM_GPU_TARGET` | String | Auto-detected from GPU | `grim-backend-rocm` | Target AMD GCN architecture (e.g. `gfx1030`, `gfx1100`, `gfx1200`, `gfx1201`, `gfx90a`, `gfx942`). Automatically probed via `hipGetDeviceProperties` if unset. |
 | `ROCM_PATH` | String | `/opt/rocm` | `grim-backend-rocm` | ROCm installation directory for resolving HIP/rocBLAS libraries. |
 | `HIP_PATH` | String | `/opt/rocm/hip` | `grim-backend-rocm` | HIP toolkit installation path. |
 | `HIP_VISIBLE_DEVICES` | String | Unset | `grim-backend-rocm` | Comma-separated list of visible AMD GPU ordinals. |
@@ -105,6 +105,11 @@ LRU — never a correctness difference.
 | `GRIM_MEM_BUDGET_MIB` | Number (MiB) | Unset | `grim-core`, `grim-engine` | Maximum GPU memory budget allocation limit in MiB. |
 | `GRIM_KERNEL_TIMEOUT` | Number (Seconds) | `300` | `grim-core` | GPU kernel dispatch execution timeout before aborting. |
 | `GRIM_CONTEXT` | Number (Tokens) | Model Default | `grim-core`, `grim-engine` | Overrides maximum context length and KV cache buffer allocation. |
+| `GRIM_PHASE_TRACE` | Flag (`1`/`true`) | Unset | `grim-models-transformer`, `grim-backend-rocm` | Logs granular per-phase microbench timing breakdown (prefill/decode/collective). |
+| `GRIM_FUSED_RESIDUAL_GATEUP` | Flag (`1`/`true`) | `1` | `grim-backend-rocm` | Enables fused residual addition and SwiGLU gate/up projection on supported architectures. |
+| `GRIM_BLASLT_PREFILL` | Flag (`1`/`true`) | Unset | `grim-backend-rocm` | Routes prefill GEMMs through rocBLASLt when available on CDNA/RDNA architectures. |
+| `GRIM_WATCHDOG_TIMEOUT_SECS` | Number (Seconds) | `30` | `grim-backend-rocm` | ROCm GPU progress watchdog stall timeout before triggering exit code 101. |
+| `GRIM_CAPABILITY_PLACEMENT` | Flag (`1`/`true`) | `0` | `grim-models-transformer` | Enables capability-aware layer placement across mixed consumer GPUs (e.g. 9070 XT + 9060 XT). |
 
 ### Serving & Network Controls
 

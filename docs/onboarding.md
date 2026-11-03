@@ -4,9 +4,9 @@ This guide walks new contributors through setting up a development environment f
 
 ## Prerequisites
 
-- **Rust toolchain**: edition 2024, minimum version 1.85
+- **Rust toolchain**: edition 2024, minimum version 1.86.0
   ```bash
-  rustup update 1.85
+  rustup update 1.86.0
   rustup default stable
   ```
 - **Git** (for cloning the repository)

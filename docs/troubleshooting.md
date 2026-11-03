@@ -23,8 +23,8 @@ This guide catalogs common failure modes, error messages, and their resolutions 
 ## 2. AMD ROCm / HIP Issues
 
 ### Symptom: `RocmDevice::probe()` returns empty list or fails with missing shared library
-- **Cause**: Dynamic loader cannot find `libamdhip64.so.6` or `librocblas.so.4` in system search paths.
-- **Fix**: Verify ROCm installation and export `LD_LIBRARY_PATH`:
+- **Cause**: Dynamic loader cannot find `libamdhip64.so` (or versioned `libamdhip64.so.6` / `.so.5`) or `librocblas.so` in system search paths.
+- **Fix**: Verify ROCm installation and export `ROCM_PATH` / `LD_LIBRARY_PATH`:
   ```bash
   export ROCM_PATH=/opt/rocm
   export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
@@ -35,7 +35,27 @@ This guide catalogs common failure modes, error messages, and their resolutions 
 - **Cause**: Target GCN architecture mismatch or missing LLVM device compiler backend.
 - **Fix**: Explicitly set the GPU architecture via `GRIM_GPU_TARGET`:
   ```bash
-  export GRIM_GPU_TARGET=gfx1100  # for RX 7900 / RDNA3
+  export GRIM_GPU_TARGET=gfx1201  # for RX 9070 XT / RDNA4 (or gfx1100 for RX 7900)
+  ```
+
+### Symptom: Watchdog exit 101 (`[ROCM WATCHDOG TIMEOUT] No progress detected`)
+- **Cause**: Kernel or driver hang/deadlock on GPU, or unexpected timeout.
+- **Fix**: Run with kernel serialization to isolate the stalling kernel:
+  ```bash
+  AMD_SERIALIZE_KERNEL=3 grim run ...
+  ```
+  For large model loads over slow storage, extend the timeout:
+  ```bash
+  export GRIM_WATCHDOG_TIMEOUT_SECS=120
+  ```
+
+### Symptom: GPU Memory Exhaustion (OOM) or Page Fault
+- **Cause**: KV cache allocation exceeding available device VRAM or fragmentation under mixed-card setups.
+- **Fix**: Reduce context window or configure memory limits:
+  ```bash
+  export GRIM_CONTEXT=4096
+  export GRIM_MEM_FRACTION=0.90
+  export AMD_SERIALIZE_KERNEL=3 # pinpoint faulting instruction if kernel segfaults
   ```
 
 ---
