@@ -64,6 +64,26 @@ pub struct SpeculativeCausalLm {
     /// PID depth controller driving the DSpark draft block length K.
     /// Fed by observed (accepted, proposed) counts each DSpark step.
     depth_tuner: Mutex<SpeculativeDepthPidController>,
+    /// Optional GPU rejection-sampling verifier (Task 10.6). When set and the
+    /// verify logits are ROCm-resident, the ratio test runs on device — no
+    /// vocab-sized D2H copy. Errors fall back to the CPU verify loop.
+    gpu_verifier: Option<Arc<dyn SpeculativeVerifier>>,
+}
+
+/// Backend-agnostic GPU verification hook (Task 10.6). Implemented by the
+/// engine's ROCm verifier; the wrapper stays free of backend deps.
+/// Returns the accepted DRAFT-token count (the kernel's residual/bonus
+/// sample is excluded — callers derive it as accepted_len - 1).
+pub trait SpeculativeVerifier: Send + Sync {
+    fn verify(
+        &self,
+        target_logits: &Tensor,
+        draft_logits: &Tensor,
+        context_len: usize,
+        vocab_size: usize,
+        draft_tokens: &[u32],
+        uniform_rands: &[f32],
+    ) -> Result<usize>;
 }
 
 impl SpeculativeCausalLm {
@@ -81,6 +101,7 @@ impl SpeculativeCausalLm {
                 SpeculationConfig::default(),
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
+            gpu_verifier: None,
         }
     }
 
@@ -121,6 +142,7 @@ impl SpeculativeCausalLm {
             confidence: Some(confidence),
             scheduler: Mutex::new(scheduler),
             depth_tuner: Mutex::new(depth_tuner),
+            gpu_verifier: None,
         }
     }
 
@@ -138,6 +160,7 @@ impl SpeculativeCausalLm {
                 SpeculationConfig::default(),
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
+            gpu_verifier: None,
         }
     }
 
@@ -201,6 +224,75 @@ impl SpeculativeCausalLm {
             is_weight_streaming_active,
             available_vram_bytes,
         )
+    }
+
+    /// Attach a GPU rejection-sampling verifier (Task 10.6). Called by the
+    /// engine when the target runs on ROCm; the wrapper itself stays
+    /// backend-agnostic. `None` (default) keeps the CPU verify loop.
+    pub fn set_gpu_verifier(&mut self, verifier: Arc<dyn SpeculativeVerifier>) {
+        self.gpu_verifier = Some(verifier);
+    }
+
+    /// Shared verify decision (Task 10.6): GPU rejection sampler when a
+    /// verifier is attached and both logits tensors are ROCm-resident, CPU
+    /// softmax loop otherwise (also the fallback on verifier error). The RNG
+    /// is consumed by whichever arm runs; the caller passes a throwaway clone
+    /// (session RNG state is unaffected either way).
+    fn verify_accepted_count(
+        &self,
+        target_logits: &Tensor,
+        draft_logits: &Tensor,
+        context_len: usize,
+        vocab_size: usize,
+        draft_tokens: &[u32],
+        verify_len: usize,
+        uniforms: &[f32],
+        rng: &mut grim_core::rng::SimpleRng,
+    ) -> Result<usize> {
+        let gpu_ready = self.gpu_verifier.is_some()
+            && matches!(target_logits.device(), Device::Rocm(_))
+            && matches!(draft_logits.device(), Device::Rocm(_))
+            && uniforms.len() >= verify_len + 1;
+        if let (true, Some(verifier)) = (gpu_ready, self.gpu_verifier.as_ref()) {
+            match verifier.verify(
+                target_logits,
+                draft_logits,
+                context_len,
+                vocab_size,
+                draft_tokens,
+                uniforms,
+            ) {
+                Ok(count) => return Ok(count),
+                Err(e) => {
+                    tracing::debug!("GPU speculative verify failed, falling back to CPU: {e}");
+                }
+            }
+        }
+        // CPU reference loop: per-row softmax + ratio test with per-request
+        // randomness (identical math to the pre-Task-10.6 loop).
+        let target_probs = target_logits.to_vec_f32()?;
+        let draft_logits_cpu = draft_logits.to_vec_f32()?;
+        let mut accepted_count = 0usize;
+        for i in 0..verify_len {
+            let draft_tok = draft_tokens[i] as usize;
+            let row_start = (context_len + i) * vocab_size;
+            let row_end = row_start + vocab_size;
+            let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
+            let draft_row_start = i * vocab_size;
+            let draft_row_end = draft_row_start + vocab_size;
+            let p_draft = softmax_f32_row(&draft_logits_cpu[draft_row_start..draft_row_end])[draft_tok];
+            let p_accept = if p_draft > 1e-10 {
+                (p_target / p_draft).min(1.0)
+            } else {
+                0.0
+            };
+            if rng.next_f32() < p_accept {
+                accepted_count += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(accepted_count)
     }
 
     pub fn strategy(&self) -> Strategy {
@@ -316,43 +408,30 @@ impl SpeculativeCausalLm {
                 let target_logits =
                     self.target
                         .forward(session, &extended_input, &extended_positions, adapters)?;
-                let target_probs = target_logits.to_vec_f32()?;
                 let vocab_size = scored.base_logits.shape().dims()[1];
-                let draft_logits = scored.base_logits.to_vec_f32()?;
 
                 // CRIT-4: Use per-request RNG instead of global rand::random()
+                // Task 10.6: draw verify_len+1 uniforms up front so the GPU
+                // rejection sampler can run without a vocab-sized D2H copy;
+                // the CPU fallback loop consumes the same clone lazily.
                 let mut rng = session
                     .request_rng()
                     .cloned()
                     .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
+                let uniforms: Vec<f32> =
+                    (0..=verify_len).map(|_| rng.next_f32()).collect();
 
-                // Rejection-sampling validation loop (§5.3) Correctly index logits as flat [seq, vocab_size] row-major, apply per-row softmax, and use the standard ratio test with per-request randomness.
-                // Target logits cover [0..context_len) rows (original input positions).
                 let context_len = input_ids.shape().elem_count();
-                let mut accepted_count = 0;
-                for i in 0..verify_len {
-                    let draft_tok = scored.tokens[i] as usize;
-
-                    let row_start = (context_len + i) * vocab_size;
-                    let row_end = row_start + vocab_size;
-                    let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
-                    let draft_row_start = i * vocab_size;
-                    let draft_row_end = draft_row_start + vocab_size;
-                    let p_draft =
-                        softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
-
-                    // Ratio test: accept with min(1, p_target / p_draft).
-                    let p_accept = if p_draft > 1e-10 {
-                        (p_target / p_draft).min(1.0)
-                    } else {
-                        0.0
-                    };
-                    if rng.next_f32() < p_accept {
-                        accepted_count += 1;
-                    } else {
-                        break;
-                    }
-                }
+                let accepted_count = self.verify_accepted_count(
+                    &target_logits,
+                    &scored.base_logits,
+                    context_len,
+                    vocab_size,
+                    &scored.tokens[..verify_len],
+                    verify_len,
+                    &uniforms,
+                    &mut rng,
+                )?;
 
                 // CRIT-5: Properly commit/rollback KV cache based on accepted count.
                 // tentative_append(verify_len) must have added >= accepted_count slots.
@@ -472,39 +551,26 @@ impl SpeculativeCausalLm {
 
         // 4. Rejection sampling / validation loop (§5.3) The target logits
         // tensor has shape [S + verify_len, vocab_size] where S = len(original_input).
-        let target_probs = target_logits.to_vec_f32()?;
+        // Task 10.6: GPU rejection sampler when a verifier is attached (no
+        // vocab-sized D2H); CPU softmax loop otherwise/fallback.
         let vocab_size = draft_block.base_logits.shape().dims()[1];
-        let draft_logits = draft_block.base_logits.to_vec_f32()?;
         let context_len = input_ids.shape().elem_count();
 
-        let mut accepted_count = 0;
         let mut rng = session
             .request_rng()
             .cloned()
             .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
-        for i in 0..verify_len {
-            let draft_tok = draft_block.tokens[i] as usize;
-
-            // Target row at (context_len + i), draft row at i
-            let target_row_start = (context_len + i) * vocab_size;
-            let target_row_end = target_row_start + vocab_size;
-            let draft_row_start = i * vocab_size;
-            let draft_row_end = draft_row_start + vocab_size;
-            let p_target =
-                softmax_f32_row(&target_probs[target_row_start..target_row_end])[draft_tok];
-            let p_draft = softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
-
-            let p_accept = if p_draft > 1e-10 {
-                (p_target / p_draft).min(1.0)
-            } else {
-                0.0
-            };
-            if rng.next_f32() < p_accept {
-                accepted_count += 1;
-            } else {
-                break;
-            }
-        }
+        let uniforms: Vec<f32> = (0..=verify_len).map(|_| rng.next_f32()).collect();
+        let accepted_count = self.verify_accepted_count(
+            &target_logits,
+            &draft_block.base_logits,
+            context_len,
+            vocab_size,
+            &draft_block.tokens[..verify_len],
+            verify_len,
+            &uniforms,
+            &mut rng,
+        )?;
 
         if accepted_count > verify_len {
             return Err(Error::Session(format!(

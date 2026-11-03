@@ -34,9 +34,14 @@ impl Engine {
             grim_speculative::ThroughputProfile::default(),
             grim_speculative::SpeculationConfig::default(),
         );
-        Box::new(grim_speculative::SpeculativeCausalLm::with_dspark(
+        let mut wrapped = grim_speculative::SpeculativeCausalLm::with_dspark(
             model, draft, markov, confidence, scheduler,
-        ))
+        );
+        // Task 10.6: GPU rejection-sampling verifier (CPU fallback for non-ROCm).
+        wrapped.set_gpu_verifier(std::sync::Arc::new(
+            crate::engine::speculative::RocmSpeculativeVerifier,
+        ));
+        Box::new(wrapped)
     }
 
     pub fn register_with_dspark(

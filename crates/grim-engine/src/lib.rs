@@ -53,6 +53,8 @@ pub mod scythe2;
 /// WI-SB3: TTFT/ITL A/B harness — results protocol + WI-INF4 verdict rule.
 pub mod scythe_ab;
 pub mod speculative_loop;
+/// Task 10.6: GPU rejection-sampling verifier wired into speculative decode.
+pub use engine::speculative::RocmSpeculativeVerifier;
 pub mod streaming_forward;
 pub mod tp_layers;
 /// P2: packed-step training driver (varlen grouping + one optimizer step per group).

@@ -60,7 +60,7 @@ impl Engine {
         // R4 - capture the model's hyperparameters (when reportable) before `model` is moved into the
         // speculative wrapper, so the admission gate can re-certify each request's footprint against *current* free memory.
         let arch_hyperparams = model.arch_hyperparams();
-        let wrapped = SpeculativeCausalLm::auto(
+        let mut wrapped = SpeculativeCausalLm::auto(
             model,
             draft,
             markov,
@@ -68,6 +68,9 @@ impl Engine {
             is_weight_streaming_active,
             available_vram,
         );
+        // Task 10.6: attach the GPU rejection-sampling verifier — the
+        // wrapper falls back to the CPU loop for non-ROCm targets.
+        wrapped.set_gpu_verifier(std::sync::Arc::new(RocmSpeculativeVerifier));
         let config: Box<dyn ModelConfig> = Box::new(grim_core::config::GenericModelConfig {
             name: id.to_string(),
             modality,
@@ -97,10 +100,12 @@ impl Engine {
         let arch_hyperparams = model.arch_hyperparams();
         let adapter = grim_speculative::LlamaMtpAdapter::new(model.clone());
         let mtp_arc: Arc<dyn grim_speculative::NativeMtp> = Arc::new(adapter);
-        let wrapped = SpeculativeCausalLm::with_native_mtp(
+        let mut wrapped = SpeculativeCausalLm::with_native_mtp(
             Box::new(grim_speculative::LlamaMtpAdapter::new(model)),
             mtp_arc,
         );
+        // Task 10.6: GPU rejection-sampling verifier (CPU fallback for non-ROCm).
+        wrapped.set_gpu_verifier(std::sync::Arc::new(RocmSpeculativeVerifier));
         let config: Box<dyn ModelConfig> = Box::new(grim_core::config::GenericModelConfig {
             name: id.to_string(),
             modality,
@@ -174,5 +179,117 @@ impl Engine {
             self.register_model(id, base_model);
         }
         Ok(())
+    }
+}
+
+// ===== Task 10.6: GPU rejection-sampling verifier (ROCm) =====
+//
+// Implements `grim_speculative::SpeculativeVerifier` with the device-side
+// `grim_speculative_rejection_sample` kernel: row slices are narrowed D2D,
+// softmaxed on device, and only the tiny accepted_lens/accepted_tokens words
+// cross back to host — no vocab-sized D2H copy in the verify path.
+
+pub struct RocmSpeculativeVerifier;
+
+impl grim_speculative::speculative_wrapper::SpeculativeVerifier for RocmSpeculativeVerifier {
+    fn verify(
+        &self,
+        target_logits: &grim_tensor::Tensor,
+        draft_logits: &grim_tensor::Tensor,
+        context_len: usize,
+        vocab_size: usize,
+        draft_tokens: &[u32],
+        uniform_rands: &[f32],
+    ) -> Result<usize> {
+        use grim_tensor::backend::{CoreTensorOps, ElementwiseOps, MemoryOps};
+        use grim_tensor::{DType, Shape};
+
+        let ordinal = match target_logits.device() {
+            grim_tensor::Device::Rocm(o) => *o as usize,
+            other => {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "spec verify: non-ROCm target {other:?}"
+                )));
+            }
+        };
+        let dev = grim_backend_rocm::device::roc_device::RocmDevice::try_new(ordinal)?;
+        let k = draft_tokens.len();
+        if k == 0 {
+            return Ok(0);
+        }
+
+        // Kernel ABI: target_probs [K+1, vocab] (row K = bonus row, unused by
+        // the accepted-count contract — left zero), draft_probs [K, vocab],
+        // draft_tokens int32 bytes, uniforms [K+1], accepted out [K+1]/[1].
+        let t_rows = dev
+            .narrow_rows(
+                target_logits.storage().as_ref(),
+                context_len,
+                k,
+                vocab_size,
+                &Shape::new(vec![k, vocab_size]),
+            )?
+            .0;
+        let t_probs = dev.softmax(t_rows.as_ref(), &Shape::new(vec![k, vocab_size]))?.0;
+        let mut t_buf = dev.alloc_storage(
+            &Shape::new(vec![k + 1, vocab_size]),
+            DType::F32,
+        )?;
+        dev.write_rows(t_buf.as_mut(), 0, t_probs.as_ref(), k, vocab_size)?;
+
+        let d_rows = dev
+            .narrow_rows(
+                draft_logits.storage().as_ref(),
+                0,
+                k,
+                vocab_size,
+                &Shape::new(vec![k, vocab_size]),
+            )?
+            .0;
+        let d_probs = dev.softmax(d_rows.as_ref(), &Shape::new(vec![k, vocab_size]))?.0;
+
+        // draft_tokens as raw i32 bytes (kernel dereferences `const int*` —
+        // f32 bit patterns would be garbage).
+        let dt_bytes: Vec<u8> = draft_tokens
+            .iter()
+            .flat_map(|&t| (t as i32).to_le_bytes())
+            .collect();
+        let dt = grim_backend_rocm::MemoryOps::from_cpu_bytes(
+            &dev,
+            &dt_bytes,
+            &Shape::new(vec![k]),
+            DType::U8,
+        )?;
+        let ur = <grim_backend_rocm::device::roc_device::RocmDevice as CoreTensorOps>::from_cpu(
+            &dev,
+            uniform_rands,
+            &Shape::new(vec![uniform_rands.len()]),
+            DType::F32,
+        )?;
+        let at = dev.alloc_storage(&Shape::new(vec![k + 1]), DType::F32)?;
+        let al = dev.alloc_storage(&Shape::new(vec![1]), DType::F32)?;
+
+        let tp_s = grim_backend_rocm::device::util::as_rocm(t_buf.as_ref())?;
+        let dp_s = grim_backend_rocm::device::util::as_rocm(d_probs.as_ref())?;
+        let dt_s = grim_backend_rocm::device::util::as_rocm(dt.as_ref())?;
+        let ur_s = grim_backend_rocm::device::util::as_rocm(ur.as_ref())?;
+        let at_s = grim_backend_rocm::device::util::as_rocm(at.as_ref())?;
+        let al_s = grim_backend_rocm::device::util::as_rocm(al.as_ref())?;
+
+        dev.launch_speculative_rejection_sample(
+            tp_s, dp_s, dt_s, ur_s, at_s, al_s, 1, k, vocab_size,
+        )?;
+        dev.synchronize();
+
+        // accepted_lens holds the kernel's count: all-accepted = K drafts +
+        // bonus (K+1); rejected at j = j drafts + 1 residual (j+1). The
+        // wrapper's contract counts DRAFT acceptances only, so subtract the
+        // trailing sampled token.
+        let lens = al.to_cpu_vec_f32()?;
+        let accepted_len = lens
+            .first()
+            .map(|v| v.to_bits() as usize)
+            .unwrap_or(0);
+        Ok(accepted_len.saturating_sub(1).min(k))
     }
 }
