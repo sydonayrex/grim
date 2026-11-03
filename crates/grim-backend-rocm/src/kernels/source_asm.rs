@@ -87,7 +87,6 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::q3k_gemm::KERNEL_SOURCE);
     s.push_str(&crate::kernels::quant_tiled_gemm::tiled_quant_kernel_source());
     s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);
-    s.push_str(crate::kernels::fp8_gemm_rdna4::KERNEL_SOURCE);
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
     // WI-D: the selective scan sources live in their own TU — without this
@@ -213,8 +212,7 @@ mod source_asm_self_tests {
         let src = compute_kernel_source();
         assert!(src.contains("grim_cross_attention"));
         assert!(src.contains("grim_rwkv_time_mix"));
-        assert!(src.contains("grim_fp8_gemm_rdna4"));
-    }
+        }
 
     #[test]
     fn specialized_source_wires_lds_and_schedule_controls() {

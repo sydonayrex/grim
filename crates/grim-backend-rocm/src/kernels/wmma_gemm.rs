@@ -776,21 +776,7 @@ mod self_tests {
             "FP8 MFMA kernel must use the shared fp8_e4m3_to_float_hip helper"
         );
     }
-    /// Verifies the standalone FP8 GEMM kernel (fp8_gemm_rdna4.rs) is present in the compute_kernel_source and is arch-gated.
-    /// The standalone kernel is dead code (launch_fp8_gemm_rdna4 has no callers - the fused dequant path.
-    #[test]
-    fn source_contains_fp8_standalone_gated_path() {
-        let src = crate::kernels::source_asm::compute_kernel_source();
-        assert!(
-            src.contains("grim_fp8_gemm_rdna4"),
-            "standalone FP8 GEMM kernel must be present in compute_kernel_source"
-        );
-        assert!(
-            src.contains("#if defined(__gfx1200__)") && src.contains("#if defined(__gfx1100__)"),
-            "standalone FP8 GEMM kernel must be arch-gated"
-        );
-    }
-
+    
     /// Verifies the standalone FP8 dequant kernel (fp8_standalone.rs) is present in the compute_kernel_source.
     /// This is the scalar FP8 E4M3→F32 dequant path used by the non-MFMA FP8 GEMM fallback.
     #[test]

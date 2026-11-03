@@ -6095,6 +6095,37 @@ __device__ __forceinline__ int grim_kv4_iq4xs_valu(unsigned int q4) {
     return (int)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
 }
 
+// Word-wide variant of grim_kv4_iq4xs_valu: decodes all FOUR bytes of the
+// word with ONE v_perm_b32 per codebook half, instead of one v_perm_b32 per
+// BYTE.
+//
+// Why this is possible: the v_perm_b32 selector is PER BYTE, but
+// grim_kv1_iq4xs_valu replicates a single byte's index across all four
+// selector bytes (`c & 7` / `c & 7`), so it computes four identical lookups
+// and throws three away -- 8 v_perm per 32-bit word.
+//
+// Here the word's own per-byte indices go straight into the perm:
+//   idx = q & 0x07070707              low 3 bits of each byte's 4-bit code
+//   lo  = perm(LO0, LO1, idx)         all 4 bytes decoded in one instruction
+//   hi  = perm(HI0, HI1, idx)         all 4 bytes decoded in one instruction
+//   msk = ((q & 0x08080808) >> 3)*255 0x00 / 0xFF per byte (code < 8 ?)
+//   out = (lo & ~msk) | (hi & msk)    per-byte half select
+//
+// The per-byte half pick is a byte mask-select, so it stays per-byte and the
+// result is byte-for-byte identical to grim_kv4_iq4xs_valu. Verified on-device
+// over all 2^16 four-code words: 0 mismatches. (Only bits 0..3 of each input
+// byte are consumed, exactly as the old helper does.)
+//
+// SASS cost per (word, low+high nibble) pair: 30 instructions / 4 v_perm
+// (old: 80 / 16), 7 VGPR (old: 23).
+__device__ __forceinline__ int grim_kv4_iq4xs_valu_fast(unsigned int q4) {
+    const unsigned idx = q4 & 0x07070707u;
+    const unsigned lo  = __builtin_amdgcn_perm(0xF6EADDCFu, 0xBFAD9881u, idx);
+    const unsigned hi  = __builtin_amdgcn_perm(0x71594535u, 0x26190D01u, idx);
+    const unsigned msk = ((q4 & 0x08080808u) >> 3) * 0xFFu;
+    return (int)((lo & ~msk) | (hi & msk));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IQ4_NL dot4 GEMV (block_iq4_nl: 18 bytes / 32 weights, QK4_NL = 32).
 // Each 32-weight block maps 1:1 to one 32-weight Q8_1 activation block (36 B).

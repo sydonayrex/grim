@@ -2344,55 +2344,6 @@ impl RocmDevice {
         )
     }
 
-    /// Launch the standalone FP8 GEMM kernel (gfx1200+ native MFMA,
-    #[allow(dead_code)]
-    pub(crate) fn launch_fp8_gemm_rdna4(
-        &self,
-        a_storage: &RocmStorage,
-        b_storage: &RocmStorage,
-        out_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        let a_ptr = a_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fp8_gemm_rdna4: a has no device ptr".into()))?;
-        let b_ptr = b_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fp8_gemm_rdna4: b has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fp8_gemm_rdna4: out has no device ptr".into()))?;
-
-        // 16×16 tiling: one thread per output element, tile = 16 threads
-        const TILE: usize = 16;
-        let grid_x = (n.div_ceil(TILE)) as u32;
-        let grid_y = (m.div_ceil(TILE)) as u32;
-        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-        let block_dim = HipDim3::new(TILE as u32, TILE as u32, 1);
-
-        let mut aptr = a_ptr;
-        let mut bptr = b_ptr;
-        let mut optr = out_ptr;
-        let mut mm = m as i32;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-
-        self.launch_compute_kernel(
-            "grim_fp8_gemm_rdna4",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut aptr),
-                arg(&mut bptr),
-                arg(&mut optr),
-                arg(&mut mm),
-                arg(&mut nn),
-                arg(&mut kk),
-            ],
-        )
-    }
 
     /// Op-tagged GEMM. `op` drives the `ShapeClass` via `ShapeClass::from_op`: `LmHead` selects the TLOLog tile arm (wide block_n
     /// for the vocab-dominated output column); everything else bins by M as before (from_op(Other, m) == from_m(m)).

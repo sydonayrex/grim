@@ -27,7 +27,6 @@ pub mod device_sampler;
 pub mod dot_gemv;
 pub mod extend_attention;
 pub mod flash_decode;
-pub mod fp8_gemm_rdna4;
 pub mod fp8_standalone;
 pub mod fused_dequant_gemm;
 pub mod fused_linear_ce;
