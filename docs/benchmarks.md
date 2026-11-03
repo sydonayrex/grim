@@ -1027,6 +1027,52 @@ GB/s** against the K-quants' 78-100.
   IQ family at all** (its 4-bit codes are table indices, not numbers, and
   gfx1200 exposes no int8 WMMA), so the IQ path's lever is the lookup.
 
+## Task 2.2 — IQ4_XS Decode GEMV v3 Evaluation & Resolution (2026-11-03)
+
+### 1. Re-Evaluation of Microbenchmark & Hardware Roofline
+
+Previous warm-cache single-buffer microbenchmarks (11.14 MB weight tensor) fit completely
+inside the 64 MB Infinity Cache (L3) of the RX 9070 XT (`gfx1201`), reporting artificial
+in-cache bandwidth (~260 GB/s) rather than streaming DRAM bandwidth.
+
+To measure real DRAM streaming throughput, the benchmark harness was rebuilt with cold-cache
+streaming (`dot4_kquant_grouped_parity.rs::iq4xs_gemv_sub_v3_parity_and_speed`):
+- Rotates across 8 distinct weight tensor allocations (>378 MB total weight footprint),
+  exceeding the 64 MB Infinity Cache by >5.9×.
+- Runs dominant 27B model shapes:
+  - Gate/Up: `k=5120, n=17408` (47.3 MB per weight buffer)
+  - Down-projection: `k=17408, n=5120` (47.3 MB per weight buffer)
+- Measures both target devices with clocks pinned:
+  - Device 0: AMD Radeon RX 9070 XT (`gfx1201`, 64 CUs, 64 MB L3, ~511 GB/s roofline)
+  - Device 1: AMD Radeon RX 9060 XT (`gfx1200`, 32 CUs, 32 MB L3, ~284 GB/s roofline)
+
+### 2. Cold Benchmark Measurements vs Roofline
+
+| Device | Model Shape | Kernel | Time (µs) | Effective GB/s | % of Device Roofline | Ratio v3/v2 |
+|---|---|---|---|---|---|---|
+| **Dev 0 (RX 9070 XT)** | `k=5120, n=17408` (Gate/Up) | `v2` (1-wave CTA) | 96.9 | **488.4 GB/s** | **95.6%** | Baseline |
+| | | `v3` (8-wave LDS) | 107.7 | 439.6 GB/s | 86.0% | **0.900×** (FAIL) |
+| | `k=17408, n=5120` (Down) | `v2` (1-wave CTA) | 109.4 | **432.8 GB/s** | **84.7%** | Baseline |
+| | | `v3` (8-wave LDS) | 99.0 | 478.0 GB/s | 93.5% | 1.104× (FAIL bar) |
+| **Dev 1 (RX 9060 XT)** | `k=5120, n=17408` (Gate/Up) | `v2` (1-wave CTA) | 171.9 | **275.4 GB/s** | **97.0%** | Baseline |
+| | | `v3` (8-wave LDS) | 174.1 | 271.9 GB/s | 95.7% | **0.988×** (FAIL) |
+| | `k=17408, n=5120` (Down) | `v2` (1-wave CTA) | 188.9 | **250.6 GB/s** | **88.2%** | Baseline |
+| | | `v3` (8-wave LDS) | 175.3 | 270.1 GB/s | 95.1% | 1.078× (FAIL bar) |
+
+*Ship Bar Requirement: `v3 / v2 >= 1.15×` across dominant shapes.*
+
+### 3. Root Cause & Architectural Headroom Analysis
+
+1. **No Memory Headroom on Dominant Shapes**: On the dominant gate/up shape (`k=5120, n=17408`, 2× weight volume of down-proj), `v2` achieves **488.4 GB/s on Dev 0 (95.6% of 511 GB/s roofline)** and **275.4 GB/s on Dev 1 (97.0% of 284 GB/s roofline)**. Weight streaming in `v2` is already bandwidth-saturated; there is zero headroom left for algorithmic or LDS caching speedups.
+2. **v3 Architectural Penalties**:
+   - Staging the activation row in LDS (`s_act[20480]`) saves only 5.7 KB of activation traffic against 47.3 MB of weight streaming (<0.012% of memory traffic).
+   - Serialized prologue barrier (`__syncthreads()`) forces all 8 waves to wait on cooperative activation staging before any global weight loads issue.
+   - Coarser granularity (32 cols/CTA vs 4 cols/CTA in v2) reduces grid occupancy on 64 CUs, causing tail-wave latency penalties on gate/up projections.
+3. **Task 2.2 Resolution**:
+   - `v3` failed the ship bar (`v3 / v2 >= 1.15×`).
+   - `v2` remains the production default dispatch.
+   - Task 2.2 is CLOSED as a valid negative outcome per plan ON-FAILURE clause.
+
 ## The IQ4_XS decode census: the 17.2 GB/s premise is refuted (2026-10-22, PLAN-iq-family-decode T1)
 
 `iq4xs_decode_kernel_census` (n=4096, k=5120, m=1, 11.14 MB packed, GPU 1, rocprofv3 `--kernel-trace`):
