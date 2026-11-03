@@ -63,8 +63,13 @@ impl ModelSupportTier {
             (Self::Unsupported, "open NaN in Xing4.0 chain")
         } else if arch_lower.contains("llama") && (arch_lower.contains("moe") || path_lower.contains("moe")) {
             (Self::Experimental, "known MoE routing divergence")
-        } else if arch_lower.contains("qwen") || arch_lower.contains("lfm") || arch_lower.contains("bitnet") {
+        } else if arch_lower.contains("qwen") || arch_lower.contains("lfm") {
             (Self::Green, "fully validated production support")
+        } else if arch_lower.contains("bitnet") {
+            // Task 10.5 honesty fix: TQ1_0/TQ2_0 GGUFs map to Storage::Unsupported
+            // (no ternary Storage backend), so a BitNet TQ2_0 checkpoint fails at
+            // load. Only non-ternary BitNet weights run (via the Llama wrapper).
+            (Self::Experimental, "TQ2_0/TQ1_0 ternary weights unsupported at load; non-ternary BitNet runs via Llama path")
         } else {
             (Self::Green, "standard architecture support")
         }
@@ -7060,7 +7065,7 @@ mod tests {
         );
         assert_eq!(
             ModelSupportTier::classify("bitnet", "model.gguf").0,
-            ModelSupportTier::Green
+            ModelSupportTier::Experimental
         );
     }
 }
