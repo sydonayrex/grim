@@ -6269,6 +6269,110 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v2
     }
 }
 
+
+// Task 2.2 v3: the v2 wave (32 threads, 4 columns, slot-strided super-blocks,
+// identical accumulation order) with TWO changes only:
+//   1. block 256 = 8 waves per CTA -> 32 output columns per CTA;
+//   2. the q8_1 activation row is staged in STATIC LDS once per CTA by a
+//      cooperative load, so the row is read from GLOBAL memory once instead
+//      of once per 4-column block (v2 re-read it n/4 times; v3 reads it
+//      n/32 times — 8x less activation traffic; B streams once either way).
+// The per-lane FP32 accumulation order is byte-for-byte the v2 loop, so the
+// outputs are BIT-IDENTICAL to v2 (pinned by iq4xs_gemv_sub_v3_parity).
+// Static LDS sized for the largest production K (down-proj 17408 ->
+// 68 super-blocks x 8 q8_1 blocks x 36 B = 19584 B, rounded to 20480); the
+// launcher refuses K above that and falls back to v2.
+extern "C" __global__ void __launch_bounds__(256) grim_dot4_iq4xs_q81_gemv_sub_v3(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    __shared__ unsigned char s_act[20480];
+    const int tid  = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int row  = blockIdx.y;
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const int row_bytes = n_sb * 8 * GRIM_Q8_1_BYTES;
+
+    // Cooperative row load BEFORE any per-wave early-out: every thread must
+    // reach the __syncthreads or the CTA deadlocks.
+    if (row < M && row_bytes <= (int)sizeof(s_act)) {
+        const unsigned char* a_row_g = A_q81 + (long long)row * row_bytes;
+        for (int i = tid; i < row_bytes; i += 256) s_act[i] = a_row_g[i];
+    }
+    __syncthreads();
+
+    const int col_base = blockIdx.x * 32 + wave * 4;
+    if (row >= M || col_base >= N || row_bytes > (int)sizeof(s_act)) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        const unsigned char* a_blk = s_act + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+        const float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        int a4[8];
+        __builtin_memcpy(a4, a_blk + 4, 32);
+
+        uint2 hdr_col[4];
+        uint2 qv0_col[4];
+        uint2 qv1_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 136;
+                hdr_col[j] = ((const uint2*)b_sb)[0];
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+                qv0_col[j] = qs2[0];
+                qv1_col[j] = qs2[1];
+            } else {
+                hdr_col[j] = make_uint2(0u, 0u);
+                qv0_col[j] = make_uint2(0u, 0u);
+                qv1_col[j] = make_uint2(0u, 0u);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned hdr = hdr_col[j].x;
+            const unsigned sc_l4 = hdr_col[j].y;
+            const float d = fp16_to_float_device((unsigned short)(hdr & 0xFFFFu));
+            const unsigned scales_h = hdr >> 16;
+            const int ls = (int)((sc_l4 >> (4 * sub)) & 0x0Fu)
+                         | (((int)((scales_h >> (2 * sub)) & 3u)) << 4);
+            const float dl = d * (float)(ls - 32);
+
+            const unsigned qw[4] = {qv0_col[j].x, qv0_col[j].y, qv1_col[j].x, qv1_col[j].y};
+            int pos = 0;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                pos = grim_sdot4(a4[w],     grim_kv4_iq4xs_valu(qw[w] & 0x0F0F0F0Fu),        pos);
+                pos = grim_sdot4(a4[w + 4], grim_kv4_iq4xs_valu((qw[w] >> 4) & 0x0F0F0F0Fu), pos);
+            }
+            facc[j] += dl * d_a * (float)pos;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
 "#;
 
 #[cfg(test)]

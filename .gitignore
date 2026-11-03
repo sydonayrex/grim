@@ -2,9 +2,6 @@ crates.zip
 *.zip
 target/
 old/
-*.
-!.gitignore
-!.gitattributes
 *.gguf
 *.safetensors
 models/
@@ -16,8 +13,7 @@ models/
 .zl/
 .agents/
 node_modules/
-package.json
-package.lock.json
+package-lock.json
 
 # Autotuner on-disk tune caches (test/runtime artifacts)
 .autotune_cache/

@@ -1947,6 +1947,18 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
+        // Task 2.2 v3 (opt-in until the ship bar is measured): 8-wave CTA with
+        // the activation row staged in static LDS (8x less A traffic).
+        // Refused above K=17408 (LDS capacity); falls back to the v2 arm.
+        static V3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v3 = *V3.get_or_init(|| {
+            matches!(std::env::var("GRIM_IQ4XS_V3").as_deref(), Ok("1" | "true" | "on"))
+                && k <= 17408
+                && k % 256 == 0
+        });
+        if v3 {
+            return self.launch_dot4_iq4xs_q81_gemv_v3_for_ab(act_q81, b_storage, out_storage, m, n, k);
+        }
         self.launch_dot4_iq4xs_q81_gemv_with(
             act_q81,
             b_storage,
@@ -1961,6 +1973,52 @@ impl RocmDevice {
             } else {
                 "grim_dot4_iq4xs_q81_gemv_fast"
             },
+        )
+    }
+
+    /// Task 2.2 A/B entry: the v3 LDS-row kernel driven directly, so the
+    /// parity gate exercises it regardless of the process-wide env arm.
+    pub fn launch_dot4_iq4xs_q81_gemv_v3_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        assert!(k <= 17408 && k % 256 == 0, "v3 supports K in (256-multiples, <= 17408)");
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq4xs_q81_gemv_v3: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv_v3: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq4xs_q81_gemv_v3: out has no device ptr".into()))?;
+        // v3 geometry: 32 columns per CTA (8 waves x 4), 256 threads.
+        let grid_x = (n as u32).div_ceil(32);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_iq4xs_q81_gemv_sub_v3",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 
