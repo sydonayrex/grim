@@ -2632,10 +2632,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "grim-compressed-tensors"
-version = "0.1.0"
-
-[[package]]
 name = "grim-constrain"
 version = "0.1.0"
 dependencies = [
@@ -3022,7 +3018,6 @@ name = "grim-tensor"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
- "grim-compressed-tensors",
  "serde",
  "thiserror 1.0.69",
 ]

@@ -12,6 +12,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
     s.push_str(crate::kernels::log_softmax_vjp::LOG_SOFTMAX_VJP_KERNEL_SOURCE);
     s.push_str(crate::kernels::blend_kv_rope::BLEND_KV_ROPE_HIP_SRC);
+    s.push_str(crate::kernels::batched_lora::BATCHED_LORA_DISPATCHED_KERNEL_SOURCE);
     s.push_str(crate::kernels::comm_fuse::COMM_FUSE_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rho_microbench::KERNEL_SOURCE);

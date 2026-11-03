@@ -712,6 +712,118 @@ pub fn batched_lora_group_device(
     result
 }
 
+/// Dispatched batched multi-LoRA operating entirely on device `RocmStorage` buffers (Task 10.1 Step 2).
+///
+/// Dispatches `grim_lora_shrink_dispatched` followed by `grim_lora_expand_dispatched`
+/// on `dev.default_stream` with ZERO `hipMalloc`, ZERO `hipMemcpy`, and ZERO sync during execution.
+/// Safe to record in HIP graph capture.
+///
+/// Parameters:
+/// - `dev`: ROCm device context.
+/// - `x`: Input tensor `[num_tokens, in_dim]` on device.
+/// - `y`: Output tensor `[num_tokens, out_dim]` on device (accumulated into in-place).
+/// - `scratch_v`: Preallocated intermediate buffer of at least `num_tokens * max_rank * sizeof(f32)` bytes on device.
+/// - `d_token_adapter`: `[num_tokens]` u32 buffer mapping each token to an adapter index (or `0xFFFFFFFF` for base).
+/// - `d_adapters`: Descriptor buffer holding `(a_ptrs, b_ptrs, ranks, scalings)` arrays on device.
+/// - `num_tokens`: Number of tokens in batch.
+/// - `in_dim`: Input feature dimension.
+/// - `out_dim`: Output feature dimension.
+/// - `max_rank`: Maximum rank across all loaded/active adapters.
+pub fn launch_batched_lora_dispatched_storage(
+    dev: &RocmDevice,
+    x: &crate::memory::storage::RocmStorage,
+    y: &crate::memory::storage::RocmStorage,
+    scratch_v: &crate::memory::storage::RocmStorage,
+    d_token_adapter: &crate::memory::storage::RocmStorage,
+    d_adapters: &crate::memory::storage::RocmStorage,
+    num_tokens: usize,
+    in_dim: usize,
+    out_dim: usize,
+    max_rank: usize,
+) -> Result<()> {
+    if num_tokens == 0 || in_dim == 0 || out_dim == 0 || max_rank == 0 {
+        return Ok(());
+    }
+
+    let x_ptr = x.device_ptr.ok_or_else(|| Error::Backend("launch_batched_lora: x has no device ptr".into()))?;
+    let y_ptr = y.device_ptr.ok_or_else(|| Error::Backend("launch_batched_lora: y has no device ptr".into()))?;
+    let inter_ptr = scratch_v.device_ptr.ok_or_else(|| Error::Backend("launch_batched_lora: scratch_v has no device ptr".into()))?;
+    let token_adapter_ptr = d_token_adapter.device_ptr.ok_or_else(|| Error::Backend("launch_batched_lora: d_token_adapter has no device ptr".into()))?;
+    let adapters_ptr = d_adapters.device_ptr.ok_or_else(|| Error::Backend("launch_batched_lora: d_adapters has no device ptr".into()))?;
+
+    // d_adapters layout:
+    // [0]: a_ptrs (*const f32 * num_adapters)
+    // [1]: b_ptrs (*const f32 * num_adapters)
+    // [2]: ranks (u32 * num_adapters)
+    // [3]: scalings (f32 * num_adapters)
+    let a_ptrs_dev = adapters_ptr;
+    let b_ptrs_dev = adapters_ptr + (num_tokens * std::mem::size_of::<*const f32>()) as u64;
+    let ranks_dev = b_ptrs_dev + (num_tokens * std::mem::size_of::<*const f32>()) as u64;
+    let scalings_dev = ranks_dev + (num_tokens * std::mem::size_of::<u32>()) as u64;
+
+    let mut x_arg = x_ptr as *mut std::ffi::c_void;
+    let mut a_arg = a_ptrs_dev as *mut std::ffi::c_void;
+    let mut idx_arg = token_adapter_ptr as *mut std::ffi::c_void;
+    let mut ranks_arg = ranks_dev as *mut std::ffi::c_void;
+    let mut inter_arg = inter_ptr as *mut std::ffi::c_void;
+    let mut in_dim_i = in_dim as u32;
+    let mut max_rank_i = max_rank as u32;
+    let mut tokens_i = num_tokens as u32;
+
+    dev.launch_compute_kernel(
+        "grim_lora_shrink_dispatched",
+        HipDim3::new(
+            max_rank.div_ceil(BATCHED_LORA_BLOCK) as u32,
+            num_tokens as u32,
+            1,
+        ),
+        HipDim3::new(BATCHED_LORA_BLOCK as u32, 1, 1),
+        &mut [
+            arg(&mut x_arg),
+            arg(&mut a_arg),
+            arg(&mut idx_arg),
+            arg(&mut ranks_arg),
+            arg(&mut inter_arg),
+            arg(&mut in_dim_i),
+            arg(&mut max_rank_i),
+            arg(&mut tokens_i),
+        ],
+    )?;
+
+    let mut inter_arg2 = inter_ptr as *mut std::ffi::c_void;
+    let mut b_arg = b_ptrs_dev as *mut std::ffi::c_void;
+    let mut idx_arg2 = token_adapter_ptr as *mut std::ffi::c_void;
+    let mut ranks_arg2 = ranks_dev as *mut std::ffi::c_void;
+    let mut scalings_arg = scalings_dev as *mut std::ffi::c_void;
+    let mut y_arg = y_ptr as *mut std::ffi::c_void;
+    let mut out_dim_i = out_dim as u32;
+    let mut max_rank_i2 = max_rank as u32;
+    let mut tokens_i2 = num_tokens as u32;
+
+    dev.launch_compute_kernel(
+        "grim_lora_expand_dispatched",
+        HipDim3::new(
+            out_dim.div_ceil(BATCHED_LORA_BLOCK) as u32,
+            num_tokens as u32,
+            1,
+        ),
+        HipDim3::new(BATCHED_LORA_BLOCK as u32, 1, 1),
+        &mut [
+            arg(&mut inter_arg2),
+            arg(&mut b_arg),
+            arg(&mut idx_arg2),
+            arg(&mut ranks_arg2),
+            arg(&mut scalings_arg),
+            arg(&mut y_arg),
+            arg(&mut out_dim_i),
+            arg(&mut max_rank_i2),
+            arg(&mut tokens_i2),
+        ],
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

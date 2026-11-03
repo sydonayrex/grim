@@ -6409,6 +6409,119 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v7
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Task 2.2 (fast decode + early B issue): IQ4_XS sub-block-per-lane GEMV v8.
+//
+// v8 == v7 (word-wide nibble decode) with ONE more change: the B loads are
+// issued BEFORE the A row is touched.
+//
+// Why: in v2/v7 the source computes `d_a` (the fp16 activation scale)
+// immediately after the A load, and `fp16_to_float_device` is a branchy
+// software conversion (~25 instructions + 3 branches). The compiler emits it
+// BEFORE the B loads, so the 8 DRAM-bound B requests are not even issued
+// until the A conversion has finished. The SASS of v7 shows exactly that:
+//
+//   raw 178  global_load_d16_b16   (A scale)
+//   raw 192..231                   fp16 -> f32 conversion (stalls on A)
+//   raw 234,235                    global_load_b128 x2 (A activations)
+//   raw 249..309                   global_load_b64/b128 x8 (B, DRAM)
+//   raw 366  s_wait_loadcnt 0x0    <-- all DRAM latency exposed here
+//
+// Issuing the B loads first means the DRAM requests are in flight while the
+// A conversion runs, and the final wait retires ~60 instructions earlier.
+//
+// Everything else is untouched: same decode, same arithmetic order, same
+// per-lane superblock walk => bit-exact vs v2 (and vs v7).
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v8(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        // (1) Issue the DRAM-bound B requests FIRST: 4 columns x (8 B header
+        //     + 16 B quants). They are the long-latency loads, so they get the
+        //     most issue-to-use distance.
+        uint2 hdr_col[4];
+        uint2 qv0_col[4];
+        uint2 qv1_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 136;
+                hdr_col[j] = ((const uint2*)b_sb)[0];
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+                qv0_col[j] = qs2[0];
+                qv1_col[j] = qs2[1];
+            } else {
+                hdr_col[j] = make_uint2(0u, 0u);
+                qv0_col[j] = make_uint2(0u, 0u);
+                qv1_col[j] = make_uint2(0u, 0u);
+            }
+        }
+
+        // (2) Then the A row (L2-resident, short latency). Both the scale and
+        //     the activation bytes are requested BEFORE the fp16 scale
+        //     conversion, so the conversion's stall delays neither the B
+        //     requests nor the A activation requests.
+        const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+        const unsigned short a_scale = ((const unsigned short*)a_blk)[0];
+        int a4[8];
+        __builtin_memcpy(a4, a_blk + 4, 32);
+        const float d_a = fp16_to_float_device(a_scale);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned hdr = hdr_col[j].x;
+            const unsigned sc_l4 = hdr_col[j].y;
+            const float d = fp16_to_float_device((unsigned short)(hdr & 0xFFFFu));
+            const unsigned scales_h = hdr >> 16;
+            const int ls = (int)((sc_l4 >> (4 * sub)) & 0x0Fu)
+                         | (((int)((scales_h >> (2 * sub)) & 3u)) << 4);
+            const float dl = d * (float)(ls - 32);
+
+            const unsigned qw[4] = {qv0_col[j].x, qv0_col[j].y, qv1_col[j].x, qv1_col[j].y};
+            int pos = 0;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                pos = grim_sdot4(a4[w],     grim_kv4_iq4xs_valu_fast(qw[w]),       pos);
+                pos = grim_sdot4(a4[w + 4], grim_kv4_iq4xs_valu_fast(qw[w] >> 4), pos);
+            }
+            facc[j] += dl * d_a * (float)pos;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Task 2.3 diagnostics: decompose the v2 -> measured-stream-ceiling gap.
 //
 // Measured facts (Dev0/gfx1201, k=5120 n=17408, 8 rotating cold weight blobs):

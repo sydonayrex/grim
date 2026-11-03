@@ -28,7 +28,6 @@ pub use dtype::{
 pub use error::{Error, Result};
 /// Re-export the `.gcct` compressed-tensor type tags so `Storage`'s compressed
 /// variants expose a single, backend-agnostic enum.
-pub use grim_compressed_tensors::CompressedTensorType;
 pub use provider::{RawTensor, TensorMeta, TensorProvider};
 pub use shape::Shape;
 pub use softmax_merge::{SoftmaxPartial, merge_all, merge_partials};
