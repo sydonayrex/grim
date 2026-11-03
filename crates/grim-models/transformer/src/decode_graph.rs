@@ -1685,6 +1685,7 @@ impl DecodeGraphModel for Llama {
 
         let pos = graph.buffers.current_pos;
         // TEMP-DIAG (GRIM_TOTALS_TRACE): dump per-layer totals at replay start.
+        let diag_pos = graph.buffers.current_pos;
         if std::env::var("GRIM_TOTALS_TRACE").as_deref() == Ok("1") {
             if let Some(t0) = graph.buffers.layer_totals.first() {
                 if let Some(p) = t0.device_ptr_u64() {
@@ -1697,7 +1698,7 @@ impl DecodeGraphModel for Llama {
                             grim_backend_rocm::HipMemcpyKind::DeviceToHost,
                         );
                     }
-                    eprintln!("[totals-diag] replay pos={} layer0_total={}", pos, v[0]);
+                    eprintln!("[totals-diag] replay pos={} layer0_total={}", diag_pos, v[0]);
                 }
             }
         }
@@ -4760,7 +4761,11 @@ impl DecodeGraphModel for Qwen35 {
 
         // Pre-capture VRAM guard: verify each device has sufficient free VRAM headroom
         // (minimum 1.5 GB) for lazy kernel module loads (hsaco), activation scratch, and driver state.
-        let min_free_bytes: u64 = 1536 * 1024 * 1024; // 1.5 GB minimum
+        let min_free_bytes: u64 = if std::env::var_os("GRIM_DEBUG_VRAM_GUARD").is_some() {
+            0
+        } else {
+            1536 * 1024 * 1024 // 1.5 GB minimum
+        };
         for &ord in &ords {
             let (free, total) = grim_backend_rocm::vram_info(ord);
             if total > 0 && free < min_free_bytes {

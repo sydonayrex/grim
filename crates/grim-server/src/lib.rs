@@ -167,15 +167,8 @@ pub static LIVE_CLEANUP_GUARDS: AtomicUsize = AtomicUsize::new(0);
 /// Active/queued request counter for admission control.
 pub static ADMISSION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Per-instance override for admission queue cap, primarily for tests.
-pub static MAX_QUEUE_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
-
 /// Get the maximum admitted queue length from `GRIM_MAX_QUEUE` (default: 64).
 pub fn max_queue_limit() -> usize {
-    let ov = MAX_QUEUE_OVERRIDE.load(Ordering::Relaxed);
-    if ov > 0 {
-        return ov;
-    }
     std::env::var("GRIM_MAX_QUEUE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -195,10 +188,21 @@ pub struct AdmissionTicket;
 
 impl AdmissionTicket {
     pub fn try_acquire() -> std::result::Result<Self, Response> {
-        let max_q = max_queue_limit();
-        let current = ADMISSION_COUNTER.fetch_add(1, Ordering::SeqCst);
+        Self::try_acquire_in(&ADMISSION_COUNTER, max_queue_limit())
+    }
+
+    /// Admission core over an explicit counter and cap. The global path
+    /// above uses `ADMISSION_COUNTER`; tests pass a local counter so cap
+    /// behaviour can be asserted without starving concurrently running tests.
+    /// NOTE: the returned ticket releases `ADMISSION_COUNTER` on drop, so
+    /// only the global counter may be used with a live ticket.
+    pub(crate) fn try_acquire_in(
+        counter: &AtomicUsize,
+        max_q: usize,
+    ) -> std::result::Result<Self, Response> {
+        let current = counter.fetch_add(1, Ordering::SeqCst);
         if current >= max_q {
-            ADMISSION_COUNTER.fetch_sub(1, Ordering::SeqCst);
+            counter.fetch_sub(1, Ordering::SeqCst);
             let mut resp = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({

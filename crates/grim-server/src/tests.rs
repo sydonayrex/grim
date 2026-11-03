@@ -2951,30 +2951,18 @@ async fn test_request_limits_context_length_and_queue_admission() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["usage"]["completion_tokens"], 15);
 
-    // (c) admission queue cap GRIM_MAX_QUEUE -> 503 Service Unavailable with Retry-After: 1
-    // Set MAX_QUEUE_OVERRIDE to 1 so saturation only requires 1 request / ticket, then saturate.
-    crate::MAX_QUEUE_OVERRIDE.store(1, Ordering::SeqCst);
-    let ticket = crate::AdmissionTicket::try_acquire().expect("acquire 1 should succeed");
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "model": "default",
-                        "messages": [{"role": "user", "content": "hi"}],
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // (c) admission queue cap -> 503 Service Unavailable with Retry-After: 1.
+    // Uses a LOCAL counter at its cap: the global counter/cap must not be
+    // touched here or concurrently running handler tests would be shed.
+    let saturated = std::sync::atomic::AtomicUsize::new(3);
+    let resp = match crate::AdmissionTicket::try_acquire_in(&saturated, 3) {
+        Ok(_) => panic!("admission at cap must be refused"),
+        Err(r) => r,
+    };
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("1"));
-    drop(ticket);
-    crate::MAX_QUEUE_OVERRIDE.store(0, Ordering::SeqCst);
+    assert_eq!(saturated.load(Ordering::SeqCst), 3, "refused admission must not leak a count");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "queue_full");
 }
