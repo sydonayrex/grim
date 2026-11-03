@@ -1332,5 +1332,14 @@ exactly chunk_len x vocab / 256 elements — that a binary-layout shift exposes.
 (d780bd54) binary hides it by layout luck, not by correctness.
 No workaround found at HEAD: chunk 64/128/256/1024, splits 24/40-26/38-32/32, ctx 768-4096,
 graph on/off all fault (or the graph-pool alloc is cleanly denied -> Error).
-NEXT: debug the [chunk,vocab] logits kernel directly (kernarg geometry / scratch sizing) on a
-d780bd54-vs-HEAD kernarg dump; unblocks Tasks 2.3, 6.4 and the 27B PPL-at-cap gate.
+RESOLVED 2026-11-03 (commit 7ca66aba) — it was never the logits kernel and never layout.
+The runtime-named faulting kernels were the SAMPLERS (grim_argmax_stage1 greedy /
+grim_sample_logits_stochastic temp=0.9), and run.rs:2326 sampled through the MODEL's FIRST
+device while the two-card eager logits are resident on the LM-head card (rocm:1):
+cross-device pointer -> 'Page not present'. The graph path already sampled on the storage's
+own ordinal; the eager path now mirrors it. HEAD 3/3 faults -> 0/3 after the one-line
+device-ordinal fix; coherent generation restored at 32/32; default split clean;
+GRIM_KV_ARENA_ROWS=47 ring engages fault-free on the 27B. grim-cli lib: 241 passed.
+The bisect 'boundary commits' were artifacts of which allocation path the runs took, not
+causes. Tasks 2.3 / 6.4 / the two-card A/B harness and the 27B PPL-at-cap gates are
+UNBLOCKED.
