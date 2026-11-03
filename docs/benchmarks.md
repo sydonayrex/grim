@@ -1343,3 +1343,11 @@ GRIM_KV_ARENA_ROWS=47 ring engages fault-free on the 27B. grim-cli lib: 241 pass
 The bisect 'boundary commits' were artifacts of which allocation path the runs took, not
 causes. Tasks 2.3 / 6.4 / the two-card A/B harness and the 27B PPL-at-cap gates are
 UNBLOCKED.
+
+Post-fix verification (2026-11-03): the full 27B production harness
+(`qwen35_production_27b_route_wall_and_utilization`) passes end-to-end for
+the first time since the fault appeared — all 4 arms capture (OLD 1543
+nodes / STEP3-DEDUP 1327), LOGITS-GATE and Task-0.5 PPL-512 bit-identical
+(|dNLL| = 0.000000, PPL 41221.9574 both arms), STEP3-DEDUP warm wall
+82.9 ms / cold 82.7 ms (vs the 92.6 ms AE75E0C6 baseline), structure
+share 4.1% (<50% band: node reduction remains the lever).
