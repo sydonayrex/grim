@@ -1505,3 +1505,19 @@ Verdicts:
 
 Do not iterate further on iq4xs dot4: v2 at 88% of measured ceiling is the
 practical roofline for this access pattern on gfx1200.
+
+## 13. Task 2.6 Step 4 — norm+q81 fusion wired, engagement OPEN (2026-11-03)
+
+decode_graph.rs: GRIM_FUSE_NORM_QUANT (default ON) — when the attention
+norm's qkv consumers include a q8_1 one (predicate: the SAME
+linear_decode_quant_kind the linears apply), the dual
+grim_rms_norm_quant_q81_dual kernel replaces rms_norm + first quantize,
+and linear_into_named_ready threads q81_ready into q/k/v. FFN site NOT
+wired (fused_add_rms_norm_gate_up_silu already covers the dot4 path).
+
+27B harness result: BIT-EXACT green (inert — safe), wall unchanged 82.8ms,
+but node count 1327 UNCHANGED — the predicate returned false for every
+layer (0 fusions vs the Step-1 floor of 35 attn sites). Suspect: weight
+dtype/provenance at predicate time differs from the GGUF probe (35/65
+attn sites showed a q81 consumer). OPEN: debug the predicate (dump
+linear_decode_quant_kind per qkv weight at capture), then re-measure.
