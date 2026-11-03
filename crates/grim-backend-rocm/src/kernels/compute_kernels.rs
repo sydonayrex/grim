@@ -1517,6 +1517,169 @@ grim_add_rms_norm_decode(const float* x, const float* residual,
     }
 }
 
+// Task 2.6: fused RMSNorm -> q8_1 quantize epilogue (DUAL output). Pass 1 is
+// the EXACT grim_rms_norm_decode stride-128 4-wide reduction (out_f32
+// byte-identical by construction); pass 2 walks consecutive 32-column blocks
+// per WARP so the q8_1 amax butterfly is warp-local — the same fmaxf
+// reduction order-free max as grim_quantize_q8_1, the same d = amax/127,
+// inv_d guard, round() codes and f16 d/s header. out_f32 values use the
+// identical expression `x[col] * w[col] / rms`, so the f32 stream matches the
+// standalone norm bit for bit regardless of the changed write order.
+extern "C" __global__ void __launch_bounds__(256)
+grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float* out,
+                             unsigned char* out_q81, int row_len, float eps) {
+    __shared__ float s_lane_sums[32];
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    if (warp_id == 0) {
+        float ss = 0.0f;
+        for (int col = lane; col < row_len; col += 128) {
+            const int c1 = col + 32;
+            const int c2 = col + 64;
+            const int c3 = col + 96;
+            const float v0 = x[col];
+            const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
+            const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
+            const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
+            ss = __builtin_fmaf(v0, v0, ss);
+            ss = __builtin_fmaf(v1, v1, ss);
+            ss = __builtin_fmaf(v2, v2, ss);
+            ss = __builtin_fmaf(v3, v3, ss);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            ss += __shfl_xor_sync(shfl_mask, ss, off);
+        if (lane == 0) {
+            s_lane_sums[0] = sqrtf(ss / (float)row_len + eps);
+        }
+    }
+    __syncthreads();
+
+    const float rms = s_lane_sums[0];
+    const int n_q_blocks = (row_len + 31) / 32;
+    for (int blk = warp_id; blk < n_q_blocks; blk += 8) {
+        const int col = blk * 32 + lane;
+        const bool live = col < row_len;
+        const float v = live ? (x[col] * w[col] / rms) : 0.0f;
+        if (live) out[col] = v;
+
+        float amax = __builtin_fabsf(v);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(shfl_mask, amax, mask));
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        const signed char qi = (signed char)__builtin_roundf(v * inv_d);
+
+        float fsum = (float)qi;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            fsum += __shfl_xor_sync(shfl_mask, fsum, mask);
+
+        unsigned char* row_dst = out_q81 + (long long)blk * 36;
+        if (lane == 0) {
+            _Float16 hd = (_Float16)d;
+            _Float16 hs = (_Float16)(fsum * d);
+            unsigned short wd, ws;
+            __builtin_memcpy(&wd, &hd, 2);
+            __builtin_memcpy(&ws, &hs, 2);
+            row_dst[0] = (unsigned char)(wd & 0xFF);
+            row_dst[1] = (unsigned char)(wd >> 8);
+            row_dst[2] = (unsigned char)(ws & 0xFF);
+            row_dst[3] = (unsigned char)(ws >> 8);
+        }
+        row_dst[4 + lane] = (unsigned char)qi;
+    }
+}
+
+// Task 2.6: fused add+RMSNorm -> q8_1 quantize epilogue (DUAL output). Pass 1
+// and the rms reduction are the EXACT grim_add_rms_norm_decode sequence (y_out
+// stride-256 pre-barrier, warp-0 stride-128 fmaf reduction), so out_f32 is
+// byte-identical to the split path. Pass 3 walks warp-local 32-column blocks
+// for the q8_1 side, reading the already-published y_out — aliasing-safe
+// because every column is read and written by the SAME lane.
+extern "C" __global__ void __launch_bounds__(256)
+grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
+                                 const float* __restrict__ w, float* y_out, float* norm_out,
+                                 unsigned char* out_q81, int row_len, float eps) {
+    __shared__ float s_rms;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    for (int col = tid; col < row_len; col += 256) {
+        y_out[col] = x[col] + residual[col];
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float ss = 0.0f;
+        for (int col = lane; col < row_len; col += 128) {
+            const int c1 = col + 32;
+            const int c2 = col + 64;
+            const int c3 = col + 96;
+            const float y0 = y_out[col];
+            const float y1 = (c1 < row_len) ? y_out[c1] : 0.0f;
+            const float y2 = (c2 < row_len) ? y_out[c2] : 0.0f;
+            const float y3 = (c3 < row_len) ? y_out[c3] : 0.0f;
+            ss = __builtin_fmaf(y0, y0, ss);
+            ss = __builtin_fmaf(y1, y1, ss);
+            ss = __builtin_fmaf(y2, y2, ss);
+            ss = __builtin_fmaf(y3, y3, ss);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            ss += __shfl_xor_sync(shfl_mask, ss, off);
+        if (lane == 0) {
+            s_rms = sqrtf(ss / (float)row_len + eps);
+        }
+    }
+    __syncthreads();
+
+    const float rms = s_rms;
+    const int n_q_blocks = (row_len + 31) / 32;
+    for (int blk = warp_id; blk < n_q_blocks; blk += 8) {
+        const int col = blk * 32 + lane;
+        const bool live = col < row_len;
+        const float y = live ? y_out[col] : 0.0f;
+        const float v = live ? (y * w[col] / rms) : 0.0f;
+        if (live) norm_out[col] = v;
+
+        float amax = __builtin_fabsf(v);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(shfl_mask, amax, mask));
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        const signed char qi = (signed char)__builtin_roundf(v * inv_d);
+
+        float fsum = (float)qi;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            fsum += __shfl_xor_sync(shfl_mask, fsum, mask);
+
+        unsigned char* row_dst = out_q81 + (long long)blk * 36;
+        if (lane == 0) {
+            _Float16 hd = (_Float16)d;
+            _Float16 hs = (_Float16)(fsum * d);
+            unsigned short wd, ws;
+            __builtin_memcpy(&wd, &hd, 2);
+            __builtin_memcpy(&ws, &hs, 2);
+            row_dst[0] = (unsigned char)(wd & 0xFF);
+            row_dst[1] = (unsigned char)(wd >> 8);
+            row_dst[2] = (unsigned char)(ws & 0xFF);
+            row_dst[3] = (unsigned char)(ws >> 8);
+        }
+        row_dst[4 + lane] = (unsigned char)qi;
+    }
+}
+
 // Warp-per-row online softmax (shuffle max + shuffle sum).
 extern "C" __global__ void __launch_bounds__(256)
 grim_softmax(const float* __restrict__ x, float* __restrict__ out, int row_len, int total) {

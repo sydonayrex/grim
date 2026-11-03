@@ -67,4 +67,91 @@ impl RocmDevice {
             ],
         )
     }
+
+    /// Task 2.6: fused RMSNorm -> (out_f32, q8_1) dual-output epilogue in one
+    /// launch (decode-shaped: single row, block 256). `out_f32` is
+    /// byte-identical to standalone `grim_rms_norm_decode`; `out_q81` matches
+    /// `grim_quantize_q8_1(out_f32)` within ±1 int8 code per element.
+    pub fn launch_rms_norm_quant_q81_dual(
+        &self,
+        x: &RocmStorage,
+        weight: &RocmStorage,
+        out_f32: &RocmStorage,
+        out_q81: &RocmStorage,
+        row_len: usize,
+        eps: f32,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x.device_ptr
+            .ok_or_else(|| Error::Backend("rms_norm_quant_q81_dual: x has no device ptr".into()))?;
+        let w_ptr = weight.device_ptr
+            .ok_or_else(|| Error::Backend("rms_norm_quant_q81_dual: weight has no device ptr".into()))?;
+        let o_ptr = out_f32.device_ptr
+            .ok_or_else(|| Error::Backend("rms_norm_quant_q81_dual: out_f32 has no device ptr".into()))?;
+        let q_ptr = out_q81.device_ptr
+            .ok_or_else(|| Error::Backend("rms_norm_quant_q81_dual: out_q81 has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(1, 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut xptr = x_ptr;
+        let mut wptr = w_ptr;
+        let mut optr = o_ptr;
+        let mut qptr = q_ptr;
+        let mut kk = row_len as i32;
+        let mut ep = eps;
+        self.launch_compute_kernel(
+            "grim_rms_norm_quant_q81_dual",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut xptr), arg(&mut wptr), arg(&mut optr), arg(&mut qptr), arg(&mut kk), arg(&mut ep)],
+        )
+    }
+
+    /// Task 2.6: fused add+RMSNorm -> (y_out, norm_out, q8_1) triple-output
+    /// epilogue in one launch. `norm_out` is byte-identical to standalone
+    /// `grim_add_rms_norm_decode`; `out_q81` matches
+    /// `grim_quantize_q8_1(norm_out)` within ±1 int8 code per element.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_add_rms_norm_quant_q81_dual(
+        &self,
+        x: &RocmStorage,
+        residual: &RocmStorage,
+        weight: &RocmStorage,
+        y_out: &RocmStorage,
+        norm_out: &RocmStorage,
+        out_q81: &RocmStorage,
+        row_len: usize,
+        eps: f32,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x.device_ptr
+            .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: x has no device ptr".into()))?;
+        let r_ptr = residual.device_ptr
+            .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: residual has no device ptr".into()))?;
+        let w_ptr = weight.device_ptr
+            .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: weight has no device ptr".into()))?;
+        let y_ptr = y_out.device_ptr
+            .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: y_out has no device ptr".into()))?;
+        let n_ptr = norm_out.device_ptr
+            .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: norm_out has no device ptr".into()))?;
+        let q_ptr = out_q81.device_ptr
+            .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: out_q81 has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(1, 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut xptr = x_ptr;
+        let mut rptr = r_ptr;
+        let mut wptr = w_ptr;
+        let mut yptr = y_ptr;
+        let mut nptr = n_ptr;
+        let mut qptr = q_ptr;
+        let mut kk = row_len as i32;
+        let mut ep = eps;
+        self.launch_compute_kernel(
+            "grim_add_rms_norm_quant_q81_dual",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xptr), arg(&mut rptr), arg(&mut wptr),
+                arg(&mut yptr), arg(&mut nptr), arg(&mut qptr),
+                arg(&mut kk), arg(&mut ep),
+            ],
+        )
+    }
 }

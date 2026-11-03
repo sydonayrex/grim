@@ -6270,6 +6270,251 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v2
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 2.3 diagnostics: decompose the v2 -> measured-stream-ceiling gap.
+//
+// Measured facts (Dev0/gfx1201, k=5120 n=17408, 8 rotating cold weight blobs):
+//   stream ceiling 612.5 GB/s, v2 490.8 GB/s (80.1% of ceiling).
+// The additive model (DRAM time + decode-VALU time) reproduces v2's runtime to
+// within 1%, which says v2 exposes ~25 us of DRAM-idle "compute bubble" per
+// launch: the wave issues its 12 B loads + 3 A loads, WAITS, then runs ~810
+// VALU instructions with no memory request in flight.
+//
+// These probes isolate the two halves:
+//   P1 load_probe : v2's EXACT A+B access pattern, ZERO decode compute.
+//   P2 loadb_probe: v2's EXACT B access pattern, ZERO A load, ZERO decode.
+//
+//   P1 ~= stream ceiling  => load path is fine; the bubble is compute exposure.
+//   P1 <  stream ceiling  => the access pattern itself is the limiter.
+//   P2 >> P1              => the (tiny, L2-hot) A row costs real bandwidth.
+//
+// Both probes keep the loads live by folding them into an accumulator whose
+// publish branch can never fire (same trick as grim_stream_read_probe).
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void __launch_bounds__(32) grim_iq4xs_q81_gemv_load_probe(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    unsigned acc = 0u;
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        // --- A row: identical to v2 (fp16 scale + 32 B of int8 codes) ---
+        const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+        const unsigned da = ((const unsigned short*)a_blk)[0];
+        int a4[8];
+        __builtin_memcpy(a4, a_blk + 4, 32);
+        acc ^= da ^ (unsigned)a4[0] ^ (unsigned)a4[1] ^ (unsigned)a4[2]
+                   ^ (unsigned)a4[3] ^ (unsigned)a4[4] ^ (unsigned)a4[5]
+                   ^ (unsigned)a4[6] ^ (unsigned)a4[7];
+
+        // --- B row: identical to v2 (uint2 header + two uint2 quants) ---
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 136;
+                const uint2 hdr = ((const uint2*)b_sb)[0];
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+                const uint2 q0 = qs2[0];
+                const uint2 q1 = qs2[1];
+                acc ^= hdr.x ^ hdr.y ^ q0.x ^ q0.y ^ q1.x ^ q1.y;
+            }
+        }
+    }
+    if (acc == 0xDEADBEEFu) C[(long long)row * N + col_base] = (float)acc;
+}
+
+// B-only twin of grim_iq4xs_q81_gemv_load_probe (no A row traffic).
+extern "C" __global__ void __launch_bounds__(32) grim_iq4xs_q81_gemv_loadb_probe(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    unsigned acc = 0u;
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 136;
+                const uint2 hdr = ((const uint2*)b_sb)[0];
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+                const uint2 q0 = qs2[0];
+                const uint2 q1 = qs2[1];
+                acc ^= hdr.x ^ hdr.y ^ q0.x ^ q0.y ^ q1.x ^ q1.y;
+            }
+        }
+    }
+    if (acc == 0xDEADBEEFu) C[(long long)row * N + col_base] = (float)acc;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 2.3 v5: v2 with MANUAL software pipelining.
+//
+// v2's inner loop is strictly serialised per wave:
+//     issue 12 B loads + 3 A loads  ->  WAIT for all of them  ->  ~810 VALU
+//     instructions of IQ4XS decode with NOTHING in flight.
+// Because every resident wave runs the same code, they stay in phase, so the
+// whole GPU alternates between "DRAM saturated" and "DRAM idle". Measured:
+// 80% of the stream ceiling on both real 27B shapes.
+//
+// v5 issues the NEXT superblock's loads at the TOP of the current iteration,
+// so the decode VALU work runs while the next iteration's data streams in.
+// Same 32-thread CTA, same 4-column geometry, same arithmetic order (and the
+// same per-lane superblock order) => bit-exact vs v2.
+//
+// Cost: one extra B buffer (4 cols x (uint2 hdr + uint2 q0 + uint2 q1) = 24
+// VGPR) plus one extra A buffer (8 int + 1 float = 9 VGPR). Occupancy drops
+// from ~8 to ~5 waves/SIMD, which the A/B harness measures directly.
+// ─────────────────────────────────────────────────────────────────────────────
+struct GrimIq4xsSb {
+    uint2 hdr[4];
+    uint2 qv0[4];
+    uint2 qv1[4];
+    int   a4[8];
+    float da;
+};
+
+__device__ __forceinline__ void grim_iq4xs_load_sb(
+    const unsigned char* a_row,
+    const unsigned char* b0,
+    long long col_stride,
+    int active_cols,
+    int sb,
+    int sub,
+    GrimIq4xsSb& s)
+{
+    const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+    s.da = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+    __builtin_memcpy(s.a4, a_blk + 4, 32);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        if (j < active_cols) {
+            const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 136;
+            s.hdr[j] = ((const uint2*)b_sb)[0];
+            const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);
+            s.qv0[j] = qs2[0];
+            s.qv1[j] = qs2[1];
+        } else {
+            s.hdr[j] = make_uint2(0u, 0u);
+            s.qv0[j] = make_uint2(0u, 0u);
+            s.qv1[j] = make_uint2(0u, 0u);
+        }
+    }
+}
+
+__device__ __forceinline__ void grim_iq4xs_compute_sb(
+    const GrimIq4xsSb& s,
+    int active_cols,
+    int sub,
+    float* facc)
+{
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        if (j >= active_cols) break;
+        const unsigned hdr = s.hdr[j].x;
+        const unsigned sc_l4 = s.hdr[j].y;
+        const float d = fp16_to_float_device((unsigned short)(hdr & 0xFFFFu));
+        const unsigned scales_h = hdr >> 16;
+        const int ls = (int)((sc_l4 >> (4 * sub)) & 0x0Fu)
+                     | (((int)((scales_h >> (2 * sub)) & 3u)) << 4);
+        const float dl = d * (float)(ls - 32);
+
+        const unsigned qw[4] = {s.qv0[j].x, s.qv0[j].y, s.qv1[j].x, s.qv1[j].y};
+        int pos = 0;
+        #pragma unroll
+        for (int w = 0; w < 4; w++) {
+            pos = grim_sdot4(s.a4[w],     grim_kv4_iq4xs_valu(qw[w] & 0x0F0F0F0Fu),        pos);
+            pos = grim_sdot4(s.a4[w + 4], grim_kv4_iq4xs_valu((qw[w] >> 4) & 0x0F0F0F0Fu), pos);
+        }
+        facc[j] += dl * s.da * (float)pos;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq4xs_q81_gemv_sub_v5(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq4xs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 136;
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    GrimIq4xsSb cur;
+    GrimIq4xsSb nxt;
+
+    // Prologue: fetch the first superblock this lane owns.
+    grim_iq4xs_load_sb(a_row, b0, col_stride, active_cols, slot, sub, cur);
+
+    for (int sb = slot; sb < n_sb; sb += 4) {
+        const int sb_n = sb + 4;
+        const bool has_next = (sb_n < n_sb);
+        // ISSUE NEXT: the loads for sb+4 go out before this iteration's VALU.
+        if (has_next) {
+            grim_iq4xs_load_sb(a_row, b0, col_stride, active_cols, sb_n, sub, nxt);
+        }
+        // CONSUME CURRENT: ~810 VALU instructions, overlapped with the loads
+        // issued above.
+        grim_iq4xs_compute_sb(cur, active_cols, sub, facc);
+        if (has_next) {
+            cur = nxt;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+
 // Task 2.2 v4: WhiteCrow v5-style 4-wave CTA (128 threads) with 4-superblock
 // unroll stride and ZERO LDS / zero __syncthreads.
 //

@@ -1924,6 +1924,72 @@ impl RocmDevice {
         )
     }
 
+    /// Task 2.3 A/B: v5 — v2 with manual software pipelining (next superblock's
+    /// loads issued before the current superblock's decode). Same geometry as
+    /// v2 (32-thread CTA, 4 columns), bit-exact vs v2.
+    pub fn launch_dot4_iq4xs_q81_gemv_v5_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub_v5",
+        )
+    }
+
+    /// Task 2.3 diagnostic: v2's exact A+B access pattern with zero decode
+    /// compute. Isolates the memory path from the VALU decode path.
+    pub fn launch_iq4xs_q81_gemv_load_probe_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_iq4xs_q81_gemv_load_probe",
+        )
+    }
+
+    /// Task 2.3 diagnostic: v2's exact B access pattern, no A row, no decode.
+    pub fn launch_iq4xs_q81_gemv_loadb_probe_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_iq4xs_q81_gemv_loadb_probe",
+        )
+    }
+
     pub(crate) fn launch_dot4_iq4xs_q81_gemv(
         &self,
         act_q81: &RocmStorage,

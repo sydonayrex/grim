@@ -60,6 +60,7 @@ fn candidate_lib_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
     }
     for fixed in [
         "/opt/rocm/lib",
+        "/opt/rocm/core/lib",
         "/usr/lib/rocm/lib",
         "/usr/lib/rocm",
         "/usr/lib64",
@@ -123,6 +124,7 @@ fn candidate_include_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
     push_env(&mut dirs, "ROCM_PATH");
     for fixed in [
         "/opt/rocm/include",
+        "/opt/rocm/core/include",
         "/usr/include/rocm",
         "/usr/include",
     ] {
