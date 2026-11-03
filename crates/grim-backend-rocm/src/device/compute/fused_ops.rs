@@ -50,9 +50,11 @@ impl RocmDevice {
         // capture bracket and the whole decode step falls back to eager.
         let is_iq2s = dt.arith == ArithType::F32
             && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::IQ2S));
-        if !is_f32_native && !is_q4k && !is_q3k && !is_iq3s && !is_iq2s {
+        let is_q6k = dt.arith == ArithType::F32
+            && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::Q6K));
+        if !is_f32_native && !is_q4k && !is_q3k && !is_iq3s && !is_iq2s && !is_q6k {
             return Err(Error::Unimplemented(
-                "embedding_gather_dev_idx: F32 native, Q4_K or Q3_K tables only".into(),
+                "embedding_gather_dev_idx: F32 native, Q4_K, Q3_K, Q6_K, IQ3_S, or IQ2_S tables only".into(),
             ));
         }
         let w_ptr = weight
@@ -172,6 +174,37 @@ impl RocmDevice {
         // The kernel bounds-checks in-gpu instead, so the graph path keeps the
         // safety the eager `embedding_q4k` gets from its host-side check.
         let mut rows = (weight.bytes / row_bytes) as i32;
+        if is_q6k {
+            const Q6K_BLOCK: usize = 256;
+            const Q6K_BLOCK_BYTES: usize = 210;
+            if dim == 0 || dim % Q6K_BLOCK != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: Q6_K dim {dim} must be a non-zero multiple of {Q6K_BLOCK}"
+                )));
+            }
+            let q6k_row_bytes = (dim / Q6K_BLOCK) * Q6K_BLOCK_BYTES;
+            if q6k_row_bytes == 0 || weight.bytes % q6k_row_bytes != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: Q6_K table of {} B is not a whole number of \
+                     {q6k_row_bytes}-B rows",
+                    weight.bytes
+                )));
+            }
+            let mut q6k_rows = (weight.bytes / q6k_row_bytes) as i32;
+            return self.launch_compute_kernel(
+                "grim_embedding_q6k_gather",
+                grid,
+                block,
+                &mut [
+                    arg(&mut w),
+                    arg(&mut o),
+                    arg(&mut i),
+                    arg(&mut d),
+                    arg(&mut t),
+                    arg(&mut q6k_rows),
+                ],
+            );
+        }
         if is_q3k {
             const Q3K_BLOCK: usize = 256;
             const Q3K_BLOCK_BYTES: usize = 110;
