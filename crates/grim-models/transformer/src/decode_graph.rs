@@ -233,7 +233,24 @@ fn linear_into_named(
     what: &str,
     layer: usize,
 ) -> Result<()> {
-    let mut q81_ready = false;
+    linear_into_named_ready(dev, a, w, out, act_q81, what, layer, false)
+}
+
+/// Task 2.6: `linear_into_named` with a caller-supplied `q81_ready` — the
+/// fused norm+q81 dual kernel has already filled `act_q81`, so q81-consuming
+/// linears skip their own quantize.
+#[allow(clippy::too_many_arguments)]
+fn linear_into_named_ready(
+    dev: &Dev,
+    a: &Storage,
+    w: &grim_tensor::Tensor,
+    out: &grim_backend_rocm::RocmStorage,
+    act_q81: &grim_backend_rocm::RocmStorage,
+    what: &str,
+    layer: usize,
+    q81_ready: bool,
+) -> Result<()> {
+    let mut q81_ready = q81_ready;
     let mut u4_ready = false;
     linear_into_named_dedup(
         dev,
@@ -473,8 +490,47 @@ impl LlamaBlock {
             && (self._cfg.local_num_heads * self._cfg.head_dim) % 4 == 0
             && (self._cfg.local_num_kv_heads * self._cfg.head_dim) % 4 == 0;
 
+        let fuse_norm_quant = self.attn_norm.kind == NormKind::Rms
+            && buffers.batch.max(1) == 1
+            && !matches!(
+                std::env::var("GRIM_FUSE_NORM_QUANT").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+            && (|| {
+                // Exact same predicate the linears will apply later: fuse
+                // iff ANY of q/k/v consumes q8_1 (then the dual kernel's
+                // q8_1 output is consumed; non-q81 consumers are unaffected).
+                for t in [self.wq.weight(), self.wk.weight(), self.wv.weight()] {
+                    let w = match rocm_storage(t) {
+                        Ok(w) => w,
+                        Err(_) => return false,
+                    };
+                    let n = t.shape().dims().first().copied().unwrap_or(0);
+                    if dev.linear_decode_quant_kind(w, 1, n, hidden).0 {
+                        return true;
+                    }
+                }
+                false
+            })();
         if !norm_fused_qkv {
+            // Task 2.6: fuse the q8_1 quantize into the norm launch when any
+            // qkv consumer needs q8_1 — one dual-output kernel replaces
+            // norm + first quantize. Byte-identity to the split path is
+            // pinned by rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity.
+            // m == 1 only: the dual kernel is decode-shaped (single row).
             match self.attn_norm.kind {
+                NormKind::Rms if fuse_norm_quant => {
+                    let norm_w = rocm_storage(&attn_w)?;
+                    dev.launch_rms_norm_quant_q81_dual(
+                        dst_downcast(attn_in)?,
+                        norm_w,
+                        &buffers.norm_buf[layer_idx],
+                        &buffers.act_q81_buf[layer_idx],
+                        hidden,
+                        self.attn_norm.eps,
+                    )
+                    .map_err(|e| grim_core::error::Error::Backend(format!("fused norm+q81: {e}")))?;
+                }
                 NormKind::Rms => {
                     dev.rms_norm_into(
                         attn_in,
@@ -507,8 +563,12 @@ impl LlamaBlock {
         if let Some(fused) = fused_qkv {
             let norm_rocm = dst_downcast(normed)?;
             let m = buffers.batch.max(1);
-            dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
-                .map_err(|e| grim_core::error::Error::Backend(format!("qkv quant: {e}")))?;
+            // Task 2.6: when the dual norm+q81 kernel already filled `act`,
+            // this quantize is redundant — skip it.
+            if !fuse_norm_quant {
+                dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("qkv quant: {e}")))?;
+            }
             dev.launch_fused_qkv_dot4_into(
                 act,
                 &fused.storage,
@@ -548,7 +608,20 @@ impl LlamaBlock {
                 n_kv,
                 hidden,
             )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused norm qkv dot4: {e}")))?;
+                .map_err(|e| grim_core::error::Error::Backend(format!("fused norm qkv dot4: {e}")))?;
+        } else if fuse_norm_quant {
+            // Task 2.6: `act` already holds q8_1(normed) from the dual
+            // norm kernel; pass q81_ready so q81-consuming linears skip
+            // their own quantize (non-q81 consumers ignore the flag).
+            linear_into_named_ready(
+                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, true,
+            )?;
+            linear_into_named_ready(
+                dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, true,
+            )?;
+            linear_into_named_ready(
+                dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, true,
+            )?;
         } else {
             linear_into(
                 dev,
