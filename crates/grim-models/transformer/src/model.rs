@@ -534,7 +534,7 @@ impl Llama {
 
     pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<DecodeOutputs> {
         let mut throwaway = Inner::new(self.device.clone());
-        self.decode_paged(hidden, positions, &mut throwaway, None, 0)
+        self.decode_paged_adapters(hidden, positions, &mut throwaway, None, 0, &[])
     }
 
     pub fn decode_paged(
@@ -542,8 +542,20 @@ impl Llama {
         hidden: &Tensor,
         positions: &[u32],
         session: &mut dyn SessionT,
+        caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
+        layer: usize,
+    ) -> Result<DecodeOutputs> {
+        self.decode_paged_adapters(hidden, positions, session, caches, layer, &[])
+    }
+
+    pub fn decode_paged_adapters(
+        &self,
+        hidden: &Tensor,
+        positions: &[u32],
+        session: &mut dyn SessionT,
         mut caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
         _layer: usize,
+        adapters: &[grim_core::model::AdapterHandle],
     ) -> Result<DecodeOutputs> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
@@ -558,8 +570,14 @@ impl Llama {
                 }
             }
             let cache = caches.as_deref_mut().and_then(|c| c[i].as_mut());
-            let (attn_out, k, v) =
-                block.forward_with_kv_paged(&h, positions, Some(&mut *session), cache, i)?;
+            let (attn_out, k, v) = block.forward_with_kv_paged_adapters(
+                &h,
+                positions,
+                Some(&mut *session),
+                cache,
+                i,
+                adapters,
+            )?;
             kv_pairs.push((k, v));
             // MoE layers: `attn_out` is the post-attention residual (dense FFN was skipped inside the block).
             // Route it through the experts and ADD the residual back - `MoeBlock::forward` returns only the.
@@ -728,7 +746,14 @@ impl CausalLm for Llama {
                     )
                 })?;
             let mut throwaway = Inner::new(self.device.clone());
-            self.decode_paged(&hidden_t, &pos_vec, &mut throwaway, Some(caches), 0)?
+            self.decode_paged_adapters(
+                &hidden_t,
+                &pos_vec,
+                &mut throwaway,
+                Some(caches),
+                0,
+                adapters,
+            )?
         };
         session.set_last_hidden_state(hidden_state);
         let logits = if adapters.is_empty() {

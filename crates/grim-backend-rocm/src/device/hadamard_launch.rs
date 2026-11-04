@@ -185,7 +185,7 @@ pub fn launch_fwht_signed(
 //     skip — enforced by the caller via `HadamardPlan::signs_for`
 //     BEFORE this function is reached).
 pub fn launch_fwht_signed_tiled(
-    _dev: &RocmDevice,
+    dev: &RocmDevice,
     src: &RocmStorage,
     dst: &RocmStorage,
     signs: &RocmStorage,
@@ -224,62 +224,55 @@ pub fn launch_fwht_signed_tiled(
     if dst.dtype != DType::F32 {
         return Err(Error::Backend(format!("fwht: dst must be f32, got {:?}", dst.dtype)));
     }
-    for b in 0..n_blk as usize {
-        // Strided page extract: gather block b of every row into a
-        // 1024-contiguous staging buffer, run the SAME single-block
-        // kernel the fwht parity gate covers (no second kernel to
-        // drift), scatter back. Reuses the Common kernel page path
-        // via `copy_slice_into`/`copy_slice_range` semantics on
-        // RocmStorage element ranges — 2 D2D copies + 1 FWHT per
-        // block, stream-ordered, capture-safe.
-        for _ in 0..1 {
-            // Single-block dispatch against the full buffer with a
-            // composed signs slice: the kernel's `signs_ptr` base
-            // and row stride are the whole buffer's row stride =
-            // full_width when the signs slice for block b is its
-            // own pointer? NO — the kernel strides src by FWHT_N,
-            // so calling it against a full-width buffer would read
-            // the wrong columns. The staging page IS the kernel's
-            // input; gather+scatter copy keeps the kernel byte-
-            // identical to the parity-covered path.
-        }
-        // Device-side staging: one page per block, reused across
-        // b (stream-ordered, so the buffer is free at each use).
-        // Compute page offsets from `src`/`dst` element bases with
-        // the SAME kernel's expectations: page i holds
-        // src[r*full_width + b*1024 .. r*full_width + (b+1)*1024].
-        //
-        // The actual pointer arithmetic lives in
-        // `RocmStorage::copy_slice_*` — the caller (the decode
-        // graph) supplies `src`/`dst` as RocmStorage and the
-        // `dev.copy_slice_into(dst, src, off, count)` primitive
-        // reads elements [off, off+count) from src, i.e. a row-
-        // major little-endian element range. For a page-sized
-        // contiguous block the gather is NOT a single element range
-        // (rows are strided by full_width), so this loop does a
-        // per-row gather+scatter via the device's slice-copy
-        // primitive (Common kernel `copy_slice_range` semantics
-        // accept arbitrary element offsets).
-        //
-        // The loop is intentionally on the common `BackendStorage`
-        // slice-copy interface so the exact copy semantics are
-        // pinned by the same tests that cover the existing
-        // graph's `copy_slice_range` uses (qwen35 fused-Qkv
-        // scatter). No new kernel, no new copy primitive.
-        for r in 0..rows {
-            let row_base = r * full_width + b * n as usize;
-            for _page in [0] {
-                let _ = (row_base, _page);
-            }
-        }
-        let _ = b;
-    }
-    // Defer to the caller: the graph's decode layer issues the
-    // per-block gather/FWHT/scatter launches on its own stream
-    // through `HadamardPlan::apply_fwht` (which reuses
-    // `launch_fwht_signed` per block against a page staging buffer
-    // HERE, so the kernel stays the parity-covered one). This
-    // helper is the shape/validity guard — it proves the width
-    // contract BEFORE the graph pays for the first gather.
+    let f16 = if src.dtype == DType::F32 {
+        false
+    } else if src.dtype == DType::F16 {
+        true
+    } else {
+        return Err(Error::Backend(format!(
+            "fwht tiled: src must be f32 or f16, got {:?}",
+            src.dtype
+        )));
+    };
+    let src_ptr = src
+        .device_ptr
+        .ok_or_else(|| Error::Backend("fwht tiled: src has no device ptr".into()))?;
+    let dst_ptr = dst
+        .device_ptr
+        .ok_or_else(|| Error::Backend("fwht tiled: dst has no device ptr".into()))?;
+    let signs_ptr = signs
+        .device_ptr
+        .ok_or_else(|| Error::Backend("fwht tiled: signs has no device ptr".into()))?;
+
+    // 2D grid: blockIdx.x = block index b, blockIdx.y = activation row r.
+    // ONE launch for the whole n_blk * rows grid — a folded linear costs one
+    // graph node, not n_blk gather/kernel/scatter round-trips.
+    let kernel = if f16 {
+        "grim_fwht_tiled_f16"
+    } else {
+        "grim_fwht_tiled_f32"
+    };
+    let grid_dim = HipDim3::new(n_blk, rows as u32, 1);
+    let block_dim = HipDim3::new(256, 1, 1);
+
+    let mut sptr = src_ptr;
+    let mut dptr = dst_ptr;
+    let mut rows64 = rows as i64;
+    let mut stride64 = full_width as i64;
+    let mut scale = 1.0f32 / (n as f32).sqrt();
+    let mut sptr_signs = signs_ptr;
+    dev.launch_compute_kernel(
+        kernel,
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut dptr),
+            arg(&mut rows64),
+            arg(&mut stride64),
+            arg(&mut scale),
+            arg(&mut sptr_signs),
+        ],
+    )?;
     Ok(())
 }

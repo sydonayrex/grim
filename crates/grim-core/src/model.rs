@@ -6,6 +6,57 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::error::Result;
 use crate::hyperparams::ArchHyperparameters;
 
+/// Target module for per-layer LoRA projections (Task 10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TargetModule {
+    AttnQ,
+    AttnK,
+    AttnV,
+    AttnOutput,
+    FfnGate,
+    FfnUp,
+    FfnDown,
+    Logits,
+}
+
+impl TargetModule {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AttnQ => "attn_q",
+            Self::AttnK => "attn_k",
+            Self::AttnV => "attn_v",
+            Self::AttnOutput => "attn_output",
+            Self::FfnGate => "ffn_gate",
+            Self::FfnUp => "ffn_up",
+            Self::FfnDown => "ffn_down",
+            Self::Logits => "output",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let n = name.to_ascii_lowercase();
+        if n.contains("attn_q") || n.contains("q_proj") || n.ends_with(".wq") {
+            Some(Self::AttnQ)
+        } else if n.contains("attn_k") || n.contains("k_proj") || n.ends_with(".wk") {
+            Some(Self::AttnK)
+        } else if n.contains("attn_v") || n.contains("v_proj") || n.ends_with(".wv") {
+            Some(Self::AttnV)
+        } else if n.contains("attn_output") || n.contains("o_proj") || n.ends_with(".wo") {
+            Some(Self::AttnOutput)
+        } else if n.contains("ffn_gate") || n.contains("gate_proj") || n.ends_with(".w_gate") {
+            Some(Self::FfnGate)
+        } else if n.contains("ffn_up") || n.contains("up_proj") || n.ends_with(".w_up") {
+            Some(Self::FfnUp)
+        } else if n.contains("ffn_down") || n.contains("down_proj") || n.ends_with(".w_down") {
+            Some(Self::FfnDown)
+        } else if n.contains("output") || n.contains("lm_head") || n.contains("logits") {
+            Some(Self::Logits)
+        } else {
+            None
+        }
+    }
+}
+
 /// Handle to a loaded adapter (LoRA weights + A/B rank + scaling factor).
 /// Zero or more adapters may be active per request; the engine fuses their low-rank updates.
 #[derive(Clone)]
@@ -14,6 +65,39 @@ pub struct AdapterHandle {
     pub a: Tensor,
     pub b: Tensor,
     pub alpha: f32,
+    pub layer_idx: Option<usize>,
+    pub target: Option<TargetModule>,
+}
+
+impl AdapterHandle {
+    pub fn new(id: u32, a: Tensor, b: Tensor, alpha: f32) -> Self {
+        Self {
+            id,
+            a,
+            b,
+            alpha,
+            layer_idx: None,
+            target: None,
+        }
+    }
+
+    pub fn with_target(
+        id: u32,
+        a: Tensor,
+        b: Tensor,
+        alpha: f32,
+        layer_idx: usize,
+        target: TargetModule,
+    ) -> Self {
+        Self {
+            id,
+            a,
+            b,
+            alpha,
+            layer_idx: Some(layer_idx),
+            target: Some(target),
+        }
+    }
 }
 
 /// Concrete dynamic model config — what every `load` constructor expects.

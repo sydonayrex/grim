@@ -737,11 +737,12 @@ pub fn launch_batched_lora_dispatched_storage(
     d_token_adapter: &crate::memory::storage::RocmStorage,
     d_adapters: &crate::memory::storage::RocmStorage,
     num_tokens: usize,
+    num_adapters: usize,
     in_dim: usize,
     out_dim: usize,
     max_rank: usize,
 ) -> Result<()> {
-    if num_tokens == 0 || in_dim == 0 || out_dim == 0 || max_rank == 0 {
+    if num_tokens == 0 || in_dim == 0 || out_dim == 0 || max_rank == 0 || num_adapters == 0 {
         return Ok(());
     }
 
@@ -757,9 +758,9 @@ pub fn launch_batched_lora_dispatched_storage(
     // [2]: ranks (u32 * num_adapters)
     // [3]: scalings (f32 * num_adapters)
     let a_ptrs_dev = adapters_ptr;
-    let b_ptrs_dev = adapters_ptr + (num_tokens * std::mem::size_of::<*const f32>()) as u64;
-    let ranks_dev = b_ptrs_dev + (num_tokens * std::mem::size_of::<*const f32>()) as u64;
-    let scalings_dev = ranks_dev + (num_tokens * std::mem::size_of::<u32>()) as u64;
+    let b_ptrs_dev = adapters_ptr + (num_adapters * std::mem::size_of::<*const f32>()) as u64;
+    let ranks_dev = b_ptrs_dev + (num_adapters * std::mem::size_of::<*const f32>()) as u64;
+    let scalings_dev = ranks_dev + (num_adapters * std::mem::size_of::<u32>()) as u64;
 
     let mut x_arg = x_ptr as *mut std::ffi::c_void;
     let mut a_arg = a_ptrs_dev as *mut std::ffi::c_void;

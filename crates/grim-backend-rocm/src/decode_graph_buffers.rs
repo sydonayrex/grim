@@ -39,6 +39,34 @@ use grim_tensor::{ArithType, DType};
 thread_local! {
     static CAPTURE_FP8_PAD: std::cell::Cell<*const RocmStorage> =
         const { std::cell::Cell::new(std::ptr::null()) };
+    static ACTIVE_LORA_DISPATCH: std::cell::Cell<Option<&'static dyn ActiveLoraDispatchState>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Device-resident descriptor pointers for active multi-LoRA dispatch (Task 10.1).
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveLoraDispatchPointers {
+    pub d_token_adapter: *const RocmStorage,
+    pub d_adapters: *const RocmStorage,
+    pub scratch_v: *const RocmStorage,
+    pub num_tokens: usize,
+    pub num_adapters: usize,
+    pub max_rank: usize,
+}
+
+/// Trait or lookup abstraction for checking active LoRA adapters per (layer, module).
+pub trait ActiveLoraDispatchState: Send + Sync {
+    fn get_dispatch(&self, layer: usize, target: &str) -> Option<ActiveLoraDispatchPointers>;
+}
+
+pub fn install_active_lora_dispatch(state: Option<&'static dyn ActiveLoraDispatchState>) {
+    ACTIVE_LORA_DISPATCH.with(|c| {
+        c.set(state);
+    });
+}
+
+pub fn active_lora_dispatch() -> Option<&'static dyn ActiveLoraDispatchState> {
+    ACTIVE_LORA_DISPATCH.with(|c| c.get())
 }
 
 fn install_capture_fp8_pad(scratch: Option<&RocmStorage>) {

@@ -241,12 +241,12 @@ mod adapter_lifecycle_tests {
     use crate::EngineConfig;
 
     fn test_handle(id: u32) -> AdapterHandle {
-        AdapterHandle {
+        AdapterHandle::new(
             id,
-            a: grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1, 1])),
-            b: grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1, 1])),
-            alpha: 1.0,
-        }
+            grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1, 1])),
+            grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1, 1])),
+            1.0,
+        )
     }
 
     /// Dropped ids must not resolve (no stale alias); re-registration serves

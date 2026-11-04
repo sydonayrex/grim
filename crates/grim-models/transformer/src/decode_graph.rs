@@ -652,6 +652,39 @@ fn linear_into_named_dedup(
     }
     *q81_ready = q_flags.q81_ready;
     *u4_ready = q_flags.u4_ready;
+
+    // Task 10.1 Step 4: After the base GEMV/GEMM writes `out`, if active multi-LoRA dispatch
+    // is registered for (layer, what), accumulate delta into `out` in-place.
+    if let Some(dispatch_state) = grim_backend_rocm::decode_graph_buffers::active_lora_dispatch() {
+        if let Some(disp) = dispatch_state.get_dispatch(layer, what) {
+            if disp.num_tokens > 0 && disp.max_rank > 0 && disp.num_adapters > 0 {
+                unsafe {
+                    let d_token_adapter = &*disp.d_token_adapter;
+                    let d_adapters = &*disp.d_adapters;
+                    let scratch_v = &*disp.scratch_v;
+                    let a_s = dst_downcast(a).map_err(|e| {
+                        grim_core::error::Error::Backend(format!(
+                            "lora_dispatch[{what} @ layer {layer}]: act not RocmStorage: {e}"
+                        ))
+                    })?;
+                    grim_backend_rocm::kernels::batched_lora::launch_batched_lora_dispatched_storage(
+                        dev,
+                        a_s,
+                        out,
+                        scratch_v,
+                        d_token_adapter,
+                        d_adapters,
+                        disp.num_tokens,
+                        disp.num_adapters,
+                        k,
+                        n,
+                        disp.max_rank,
+                    )?;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

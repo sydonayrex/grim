@@ -160,12 +160,7 @@ pub async fn load_adapter_route(
         let a = grim_backend_cpu::cpu_tensor(a_data, grim_tensor::Shape::from_slice(a_shape));
         let b = grim_backend_cpu::cpu_tensor(b_data, grim_tensor::Shape::from_slice(b_shape));
         // alpha=32 matches `grim merge`'s scale convention (32/rank).
-        let handle = grim_core::model::AdapterHandle {
-            id: engine.next_adapter_id(),
-            a,
-            b,
-            alpha: 32.0,
-        };
+        let handle = grim_core::model::AdapterHandle::new(engine.next_adapter_id(), a, b, 32.0);
         engine.register_adapter(&base_model, &payload.name, handle);
         applied.push(tensor_name);
     }

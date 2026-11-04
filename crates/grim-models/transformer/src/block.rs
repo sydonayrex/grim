@@ -746,8 +746,22 @@ impl LlamaBlock {
         x: &Tensor,
         positions: &[u32],
         session: Option<&mut dyn grim_core::session::SessionT>,
+        cache: Option<&mut LlamaLayerCache>,
+        layer: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.forward_with_kv_paged_adapters(x, positions, session, cache, layer, &[])
+    }
+
+    /// Forward pass with optional SessionT paged attention dispatch,
+    /// optional per-layer KV cache, and active per-layer adapters.
+    pub fn forward_with_kv_paged_adapters(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        session: Option<&mut dyn grim_core::session::SessionT>,
         mut cache: Option<&mut LlamaLayerCache>,
         layer: usize,
+        adapters: &[grim_core::model::AdapterHandle],
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let _t0 = std::time::Instant::now();
         let x_2d = x;
@@ -759,23 +773,86 @@ impl LlamaBlock {
         let (q, k, v, k_raw) = if seq_tokens == 1 && self.wqkv_q80_fused.is_some() {
             if let Some(ref fused) = self.wqkv_q80_fused {
                 let (q_raw, k_raw, v_raw) = self.fused_qkv_dot4_decode(&x_norm, fused)?;
+                let q_raw = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &q_raw,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::AttnQ,
+                )?;
+                let k_raw = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &k_raw,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::AttnK,
+                )?;
+                let v = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &v_raw,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::AttnV,
+                )?;
                 let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
                 let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
-                (q, k, v_raw, Some(k_raw))
+                (q, k, v, Some(k_raw))
             } else {
                 let q_raw = self.wq.forward(&x_norm)?;
+                let q_raw = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &q_raw,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::AttnQ,
+                )?;
                 let k_raw = self.wk.forward(&x_norm)?;
+                let k_raw = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &k_raw,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::AttnK,
+                )?;
+                let v = self.wv.forward(&x_norm)?;
+                let v = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &v,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::AttnV,
+                )?;
                 let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
                 let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
-                let v = self.wv.forward(&x_norm)?;
                 (q, k, v, Some(k_raw))
             }
         } else {
             let q_raw = self.wq.forward(&x_norm)?;
+            let q_raw = crate::lora::apply_adapters_to_projection(
+                &x_norm,
+                &q_raw,
+                adapters,
+                layer,
+                grim_core::model::TargetModule::AttnQ,
+            )?;
             let k_raw = self.wk.forward(&x_norm)?;
+            let k_raw = crate::lora::apply_adapters_to_projection(
+                &x_norm,
+                &k_raw,
+                adapters,
+                layer,
+                grim_core::model::TargetModule::AttnK,
+            )?;
+            let v = self.wv.forward(&x_norm)?;
+            let v = crate::lora::apply_adapters_to_projection(
+                &x_norm,
+                &v,
+                adapters,
+                layer,
+                grim_core::model::TargetModule::AttnV,
+            )?;
             let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
             let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
-            let v = self.wv.forward(&x_norm)?;
             (q, k, v, Some(k_raw))
         };
         let _t2 = std::time::Instant::now();
@@ -931,7 +1008,14 @@ impl LlamaBlock {
             } else {
                 attn_out
             };
-            self.wo.forward(&attn_out)?
+            let attn_out = self.wo.forward(&attn_out)?;
+            crate::lora::apply_adapters_to_projection(
+                &attn_out,
+                &attn_out,
+                adapters,
+                layer,
+                grim_core::model::TargetModule::AttnOutput,
+            )?
         };
 
         // `attn_post_norm` goes on the attention output BEFORE the residual
@@ -969,7 +1053,22 @@ impl LlamaBlock {
         };
         let (gate, up) = if seq_tokens == 1 && self.w_gate_up_q80_fused.is_some() {
             if let Some(ref fused) = self.w_gate_up_q80_fused {
-                self.fused_gate_up_dot4_decode(&x_norm, fused)?
+                let (gate, up) = self.fused_gate_up_dot4_decode(&x_norm, fused)?;
+                let gate = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &gate,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::FfnGate,
+                )?;
+                let up = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &up,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::FfnUp,
+                )?;
+                (gate, up)
             } else {
                 let gate = self
                     .w_gate
@@ -978,6 +1077,13 @@ impl LlamaBlock {
                         grim_core::error::Error::Backend("dense FFN w_gate missing".into())
                     })?
                     .forward(&x_norm)?;
+                let gate = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &gate,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::FfnGate,
+                )?;
                 let up = self
                     .w_up
                     .as_ref()
@@ -985,6 +1091,13 @@ impl LlamaBlock {
                         grim_core::error::Error::Backend("dense FFN w_up missing".into())
                     })?
                     .forward(&x_norm)?;
+                let up = crate::lora::apply_adapters_to_projection(
+                    &x_norm,
+                    &up,
+                    adapters,
+                    layer,
+                    grim_core::model::TargetModule::FfnUp,
+                )?;
                 (gate, up)
             }
         } else {
@@ -993,11 +1106,25 @@ impl LlamaBlock {
                 .as_ref()
                 .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_gate missing".into()))?
                 .forward(&x_norm)?;
+            let gate = crate::lora::apply_adapters_to_projection(
+                &x_norm,
+                &gate,
+                adapters,
+                layer,
+                grim_core::model::TargetModule::FfnGate,
+            )?;
             let up = self
                 .w_up
                 .as_ref()
                 .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_up missing".into()))?
                 .forward(&x_norm)?;
+            let up = crate::lora::apply_adapters_to_projection(
+                &x_norm,
+                &up,
+                adapters,
+                layer,
+                grim_core::model::TargetModule::FfnUp,
+            )?;
             (gate, up)
         };
         let silu_storage = if seq_tokens == 1
@@ -1020,6 +1147,13 @@ impl LlamaBlock {
             .as_ref()
             .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_down missing".into()))?
             .forward(&silu_storage)?;
+        let ffn_out = crate::lora::apply_adapters_to_projection(
+            &silu_storage,
+            &ffn_out,
+            adapters,
+            layer,
+            grim_core::model::TargetModule::FfnDown,
+        )?;
 
         let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
         Ok((out, k, v))

@@ -633,12 +633,7 @@ mod tests {
             vec![0.01f32; out_dim * 4],
             grim_tensor::Shape::new(vec![out_dim, 4]),
         );
-        AdapterHandle {
-            id,
-            a,
-            b,
-            alpha: 1.0,
-        }
+        AdapterHandle::new(id, a, b, 1.0)
     }
 
     #[test]
@@ -2033,12 +2028,7 @@ mod tests {
             vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             grim_tensor::Shape::new(vec![dim, rank]),
         );
-        let handle = AdapterHandle {
-            id: 10,
-            a,
-            b,
-            alpha: 2.0,
-        };
+        let handle = AdapterHandle::new(10, a, b, 2.0);
         engine.register_adapter("default", "lora_test", handle);
 
         // Rows 0-1 carry adapter 10, row 2 is base (passthrough).
@@ -2102,12 +2092,7 @@ mod tests {
             engine.register_adapter(
                 "tiny",
                 "shared_lora",
-                AdapterHandle {
-                    id: 10,
-                    a,
-                    b,
-                    alpha: 2.0,
-                },
+                AdapterHandle::new(10, a, b, 2.0),
             );
             engine
         };
