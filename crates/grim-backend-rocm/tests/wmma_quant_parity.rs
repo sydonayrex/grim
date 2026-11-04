@@ -106,9 +106,11 @@ fn run_case(
     deq: &dyn Fn(&[u8], usize) -> Vec<f32>,
 ) {
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-    let b_orig: Vec<f32> = (0..k * n)
-        .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
-        .collect();
+    // signed: all-positive weights cannot catch a sudot4 NEG-bit bug
+    // (preserves the [-6,6] magnitude of the old [1,7] range, zero-centered
+    // so the NEG bit is exercised; the grouped-parity worst_rel bar is
+    // scale-relative, so the tolerance justification is unaffected).
+    let b_orig: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.013).cos() * 6.0).collect();
     let b_packed = pack(&b_orig).expect("pack");
 
     let a_shape = Shape::new(vec![m, k]);
@@ -429,9 +431,11 @@ fn wmma_quant_fp16_input_parity() {
     let _route = route_counter_lock();
     let (m, n, k) = (1usize, 1024usize, 1024usize);
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-    let b_orig: Vec<f32> = (0..k * n)
-        .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
-        .collect();
+    // signed: all-positive weights cannot catch a sudot4 NEG-bit bug
+    // (preserves the [-6,6] magnitude of the old [1,7] range, zero-centered
+    // so the NEG bit is exercised; the grouped-parity worst_rel bar is
+    // scale-relative, so the tolerance justification is unaffected).
+    let b_orig: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.013).cos() * 6.0).collect();
     let b_packed = pack_q8_0(&b_orig).expect("pack");
 
     let q_dtype = DType {

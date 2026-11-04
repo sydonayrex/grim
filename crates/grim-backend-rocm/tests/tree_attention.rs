@@ -40,14 +40,18 @@ fn test_tree_attention_gpu_matches_reference() {
     let parents_shape = Shape::new(vec![(1 + gamma) as usize]);
     let out_shape = q_shape.clone();
 
+    // Audit §2.2: the original fixture is sin/cos of non-negative args
+    // (all-positive on the exercised index range), so a kernel that drops
+    // the sign bit of an input passes vacuously. The second signed pass
+    // below negates K (mixed-sign Q/K/V) with the same 1e-3 tolerance.
     // Generate mock Q, K, V data on CPU
-    let q_cpu: Vec<f32> = (0..q_shape.elem_count())
+    let q_pos: Vec<f32> = (0..q_shape.elem_count())
         .map(|x| (x as f32 * 0.1).sin())
         .collect();
-    let k_cpu: Vec<f32> = (0..kv_shape.elem_count())
+    let k_pos: Vec<f32> = (0..kv_shape.elem_count())
         .map(|x| (x as f32 * 0.15).cos())
         .collect();
-    let v_cpu: Vec<f32> = (0..kv_shape.elem_count())
+    let v_pos: Vec<f32> = (0..kv_shape.elem_count())
         .map(|x| (x as f32 * 0.2).sin())
         .collect();
 
@@ -63,12 +67,6 @@ fn test_tree_attention_gpu_matches_reference() {
     // path for 3: [0, 3]
     let parents_cpu: Vec<u32> = vec![0, 0, 1, 0];
 
-    // Upload to GPU
-    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
-    let k_storage = dev.from_cpu(&k_cpu, &kv_shape, DType::F32).unwrap();
-    let v_storage = dev.from_cpu(&v_cpu, &kv_shape, DType::F32).unwrap();
-    let mut out_storage = dev.zeros(&out_shape, DType::F32).unwrap();
-
     // We can upload parents by casting u32 to f32 raw bits
     let parents_f32: &[f32] = unsafe {
         std::slice::from_raw_parts(parents_cpu.as_ptr() as *const f32, parents_cpu.len())
@@ -77,27 +75,51 @@ fn test_tree_attention_gpu_matches_reference() {
         .from_cpu(parents_f32, &parents_shape, DType::F32)
         .unwrap();
 
-    // Launch
-    let res = launch_tree_attention(
-        &dev,
-        q_storage.as_ref(),
-        k_storage.as_ref(),
-        v_storage.as_ref(),
-        parents_storage.as_ref(),
-        out_storage.as_mut(),
-        batch,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        gamma,
-        kv_seq_len,
-        cache_offset,
-    );
+    // Two passes over the same launch/reference plumbing: the all-positive
+    // fixture, then the signed variant with K negated (`-sin(...)`).
+    for pass in 0..2 {
+        let (q_cpu, k_cpu, v_cpu) = if pass == 0 {
+            (q_pos.clone(), k_pos.clone(), v_pos.clone())
+        } else {
+            (
+                q_pos.clone(),
+                k_pos.iter().map(|v| -v).collect::<Vec<f32>>(),
+                v_pos.clone(),
+            )
+        };
+        let label = if pass == 0 { "positive" } else { "signed(-K)" };
 
-    assert!(res.is_ok(), "launch_tree_attention failed: {:?}", res.err());
+        // Upload to GPU
+        let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+        let k_storage = dev.from_cpu(&k_cpu, &kv_shape, DType::F32).unwrap();
+        let v_storage = dev.from_cpu(&v_cpu, &kv_shape, DType::F32).unwrap();
+        let mut out_storage = dev.zeros(&out_shape, DType::F32).unwrap();
 
-    // Read back output
-    let out_cpu = out_storage.to_cpu_vec_f32().unwrap();
+        // Launch
+        let res = launch_tree_attention(
+            &dev,
+            q_storage.as_ref(),
+            k_storage.as_ref(),
+            v_storage.as_ref(),
+            parents_storage.as_ref(),
+            out_storage.as_mut(),
+            batch,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            gamma,
+            kv_seq_len,
+            cache_offset,
+        );
+
+        assert!(
+            res.is_ok(),
+            "launch_tree_attention failed ({label}): {:?}",
+            res.err()
+        );
+
+        // Read back output
+        let out_cpu = out_storage.to_cpu_vec_f32().unwrap();
 
     // Reconstruct path verification helper
     let is_ancestor = |j_tree: usize, i_tree: usize| -> bool {
@@ -190,18 +212,19 @@ fn test_tree_attention_gpu_matches_reference() {
     }
 
     // Assert relative error is within tolerance
-    for i in 0..out_cpu.len() {
-        let got = out_cpu[i];
-        let want = want_out[i];
-        let diff = (got - want).abs();
-        let denom = got.abs().max(want.abs()).max(1e-6);
-        assert!(
-            diff / denom < 1e-3,
-            "Divergence at index {}: got {}, want {} (rel diff: {})",
-            i,
-            got,
-            want,
-            diff / denom
-        );
+        for i in 0..out_cpu.len() {
+            let got = out_cpu[i];
+            let want = want_out[i];
+            let diff = (got - want).abs();
+            let denom = got.abs().max(want.abs()).max(1e-6);
+            assert!(
+                diff / denom < 1e-3,
+                "Divergence at index {} ({label}): got {}, want {} (rel diff: {})",
+                i,
+                got,
+                want,
+                diff / denom
+            );
+        }
     }
 }

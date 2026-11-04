@@ -188,6 +188,104 @@ fn run_quant_matmul(
     Ok(out_s.to_cpu_vec_f32()?)
 }
 
+/// Audit §2.2 — sudot4 NEG-bit discriminator. All-negative activation row
+/// and all-negative weight row (A = -1.0, B = -0.5): a kernel that drops or
+/// ignores the sign bit of either operand (or reads the weight codes as
+/// unsigned) returns zero, -ratio, or a wildly wrong magnitude here, while
+/// a sign-correct Sudot4 returns the full positive product. The assertion is
+/// against the CPU dot to ≤1e-5 relative — tighter than the 2e-2 grouped
+/// bar, because with constant inputs the only remaining noise is the fp32
+/// accumulation order (activation quantization of a constant is exact in
+/// both the device q8_1 quantizer and the fp32 host reference, and the Q8_0
+/// weights pack to a constant code, so the products coincide up to
+/// floating-point summation order).
+#[test]
+#[ignore]
+fn dot4_all_negative_probe() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 1024usize;
+    let k = 1024usize;
+    // signed: all-positive weights cannot catch a sudot4 NEG-bit bug
+    let a: Vec<f32> = vec![-1.0; m * k];
+    let b_f32: Vec<f32> = vec![-0.5; n * k];
+    let b_packed = pack_q80(&b_f32, n, k);
+    let want = reference_q80(&a, &b_packed, m, n, k);
+    let (a_dev, b_dev) = upload_q80_case(&dev, &a, &b_packed, m, k).expect("upload");
+    let got = run_quant_matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), n).expect("dot4 run");
+
+    let mut worst_rel = 0.0f32;
+    for i in 0..want.len() {
+        let rel = (got[i] - want[i]).abs() / want[i].abs().max(1e-6);
+        if rel > worst_rel {
+            worst_rel = rel;
+        }
+    }
+    eprintln!("[dot4-all-negative] n={n} k={k} worst_rel={worst_rel:.3e} sample got={:?} want={:?}", &got[..4], &want[..4]);
+    assert!(
+        worst_rel <= 1e-5,
+        "dot4 all-negative probe diverges from CPU dot: worst_rel={worst_rel}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
+/// Audit §2.3 — tail-K probe. K=288 is 32-aligned (so `pack_q80` /
+/// `host_quantize_q8_1` / `assert_eq!(k%32,0)` pass and the Q8_0 dot4
+/// dispatch at quant/mod.rs `k % 32 == 0` accepts it) but is NOT a multiple
+/// of 256, so any kernel that hard-assumes a whole number of 256-wide
+/// Q4K/Q5K/Q6K superblocks (or otherwise vectorizes by 256) drops or
+/// double-counts the 32-element tail. The Q8_0 layout uses 34-byte blocks
+/// per 32 elements, so 288 = 9 blocks exactly — this exercises the tail
+/// without changing the dispatch asserts. The CPU oracle is the same
+/// `reference_q80` the passing gates use, so a tail defect shows up as a
+/// parity break, not a layout error.
+#[test]
+#[ignore]
+fn dot_gemv_tail_k() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 1024usize;
+    let k = 288usize;
+    assert_eq!(k % 32, 0, "tail K must satisfy the 32-alignment dispatch gate");
+    assert_ne!(k % 256, 0, "tail K must NOT be a multiple of 256");
+
+    let (a, b_packed) = build_q80_case(m, n, k);
+    let want = reference_q80(&a, &b_packed, m, n, k);
+    let (a_dev, b_dev) = upload_q80_case(&dev, &a, &b_packed, m, k).expect("upload");
+    let got = run_quant_matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), n).expect("dot4 run");
+
+    let worst = worst_rel(&want, &got);
+    let diff = max_diff(&want, &got);
+    eprintln!("[dot4-tail-k] n={n} k={k} max_diff={diff} worst_rel={worst}");
+    assert!(
+        worst <= 2e-2,
+        "dot4 GEMV diverges from CPU reference at tail K={k}: worst_rel={worst} max_diff={diff}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
 /// PASSED: dot2 GEMV matches the fp32 CPU reference within fp16-activation
 /// quantization tolerance at the LFM2.5 decode shapes.
 #[test]

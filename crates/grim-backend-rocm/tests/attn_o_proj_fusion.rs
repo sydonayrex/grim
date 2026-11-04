@@ -36,112 +36,132 @@ fn fused_attn_output_proj_matches_unfused() {
     let kv_len = 7;
     let hidden = num_heads * head_dim; // 64
 
-    let q_data = fill(seq_len * num_heads * head_dim, 0.3);
-    let k_data = fill(kv_len * num_kv_heads * head_dim, 0.5);
-    let v_data = fill(kv_len * num_kv_heads * head_dim, 0.9);
-    let o_w = fill(hidden * hidden, 0.2);
+    // Audit §2.2: `fill` (0.3/0.5/0.9 seeds) is one-sided on the exercised
+    // range. The second pass below uses negative seeds (`-0.3` etc.) so the
+    // fused-vs-unfused comparison runs on mixed-sign Q/K/V/W at the same
+    // 2e-3 tolerance — a sign-dropping GEMM epilogue cannot pass vacuously.
+    let q_pos = fill(seq_len * num_heads * head_dim, 0.3);
+    let k_pos = fill(kv_len * num_kv_heads * head_dim, 0.5);
+    let v_pos = fill(kv_len * num_kv_heads * head_dim, 0.9);
+    let o_pos = fill(hidden * hidden, 0.2);
 
-    let q = dev
-        .from_cpu(
-            &q_data,
-            &Shape::from_slice(&[seq_len, num_heads, head_dim]),
-            DType::F32,
-        )
-        .unwrap();
-    let k = dev
-        .from_cpu(
-            &k_data,
-            &Shape::from_slice(&[kv_len, num_kv_heads, head_dim]),
-            DType::F32,
-        )
-        .unwrap();
-    let v = dev
-        .from_cpu(
-            &v_data,
-            &Shape::from_slice(&[kv_len, num_kv_heads, head_dim]),
-            DType::F32,
-        )
-        .unwrap();
-    let o = dev
-        .from_cpu(&o_w, &Shape::from_slice(&[hidden, hidden]), DType::F32)
-        .unwrap();
+    // Two passes over the same fused-vs-unfused plumbing: the original
+    // one-sided fixture, then the signed variant with negative seeds.
+    for pass in 0..2 {
+        let (q_data, k_data, v_data, o_w) = if pass == 0 {
+            (q_pos.clone(), k_pos.clone(), v_pos.clone(), o_pos.clone())
+        } else {
+            (
+                fill(seq_len * num_heads * head_dim, -0.3),
+                fill(kv_len * num_kv_heads * head_dim, -0.5),
+                fill(kv_len * num_kv_heads * head_dim, -0.9),
+                fill(hidden * hidden, -0.2),
+            )
+        };
+        let label = if pass == 0 { "positive" } else { "signed(-seed)" };
 
-    // Reference: existing unfused path — attention kernel, then separate GEMM.
-    let attn_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
-    let (attn, h) = dev
-        .qkv_attention(
-            q.as_ref(),
-            k.as_ref(),
-            v.as_ref(),
-            num_kv_heads,
-            kv_len,
-            0,
-            None,
-            &attn_shape,
-            None,
-            None,
-        )
-        .unwrap();
-    h.synchronize().unwrap();
-    let attn_flat = attn.to_cpu_vec_f32().unwrap();
-    let attn2d = dev
-        .from_cpu(
-            &attn_flat,
-            &Shape::from_slice(&[seq_len, hidden]),
-            DType::F32,
-        )
-        .unwrap();
-    let (proj, h) = CoreTensorOps::matmul(
-        &dev,
-        attn2d.as_ref(),
-        o.as_ref(),
-        &Shape::from_slice(&[seq_len, hidden]),
-    )
-    .unwrap();
-    h.synchronize().unwrap();
-    let want = proj.to_cpu_vec_f32().unwrap();
+        let q = dev
+            .from_cpu(
+                &q_data,
+                &Shape::from_slice(&[seq_len, num_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let k = dev
+            .from_cpu(
+                &k_data,
+                &Shape::from_slice(&[kv_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let v = dev
+            .from_cpu(
+                &v_data,
+                &Shape::from_slice(&[kv_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let o = dev
+            .from_cpu(&o_w, &Shape::from_slice(&[hidden, hidden]), DType::F32)
+            .unwrap();
 
-    // Fused path: O-projection applied in the attention kernel epilogue.
-    let (fused, h) = dev
-        .fused_attn_o_proj(
-            q.as_ref(),
-            k.as_ref(),
-            v.as_ref(),
+        // Reference: existing unfused path — attention kernel, then separate GEMM.
+        let attn_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+        let (attn, h) = dev
+            .qkv_attention(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                num_kv_heads,
+                kv_len,
+                0,
+                None,
+                &attn_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        h.synchronize().unwrap();
+        let attn_flat = attn.to_cpu_vec_f32().unwrap();
+        let attn2d = dev
+            .from_cpu(
+                &attn_flat,
+                &Shape::from_slice(&[seq_len, hidden]),
+                DType::F32,
+            )
+            .unwrap();
+        let (proj, h) = CoreTensorOps::matmul(
+            &dev,
+            attn2d.as_ref(),
             o.as_ref(),
-            num_kv_heads,
-            kv_len,
-            0,
             &Shape::from_slice(&[seq_len, hidden]),
         )
-        .expect("fused_attn_o_proj should launch");
-    h.synchronize().unwrap();
-    let got = fused.to_cpu_vec_f32().unwrap();
+        .unwrap();
+        h.synchronize().unwrap();
+        let want = proj.to_cpu_vec_f32().unwrap();
 
-    assert_eq!(got.len(), want.len(), "fused output length mismatch");
-    let tol = 2e-3f32;
-    let mut worst = 0.0f32;
-    for i in 0..want.len() {
-        let denom = want[i].abs().max(got[i].abs()).max(1e-6);
-        let err = ((got[i] - want[i]) / denom).abs();
-        worst = worst.max(err);
+        // Fused path: O-projection applied in the attention kernel epilogue.
+        let (fused, h) = dev
+            .fused_attn_o_proj(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                o.as_ref(),
+                num_kv_heads,
+                kv_len,
+                0,
+                &Shape::from_slice(&[seq_len, hidden]),
+            )
+            .expect("fused_attn_o_proj should launch");
+        h.synchronize().unwrap();
+        let got = fused.to_cpu_vec_f32().unwrap();
+
+        assert_eq!(got.len(), want.len(), "fused output length mismatch ({label})");
+        let tol = 2e-3f32;
+        let mut worst = 0.0f32;
+        for i in 0..want.len() {
+            let denom = want[i].abs().max(got[i].abs()).max(1e-6);
+            let err = ((got[i] - want[i]) / denom).abs();
+            worst = worst.max(err);
+            assert!(
+                err <= tol,
+                "fused O-proj mismatch at {i} (token {} col {}): fused {} vs unfused {} (rel err {err}) [{label}]",
+                i / hidden,
+                i % hidden,
+                got[i],
+                want[i]
+            );
+        }
+        // Guard against vacuous pass: reference must be non-trivial.
         assert!(
-            err <= tol,
-            "fused O-proj mismatch at {i} (token {} col {}): fused {} vs unfused {} (rel err {err})",
-            i / hidden,
-            i % hidden,
-            got[i],
-            want[i]
+            want.iter().any(|x| x.abs() > 1e-4),
+            "reference output is all ~zero ({label}); test proves nothing"
+        );
+        eprintln!(
+            "fused_attn_o_proj worst rel err: {worst:.3e} over {} elems [{label}]",
+            want.len()
         );
     }
-    // Guard against vacuous pass: reference must be non-trivial.
-    assert!(
-        want.iter().any(|x| x.abs() > 1e-4),
-        "reference output is all ~zero; test proves nothing"
-    );
-    eprintln!(
-        "fused_attn_o_proj worst rel err: {worst:.3e} over {} elems",
-        want.len()
-    );
 }
 
 /// WI-F2 gate 3 — occupancy regression harness. Asserts the fused-epilogue

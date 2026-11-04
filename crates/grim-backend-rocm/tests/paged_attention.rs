@@ -35,16 +35,13 @@ fn test_paged_attention_gpu_matches_reference() {
     ]);
     let out_shape = q_shape.clone();
 
+    // Audit §2.2: sin/cos of non-negative args (all-positive). A second
+    // signed pass below negates K (`-sin(...)`) with the same 1e-3
+    // tolerance so a sign-dropping kernel cannot pass vacuously.
     // Generate mock Q, K, V data on CPU
-    let q_cpu: Vec<f32> = (0..16).map(|x| (x as f32 * 0.1).sin()).collect();
-    let k_cpu: Vec<f32> = (0..64).map(|x| (x as f32 * 0.15).cos()).collect();
-    let v_cpu: Vec<f32> = (0..64).map(|x| (x as f32 * 0.2).sin()).collect();
-
-    // Upload to GPU
-    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
-    let k_storage = dev.from_cpu(&k_cpu, &page_shape, DType::F32).unwrap();
-    let v_storage = dev.from_cpu(&v_cpu, &page_shape, DType::F32).unwrap();
-    let mut out_storage = dev.zeros(&out_shape, DType::F32).unwrap();
+    let q_pos: Vec<f32> = (0..16).map(|x| (x as f32 * 0.1).sin()).collect();
+    let k_pos: Vec<f32> = (0..64).map(|x| (x as f32 * 0.15).cos()).collect();
+    let v_pos: Vec<f32> = (0..64).map(|x| (x as f32 * 0.2).sin()).collect();
 
     // Create block table
     let table_entries = [
@@ -72,35 +69,54 @@ fn test_paged_attention_gpu_matches_reference() {
         )
         .unwrap();
 
-    // Launch
-    let res = launch_paged_attention(
-        &dev,
-        q_storage.as_ref(),
-        table_storage.as_ref(),
-        k_storage.as_ref(),
-        v_storage.as_ref(),
-        out_storage.as_mut(),
-        batch,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        max_blocks,
-        page_size,
-        kv_seq_len,
-        cache_offset,
-        0i32,
-        None, // WI-X5 block_dim_override: keep the wavefront-aware default
-    );
+    // Two passes: all-positive fixture, then signed variant with K negated.
+    for pass in 0..2 {
+        let (q_cpu, k_cpu, v_cpu) = if pass == 0 {
+            (q_pos.clone(), k_pos.clone(), v_pos.clone())
+        } else {
+            (
+                q_pos.clone(),
+                k_pos.iter().map(|v| -v).collect::<Vec<f32>>(),
+                v_pos.clone(),
+            )
+        };
+        let label = if pass == 0 { "positive" } else { "signed(-K)" };
 
-    assert!(
-        res.is_ok(),
-        "launch_paged_attention failed: {:?}",
-        res.err()
-    );
+        // Upload to GPU
+        let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+        let k_storage = dev.from_cpu(&k_cpu, &page_shape, DType::F32).unwrap();
+        let v_storage = dev.from_cpu(&v_cpu, &page_shape, DType::F32).unwrap();
+        let mut out_storage = dev.zeros(&out_shape, DType::F32).unwrap();
 
-    // Read back output
-    let out_cpu = out_storage.to_cpu_vec_f32().unwrap();
-    assert_eq!(out_cpu.len(), 16);
+        // Launch
+        let res = launch_paged_attention(
+            &dev,
+            q_storage.as_ref(),
+            table_storage.as_ref(),
+            k_storage.as_ref(),
+            v_storage.as_ref(),
+            out_storage.as_mut(),
+            batch,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            0i32,
+            None, // WI-X5 block_dim_override: keep the wavefront-aware default
+        );
+
+        assert!(
+            res.is_ok(),
+            "launch_paged_attention failed ({label}): {:?}",
+            res.err()
+        );
+
+        // Read back output
+        let out_cpu = out_storage.to_cpu_vec_f32().unwrap();
+        assert_eq!(out_cpu.len(), 16);
 
     // Reconstruct flat K and V from pages
     let mut k_flat = vec![0.0f32; (kv_seq_len * num_kv_heads * head_dim) as usize];
@@ -171,18 +187,19 @@ fn test_paged_attention_gpu_matches_reference() {
     }
 
     // Assert relative error is within tolerance
-    for i in 0..out_cpu.len() {
-        let got = out_cpu[i];
-        let want = want_out[i];
-        let diff = (got - want).abs();
-        let denom = got.abs().max(want.abs()).max(1e-6);
-        assert!(
-            diff / denom < 1e-3,
-            "Divergence at index {}: got {}, want {} (rel diff: {})",
-            i,
-            got,
-            want,
-            diff / denom
-        );
+        for i in 0..out_cpu.len() {
+            let got = out_cpu[i];
+            let want = want_out[i];
+            let diff = (got - want).abs();
+            let denom = got.abs().max(want.abs()).max(1e-6);
+            assert!(
+                diff / denom < 1e-3,
+                "Divergence at index {} ({label}): got {}, want {} (rel diff: {})",
+                i,
+                got,
+                want,
+                diff / denom
+            );
+        }
     }
 }
