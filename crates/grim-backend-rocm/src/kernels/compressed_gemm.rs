@@ -329,3 +329,74 @@ extern "C" __global__ void grim_wna16_dequant_gemm_backward_dx(
     dX[row * K + k] = acc;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Host-side mirror of the in-kernel MSB-first N-bit extractor. The kernel
+    // source defines it in HIP C (`grim_decode_msb_nbit`); this mirrors the
+    // same bit walk in Rust so the packing contract is pinned independently
+    // of any device. bit p lives at byte p/8, bit 7-(p%8); codes assemble
+    // MSB-first (audit §3.6: the previous revision computed a negative
+    // shift on the first byte, which is UB in C and extracted the wrong bits).
+    fn pack_msb_nbit(codes: &[u32], n_bit: u8) -> Vec<u8> {
+        let total_bits = codes.len() * n_bit as usize;
+        let mut bytes = vec![0u8; total_bits.div_ceil(8)];
+        for (lane, &code) in codes.iter().enumerate() {
+            for bit in 0..n_bit as usize {
+                if code & (1 << (n_bit as usize - 1 - bit)) != 0 {
+                    let pos = lane * n_bit as usize + bit;
+                    bytes[pos / 8] |= 1 << (7 - (pos % 8));
+                }
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn host_decode_msb_nbit_roundtrips_pack() {
+        // Covers the cases that distinguish MSB-first from LSB-first and
+        // from the old negative-shift walk: codes crossing a byte boundary
+        // (n_bit=3, lane=2 spans bytes 0..1), all-ones, and zero.
+        for n_bit in [2u8, 3, 4, 5, 8] {
+            let max = (1u32 << n_bit) - 1;
+            let codes: Vec<u32> = (0..17)
+                .map(|i| (i as u32 * 7 + 1) % (max + 1))
+                .collect();
+            let bytes = pack_msb_nbit(&codes, n_bit);
+            for (lane, &want) in codes.iter().enumerate() {
+                let got = decode_msb_nbit(&bytes, 0, lane, n_bit);
+                assert_eq!(got, want, "n_bit={n_bit} lane={lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn host_decode_msb_nbit_known_vectors() {
+        // Hand-computed: n_bit=4, [0xA, 0x5] -> 0xA5; n_bit=2, [1,2,3] -> 0b01_10_11 = 0x6C.
+        assert_eq!(decode_msb_nbit(&[0xA5], 0, 0, 4), 0xA);
+        assert_eq!(decode_msb_nbit(&[0xA5], 0, 1, 4), 0x5);
+        assert_eq!(decode_msb_nbit(&[0b0110_1100], 0, 0, 2), 1);
+        assert_eq!(decode_msb_nbit(&[0b0110_1100], 0, 1, 2), 2);
+        assert_eq!(decode_msb_nbit(&[0b0110_1100], 0, 2, 2), 3);
+        assert_eq!(decode_msb_nbit(&[0xFF], 0, 0, 4), 0xF);
+        assert_eq!(decode_msb_nbit(&[0x00], 0, 0, 4), 0x0);
+        // Row variant: same walk over a row's packed bytes.
+        assert_eq!(decode_msb_nbit_row(&[0xA5], 0, 0, 4), 0xA);
+        assert_eq!(decode_msb_nbit_row(&[0xA5], 0, 1, 4), 0x5);
+    }
+
+    #[test]
+    fn compressed_gemm_sources_contain_all_entries() {
+        assert!(WEIGHT_NA16_KERNEL.contains("grim_dequant_wna16"));
+        assert!(WEIGHT_NA16_KERNEL.contains("grim_decode_msb_nbit"));
+        assert!(EMBEDDING_NA16_INT_KERNEL.contains("grim_dequant_embedding_wna16_int"));
+        assert!(W8A8_GEMM_KERNEL.contains("grim_w8a8_int8_dequant_gemm"));
+        assert!(W8A8_GEMM_KERNEL.contains("grim_w8a8_fp8_dequant_gemm"));
+        assert!(W8A8_GEMM_KERNEL.contains("grim_w8a8_int8_dequant_gemm_backward_dx"));
+        assert!(W8A8_GEMM_KERNEL.contains("grim_w8a8_fp8_dequant_gemm_backward_dx"));
+        assert!(W8A8_GEMM_KERNEL.contains("grim_wna16_dequant_gemm"));
+        assert!(W8A8_GEMM_KERNEL.contains("grim_wna16_dequant_gemm_backward_dx"));
+    }
+}

@@ -16,7 +16,8 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::{
     dequant_fp8, dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs,
-    dequant_iq4nl, dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_q4k,
+    dequant_iq4nl, dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_nutcracker, dequant_nvfp4,
+    dequant_q4k,
 };
 use grim_tensor::error::Error as QuantError;
 
@@ -146,6 +147,17 @@ fn build_mxfp_bytes(n: usize, codes_per_2: bool, exps: &[u8]) -> Vec<u8> {
 
 fn dev() -> RocmDevice {
     RocmDevice::try_new(0).expect("RocmDevice::try_new(0) should succeed on a system with ROCm")
+}
+
+/// House `gpu_device()` gating (copied from the sibling parity files):
+/// `require_gpu_device()` returns `None` unless `GRIM_RUN_GPU_TESTS` is set,
+/// so CPU-only `cargo test` stays green without a GPU. The legacy `dev()`
+/// above panics without one; new tests use this instead.
+fn gpu_device() -> Option<RocmDevice> {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return None;
+    }
+    grim_backend_rocm::require_gpu_device()
 }
 
 fn assert_bit_exact(name: &str, got: &[f32], expected: &[f32]) {
@@ -331,4 +343,96 @@ fn iq_kernels_run_and_report_deviation() {
     run_iq("iq3s", 110, 256, &|b, n| dequant_iq3s(b, n));
     run_iq("iq4nl", 18, 32, &|b, n| dequant_iq4nl(b, n));
     run_iq("iq4xs", 136, 256, &|b, n| dequant_iq4xs(b, n));
+}
+
+// ── fp8_standalone small-shape case (audit §3.6) ──────────────────────────
+// `fp8_kernel_matches_cpu_oracle` above already launches `grim_dequant_fp8`
+// (`launch_dequant_fp8` → `dequantize_fp8_host`) bit-exact against
+// `grim_quant::dequant_fp8`. This adds the small-shape, odd-boundary variant
+// with the house `gpu_device()` gating: a 33-element buffer (spans two
+// 256-thread blocks' tail, exercises the `idx >= n_weights` early-out)
+// and a non-power-of-two scale. Bit-exact, like the 512-element case.
+
+#[test]
+#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
+fn fp8_standalone_small_shape_matches_cpu_oracle_bit_exact() {
+    let Some(dev) = gpu_device() else { return };
+    let n: usize = 33;
+    let scale = 0.625f32;
+    // Finite E4M3 codes only (drop the NaN code 0x7F from the 512-case roster):
+    // a single NaN element would poison the byte-count check below.
+    let mut bytes = Vec::with_capacity(4 + n);
+    bytes.extend_from_slice(&scale.to_le_bytes());
+    for i in 0..n {
+        let code = match i % 8 {
+            0 => 0x00,
+            1 => 0x01,
+            2 => 0x03,
+            3 => 0x10,
+            4 => 0x1B,
+            5 => 0x88,
+            6 => 0x42, // normal, positive (replaces 0x7F NaN)
+            _ => 0xC0 | (i as u8 & 0x07),
+        };
+        bytes.push(code);
+    }
+    let expected = dequant_fp8(&bytes, n).unwrap();
+    let got = dev.dequantize_fp8_host(&bytes, n).unwrap();
+    assert_bit_exact("fp8_small", &got, &expected);
+}
+
+// ── mxfp_standalone 9-byte schemes (audit §3.6) ───────────────────────────
+// `mxfp4_kernel_matches_cpu_oracle` / `mxfp8_kernel_matches_cpu_oracle` above
+// already launch `grim_dequant_mxfp4` / `grim_dequant_mxfp8` bit-exact.
+// The two remaining kernels in `mxfp_standalone.rs` — `grim_dequant_nutcracker`
+// and `grim_dequant_nvfp4` — had no launch test at all (only the
+// `the_two_9byte_schemes_use_different_scale_decoders` string check).
+// Both share the 9-bytes-per-16 layout; the ONLY difference is the scale
+// decode ([exp:6|sel:2] selector vs E4M3), which is exactly what this pins.
+
+/// Build a 9-byte-per-16 roster: `n_blocks` sub-blocks, each [scale_byte]
+/// + 8 nibble-packed E2M1 code bytes (low nibble first). Codes cycle all 16
+/// E2M1 codes so the zero-code paths (Nutcracker selector vs NVFP4 real
+/// zero) are both exercised.
+fn build_9byte_bytes(n: usize, scale_bytes: &[u8]) -> Vec<u8> {
+    let n_blocks = n.div_ceil(16);
+    assert_eq!(scale_bytes.len(), n_blocks);
+    let mut bytes = Vec::with_capacity(n_blocks * 9);
+    for (blk, &scale) in scale_bytes.iter().enumerate() {
+        bytes.push(scale);
+        for i in 0..8 {
+            let lo = ((blk * 16 + i * 2) % 16) as u8;
+            let hi = ((blk * 16 + i * 2 + 1) % 16) as u8;
+            bytes.push(lo | (hi << 4));
+        }
+    }
+    bytes
+}
+
+#[test]
+#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
+fn nutcracker_kernel_matches_cpu_oracle_bit_exact() {
+    let Some(dev) = gpu_device() else { return };
+    let n: usize = 32; // 2 sub-blocks, distinct selectors per block
+    // exp=31 (scale 1.0) with sel=0b01 (special +2.5) and sel=0b10 (-5.0).
+    let scale_bytes = [
+        grim_quant::nutcracker_pack_scale(31, 0b01),
+        grim_quant::nutcracker_pack_scale(31, 0b10),
+    ];
+    let bytes = build_9byte_bytes(n, &scale_bytes);
+    let expected = dequant_nutcracker(&bytes, n).unwrap();
+    let got = dev.dequantize_nutcracker_host(&bytes, n).unwrap();
+    assert_bit_exact("nutcracker", &got, &expected);
+}
+
+#[test]
+#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
+fn nvfp4_kernel_matches_cpu_oracle_bit_exact() {
+    let Some(dev) = gpu_device() else { return };
+    let n: usize = 32;
+    // E4M3 scale bytes: 0x38 = 1.0, 0x40 = 2.0 (fp8_e4m3_to_f32 of each).
+    let bytes = build_9byte_bytes(n, &[0x38, 0x40]);
+    let expected = dequant_nvfp4(&bytes, n).unwrap();
+    let got = dev.dequantize_nvfp4_host(&bytes, n).unwrap();
+    assert_bit_exact("nvfp4", &got, &expected);
 }
