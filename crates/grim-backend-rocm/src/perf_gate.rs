@@ -1,7 +1,24 @@
 //! Phase-3 §3.7 - Profiling CI gate. Regression harness that compares a measured `cycles_per_call` against a baseline JSON keyed by kernel
 //! name and arch, and decides: - `Within { delta_pct, threshold_pct }` - measurement is within budget (≤ threshold-pct above baseline).
+//!
+//! Audit §3.4 wiring (manual-only gate):
+//!
+//! - The committed baseline lives at `benches/baseline/rocm_perf_baseline.json`
+//!   (serde alias `arch` for `gpu_arch`; see `BaselineTableJson`). It is
+//!   loaded with [`BaselineTable::load_baseline`] (or
+//!   [`BaselineTable::load_default_baseline`] for the canonical path).
+//! - Manual local run ONLY, never CI-gated (consumer ROCm project, no GPU CI):
+//!   `cargo test --test perf_gate -- --nocapture` parses the JSON on CPU;
+//!   `GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm --test perf_gate -- --ignored --nocapture`
+//!   (or `--bench kv_dequant_perf`) runs the GPU harness. No `.github/workflows`
+//!   job invokes this gate.
+//! - Timing note: benches currently time with `Instant::now()` wall clock
+//!   (host synchronize per iteration; see `docs/benchmarks.md` §2). GPU-event
+//!   timing (`hipEvent`) is the follow-up; it is deliberately NOT rewritten in
+//!   this pass.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -38,13 +55,42 @@ pub struct BaselineEntry {
 pub struct BaselineTable {
     arch: String,
     inner: HashMap<String, BaselineEntry>,
+    /// `hipconfig --version` of the machine that produced this baseline.
+    rocm_version: String,
+    /// Decode batch size the baseline was measured at (decode regime).
+    batch: Option<u32>,
+    /// Regime the baseline covers (e.g. `"decode"` — decode, not prefill).
+    prefill_decode: Option<String>,
+    /// End-to-end tokens/sec recorded alongside the per-kernel baselines.
+    tok_per_s: Option<f64>,
+    /// When the baseline was measured (or `"TEMPLATE"` before the first run).
+    measured_at: Option<String>,
 }
 
 /// Wire-format mirror of `BaselineTable`. Kept private so the public type
 /// can evolve independently.
+///
+/// Schema (audit §3.4, `benches/baseline/rocm_perf_baseline.json`):
+/// `{arch, rocm_version, batch, prefill_decode ("decode"), tok_per_s,
+/// measured_at, entries: [{kernel, baseline_cycles_per_call, threshold_pct}]}`
+/// (`gpu_arch` is accepted as an alias for `arch`.) The repo checkout is
+/// nightly `main` (§2 of `docs/benchmarks.md`), so `rocm_version` records the
+/// runtime the baseline was measured under (`hipconfig --version`); results
+/// without arch/version are not reproducible.
 #[derive(Debug, Serialize, Deserialize)]
 struct BaselineTableJson {
+    #[serde(rename = "arch", alias = "gpu_arch")]
     gpu_arch: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rocm_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    batch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefill_decode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tok_per_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    measured_at: Option<String>,
     entries: Vec<BaselineEntry>,
 }
 
@@ -55,11 +101,42 @@ impl BaselineTable {
         Self {
             arch: arch.into(),
             inner: HashMap::new(),
+            rocm_version: String::new(),
+            batch: None,
+            prefill_decode: None,
+            tok_per_s: None,
+            measured_at: None,
         }
     }
 
     pub fn arch(&self) -> &str {
         &self.arch
+    }
+
+    /// ROCm runtime version this baseline was measured under (`hipconfig --version`);
+    /// empty when the table was built in-memory.
+    pub fn rocm_version(&self) -> &str {
+        &self.rocm_version
+    }
+
+    /// Decode batch size recorded with the baseline, if any.
+    pub fn batch(&self) -> Option<u32> {
+        self.batch
+    }
+
+    /// Regime covered by the baseline (e.g. `"decode"`).
+    pub fn prefill_decode(&self) -> Option<&str> {
+        self.prefill_decode.as_deref()
+    }
+
+    /// End-to-end tokens/sec recorded with the baseline, if any.
+    pub fn tok_per_s(&self) -> Option<f64> {
+        self.tok_per_s
+    }
+
+    /// When the baseline was measured, or `"TEMPLATE"` pre-first-run.
+    pub fn measured_at(&self) -> Option<&str> {
+        self.measured_at.as_deref()
     }
 
     /// Decide whether the entry is acceptable: `baseline > 0` and `threshold_pct > 0`.
@@ -104,6 +181,11 @@ impl BaselineTable {
         entries.sort_by(|a, b| a.kernel.cmp(&b.kernel));
         let wire = BaselineTableJson {
             gpu_arch: self.arch.clone(),
+            rocm_version: self.rocm_version.clone(),
+            batch: self.batch,
+            prefill_decode: self.prefill_decode.clone(),
+            tok_per_s: self.tok_per_s,
+            measured_at: self.measured_at.clone(),
             entries,
         };
         serde_json::to_string_pretty(&wire)
@@ -127,16 +209,58 @@ impl BaselineTable {
                 )));
             }
         }
-        Ok(Self {
+        let table = Self {
             arch: wire.gpu_arch,
             inner,
-        })
+            rocm_version: wire.rocm_version,
+            batch: wire.batch,
+            prefill_decode: wire.prefill_decode,
+            tok_per_s: wire.tok_per_s,
+            measured_at: wire.measured_at,
+        };
+        Ok(table)
+    }
+
+    /// Load the committed baseline JSON from disk (audit §3.4 wiring).
+    ///
+    /// Missing file, unreadable file, or invalid schema all surface as
+    /// `Error::Backend` — the gate never fabricates a baseline.
+    pub fn load_baseline(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let s = std::fs::read_to_string(path).map_err(|e| {
+            Error::Backend(format!(
+                "BaselineTable::load_baseline: read {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Self::from_json(&s)
+    }
+
+    /// Canonical committed-baseline path: `benches/baseline/rocm_perf_baseline.json`
+    /// relative to this crate's manifest dir.
+    pub fn default_baseline_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/baseline/rocm_perf_baseline.json")
+    }
+
+    /// Load the committed baseline (`Desktop$CARGO_MANIFEST_DIR/benches/baseline/rocm_perf_baseline.json`).
+    pub fn load_default_baseline() -> Result<Self> {
+        Self::load_baseline(Self::default_baseline_path())
     }
 }
 
 fn validate_wire(wire: &BaselineTableJson) -> Result<()> {
     if wire.gpu_arch.is_empty() {
         return Err(Error::Backend("baseline json: gpu_arch is empty".into()));
+    }
+    if let Some(batch) = wire.batch {
+        if batch == 0 {
+            return Err(Error::Backend(format!(
+                "baseline json: batch must be > 0, got {}",
+                batch
+            )));
+        }
     }
     for e in &wire.entries {
         if e.kernel.is_empty() {
@@ -289,7 +413,7 @@ mod gate_self_tests {
     //! Tiny self-tests that prove the gate uses the threshold the spec calls for (default +5%) on a bare-bones entry.
     //! The bulk of the tests live in `tests/perf_gate.rs`; here we only keep one boundary check.
 
-    use super::{BaselineEntry, Measurement, PerfGate, Verdict};
+    use super::{BaselineEntry, BaselineTable, Measurement, PerfGate, Verdict};
 
     #[test]
     fn regressed_path_returns_regressed_kind() {
@@ -325,5 +449,31 @@ mod gate_self_tests {
             matches!(v, Verdict::Regressed { .. }),
             "+20% slower regresses"
         );
+    }
+
+    #[test]
+    fn committed_baseline_template_parses_with_metadata() {
+        // CPU-only: validates the committed template
+        // `benches/baseline/rocm_perf_baseline.json` parses via the same
+        // `from_json` path the manual GPU gate uses, and carries the
+        // reproducibility metadata (arch + ROCm version).
+        let table = BaselineTable::load_default_baseline()
+            .expect("committed baseline template must parse");
+        assert_eq!(table.arch(), "gfx1036");
+        assert!(!table.rocm_version().is_empty(), "template must record rocm_version");
+        assert_eq!(table.batch(), Some(1));
+        assert_eq!(table.prefill_decode(), Some("decode"));
+        assert!(table.tok_per_s().is_some_and(|v| v > 0.0));
+        assert_eq!(table.measured_at(), Some("TEMPLATE"));
+        assert!(
+            table.entry("grim_qkv_attention").is_some(),
+            "template must carry a grim_qkv_attention entry"
+        );
+    }
+
+    #[test]
+    fn baseline_rejects_zero_batch() {
+        let bad = r#"{"gpu_arch":"gfx1036","rocm_version":"7.x","batch":0,"entries":[]}"#;
+        assert!(BaselineTable::from_json(bad).is_err(), "batch 0 must be rejected");
     }
 }

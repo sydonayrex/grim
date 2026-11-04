@@ -1,0 +1,21 @@
+{
+  "arch": "gfx1036",
+  "_comment": "AUDIT §3.4 manual-only perf gate baseline. PLACEHOLDER template: plausible values only, replace on first manual GPU run. Manual local run ONLY (consumer ROCm project, no GPU CI): cargo test --test perf_gate -- --nocapture (CPU parse check); GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm --test perf_gate -- --ignored --nocapture (GPU harness); or cargo bench -p grim-backend-rocm --bench kv_dequant_perf. Never CI-gated, no .github/workflows job invokes this gate. Fields arch + rocm_version (rocm-profiling-perf minimum: result without arch/version is not reproducible) identify the machine; batch/prefill_decode identify the decode regime. Warmup/GPU-event timing: benches currently use Instant::now() wallclock (docs/benchmarks.md §2); hipEvent timing is the follow-up, not rewritten in this pass.",
+  "rocm_version": "7.x (nightly main; confirm via hipconfig --version)",
+  "batch": 1,
+  "prefill_decode": "decode",
+  "tok_per_s": 92.0,
+  "measured_at": "TEMPLATE",
+  "entries": [
+    {
+      "kernel": "grim_qkv_attention",
+      "baseline_cycles_per_call": 5000000.0,
+      "threshold_pct": 5.0
+    },
+    {
+      "kernel": "grim_matmul_f32",
+      "baseline_cycles_per_call": 12345678.0,
+      "threshold_pct": 10.0
+    }
+  ]
+}

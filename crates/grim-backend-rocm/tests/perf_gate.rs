@@ -344,6 +344,51 @@ fn perf_gate_per_key_threshold_overrides_library_default() -> TestResult {
 }
 
 // =========================================================================
+// AUDIT §3.4 — committed baseline template loads from disk (CPU-only).
+// =========================================================================
+
+#[test]
+fn baseline_table_loads_committed_template_from_disk() -> TestResult {
+    let table = BaselineTable::load_default_baseline()?;
+    // Reproducibility metadata (rocm-profiling-perf minimum: result without
+    // arch/version is not reproducible).
+    assert_eq!(table.arch(), "gfx1036");
+    assert!(!table.rocm_version().is_empty(), "template must record rocm_version");
+    assert_eq!(table.batch(), Some(1));
+    assert_eq!(table.prefill_decode(), Some("decode"));
+    // Placeholder (benches/kv_dequant_perf.rs:5: "92-127 tok/s" on gfx1036);
+    // first manual GPU run replaces it.
+    let tok = table.tok_per_s().ok_or("template must carry tok_per_s")?;
+    assert!(tok > 0.0 && tok < 1000.0, "implausible tok_per_s: {}", tok);
+    assert_eq!(table.measured_at(), Some("TEMPLATE"));
+    let qkv = table
+        .entry("grim_qkv_attention")
+        .ok_or("template must carry grim_qkv_attention")?;
+    assert!(qkv.baseline_cycles_per_call > 0.0 && qkv.threshold_pct > 0.0);
+    Ok(())
+}
+
+#[test]
+fn baseline_table_load_missing_file_is_err_not_panic() -> TestResult {
+    let res = BaselineTable::load_baseline(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/baseline/does-not-exist.json"),
+    );
+    assert!(res.is_err(), "missing baseline file must surface as Err");
+    Ok(())
+}
+
+#[test]
+fn baseline_table_arch_alias_gpu_arch_accepted() -> TestResult {
+    // The wire struct keeps `gpu_arch` as the canonical field with `arch`
+    // as an alias, so old-era files still parse.
+    let legacy = r#"{"gpu_arch":"gfx1201","rocm_version":"7.x","batch":1,"prefill_decode":"decode","tok_per_s":10.0,"measured_at":"2026-01-01","entries":[]}"#;
+    let t = BaselineTable::from_json(legacy)?;
+    assert_eq!(t.arch(), "gfx1201");
+    assert_eq!(t.tok_per_s(), Some(10.0));
+    Ok(())
+}
+
+// =========================================================================
 // RED — Default-constructed gate accepts an empty baseline and reports
 // NoBaseline for any key (we never panic on an empty benchmark file).
 // =========================================================================
