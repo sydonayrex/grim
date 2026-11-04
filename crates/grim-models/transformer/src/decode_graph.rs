@@ -3252,63 +3252,49 @@ impl Qwen35Block {
                 let wv = self.wv.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wv in full attention block".into())
                 })?;
-                let mut q81_ready = fuse_norm_quant;
-                let mut u4_ready = false;
-                linear_into_named_dedup(
+                let mut graph_emitter = RocmGraphEmitter {
                     dev,
+                    emit: emit.as_deref_mut(),
+                };
+                // Task 5B.5 Attention block migration: initialize flags from fuse_norm_quant
+                // and pass through emit_linear_dedup which returns updated QuantFlags post-launch.
+                let flags = grim_graph::QuantFlags {
+                    q81_ready: fuse_norm_quant,
+                    u4_ready: false,
+                };
+                let flags = grim_graph::emit_linear_dedup(
+                    &mut graph_emitter,
                     normed,
                     wq.weight(),
                     &buffers.q_buf[layer_idx],
                     act,
                     "attn.q",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    flags,
+                    true,
                 )?;
-                linear_into_named_dedup(
-                    dev,
+                let flags = grim_graph::emit_linear_dedup(
+                    &mut graph_emitter,
                     normed,
                     wk.weight(),
                     &buffers.k_buf[layer_idx],
                     act,
                     "attn.k",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    flags,
+                    true,
                 )?;
-                linear_into_named_dedup(
-                    dev,
+                let _ = grim_graph::emit_linear_dedup(
+                    &mut graph_emitter,
                     normed,
                     wv.weight(),
                     &buffers.v_buf[layer_idx],
                     act,
                     "attn.v",
                     layer_idx,
-                    &mut q81_ready,
-                    &mut u4_ready,
+                    flags,
+                    true,
                 )?;
-                // M7.1: the three plain projections are three GEMM nodes —
-                // the ring's GEMM arm computes in f32, so a NATIVE weight is
-                // a node it can run, and a quantized one is a FALLBACK.
-                if let Some(e) = emit.as_deref_mut() {
-                    for w in [wq, wk, wv] {
-                        let weight = w.weight();
-                        let native = crate::decode_graph::rocm_storage(weight)
-                            .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
-                            .unwrap_or(false);
-                        let n = weight.shape().dim(0).unwrap_or(0) as u32;
-                        let k = weight.shape().dim(1).unwrap_or(0) as u32;
-                        e.launch(
-                            if native {
-                                grim_backend_rocm::task_graph::op::GEMM
-                            } else {
-                                grim_backend_rocm::task_graph::op::FALLBACK
-                            },
-                            [0, n, k, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                            &[],
-                        );
-                    }
-                }
             }
 
             // 3. Split the fused Q|gate. `q_buf` holds [Q | gate] at 2*q_dim;

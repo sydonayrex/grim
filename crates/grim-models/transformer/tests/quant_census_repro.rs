@@ -54,46 +54,72 @@ fn test_q81_launch_census_and_logits_parity_vs_dedup_disabled() {
 
     let w1_rocm = as_rocm(w1_t.as_ref()).unwrap();
     let w2_rocm = as_rocm(w2_t.as_ref()).unwrap();
-    let out1_rocm = as_rocm(out1_t.as_ref()).unwrap();
-    let out2_rocm = as_rocm(out2_t.as_ref()).unwrap();
+    let _out1_rocm = as_rocm(out1_t.as_ref()).unwrap();
+    let _out2_rocm = as_rocm(out2_t.as_ref()).unwrap();
     let scratch_rocm = as_rocm(scratch_t.as_ref()).unwrap();
 
-    // Arm 1: Normal dedup execution where q81_ready starts FALSE,
-    // and linear_decode_into_prequant sets it to TRUE only after launching.
-    let mut q81_ready = false;
-    let u4_ready = false;
+    // Arm 1: Normal dedup execution on real attention Q/K/V block call site
+    // When fuse_norm_quant is false, attention Q/K/V sharing normed input with dedup enabled
+    // must execute exactly 1 grim_quantize_q8_1 launch across Q, K, and V!
+    let mut cfg_attn = tiny_cfg();
+    cfg_attn.num_layers = 2;
+    cfg_attn.full_attention_interval = 1; // All layers full attention
+    let mut provider_attn = synth_weights_layers(2);
+    for key in [
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+    ] {
+        if let Some(old) = provider_attn.tensors.get(key) {
+            let shape = old.shape.clone();
+            let k = shape[1];
+            let n = shape[0];
+            let fake_bytes = vec![0u8; (n * k / 32) * 36];
+            provider_attn.tensors.insert(
+                key.to_string(),
+                RawTensor {
+                    bytes: fake_bytes,
+                    shape,
+                    dtype: grim_tensor::DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q5K),
+                    },
+                    provenance: grim_tensor::QuantProvenance::GrimNative,
+                },
+            );
+        }
+    }
+    let dev_arc_attn = RocmDevice::shared(0);
+    let device_attn = grim_tensor::Device::Rocm(0);
+    let ws_attn = WeightSource::root(&provider_attn, device_attn.clone());
+    let model_attn = Qwen35::load(device_attn, &ws_attn, cfg_attn).expect("load model");
+    let attn_blk = &model_attn.blocks[0];
+    assert!(attn_blk.is_full_attention, "layer 0 must be full attention");
+    let graph_attn = model_attn.get_or_create_decode_graph(16, 1).expect("graph");
 
+    unsafe { std::env::set_var("GRIM_FUSE_NORM_QUANT", "0") }; // Force non-fused path
     reset_kernel_route_counters();
-    dev.linear_decode_into_prequant(
-        a_t.as_ref(),
-        w1_rocm,
-        out1_rocm,
-        scratch_rocm,
-        q81_ready,
-        u4_ready,
-    ).expect("linear_decode_into_prequant proj1");
-    q81_ready = true; // Set AFTER the kernel runs!
+    attn_blk.forward_graph(
+        0,
+        &graph_attn.buffers,
+        &dev_arc_attn,
+        None,
+        None,
+        None,
+        false,
+    ).expect("forward_graph attn");
+    dev_arc_attn.synchronize();
+    unsafe { std::env::remove_var("GRIM_FUSE_NORM_QUANT") };
 
-    dev.linear_decode_into_prequant(
-        a_t.as_ref(),
-        w2_rocm,
-        out2_rocm,
-        scratch_rocm,
-        q81_ready,
-        u4_ready,
-    ).expect("linear_decode_into_prequant proj2");
-    dev.synchronize();
-
-    let routes = kernel_route_snapshot();
-    let q81_launches = routes
+    let attn_routes = kernel_route_snapshot();
+    let attn_q81_launches = attn_routes
         .iter()
         .find(|(k, _)| k == "grim_quantize_q8_1")
         .map(|(_, c)| *c)
         .unwrap_or(0);
-
     assert_eq!(
-        q81_launches, 1,
-        "two projections sharing input with dedup enabled must execute exactly 1 grim_quantize_q8_1 launch"
+        attn_q81_launches, 1,
+        "attention Q/K/V at real call site (non-fused) must execute exactly 1 grim_quantize_q8_1 launch"
     );
 
     // Arm 1b: Verify FFN gate and up projections specifically exercise dedup via emit_linear_dedup.
