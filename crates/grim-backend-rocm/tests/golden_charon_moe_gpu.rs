@@ -29,7 +29,6 @@
 //! otherwise the tests no-op (the codebase convention, see
 //! `decode_gemm.rs`, `golden_q4k_gpu_mutation.rs`).
 
-use std::panic;
 
 use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::RocmDevice;
@@ -42,8 +41,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 // ---------------------------------------------------------------------------

@@ -18,7 +18,6 @@
 //! prior header claim could not have held on live hardware: the D2D path
 //! bailed to CPU fallback and the residency assertion failed).
 
-use std::panic;
 use std::sync::Arc;
 
 use grim_backend_cpu::cpu_tensor;
@@ -40,8 +39,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 struct ExpertWeights {

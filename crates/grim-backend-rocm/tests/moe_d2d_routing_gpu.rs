@@ -29,8 +29,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// P1 parity must never turn a missing GPU into a green result. The test is

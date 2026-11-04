@@ -21,11 +21,9 @@ use std::sync::Arc;
 
 fn gpu_device() -> Option<Arc<RocmDevice>> {
     if !grim_backend_rocm::gpu_test_enabled() {
-        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run");
         return None;
     }
-    std::panic::catch_unwind(|| Arc::new(RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")))
-        .ok()
+    grim_backend_rocm::require_gpu_device().map(std::sync::Arc::new)
 }
 
 /// Row count is kept small so the test runs in milliseconds; `dim` matches the

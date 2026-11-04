@@ -276,14 +276,14 @@
 ### Task 5B.1: crate skeleton + `emit_norm`
 **Files:** Create `crates/grim-graph/{Cargo.toml,src/lib.rs,src/norm.rs}`; root `Cargo.toml` workspace members. Unit tests only — no GPU.
 **Produces:** `NormSpec { weight: &Tensor, eps: f32 }`; `emit_norm(emitter, input, out, spec, m, k) -> Result<()>`. The eps→NORM/FALLBACK rule (|eps − 1e-5| < f32::EPSILON) moves HERE.
-- [x] Failing test: eps 1e-5 records NORM opcode, 9e-6 records FALLBACK (recording emitter with `LaunchEmitter::launch`'s exact signature). (COMPLETE: tested and passed in `grim-graph`).
-- [x] Port the norm block from `decode_graph.rs:2384-2430` region verbatim (M7.1 comment travels with it). `cargo test -p grim-graph` green. Commit. (COMPLETE: committed `d5a18eec`).
+- [ ] Failing test: eps 1e-5 records NORM opcode, 9e-6 records FALLBACK (recording emitter with `LaunchEmitter::launch`'s exact signature). (PARTIAL: unit test passes in `grim-graph`, but trait lacks operands/emission coupling).
+- [ ] Port the norm block from `decode_graph.rs:2384-2430` region verbatim (M7.1 comment travels with it). `cargo test -p grim-graph` green. Commit. (OPEN: needs generic operand redesign).
 
 ### Task 5B.2: `emit_linear_dedup` + `QuantFlags`
 **Files:** Create `grim-graph/src/linear.rs`; modify `decode_graph.rs` to call INTO it (old fn kept as `#[cfg(test)]` reference).
 **Produces:** `QuantFlags { q81_ready: bool, u4_ready: bool }` (pub, Copy); `emit_linear_dedup(dev, a, w, out, act_q81, what, layer, flags: &mut QuantFlags)`.
-- [x] Failing test: two linears over the SAME input → second skips `grim_quantize_q8_1` (toy-graph census, pattern `decode_speed_bench.rs`). (COMPLETE: tested and passed in `grim-graph`).
-- [x] Port `linear_into_named_dedup` verbatim. Byte-identical logits vs old path, `GRIM_DEDUP_QUANT` on AND off. Full `grim-models` suite. Commit. (COMPLETE: committed `d5a18eec`).
+- [ ] Failing test: two linears over the SAME input → second skips `grim_quantize_q8_1` (toy-graph census, pattern `decode_speed_bench.rs`). (PARTIAL: toy test in `grim-graph` passes, but premature flag mutation bypassed real device quantize).
+- [ ] Port `linear_into_named_dedup` verbatim. Byte-identical logits vs old path, `GRIM_DEDUP_QUANT` on AND off. Full `grim-models` suite. Commit. (OPEN: device launch stays hand-written; needs generic operand redesign).
 
 ### Task 5B.3: `emit_rope` — YaRN-unrepresentable
 **Files:** Create `grim-graph/src/rope.rs`.
@@ -293,19 +293,24 @@
 
 ### Task 5B.4: Migrate llama (smallest family, known bugs as the gate)
 **Files:** `crates/grim-models/transformer/src/block.rs` / `decode_graph.rs` emission paths ONLY.
-- [x] Baseline FIRST: llama PPL + launch census → `/tmp/llama_pre_builder.json`. (COMPLETE: recorded).
-- [x] PM-3 closure written as an assertion: llama graphs must contain 0 `sigmoid_mul` nodes. Swapped emission to builder calls → PASS. (COMPLETE: committed `3f2bd179` and `cc98ba54`).
-- [x] Gates: census node-for-node equal EXCEPT removed gate nodes; `llama_q41_task_graph.rs` green (0 cols over 10% of scale, max diff ~1e-6). Commit. (COMPLETE: committed `cc98ba54`).
+- [ ] Baseline FIRST: llama PPL + launch census → `/tmp/llama_pre_builder.json`. (PARTIAL: recorded, but emission is recording-only dummy).
+- [ ] PM-3 closure written as an assertion: llama graphs must contain 0 `sigmoid_mul` nodes. Swapped emission to builder calls → PASS. (PARTIAL: assertion green, but builder scaffolding is recording-only).
+- [ ] Gates: census node-for-node equal EXCEPT removed gate nodes; `llama_q41_task_graph.rs` green (0 cols over 10% of scale, max diff ~1e-6). Commit. (PARTIAL: passes via hand-written launches. Harmless dummy emit_linear_dedup calls at :659-688 left in place to be absorbed by grim-graph redesign).
 
 ### Task 5B.5: Migrate qwen35 decode graph (the prize)
 **Files:** `decode_graph.rs` emission regions ONLY. Placement / KDA wiring / routing policy STAY in `qwen35.rs`.
 - [ ] Baseline: structural task graph verified (37 nodes identical).
 - [ ] Migrate ONE block kind per commit:
-  - Attention blocks: norm + QKV linears migrated to `grim_graph::emit_norm` / `emit_linear_dedup` (committed `23ee8bb8`).
-  - KDA recurrent blocks: projections migrated to `grim_graph::emit_linear_dedup` (committed `78d8ccbb`).
-  - FFN blocks: FFN norm and gate/up projections migrated to `grim_graph::emit_norm` / `emit_linear_dedup` (committed `41adc323`).
-- [ ] Final step (mandatory, anti-stall): DELETE the superseded emission code (expect −2-4k lines). Full suites: `cargo test -p grim-cli` (bin tests), backend-rocm GPU-gated, grim-server integration.
-- [ ] Gates: census node-for-node equal (37 nodes), two-card split model replay green (committed `9a97ff23`), `qwen35_graph_capture` suite 13/13 passed. **ON FAILURE at any sub-step:** the block kind reverts to the old path; report. Do not leave a half-migrated kind committed.
+  - Attention blocks: reverted premature flag mutation (`dd69837a`); awaiting grim-graph redesign.
+  - KDA recurrent blocks: reverted premature flag mutation (`dd69837a`); awaiting grim-graph redesign.
+  - FFN blocks: reverted premature flag mutation (`dd69837a`); awaiting grim-graph redesign.
+- [ ] Final step (mandatory, anti-stall): DELETE the superseded emission code (expect −2-4k lines scoped to emission regions). Full suites: `cargo test -p grim-cli` (bin tests), backend-rocm GPU-gated, grim-server integration.
+- [ ] Gates:
+  - IR census node-for-node equal (37 nodes): catches IR topology drift / missing graph nodes.
+  - Real-launch census gate (`quant_census_repro.rs`): catches skipped `grim_quantize_q8_1` / kernel launches on GPU.
+  - Two-card split model replay green (committed `9a97ff23`).
+  - `qwen35_graph_capture` suite 13/13 passed.
+  **ON FAILURE at any sub-step:** the block kind reverts to the old path; report. Do not leave a half-migrated kind committed.
 
 ---
 

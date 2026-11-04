@@ -31,7 +31,6 @@
 use grim_backend_rocm::{RocmDevice, kernel_route_snapshot};
 use grim_quant::tree_pie::{TREE_PIE_WORDS_PER_32, pack_tree_pie, unpack_tree_pie};
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
-use std::panic;
 use std::time::Instant;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -40,7 +39,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 const HIDDEN: usize = 512;

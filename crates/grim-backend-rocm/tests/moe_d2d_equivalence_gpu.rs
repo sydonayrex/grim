@@ -16,7 +16,6 @@
 //! assert numeric match AND arm identity separately (C2 split: D2D vs host
 //! MoE dispatch conflated under "forward matches").
 
-use std::panic;
 
 use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::RocmDevice;
@@ -35,7 +34,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 // ── deterministic synthetic MoE (same generators as golden_charon_moe_gpu) ──

@@ -39,6 +39,11 @@ pub fn compute_kernel_source() -> String {
     // feature-gated: the Q2_0 forward is unconditional, and gating only the
     // backward would reproduce the half-wired state this kernel fixes.
     s.push_str(crate::kernels::q2_0_gemm::KERNEL_SOURCE);
+    // Prism/Bonsai FWHT-1024 Hadamard (port of PrismML fwht.cu). Rides in the
+    // same aggregate translation unit — without this append hipModuleGetFunction
+    // fails with error 500 on first use. Reuses `fp16_to_float_device` from
+    // shared_device_fns (pushed first), so it must stay after that push.
+    s.push_str(crate::kernels::fwht::KERNEL_SOURCE);
     // TreePie (WS-A): 5.0 bpw decode + M=1 GEMV. After dot_gemv -- reuses
     // grim_fdot2_f32_f16 from it.
     s.push_str(crate::kernels::tree_pie::KERNEL_SOURCE);
@@ -200,6 +205,9 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_dequant_q8_0"));
         // GRAVE Phase 4 fused GDN-2 kernel lives in gla_kernels.
         assert!(src.contains("grim_gla_state_update_output"));
+        // Prism/Bonsai FWHT-1024 kernels live in kernels::fwht.
+        assert!(src.contains("grim_fwht_smem_f32"));
+        assert!(src.contains("grim_fwht_block_f32"));
     }
 
     #[test]

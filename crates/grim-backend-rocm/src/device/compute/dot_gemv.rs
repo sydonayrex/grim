@@ -2041,6 +2041,32 @@ impl RocmDevice {
         )
     }
 
+    /// Task 2.2+ A/B: v8 — v7 with the B (DRAM) loads issued before the
+    /// A row is touched, so the 8 DRAM-bound B requests are in flight
+    /// while the branchy fp16->f32 A-scale conversion runs (in v2/v7 the
+    /// compiler emits the conversion before the B loads and the final
+    /// wait retires ~60 instructions late). Bit-exact vs v2/v7 — same
+    /// decode, same arithmetic order, same per-lane superblock walk.
+    pub fn launch_dot4_iq4xs_q81_gemv_v8_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq4xs_q81_gemv_sub_v8",
+        )
+    }
+
     /// Task 2.2 A/B: v7 — v2 with the IQ4_XS nibble decode done word-wide
     /// (one v_perm_b32 pair per 32-bit word instead of per byte). Bit-exact
     /// vs v2; cuts the decode block that keeps DRAM idle.

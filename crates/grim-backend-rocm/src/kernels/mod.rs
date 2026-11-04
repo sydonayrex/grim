@@ -27,6 +27,8 @@ pub mod device_sampler;
 pub mod dot_gemv;
 pub mod extend_attention;
 pub mod flash_decode;
+/// Prism/Bonsai FWHT-1024 (Hadamard) HIP kernels — port of PrismML fwht.cu.
+pub mod fwht;
 pub mod fp8_standalone;
 pub mod fused_dequant_gemm;
 pub mod fused_linear_ce;

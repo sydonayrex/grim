@@ -3,7 +3,6 @@
 //! Verifies that un-rotating a key tensor from position p_old and re-rotating
 //! it to p_new on ROCm GPU yields numerical identity with computing RoPE directly at p_new.
 
-use std::panic;
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::DType;
@@ -14,8 +13,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 #[test]

@@ -21,7 +21,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !gpu_test_enabled() {
         return None;
     }
-    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// Xing4.0-shaped config: NeoX half-split pairing, rotary_dim == dim,

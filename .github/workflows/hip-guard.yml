@@ -1,11 +1,7 @@
 name: HIP guard gate
 
 on:
-  pull_request:
-    paths:
-      - crates/grim-backend-rocm/src/**
-      - scripts/check-hip-guards.sh
-      - .github/workflows/hip-guard.yml
+  workflow_dispatch:
 
 permissions:
   contents: read

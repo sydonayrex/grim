@@ -13,7 +13,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// Deterministic synthetic weight/activation filler.

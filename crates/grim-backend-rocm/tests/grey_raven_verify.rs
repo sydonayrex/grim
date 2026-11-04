@@ -27,7 +27,6 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{ArithType, DType, MemoryOps, Shape, Storage};
-use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -35,7 +34,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 fn up(dev: &RocmDevice, bytes: &[u8]) -> TestResult<Box<dyn grim_tensor::BackendStorage>> {

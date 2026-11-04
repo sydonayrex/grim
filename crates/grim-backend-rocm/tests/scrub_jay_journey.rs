@@ -28,7 +28,6 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::scrub_jay::{SCRUB_JAY_BLOCK, quantize_block};
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
-use std::panic;
 use std::time::Instant;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -37,7 +36,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 struct Lcg(u64);

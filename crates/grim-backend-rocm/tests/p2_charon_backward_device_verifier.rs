@@ -21,7 +21,6 @@
 //! computation of the same math. Device-vs-host agreement at this
 //! tolerance proves the HIP kernel executes the decomposition correctly.
 
-use std::panic;
 
 use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::RocmDevice;
@@ -41,8 +40,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 // ---------------------------------------------------------------------------

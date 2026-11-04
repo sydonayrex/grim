@@ -21,7 +21,6 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{CoreTensorOps, DType, Shape};
-use std::panic;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
@@ -33,8 +32,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// CPU reference for the crate matmul contract: A is [m x k], B is the

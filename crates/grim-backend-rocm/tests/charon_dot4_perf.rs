@@ -14,14 +14,13 @@ use grim_backend_rocm::autotune::{AutotuneConfig, Autotuner, MoeKernelKey};
 use grim_backend_rocm::kernels::charon::{
     CharonDot4Quant, RoutingAssignment, dot4_supported, grouped_dot4_entry,
 };
-use std::panic;
 use std::time::Instant;
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 fn quant_q80(w: &[f32]) -> Vec<u8> {

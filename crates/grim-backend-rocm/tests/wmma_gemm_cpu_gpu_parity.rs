@@ -19,7 +19,6 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{CoreTensorOps, DType, Shape};
-use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -28,7 +27,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// Round an f32 value through f16 to simulate GPU storage precision.

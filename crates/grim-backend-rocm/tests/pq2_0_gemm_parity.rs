@@ -8,7 +8,6 @@
 
 use grim_backend_rocm::device::roc_device::RocmDevice;
 use grim_tensor::{CoreTensorOps, DType, Shape};
-use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -16,7 +15,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// Pack one PQ2_0 block: `[f16 delta LE][32 bytes, 4 codes each]`.

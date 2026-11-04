@@ -17,15 +17,13 @@ use grim_quant::quant_q4k;
 use grim_tensor::{
     ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage,
 };
-use std::panic;
 
 /// Build a RocmDevice if the GPU test environment is enabled.
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 /// Compute max absolute difference between two float slices.

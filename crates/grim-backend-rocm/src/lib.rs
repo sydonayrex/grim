@@ -146,6 +146,9 @@ pub use crate::device::layout::{
 
 pub use crate::device::gemm_tuning::{GemmTileConfig, lookup_gemm_config, lookup_solution_index};
 
+// Prism/Bonsai FWHT-1024 Hadamard transform (Task 4 consumes this path).
+pub use crate::device::hadamard_launch::launch_fwht_signed;
+
 pub use crate::graph_capture::{CapturedGraph, HipGraphExecutor, hip_graph_launch};
 
 pub use crate::gptq_kernel::wavefront_size_for_gcn;
@@ -172,8 +175,9 @@ pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
 
 pub use crate::device::util::{
     DeviceGuard, ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size,
-    dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch,
-    prefill_in_flight, raw_set_device, set_prefill_in_flight, warp_rows_launch,
+    dtype_f32, gpu_require_enabled, gpu_target_arch, gpu_target_flag, gpu_test_enabled,
+    gpu_test_lock, linear_launch, prefill_in_flight, raw_set_device, require_gpu_device,
+    set_prefill_in_flight, warp_rows_launch,
 };
 pub use crate::peer_access::{enable_peer_access, enumerate_devices, p2p_memcpy_async};
 

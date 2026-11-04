@@ -16,7 +16,6 @@ use grim_tensor::{
     CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape,
     dtype::{ArithType, Storage},
 };
-use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -24,7 +23,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
+    grim_backend_rocm::require_gpu_device()
 }
 
 fn f16_to_f32(b0: u8, b1: u8) -> f32 {

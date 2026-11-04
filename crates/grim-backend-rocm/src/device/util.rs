@@ -214,6 +214,48 @@ pub fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Fail-loud gate for tests that opt into the GPU tier explicitly.
+///
+/// Consumer-ROCm local-run contract (no automatic GPU CI): `GRIM_GPU_TEST=1`
+/// enables the tier, but in its default form a missing GPU is a *silent*
+/// skip (`gpu_device() -> None` → `return Ok(())`). This is how a broken
+/// HIP layer passes vacuously. Setting `GRIM_REQUIRE_GPU=1` (always used
+/// together with `--ignored`) makes device acquisition **panicking**: the
+/// test goes red instead of green when the tier was explicitly requested
+/// but no GPU answers.
+///
+/// Usage in the common `gpu_device()` shape:
+///
+/// ```text
+/// fn gpu_device() -> Option<RocmDevice> {
+///     if !grim_backend_rocm::device::util::gpu_test_enabled() { return None; }
+///     grim_backend_rocm::device::util::require_gpu_device()
+/// }
+/// ```
+pub fn require_gpu_device() -> Option<crate::RocmDevice> {
+    if !gpu_test_enabled() {
+        return None;
+    }
+    let dev = std::panic::catch_unwind(|| crate::RocmDevice::try_new(0)).ok().and_then(|r| r.ok());
+    if dev.is_none() && gpu_require_enabled() {
+        panic!(
+            "GRIM_REQUIRE_GPU=1: GPU test tier explicitly requested but RocmDevice::try_new(0) failed — \
+             is a GPU present, is hipcc correct, does --offload-arch match gcnArchName?"
+        );
+    }
+    dev
+}
+
+/// Whether the GPU tier was explicitly required (local manual run). Defaults
+/// to false; defaults to silent skip so CPU-only `cargo test` (the only CI
+/// mode in this consumer-ROCm project — see `.github/workflows/`) stays
+/// green without a GPU.
+pub fn gpu_require_enabled() -> bool {
+    std::env::var("GRIM_REQUIRE_GPU")
+        .map(|val| val == "1" || val.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// RAII guard that switches the calling thread to `ordinal` and restores the previous current device on drop.
 /// Probes that call `hipSetDevice` on multi-GPU boxes must use this: leaving the thread on a.
 pub struct DeviceGuard {
