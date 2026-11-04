@@ -205,7 +205,10 @@ fn prism_formats_map_to_unsupported_storage_not_a_wrong_kquant_scheme() {
     use grim_format::gguf::{GgufDType, map_gguf_dtype_to_storage};
     use grim_tensor::dtype::Storage;
 
-    for (dt, name) in [(GgufDType::PQ2_0, "PQ2_0"), (GgufDType::PTQ1_0, "PTQ1_0")] {
+    // PQ2_0 left the unsupported set (Task 10.5): it maps to
+    // Block(BlockDtype::Pq2_0) with a device GEMV + host decoder — see
+    // grim-format's prism_unsupported_format_test for the updated contract.
+    for (dt, name) in [(GgufDType::PTQ1_0, "PTQ1_0")] {
         let dtype = map_gguf_dtype_to_storage(dt);
         match &dtype.storage {
             Storage::Unsupported(f) => {
@@ -219,13 +222,17 @@ fn prism_formats_map_to_unsupported_storage_not_a_wrong_kquant_scheme() {
             }
             other => panic!("{name} must not map to a usable storage: {other:?}"),
         }
+        // PQ2_0 now maps to a real block dtype — pin it here so the mapping
+        // cannot silently regress to Unsupported.
+        let pq2 = map_gguf_dtype_to_storage(GgufDType::PQ2_0);
+        assert!(matches!(
+            pq2.storage,
+            Storage::Block(grim_tensor::dtype::BlockDtype::Pq2_0)
+        ), "PQ2_0 must map to Block(Pq2_0), got {pq2:?}");
         // Geometry must still be right so size accounting is exact.
         assert_eq!(dt.block_size(), 128);
-        assert_eq!(
-            dt.type_size_per_block(),
-            if name == "PQ2_0" { 34 } else { 28 }
-        );
-        assert_eq!(dt.tag(), if name == "PQ2_0" { 142 } else { 143 });
+        assert_eq!(dt.type_size_per_block(), 28);
+        assert_eq!(dt.tag(), 143);
     }
 
     // Upstream Q2_0 at tag 42 must remain the *supported* group-64 codec.
