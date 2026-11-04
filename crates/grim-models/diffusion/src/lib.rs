@@ -7,12 +7,14 @@
 
 pub mod flow_match;
 pub mod flux2;
+pub mod lora;
 pub mod scheduler;
 pub mod unet;
 pub mod vae;
 
 pub use flow_match::{FlowMatchEulerConfig, FlowMatchEulerScheduler};
 pub use flux2::{Flux2Config, Flux2Transformer2D};
+pub use lora::{DiffusionLoraAdapter, LoraModule};
 pub use scheduler::{DdimScheduler, EulerScheduler};
 pub use unet::{Unet2D, UnetConfig};
 pub use vae::{Flux2VAE, Flux2VaeConfig};

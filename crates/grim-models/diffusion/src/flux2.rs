@@ -56,24 +56,24 @@ impl ModelConfig for Flux2Config {
 }
 
 /// Double-Stream Joint Attention Block for Flux 2.
-struct FluxJointBlock {
-    img_norm1: RmsNorm,
-    img_qkv: Linear,
-    img_proj: Linear,
-    img_norm2: RmsNorm,
-    img_mlp1: Linear,
-    img_mlp2: Linear,
+pub struct FluxJointBlock {
+    pub img_norm1: RmsNorm,
+    pub img_qkv: Linear,
+    pub img_proj: Linear,
+    pub img_norm2: RmsNorm,
+    pub img_mlp1: Linear,
+    pub img_mlp2: Linear,
 
-    txt_norm1: RmsNorm,
-    txt_qkv: Linear,
-    txt_proj: Linear,
-    txt_norm2: RmsNorm,
-    txt_mlp1: Linear,
-    txt_mlp2: Linear,
+    pub txt_norm1: RmsNorm,
+    pub txt_qkv: Linear,
+    pub txt_proj: Linear,
+    pub txt_norm2: RmsNorm,
+    pub txt_mlp1: Linear,
+    pub txt_mlp2: Linear,
 
-    heads: usize,
-    head_dim: usize,
-    hidden_dim: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
 }
 
 impl FluxJointBlock {
@@ -129,11 +129,31 @@ impl FluxJointBlock {
     }
 
     fn forward(&self, img: &Tensor, txt: &Tensor, _mod_emb: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.forward_with_lora(img, txt, _mod_emb, &[])
+    }
+
+    fn forward_with_lora(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        _mod_emb: &Tensor,
+        loras: &[(&str, &crate::lora::LoraModule)],
+    ) -> Result<(Tensor, Tensor)> {
         let img_n = self.img_norm1.forward(img)?;
         let txt_n = self.txt_norm1.forward(txt)?;
 
-        let img_qkv = self.img_qkv.forward(&img_n)?;
-        let txt_qkv = self.txt_qkv.forward(&txt_n)?;
+        let mut img_qkv = self.img_qkv.forward(&img_n)?;
+        let mut txt_qkv = self.txt_qkv.forward(&txt_n)?;
+
+        for (name, module) in loras {
+            if *name == "img_attn.qkv" {
+                let delta = module.forward(&img_n)?;
+                img_qkv = grim_nn::modules::add_on_device(&img_qkv, &delta)?;
+            } else if *name == "txt_attn.qkv" {
+                let delta = module.forward(&txt_n)?;
+                txt_qkv = grim_nn::modules::add_on_device(&txt_qkv, &delta)?;
+            }
+        }
 
         let img_seq = img.shape().dims()[0];
         let txt_seq = txt.shape().dims()[0];
@@ -214,8 +234,18 @@ impl FluxJointBlock {
         let txt_attn = cpu_tensor(txt_attn_vec, Shape::new(vec![txt_seq, d]));
         let img_attn = cpu_tensor(img_attn_vec, Shape::new(vec![img_seq, d]));
 
-        let txt_proj = self.txt_proj.forward(&txt_attn)?;
-        let img_proj = self.img_proj.forward(&img_attn)?;
+        let mut txt_proj = self.txt_proj.forward(&txt_attn)?;
+        let mut img_proj = self.img_proj.forward(&img_attn)?;
+
+        for (name, module) in loras {
+            if *name == "txt_attn.proj" {
+                let delta = module.forward(&txt_attn)?;
+                txt_proj = grim_nn::modules::add_on_device(&txt_proj, &delta)?;
+            } else if *name == "img_attn.proj" {
+                let delta = module.forward(&img_attn)?;
+                img_proj = grim_nn::modules::add_on_device(&img_proj, &delta)?;
+            }
+        }
 
         // Residual 1
         let txt_v = txt.to_vec_f32()?;
@@ -278,15 +308,15 @@ impl FluxJointBlock {
 }
 
 /// Single-Stream Unified Attention Block for Flux 2.
-struct FluxSingleBlock {
-    norm: RmsNorm,
-    qkv: Linear,
-    proj: Linear,
-    mlp1: Linear,
-    mlp2: Linear,
-    heads: usize,
-    head_dim: usize,
-    hidden_dim: usize,
+pub struct FluxSingleBlock {
+    pub norm: RmsNorm,
+    pub qkv: Linear,
+    pub proj: Linear,
+    pub mlp1: Linear,
+    pub mlp2: Linear,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
 }
 
 impl FluxSingleBlock {
@@ -429,18 +459,19 @@ pub struct Flux2Transformer2D {
     pub config: Flux2Config,
     pub device: Device,
     pub scheduler: crate::flow_match::FlowMatchEulerScheduler,
-    img_in_proj: Linear,
-    txt_in_proj: Linear,
-    time_embed: Linear,
-    joint_blocks: Vec<FluxJointBlock>,
-    single_blocks: Vec<FluxSingleBlock>,
-    out_proj: Linear,
+    pub lora_adapters: Vec<crate::lora::DiffusionLoraAdapter>,
+    pub img_in_proj: Linear,
+    pub txt_in_proj: Linear,
+    pub time_embed: Linear,
+    pub joint_blocks: Vec<FluxJointBlock>,
+    pub single_blocks: Vec<FluxSingleBlock>,
+    pub out_proj: Linear,
 }
 
 impl Flux2Transformer2D {
-    /// Instantiate a randomly initialized Flux 2 MM-DiT model for testing/generation.
-    pub fn random(device: Device, config: Flux2Config) -> Self {
-        let mut rng = SimpleRng::new(5555);
+    /// Instantiate a Flux 2 MM-DiT model with a given seed.
+    pub fn new_with_seed(device: Device, config: Flux2Config, seed: u64) -> Self {
+        let mut rng = SimpleRng::new(seed);
         let hidden_dim = config.num_attention_heads * config.attention_head_dim;
 
         let img_in_proj = make_rand_linear(config.in_channels, hidden_dim, &mut rng);
@@ -480,6 +511,7 @@ impl Flux2Transformer2D {
             config,
             device,
             scheduler,
+            lora_adapters: Vec::new(),
             img_in_proj,
             txt_in_proj,
             time_embed,
@@ -487,6 +519,11 @@ impl Flux2Transformer2D {
             single_blocks,
             out_proj,
         }
+    }
+
+    /// Instantiate a randomly initialized Flux 2 MM-DiT model for testing/generation.
+    pub fn random(device: Device, config: Flux2Config) -> Self {
+        Self::new_with_seed(device, config, 5555)
     }
 
     /// Predict noise velocity field $v_\theta(x_t, t, c)$ for input packed latents and text context.
@@ -515,8 +552,22 @@ impl Flux2Transformer2D {
         let mod_emb = self.time_embed.forward(&time_t)?;
 
         // 1. Double-Stream Joint Attention Blocks
-        for block in &self.joint_blocks {
-            let (next_img, next_txt) = block.forward(&img_h, &txt_h, &mod_emb)?;
+        for (i, block) in self.joint_blocks.iter().enumerate() {
+            let prefix = format!("joint_blocks.{i}.");
+            let mut active_loras = Vec::new();
+            for adapter in &self.lora_adapters {
+                for (name, module) in &adapter.modules {
+                    if let Some(rest) = name.strip_prefix(&prefix) {
+                        active_loras.push((rest, module));
+                    }
+                }
+            }
+
+            let (next_img, next_txt) = if active_loras.is_empty() {
+                block.forward(&img_h, &txt_h, &mod_emb)?
+            } else {
+                block.forward_with_lora(&img_h, &txt_h, &mod_emb, &active_loras)?
+            };
             img_h = next_img;
             txt_h = next_txt;
         }
