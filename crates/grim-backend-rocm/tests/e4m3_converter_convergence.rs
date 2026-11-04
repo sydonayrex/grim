@@ -7,7 +7,7 @@
 //! | site | rounding | status |
 //! |---|---|---|
 //! | `dot_gemv.rs::grim_f32_to_fp8_e4m3` (ROCm device) | RNE | reference |
-//! | `precision_kernel_ab/e4m3.rs::to_e4m3_rne` (A/B oracle) | RNE | reference |
+//! | `benches/precision_kernel_ab/e4m3.rs::to_e4m3_rne` (A/B oracle) | RNE | reference |
 //! | `grim-quant::f32_to_fp8_e4m3` (host API) | ~~truncate~~ -> RNE | fixed |
 //! | CUDA `kernels/source.rs` mirror | ~~truncate~~ -> RNE | fixed |
 //! | `quant_standalone.rs` | half-up | **still divergent** |
@@ -31,7 +31,7 @@ use grim_quant::f32_to_fp8_e4m3;
 
 /// The A/B's device-faithful oracle, re-derived here rather than imported.
 ///
-/// `precision_kernel_ab/e4m3.rs` is a private module of an integration test and
+/// `benches/precision_kernel_ab/e4m3.rs` is a private module of an integration test and
 /// is not reachable from another test binary, so the RNE rule is restated here
 /// from the format definition. If the two ever disagree, the bias test below is
 /// what notices.
@@ -195,7 +195,7 @@ fn every_grid_point_and_every_midpoint_agree() {
 #[test]
 fn the_device_and_cuda_sources_still_implement_rne() {
     // The A/B's own oracle, which the device kernel is measured against.
-    let ab_source = include_str!("precision_kernel_ab/e4m3.rs");
+    let ab_source = include_str!("../benches/precision_kernel_ab/e4m3.rs");
     assert!(
         ab_source.contains("rne") || ab_source.contains("RNE") || ab_source.contains("to_e2m"),
         "the A/B oracle should still name its rounding rule"

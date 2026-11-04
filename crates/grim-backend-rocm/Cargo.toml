@@ -136,6 +136,130 @@ q6k = []
 # iq = []
 # q8_0 = []
 
+# ── benches/ (was tests/) ───────────────────────────────────────────────
+# Timing/probe files moved out of tests/: they are `#[test]`-based probes,
+# not criterion benches, so `harness = true` makes libtest run them as
+# bench targets and they stay out of `cargo test`'s default run.
+# Excluded on purpose: tests/autotune.rs + tests/perf_gate.rs (pure CPU logic,
+# stay in tests/), tests/q4k_dequant_diag.rs + tests/q8_0_diag.rs (genuine
+# CPU-oracle parity checks, stay in tests/).
+
+[[bench]]
+name = "big64x128_debug"
+harness = true
+
+[[bench]]
+name = "big_k56_parity_bench"
+harness = true
+
+[[bench]]
+name = "big_q4k_probe"
+harness = true
+
+[[bench]]
+name = "charon_dot4_perf"
+harness = true
+
+[[bench]]
+name = "dot4_gemv_floor_probe"
+harness = true
+
+[[bench]]
+name = "dot4_q4k_arch_probe"
+harness = true
+
+[[bench]]
+name = "dot4_q4k_debug"
+harness = true
+
+[[bench]]
+name = "dot4_q4k_dmmv_ab"
+harness = true
+
+[[bench]]
+name = "forest_dispatch_bench"
+harness = true
+
+[[bench]]
+name = "grey_raven_dispatch_bench"
+harness = true
+
+[[bench]]
+name = "iq_lds_codebook_ab"
+harness = true
+
+[[bench]]
+name = "kda_scan_bench"
+harness = true
+
+[[bench]]
+name = "kv_dequant_perf"
+harness = true
+
+[[bench]]
+name = "m1_decode_regime_probe"
+harness = true
+
+[[bench]]
+name = "paged_whitecrow_bench"
+harness = true
+
+[[bench]]
+name = "phase5_dispatch_ab"
+harness = true
+
+[[bench]]
+name = "precision_kernel_ab"
+harness = true
+
+[[bench]]
+name = "qkv_blob_m_probe"
+harness = true
+
+[[bench]]
+name = "rdna4_rho_microbench"
+harness = true
+
+[[bench]]
+name = "rocblas_f16_gemm_bench"
+harness = true
+
+[[bench]]
+name = "w4a16_dequant_service_probe"
+harness = true
+
+[[bench]]
+name = "wave_arm_candidates_ab"
+harness = true
+
+[[bench]]
+name = "wave_parallelism_ab"
+harness = true
+
+[[bench]]
+name = "wave_small_op_ab"
+harness = true
+
+[[bench]]
+name = "wave_staged_ab"
+harness = true
+
+[[bench]]
+name = "whitecrow_dispatch_bench"
+harness = true
+
+[[bench]]
+name = "whiteraven_dispatch_bench"
+harness = true
+
+[[bench]]
+name = "wmma_i8_probe"
+harness = true
+
+[[bench]]
+name = "wmma_q4k_shape_bench"
+harness = true
+
 [[test]]
 name = "gptq_gemm_gpu_parity"
 required-features = ["gpu-test-shims"]
