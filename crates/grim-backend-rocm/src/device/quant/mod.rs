@@ -437,6 +437,36 @@ impl QuantOps for RocmDevice {
                     return self.matmul(a, b_packed, out_shape);
                 }
             }
+            DTypeStorage::Block(BlockDtype::Pq2_0) => {
+                // Task 10.5: Prism PQ2_0 (tag 142, Ternary-2) x Q8_0 GEMV —
+                // geometry clone of the Q2_0 arm at 128-weight blocks. Same
+                // wave32 requirement, same q8_0 activation quantize, K must
+                // be 128-aligned.
+                if wave32 && k % 128 == 0 && !Self::is_fp16_activation(a_storage) {
+                    let q80_bytes = (k / 32) * 34 * m;
+                    let mut buf_guard = self.act_q80_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q80_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &Shape::new(vec![q80_bytes]),
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let act_q80 = buf_guard.as_ref().unwrap();
+                    let _ = self.launch_quant_q8_0(a_storage, act_q80, m * k)?;
+                    self.launch_dot4_pq2_0_q80_gemv(act_q80, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    return self.matmul(a, b_packed, out_shape);
+                }
+            }
             DTypeStorage::KQuant(KQuantScheme::Q6K) => {
                 let is_rdna34 = self.is_rdna34;
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags

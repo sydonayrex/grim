@@ -129,6 +129,98 @@ extern "C" __global__ void grim_dot4_q2_0_q80_gemv(
     }
 }
 
+// Prism PQ2_0 (GGUF tag 142, Ternary-2): 34-byte blocks of [f16 delta][32
+// packed 2-bit codes], 128 weights per block, codebook {-1, 0, +1, +2} —
+// the SAME (q - 1) * d law as the Q2_0 arm above, at double block size.
+// Task 10.5: geometry clone of grim_dot4_q2_0_q80_gemv (no new design).
+// ONE PQ2_0 block of 128 weights maps to FOUR Q8_0 blocks of 32; a 128-wide
+// block accumulates to at most 2*127*128 = 32512, still inside int32.
+#define GRIM_PQ2_0_BLOCK_SIZE 128
+#define GRIM_PQ2_0_BYTES      34
+
+extern "C" __global__ void grim_dot4_pq2_0_q80_gemv(
+    const unsigned char* __restrict__ A_q80,
+    const unsigned char* __restrict__ B_pq2_0,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_x_blocks = K / GRIM_PQ2_0_BLOCK_SIZE;  // 128-weight weight blocks
+    const int n_y_blocks = K / GRIM_Q8_0_BLOCK_SIZE;   // 32-weight activation blocks
+
+    const unsigned char* a_row =
+        A_q80 + (long long)row * n_y_blocks * GRIM_Q8_0_BYTES;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const unsigned char* b_col[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_pq2_0 + (long long)(col_base + j) * n_x_blocks * GRIM_PQ2_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_x_blocks; blk += 32) {
+        // The FOUR Q8_0 activation blocks that pair with this PQ2_0 block.
+        const unsigned char* a_blk0 = a_row + (long long)(blk * 4)       * GRIM_Q8_0_BYTES;
+        const unsigned char* a_blk1 = a_row + (long long)(blk * 4 + 1)   * GRIM_Q8_0_BYTES;
+        const unsigned char* a_blk2 = a_row + (long long)(blk * 4 + 2)   * GRIM_Q8_0_BYTES;
+        const unsigned char* a_blk3 = a_row + (long long)(blk * 4 + 3)   * GRIM_Q8_0_BYTES;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_PQ2_0_BYTES;
+            float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const unsigned char* qs = b_blk + 2;   // 32 bytes = 128 two-bit codes
+
+            float sumi = 0.0f;
+            #pragma unroll
+            for (int half = 0; half < 4; half++) {
+                const unsigned char* a_blk = half == 0 ? a_blk0
+                                           : half == 1 ? a_blk1
+                                           : half == 2 ? a_blk2 : a_blk3;
+                float d1 = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                const signed char* qy = (const signed char*)(a_blk + 2);
+
+                int sumi_block = 0;
+                const unsigned char* qs_h = qs + half * 8;   // 8 bytes = 32 codes
+                for (int b = 0; b < 8; ++b) {
+                    const unsigned char byte = qs_h[b];
+                    // Same unpack as Q2_0: four 2-bit codes -> {-1,0,+1,+2}.
+                    sumi_block += ((int)((byte >> 0) & 3) - 1) * (int)qy[b*4 + 0];
+                    sumi_block += ((int)((byte >> 2) & 3) - 1) * (int)qy[b*4 + 1];
+                    sumi_block += ((int)((byte >> 4) & 3) - 1) * (int)qy[b*4 + 2];
+                    sumi_block += ((int)((byte >> 6) & 3) - 1) * (int)qy[b*4 + 3];
+                }
+                sumi += d1 * (float)sumi_block;
+            }
+            facc[j] += d0 * sumi;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 // PLAN-kernel-launch-reduction Phase B: QKV GEMV — one launch covers the three
 // projections (each col-base 4-group lies wholly inside one section, since the
 // launcher requires Nq % 4 == 0 and Nkv % 4 == 0). Same math as

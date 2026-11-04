@@ -3045,6 +3045,11 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::BlockDtype::Fp8Block16 => {
                     grim_quant::dequant_fp8_block16(raw, n)
                 }
+                // Prism PQ2_0: flat 128-weight blocks — the flat entry point
+                // has exactly the geometry the decoder needs.
+                grim_tensor::dtype::BlockDtype::Pq2_0 => {
+                    grim_quant::dequant_pq2_0(raw, n)
+                }
             },
             Storage::ResidualPacked(_) => Err(Error::Unimplemented(
                 "to_cpu_vec_f32: ResidualPacked dequant not supported".into(),

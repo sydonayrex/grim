@@ -1035,6 +1035,9 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             // refuses while host decode serves.
             BlockDtype::Fp8Sparse24 => grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, n)
                 .map_err(|e| Error::Unimplemented(e.to_string())),
+            // Prism PQ2_0: flat 128-weight blocks decode with the flat count.
+            BlockDtype::Pq2_0 => grim_quant::dequant_pq2_0(&raw.bytes, n)
+                .map_err(|e| Error::Unimplemented(e.to_string())),
         },
         Storage::ResidualPacked(_) => Err(Error::Unimplemented(
             "dequant_to_f32: ResidualPacked not yet supported".into(),

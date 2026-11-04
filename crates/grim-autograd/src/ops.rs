@@ -412,6 +412,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             BlockDtype::Int8PerChannel => 8,
             // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
             BlockDtype::Q4_0 | BlockDtype::Q4_1 => 4,
+            // Prism PQ2_0: 2-bit codes (34 B per 128 weights = 2.125 bpw).
+            BlockDtype::Pq2_0 => 2,
         },
         Storage::FloatPack(scheme) => match scheme {
             FloatPackScheme::Fp4 => 4,

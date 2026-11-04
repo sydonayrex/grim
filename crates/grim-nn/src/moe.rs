@@ -1516,6 +1516,8 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 BlockDtype::Int8PerChannel => 8,
                 // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
                 BlockDtype::Q4_0 | BlockDtype::Q4_1 => 4,
+                // Prism PQ2_0: 2-bit codes (34 B per 128 weights).
+                BlockDtype::Pq2_0 => 2,
             };
             (elem_count * bits).div_ceil(8)
         }

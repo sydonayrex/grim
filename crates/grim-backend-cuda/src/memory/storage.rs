@@ -149,6 +149,9 @@ pub(crate) fn cuda_dequant_quantized_storage(
             BlockDtype::Int8PerChannel => Err(Error::Unimplemented(
                 "ForestRaven INT8 has no CUDA kernel route yet (host decode via dequant_forest only)".to_string(),
             )),
+            BlockDtype::Pq2_0 => Err(Error::Unimplemented(
+                "Prism PQ2_0 has no CUDA kernel route yet (host decode via dequant_pq2_0 only)".to_string(),
+            )),
         },
         DTypeStorage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(
             "quantized_matmul_backward_dx: ResidualPacked (bpw {}) host dequant not implemented; \

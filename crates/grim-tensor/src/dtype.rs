@@ -198,6 +198,13 @@ pub enum BlockDtype {
     /// decode to finite, plausible, wrong weights -- so it gets its own tag
     /// (673), its own QuantFormat, and no silent conversion either way.
     Fp8Sparse24Hw,
+    /// Prism `PQ2_0` (GGUF tag 142, Ternary-2): 34-byte blocks of
+    /// `[f16 delta][32 packed 2-bit codes]`, one block per 128 weights,
+    /// `w = (q - 1) * delta` — the SAME code law as the legacy Q2_0 arm
+    /// above, at double block size (2.125 bpw). Served by the PQ2_0 dot4
+    /// GEMV (`grim_dot4_pq2_0_q80_gemv`), a geometry clone of the Q2_0
+    /// kernel; host decode via `grim_quant::dequant_pq2_0`.
+    Pq2_0,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -521,6 +528,8 @@ impl DType {
                 // GreyRaven-HW: 260 B per 512 weights, exact for whole tiles.
                 // Tails round up (over-allocates, never truncates).
                 BlockDtype::Fp8Sparse24Hw => elem_count.div_ceil(512) * 260,
+                // Prism PQ2_0: 34 B per 128 weights (f16 delta + 32 code bytes).
+                BlockDtype::Pq2_0 => elem_count.div_ceil(128) * 34,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
             Storage::Unsupported(f) => match (f.block_size, f.bytes_per_block) {
@@ -648,6 +657,9 @@ impl TryFrom<&Storage> for QuantFormat {
                 // and no canonical QuantFormat names them yet; refuse rather
                 // than report a format a decoder would not honour.
                 BlockDtype::Q4_0 | BlockDtype::Q4_1 => Err(()),
+                // PQ2_0 rides the GGUF dtype mapping (tag 142) directly, not a
+                // QuantFormat conversion; report the same refusal shape.
+                BlockDtype::Pq2_0 => Err(()),
             },
             Storage::W4A4OstQuant(_) => Ok(QuantFormat::W4A4OstQuant),
             Storage::W4A16(_) => Ok(QuantFormat::W4A16),

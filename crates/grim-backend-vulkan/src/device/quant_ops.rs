@@ -223,6 +223,9 @@ impl QuantOps for VulkanDevice {
                             "ForestRaven INT8 has no Vulkan kernel route yet (host decode via dequant_forest only)".into(),
                         ))
                     }
+                    BlockDtype::Pq2_0 => {
+                        grim_quant::dequant_pq2_0(&b_bytes_cpu, k * n)?
+                    }
                 })
             }
             Storage::CompressedTensorsW8A8Fp8 => {

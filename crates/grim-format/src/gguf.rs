@@ -2513,8 +2513,16 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel),
         },
-        GgufDType::PQ2_0
-        | GgufDType::PTQ1_0
+        // Task 10.5: Prism PQ2_0 (tag 142) has a device kernel —
+        // `grim_dot4_pq2_0_q80_gemv` (geometry clone of the Q2_0 dot4 arm at
+        // 128-weight blocks) and a host decoder (`grim_quant::dequant_pq2_0`).
+        // Served as a real block dtype so Bonsai-27B loads without a 108 GB
+        // f32 expansion. The other Prism tags stay refused.
+        GgufDType::PQ2_0 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Pq2_0),
+        },
+        GgufDType::PTQ1_0
         | GgufDType::TQ1_0
         | GgufDType::TQ2_0
         | GgufDType::Q1_0 => DType {

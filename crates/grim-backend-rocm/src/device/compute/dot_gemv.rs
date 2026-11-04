@@ -294,6 +294,57 @@ impl RocmDevice {
         )
     }
 
+    /// Launch the Prism PQ2_0 x Q8_0 dot4 GEMV (Task 10.5). Geometry clone of
+    /// the Q2_0 launcher: 128-weight weight blocks (34 B), 4 q8_0 blocks per
+    /// weight block. K must be 128-aligned; wave32 only (kernel lives in the
+    /// RDNA dot_gemv guard).
+    pub fn launch_dot4_pq2_0_q80_gemv(
+        &self,
+        act_q80: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_pq2_0_q80_gemv: K must be 128-aligned (k={k})"
+            )));
+        }
+        let a_ptr = act_q80.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_pq2_0_q80_gemv: act_q80 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_pq2_0_q80_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_pq2_0_q80_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_pq2_0_q80_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Down-projection activation-reuse experiment: consume a prequantized Q8.1 activation
     /// row and fuse the residual epilogue into the Q8.0 dot4 launch.
     pub fn launch_dot4_q80_q81_add_gemv(
