@@ -130,6 +130,44 @@ fn test_q81_launch_census_and_logits_parity_vs_dedup_disabled() {
         "FFN gate/up projections sharing input with dedup enabled must execute exactly 1 grim_quantize_q8_1 launch"
     );
 
+    // Arm 1c: KDA recurrent projections (kda.attn_qkv, kda.alpha, kda.beta, kda.attn_gate).
+    // All 4 projections share the same layer activation (q81_ready starts false and is set
+    // post-launch). Exactly 1 grim_quantize_q8_1 launch must run across all 4 projections.
+    let out_kda_1 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 1");
+    let out_kda_2 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 2");
+    let out_kda_3 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 3");
+    let out_kda_4 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 4");
+    let out_kda_1_rocm = as_rocm(out_kda_1.as_ref()).unwrap();
+    let out_kda_2_rocm = as_rocm(out_kda_2.as_ref()).unwrap();
+    let out_kda_3_rocm = as_rocm(out_kda_3.as_ref()).unwrap();
+    let out_kda_4_rocm = as_rocm(out_kda_4.as_ref()).unwrap();
+
+    let mut q81_kda_ready = false;
+    reset_kernel_route_counters();
+    for dst in [out_kda_1_rocm, out_kda_2_rocm, out_kda_3_rocm, out_kda_4_rocm] {
+        dev.linear_decode_into_prequant(
+            a_t.as_ref(),
+            w1_rocm,
+            dst,
+            scratch_rocm,
+            q81_kda_ready,
+            false,
+        ).expect("linear_decode_into_prequant kda");
+        q81_kda_ready = true; // Set strictly post-launch!
+    }
+    dev.synchronize();
+
+    let kda_routes = kernel_route_snapshot();
+    let kda_q81_launches = kda_routes
+        .iter()
+        .find(|(k, _)| k == "grim_quantize_q8_1")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    assert_eq!(
+        kda_q81_launches, 1,
+        "KDA 4-projection group sharing input with dedup enabled must execute exactly 1 grim_quantize_q8_1 launch"
+    );
+
     // Arm 2: GRIM_DEDUP_QUANT=0 forces prologue quantize on both projections
     let out1_ref_t = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc out1_ref");
     let out1_ref_rocm = as_rocm(out1_ref_t.as_ref()).unwrap();

@@ -1033,6 +1033,31 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
         &EXPECTED_37_BASELINE_OPS[..],
         "node opcode sequence must match the 37-node baseline node-for-node"
     );
+    // Pin GEMM nodes to (n, k) to guard against node swapping or parameter drift
+    const EXPECTED_GEMM_PARAMS: [(usize, u32, u32); 13] = [
+        (2, 0, 0),       // Layer 0 recurrent FFN GEMM (emitted at model loop via gemm_params)
+        (4, 512, 256),   // Layer 1 attn.q
+        (5, 128, 256),   // Layer 1 attn.k
+        (6, 128, 256),   // Layer 1 attn.v
+        (15, 256, 256),  // Layer 1 wo
+        (16, 256, 192),  // Layer 1 ffn_down
+        (19, 0, 0),      // Layer 2 recurrent FFN GEMM
+        (21, 512, 256),  // Layer 3 attn.q
+        (22, 128, 256),  // Layer 3 attn.k
+        (23, 128, 256),  // Layer 3 attn.v
+        (32, 256, 256),  // Layer 3 wo
+        (33, 256, 192),  // Layer 3 ffn_down
+        (36, 64, 0),     // Output head projection
+    ];
+    for (node_idx, exp_n, exp_k) in EXPECTED_GEMM_PARAMS {
+        let n = ir.nodes[node_idx].params[1];
+        let k = ir.nodes[node_idx].params[2];
+        assert_eq!(
+            (n, k),
+            (exp_n, exp_k),
+            "GEMM node {node_idx} shape mismatch: expected ({exp_n}, {exp_k}), got ({n}, {k})"
+        );
+    }
     assert_eq!(
         ops[0],
         op::ELEMENTWISE,
