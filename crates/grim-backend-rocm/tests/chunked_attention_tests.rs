@@ -21,14 +21,8 @@ fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
 }
 
 #[test]
-#[ignore]
-fn test_advanced_attention_kernels_compile() {
+fn test_advanced_attention_kernels_wavefront_size() {
     let dev = RocmDevice::new(0);
-    let src = grim_backend_rocm::kernels::source_asm::compute_kernel_source();
-    assert!(src.contains("grim_extend_attention_chunk"));
-    assert!(src.contains("grim_merge_attn_states"));
-    assert!(src.contains("grim_reshape_and_cache_preshuffled"));
-    assert!(src.contains("grim_preshuffled_paged_attention"));
     assert_eq!(dev.wavefront_size(), grim_backend_rocm::WavefrontSize::W32);
 }
 

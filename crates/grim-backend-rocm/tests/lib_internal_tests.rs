@@ -6,6 +6,7 @@
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::backend::BackendDevice;
 
+// Retargeted to public API: `compute_kernel_source()` is `pub` (src/kernels/source_asm.rs:3), reachable from tests/ via `grim_backend_rocm::kernels::source_asm`.
 #[test]
 fn kernel_source_has_no_duplicate_device_fns() {
     use grim_backend_rocm::kernels::source_asm::compute_kernel_source;

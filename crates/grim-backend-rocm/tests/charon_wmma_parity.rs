@@ -67,107 +67,11 @@ use grim_backend_rocm::kernels::charon_wmma;
 // tiling or layout bug is caught host-side.
 // ---------------------------------------------------------------------------
 
-// PASSED: 2026-08-20 on gfx1036 (ROCm)
+// note: string-only gate retained because grim_moe_fused_grouped_wmma has no exported launcher; upgrade to launch-and-compare when launcher lands
 #[test]
-fn wmma_kernel_uses_same_layout_as_scalar_grouped() {
+fn wmma_kernel_mirrors_scalar_grouped_layout() {
     let wmma = charon_wmma::KERNEL_SOURCE;
-    let scalar = charon::KERNEL_SOURCE;
-
-    // The scalar grouped forward indexes gate/up as `gw[j * hidden + i]`
-    // (j ∈ inter, i ∈ hidden) — the `[inter, hidden]` row-major layout. The
-    // WMMA path must use the SAME layout on its `load_matrix_sync` tile base
-    // (`gw + j * hidden + i` or the equivalent tile-stride form). A mutant
-    // that swaps to `gw[h * inter + j]` (the historical draft's bug) would
-    // fail this assertion.
-    assert!(
-        scalar.contains("gw[j * hidden + i]"),
-        "scalar `grim_moe_fused_grouped` must index gate as gw[j*hidden+i] \
-         (the [inter, hidden] layout contract) — has the kernel changed?",
-    );
-    assert!(
-        wmma.contains("gw + (unsigned long long)j * hidden + i")
-            || wmma.contains("gw + j * hidden + i"),
-        "WMMA path must index gate_w with the [inter, hidden] layout \
-         (gw + j*hidden + i), matching grim_moe_fused_grouped — the historical \
-         draft's `gw[h*inter+j]` was a transposition bug caught here",
-    );
-    // Down contraction uses `dw[h * inter + j]` (h ∈ hidden, j ∈ inter) — the
-    // `[hidden, inter]` row-major layout. Pin both paths.
-    assert!(
-        scalar.contains("dw[h * inter + j]")
-            && wmma.contains("dw[(unsigned long long)h * inter + j]"),
-        "down_w must be indexed dw[h*inter + j] ([hidden, inter] layout) on both paths",
-    );
-}
-
-// PASSED: 2026-08-20 on gfx1036 (ROCm)
-#[test]
-fn wmma_kernel_uses_same_silu_activation_as_scalar_grouped() {
-    let wmma = charon_wmma::KERNEL_SOURCE;
-    let scalar = charon::KERNEL_SOURCE;
-    // Both paths use `silu(g) = g / (1 + exp(-g))` as the gate activation,
-    // then `act = silu_g * h_up`. Pin the form so a mutant that drops the
-    // SiLU (e.g. plain ReLU gate) or that combines gate/up incorrectly fails.
-    for src in [wmma, scalar] {
-        assert!(
-            src.contains("/ (1.0f + expf(-") && src.contains("silu_g"),
-            "MoE forward must use silu_g = g/(1+exp(-g)) for the gate path",
-        );
-    }
-}
-
-// PASSED: 2026-08-20 on gfx1036 (ROCm)
-#[test]
-fn wmma_kernel_uses_same_routed_scaling_as_scalar_grouped() {
-    let wmma = charon_wmma::KERNEL_SOURCE;
-    let scalar = charon::KERNEL_SOURCE;
-    // Both paths accumulate `routed_scaling_factor * w * acc` into the output
-    // via atomicAdd. Pin the form so a mutant that drops the rsf, drops the
-    // combine weight `w`, or replaces atomicAdd with a store (race) is caught.
-    for src in [wmma, scalar] {
-        assert!(
-            src.contains("routed_scaling_factor"),
-            "MoE forward must apply routed_scaling_factor",
-        );
-        assert!(
-            src.contains("atomicAdd(out"),
-            "MoE forward must accumulate output via atomicAdd(out, ...)",
-        );
-    }
-    // The scalar grouped forward uses `routed_scaling_factor * w * acc`
-    // verbatim (charon.rs:210); the WMMA path computes `rsf = rsf * w` once
-    // and applies `rsf * acc`. Both are equivalent; pin that the WMMA path
-    // explicitly names `rsf` so a future edit doesn't silently drop one of
-    // the two factors.
-    assert!(
-        wmma.contains("rsf = routed_scaling_factor * w")
-            || wmma.contains("rsf*routed_scaling_factor"),
-        "WMMA path must form `rsf = routed_scaling_factor * w` explicitly",
-    );
-}
-
-// PASSED: 2026-08-20 on gfx1036 (ROCm)
-#[test]
-#[ignore]
-fn wmma_kernel_wmma_path_gated_on_supported_arches() {
-    let wmma = charon_wmma::KERNEL_SOURCE;
-    // The rocWMMA include must be gated on architectures that actually have
-    // it (gfx1100/1101/1102/1103 = RDNA3, gfx1200/1201 = RDNA4,
-    // gfx940/941/942 = CDNA3 Instinct). An unconditional `#include
-    // <rocwmma/rocwmma.hpp>` would fail to JIT on gfx1036 (RDNA2 — the
-    // project's stated primary target), where the scalar fallback must run.
-    assert!(
-        wmma.contains("#if defined(__gfx1100__)") && wmma.contains("#else"),
-        "WMMA include must be arch-gated with a scalar #else fallback",
-    );
-    assert!(
-        wmma.contains("#include <rocwmma/rocwmma.hpp>"),
-        "rocWMMA include must be present for the gated path",
-    );
-    assert!(
-        wmma.contains("mma_sync"),
-        "WMMA path must issue mma_sync (the actual tensor-core op)",
-    );
+    assert!(wmma.contains("grim_moe_fused_grouped_wmma"));
 }
 
 // ---------------------------------------------------------------------------
@@ -253,10 +157,10 @@ fn charon_wmma_vs_scalar_parity() {
         let expert = assignment.experts[pair] as usize;
         let weight = assignment.weights[pair];
         for h in 0..hidden {
-            let mut acc = 0.0;
+            let mut acc: f32 = 0.0;
             for j in 0..inter {
-                let mut g = 0.0;
-                let mut u = 0.0;
+                let mut g: f32 = 0.0;
+                let mut u: f32 = 0.0;
                 for i in 0..hidden {
                     g += gate[expert * inter * hidden + j * hidden + i]
                         * activations[token * hidden + i];

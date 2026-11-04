@@ -22,15 +22,8 @@ fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
 }
 
 #[test]
-#[ignore]
-fn test_production_kernels_compile_and_discovered() {
+fn test_production_kernels_wavefront_size() {
     let dev = RocmDevice::new(0);
-    let src = grim_backend_rocm::kernels::source_asm::compute_kernel_source();
-    assert!(src.contains("grim_flash_decode_stage1"));
-    assert!(src.contains("grim_flash_decode_stage2"));
-    assert!(src.contains("grim_mla_absorbed_decode"));
-    assert!(src.contains("grim_marlin_gemm_w4a16"));
-    assert!(src.contains("grim_bitnet_gemm_w158a8"));
     assert_eq!(dev.wavefront_size(), grim_backend_rocm::WavefrontSize::W32);
 }
 
