@@ -830,7 +830,7 @@ fn f16_arena_convert_and_attend_parity() {
     }
     let dev = RocmDevice::try_new(0)
         .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
 
     // (a) convert roundtrip: f32 -> f16 bits -> f32 must match within
     // f16 rounding (~5e-4 relative on these magnitudes).
@@ -1017,7 +1017,7 @@ fn f16kv_attention_single_row_broadcast() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 32, 1);
     let q_data: Vec<f32> = (0..(seq_len * num_heads * head_dim))
@@ -1125,7 +1125,7 @@ fn int8_append_quantize_parity() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (n_rows, nkv, hd) = (5_usize, 4, 64);
     let stride = nkv * hd;
@@ -1211,7 +1211,7 @@ fn int8_attend_matches_f32() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (4_usize, 8, 4, 64, 16);
     let mut seed = 0x1851u64;
@@ -1339,7 +1339,7 @@ fn int8_attend_single_row_broadcast() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 32, 1);
     let q_data = vec![0.1f32; seq_len * num_heads * head_dim];
@@ -1431,7 +1431,7 @@ fn int4_append_quantize_parity() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (n_rows, nkv, head_dim) = (4_usize, 2_usize, 64_usize);
     let stride = nkv * head_dim;
@@ -1523,7 +1523,7 @@ fn whitecrow_append_quantize_parity_bit_exact() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     // head_dim MUST be a multiple of 128 so 128-value groups align to head
     // vectors; 128 = one 67-byte block per head (the production Qwen case).
@@ -1624,7 +1624,7 @@ fn whitecrow_dense_attention_matches_host_decode_reference() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 128, 6);
     let cache_offset = 0usize;
     let stride = num_kv_heads * head_dim;
@@ -1802,7 +1802,7 @@ fn graph_whitecrow_multirow_matches_quantized_q_reference() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nh, nkv, hd, rows) = (4_usize, 2, 128, 8);
     let stride = nkv * hd;
@@ -1956,7 +1956,7 @@ fn graph_whitecrow_split_matches_serial_dev_kernel() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nh, nkv, hd, rows) = (4_usize, 2, 128, 64);
     let stride = nkv * hd;
@@ -2147,7 +2147,7 @@ fn int4_attend_single_row_broadcast() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 32, 1);
     let q_data = vec![0.1f32; seq_len * num_heads * head_dim];
@@ -2244,7 +2244,7 @@ fn i8_append_sidecar_offsets_are_independent_units() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (n_rows, nkv, hd) = (3_usize, 2, 32);
     let stride = nkv * hd;
@@ -2352,7 +2352,7 @@ fn kv_append_ring_pins_sinks_and_cycles_newest() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let (cap, sinks, nkv, hd) = (10usize, 3usize, 2usize, 8usize);
     let stride = nkv * hd;
     let n_tokens = cap * 2 + 5;
@@ -2485,7 +2485,7 @@ fn graph_i8_append_and_attend_match_eager_f32() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nh, nkv, hd) = (8_usize, 4, 64);
     let stride = nkv * hd;
@@ -2659,7 +2659,7 @@ fn k2v4_append_quantize_parity() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (n_rows, nkv, hd) = (5_usize, 4, 64);
     let stride = nkv * hd;
@@ -2753,7 +2753,7 @@ fn k2v4_attend_matches_host_oracle() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nh, nkv, hd, kv_len) = (8_usize, 4, 64, 6);
     let stride = nkv * hd;
@@ -2927,7 +2927,7 @@ fn k2v4_packing_is_exactly_four_codes_per_byte() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (n_rows, nkv, hd) = (2_usize, 1, 64);
     let stride = nkv * hd;
@@ -3033,7 +3033,7 @@ fn graph_i4_append_matches_eager_quantizer() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::{DType, Shape};
     let (nkv, hd, rows) = (2_usize, 64_usize, 3_usize);
     let stride = nkv * hd;
@@ -3139,7 +3139,7 @@ fn graph_i4_append_honours_the_ring() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::{DType, Shape};
     let (nkv, hd) = (2_usize, 64_usize);
     let stride = nkv * hd;
@@ -3301,7 +3301,7 @@ fn graph_i4_append_and_attend_match_eager_f32() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nh, nkv, hd) = (8_usize, 4, 64);
     let stride = nkv * hd;
@@ -3444,7 +3444,7 @@ fn graph_i4_multirow_matches_eager_and_corruption_control() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nh, nkv, hd, rows) = (8_usize, 4, 64, 8_usize);
     let stride = nkv * hd;
@@ -3640,7 +3640,7 @@ fn fused_rope_append_whitecrow_bytes_match_two_node_path() {
         return;
     }
     let dev = RocmDevice::try_new(0).expect("try_new");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     use grim_tensor::ArithType;
     let (nkv, hd, steps, batch) = (2usize, 128usize, 2usize, 1usize);
     let stride = nkv * hd;
@@ -3937,7 +3937,7 @@ fn increasing_max_softmax_matches_f64_reference() {
     }
     let dev = RocmDevice::try_new(0)
         .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
 
     // seq=8 queries over 8 KV positions, 1 head, head_dim=8. Q is the identity
     // pattern (q_i = e_i) and K_j = c_j * e_{j % 8} with c strictly increasing,

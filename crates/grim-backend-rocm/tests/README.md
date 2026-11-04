@@ -25,3 +25,7 @@ Conventions every GPU test follows:
   (device 0.17× vs CPU D2H on gfx1201 debug — real perf deficit, kernel work),
   `charon_wmma_vs_scalar_parity` (`hipModuleLoad 209` on some RDNA4 boxes —
   see file header).
+
+## Coverage
+
+Local only — no CI gate (consumer ROCm project, no GPU CI). Run: scripts/coverage-rocm.sh

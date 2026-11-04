@@ -21,7 +21,10 @@ fn dispatch_routes_to_the_grey_kernel() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
-    if !dev.gcn_arch().starts_with("gfx12") {
+    if let Some(reason) =
+        grim_backend_rocm::device::util::skip_unless_arch("gfx12")
+    {
+        eprintln!("{reason}");
         return Ok(());
     }
     let (m, n, k) = (16usize, 16usize, 32usize);

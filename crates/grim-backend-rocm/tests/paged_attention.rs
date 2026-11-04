@@ -219,7 +219,7 @@ fn paged_attention_deterministic_across_runs() {
         RocmDevice::try_new(0)
             .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
     );
-    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let batch = 1u32;
     let num_heads = 2u32;
     let num_kv_heads = 1u32;

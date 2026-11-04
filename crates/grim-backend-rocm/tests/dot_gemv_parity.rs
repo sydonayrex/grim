@@ -13,12 +13,6 @@ use grim_backend_rocm::RocmDevice;
 use grim_tensor::{
     ArithType, BlockDtype, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage,
 };
-use std::sync::Mutex;
-
-lazy_static::lazy_static! {
-    static ref DOT_MUTEX: Mutex<()> = Mutex::new(());
-}
-
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
@@ -202,7 +196,7 @@ fn run_quant_matmul(
 #[test]
 #[ignore]
 fn dot4_all_negative_probe() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -253,7 +247,7 @@ fn dot4_all_negative_probe() {
 #[test]
 #[ignore]
 fn dot_gemv_tail_k() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -290,7 +284,7 @@ fn dot_gemv_tail_k() {
 /// quantization tolerance at the LFM2.5 decode shapes.
 #[test]
 fn dot2_q80_parity_vs_cpu() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -386,7 +380,7 @@ fn pack_q80(w: &[f32], rows: usize, k: usize) -> Vec<u8> {
 /// into q/k/v) within 1e-4 — same kernel, same math, only launch grouping differs.
 #[test]
 fn fused_qkv_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -500,7 +494,7 @@ fn fused_qkv_gemv_parity() {
 /// the combined quantization tolerance.
 #[test]
 fn dot2_matches_wmma() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -531,7 +525,7 @@ fn dot2_matches_wmma() {
 /// math). Random q [1, heads*steps, head_dim] at base positions B ∈ {0, 17, 500}.
 #[test]
 fn rope_dev_base_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -591,7 +585,7 @@ fn rope_dev_base_parity() {
 /// matches the CPU reference within quantization tolerance.
 #[test]
 fn dot4_q4k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -668,7 +662,7 @@ fn dot4_q4k_gemv_parity() {
 /// SPEED-DOT: Q5_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
 fn dot4_q5k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -744,7 +738,7 @@ fn dot4_q5k_gemv_parity() {
 /// SPEED-DOT: Q6_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
 fn dot4_q6k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -821,7 +815,7 @@ fn dot4_q6k_gemv_parity() {
 /// Verifies `q6k_head_parity` at realistic head shape (k=512, n=512).
 #[test]
 fn q6k_head_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -895,7 +889,7 @@ fn q6k_head_parity() {
 /// SPEED-DOT-FUSED (Phase 4c): `launch_fused_gate_up_dot4` matches CPU reference.
 #[test]
 fn fused_gate_up_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1002,7 +996,7 @@ fn fused_gate_up_gemv_parity() {
 /// SPEED-DOT-OPFUSE (Phase 4a): `rmsnorm_rope` matches unfused RMSNorm then RoPE.
 #[test]
 fn rmsnorm_rope_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1083,7 +1077,7 @@ fn rmsnorm_rope_parity() {
 /// SPEED-DOT-OPFUSE (Phase 4d): `grim_silu_mul_quant_q8_1` parity test.
 #[test]
 fn silu_mul_quant_q81_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1267,7 +1261,7 @@ fn fp8_e4m3_to_f32_host(val: u8) -> f32 {
 /// E4M3 quantization + dequantization.
 #[test]
 fn dot4_fp8_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1354,7 +1348,7 @@ fn dot4_fp8_gemv_parity() {
 /// 256 weights) and the CPU side mirrors the kernel's Q8_1 activation quant.
 #[test]
 fn dot4_q2k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1464,7 +1458,7 @@ fn dot4_q2k_gemv_parity() {
 /// (110 bytes / 256 weights, llama.cpp spec).
 #[test]
 fn dot4_q3k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1565,7 +1559,7 @@ fn dot4_q3k_gemv_parity() {
 /// against the CPU dequantization oracle.
 #[test]
 fn dot8_w4a4_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1757,7 +1751,7 @@ fn dot8_w4a4_gemv_parity() {
 /// fixture whose rows were identical, and would pass on row 0 in any case.
 #[test]
 fn dot8_w4a4_gemv_parity_multi_row() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1953,7 +1947,7 @@ fn dot8_w4a4_gemv_parity_multi_row() {
 /// buffer. Both are fixed; the test now runs and its diff means something.
 #[test]
 fn citycrow_sudot8_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -2107,7 +2101,7 @@ fn citycrow_sudot8_gemv_parity() {
 /// Phase 4.5b: W4A4 GEMV against real model weights from Qwen3-4B OSTQuant layout.
 #[test]
 fn dot8_w4a4_qwen3_model_tensor_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -2352,7 +2346,7 @@ fn dot8_w4a4_safetensors_loader_e2e() {
 /// Tests launch_dot2_bf16_gemv and end-to-end matmul dispatch against the CPU reference.
 #[test]
 fn dot2_bf16_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -2486,7 +2480,7 @@ fn dot2_bf16_gemv_parity() {
 /// same dot4 speedup RDNA3/4 do, not the scalar fallback. Skipped if no APU.
 #[test]
 fn dot4_q4k_gemv_parity_on_rdna2_apu() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
@@ -2584,7 +2578,7 @@ fn gpu_device_rdna2() -> Option<RocmDevice> {
 /// path. This test proves it matches the CPU reference on the gfx1036.
 #[test]
 fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
@@ -2670,7 +2664,7 @@ fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
 /// multi-superblock shape before it is allowed near production dispatch.
 #[test]
 fn dot4_q4k_gemv_fast_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -2750,7 +2744,7 @@ fn dot4_q4k_gemv_fast_parity() {
 /// inherit, not just the requantizer's own round-trip.
 #[test]
 fn decode_w4a4_requant_parity_vs_original_f32() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -2860,7 +2854,7 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
 /// synthetic packing as dot8_w4a4_gemv_parity, at the bigger shape.
 #[test]
 fn dot8_w4a4_gemv_parity_n256_k512() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -3024,7 +3018,7 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
 /// was correct.
 #[test]
 fn rope_dev_base_partial_rotary_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -3125,7 +3119,7 @@ fn rope_dev_base_partial_rotary_parity() {
 /// f32 association order only.
 #[test]
 fn w4a4_gemv_matches_aq_aware_reference() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -3243,7 +3237,7 @@ fn w4a4_gemv_matches_aq_aware_reference() {
 #[test]
 #[ignore]
 fn dot4_q80_gemv_deterministic_across_runs() {
-    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
