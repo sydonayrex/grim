@@ -39,7 +39,9 @@ fn fwht_1024_gpu_matches_host_oracle_signed_and_unsigned() -> TestResult {
         .collect();
     let signs_f32: Vec<f32> = signs.iter().map(|&s| s as f32).collect();
 
-    for &rows in &[1usize, 7usize, 64usize] {
+    // 256 exercises the prefill (LDS smem) variant; 1/7/64 cover the decode
+    // (block) variant at and below its rows<=64 selection threshold.
+    for &rows in &[1usize, 7usize, 64usize, 256usize] {
         let src: Vec<f32> = (0..rows * n).map(|_| rand()).collect();
 
         for use_signs in [false, true] {
@@ -88,6 +90,6 @@ fn fwht_1024_gpu_matches_host_oracle_signed_and_unsigned() -> TestResult {
             println!("rows={rows} signs={use_signs}: worst rel err {worst:.3e}");
         }
     }
-    println!("fwht-1024 GPU parity ok (signed + unsigned, rows 1/7/64)");
+    println!("fwht-1024 GPU parity ok (signed + unsigned, rows 1/7/64/256)");
     Ok(())
 }
