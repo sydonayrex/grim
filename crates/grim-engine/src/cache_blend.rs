@@ -27,6 +27,55 @@ pub struct StitchedPromptLayout {
     pub cached_token_count: usize,
 }
 
+/// A cached chunk recorded in the non-prefix KV store.
+#[derive(Debug, Clone)]
+pub struct CachedChunkEntry {
+    pub chunk_hash: u64,
+    pub original_base_pos: usize,
+    pub token_len: usize,
+    pub block_ids: Vec<usize>,
+    /// Optional stored key/value tensors if persisted in pool storage
+    pub k_data: Option<Vec<f32>>,
+    pub v_data: Option<Vec<f32>>,
+}
+
+/// Chunk-KV hash store harvested after prefill for cross-request non-prefix reuse.
+#[derive(Debug, Default)]
+pub struct ChunkKvStore {
+    chunks: std::collections::HashMap<u64, CachedChunkEntry>,
+}
+
+impl ChunkKvStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or update a cached chunk harvested after prefill.
+    pub fn insert_chunk(&mut self, entry: CachedChunkEntry) {
+        self.chunks.insert(entry.chunk_hash, entry);
+    }
+
+    /// Lookup a cached chunk by its sequence hash.
+    pub fn lookup(&self, hash: u64) -> Option<&CachedChunkEntry> {
+        self.chunks.get(&hash)
+    }
+
+    /// Number of cached chunks.
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Whether store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// Clear all cached chunks.
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+    }
+}
+
 /// CacheBlend engine for non-prefix chunk matching.
 #[derive(Debug, Default)]
 pub struct CacheBlendEngine {

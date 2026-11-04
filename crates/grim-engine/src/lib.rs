@@ -60,7 +60,7 @@ pub mod tp_layers;
 /// P2: packed-step training driver (varlen grouping + one optimizer step per group).
 pub mod train_packed;
 
-pub use cache_blend::{CacheBlendEngine, CachedSegment, StitchedPromptLayout};
+pub use cache_blend::{CacheBlendEngine, CachedSegment, ChunkKvStore, StitchedPromptLayout};
 pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
 
 use std::collections::HashMap;

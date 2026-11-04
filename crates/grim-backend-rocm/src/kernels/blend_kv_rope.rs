@@ -13,7 +13,8 @@ pub struct BlendConfig {
 }
 
 /// Fused KV cache blending CPU reference implementation.
-/// Preserves `k_dst[..divergence_token]` and `v_dst[..divergence_token]` from existing cache, and applies RoPE to `k_src[divergence_token..]` before scattering into.
+/// Preserves `k_dst[..divergence_token]` and `v_dst[..divergence_token]` from existing cache,
+/// and applies RoPE to `k_src[divergence_token..]` before scattering into `k_dst`.
 pub fn blend_kv_rope_cpu(
     cfg: &BlendConfig,
     k_src: &[f32],
@@ -21,6 +22,32 @@ pub fn blend_kv_rope_cpu(
     k_dst: &mut [f32],
     v_dst: &mut [f32],
     base_pos: usize,
+    rope_theta: f32,
+) -> Result<()> {
+    blend_kv_rope_transform_cpu(
+        cfg,
+        k_src,
+        v_src,
+        k_dst,
+        v_dst,
+        None, // no unrotate; k_src is unrotated
+        base_pos,
+        rope_theta,
+    )
+}
+
+/// Fused KV cache blending with two-position RoPE unrotate(old_pos) -> rotate(new_pos).
+/// When `old_base_pos` is `Some(old)`, `k_src` is assumed to be POST-RoPE at `old + t` and is first unrotated
+/// by `-angle_old` before being rotated by `+angle_new` at `new + t`.
+/// If `old_base_pos` is `None`, standard forward-only RoPE rotation from `new + t` is performed.
+pub fn blend_kv_rope_transform_cpu(
+    cfg: &BlendConfig,
+    k_src: &[f32],
+    v_src: &[f32],
+    k_dst: &mut [f32],
+    v_dst: &mut [f32],
+    old_base_pos: Option<usize>,
+    new_base_pos: usize,
     rope_theta: f32,
 ) -> Result<()> {
     let elem_per_token = cfg.num_heads * cfg.head_dim;
@@ -55,7 +82,6 @@ pub fn blend_kv_rope_cpu(
     // Apply RoPE and copy divergent tail for K
     let half_dim = cfg.head_dim / 2;
     for t in cfg.divergence_token..cfg.block_size {
-        let pos = (base_pos + t) as f32;
         let token_offset = t * elem_per_token;
 
         for h in 0..cfg.num_heads {
@@ -63,13 +89,17 @@ pub fn blend_kv_rope_cpu(
 
             for d in 0..half_dim {
                 let freq = 1.0 / (rope_theta.powf((2 * d) as f32 / cfg.head_dim as f32));
-                let angle = pos * freq;
+                let delta_pos = match old_base_pos {
+                    Some(old) => (new_base_pos as f32) - (old as f32),
+                    None => (new_base_pos + t) as f32,
+                };
+                let angle = delta_pos * freq;
                 let (sin_val, cos_val) = angle.sin_cos();
 
                 let k0 = k_src[head_offset + d];
                 let k1 = k_src[head_offset + d + half_dim];
 
-                // Rotary rotation
+                // Rotary rotation by angle (delta_pos)
                 k_dst[head_offset + d] = k0 * cos_val - k1 * sin_val;
                 k_dst[head_offset + d + half_dim] = k0 * sin_val + k1 * cos_val;
             }
@@ -81,7 +111,7 @@ pub fn blend_kv_rope_cpu(
 
 /// GPU HipRTC kernel source template for fused RoPE + scatter cache blending.
 pub const BLEND_KV_ROPE_HIP_SRC: &str = r#"
-extern "C" __global__ void blend_kv_rope_kernel(
+extern "C" __global__ void blend_kv_rope_transform_kernel(
     const float* __restrict__ k_src,
     const float* __restrict__ v_src,
     float* __restrict__ k_dst,
@@ -90,7 +120,9 @@ extern "C" __global__ void blend_kv_rope_kernel(
     int num_heads,
     int head_dim,
     int divergence_token,
-    int base_pos,
+    int old_base_pos,
+    int new_base_pos,
+    int is_post_rope,
     float rope_theta
 ) {
     int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -112,10 +144,13 @@ extern "C" __global__ void blend_kv_rope_kernel(
     int d = rem % head_dim;
     int half_dim = head_dim / 2;
 
-    int pos = base_pos + token_idx;
+    float delta_pos = (is_post_rope != 0)
+        ? (float)(new_base_pos - old_base_pos)
+        : (float)(new_base_pos + token_idx);
+
     int d_base = (d < half_dim) ? d : (d - half_dim);
     float freq = 1.0f / __powf(rope_theta, (float)(2 * d_base) / (float)head_dim);
-    float angle = (float)pos * freq;
+    float angle = delta_pos * freq;
     float sin_val, cos_val;
     __sincosf(angle, &sin_val, &cos_val);
 
@@ -129,21 +164,41 @@ extern "C" __global__ void blend_kv_rope_kernel(
         k_dst[tid] = k0 * sin_val + k1 * cos_val;
     }
 }
+
+extern "C" __global__ void blend_kv_rope_kernel(
+    const float* __restrict__ k_src,
+    const float* __restrict__ v_src,
+    float* __restrict__ k_dst,
+    float* __restrict__ v_dst,
+    int block_size,
+    int num_heads,
+    int head_dim,
+    int divergence_token,
+    int base_pos,
+    float rope_theta
+) {
+    blend_kv_rope_transform_kernel(
+        k_src, v_src, k_dst, v_dst,
+        block_size, num_heads, head_dim, divergence_token,
+        0, base_pos, 0, rope_theta
+    );
+}
 "#;
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use std::ffi::c_void;
 
-/// Launch GPU-accelerated fused RoPE + scatter KV cache blending kernel (Task 10.7).
-pub fn launch_blend_kv_rope(
+/// Launch GPU-accelerated fused RoPE + scatter KV cache blending kernel with unrotate(old_pos) -> rotate(new_pos).
+pub fn launch_blend_kv_rope_transform(
     dev: &RocmDevice,
     cfg: &BlendConfig,
     k_src: &RocmStorage,
     v_src: &RocmStorage,
     k_dst: &RocmStorage,
     v_dst: &RocmStorage,
-    base_pos: i32,
+    old_base_pos: Option<i32>,
+    new_base_pos: i32,
     rope_theta: f32,
 ) -> Result<*mut c_void> {
     let k_src_ptr = k_src
@@ -171,11 +226,13 @@ pub fn launch_blend_kv_rope(
     let mut nh = cfg.num_heads as i32;
     let mut hd = cfg.head_dim as i32;
     let mut dt = cfg.divergence_token as i32;
-    let mut bp = base_pos;
+    let mut old_bp = old_base_pos.unwrap_or(0);
+    let mut new_bp = new_base_pos;
+    let mut is_post = if old_base_pos.is_some() { 1i32 } else { 0i32 };
     let mut theta = rope_theta;
 
     dev.launch_compute_kernel(
-        "blend_kv_rope_kernel",
+        "blend_kv_rope_transform_kernel",
         grid_dim,
         block_dim,
         &mut [
@@ -187,9 +244,27 @@ pub fn launch_blend_kv_rope(
             crate::arg(&mut nh),
             crate::arg(&mut hd),
             crate::arg(&mut dt),
-            crate::arg(&mut bp),
+            crate::arg(&mut old_bp),
+            crate::arg(&mut new_bp),
+            crate::arg(&mut is_post),
             crate::arg(&mut theta),
         ],
+    )
+}
+
+/// Launch GPU-accelerated fused RoPE + scatter KV cache blending kernel (Task 10.7).
+pub fn launch_blend_kv_rope(
+    dev: &RocmDevice,
+    cfg: &BlendConfig,
+    k_src: &RocmStorage,
+    v_src: &RocmStorage,
+    k_dst: &RocmStorage,
+    v_dst: &RocmStorage,
+    base_pos: i32,
+    rope_theta: f32,
+) -> Result<*mut c_void> {
+    launch_blend_kv_rope_transform(
+        dev, cfg, k_src, v_src, k_dst, v_dst, None, base_pos, rope_theta,
     )
 }
 
