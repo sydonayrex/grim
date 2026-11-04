@@ -6,12 +6,12 @@ pub struct QuantFlags {
     pub u4_ready: bool,
 }
 
-pub trait LinearEmitter<A, W, Out, Scratch> {
+pub trait LinearEmitter<A: ?Sized, W: ?Sized, Out: ?Sized, Scratch: ?Sized> {
     fn emit_linear(
         &mut self,
         input: &A,
         weight: &W,
-        out: &mut Out,
+        out: &Out,
         scratch_q81: &Scratch,
         what: &str,
         layer: usize,
@@ -20,13 +20,19 @@ pub trait LinearEmitter<A, W, Out, Scratch> {
 }
 
 /// Executes device linear projection and IR emission via `emitter`.
-/// Takes `flags` by value (immutable shared copy) and returns the updated `QuantFlags`
-/// after the launch, preventing premature state mutation that skips quantize kernels.
-pub fn emit_linear_dedup<A, W, Out, Scratch, E: LinearEmitter<A, W, Out, Scratch>>(
+/// Takes `flags` by value (immutable copy) and returns the updated `QuantFlags`
+/// post-launch, preventing premature state mutation that skips quantize kernels.
+pub fn emit_linear_dedup<
+    A: ?Sized,
+    W: ?Sized,
+    Out: ?Sized,
+    Scratch: ?Sized,
+    E: LinearEmitter<A, W, Out, Scratch>,
+>(
     emitter: &mut E,
     input: &A,
     weight: &W,
-    out: &mut Out,
+    out: &Out,
     scratch_q81: &Scratch,
     what: &str,
     layer: usize,
@@ -51,7 +57,7 @@ mod tests {
             &mut self,
             _input: &MockTensor,
             _weight: &MockTensor,
-            _out: &mut MockTensor,
+            _out: &MockTensor,
             _scratch_q81: &MockTensor,
             _what: &str,
             _layer: usize,
@@ -76,16 +82,14 @@ mod tests {
         let flags = QuantFlags::default();
         let inp = MockTensor;
         let w = MockTensor;
-        let mut out = MockTensor;
+        let out = MockTensor;
         let scratch = MockTensor;
 
-        // Flags are taken by value and returned updated, so the caller cannot
-        // observe flags.q81_ready == true before the first launch occurs.
         let flags1 = emit_linear_dedup(
             &mut emitter,
             &inp,
             &w,
-            &mut out,
+            &out,
             &scratch,
             "linear_1",
             0,
@@ -100,14 +104,14 @@ mod tests {
             &mut emitter,
             &inp,
             &w,
-            &mut out,
+            &out,
             &scratch,
             "linear_2",
             0,
             flags1,
         )
         .unwrap();
-        assert_eq!(emitter.quant_launches, 1); // skipped!
+        assert_eq!(emitter.quant_launches, 1); // skipped on second launch!
         assert_eq!(emitter.gemv_launches, 2);
         assert!(flags2.q81_ready);
     }

@@ -6,17 +6,17 @@ pub enum NormKind {
     Fallback,
 }
 
-pub struct NormSpec<'a, W> {
+pub struct NormSpec<'a, W: ?Sized> {
     pub weight: Option<&'a W>,
     pub eps: f32,
 }
 
-pub trait NormEmitter<A, W, Out> {
+pub trait NormEmitter<A: ?Sized, W: ?Sized, Out: ?Sized> {
     fn emit_norm(
         &mut self,
         input: &A,
         weight: &W,
-        out: &mut Out,
+        out: &Out,
         eps: f32,
         kind: NormKind,
         m: usize,
@@ -26,12 +26,12 @@ pub trait NormEmitter<A, W, Out> {
 
 /// The eps -> NORM / FALLBACK rule (|eps - 1e-5| < f32::EPSILON).
 /// Evaluates the specification, determines NORM vs FALLBACK, and executes
-/// both the launch and IR recording through `emitter`.
-pub fn emit_norm<A, W, Out, E: NormEmitter<A, W, Out>>(
+/// both the device launch and IR recording through `emitter`.
+pub fn emit_norm<A: ?Sized, W: ?Sized, Out: ?Sized, E: NormEmitter<A, W, Out>>(
     emitter: &mut E,
     input: &A,
     weight: &W,
-    out: &mut Out,
+    out: &Out,
     eps: f32,
     m: usize,
     k: usize,
@@ -49,7 +49,7 @@ pub fn emit_norm<A, W, Out, E: NormEmitter<A, W, Out>>(
 mod tests {
     use super::*;
 
-    struct MockTensor(pub usize);
+    struct MockTensor;
 
     struct TestEmitter {
         recorded: Vec<(NormKind, f32, usize, usize)>,
@@ -60,7 +60,7 @@ mod tests {
             &mut self,
             _input: &MockTensor,
             _weight: &MockTensor,
-            _out: &mut MockTensor,
+            _out: &MockTensor,
             eps: f32,
             kind: NormKind,
             m: usize,
@@ -74,15 +74,15 @@ mod tests {
     #[test]
     fn test_emit_norm_eps_routing() {
         let mut emitter = TestEmitter { recorded: vec![] };
-        let mut out = MockTensor(0);
-        let inp = MockTensor(1);
-        let w = MockTensor(2);
+        let out = MockTensor;
+        let inp = MockTensor;
+        let w = MockTensor;
 
-        let res = emit_norm(&mut emitter, &inp, &w, &mut out, 1e-5, 1, 256).unwrap();
+        let res = emit_norm(&mut emitter, &inp, &w, &out, 1e-5, 1, 256).unwrap();
         assert_eq!(res, NormKind::Norm);
         assert_eq!(emitter.recorded[0], (NormKind::Norm, 1e-5, 1, 256));
 
-        let res2 = emit_norm(&mut emitter, &inp, &w, &mut out, 9e-6, 1, 256).unwrap();
+        let res2 = emit_norm(&mut emitter, &inp, &w, &out, 9e-6, 1, 256).unwrap();
         assert_eq!(res2, NormKind::Fallback);
         assert_eq!(emitter.recorded[1], (NormKind::Fallback, 9e-6, 1, 256));
     }
