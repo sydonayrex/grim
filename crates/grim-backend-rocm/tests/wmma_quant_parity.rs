@@ -153,9 +153,28 @@ fn run_case(
         nonfinite, 0,
         "{format:?}: WMMA kernel produced {nonfinite} non-finite outputs (NaN/Inf)"
     );
+    // Grouped-parity bar (dot4_kquant_grouped_parity.rs:287-312 form):
+    // per-element d / acc.abs().max(1e-3) <= 2e-2 beyond the near-zero floor.
+    let amax = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let mut worst_rel = 0.0f32;
+    for i in 0..want.len() {
+        let d = (got[i] - want[i]).abs();
+        if !d.is_finite() {
+            worst_rel = f32::INFINITY;
+            break;
+        }
+        if d < amax * 1e-4 + 1e-6 {
+            continue;
+        }
+        let r = d / want[i].abs().max(1e-3);
+        if r > worst_rel {
+            worst_rel = r;
+        }
+    }
+    eprintln!("[{format:?}] worst_rel={worst_rel} amax={amax}");
     assert!(
-        max_diff < 0.5,
-        "{format:?}: WMMA kernel diverges from reference (max_diff={max_diff})"
+        worst_rel <= 2e-2,
+        "{format:?}: WMMA kernel diverges from reference (worst_rel={worst_rel} max_diff={max_diff})"
     );
 }
 

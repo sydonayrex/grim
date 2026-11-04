@@ -287,9 +287,13 @@ fn tiled_quant_parity_all_formats_forward() {
     for (tag, scheme, blk, bytes, entry) in FORMATS {
         let d1 = parity_forward(&fx, tag, *scheme, *blk, *bytes, entry, 32, 128, 256);
         let d2 = parity_forward(&fx, tag, *scheme, *blk, *bytes, entry, 18, 100, 256);
-        assert!(
-            d1 <= 1e-3 && d2 <= 1e-3,
-            "{tag} forward parity: max_abs_diff {d1}/{d2} exceeds 1e-3"
+        assert_eq!(
+            d1, 0.0,
+            "{tag} forward parity: max_abs_diff {d1} — the tiled kernel must be BIT-IDENTICAL to the scalar kernel"
+        );
+        assert_eq!(
+            d2, 0.0,
+            "{tag} forward parity: max_abs_diff {d2} — the tiled kernel must be BIT-IDENTICAL to the scalar kernel"
         );
     }
 }
@@ -303,9 +307,9 @@ fn tiled_quant_parity_all_formats_backward() {
     let fx = fixture();
     for (tag, scheme, blk, bytes, entry) in FORMATS {
         let d = parity_backward(&fx, tag, *scheme, *blk, *bytes, entry, 18, 100, 256);
-        assert!(
-            d <= 1e-3,
-            "{tag} backward parity: max_abs_diff {d} exceeds 1e-3"
+        assert_eq!(
+            d, 0.0,
+            "{tag} backward parity: max_abs_diff {d} — the tiled kernel must be BIT-IDENTICAL to the scalar kernel"
         );
     }
 }

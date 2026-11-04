@@ -1,7 +1,7 @@
 //! Task 10: Parity test for Phase D.2 direct f32act fused kernels.
 //! Compares `launch_dot4_qkv_q80_f32act_gemv_into` and `launch_dot4_gate_up_silu_q80_f32act_gemv_into`
 //! against the canonical 2-launch oracle (`launch_quantize_q8_1` + fused GEMV).
-//! Tolerance standard: |got - want| <= 1e-5 (scale bit-exactness via (_Float16) cast).
+//! Tolerance standard: |got - want| <= 1e-4 (scale bit-exactness via (_Float16) cast).
 //!
 //! Gated: canonical `gpu_test_enabled()`.
 

@@ -61,9 +61,11 @@ fn host_gemm_f32(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: u
 /// to F16; the host oracle is pure f32 but the GPU inputs are F16-quantized,
 /// introducing ~1e-2 relative error for values near 1.0. We use a slightly
 /// looser tolerance for large K (more accumulation steps → more rounding).
+/// Returns a RELATIVE coefficient (K>=4096: `amax * 5e-3`); call sites
+/// multiply by the oracle magnitude `amax` to form the absolute allowance.
 fn tolerance_for(k: usize) -> f32 {
     if k >= 4096 {
-        0.5
+        5e-3
     } else if k >= 512 {
         0.1
     } else {
@@ -155,7 +157,12 @@ fn gate_2_6_4_decode_gemm_matches_cpu_oracle() -> TestResult {
     let mut host = vec![0f32; m * n];
     host_gemm_f32(&a_data, &b_data, &mut host, m, k, n);
 
-    let tol = tolerance_for(k);
+    let amax = host.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let tol = if k >= 4096 {
+        amax * tolerance_for(k)
+    } else {
+        tolerance_for(k)
+    };
     let diff = max_abs_diff(&gpu, &host);
     assert!(
         diff <= tol,
@@ -189,7 +196,12 @@ fn gate_2_6_4_decode_gemm_m8_matches_cpu_oracle() -> TestResult {
     let mut host = vec![0f32; m * n];
     host_gemm_f32(&a_data, &b_data, &mut host, m, k, n);
 
-    let tol = tolerance_for(k);
+    let amax = host.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let tol = if k >= 4096 {
+        amax * tolerance_for(k)
+    } else {
+        tolerance_for(k)
+    };
     let diff = max_abs_diff(&gpu, &host);
     assert!(
         diff <= tol,
@@ -259,7 +271,12 @@ fn gate_2_6_2b_decode_gemm_aligned_and_irregular_n() -> TestResult {
         let mut host = vec![0f32; m * n];
         host_gemm_f32(&a_data, &b_data, &mut host, m, k, n);
 
-        let tol = tolerance_for(k);
+        let amax = host.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let tol = if k >= 4096 {
+            amax * tolerance_for(k)
+        } else {
+            tolerance_for(k)
+        };
         let diff = max_abs_diff(&gpu, &host);
         assert!(
             diff <= tol,
@@ -293,7 +310,14 @@ fn gate_2_6_2b_double_buffer_many_k_steps_no_race() -> TestResult {
     let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.02).cos() * 0.3).collect();
 
     let mut prev: Option<Vec<f32>> = None;
-    let tol = tolerance_for(k);
+    let mut host0 = vec![0f32; m * n];
+    host_gemm_f32(&a_data, &b_data, &mut host0, m, k, n);
+    let amax0 = host0.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let tol = if k >= 4096 {
+        amax0 * tolerance_for(k)
+    } else {
+        tolerance_for(k)
+    };
 
     for run in 0..2 {
         let gpu = run_decode_kernel(&dev, &a_data, &b_data, m, k, n)?;

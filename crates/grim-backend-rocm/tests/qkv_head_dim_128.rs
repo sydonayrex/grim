@@ -2,7 +2,7 @@
 //!
 //! The CPU reference must produce finite (non-NaN) output for head_dim=128.
 //! The GPU path (gated by GRIM_RUN_GPU_TESTS) must match the CPU reference
-//! within atol=1e-4 instead of silently returning NaN.
+//! within atol=1e-3 instead of silently returning NaN.
 //!
 //! RED bar: with the head_dim > 64 NaN guard in place, the GPU path currently
 //! returns Err (blocked by roc_device.rs host-side check). After the guard is
@@ -206,7 +206,7 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
         assert!(!x.is_nan(), "GPU output has NaN at index {}", i);
     }
 
-    // Verify against CPU reference within atol=1e-4.
+    // Verify against CPU reference within atol=1e-3.
     let want = reference_attention(
         &q_data,
         &k_data,

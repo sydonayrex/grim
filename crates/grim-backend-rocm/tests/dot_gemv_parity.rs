@@ -97,6 +97,31 @@ fn reference_q80(a: &[f32], b_packed: &[u8], m: usize, n: usize, k: usize) -> Ve
 /// `eprintln!` prints `inf` — no call site needs to change. The offending
 /// index is reported once so a NaN halfway through a big tensor is
 /// identifiable rather than just "somewhere in there".
+/// Grouped-parity bar (dot4_kquant_grouped_parity.rs:287-312 form), shared by
+/// the dot GEMV parity gates below: per-element relative error
+/// `d / acc.abs().max(1e-3)` must stay `<= 2e-2` beyond the near-zero floor
+/// `d < amax * 1e-4 + 1e-6`, where `amax` is the oracle magnitude. Returns the
+/// worst offending relative error (0.0 when every element passes).
+fn worst_rel(want: &[f32], got: &[f32]) -> f32 {
+    assert_eq!(want.len(), got.len(), "length mismatch");
+    let amax = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let mut worst = 0.0f32;
+    for i in 0..want.len() {
+        let d = (got[i] - want[i]).abs();
+        if !(d.is_finite()) {
+            return f32::INFINITY;
+        }
+        if d < amax * 1e-4 + 1e-6 {
+            continue;
+        }
+        let r = d / want[i].abs().max(1e-3);
+        if r > worst {
+            worst = r;
+        }
+    }
+    worst
+}
+
 fn max_diff(want: &[f32], got: &[f32]) -> f32 {
     assert_eq!(want.len(), got.len(), "length mismatch");
     let mut max_diff = 0.0f32;
@@ -182,13 +207,14 @@ fn dot2_q80_parity_vs_cpu() {
         let (a_dev, b_dev) = upload_q80_case(&dev, &a, &b_packed, 1, k).expect("upload");
         let got = run_quant_matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), n).expect("dot2 run");
 
+        let worst = worst_rel(&want, &got);
         let diff = max_diff(&want, &got);
-        eprintln!("[dot2-vs-cpu] n={n} k={k} max_diff={diff}");
+        eprintln!("[dot2-vs-cpu] n={n} k={k} max_diff={diff} worst_rel={worst}");
         // int8 activation quantization adds ~scale/2 error per element over
-        // K=1024 terms on top of Q8_0 weight noise — 0.5 absolute is generous.
+        // K=1024 terms on top of Q8_0 weight noise — grouped-parity 2e-2 rel.
         assert!(
-            diff < 0.5,
-            "dot2 GEMV diverges from CPU reference at n={n}: max_diff={diff}"
+            worst <= 2e-2,
+            "dot2 GEMV diverges from CPU reference at n={n}: worst_rel={worst} max_diff={diff}"
         );
     }
     unsafe {
@@ -528,11 +554,12 @@ fn dot4_q4k_gemv_parity() {
         c_cpu[col] = acc;
     }
 
+    let worst = worst_rel(&c_cpu, &c_dev);
     let diff = max_diff(&c_cpu, &c_dev);
-    eprintln!("[dot4-q4k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    eprintln!("[dot4-q4k-gemv-parity] n={n} k={k} max_diff={diff:.6} worst_rel={worst:.6}");
     assert!(
-        diff < 0.5,
-        "dot4 Q4_K GEMV diverges from CPU reference: {diff}"
+        worst <= 2e-2,
+        "dot4 Q4_K GEMV diverges from CPU reference: worst_rel={worst} max_diff={diff}"
     );
 
     unsafe {
@@ -603,11 +630,12 @@ fn dot4_q5k_gemv_parity() {
         c_cpu[col] = acc;
     }
 
+    let worst = worst_rel(&c_cpu, &c_dev);
     let diff = max_diff(&c_cpu, &c_dev);
-    eprintln!("[dot4-q5k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    eprintln!("[dot4-q5k-gemv-parity] n={n} k={k} max_diff={diff:.6} worst_rel={worst:.6}");
     assert!(
-        diff < 0.5,
-        "dot4 Q5_K GEMV diverges from CPU reference: {diff}"
+        worst <= 2e-2,
+        "dot4 Q5_K GEMV diverges from CPU reference: worst_rel={worst} max_diff={diff}"
     );
 
     unsafe {
@@ -678,11 +706,12 @@ fn dot4_q6k_gemv_parity() {
         c_cpu[col] = acc;
     }
 
+    let worst = worst_rel(&c_cpu, &c_dev);
     let diff = max_diff(&c_cpu, &c_dev);
-    eprintln!("[dot4-q6k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    eprintln!("[dot4-q6k-gemv-parity] n={n} k={k} max_diff={diff:.6} worst_rel={worst:.6}");
     assert!(
-        diff < 0.5,
-        "dot4 Q6_K GEMV diverges from CPU reference: {diff}"
+        worst <= 2e-2,
+        "dot4 Q6_K GEMV diverges from CPU reference: worst_rel={worst} max_diff={diff}"
     );
 
     unsafe {
