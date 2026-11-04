@@ -113,17 +113,17 @@ fn unsupported_storage_names_the_format_and_the_remedy() {
     use grim_format::gguf::map_gguf_dtype_to_storage;
     use grim_tensor::dtype::Storage;
 
-    for (dtype, name) in [(GgufDType::PQ2_0, "PQ2_0"), (GgufDType::PTQ1_0, "PTQ1_0")] {
+    // PQ2_0 left this list (Task 10.5): it now maps to Block(Pq2_0) with a
+    // device GEMV + host decoder; see bonsai_pq2_0_provider.rs. PTQ1_0 and the
+    // remaining Prism tags stay refused with the naming contract below.
+    for (dtype, name) in [(GgufDType::PTQ1_0, "PTQ1_0")] {
         let s = map_gguf_dtype_to_storage(dtype).storage;
         let Storage::Unsupported(f) = s else {
             panic!("{name} must be Unsupported");
         };
         assert_eq!(f.name, name);
         assert_eq!(f.block_size, Some(128));
-        assert_eq!(
-            f.bytes_per_block,
-            Some(if name == "PQ2_0" { 34 } else { 28 })
-        );
+        assert_eq!(f.bytes_per_block, Some(28));
         // The message must tell the user what failed AND what to do.
         for needle in [name, "Re-quantize", "Q2_0 tag 42"] {
             assert!(
