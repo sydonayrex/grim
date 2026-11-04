@@ -3235,3 +3235,38 @@ fn w4a4_gemv_matches_aq_aware_reference() {
         );
     }
 }
+
+/// Audit §4 regression/env — determinism (task_ring_gemm.rs:219 twice-run
+/// byte-equality pattern): the Q8_0 dot GEMV must produce bit-identical output
+/// across two runs with identical inputs. One canonical dot4 case (n=1024,
+/// k=1024, the `dot2_q80_parity_vs_cpu` fixture shape) only, not every case.
+#[test]
+#[ignore]
+fn dot4_q80_gemv_deterministic_across_runs() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+    let (n, k) = (1024usize, 1024usize);
+    let (a, b_packed) = build_q80_case(1, n, k);
+    let (a_dev, b_dev) = upload_q80_case(&dev, &a, &b_packed, 1, k).expect("upload");
+    let r1 = run_quant_matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), n).expect("dot4 run 1");
+    let r2 = run_quant_matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), n).expect("dot4 run 2");
+    assert_eq!(r1.len(), r2.len(), "determinism output length");
+    for i in 0..r1.len() {
+        assert_eq!(
+            r1[i].to_bits(),
+            r2[i].to_bits(),
+            "dot4 Q8_0 GEMV not bit-deterministic at {i}: {} vs {}",
+            r1[i],
+            r2[i]
+        );
+    }
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}

@@ -16,7 +16,7 @@
 //! 6. Parity Verification: Replaying the captured graph produces bit-accurate / floating-point
 //!    matching results against eager execution across every step.
 
-use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::{AttentionOps, RocmDevice};
 use grim_tensor::{CoreTensorOps, DType, Shape};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -416,5 +416,139 @@ fn scratch_e_in_original_binary() {
         eprintln!("[D-trunc] step {step} parity ok");
     }
     eprintln!("[D-trunc] done");
+}
+
+/// Audit §4 regression/env — graph-replay-vs-eager for an attention kernel
+/// (10-step mutation template at :116-163, condensed to two replays): capture
+/// a `qkv_attention` over preallocated Q/K/V, replay, mutate ONE element of Q
+/// in place via `write_f32_into`, replay again, and assert the replayed output
+/// matches eager (≤1e-5). If attention is not capturable by this file's
+/// helper (`begin/end_graph_capture` + `CoreTensorOps`/`AttentionOps` launches),
+/// the attempt must fail closed (Err at begin/end/replay) — capture must never
+/// silently record host work or return a bogus graph.
+#[test]
+#[ignore]
+fn graph_replay_attention_matches_eager_after_inplace_mutation() -> TestResult {
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return Ok(());
+    };
+    // Preallocated Q/K/V in decode shape (matches qkv_attention.rs fixtures).
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (4usize, 4usize, 4usize, 8usize, 4usize);
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+    let kv_shape = Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]);
+    let mut q_data: Vec<f32> = (0..(seq_len * num_heads * head_dim))
+        .map(|i| (i as f32 * 0.13).sin())
+        .collect();
+    let k_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| (i as f32 * 0.11).cos())
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| (i as f32 * 0.07).sin())
+        .collect();
+    let q_dev = CoreTensorOps::from_cpu(&dev, &q_data, &out_shape, DType::F32)?;
+    let k_dev = CoreTensorOps::from_cpu(&dev, &k_data, &kv_shape, DType::F32)?;
+    let v_dev = CoreTensorOps::from_cpu(&dev, &v_data, &kv_shape, DType::F32)?;
+
+    let eager_once = |devp: &RocmDevice, qh: &[f32]| -> TestResult<Vec<f32>> {
+        let q_e = CoreTensorOps::from_cpu(devp, qh, &out_shape, DType::F32)?;
+        let (out, h) = devp.qkv_attention(
+            q_e.as_ref(),
+            k_dev.as_ref(),
+            v_dev.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+            None,
+            None,
+        )?;
+        h.synchronize()?;
+        Ok(out.to_cpu_vec_f32()?)
+    };
+
+    // Warmup eager attention (JIT + launcher tables live before capture).
+    let _w = eager_once(&dev, &q_data)?;
+
+    // Capture: the graph reads q_dev/k_dev/v_dev and writes a captured out.
+    let graph_key = "attention-replay-probe";
+    if dev.graph_capture_enabled() {
+        dev.begin_graph_capture(graph_key)?;
+        let (cap_out, _cap_h) = dev.qkv_attention(
+            q_dev.as_ref(),
+            k_dev.as_ref(),
+            v_dev.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+            None,
+            None,
+        )?;
+        let end_res = dev.end_graph_capture(graph_key);
+        if end_res.is_err() {
+            // Fail-closed: an attention launch is not capturable by this helper.
+            eprintln!(
+                "[graph-attn] capture refused (fail-closed): {:?}",
+                end_res.err()
+            );
+            assert!(
+                !dev.has_captured_graph(graph_key),
+                "no attention graph may survive a failed capture"
+            );
+            return Ok(());
+        }
+        assert!(
+            dev.has_captured_graph(graph_key),
+            "attention capture must instantiate and store the graph"
+        );
+
+        // Replay once (pre-mutation) and compare to eager on the same Q.
+        assert!(dev.replay_graph(graph_key)?);
+        dev.synchronize();
+        let replay0 = cap_out.to_cpu_vec_f32()?;
+        let eager0 = eager_once(&dev, &q_data)?;
+        assert_eq!(eager0.len(), replay0.len());
+        let mut diff = 0.0f32;
+        for (a, b) in eager0.iter().zip(replay0.iter()) {
+            diff = diff.max((a - b).abs());
+        }
+        eprintln!("[graph-attn] pre-mutation replay-vs-eager max diff={diff:.3e}");
+        assert!(diff <= 1e-5, "pre-mutation replay diverges from eager: {diff:.3e}");
+
+        // Mutate ONE element of Q in place (10-step template, condensed to one
+        // mutation), replay again, and require the replayed output == eager.
+        q_data[0] += 0.5;
+        dev.write_f32_into(q_dev.as_ref(), &q_data)?;
+        assert!(dev.replay_graph(graph_key)?);
+        dev.synchronize();
+        let replay1 = cap_out.to_cpu_vec_f32()?;
+        let eager1 = eager_once(&dev, &q_data)?;
+        let mut diff1 = 0.0f32;
+        for (a, b) in eager1.iter().zip(replay1.iter()) {
+            diff1 = diff1.max((a - b).abs());
+        }
+        eprintln!("[graph-attn] post-mutation replay-vs-eager max diff={diff1:.3e}");
+        assert!(
+            diff1 <= 1e-5,
+            "post-mutation replay diverges from eager: {diff1:.3e}"
+        );
+        dev.drop_captured_graph(graph_key)?;
+        assert!(!dev.has_captured_graph(graph_key));
+    } else {
+        // Capture disabled (GRIM_CAPTURE_GRAPH unset): begin/end are no-ops and
+        // replay returns Ok(false). Document the fail-closed no-op behavior.
+        eprintln!("[graph-attn] capture disabled (GRIM_CAPTURE_GRAPH unset) — eager only");
+        dev.begin_graph_capture(graph_key)?;
+        dev.end_graph_capture(graph_key)?;
+        assert!(
+            !dev.replay_graph(graph_key)?,
+            "with capture disabled, replay must return Ok(false) (no silent graph)"
+        );
+    }
+    Ok(())
 }
 

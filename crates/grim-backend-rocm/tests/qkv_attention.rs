@@ -3921,3 +3921,128 @@ fn probe_rope_dev_base_pos0_identity() {
     }
     eprintln!("[probe] total moved at pos=0: {moved} (expect 0 if identity)");
 }
+
+/// Audit §2.5/§4 — increasing-max rescaling probe for softmax (running-max
+/// updates): a QKV row whose strictly increasing logits force the online
+/// softmax's running max to move repeatedly. Compared against an f64
+/// reference; the GPU result must stay within 1e-4 relative. `reduction_parity.rs`
+/// covers only `reduce_sum`/`reduce_max`/`argmax` (no softmax surface to reuse),
+/// so the probe lives here per the audit suggestion and uses this file's own
+/// CPU reference (`reference_attention`) plus an f64 softmax on the raw scores.
+#[test]
+#[ignore]
+fn increasing_max_softmax_matches_f64_reference() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    // seq=8 queries over 8 KV positions, 1 head, head_dim=8. Q is the identity
+    // pattern (q_i = e_i) and K_j = c_j * e_{j % 8} with c strictly increasing,
+    // so query 7 sees scores [0, c1, ..., c7] — each step raises the running max.
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (8usize, 1usize, 1usize, 8usize, 8usize);
+    let mut q_data = vec![0.0f32; seq_len * num_heads * head_dim];
+    for i in 0..seq_len {
+        q_data[(i * num_heads + 0) * head_dim + (i % head_dim)] = 1.0;
+    }
+    // Include negative warmup logits so the running max moves from -inf
+    // through negatives before the strictly increasing tail—max updates every step.
+    let c: [f32; 8] = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+    let mut k_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
+    let mut v_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
+    for j in 0..kv_seq_len {
+        k_data[(j * num_kv_heads + 0) * head_dim + (j % head_dim)] = c[j];
+        for d in 0..head_dim {
+            v_data[(j * num_kv_heads + 0) * head_dim + d] = (j * head_dim + d) as f32 * 0.5;
+        }
+    }
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+    let q_buf = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let k_buf = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v_buf = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let (out, h) = dev
+        .qkv_attention(
+            q_buf.as_ref(),
+            k_buf.as_ref(),
+            v_buf.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+            None,
+            None,
+        )
+        .unwrap();
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+
+    // f64 reference: recompute scores in f64, online-softmax in f64 (running
+    // max + running sum), weight V. Also keep the file's own CPU reference for
+    // a coarse cross-check.
+    let want_f32 = reference_attention(
+        &q_data, &k_data, &v_data, seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, 0,
+    );
+    let scale = 1.0f64 / (head_dim as f64).sqrt();
+    let mut want_f64 = vec![0.0f64; seq_len * num_heads * head_dim];
+    for i in 0..seq_len {
+        // causal: query i attends j <= i (cache_offset = 0)
+        let mut rmax = f64::NEG_INFINITY;
+        let mut rsum = 0.0f64;
+        let mut scores = vec![0.0f64; i + 1];
+        for j in 0..=i {
+            let mut dot = 0.0f64;
+            for d in 0..head_dim {
+                dot += q_data[(i * num_heads + 0) * head_dim + d] as f64
+                    * k_data[(j * num_kv_heads + 0) * head_dim + d] as f64;
+            }
+            let s = dot * scale;
+            scores[j] = s;
+            rmax = rmax.max(s);
+        }
+        for &s in &scores {
+            rsum += (s - rmax).exp();
+        }
+        for d in 0..head_dim {
+            let mut acc = 0.0f64;
+            for j in 0..=i {
+                acc += ((scores[j] - rmax).exp() / rsum)
+                    * v_data[(j * num_kv_heads + 0) * head_dim + d] as f64;
+            }
+            want_f64[(i * num_heads + 0) * head_dim + d] = acc;
+        }
+    }
+
+    let mut worst_rel = 0.0f64;
+    for (g, w) in got.iter().zip(want_f64.iter()) {
+        let denom = (w.abs() as f64).max(1e-6);
+        let rel = ((*g as f64) - w).abs() / denom;
+        if rel > worst_rel {
+            worst_rel = rel;
+        }
+    }
+    eprintln!("[increasing-max-softmax] worst_rel={worst_rel:.3e}");
+    assert!(
+        worst_rel <= 1e-4,
+        "increasing-max softmax diverges from f64 reference: worst_rel={worst_rel:.3e}"
+    );
+    // Coarse cross-check against the file's own CPU reference.
+    assert!(
+        approx_close(&got, &want_f32, 1e-3),
+        "increasing-max softmax diverges from reference_attention"
+    );
+}

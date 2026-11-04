@@ -127,6 +127,64 @@ fn run_case(dev: &RocmDevice, rows: usize, row_len: usize) {
     }
 }
 
+/// Audit §4 regression/env — determinism (task_ring_gemm.rs:219 twice-run
+/// byte-equality pattern): the fused add+rms_norm launched twice with identical
+/// inputs must be bit-identical element-wise. One canonical case
+/// (rows=1, row_len=1024) only, not every case.
+#[test]
+#[ignore]
+fn fused_add_rms_norm_deterministic_across_runs() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let rows = 1usize;
+    let row_len = 1024usize;
+    let n = rows * row_len;
+    let shape = Shape::new(vec![rows, row_len]);
+    let x = fill(n, 0.1);
+    let r = fill(n, 2.7);
+    let w: Vec<f32> = (0..row_len).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+    let x_s = dev.from_cpu(&x, &shape, DType::F32).unwrap();
+    let r_s = dev.from_cpu(&r, &shape, DType::F32).unwrap();
+    let w_s = dev
+        .from_cpu(&w, &Shape::new(vec![row_len]), DType::F32)
+        .unwrap();
+    let run_once = |devp: &RocmDevice| -> (Vec<f32>, Vec<f32>) {
+        let sum = devp.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        let norm = devp.from_cpu(&vec![0.0f32; n], &shape, DType::F32).unwrap();
+        devp.fused_add_rms_norm_into(
+            x_s.as_ref(),
+            r_s.as_ref(),
+            w_s.as_ref(),
+            1e-5,
+            as_rocm(sum.as_ref()).unwrap(),
+            as_rocm(norm.as_ref()).unwrap(),
+            &shape,
+        )
+        .unwrap();
+        (
+            sum.to_cpu_vec_f32().unwrap(),
+            norm.to_cpu_vec_f32().unwrap(),
+        )
+    };
+    let (s1, n1) = run_once(&dev);
+    let (s2, n2) = run_once(&dev);
+    for i in 0..n {
+        assert_eq!(
+            s1[i].to_bits(),
+            s2[i].to_bits(),
+            "fused_add_rms_norm sum not bit-deterministic at {i}"
+        );
+        assert_eq!(
+            n1[i].to_bits(),
+            n2[i].to_bits(),
+            "fused_add_rms_norm norm not bit-deterministic at {i}"
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn fused_add_rms_norm_matches_split_path() {

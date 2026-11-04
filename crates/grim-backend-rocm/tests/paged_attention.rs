@@ -203,3 +203,101 @@ fn test_paged_attention_gpu_matches_reference() {
         }
     }
 }
+
+/// Audit §4 regression/env — determinism (task_ring_gemm.rs:219 twice-run
+/// byte-equality pattern): paged attention launched twice with identical
+/// inputs must be bit-identical element-wise. One canonical case (the
+/// positive fixture above: batch=1, heads=2/1, head_dim=8, page_size=4)
+/// only, not every case.
+#[test]
+#[ignore]
+fn paged_attention_deterministic_across_runs() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = Arc::new(
+        RocmDevice::try_new(0)
+            .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
+    );
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let batch = 1u32;
+    let num_heads = 2u32;
+    let num_kv_heads = 1u32;
+    let head_dim = 8u32;
+    let page_size = 4u32;
+    let kv_seq_len = 8u32;
+    let max_blocks = 2u32;
+    let cache_offset = 7u32;
+    let q_shape = Shape::new(vec![batch as usize, num_heads as usize, head_dim as usize]);
+    let page_shape = Shape::new(vec![
+        2usize,
+        page_size as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+    ]);
+    let out_shape = q_shape.clone();
+    let q_cpu: Vec<f32> = (0..16).map(|x| (x as f32 * 0.1).sin()).collect();
+    let k_cpu: Vec<f32> = (0..64).map(|x| (x as f32 * 0.15).cos()).collect();
+    let v_cpu: Vec<f32> = (0..64).map(|x| (x as f32 * 0.2).sin()).collect();
+    let table_entries = [
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
+    ];
+    let table_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(
+            table_entries.as_ptr() as *const f32,
+            table_entries.len() * 2,
+        )
+    };
+    let table_storage = dev
+        .from_cpu(
+            table_f32,
+            &Shape::new(vec![batch as usize, max_blocks as usize, 2]),
+            DType::F32,
+        )
+        .unwrap();
+    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+    let k_storage = dev.from_cpu(&k_cpu, &page_shape, DType::F32).unwrap();
+    let v_storage = dev.from_cpu(&v_cpu, &page_shape, DType::F32).unwrap();
+    let run_once = |devp: &Arc<RocmDevice>| -> Vec<f32> {
+        let mut out_storage = CoreTensorOps::zeros(devp.as_ref(), &out_shape, DType::F32).unwrap();
+        launch_paged_attention(
+            devp,
+            q_storage.as_ref(),
+            table_storage.as_ref(),
+            k_storage.as_ref(),
+            v_storage.as_ref(),
+            out_storage.as_mut(),
+            batch,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            0i32,
+            None,
+        )
+        .expect("launch_paged_attention");
+        out_storage.to_cpu_vec_f32().unwrap()
+    };
+    let r1 = run_once(&dev);
+    let r2 = run_once(&dev);
+    assert_eq!(r1.len(), r2.len(), "determinism output length");
+    for i in 0..r1.len() {
+        assert_eq!(
+            r1[i].to_bits(),
+            r2[i].to_bits(),
+            "paged_attention not bit-deterministic at {i}: {} vs {}",
+            r1[i],
+            r2[i]
+        );
+    }
+}
