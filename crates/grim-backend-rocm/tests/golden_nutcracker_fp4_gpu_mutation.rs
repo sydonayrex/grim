@@ -170,3 +170,86 @@ fn test_nutcracker_packed_data_is_well_formed() -> TestResult {
     assert!(nrmse < 0.15, "NRMSE {nrmse:.4} is implausible for 4.5 bpw");
     Ok(())
 }
+
+// ── Real mutation proof — M-NUT-SEL-01 ──────────────────────────────────────
+//
+// Manual perturbation (no cargo-mutants): flip ONE selector nibble — force the
+// block-0 selector (low 2 bits of packed byte 0, 9-byte block layout) to the
+// other two-bit pattern (`sel ^ 3`). The kernel is untouched. The true CPU
+// oracle is untouched. Only the GPU's packed weight buffer is perturbed —
+// equivalent to the kernel ignoring/mangling the selector bits it must honor.
+//
+// Gate: passes_unmutated == true AND passes_mutated == false under the main
+// test's peak-relative bound (max_err <= max(peak*0.15, 1e-4)), factored as a
+// closure. Mutation ID: M-NUT-SEL-01.
+#[test]
+#[ignore = "requires AMD GPU"]
+fn test_nutcracker_gpu_gemm_mutation_is_detected() -> TestResult {
+    let (m, k, n) = (1usize, 256usize, 128usize);
+    let a_data: Vec<f32> = weights(m * k);
+    let b_orig: Vec<f32> = weights(k * n);
+    let b_packed = quant_nutcracker(&b_orig)?;
+    let b_dequant = dequant_nutcracker(&b_packed, k * n)?;
+    let expected = ground_truth(&a_data, &b_dequant, m, k, n);
+
+    let mut peak = 0.0f32;
+    for &v in &expected {
+        peak = peak.max(v.abs());
+    }
+    let bound = (peak * 0.15).max(1e-4);
+    let verdict = |actual: &[f32]| -> bool {
+        assert_eq!(actual.len(), expected.len());
+        actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+            <= bound
+    };
+
+    // CPU-only sensitivity proof (device-free): decode the mutated bytes with
+    // the reference decoder and run the ground-truth contraction. Must fail.
+    assert!(!b_packed.is_empty(), "packed buffer empty — cannot mutate selector");
+    let mut b_mutated = b_packed.clone();
+    b_mutated[0] ^= 0x03; // flip block-0 selector (low 2 bits)
+    let b_dequant_mut = dequant_nutcracker(&b_mutated, k * n)?;
+    let cpu_mut = ground_truth(&a_data, &b_dequant_mut, m, k, n);
+    assert!(verdict(&expected), "oracle must pass its own verdict");
+    assert!(
+        !verdict(&cpu_mut),
+        "M-NUT-SEL-01 not detected at CPU level: mutated-selector oracle still passes — fixture insensible"
+    );
+
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] M-NUT-SEL-01: no GPU (CPU sensitivity proven above)");
+        return Ok(());
+    };
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
+    let out_shape = Shape::from_slice(&[m, n]);
+    let dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::FloatPack(FloatPackScheme::NutFp4),
+    };
+    let run_gpu = |packed: &[u8]| -> TestResult<Vec<f32>> {
+        let b_dev = MemoryOps::from_cpu_bytes(&dev, packed, &Shape::from_slice(&[n, k]), dtype.clone())?;
+        let (out, handle) = dev.quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Fp4,
+            &out_shape,
+        )?;
+        handle.synchronize()?;
+        Ok(out.to_cpu_vec_f32()?)
+    };
+
+    let passes_unmutated = verdict(&run_gpu(&b_packed)?);
+    let passes_mutated = verdict(&run_gpu(&b_mutated)?);
+    assert!(passes_unmutated, "unmutated GPU run must pass");
+    assert!(
+        !passes_mutated,
+        "M-NUT-SEL-01 NOT detected: flipped-selector GPU output still passes — gate did not fire"
+    );
+    Ok(())
+}

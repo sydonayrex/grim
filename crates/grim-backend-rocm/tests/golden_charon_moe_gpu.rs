@@ -1808,3 +1808,118 @@ fn charon_grouped_iqk_q2k() {
 fn charon_grouped_iqk_q3k() {
     kat_iqk(11, IQK_BLOCK_BYTES[11], IQK_NAMES[11]);
 }
+
+// ── Real mutation proof — M-CHARON-SILU-01 ──────────────────────────────────
+//
+// Manual perturbation (no cargo-mutants): SiLU negated — `-silu(x)` instead of
+// `silu(x)` in the fused dispatch. The HIP kernel is untouched; the
+// perturbation is applied at the GPU-input boundary, the weakest true mutation
+// that fits without touching HIP source: the activation tensor fed to the
+// kernel is negated (x -> -x), and the CPU oracle is run on the same negated
+// tensor to produce the mutated expectation (a faithful kernel on negated
+// input must match it, and must NOT match the true oracle within tolerance).
+// SiLU is not odd — silu(-x) != silu(x) (silu(-1) = -0.27, silu(1) = +0.73) —
+// so the mutated expectation diverges from the true oracle by O(1).
+//
+// Gate: passes_unmutated == true (each GPU run within the main test's
+// max-abs-diff <= 1e-3 verdict against its reference) AND
+// passes_mutated == false (GPU on true input vs the negated-input CPU oracle).
+// Mutation ID: M-CHARON-SILU-01.
+#[test]
+#[ignore]
+fn charon_fused_dispatch_mutation_is_detected() {
+    let routed_scaling_factor = 1.0f32;
+    let moe = build_moe_oracle(routed_scaling_factor);
+    let x_vec = deterministic_activations();
+    let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
+
+    // G-A3 oracle-integrity guard (same as the other golden tests).
+    let moe_rsf1 = build_moe_oracle(1.0f32);
+    let moe_rsf05 = build_moe_oracle(0.5f32);
+    assert_oracle_respects_rsf(&x_vec, &moe_rsf1, &moe_rsf05);
+
+    // True reference.
+    let cpu_true = moe
+        .forward(&x)
+        .expect("CPU oracle forward")
+        .to_vec_f32()
+        .expect("cpu vec");
+
+    // Mutated expectation: same oracle on negated activations (-silu class:
+    // SiLU of the negated stream diverges from the true stream's SiLU).
+    let x_vec_neg: Vec<f32> = x_vec.iter().map(|&v| -v).collect();
+    let x_neg = cpu_tensor(x_vec_neg.clone(), Shape::new(vec![BATCH, HIDDEN]));
+    let moe_neg = build_moe_oracle(routed_scaling_factor);
+    let cpu_mut = moe_neg
+        .forward(&x_neg)
+        .expect("CPU mutated oracle forward")
+        .to_vec_f32()
+        .expect("cpu vec");
+
+    let verdict = |actual: &[f32], reference: &[f32]| -> bool {
+        assert_eq!(actual.len(), reference.len());
+        max_abs_diff(actual, reference) <= 1e-3
+    };
+
+    // CPU-only sensitivity proof (device-free): true-vs-mutated oracle
+    // divergence must exceed tolerance, otherwise the fixture cannot detect
+    // the mutation at all.
+    assert!(verdict(&cpu_true, &cpu_true), "oracle must match itself");
+    assert!(
+        !verdict(&cpu_mut, &cpu_true),
+        "M-CHARON-SILU-01 not detected at CPU level: negated-activation oracle still matches the true oracle within 1e-3 — fixture insensible"
+    );
+
+    let Some(dev) = gpu_device() else {
+        eprintln!("M-CHARON-SILU-01: no GPU (CPU sensitivity proven above)");
+        return;
+    };
+
+    let (indices, weights) = moe.router.route(&x).expect("router route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
+
+    let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
+    let gpu_true = dev
+        .charon_fused_dispatch_roundtrip(
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
+        )
+        .expect("charon roundtrip (true weights)");
+
+    let gpu_mut = dev
+        .charon_fused_dispatch_roundtrip(
+            &x_vec_neg,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
+        )
+        .expect("charon roundtrip (negated activations)");
+
+    // True input: GPU must match the true oracle. Negated input: GPU must
+    // match the negated oracle AND must NOT match the true oracle.
+    let passes_unmutated = verdict(&gpu_true, &cpu_true);
+    let passes_mutated = verdict(&gpu_mut, &cpu_true);
+    assert!(passes_unmutated, "unmutated GPU run must match the true oracle within 1e-3");
+    assert!(
+        verdict(&gpu_mut, &cpu_mut),
+        "mutated GPU run should track the mutated oracle (faithful kernel)"
+    );
+    assert!(
+        !passes_mutated,
+        "M-CHARON-SILU-01 NOT detected: negated-activation GPU output still matches the true oracle within 1e-3 — gate did not fire"
+    );
+}
