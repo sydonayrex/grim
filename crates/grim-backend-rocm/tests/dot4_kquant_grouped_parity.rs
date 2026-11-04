@@ -3312,3 +3312,196 @@ fn iq4xs_gemv_sub_v3_parity_and_speed() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLAN-iq4xs-multirow: parity + cold-cache bench for the multi-row arm.
+// Separate from the M=1 production dispatch (v8 default, commit 97738ef2);
+// the host dequant oracle below is the same `dequant_q81` + `dequant(bq)`
+// pair the M=1 test uses, applied per row.
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn iq4xs_gemv_rows_parity_and_speed() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return;
+    };
+
+    // Parity: bit-exact vs v2 per row, envelope vs host oracle.
+    for (k, n, m) in [
+        (5120usize, 4096usize, 1usize),
+        (5120, 4096, 2),
+        (5120, 4096, 8),
+        (5120, 17408, 8),
+        (17408, 5120, 8),
+    ] {
+        let (blk_bytes, quant, dequant) = scheme("iq4xs");
+        let row_bytes = (k / 256) * blk_bytes;
+        let mut rng = Lcg(0x14C45C ^ (k as u64) ^ ((n as u64) << 32) ^ (m as u64));
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
+
+        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![m * k]), f32ty)
+            .map_err(|e| format!("a h2d: {e}")).unwrap();
+        let q81_len = m * (k / 32) * 36;
+        let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
+            .map_err(|e| format!("q81 alloc: {e}")).unwrap();
+        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81_st.as_ref()).unwrap(), m, k)
+            .map_err(|e| format!("quantize: {e}")).unwrap();
+        dev.synchronize();
+        let q81_host = bytes_of(&q81_st).unwrap();
+        let a_deq = dequant_q81(&q81_host, m * k);
+
+        let mut bq = vec![0u8; n * row_bytes];
+        for col in 0..n {
+            let packed = quant(&b[col * k..(col + 1) * k]).map_err(|e| format!("quant: {e}")).unwrap();
+            assert_eq!(packed.len(), row_bytes, "iq4xs row length");
+            bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
+        }
+        let b_st = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
+            .map_err(|e| format!("b h2d: {e}")).unwrap();
+
+        let mk_out = || MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native },
+        ).map_err(|e| format!("out alloc: {e}")).unwrap();
+        let out_v2 = mk_out();
+        let out_r2 = mk_out();
+        let out_r8 = mk_out();
+
+        let a_r = as_rocm(q81_st.as_ref()).unwrap();
+        let b_r = as_rocm(b_st.as_ref()).unwrap();
+        let o_v2 = as_rocm(out_v2.as_ref()).unwrap();
+        let o_r2 = as_rocm(out_r2.as_ref()).unwrap();
+        let o_r8 = as_rocm(out_r8.as_ref()).unwrap();
+
+        dev.launch_dot4_iq4xs_q81_gemv_v8_for_ab(a_r, b_r, o_v2, m, n, k)
+            .map_err(|e| format!("v8 (ref): {e}")).unwrap();
+        dev.launch_dot4_iq4xs_q81_gemv_rows2_for_ab(a_r, b_r, o_r2, m, n, k)
+            .map_err(|e| format!("v9-r2: {e}")).unwrap();
+        dev.launch_dot4_iq4xs_q81_gemv_rows8_for_ab(a_r, b_r, o_r8, m, n, k)
+            .map_err(|e| format!("v9-r8: {e}")).unwrap();
+        dev.synchronize();
+
+        let got_v2 = f32_vec(&out_v2).unwrap();
+        let got_r2 = f32_vec(&out_r2).unwrap();
+        let got_r8 = f32_vec(&out_r8).unwrap();
+        for (i, (x, y)) in got_v2.iter().zip(got_r2.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(),
+                "k={k} n={n} m={m}: v9-r2 diverged from v8 at [{i}]: {x} vs {y}");
+        }
+        for (i, (x, y)) in got_v2.iter().zip(got_r8.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(),
+                "k={k} n={n} m={m}: v9-r8 diverged from v8 at [{i}]: {x} vs {y}");
+        }
+
+        // Envelope vs host oracle per row: dot(dequant_q81(a), dequant(bq)).
+        let scale = got_v2.iter().fold(0.0f32, |mx, v| mx.max(v.abs())).max(1e-6);
+        for row in 0..m {
+            for col in 0..n {
+                let w = dequant(&bq[col * row_bytes..(col + 1) * row_bytes], k).unwrap();
+                let want: f32 = a_deq[row * k..(row + 1) * k].iter().zip(w.iter())
+                    .map(|(x, y)| x * y).sum();
+                let rel = (got_r2[row * n + col] - want).abs() / scale;
+                assert!(rel <= 5e-3, "k={k} n={n} m={m} ({row},{col}): rel {rel} > 5e-3");
+            }
+        }
+        eprintln!("[iq4xs-v9] k={k} n={n} m={m}: parity green (bit-exact vs v8, envelope vs host)");
+    }
+
+    // Cold-cache A/B: 8 rotating weight blobs, same accounting as the
+    // iq4xs_gemv_sub_v3_parity_and_speed harness, extended to M rows.
+    let n_copies = 8usize;
+    let iters = 200usize;
+    let shapes = [(5120usize, 17408usize, 8usize), (17408usize, 5120usize, 8usize), (5120usize, 17408usize, 2usize)];
+    for (k, n, m) in shapes {
+        let (blk_bytes, quant, _deq) = scheme("iq4xs");
+        let row_bytes = (k / 256) * blk_bytes;
+        let q81_len = m * (k / 32) * 36;
+        let mut rng = Lcg(0xBEEF_9999u64 ^ k as u64 ^ n as u64 ^ m as u64);
+        let mut weight_blobs: Vec<Vec<u8>> = Vec::with_capacity(n_copies);
+        for _ in 0..n_copies {
+            let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
+            let mut packed = vec![0u8; n * row_bytes];
+            for col in 0..n {
+                let p = quant(&b[col * k..(col + 1) * k]).unwrap();
+                packed[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&p);
+            }
+            weight_blobs.push(packed);
+        }
+        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).unwrap();
+        let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone()).unwrap();
+        dev.launch_quantize_q8_1(as_rocm(a_st.as_ref()).unwrap(), as_rocm(q81_st.as_ref()).unwrap(), m, k).unwrap();
+        dev.synchronize();
+        let a_r = as_rocm(q81_st.as_ref()).unwrap();
+        let b_sts: Vec<_> = weight_blobs.iter().map(|wb| {
+            MemoryOps::from_cpu_bytes(&dev, wb, &Shape::new(vec![wb.len()]), u8ty.clone()).unwrap()
+        }).collect();
+        let out_v8 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let out_r2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let out_r8 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native }).unwrap();
+        let o_v8 = as_rocm(out_v8.as_ref()).unwrap();
+        let o_r2 = as_rocm(out_r2.as_ref()).unwrap();
+        let o_r8 = as_rocm(out_r8.as_ref()).unwrap();
+
+        let bytes_moved = (n * row_bytes + q81_len + m * n * 4) as f64;
+        let time = |f: &dyn Fn(usize)| {
+            for i in 0..20 { f(i % n_copies); }
+            dev.synchronize();
+            let t0 = std::time::Instant::now();
+            for i in 0..iters { f(i % n_copies); }
+            dev.synchronize();
+            t0.elapsed().as_secs_f64() / iters as f64
+        };
+
+        let qw_words = (n * row_bytes) / 4;
+        let probe_out = MemoryOps::alloc_storage(&dev, &Shape::new(vec![4]), f32ty.clone()).unwrap();
+        let t_probe = time(&|i| {
+            let _ = dev.launch_stream_read_probe(
+                as_rocm(b_sts[i].as_ref()).unwrap(),
+                as_rocm(probe_out.as_ref()).unwrap(),
+                qw_words,
+            );
+        });
+        let g_ceil = (qw_words * 4) as f64 / t_probe / 1e9;
+        let t_v8 = time(&|i| {
+            let _ = dev.launch_dot4_iq4xs_q81_gemv_v8_for_ab(a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_v8, m, n, k);
+        });
+        let t_r2 = time(&|i| {
+            let _ = dev.launch_dot4_iq4xs_q81_gemv_rows2_for_ab(a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_r2, m, n, k);
+        });
+        let t_r8 = time(&|i| {
+            let _ = dev.launch_dot4_iq4xs_q81_gemv_rows8_for_ab(a_r, as_rocm(b_sts[i].as_ref()).unwrap(), o_r8, m, n, k);
+        });
+        let g_v8 = bytes_moved / t_v8 / 1e9;
+        let g_r2 = bytes_moved / t_r2 / 1e9;
+        let g_r8 = bytes_moved / t_r8 / 1e9;
+        eprintln!(
+            "[iq4xs v9 A/B] k={k} n={n} m={m} (ceiling {g_ceil:.1} GB/s):\n\
+             | v8 (M=1 ref): {g_v8:.1} GB/s ({:.1}% ceiling)\n\
+             | v9-r2:        {g_r2:.1} GB/s ({:.1}% ceiling) | r2/v8 = {:.3} (bar >= 1.03)\n\
+             | v9-r8:        {g_r8:.1} GB/s ({:.1}% ceiling) | r8/v8 = {:.3} (bar >= 1.06)",
+            g_v8 / g_ceil * 100.0,
+            g_r2 / g_ceil * 100.0,
+            g_r2 / g_v8,
+            g_r8 / g_ceil * 100.0,
+            g_r8 / g_v8,
+        );
+        if g_r2 / g_v8 >= 1.03 {
+            eprintln!("[iq4xs-v9-r2] SHIP BAR MET for k={k} n={n} m={m}");
+        } else {
+            eprintln!("[iq4xs-v9-r2] SHIP BAR MISSED for k={k} n={n} m={m}: r2/v8 {:.3} < 1.03x", g_r2 / g_v8);
+        }
+        if g_r8 / g_v8 >= 1.06 {
+            eprintln!("[iq4xs-v9-r8] SHIP BAR MET for k={k} n={n} m={m}");
+        } else {
+            eprintln!("[iq4xs-v9-r8] SHIP BAR MISSED for k={k} n={n} m={m}: r8/v8 {:.3} < 1.06x", g_r8 / g_v8);
+        }
+    }
+}

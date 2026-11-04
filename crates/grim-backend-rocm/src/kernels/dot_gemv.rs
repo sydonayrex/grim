@@ -7177,6 +7177,123 @@ extern "C" __global__ void __launch_bounds__(256) grim_dot4_iq4xs_q81_gemv_sub_v
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLAN-iq4xs-multirow: IQ4_XS multi-row GEMV v9. Separate arm; the M=1
+// production dispatch (v8, commit 97738ef2) and the host dequant oracle are
+// untouched by this kernel.
+//
+// One CTA decodes B (v8's B-first load order + grim_kv4_iq4xs_valu_fast
+// word-wide decode) ONCE and dots it against R activation rows, amortizing
+// the decode exposure (v8: 293.3 GB/s at gate/up, 94.1% of 311.6 ceiling;
+// load-only probe: 99.6% of ceiling). Grid: blockIdx.x = ceil(N/4),
+// blockIdx.y = ceil(M/R); blockDim (32,1,1). R is a compile-time macro;
+// R=2 = speculative decode, R=8 = prefill. Rows past M are skipped
+// per-row (no early-return — the CTA must stay alive for the valid rows).
+// ─────────────────────────────────────────────────────────────────────────────
+#define GRIM_ROWS_KERNEL(R, SFX)                                          \
+extern "C" __global__ void __launch_bounds__(32)                          \
+grim_dot4_iq4xs_q81_gemv_rows##SFX(                                       \
+    const unsigned char* __restrict__ A_q81,                              \
+    const unsigned char* __restrict__ B_iq4xs,                            \
+    float* __restrict__ C, int M, int N, int K)                           \
+{                                                                           \
+    const int lane = threadIdx.x;                                           \
+    const int col_base = blockIdx.x * 4;                                    \
+    const int row_base = blockIdx.y * R;                                    \
+    if (col_base >= N) return;                                              \
+    const int sub  = lane & 7;                                              \
+    const int slot = lane >> 3;                                             \
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;                          \
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);       \
+    const long long col_stride = (long long)n_sb * 136;                     \
+    const unsigned char* b0 = B_iq4xs + (long long)col_base * col_stride;   \
+    float facc[R][4];                                                       \
+    _Pragma("unroll")                                                       \
+    for (int r = 0; r < R; r++)                                             \
+        _Pragma("unroll")                                                   \
+        for (int j = 0; j < 4; j++) facc[r][j] = 0.0f;                      \
+    for (int sb = slot; sb < n_sb; sb += 4) {                               \
+        uint2 hdr_col[4];                                                   \
+        uint2 qv0_col[4];                                                   \
+        uint2 qv1_col[4];                                                   \
+        _Pragma("unroll")                                                   \
+        for (int j = 0; j < 4; j++) {                                       \
+            if (j < active_cols) {                                          \
+                const unsigned char* b_sb = b0 + j * col_stride +           \
+                    (long long)sb * 136;                                    \
+                hdr_col[j] = ((const uint2*)b_sb)[0];                       \
+                const uint2* qs2 = (const uint2*)(b_sb + 8 + sub * 16);     \
+                qv0_col[j] = qs2[0];                                        \
+                qv1_col[j] = qs2[1];                                        \
+            } else {                                                        \
+                hdr_col[j] = make_uint2(0u, 0u);                            \
+                qv0_col[j] = make_uint2(0u, 0u);                            \
+                qv1_col[j] = make_uint2(0u, 0u);                            \
+            }                                                               \
+        }                                                                   \
+        _Pragma("unroll")                                                   \
+        for (int r = 0; r < R; r++) {                                       \
+            const int row = row_base + r;                                   \
+            if (row >= M) break;                                            \
+            const unsigned char* a_row = A_q81 +                            \
+                (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES; \
+            const unsigned char* a_blk = a_row +                            \
+                (sb * 8 + sub) * GRIM_Q8_1_BYTES;                           \
+            const unsigned short a_scale =                                  \
+                ((const unsigned short*)a_blk)[0];                          \
+            int a4[8];                                                      \
+            __builtin_memcpy(a4, a_blk + 4, 32);                            \
+            const float d_a = fp16_to_float_device(a_scale);                \
+            _Pragma("unroll")                                               \
+            for (int j = 0; j < 4; j++) {                                   \
+                if (j >= active_cols) break;                                \
+                const unsigned hdr = hdr_col[j].x;                          \
+                const unsigned sc_l4 = hdr_col[j].y;                        \
+                const float d = fp16_to_float_device(                       \
+                    (unsigned short)(hdr & 0xFFFFu));                       \
+                const unsigned scales_h = hdr >> 16;                        \
+                const int ls = (int)((sc_l4 >> (4 * sub)) & 0x0Fu)         \
+                    | (((int)((scales_h >> (2 * sub)) & 3u)) << 4);        \
+                const float dl = d * (float)(ls - 32);                     \
+                const unsigned qw[4] = {qv0_col[j].x, qv0_col[j].y,         \
+                                        qv1_col[j].x, qv1_col[j].y};        \
+                int pos = 0;                                                \
+                _Pragma("unroll")                                           \
+                for (int w = 0; w < 4; w++) {                               \
+                    pos = grim_sdot4(a4[w],                                 \
+                        grim_kv4_iq4xs_valu_fast(qw[w]), pos);              \
+                    pos = grim_sdot4(a4[w + 4],                             \
+                        grim_kv4_iq4xs_valu_fast(qw[w] >> 4), pos);         \
+                }                                                           \
+                facc[r][j] += dl * d_a * (float)pos;                       \
+            }                                                               \
+        }                                                                   \
+    }                                                                       \
+    _Pragma("unroll")                                                       \
+    for (int r = 0; r < R; r++) {                                           \
+        _Pragma("unroll")                                                   \
+        for (int j = 0; j < 4; j++) {                                       \
+            _Pragma("unroll")                                               \
+            for (int off = 16; off > 0; off >>= 1)                          \
+                facc[r][j] += __shfl_xor(facc[r][j], off);                  \
+        }                                                                   \
+    }                                                                       \
+    if (lane == 0) {                                                        \
+        _Pragma("unroll")                                                   \
+        for (int r = 0; r < R; r++) {                                       \
+            const int row = row_base + r;                                   \
+            if (row >= M) break;                                            \
+            for (int j = 0; j < active_cols; j++)                           \
+                C[(long long)row * N + col_base + j] = facc[r][j];          \
+        }                                                                   \
+    }                                                                       \
+}
+
+GRIM_ROWS_KERNEL(2, _r2)
+GRIM_ROWS_KERNEL(8, _r8)
+#undef GRIM_ROWS_KERNEL
+
 "#;
 
 #[cfg(test)]

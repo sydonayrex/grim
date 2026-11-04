@@ -299,17 +299,18 @@
 
 ### Task 5B.5: Migrate qwen35 decode graph (the prize)
 **Files:** `decode_graph.rs` emission regions ONLY. Placement / KDA wiring / routing policy STAY in `qwen35.rs`.
-- [ ] Baseline: structural task graph verified (37 nodes identical).
+- [x] Baseline: structural task graph verified (37 nodes pinned node-for-node in `qwen35_graph_capture.rs`).
 - [ ] Migrate ONE block kind per commit:
   - Attention blocks: reverted premature flag mutation (`dd69837a`); awaiting grim-graph redesign.
   - KDA recurrent blocks: reverted premature flag mutation (`dd69837a`); awaiting grim-graph redesign.
-  - FFN blocks: reverted premature flag mutation (`dd69837a`); awaiting grim-graph redesign.
+  - FFN blocks: migrated through operand-carrying `grim-graph` (`emit_norm` and `emit_linear_dedup` with explicit `record_ir: false`, committed `b7080f62` and `a3e2380f`).
+    - *Finding on 37-node baseline:* In `d3c77e6e`, `ffn_gate` and `ffn_up` were never recorded as IR nodes (only `ffn_down` and residual add were). Emitting them unconditionally added 4 nodes (2 attention layers × 2 projections = 41 nodes). Explicit `record_ir: false` at call site preserves the 37-node contract node-for-node.
 - [ ] Final step (mandatory, anti-stall): DELETE the superseded emission code (expect −2-4k lines scoped to emission regions). Full suites: `cargo test -p grim-cli` (bin tests), backend-rocm GPU-gated, grim-server integration.
-- [ ] Gates:
-  - IR census node-for-node equal (37 nodes): catches IR topology drift / missing graph nodes.
-  - Real-launch census gate (`quant_census_repro.rs`): catches skipped `grim_quantize_q8_1` / kernel launches on GPU.
+- [x] Gates:
+  - IR census node-for-node equal (37 nodes): pinned node-for-node in `qwen35_capture_emits_a_structurally_true_task_graph`.
+  - Real-launch census gate (`quant_census_repro.rs`): passes on GPU, asserts 1 quant launch for attention and FFN dedup, byte-identical logits vs `GRIM_DEDUP_QUANT=0`.
   - Two-card split model replay green (committed `9a97ff23`).
-  - `qwen35_graph_capture` suite 13/13 passed.
+  - `qwen35_graph_capture` suite 14/14 passed.
   **ON FAILURE at any sub-step:** the block kind reverts to the old path; report. Do not leave a half-migrated kind committed.
 
 ---

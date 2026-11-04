@@ -2113,6 +2113,92 @@ impl RocmDevice {
         )
     }
 
+    /// PLAN-iq4xs-multirow: v9 A/B (M>1) entry points. Separate from the
+    /// M=1 production dispatch; grid_y = ceil(M / R), blockDim (32,1,1).
+    /// Gated on k % 256 == 0 (the iq4xs superblock alignment r2/r8 assume).
+    /// Not routed into `launch_dot4_iq4xs_q81_gemv` — deliberate: the M=1
+    /// arm is v8 and stays the default until v9 clears its ship bars.
+    pub fn launch_dot4_iq4xs_q81_gemv_rows2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_rows_with(act_q81, b_storage, out_storage, m, n, k, 2)
+    }
+
+    pub fn launch_dot4_iq4xs_q81_gemv_rows8_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_rows_with(act_q81, b_storage, out_storage, m, n, k, 8)
+    }
+
+    fn launch_dot4_iq4xs_q81_gemv_rows_with(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        rows_per_cta: usize,
+    ) -> Result<*mut c_void> {
+        let kernel_name = match rows_per_cta {
+            2 => "grim_dot4_iq4xs_q81_gemv_rows_r2",
+            8 => "grim_dot4_iq4xs_q81_gemv_rows_r8",
+            other => {
+                return Err(crate::Error::Backend(format!(
+                    "iq4xs rows: unsupported rows_per_cta {other} (wired: 2, 8)"
+                )))
+            }
+        };
+        assert!(
+            k % 256 == 0,
+            "iq4xs rows: k must be a multiple of 256 (got {k}); kernel assumes superblock alignment"
+        );
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("iq4xs rows: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("iq4xs rows: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("iq4xs rows: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_y = (m as u32).div_ceil(rows_per_cta as u32);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub(crate) fn launch_dot4_iq4xs_q81_gemv(
         &self,
         act_q81: &RocmStorage,
