@@ -7,8 +7,11 @@
 //!
 //! FP8 / MXFP4 / MXFP8 kernels are expected to be bit-exact against the CPU
 //! oracles in `grim_quant`. The IQ kernels use a simplified index-as-scale model
-//! and are expected to *deviate*; we only assert they run and we record max_err
-//! so the deviation is visible in the log.
+//! and are expected to *deviate* — they are NOT asserted bit-exact. What IS
+//! asserted is a loose smoke bound `max|gpu-cpu| <= 1.0` (see `run_iq`) so a
+//! total-kernel break cannot pass silently; tighten it to ~2x the observed
+//! max_err when the real device run measures it. A missing CPU oracle for an
+//! IQ scheme panics (fixture bug), never skips.
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::{
@@ -270,11 +273,15 @@ fn run_iq(
     assert_eq!(got.len(), n_weights, "{name}: kernel produced wrong count");
     let expected = match cpu(&bytes, n_weights) {
         Ok(e) => e,
-        Err(_) => {
-            eprintln!(
-                "[{name}_parity] skipped CPU oracle comparison (format unimplemented in CPU oracle)"
+        Err(e) => {
+            // An unimplemented oracle is a fixture/oracle bug, NOT a skip: the
+            // `grim_quant` dequant for this scheme must exist (it is imported
+            // at the top of this file). Silently returning here would let the
+            // whole `iq_kernels_run_and_report_deviation` test pass vacuously
+            // on the very formats it exists to measure.
+            panic!(
+                "CPU oracle unimplemented for {name} — fixture bug, not a skip: {e:?}"
             );
-            return;
         }
     };
     assert_eq!(
@@ -293,6 +300,21 @@ fn run_iq(
     eprintln!(
         "[{name}_parity] kernel ran ok; max|gpu-cpu| = {} (kernels use simplified model)",
         max_err
+    );
+    // SMOKE bound (not a parity claim): the IQ kernels use a simplified
+    // index-as-scale model, so bit-exactness is NOT expected and must not be
+    // asserted here. This bound exists so a total-kernel break (wrong offset
+    // walk, zero output, NaN, uninit read) cannot pass silently — 1.0 is
+    // above any conceivable dequant output magnitude deviation for these
+    // fixtures: codes are ±127 max, the fixture bytes are `(i*7 % 256)` with
+    // scales drawn from the same bytes, so every dequantized value is a
+    // small single-digit f32 and a simplified-model deviation cannot reach
+    // 1.0 unless the kernel is fundamentally broken. Tighten when the real
+    // device run measures the actual max_err (replace 1.0 with ~2x observed).
+    assert!(
+        max_err <= 1.0,
+        "{name}: max|gpu-cpu| = {max_err} exceeds the smoke bound 1.0 — \
+         the IQ dequant kernel is broken, not merely simplified"
     );
 }
 

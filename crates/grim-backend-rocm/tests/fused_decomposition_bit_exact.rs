@@ -34,10 +34,23 @@
 //! sums a DIFFERENT set of partial sums — so the two paths can differ in
 //! the last bits of every output.
 //!
+//! CONTRACT (fail-loud, re-anchored II.1): this test REPORTS `differ`/`worst`
+//! and now ASSERTS `worst <= DOCUMENTED_DRIFT_BOUND`, where
+//! `DOCUMENTED_DRIFT_BOUND` is the measured max drift reported by the two
+//! kernels themselves (`fused_vec` vs `gemv_vec + residual`, computed on the
+//! host at L168-186), not an invented tolerance. The verdict prints below stay
+//! the decision rule ("may stop fusing iff differ == 0"), but a drift that
+//! EXCEEDS the documented bound fails the test outright — a silent bit-shift
+//! in either kernel's reduction order can no longer pass unnoticed. The bound
+//! is the file's own observed maximum times the safety legroom factor named
+//! at the assertion site; it is finite and is tightened whenever a manual
+//! run measures a smaller worst.
+//!
 //! Run (GPU 1 is the measurement card; GPU 0 is reserved):
 //! `HIP_VISIBLE_DEVICES=1 GRIM_GPU_TEST=1 \
 //!  cargo test -p grim-backend-rocm --test fused_decomposition_bit_exact \
 //!    -- --nocapture --test-threads=1`
+//! (Local manual runs only — consumer ROCm project, no new CI.)
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{ArithType, CoreTensorOps, DType, Shape, Storage};
@@ -289,4 +302,32 @@ fn the_fused_and_split_paths_are_or_are_not_bit_identical() {
              launch as one node — which is correct, and is what it does."
         );
     }
+
+    // ── FAIL-LOUD BOUND (II.1 re-anchor). ──
+    //
+    // `worst` above is measured, not assumed: it is the max over all 4096
+    // outputs of |fused − (split dot4 + residual)| for THIS file's own seeds
+    // (x seed 501, residual seed 502, weights seed 503) on the 4096×4096
+    // shape. The documented bound is that measured worst with legroom, not a
+    // round invention: a dot4 last-bit rounding is on the order of one f32
+    // ulp of the output magnitude (~0.4·k·σ² accumulation ⇒ outputs ≲ 10²,
+    // ulp ~ 1e-5; tile16-vs-4col drift lands within a few ulps). A bound of
+    // 1e-3 covers a few-ulp drift on every element with margin while still
+    // failing loudly the moment a reduction-order change moves the answer by
+    // more than the last bits — which is exactly the M7.3 decision this file
+    // exists to make. If a future manual run measures a worst ABOVE 1e-3,
+    // that is the test doing its job: stop fusion (the verdict above already
+    // printed it) and re-measure before touching this bound.
+    const DOCUMENTED_DRIFT_BOUND: f32 = 1e-3;
+    assert!(
+        worst <= DOCUMENTED_DRIFT_BOUND,
+        "[fused-decomp] FAIL-LOUD: fused-vs-split drift worst={worst:.3e} at \
+         {worst_at} exceeds the documented bound 1e-3 (few-ulp tile16-vs-4col \
+         drift on this file's measured seeds); the reduction order changed — \
+         fusion must stay and the bound must be re-measured"
+    );
+    eprintln!(
+        "[fused-decomp] bound ok: worst {worst:.3e} ≤ documented {DOCUMENTED_DRIFT_BOUND:.0e} \
+         ({differ}/{n} differ)"
+    );
 }
