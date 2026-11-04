@@ -14,6 +14,7 @@ pub mod imatrix;
 pub mod gptq;
 pub mod onnx;
 pub mod ostquant;
+pub mod prism_hadamard;
 pub mod safetensors;
 pub mod spec;
 pub mod tokenizer;
