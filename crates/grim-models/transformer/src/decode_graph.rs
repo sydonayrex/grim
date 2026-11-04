@@ -3071,7 +3071,6 @@ impl Qwen35Block {
             })();
 
         // 1. RMSNorm into norm_buf (skipped when fused into the preceding layer's Residual 2 add)
-        let h_shape = buffers.layer_input[layer_idx].shape().clone();
         if fuse_norm_quant {
             let norm_w = dst_downcast(self.attn_norm.weight.storage().as_ref())?;
             dev.launch_rms_norm_quant_q81_dual(
@@ -3086,20 +3085,13 @@ impl Qwen35Block {
                 grim_core::error::Error::Backend(format!("qwen35 fused norm+q81: {e}"))
             })?;
         } else if !norm_already_fused {
-            dev.rms_norm_into(
-                &buffers.layer_input[layer_idx],
-                &**self.attn_norm.weight.storage(),
-                self.attn_norm.eps,
-                &buffers.norm_buf[layer_idx],
-                &h_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-        }
-        // Task 5B.5: validate norm emission through grim_graph builder
-        if !norm_already_fused {
-            let mut norm_emitter = DevNormEmitter(dev);
+            // Task 5B.5: Attention norm emission through RocmGraphEmitter
+            let mut graph_emitter = RocmGraphEmitter {
+                dev,
+                emit: emit.as_deref_mut(),
+            };
             let _ = grim_graph::emit_norm(
-                &mut norm_emitter,
+                &mut graph_emitter,
                 &buffers.layer_input[layer_idx],
                 &self.attn_norm.weight,
                 &buffers.norm_buf[layer_idx],
@@ -3107,33 +3099,6 @@ impl Qwen35Block {
                 batch,
                 self.hidden_size,
             )?;
-
-            if let Some(e) = emit.as_deref_mut() {
-                let eps_ok = (self.attn_norm.eps - 1e-5).abs() < f32::EPSILON;
-                let opcode = if eps_ok {
-                    grim_backend_rocm::task_graph::op::NORM
-                } else {
-                    grim_backend_rocm::task_graph::op::FALLBACK
-                };
-                let m = batch as u32;
-                let k = h_shape.dims().last().copied().unwrap_or(0) as u32;
-                e.launch(
-                    opcode,
-                    [0, k, m, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    &[
-                        (
-                            buffers.layer_input[layer_idx].device_ptr_u64().unwrap_or(0),
-                            buffers.layer_input[layer_idx].bytes() as u64,
-                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
-                        ),
-                        (
-                            buffers.norm_buf[layer_idx].device_ptr_u64().unwrap_or(0),
-                            buffers.norm_buf[layer_idx].bytes() as u64,
-                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
-                        ),
-                    ],
-                );
-            }
         }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
@@ -3982,34 +3947,21 @@ impl Qwen35Block {
             let wo = self.wo.as_ref().ok_or_else(|| {
                 grim_core::error::Error::Backend("missing wo in full attention block".into())
             })?;
-            linear_into(
+            let mut graph_emitter = RocmGraphEmitter {
                 dev,
+                emit: emit.as_deref_mut(),
+            };
+            let _ = grim_graph::emit_linear_dedup(
+                &mut graph_emitter,
                 &buffers.attn_out_buf[layer_idx],
                 wo.weight(),
                 &buffers.norm_buf[layer_idx],
                 act,
+                "attn_output",
+                layer_idx,
+                grim_graph::QuantFlags::default(),
+                true,
             )?;
-            // M7.1: the output projection is its own node — a GEMM node when
-            // the weight is NATIVE (the ring's GEMM arm computes in f32) and
-            // a FALLBACK node when it is quantized (the arm cannot run a
-            // quantized weight).
-            if let Some(e) = emit.as_deref_mut() {
-                let weight = wo.weight();
-                let native = crate::decode_graph::rocm_storage(weight)
-                    .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
-                    .unwrap_or(false);
-                let n = weight.shape().dim(0).unwrap_or(0) as u32;
-                let k = weight.shape().dim(1).unwrap_or(0) as u32;
-                e.launch(
-                    if native {
-                        grim_backend_rocm::task_graph::op::GEMM
-                    } else {
-                        grim_backend_rocm::task_graph::op::FALLBACK
-                    },
-                    [0, n, k, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    &[],
-                );
-            }
         } else {
             // KDA Recurrent layer forward pass inside captured HIP graph
             // 1. Projections: QKV -> q_buf, alpha -> kda_alpha, beta -> kda_beta, gate (z) -> gate_buf
