@@ -2736,12 +2736,8 @@ impl Qwen35Block {
                 let wv = self.wv.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wv in full attention block".into())
                 })?;
-                let mut q_flags = grim_graph::QuantFlags {
-                    q81_ready: fuse_norm_quant,
-                    u4_ready: false,
-                };
-                let mut linear_emitter = DevLinearEmitter(dev);
-                grim_graph::emit_linear_dedup(&mut linear_emitter, "attn.q", &mut q_flags)?;
+                let mut q81_ready = fuse_norm_quant;
+                let mut u4_ready = false;
                 linear_into_named_dedup(
                     dev,
                     normed,
@@ -2750,10 +2746,9 @@ impl Qwen35Block {
                     act,
                     "attn.q",
                     layer_idx,
-                    &mut q_flags.q81_ready,
-                    &mut q_flags.u4_ready,
+                    &mut q81_ready,
+                    &mut u4_ready,
                 )?;
-                grim_graph::emit_linear_dedup(&mut linear_emitter, "attn.k", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed,
@@ -2762,10 +2757,9 @@ impl Qwen35Block {
                     act,
                     "attn.k",
                     layer_idx,
-                    &mut q_flags.q81_ready,
-                    &mut q_flags.u4_ready,
+                    &mut q81_ready,
+                    &mut u4_ready,
                 )?;
-                grim_graph::emit_linear_dedup(&mut linear_emitter, "attn.v", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed,
@@ -2774,8 +2768,8 @@ impl Qwen35Block {
                     act,
                     "attn.v",
                     layer_idx,
-                    &mut q_flags.q81_ready,
-                    &mut q_flags.u4_ready,
+                    &mut q81_ready,
+                    &mut u4_ready,
                 )?;
                 // M7.1: the three plain projections are three GEMM nodes —
                 // the ring's GEMM arm computes in f32, so a NATIVE weight is
@@ -3698,12 +3692,8 @@ impl Qwen35Block {
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup silu: {e}")))?;
             } else {
-                let mut q_flags = grim_graph::QuantFlags {
-                    q81_ready: false,
-                    u4_ready: false,
-                };
-                let mut linear_emitter = DevLinearEmitter(dev);
-                grim_graph::emit_linear_dedup(&mut linear_emitter, "ffn.gate", &mut q_flags)?;
+                let mut q81_ready = false;
+                let mut u4_ready = false;
                 linear_into_named_dedup(
                     dev,
                     normed_ffn,
@@ -3712,10 +3702,9 @@ impl Qwen35Block {
                     act,
                     "ffn.gate",
                     layer_idx,
-                    &mut q_flags.q81_ready,
-                    &mut q_flags.u4_ready,
+                    &mut q81_ready,
+                    &mut u4_ready,
                 )?;
-                grim_graph::emit_linear_dedup(&mut linear_emitter, "ffn.up", &mut q_flags)?;
                 linear_into_named_dedup(
                     dev,
                     normed_ffn,
@@ -3724,8 +3713,8 @@ impl Qwen35Block {
                     act,
                     "ffn.up",
                     layer_idx,
-                    &mut q_flags.q81_ready,
-                    &mut q_flags.u4_ready,
+                    &mut q81_ready,
+                    &mut u4_ready,
                 )?;
 
                 dev.silu_mul_into(
@@ -3960,12 +3949,8 @@ impl Qwen35Block {
                     "missing KDA graph buffers for layer {layer_idx}"
                 ))
             })?;
-        let mut q_flags = grim_graph::QuantFlags {
-            q81_ready: false,
-            u4_ready: false,
-        };
-        let mut linear_emitter = DevLinearEmitter(dev);
-        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.attn_qkv", &mut q_flags)?;
+        let mut q81_ready = false;
+        let mut u4_ready = false;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3974,10 +3959,9 @@ impl Qwen35Block {
             act,
             "kda.attn_qkv",
             layer_idx,
-            &mut q_flags.q81_ready,
-            &mut q_flags.u4_ready,
+            &mut q81_ready,
+            &mut u4_ready,
         )?;
-        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.alpha", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3986,10 +3970,9 @@ impl Qwen35Block {
             act,
             "kda.alpha",
             layer_idx,
-            &mut q_flags.q81_ready,
-            &mut q_flags.u4_ready,
+            &mut q81_ready,
+            &mut u4_ready,
         )?;
-        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.beta", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -3998,10 +3981,9 @@ impl Qwen35Block {
             act,
             "kda.beta",
             layer_idx,
-            &mut q_flags.q81_ready,
-            &mut q_flags.u4_ready,
+            &mut q81_ready,
+            &mut u4_ready,
         )?;
-        grim_graph::emit_linear_dedup(&mut linear_emitter, "kda.attn_gate", &mut q_flags)?;
         linear_into_named_dedup(
             dev,
             normed,
@@ -4010,8 +3992,8 @@ impl Qwen35Block {
             act,
             "kda.attn_gate",
             layer_idx,
-            &mut q_flags.q81_ready,
-            &mut q_flags.u4_ready,
+            &mut q81_ready,
+            &mut u4_ready,
         )?;
         Ok(())
     }
