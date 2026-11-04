@@ -2159,6 +2159,18 @@ impl RocmDevice {
         if v4 {
             return self.launch_dot4_iq4xs_q81_gemv_v4_for_ab(act_q81, b_storage, out_storage, m, n, k);
         }
+        // v8 is the production arm (ship override 2026-11-03): v7 (word-wide
+        // nibble decode) with B-first load ordering. Measured cold-cache on
+        // Dev1/gfx1201 (9060 XT): v8/v2 1.064x at k=5120 n=17408, 1.118x at
+        // k=17408 n=5120 (+~18 and ~+30 GB/s). Bit-exact vs v2. Set
+        // GRIM_IQ4XS_V8=0 to fall back to the v2 arm (both still bit-exact).
+        static V8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v8 = *V8.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ4XS_V8").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         self.launch_dot4_iq4xs_q81_gemv_with(
             act_q81,
             b_storage,
@@ -2166,7 +2178,9 @@ impl RocmDevice {
             m,
             n,
             k,
-            if sub && sub_v2 {
+            if v8 {
+                "grim_dot4_iq4xs_q81_gemv_sub_v8"
+            } else if sub && sub_v2 {
                 "grim_dot4_iq4xs_q81_gemv_sub_v2"
             } else if sub {
                 "grim_dot4_iq4xs_q81_gemv_sub"
