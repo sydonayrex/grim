@@ -7,12 +7,17 @@
 //! TODO(gpu-verify)
 
 use grim_backend_rocm::{
-    as_rocm, kernel_route_snapshot, reset_kernel_route_counters, RocmDevice,
+    as_rocm, kernel_route_snapshot, reset_kernel_route_counters,
 };
-use grim_tensor::{DType, KQuantScheme, MemoryOps, Shape};
+use grim_models_transformer::decode_graph::DecodeGraphModel;
+use grim_models_transformer::qwen35::Qwen35;
+use grim_nn::WeightSource;
+use grim_tensor::{KQuantScheme, MemoryOps};
 use std::sync::Mutex;
 
 static LOCK: Mutex<()> = Mutex::new(());
+
+include!("common/qwen35_synth.rs");
 
 #[test]
 #[ignore = "needs a ROCm device; run with GRIM_RUN_GPU_TEST=1"]
@@ -131,41 +136,68 @@ fn test_q81_launch_census_and_logits_parity_vs_dedup_disabled() {
     );
 
     // Arm 1c: KDA recurrent projections (kda.attn_qkv, kda.alpha, kda.beta, kda.attn_gate).
-    // All 4 projections share the same layer activation (q81_ready starts false and is set
-    // post-launch). Exactly 1 grim_quantize_q8_1 launch must run across all 4 projections.
-    let out_kda_1 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 1");
-    let out_kda_2 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 2");
-    let out_kda_3 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 3");
-    let out_kda_4 = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc kda 4");
-    let out_kda_1_rocm = as_rocm(out_kda_1.as_ref()).unwrap();
-    let out_kda_2_rocm = as_rocm(out_kda_2.as_ref()).unwrap();
-    let out_kda_3_rocm = as_rocm(out_kda_3.as_ref()).unwrap();
-    let out_kda_4_rocm = as_rocm(out_kda_4.as_ref()).unwrap();
-
-    let mut q81_kda_ready = false;
-    reset_kernel_route_counters();
-    for dst in [out_kda_1_rocm, out_kda_2_rocm, out_kda_3_rocm, out_kda_4_rocm] {
-        dev.linear_decode_into_prequant(
-            a_t.as_ref(),
-            w1_rocm,
-            dst,
-            scratch_rocm,
-            q81_kda_ready,
-            false,
-        ).expect("linear_decode_into_prequant kda");
-        q81_kda_ready = true; // Set strictly post-launch!
+    // Test the ACTUAL call site `forward_graph_recurrent_projections` through Qwen35Block!
+    let mut cfg = tiny_cfg();
+    cfg.num_layers = 2;
+    cfg.full_attention_interval = 2; // Layer 0 is recurrent, layer 1 is attention
+    let mut provider = synth_weights_hybrid(2, 2);
+    // Replace recurrent weights with Q5K quantized storage so they exercise the prequant q8_1 leg
+    for key in [
+        "blk.0.attn_qkv.weight",
+        "blk.0.ssm_alpha.weight",
+        "blk.0.ssm_beta.weight",
+        "blk.0.attn_gate.weight",
+    ] {
+        if let Some(old) = provider.tensors.get(key) {
+            let shape = old.shape.clone();
+            let k = shape[1];
+            let n = shape[0];
+            let fake_bytes = vec![0u8; (n * k / 32) * 36];
+            provider.tensors.insert(
+                key.to_string(),
+                RawTensor {
+                    bytes: fake_bytes,
+                    shape,
+                    dtype: grim_tensor::DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q5K),
+                    },
+                    provenance: grim_tensor::QuantProvenance::GrimNative,
+                },
+            );
+        }
     }
+
+    let dev_arc = RocmDevice::shared(0);
+    let device = grim_tensor::Device::Rocm(0);
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device, &ws, cfg).expect("load model");
+    let recurrent_blk = &model.blocks[0];
+    assert!(!recurrent_blk.is_full_attention, "layer 0 must be recurrent");
+
+    let graph = model.get_or_create_decode_graph(16, 1).expect("graph");
+    let normed_input = &graph.buffers.norm_buf[0];
+    let act_buf = &graph.buffers.act_q81_buf[0];
+
+    reset_kernel_route_counters();
+    recurrent_blk.forward_graph_recurrent_projections(
+        0,
+        &graph.buffers,
+        &dev_arc,
+        normed_input,
+        act_buf,
+    ).expect("forward_graph_recurrent_projections");
     dev.synchronize();
 
-    let kda_routes = kernel_route_snapshot();
-    let kda_q81_launches = kda_routes
+    let real_kda_routes = kernel_route_snapshot();
+    let real_kda_q81 = real_kda_routes
         .iter()
         .find(|(k, _)| k == "grim_quantize_q8_1")
         .map(|(_, c)| *c)
         .unwrap_or(0);
     assert_eq!(
-        kda_q81_launches, 1,
-        "KDA 4-projection group sharing input with dedup enabled must execute exactly 1 grim_quantize_q8_1 launch"
+        real_kda_q81, 1,
+        "KDA recurrent projections at the real site must execute exactly 1 grim_quantize_q8_1 launch"
     );
 
     // Arm 2: GRIM_DEDUP_QUANT=0 forces prologue quantize on both projections

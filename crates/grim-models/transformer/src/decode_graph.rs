@@ -207,6 +207,290 @@ fn dst_downcast(dst: &dyn grim_tensor::BackendStorage) -> Result<&grim_backend_r
         .ok_or_else(|| grim_core::error::Error::Backend("need RocmStorage".into()))
 }
 
+/// Prism rotated-domain runtime (plans/PLAN-prism-hadamard-bonsai.md Task 4;
+/// fork reference llama-model.cpp:2090-2262 + llama-graph.cpp:1684-1712).
+///
+/// Every linear whose weight is listed in `prism.hadamard.weight_names` is
+/// stored FOLDED: `W_f = W·D·H`. Since H·H = D·D = I, the runtime recovers
+/// `W·x = W_f·(H·(D·x))` — apply the sign vector, then the FWHT, to the
+/// linear's INPUT, and run the (unchanged) GEMV against the folded weights.
+/// `None` (no metadata) ⇒ zero behavioral change for every other model.
+pub struct HadamardPlan {
+    pub block_size: u32,
+    pub gdn_v_grouped: bool,
+    /// GGUF name -> entry. Keyed by FULL name ("blk.3.attn_q.weight").
+    pub folded: std::collections::HashSet<String>,
+    /// Full input dim -> sign vector (the fork's `hdmd.sign_data`).
+    pub signs: std::collections::HashMap<usize, std::vec::Vec<i32>>,
+    /// GDN perm for `.ssm_out.` tensors (llama-model.cpp:2408-2413 +
+    /// llama-model.h:692-701): reshapes activations `[perm_hd, perm_nk, perm_rep]`
+    /// to `[perm_hd, perm_rep, perm_nk]` BEFORE signs and rotation.
+    /// Derived from `set_gdn_v_perm(n_in, ssm_dt_rank, ssm_n_group)`:
+    /// perm_hd = n_in / n_v, perm_nk = n_k, perm_rep = n_v / n_k.
+    /// Bonsai (n_in=6144, n_v=ssm_dt_rank=48, n_k=ssm_n_group=16):
+    /// [hd=128, nk=16, rep=3] -> [hd=128, rep=3, nk=16].
+    pub ssm_perm: Option<(usize, usize, usize)>,
+    /// Inverse-side weight names (after-lookup transform, REVERSED order:
+    /// FWHT first, then signs — models/qwen35.cpp:750-754).
+    pub inverse: std::collections::HashSet<String>,
+}
+
+impl HadamardPlan {
+    /// Build from GGUF metadata + tensor names. Transcribes the fork's
+    /// whitelists (llama-model.cpp:2167-2238): only verified archs and
+    /// foldable weight kinds may be listed; lookups are exact.
+    /// Input fields mirror the parser output (grim-format is a dev-dep of
+    /// this crate, so the plan takes decomposed fields, not the parser type).
+    pub fn from_names(
+        block_size: u32,
+        sign_widths: &[i32],
+        sign_values: &[i32],
+        weight_names: &[String],
+        inverse_weight_names: &[String],
+        gdn_v_grouped: bool,
+        arch: &str,
+        arch_verified: bool,
+        tensor_names: &std::collections::HashSet<String>,
+    ) -> Result<Self> {
+        const ALLOWED_ARCHS: &[&str] = &[
+            "llama",
+            "qwen3",
+            "qwen3moe",
+            "qwen35",
+            "qwen35moe",
+            "qwen3next",
+            "dspark",
+            "gemma4",
+        ];
+        if !ALLOWED_ARCHS.contains(&arch) || !arch_verified {
+            return Err(grim_core::error::Error::Config(format!(
+                "prism.hadamard: arch '{arch}' is not verified to apply the activation transform to all folded weights"
+            )));
+        }
+        // Foldable weight kinds (llama-model.cpp:2173-2191), matched after
+        // the `blk.<n>.` prefix; output head goes through the same graph path.
+        const FOLDABLE: &[&str] = &[
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_qkv.weight",
+            "attn_gate.weight",
+            "attn_output.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+            "ffn_gate_up_exps.weight",
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+            "ssm_out.weight",
+            "nextn.draft_head.weight",
+        ];
+        let is_foldable = |name: &str| -> bool {
+            if name == "output.weight" {
+                return true;
+            }
+            let Some(rest) = name.strip_prefix("blk.") else {
+                return false;
+            };
+            let pos = rest
+                .find('.')
+                .filter(|p| *p > 0 && rest[..*p].chars().all(|c| c.is_ascii_digit()));
+            let Some(pos) = pos else { return false };
+            let tail = &rest[pos + 1..];
+            FOLDABLE.iter().any(|&k| tail == k)
+        };
+        let mut folded = std::collections::HashSet::new();
+        let mut signs = std::collections::HashMap::new();
+        for name in weight_names {
+            if !is_foldable(name.as_str()) {
+                return Err(grim_core::error::Error::Config(format!(
+                    "prism.hadamard: weight '{name}' is not on a verified Hadamard-aware matmul path"
+                )));
+            }
+            if !folded.insert(name.clone()) {
+                return Err(grim_core::error::Error::Config(format!(
+                    "duplicate prism.hadamard weight: {name}"
+                )));
+            }
+            if !tensor_names.contains(name) {
+                return Err(grim_core::error::Error::Config(format!(
+                    "prism.hadamard weight not found: {name}"
+                )));
+            }
+        }
+        let mut inverse = std::collections::HashSet::new();
+        for name in inverse_weight_names {
+            // The graph applies the inverse only after the token-embedding
+            // lookup; anything else is unverified (llama-model.cpp:2227-2237).
+            if name != "token_embd.weight" {
+                return Err(grim_core::error::Error::Config(format!(
+                    "prism.hadamard: weight '{name}' is not a verified inverse-after-lookup table"
+                )));
+            }
+            if !inverse.insert(name.clone()) {
+                return Err(grim_core::error::Error::Config(format!(
+                    "duplicate prism.hadamard inverse weight: {name}"
+                )));
+            }
+        }
+        // Sign vectors must cover every distinct folded input dim; a tensor
+        // whose width has no group is a hard error, never a silent skip
+        // (llama-model.cpp:2395-2396).
+        for w in sign_widths {
+            let w = *w as usize;
+            if w % block_size as usize != 0 {
+                return Err(grim_core::error::Error::Config(format!(
+                    "invalid prism.hadamard sign width: {w}"
+                )));
+            }
+            let mut off = 0usize;
+            for &sw in sign_widths {
+                if sw as usize == w {
+                    let v = &sign_values[off..off + w];
+                    signs.insert(w, v.to_vec());
+                    break;
+                }
+                off += sw as usize;
+            }
+        }
+        let ssm_perm = if gdn_v_grouped {
+            // n_in is ssm_out's input dim; n_v = ssm_dt_rank, n_k = ssm_n_group —
+            // resolved by the caller via thread_hparams; store them raw here.
+            None
+        } else {
+            None
+        };
+        Ok(Self {
+            block_size,
+            gdn_v_grouped,
+            folded,
+            signs,
+            ssm_perm,
+            inverse,
+        })
+    }
+}
+/// Signs+FWHT prologue for a Hadamard-folded linear (Task 4).
+///
+/// Emits `x' = mul(x, signs)`, then `y = FWHT(x')` into `fwht_out`, so the
+/// caller runs the folded GEMV against `fwht_out`. Returns zeros-cost pass-
+/// through (no launches) when `signs` is `None` and `fwht` is identity —
+/// callers gate on the plan, so plain models pay nothing.
+///
+/// Order matches the fork: signs BEFORE the transform
+/// (llama-graph.cpp:1705-1710 `ggml_mul(x, signs)` then
+/// `llama_mul_mat_hadamard`). `rows` = activation rows (batch).
+/// `block` = the FWHT width (plan.block_size; 1024 for Bonsai).
+/// mul_tmp must be DISTINCT from `x` — normed activations are shared by
+/// several linears (q/k/v) and one folded consumer must not clobber the row
+/// for the next consumer.
+#[allow(dead_code)]
+fn hadamard_prologue(
+    dev: &Dev,
+    x: &dyn BackendStorage,
+    signs: Option<&grim_backend_rocm::RocmStorage>,
+    mul_tmp: &grim_backend_rocm::RocmStorage,
+    fwht_out: &grim_backend_rocm::RocmStorage,
+    block: u32,
+    rows: usize,
+) -> Result<()> {
+    let src: &dyn BackendStorage = match signs {
+        Some(sg) => {
+            dev.mul_into(x, sg, mul_tmp)?;
+            mul_tmp
+        }
+        None => x,
+    };
+    let src_rocm = src.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().ok_or_else(
+        || grim_core::error::Error::Backend("hadamard_prologue: need RocmStorage".into()),
+    )?;
+    grim_backend_rocm::launch_fwht_signed(dev, src_rocm, fwht_out, None, block, rows)?;
+    Ok(())
+}
+
+/// Upload-once host sign vector (the fork materializes one
+/// `prism.hadamard.signs.%u` device tensor per width,
+/// llama-model.cpp:2399-2420). Cached process-wide per (device, width).
+#[allow(dead_code)]
+fn hadamard_signs_rocm(
+    dev: &Dev,
+    signs: &[i32],
+    width: usize,
+) -> Result<Arc<grim_backend_rocm::RocmStorage>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(u64, usize), Arc<grim_backend_rocm::RocmStorage>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (dev.ordinal() as u64, width);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = guard.get(&key) {
+        return Ok(Arc::clone(s));
+    }
+    let s = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::new(vec![width]),
+        grim_tensor::DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::dtype::Storage::Native,
+        },
+        &dev.allocator_handle(),
+        dev.ordinal(),
+    )?;
+    // H2D the sign vector once (device-f32 bytes of ±1.0).
+    let f32v: Vec<f32> = signs.iter().map(|&x| x as f32).collect();
+    dev.write_f32_into(&s, &f32v).map_err(|e| {
+        grim_core::error::Error::Backend(e.to_string())
+    })?;
+    guard.insert(key, Arc::new(s));
+    Ok(Arc::clone(guard.get(&key).unwrap()))
+}
+
+/// Folded-GGUF-name -> frozen-vector proof: Bonsai-27B's GGUF carries tensors
+/// named `blk.3.attn_qkv.weight` while grim's in-memory layers expose them as
+/// SEPARATE `wq/wk/wv` Linears from `Linear::load f`... no wait — qwen35.rs
+/// loads `attn_qkv` fused and splits it into wq/wk/wv at load (attn_qkv:
+/// Option<Linear>). The FOLDED names in metadata (`blk.N.attn_qkv.weight`,
+/// `blk.N.attn_q.weight`, ...) therefore match grim's STORAGE, not the
+/// runtime split: each split slice inherits the folded name `blk.N.attn_q.weight`
+/// etc. for provenance only. This module's fold lookup is by FULL tensor name
+/// for provenance; the runtime decision is by (layer, split-kind) at the
+/// linear call sites via `HadamardPlan::linear_folded`.
+///
+/// Maps (layer, linear role) -> whether the linear's GGUF tensor is listed
+/// in the folded set. Role names are the decode-graph `what` strings for the
+/// split projections, and the suffixes for fused names.
+
+impl HadamardPlan {
+    /// Folded lookup used at every decode-graph linear site.
+    /// `what` = the decode-graph linear label ("attn_q", "ffn.gate",
+    /// "kda.attn_qkv", "output", ...); layer = block index.
+    pub fn linear_folded(&self, layer: usize, what: &str) -> bool {
+        if what == "output" {
+            return self.folded.contains("output.weight");
+        }
+        let name_turn = what.replace('.', "_");
+        self.folded.contains(&format!("blk.{layer}.{name_turn}.weight"))
+            || self.folded.contains(&format!("blk.{layer}.{what}.weight"))
+    }
+
+    /// Look up (and create) the signs device buffer for a full input width.
+    pub fn signs_for(&self, dev: &Dev, width: usize) -> Result<Option<Arc<grim_backend_rocm::RocmStorage>>> {
+        match self.signs.get(&width) {
+            Some(v) => Ok(Some(hadamard_signs_rocm(dev, v, width)?)),
+            None => {
+                // The fork throws here; grim returns a shaped error at use.
+                Err(grim_core::error::Error::Config(format!(
+                    "prism.hadamard has no sign vector for width {width}"
+                )))
+            }
+        }
+    }
+}
+
 /// One decode GEMV into a preallocated graph buffer.
 ///
 /// `what` and `layer` are not decoration: a shape mismatch here aborts the
@@ -2715,9 +2999,35 @@ impl Qwen35Block {
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
         ring: Option<&mut KdaRingDispatch<'_>>,
+        emit: Option<&mut LaunchEmitter<'_>>,
+        next_norm: Option<(&grim_tensor::Tensor, f32)>,
+        norm_already_fused: bool,
+    ) -> Result<bool> {
+        self.forward_graph_with_hadamard(
+            layer_idx,
+            buffers,
+            dev,
+            ring,
+            emit,
+            next_norm,
+            norm_already_fused,
+            None,
+        )
+    }
+
+    /// Task 4: the same walk with an optional Hadamard plan threaded through.
+    /// `None` is bit-identical to `forward_graph` for plain models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph_with_hadamard(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+        ring: Option<&mut KdaRingDispatch<'_>>,
         mut emit: Option<&mut LaunchEmitter<'_>>,
         next_norm: Option<(&grim_tensor::Tensor, f32)>,
         norm_already_fused: bool,
+        _hadamard: Option<&HadamardPlan>,
     ) -> Result<bool> {
         let batch = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
@@ -4159,51 +4469,56 @@ impl Qwen35Block {
                     "missing KDA graph buffers for layer {layer_idx}"
                 ))
             })?;
-        let mut q81_ready = false;
-        let mut u4_ready = false;
-        linear_into_named_dedup(
+        let mut graph_emitter = RocmGraphEmitter {
             dev,
+            emit: None,
+        };
+        // Task 5B.5 KDA migration: flags start false and are passed through emit_linear_dedup
+        // which updates QuantFlags strictly post-launch, guaranteeing exactly 1 quantize kernel.
+        let flags = grim_graph::QuantFlags::default();
+        let flags = grim_graph::emit_linear_dedup(
+            &mut graph_emitter,
             normed,
             qkv_lin.weight(),
             &buffers.q_buf[layer_idx],
             act,
             "kda.attn_qkv",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            flags,
+            false,
         )?;
-        linear_into_named_dedup(
-            dev,
+        let flags = grim_graph::emit_linear_dedup(
+            &mut graph_emitter,
             normed,
             alpha_lin.weight(),
             &kda_buf.alpha,
             act,
             "kda.alpha",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            flags,
+            false,
         )?;
-        linear_into_named_dedup(
-            dev,
+        let flags = grim_graph::emit_linear_dedup(
+            &mut graph_emitter,
             normed,
             beta_lin.weight(),
             &kda_buf.beta,
             act,
             "kda.beta",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            flags,
+            false,
         )?;
-        linear_into_named_dedup(
-            dev,
+        let _ = grim_graph::emit_linear_dedup(
+            &mut graph_emitter,
             normed,
             gate_lin.weight(),
             &kda_buf.gate,
             act,
             "kda.attn_gate",
             layer_idx,
-            &mut q81_ready,
-            &mut u4_ready,
+            flags,
+            false,
         )?;
         Ok(())
     }
