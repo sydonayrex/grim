@@ -984,6 +984,55 @@ fn qwen35_capture_emits_a_structurally_true_task_graph() {
         );
     }
     eprintln!("[struct] total nodes: {}", ops.len());
+    const EXPECTED_37_BASELINE_OPS: [u32; 37] = [
+        12,         // 0: Elementwise (embed gather)
+        9,          // 1: Recurrent layer 0
+        1,          // 2: Gemm (ffn_down)
+        4294967295, // 3: Fallback (layer 1 attn norm)
+        1,          // 4: Gemm (attn.q)
+        1,          // 5: Gemm (attn.k)
+        1,          // 6: Gemm (attn.v)
+        4294967295, // 7: Fallback (split gate 0)
+        4294967295, // 8: Fallback (split gate 1)
+        4294967295, // 9: Fallback (qn norm)
+        4294967295, // 10: Fallback (kn norm)
+        4294967295, // 11: Fallback (Q RoPE)
+        4294967295, // 12: Fallback (K RoPE)
+        4294967295, // 13: Fallback (KV append K)
+        4294967295, // 14: Fallback (KV append V)
+        1,          // 15: Gemm (wo)
+        1,          // 16: Gemm (ffn_down)
+        12,         // 17: Elementwise (residual add)
+        9,          // 18: Recurrent layer 2
+        1,          // 19: Gemm (ffn_down)
+        4294967295, // 20: Fallback (layer 3 attn norm)
+        1,          // 21: Gemm (attn.q)
+        1,          // 22: Gemm (attn.k)
+        1,          // 23: Gemm (attn.v)
+        4294967295, // 24: Fallback (split gate 0)
+        4294967295, // 25: Fallback (split gate 1)
+        4294967295, // 26: Fallback (qn norm)
+        4294967295, // 27: Fallback (kn norm)
+        4294967295, // 28: Fallback (Q RoPE)
+        4294967295, // 29: Fallback (K RoPE)
+        4294967295, // 30: Fallback (KV append K)
+        4294967295, // 31: Fallback (KV append V)
+        1,          // 32: Gemm (wo)
+        1,          // 33: Gemm (ffn_down)
+        12,         // 34: Elementwise (residual add)
+        10,         // 35: Norm (final output norm)
+        1,          // 36: Gemm (head projection)
+    ];
+    assert_eq!(
+        ops.len(),
+        37,
+        "census node count must be exactly 37 as pinned in baseline contract"
+    );
+    assert_eq!(
+        &ops[..37],
+        &EXPECTED_37_BASELINE_OPS[..],
+        "node opcode sequence must match the 37-node baseline node-for-node"
+    );
     assert_eq!(
         ops[0],
         op::ELEMENTWISE,

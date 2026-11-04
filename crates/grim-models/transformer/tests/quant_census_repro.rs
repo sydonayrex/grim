@@ -91,6 +91,45 @@ fn test_q81_launch_census_and_logits_parity_vs_dedup_disabled() {
         "two projections sharing input with dedup enabled must execute exactly 1 grim_quantize_q8_1 launch"
     );
 
+    // Arm 1b: Verify FFN gate and up projections specifically exercise dedup via emit_linear_dedup.
+    // FFN has 2 projections sharing the normed activation. First must quantize, second reuses it.
+    let out_gate_t = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc out_gate");
+    let out_up_t = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc out_up");
+    let out_gate_rocm = as_rocm(out_gate_t.as_ref()).unwrap();
+    let out_up_rocm = as_rocm(out_up_t.as_ref()).unwrap();
+
+    let mut q81_ffn_ready = false;
+    reset_kernel_route_counters();
+    dev.linear_decode_into_prequant(
+        a_t.as_ref(),
+        w1_rocm,
+        out_gate_rocm,
+        scratch_rocm,
+        q81_ffn_ready,
+        false,
+    ).expect("linear_decode_into_prequant ffn_gate");
+    q81_ffn_ready = true;
+    dev.linear_decode_into_prequant(
+        a_t.as_ref(),
+        w2_rocm,
+        out_up_rocm,
+        scratch_rocm,
+        q81_ffn_ready,
+        false,
+    ).expect("linear_decode_into_prequant ffn_up");
+    dev.synchronize();
+
+    let ffn_routes = kernel_route_snapshot();
+    let ffn_q81_launches = ffn_routes
+        .iter()
+        .find(|(k, _)| k == "grim_quantize_q8_1")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    assert_eq!(
+        ffn_q81_launches, 1,
+        "FFN gate/up projections sharing input with dedup enabled must execute exactly 1 grim_quantize_q8_1 launch"
+    );
+
     // Arm 2: GRIM_DEDUP_QUANT=0 forces prologue quantize on both projections
     let out1_ref_t = dev.alloc_storage(&Shape::new(vec![m, n]), DType::F32).expect("alloc out1_ref");
     let out1_ref_rocm = as_rocm(out1_ref_t.as_ref()).unwrap();

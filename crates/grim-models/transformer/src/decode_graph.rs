@@ -521,6 +521,7 @@ impl<'a, 'b, 'e> grim_graph::LinearEmitter<Storage, grim_tensor::Tensor, grim_ba
         what: &str,
         layer: usize,
         flags: grim_graph::QuantFlags,
+        record_ir: bool,
     ) -> Result<grim_graph::QuantFlags> {
         let mut q81_ready = flags.q81_ready;
         let mut u4_ready = flags.u4_ready;
@@ -536,21 +537,23 @@ impl<'a, 'b, 'e> grim_graph::LinearEmitter<Storage, grim_tensor::Tensor, grim_ba
             &mut u4_ready,
         )?;
 
-        if let Some(e) = self.emit.as_deref_mut() {
-            let native = crate::decode_graph::rocm_storage(weight)
-                .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
-                .unwrap_or(false);
-            let n = weight.shape().dim(0).unwrap_or(0) as u32;
-            let k = weight.shape().dim(1).unwrap_or(0) as u32;
-            e.launch(
-                if native {
-                    grim_backend_rocm::task_graph::op::GEMM
-                } else {
-                    grim_backend_rocm::task_graph::op::FALLBACK
-                },
-                [0, n, k, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                &[],
-            );
+        if record_ir {
+            if let Some(e) = self.emit.as_deref_mut() {
+                let native = crate::decode_graph::rocm_storage(weight)
+                    .map(|s| s.dtype().storage == grim_tensor::Storage::Native)
+                    .unwrap_or(false);
+                let n = weight.shape().dim(0).unwrap_or(0) as u32;
+                let k = weight.shape().dim(1).unwrap_or(0) as u32;
+                e.launch(
+                    if native {
+                        grim_backend_rocm::task_graph::op::GEMM
+                    } else {
+                        grim_backend_rocm::task_graph::op::FALLBACK
+                    },
+                    [0, n, k, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[],
+                );
+            }
         }
 
         Ok(grim_graph::QuantFlags {
@@ -594,6 +597,7 @@ impl<'a, A: ?Sized, W: ?Sized, Out: ?Sized, Scratch: ?Sized> grim_graph::LinearE
         _what: &str,
         _layer: usize,
         flags: grim_graph::QuantFlags,
+        _record_ir: bool,
     ) -> Result<grim_graph::QuantFlags> {
         let _ = self.0;
         Ok(flags)
@@ -800,6 +804,7 @@ impl LlamaBlock {
                 "attn_q",
                 layer_idx,
                 q_flags,
+                false,
             )?;
             linear_into_named_ready(
                 dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, q_flags.q81_ready,
@@ -813,6 +818,7 @@ impl LlamaBlock {
                 "attn_k",
                 layer_idx,
                 q_flags,
+                false,
             )?;
             linear_into_named_ready(
                 dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, q_flags.q81_ready,
@@ -826,6 +832,7 @@ impl LlamaBlock {
                 "attn_v",
                 layer_idx,
                 q_flags,
+                false,
             )?;
             linear_into_named_ready(
                 dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, q_flags.q81_ready,
@@ -842,6 +849,7 @@ impl LlamaBlock {
                 "attn_q",
                 layer_idx,
                 q_flags,
+                false,
             )?;
             linear_into_named_ready(
                 dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, false,
@@ -856,6 +864,7 @@ impl LlamaBlock {
                 "attn_k",
                 layer_idx,
                 q_flags,
+                false,
             )?;
             linear_into_named_ready(
                 dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, true,
@@ -869,6 +878,7 @@ impl LlamaBlock {
                 "attn_v",
                 layer_idx,
                 q_flags,
+                false,
             )?;
             linear_into_named_ready(
                 dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, true,
@@ -3891,6 +3901,9 @@ impl Qwen35Block {
                     emit: emit.as_deref_mut(),
                 };
                 let flags = grim_graph::QuantFlags::default();
+                // Task 5B.5 FFN migration: in baseline contract (d3c77e6e), FFN gate & up
+                // launches were not named as IR nodes (only ffn_down and residual add were).
+                // Pass record_ir: false to preserve the 37-node census baseline node-for-node.
                 let flags = grim_graph::emit_linear_dedup(
                     &mut graph_emitter,
                     normed_ffn,
@@ -3900,6 +3913,7 @@ impl Qwen35Block {
                     "ffn.gate",
                     layer_idx,
                     flags,
+                    false,
                 )?;
                 let _ = grim_graph::emit_linear_dedup(
                     &mut graph_emitter,
@@ -3910,6 +3924,7 @@ impl Qwen35Block {
                     "ffn.up",
                     layer_idx,
                     flags,
+                    false,
                 )?;
 
                 dev.silu_mul_into(

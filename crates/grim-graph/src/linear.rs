@@ -16,12 +16,14 @@ pub trait LinearEmitter<A: ?Sized, W: ?Sized, Out: ?Sized, Scratch: ?Sized> {
         what: &str,
         layer: usize,
         flags: QuantFlags,
+        record_ir: bool,
     ) -> Result<QuantFlags>;
 }
 
 /// Executes device linear projection and IR emission via `emitter`.
 /// Takes `flags` by value (immutable copy) and returns the updated `QuantFlags`
 /// post-launch, preventing premature state mutation that skips quantize kernels.
+/// `record_ir` explicitly controls whether an IR node is emitted into the graph contract.
 pub fn emit_linear_dedup<
     A: ?Sized,
     W: ?Sized,
@@ -37,8 +39,9 @@ pub fn emit_linear_dedup<
     what: &str,
     layer: usize,
     flags: QuantFlags,
+    record_ir: bool,
 ) -> Result<QuantFlags> {
-    emitter.emit_linear(input, weight, out, scratch_q81, what, layer, flags)
+    emitter.emit_linear(input, weight, out, scratch_q81, what, layer, flags, record_ir)
 }
 
 #[cfg(test)]
@@ -62,6 +65,7 @@ mod tests {
             _what: &str,
             _layer: usize,
             flags: QuantFlags,
+            _record_ir: bool,
         ) -> Result<QuantFlags> {
             let mut next = flags;
             if !flags.q81_ready {
@@ -94,6 +98,7 @@ mod tests {
             "linear_1",
             0,
             flags,
+            true,
         )
         .unwrap();
         assert_eq!(emitter.quant_launches, 1);
@@ -109,6 +114,7 @@ mod tests {
             "linear_2",
             0,
             flags1,
+            true,
         )
         .unwrap();
         assert_eq!(emitter.quant_launches, 1); // skipped on second launch!
