@@ -165,24 +165,6 @@ extern "C" __global__ void blend_kv_rope_transform_kernel(
     }
 }
 
-extern "C" __global__ void blend_kv_rope_kernel(
-    const float* __restrict__ k_src,
-    const float* __restrict__ v_src,
-    float* __restrict__ k_dst,
-    float* __restrict__ v_dst,
-    int block_size,
-    int num_heads,
-    int head_dim,
-    int divergence_token,
-    int base_pos,
-    float rope_theta
-) {
-    blend_kv_rope_transform_kernel(
-        k_src, v_src, k_dst, v_dst,
-        block_size, num_heads, head_dim, divergence_token,
-        0, base_pos, 0, rope_theta
-    );
-}
 "#;
 
 use crate::device::roc_device::RocmDevice;

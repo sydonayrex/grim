@@ -2114,31 +2114,17 @@ pub fn dequant_embedding_wna16_int(data: &[u8], elem_count: usize) -> Result<Vec
 /// Codes are packed MSB-first within each byte, crossing byte boundaries as needed.
 /// `bit_pos = lane * n_bit`, and the decoder reads across the bytes that contain those.
 fn decode_msb_nbit(code_bytes: &[u8], block_offset_bytes: usize, lane: usize, n_bit: u8) -> u32 {
-    let bit_pos = (lane as u32).wrapping_mul(n_bit as u32);
-    let byte_idx = (bit_pos / 8) as usize;
-    let bit_in_byte = bit_pos % 8;
+    // Mirror the HIP `grim_decode_msb_nbit` exactly: stream bit p lives at
+    // byte p/8, bit 7-(p%8) (bit_in_byte=0 is the byte's MSB); codes assemble
+    // MSB-first, one bit at a time.
+    let start_bit = (lane as u32) * (n_bit as u32);
     let mut code: u32 = 0;
-    let mut consumed: u32 = 0;
-    let mut b = byte_idx;
-    let mut shift = 8 - bit_in_byte;
-    while consumed < n_bit as u32 {
-        let byte = code_bytes[block_offset_bytes + b];
-        let take = if shift == 0 { 8u32 } else { shift };
-        let take = if take > n_bit as u32 - consumed {
-            n_bit as u32 - consumed
-        } else {
-            take
-        };
-        let mask = if shift == 0 {
-            0xFFu32
-        } else {
-            ((1u32 << take) - 1u32) << (8 - shift)
-        };
-        let bits = (byte as u32 & mask) >> (8 - shift - take);
-        code |= bits << consumed;
-        consumed += take;
-        b += 1;
-        shift = 0;
+    for b in 0..n_bit as u32 {
+        let pos = start_bit + b;
+        let byte_idx = (pos / 8) as usize;
+        let bit_in_byte = pos % 8; // 0 = the byte's MSB
+        let bit = ((code_bytes[block_offset_bytes + byte_idx] >> (7 - bit_in_byte)) & 1) as u32;
+        code = (code << 1) | bit;
     }
     code
 }

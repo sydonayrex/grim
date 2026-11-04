@@ -138,6 +138,62 @@ FWHT_SMEM_KERNEL(grim_fwht_smem_f32,  float,          grim_fwht_load_f32)
 FWHT_SMEM_KERNEL(grim_fwht_smem_f16,  unsigned short, fp16_to_float_device)
 FWHT_BLOCK_KERNEL(grim_fwht_block_f32, float,          grim_fwht_load_f32)
 FWHT_BLOCK_KERNEL(grim_fwht_block_f16, unsigned short, fp16_to_float_device)
+
+// ---------------------------------------------------------------------------
+// TILED variant (Task 4 graph wiring, Bonsai widths 5120 / 6144 / 17408).
+//
+// A folded linear whose input dim is `n_blk * FWHT_N` applies a BLOCK-DIAGONAL
+// D·H to the full activation row: block b of every row uses
+// `signs[b*FWHT_N .. (b+1)*FWHT_N)` and its own independent FWHT. The
+// single-launch kernels above stride `src` by the compile-time FWHT_N, so they
+// cannot address a row whose stride is a multiple of FWHT_N — calling them
+// against a 5120-wide buffer would read the WRONG columns.
+//
+// This variant takes the row stride as a runtime parameter and spreads the
+// work over a 2D grid: `blockIdx.x` = block index b, `blockIdx.y` = activation
+// row r. One launch covers the whole `n_blk * rows` grid, so a folded linear
+// costs exactly ONE graph node instead of `n_blk` gather/kernel/scatter
+// round-trips (which is also what keeps the capture node count bounded).
+//
+// Signs semantics DIFFER deliberately from the single-launch path: there the
+// `(r % n_blk)` modulo encoded fwht.cu's per-ROW block cycling for 1024-wide
+// activations. Here the activation row is FULL WIDTH and block b always pairs
+// with `signs[b*FWHT_N]`, so the row index does not enter the signs offset —
+// `signs + b * FWHT_N`. This is the fork's `build_hadamard_input` contract
+// (llama-graph.cpp:1684-1712): one sign tensor per full width, applied to the
+// same block column of every row.
+#define FWHT_TILED_KERNEL(KNAME, STYPE, LOADF)                                      \
+extern "C" __global__ void KNAME(                                                    \
+    const STYPE* __restrict__ src, float* __restrict__ dst,                          \
+    const long long n_rows, const long long row_stride,                             \
+    const float scale, const float* __restrict__ signs)                             \
+{                                                                                    \
+    __shared__ float s_sh[FWHT_N];                                                   \
+    const int b = blockIdx.x;                                                        \
+    const long long r = blockIdx.y;                                                 \
+    if (r >= n_rows) {                                                               \
+        return;                                                                      \
+    }                                                                                \
+    const long long base = r * row_stride + (long long) b * FWHT_N;                 \
+    const float* signs_blk = signs ? signs + (long long) b * FWHT_N : 0;            \
+    float reg[FWHT_N / FWHT_NT];                                                     \
+    for (int i = 0; i < FWHT_N / FWHT_NT; ++i) {                                     \
+        const int idx = i * FWHT_NT + threadIdx.x;                                   \
+        float v = LOADF(src[base + idx]) * scale;                                    \
+        if (signs_blk) {                                                             \
+            v *= signs_blk[idx];                                                     \
+        }                                                                            \
+        reg[i] = v;                                                                  \
+    }                                                                                \
+    grim_fwht_dev_block_butterfly(reg, s_sh, threadIdx.x);                          \
+    for (int i = 0; i < FWHT_N / FWHT_NT; ++i) {                                     \
+        const int idx = i * FWHT_NT + threadIdx.x;                                   \
+        dst[base + idx] = reg[i];                                                    \
+    }                                                                                \
+}
+
+FWHT_TILED_KERNEL(grim_fwht_tiled_f32, float,          grim_fwht_load_f32)
+FWHT_TILED_KERNEL(grim_fwht_tiled_f16, unsigned short, fp16_to_float_device)
 "#;
 
 #[cfg(test)]

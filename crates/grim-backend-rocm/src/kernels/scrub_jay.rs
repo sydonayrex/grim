@@ -4,7 +4,9 @@
 //! 4-bit codebook selector, 8 four-bit indices, an 8-bit sign plane, and one
 //! E4M3 block scale. The decode is
 //!
-//!     v = sign(j) * CB[selector][index] * e4m3_scale * pre_scale
+//! ```text
+//! v = sign(j) * CB[selector][index] * e4m3_scale * pre_scale
+//! ```
 //!
 //! with the frozen 16x16 codebook compiled in as a constant, so no dequantized
 //! copy of B is ever uploaded -- the weights stay at 5.5 bpw in VRAM and the
