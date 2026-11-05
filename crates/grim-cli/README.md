@@ -133,8 +133,9 @@ grim train \
 
 ## Build Flags, Feature Flags, and Environment Variables
 
-- `default = ["rocm"]`: ROCm GPU backend enabled by default (via `grim-backend-rocm/cubecl`).
-- `rocm`: Enables the ROCm backend via `cubecl`.
-- `cuda`: Enables NVIDIA CUDA compilation.
+- `default = ["rocm"]`: ROCm GPU backend enabled by default (via `grim-backend-rocm/rocm` — the native HIP path; the cubecl JIT toolchain is test config, not ship config).
+- `rocm`: Enables the ROCm backend (native HIP).
+- `parity-tests`: Pulls in `grim-backend-rocm/parity-tests` (the second HIP JIT toolchain, cubecl) for parity testing only.
+- `cuda` / `metal` / `vulkan`: Optional GPU backends — off by default; enable with `--features cuda` / `metal` / `vulkan` (`cuda` enables NVIDIA CUDA compilation).
 - `wasm-sandbox`: Enables the WASM plugin sandbox in `grim-plugin`.
 - **Environment variables**: `GRIM_HOST`, `GRIM_PORT`, `GRIM_BACKEND`, `GRIM_CONFIG_PATH`, `GRIM_LOG_DIR`.

@@ -4525,7 +4525,8 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
         }
     }
 
-    // 3. Probe Apple Metal GPUs if no GPUs found yet
+    // 3. Probe Apple Metal GPUs if no GPUs found yet (feature `metal`)
+    #[cfg(feature = "metal")]
     if gpus_json.is_empty() {
         if let Some((free, total)) = grim_backend_metal::vram_info(0) {
             if total > 0 {
@@ -4548,7 +4549,8 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
         }
     }
 
-    // 4. Probe Vulkan GPUs if no GPUs found yet
+    // 4. Probe Vulkan GPUs if no GPUs found yet (feature `vulkan`)
+    #[cfg(feature = "vulkan")]
     if gpus_json.is_empty() {
         if let Some((free, total)) = grim_backend_vulkan::vram_info(0) {
             if total > 0 {
@@ -4605,6 +4607,7 @@ fn probe_gpu_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
 }
 
 /// Metal or CPU fallback used by both CUDA and non-CUDA paths.
+#[cfg(feature = "metal")]
 fn probe_metal_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
     if let Some((free, total)) = grim_backend_metal::vram_info(0) {
         (
@@ -4619,6 +4622,13 @@ fn probe_metal_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
     } else {
         (0, 0, vec![])
     }
+}
+
+/// Metal-free build (feature `metal` off): no Metal probe to run, same
+/// "nothing found" result as a host without Metal.
+#[cfg(not(feature = "metal"))]
+fn probe_metal_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
+    (0, 0, vec![])
 }
 
 /// Probe CUDA VRAM usage for N GPUs.

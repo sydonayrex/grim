@@ -25,7 +25,7 @@ grim-models-mamba       = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true }
 grim-backend-cuda = { workspace = true, optional = true }
-grim-backend-vulkan = { workspace = true }
+grim-backend-vulkan = { workspace = true, optional = true }
 grim-backend-metal = { workspace = true, optional = true }
 grim-speculative = { workspace = true }
 grim-plugin = { workspace = true }
@@ -68,13 +68,26 @@ half = "2.0"
 tempfile = "3"
 
 [features]
-# ROCm only by default. CUDA and Metal are optional — enable with
-# --features cuda or --features metal. This avoids requiring the CUDA
-# toolkit/SDK at build time for ROCm-only hosts.
+# ROCm only by default. CUDA, Metal and Vulkan are optional — enable with
+# --features cuda / metal / vulkan. This avoids requiring the CUDA
+# toolkit/SDK (or SPIR-V toolchain) at build time for ROCm-only hosts.
+# cubecl (the second HIP JIT toolchain) is parity/test config, not ship
+# config: it is out of grim-backend-rocm's default and reachable only via
+# the `parity-tests` feature (Phase 7 item 1).
 default = ["rocm"]
-rocm = ["grim-backend-rocm/cubecl"]
+rocm = ["grim-backend-rocm/rocm"]
+parity-tests = ["grim-backend-rocm/parity-tests"]
 cuda = ["dep:grim-backend-cuda", "grim-engine/cuda"]
-metal = ["dep:grim-backend-metal"]
+# `metal` also turns on engine's Metal load-fallback probe + the nn/autograd
+# `metal-mem` dispatch arms; `vulkan` turns on the nn/autograd `vulkan-mem`
+# arms so Device::Vulkan tensors work through those layers too.
+metal = ["dep:grim-backend-metal", "grim-server/metal", "grim-engine/metal"]
+vulkan = [
+    "dep:grim-backend-vulkan",
+    "grim-server/vulkan",
+    "grim-nn/vulkan-mem",
+    "grim-autograd/vulkan-mem",
+]
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]
 
 [lints]

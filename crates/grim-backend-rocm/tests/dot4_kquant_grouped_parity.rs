@@ -3376,6 +3376,8 @@ fn iq4xs_gemv_rows_parity_and_speed() {
         let o_v2 = as_rocm(out_v2.as_ref()).unwrap();
         let o_r2 = as_rocm(out_r2.as_ref()).unwrap();
         let o_r8 = as_rocm(out_r8.as_ref()).unwrap();
+        let o_hv2 = as_rocm(out_hv2.as_ref()).unwrap();
+        let o_hv8 = as_rocm(out_hv8.as_ref()).unwrap();
 
         dev.launch_dot4_iq4xs_q81_gemv_v8_for_ab(a_r, b_r, o_v2, m, n, k)
             .map_err(|e| format!("v8 (ref): {e}")).unwrap();

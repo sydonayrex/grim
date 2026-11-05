@@ -8,6 +8,7 @@ use grim_backend_cuda;
 use grim_backend_metal;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
+#[cfg(feature = "vulkan")]
 use grim_backend_vulkan;
 use grim_core::error::Result;
 use grim_core::model::CausalLm;
@@ -945,6 +946,23 @@ fn backend_unavailable(name: &str, why: &str) -> grim_core::error::Error {
     ))
 }
 
+/// Vulkan probe behind feature `vulkan` (Phase 7 item 1): single call site
+/// for explicit selection and auto-detection. `None` when no device is
+/// present.
+#[cfg(feature = "vulkan")]
+fn probe_vulkan() -> Option<(Device, String)> {
+    match grim_backend_vulkan::VulkanDevice::probe() {
+        Ok(devices) if !devices.is_empty() => Some((Device::Vulkan, "vulkan".into())),
+        _ => None,
+    }
+}
+
+/// Feature `vulkan` off (default): no Vulkan device can ever be present.
+#[cfg(not(feature = "vulkan"))]
+fn probe_vulkan() -> Option<(Device, String)> {
+    None
+}
+
 /// Resolve the device for an explicit selection string (`"rocm"`, `"cuda:1"`, `"auto"`, ...); `None` means auto-detect.
 /// Split from [`probe_device`] so the unavailable-backend error path is unit-testable without mutating the process environment.
 pub(crate) fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
@@ -1026,12 +1044,15 @@ pub(crate) fn probe_device_with(requested: Option<&str>) -> Result<(Device, Stri
                 Err(backend_unavailable("metal", "not compiled in"))
             }
             "vulkan" => {
-                if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
-                    if !vulkan_devices.is_empty() {
-                        return Ok((Device::Vulkan, "vulkan".into()));
+                #[cfg(feature = "vulkan")]
+                {
+                    match probe_vulkan() {
+                        Some(found) => Ok(found),
+                        None => Err(backend_unavailable("vulkan", "no Vulkan devices found")),
                     }
                 }
-                Err(backend_unavailable("vulkan", "no Vulkan devices found"))
+                #[cfg(not(feature = "vulkan"))]
+                Err(backend_unavailable("vulkan", "not compiled in"))
             }
             "cpu" => Ok((Device::Cpu, "cpu".into())),
             other => Err(grim_core::error::Error::Config(format!(
@@ -1070,14 +1091,9 @@ pub(crate) fn probe_device_with(requested: Option<&str>) -> Result<(Device, Stri
                     return Ok((Device::Cuda(ordinal), format!("cuda:{}", ordinal)));
                 }
             }
-            if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
-                if !vulkan_devices.is_empty() {
-                    eprintln!("[grim] Vulkan GPU detected");
-                    Ok((Device::Vulkan, "vulkan".into()))
-                } else {
-                    eprintln!("[grim] No GPU detected; using CPU backend.");
-                    Ok((Device::Cpu, "cpu".into()))
-                }
+            if let Some(found) = probe_vulkan() {
+                eprintln!("[grim] Vulkan GPU detected");
+                Ok(found)
             } else {
                 eprintln!("[grim] No GPU detected; using CPU backend.");
                 Ok((Device::Cpu, "cpu".into()))
@@ -1097,11 +1113,9 @@ pub(crate) fn probe_device_with(requested: Option<&str>) -> Result<(Device, Stri
         }
         #[cfg(not(all(target_vendor = "apple", feature = "metal")))]
         {
-            if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
-                if !vulkan_devices.is_empty() {
-                    eprintln!("[grim] Vulkan GPU detected");
-                    return Ok((Device::Vulkan, "vulkan".into()));
-                }
+            if let Some(found) = probe_vulkan() {
+                eprintln!("[grim] Vulkan GPU detected");
+                return Ok(found);
             }
         }
         eprintln!("[grim] GPU runtime not available; using CPU backend.");
@@ -2802,9 +2816,16 @@ pub(crate) fn build_tensor(
             let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
         }
+        #[cfg(feature = "vulkan")]
         grim_tensor::Device::Vulkan => {
             let dev = grim_backend_vulkan::VulkanDevice::new();
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+        #[cfg(not(feature = "vulkan"))]
+        grim_tensor::Device::Vulkan => {
+            return Err(grim_core::error::Error::Unimplemented(
+                "Vulkan backend is not enabled in this build".into(),
+            ));
         }
         #[cfg(feature = "metal")]
         grim_tensor::Device::Metal(ordinal) => {

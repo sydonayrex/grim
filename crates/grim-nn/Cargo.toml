@@ -12,8 +12,8 @@ grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-cuda = { workspace = true, optional = true }
 grim-backend-rocm = { workspace = true }
-grim-backend-metal = { workspace = true }
-grim-backend-vulkan = { workspace = true }
+grim-backend-metal = { workspace = true, optional = true }
+grim-backend-vulkan = { workspace = true, optional = true }
 grim-quant = { workspace = true }
 grim-format = { workspace = true }
 grim-kvtransport = { workspace = true }
@@ -28,8 +28,10 @@ parking_lot = { workspace = true }
 default = ["rocm-mem"]
 cuda-mem = ["dep:grim-backend-cuda"]
 rocm-mem = []
-metal-mem = []
-vulkan-mem = []
+# Phase 7 item 1: Metal/Vulkan devices are opt-in — the `*_mem` features now
+# pull their backend crates instead of always shipping them in the default.
+metal-mem = ["dep:grim-backend-metal"]
+vulkan-mem = ["dep:grim-backend-vulkan"]
 gpu-selection = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 # R2 — deterministic MoE dispatch (UniEP idea): route tokens through a
 # DeterministicTokenMap (conflict-free prefix-sum addressing) so the CPU

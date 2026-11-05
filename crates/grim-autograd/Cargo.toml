@@ -12,17 +12,19 @@ grim-format = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true, features = ["rccl"] }
 grim-backend-cuda = { workspace = true, optional = true }
-grim-backend-metal = { workspace = true }
-grim-backend-vulkan = { workspace = true }
+grim-backend-metal = { workspace = true, optional = true }
+grim-backend-vulkan = { workspace = true, optional = true }
 grim-quant = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [features]
-default = ["rocm-mem", "metal-mem", "vulkan-mem"]
+# Phase 7 item 1: ROCm only by default — Metal/Vulkan arms are opt-in via
+# `metal-mem` / `vulkan-mem` (previously both shipped in every default build).
+default = ["rocm-mem"]
 cuda-mem = ["dep:grim-backend-cuda"]
 rocm-mem = []
-metal-mem = []
-vulkan-mem = []
+metal-mem = ["dep:grim-backend-metal"]
+vulkan-mem = ["dep:grim-backend-vulkan"]
 # grim-garage's gpu-selection feature turns on every GPU backend arm.
 gpu-selection = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 

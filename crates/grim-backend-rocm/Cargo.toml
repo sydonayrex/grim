@@ -40,10 +40,11 @@ cubecl-runtime = { version = "0.10.0", features = ["std"], optional = true }
 cc = "1.0"
 
 [features]
-# `cubecl` matches the shipping configuration (grim-cli's `rocm` feature
-# forwards to it), so a bare `cargo test -p grim-backend-rocm` exercises the
-# same kernels the release binary serves. Without it the cubecl-gated parity
-# tests fail while the shipping path is green (fit-it-damn-you.md E3).
+# Phase 7 item 1: cubecl (pure-Rust HIP JIT) is PARITY/TEST config — the
+# shipping path is the hipRTC source in `kernels/`. Shipping two JIT
+# toolchains in the default build is test config, not ship config, so
+# `cubecl` is out of `default`; reach it through `parity-tests`
+# (grim-cli/README: `cargo test -p grim-backend-rocm --features parity-tests`).
 # q4k/q5k/q6k MUST ship enabled: their fused-GEMM kernels only enter the
 # aggregate JIT unit under these gates, and KQuant GGUF models (Q4_K/Q6_K are
 # the dominant formats) hit hipModuleGetFunction error 500 at first forward
@@ -51,7 +52,7 @@ cc = "1.0"
 # q2k/q3k joined the default set for the same reason: dispatch routes
 # KQuantScheme::Q2K/Q3K unconditionally to launch_fused_dequant_gemm_q2k/q3k,
 # so a non-default build crashes any Q2_K/Q3_K model at first forward.
-default = ["jit-hw-adaptive", "cubecl", "q2k", "q3k", "q4k", "q5k", "q6k"]
+default = ["jit-hw-adaptive", "q2k", "q3k", "q4k", "q5k", "q6k"]
 rocm = []
 jit-hw-adaptive = ["rocm"]
 multi-gpu-kernel = ["rocm"]
@@ -69,6 +70,9 @@ rocm-aiter = ["rocm"]
 # decode-GEMM kernel is an embedded HIP source literal in
 # `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime.
 cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "rocm"]
+# Parity/test umbrella: everything a non-shipping A/B run needs (currently
+# just cubecl). Never enable in a release build.
+parity-tests = ["cubecl"]
 rccl = ["rocm"]
 # Public test shims (device::gptq_test_shim) letting tests/ exercise the
 # GPTQ fused dequant-GEMM launchers without widening the production API.

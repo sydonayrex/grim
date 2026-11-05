@@ -61,6 +61,8 @@ gpu-selection = [
     "dep:grim-backend-metal",
     "grim-autograd/gpu-selection",
     "grim-nn/gpu-selection",
+    # engine's Metal load-fallback probe joins the every-backend turn-on.
+    "grim-engine/metal",
 ]
 
 [lints]

@@ -5670,9 +5670,12 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
             "rocm" => grim_backend_rocm::RocmDevice::probe()
                 .map(|d| !d.is_empty())
                 .unwrap_or(false),
+            #[cfg(feature = "metal")]
             "metal" => grim_backend_metal::MetalDevice::probe()
                 .map(|d| !d.is_empty())
                 .unwrap_or(false),
+            #[cfg(not(feature = "metal"))]
+            "metal" => false,
             #[cfg(feature = "cuda")]
             "cuda" => grim_backend_cuda::CudaDevice::probe()
                 .map(|d| !d.is_empty())
@@ -5850,7 +5853,8 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
             };
         }
     }
-    // Fall back to Metal.
+    // Fall back to Metal (feature `metal`; CPU when not compiled in).
+    #[cfg(feature = "metal")]
     if let Ok(metal_devices) = grim_backend_metal::MetalDevice::probe() {
         if let Some(first) = metal_devices.first() {
             log::info!("[model_loader] Using Metal device {}", first.ordinal());
