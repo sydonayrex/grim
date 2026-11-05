@@ -1593,9 +1593,9 @@ async fn main() -> Result<()> {
                     None => {
                         print!("Enter API token for {}: ", p);
                         use std::io::Write;
-                        std::io::stdout().flush().unwrap();
+                        let _ = std::io::stdout().flush();
                         let mut input = String::new();
-                        std::io::stdin().read_line(&mut input).unwrap();
+                        let _ = std::io::stdin().read_line(&mut input);
                         input.trim().to_string()
                     }
                 };
@@ -2201,7 +2201,8 @@ async fn main() -> Result<()> {
                         let _engine =
                             grim_engine::Engine::new(grim_engine::EngineConfig::default());
                         println!("[Service] Running background daemon on port 11434");
-                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let rt = tokio::runtime::Runtime::new()
+                            .map_err(|e| Error::Config(format!("tokio runtime creation failed: {e}")))?;
                         rt.block_on(async {
                             if let Err(e) =
                                 server::cmd_server("127.0.0.1:11434", &config, &plugins).await

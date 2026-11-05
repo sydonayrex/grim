@@ -137,17 +137,26 @@ fn read_counts(provider: &GgufProvider, base: &str, n_values: usize) -> Result<V
             GgufDType::I32 => raw
                 .bytes
                 .chunks_exact(4)
-                .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as f32)
+                .map(|b| {
+                    let arr: [u8; 4] = b.try_into().unwrap_or_default();
+                    i32::from_le_bytes(arr) as f32
+                })
                 .collect(),
             GgufDType::I64 => raw
                 .bytes
                 .chunks_exact(8)
-                .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as f32)
+                .map(|b| {
+                    let arr: [u8; 8] = b.try_into().unwrap_or_default();
+                    i64::from_le_bytes(arr) as f32
+                })
                 .collect(),
             GgufDType::F32 => raw
                 .bytes
                 .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .map(|b| {
+                    let arr: [u8; 4] = b.try_into().unwrap_or_default();
+                    f32::from_le_bytes(arr)
+                })
                 .collect(),
             other => {
                 return Err(Error::Backend(format!(
@@ -202,7 +211,10 @@ fn read_f32_tensor(provider: &GgufProvider, name: &str) -> Result<Vec<f32>> {
     Ok(raw
         .bytes
         .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .map(|b| {
+            let arr: [u8; 4] = b.try_into().unwrap_or_default();
+            f32::from_le_bytes(arr)
+        })
         .collect())
 }
 

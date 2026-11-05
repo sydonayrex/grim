@@ -955,7 +955,10 @@ pub fn parse_attachment_index(buf: &[u8], base: u64) -> Result<Vec<EmbeddedAttac
     if buf_len < 15 {
         return Ok(Vec::new()); // too small for any trailer; no attachments
     }
-    let stored = u64::from_le_bytes(buf[(buf_len - 8) as usize..].try_into().unwrap());
+    let stored = match buf[(buf_len - 8) as usize..].try_into() {
+        Ok(b) => u64::from_le_bytes(b),
+        Err(_) => return Ok(Vec::new()),
+    };
     if stored < base || stored + 15 > base + buf_len {
         return Ok(Vec::new()); // trailer not inside this slice / absent
     }
@@ -967,7 +970,10 @@ pub fn parse_attachment_index(buf: &[u8], base: u64) -> Result<Vec<EmbeddedAttac
     if pos + 4 > buf.len() {
         return Err(Error::Backend("truncated attachment index: no count".into()));
     }
-    let count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    let count = match buf[pos..pos + 4].try_into() {
+        Ok(b) => u32::from_le_bytes(b) as usize,
+        Err(_) => return Err(Error::Backend("truncated attachment count".into())),
+    };
     pos += 4;
     // The trailer indexes one sidecar per known kind — a count beyond that is
     // corruption, not a big attachment set; refuse before sizing anything.
@@ -987,18 +993,30 @@ pub fn parse_attachment_index(buf: &[u8], base: u64) -> Result<Vec<EmbeddedAttac
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         need(buf, pos, 2, "kind length")?;
-        let kind_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        let kind_len = match buf[pos..pos + 2].try_into() {
+            Ok(b) => u16::from_le_bytes(b) as usize,
+            Err(_) => return Err(Error::Backend("invalid kind length".into())),
+        };
         pos += 2;
         need(buf, pos, kind_len, "kind name")?;
         let kind = String::from_utf8_lossy(&buf[pos..pos + kind_len]).into_owned();
         pos += kind_len;
         need(buf, pos, 16, "offset/size")?;
-        let offset = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        let offset = match buf[pos..pos + 8].try_into() {
+            Ok(b) => u64::from_le_bytes(b),
+            Err(_) => return Err(Error::Backend("invalid offset".into())),
+        };
         pos += 8;
-        let size = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        let size = match buf[pos..pos + 8].try_into() {
+            Ok(b) => u64::from_le_bytes(b),
+            Err(_) => return Err(Error::Backend("invalid size".into())),
+        };
         pos += 8;
         need(buf, pos, 32, "sha256")?;
-        let sha256 = buf[pos..pos + 32].try_into().unwrap();
+        let sha256 = match buf[pos..pos + 32].try_into() {
+            Ok(b) => b,
+            Err(_) => return Err(Error::Backend("invalid sha256".into())),
+        };
         pos += 32;
         out.push(EmbeddedAttachment {
             kind,

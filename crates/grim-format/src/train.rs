@@ -330,8 +330,8 @@ impl TrainState {
         let mut names: Vec<String> = self
             .blobs
             .keys()
-            .filter(|k| k.ends_with(".lora_A.weight"))
-            .map(|k| k.strip_suffix(".lora_A.weight").unwrap().to_string())
+            .filter_map(|k| k.strip_suffix(".lora_A.weight"))
+            .map(|s| s.to_string())
             .collect();
         names.sort();
         names

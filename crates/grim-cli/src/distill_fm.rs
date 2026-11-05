@@ -182,25 +182,24 @@ pub fn cmd_distill_fm(cfg: &DistillConfig) -> Result<()> {
         .map(|&li| {
             let b = &lfm.layers[li];
             let to_mat = |lin: &grim_nn::Linear| -> Vec<Vec<f64>> {
-                let data = lin.weight.to_vec_f32().unwrap();
+                let data = lin.weight.to_vec_f32().unwrap_or_default();
                 let dims = lin.weight.shape().dims();
                 let (out_dim, in_dim) = (dims[0], dims[1]);
                 (0..out_dim)
                     .map(|r| {
-                        data[r * in_dim..(r + 1) * in_dim]
-                            .iter()
-                            .map(|&x| x as f64)
-                            .collect()
+                        data.get(r * in_dim..(r + 1) * in_dim)
+                            .map(|slice| slice.iter().map(|&x| x as f64).collect())
+                            .unwrap_or_default()
                     })
                     .collect()
             };
             LayerHost {
                 li,
                 w: grim_models_transformer::gla_train::FmWeights {
-                    wq: to_mat(b.wq.as_ref().unwrap()),
-                    wk: to_mat(b.wk.as_ref().unwrap()),
-                    wv: to_mat(b.wv.as_ref().unwrap()),
-                    wo: to_mat(b.wo.as_ref().unwrap()),
+                    wq: b.wq.as_ref().map(to_mat).unwrap_or_default(),
+                    wk: b.wk.as_ref().map(to_mat).unwrap_or_default(),
+                    wv: b.wv.as_ref().map(to_mat).unwrap_or_default(),
+                    wo: b.wo.as_ref().map(to_mat).unwrap_or_default(),
                 },
                 heads: b.num_heads,
                 kv_heads: b.num_kv_heads,

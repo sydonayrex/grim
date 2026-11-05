@@ -928,7 +928,9 @@ fn tokenizer_for_path(path_str: &str) -> Option<GgufTokenizer> {
             .unwrap_or(std::path::Path::new("."));
         let tj = dir.join("tokenizer.json");
         if tj.exists() {
-            return GgufTokenizer::from_hf_json(tj.to_str().unwrap()).ok();
+            if let Some(tj_str) = tj.to_str() {
+                return GgufTokenizer::from_hf_json(tj_str).ok();
+            }
         }
     }
     None

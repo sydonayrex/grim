@@ -133,10 +133,13 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await;
-    if health.is_err() || !health.unwrap().status().is_success() {
-        return Err(Error::Config(format!(
-            "serving bench: no server at {addr} (start one with 'grim-cli serve')"
-        )));
+    match health {
+        Ok(resp) if resp.status().is_success() => {}
+        _ => {
+            return Err(Error::Config(format!(
+                "serving bench: no server at {addr} (start one with 'grim-cli serve')"
+            )));
+        }
     }
 
     let client = reqwest::Client::builder()
@@ -223,8 +226,8 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
             "serving bench: zero successful requests".into(),
         ));
     }
-    request_latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    all_itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    request_latencies_ms.sort_by(|a, b| a.total_cmp(b));
+    all_itls.sort_by(|a, b| a.total_cmp(b));
 
     let pct = |p: f64| -> f64 {
         let idx = (((request_latencies_ms.len() as f64) * p) as usize)
@@ -260,7 +263,7 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
 
 /// ITL percentile math on canned latencies (unit-testable core of serve mode).
 pub fn percentiles_of(mut v: Vec<f64>) -> (f64, f64, f64) {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b));
     let pct = |p: f64| -> f64 {
         let idx = (((v.len() as f64) * p) as usize).clamp(1, v.len()) - 1;
         v[idx]

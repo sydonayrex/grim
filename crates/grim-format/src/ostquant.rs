@@ -80,10 +80,9 @@ impl OstQuantProvider {
 
         let mut tensors = HashMap::new();
         for (name, tensor_info) in &info {
-            if !name.ends_with(".qweight") {
+            let Some(base_name) = name.strip_suffix(".qweight") else {
                 continue;
-            }
-            let base_name = name.strip_suffix(".qweight").unwrap();
+            };
 
             let scales_name = format!("{base_name}.scales");
             let zeros_name = format!("{base_name}.zeros");

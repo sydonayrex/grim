@@ -830,7 +830,7 @@ impl GgufTokenizer {
             for i in 0..symbols.len().saturating_sub(1) {
                 let pair = format!("{} {}", symbols[i], symbols[i + 1]);
                 if let Some(&rank) = merges.get(&pair) {
-                    if best_rank.is_none() || rank < best_rank.unwrap() {
+                    if best_rank.is_none_or(|br| rank < br) {
                         best_rank = Some(rank);
                         best_idx = Some(i);
                     }
@@ -906,7 +906,7 @@ impl GgufTokenizer {
                 for i in 0..symbols.len().saturating_sub(1) {
                     let pair = format!("{} {}", symbols[i], symbols[i + 1]);
                     if let Some(&rank) = merges.get(&pair) {
-                        if best_rank.is_none() || rank < best_rank.unwrap() {
+                        if best_rank.is_none_or(|br| rank < br) {
                             best_rank = Some(rank);
                             best_idx = Some(i);
                         }
@@ -1222,7 +1222,9 @@ pub fn sanitize_jinja_template(template: &str) -> String {
                     tag.push(c);
                     inner.push(c);
                     if c == '%' && buf.peek() == Some(&'}') {
-                        tag.push(buf.next().unwrap());
+                        if let Some(closing) = buf.next() {
+                            tag.push(closing);
+                        }
                         break;
                     }
                 }
@@ -1683,7 +1685,9 @@ fn gpt2_byte_encoder() -> HashMap<u8, char> {
         if bs.contains(&b) {
             map.insert(b, b as char);
         } else {
-            map.insert(b, char::from_u32(256 + c).unwrap());
+            if let Some(ch) = char::from_u32(256 + c) {
+                map.insert(b, ch);
+            }
             c += 1;
         }
     }

@@ -1289,7 +1289,7 @@ impl Engine {
                 let bucket_size = [32usize, 16, 8, 4, 2]
                     .into_iter()
                     .find(|&b| b <= n)
-                    .unwrap();
+                    .unwrap_or(2);
                 let chunk = &rest[..bucket_size];
                 let bucket = match DecodeBatchBucket::from_batch_size(bucket_size) {
                     Some(b) => b,

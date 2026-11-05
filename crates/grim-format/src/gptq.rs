@@ -159,12 +159,9 @@ impl GptqProvider {
         let mut tensors = HashMap::new();
         for (name, tensor_info) in &info {
             // Check for GPTQ tensor naming pattern ending in .qweight
-            if !name.ends_with(".qweight") {
+            let Some(base_name) = name.strip_suffix(".qweight") else {
                 continue;
-            }
-
-            // Get base name by removing .qweight suffix
-            let base_name = name.strip_suffix(".qweight").unwrap();
+            };
 
             // Try to find companion tensors
             let qzeros_name = format!("{}.qzeros", base_name);
@@ -208,7 +205,9 @@ impl GptqProvider {
             let mut desc_act = default_desc_act;
             if let Some(_g_idx_off) = g_idx_offset {
                 // Read g_idx to verify monotonicity
-                let g_idx_info = info.get(&g_idx_name).unwrap();
+                let Some(g_idx_info) = info.get(&g_idx_name) else {
+                    continue;
+                };
                 let mut local_reader = BufReader::new(
                     File::open(&resolved_str).map_err(|e| Error::Backend(e.to_string()))?,
                 );

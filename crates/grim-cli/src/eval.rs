@@ -411,10 +411,10 @@ fn tensor_on_device(
     let storage = match device {
         grim_tensor::Device::Cpu => grim_backend_cpu::CpuDevice::new()
             .from_cpu(&data, shape, grim_tensor::DType::F32)
-            .unwrap(),
+            .expect("CpuDevice from_cpu"),
         grim_tensor::Device::Rocm(o) => grim_backend_rocm::RocmDevice::shared(*o)
             .from_cpu(&data, shape, grim_tensor::DType::F32)
-            .unwrap(),
+            .expect("RocmDevice from_cpu"),
         _ => panic!("unsupported device {device:?}"),
     };
     grim_tensor::Tensor::new(
@@ -512,7 +512,9 @@ pub async fn cmd_eval(
             "metrics": metrics,
             "date": chrono_now_iso(),
         });
-        std::fs::write(&out_path, serde_json::to_string_pretty(&doc).unwrap())
+        let pretty_json = serde_json::to_string_pretty(&doc)
+            .map_err(|e| Error::Config(format!("serialize eval json: {e}")))?;
+        std::fs::write(&out_path, pretty_json)
             .map_err(|e| Error::Config(format!("write {out_path}: {e}")))?;
         println!("[eval] wrote {out_path}");
     }

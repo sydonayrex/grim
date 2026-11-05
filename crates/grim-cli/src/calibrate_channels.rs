@@ -287,7 +287,7 @@ fn write_sidecar(
             let alloc = grim_kvquant::channel_importance::ChannelBitAllocation::from_scores(
                 &k_scores, k_def, kb, &v_scores, 4, vb,
             ).expect("allocator inputs are geometry-consistent");
-            serde_json::to_value(alloc).unwrap()
+            serde_json::to_value(alloc).unwrap_or(serde_json::Value::Null)
         }),
     });
     let json = serde_json::to_string_pretty(&value)

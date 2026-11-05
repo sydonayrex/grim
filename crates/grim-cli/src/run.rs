@@ -2052,6 +2052,7 @@ pub async fn cmd_run(
                 decode_prefill_cache.push((input_tensor, positions_tensor));
                 // Proof: pushed one element on the line above, so `last`
                 // cannot be `None`. Same logic-bug rationale as above.
+                #[allow(clippy::unwrap_used)]
                 let (i, p) = decode_prefill_cache.last().unwrap();
                 (i, p)
             }
