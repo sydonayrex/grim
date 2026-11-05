@@ -42,10 +42,6 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         None => return Ok(()),
     };
     let device = grim_tensor::Device::Rocm(dev.ordinal());
-    // Fidelity with the grim-cli run path: grim-cli promotes the KV arena to
-    // f16 via its dynamic-kv probe; without this the harness decodes with an
-    // f32 arena and flips a near-tie at token 3 (369 vs 6587).
-    std::env::set_var("GRIM_KV_ARENA", "f16");
     let model = grim_engine::model_loader::load_model_from_gguf(MODEL, device.clone())
         .map_err(|e| format!("load_model_from_gguf failed: {e}"))?;
     let provider = grim_format::GgufProvider::open(MODEL).map_err(|e| format!("GgufProvider::open failed: {e}"))?;
@@ -98,7 +94,21 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
     let ref_path = std::path::Path::new("/tmp/bonsai_ref_tokens.txt");
     let txt = std::fs::read_to_string(ref_path).map_err(|e| format!("read ref: {e}"))?;
     let want: Vec<u32> = txt.split_whitespace().map(|t| t.parse().expect("token id")).collect();
-    assert_eq!(generated[..32], want[..32], "Gate D first-32 token parity failed");
+    if generated[..32] != want[..32] {
+        // Plan rule (Task 6 Step 2): on divergence print both logit gaps and
+        // STOP — do not weaken to "similar text". Report the greedy top-2 gap
+        // at the FIRST divergent position for both sides.
+        let div = (0..32).find(|&i| generated[i] != want[i]).unwrap();
+        eprintln!(
+            "[gate-d] first divergence at token {div}: grim={} ref={}\n  grim[0..8]={:?}\n  ref [0..8]={:?}",
+            generated[div], want[div], &generated[..8], &want[..8]
+        );
+        eprintln!(
+            "[gate-d] STOP per plan: parity NOT met (matched {div}/32 tokens)"
+        );
+        return Err(format!("Gate D parity: diverged at token {div} (grim {} vs ref {})", generated[div], want[div]).into());
+    }
+    println!("[gate-d] first 32 tokens identical to reference");
     let _ = dev_box;
     Ok(())
 }

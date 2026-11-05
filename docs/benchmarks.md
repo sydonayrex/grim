@@ -1543,3 +1543,52 @@ CLOSED per the plan's honest-negative rule. The dual kernels + wiring
 stay in-tree: byte-exact, gated (GRIM_FUSE_NORM_QUANT), and live for any
 model geometry where a standalone m=1 norm precedes a q81 consumer
 (e.g. layer 0, non-Qwen35 families). Do not credit a perf win.
+
+## Bonsai-27B Prism Hadamard runtime (plans/PLAN-prism-hadamard-bonsai.md Task 6)
+
+Recorded 2026-11-04, RX 9070 XT + RX 9060 XT (gfx1201/gfx1200, wave32), two-card
+split (rocm:0=21 layers, rocm:1=43 layers), prompt
+"Explain how a transistor works in two paragraphs:" (chat-template 20 tokens),
+greedy (temp 0), repeat penalty 1.0, `GRIM_PHASE_TRACE=1`.
+
+### grim (decode-graph replay path active)
+
+| Metric | Value |
+|---|---|
+| TTFT (prefill 20 tokens) | 1846.5 ms |
+| Decode, steady state | 94.7 ms/token (p50 over 2110 steps; p90 104.3 ms) |
+| Achieved GEMV bandwidth | 75.9 GB/s |
+| Path | `graph-sampled` n=2110, total 199.8 s |
+
+### Reference (`llama-prism` b12128, GPU, same file)
+
+| Metric | Value |
+|---|---|
+| Prompt eval | 396.0 ms / 18 tokens (22.0 ms/token) |
+| Eval | 2090.1 ms / 63 runs (33.18 ms/token) |
+
+### Verdict
+
+grim is ~2.9x slower per token than the fork's fused kernels (94.7 vs 33.18
+ms/token), as the plan anticipated: the FWHT+q8_1 quantizer fusion
+(~390 launches/step) and `add_rms_norm+FWHT` fusion are explicitly deferred to
+a follow-up plan (Task 7). Recorded, not chased, per the plan's rule.
+
+### Token parity (Task 6 Step 2 — NOT met)
+
+The plan's Gate D requires the first 32 greedy tokens to be token-identical to
+the reference. Outcome: grim matches the reference for the first 2 tokens and
+diverges at token 3 (grim 369 vs reference 6587; both logits are near-ties).
+Per the plan's stop rule ("any divergence -> print both logit gaps and STOP for
+analysis; do not weaken"), Gate D reports the divergence and fails rather than
+degrading to text comparison. The gate is implemented in
+`crates/grim-models/transformer/tests/bonsai_hadamard_e2e.rs`
+(`gate_d_bonsai_first_32_token_parity`, `#[ignore]`, GPU-gated) with the
+reference token ids pinned from the reference server run
+(`/tmp/bonsai_ref_tokens.txt`, 64 tokens, temp 0 seed 42).
+
+Remaining analysis (follow-up): per-layer/per-projection hidden-state bisection
+against reference dumps (the plan's original bisect protocol) to find the
+residual rotated-domain numerics gap; suspects are the near-tie logit flips
+(369/6587, 728/264) arising from PQ2_0 + FWHT accumulation-order differences
+between grim's device path and llama.cpp's.
