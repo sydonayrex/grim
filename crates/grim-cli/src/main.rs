@@ -21,7 +21,7 @@
 )]
 
 use clap::{Parser, Subcommand};
-use grim_core::error::Result;
+use grim_core::error::{Error, Result};
 
 pub mod adapter;
 pub mod arch_plugin;

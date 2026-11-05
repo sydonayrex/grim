@@ -29,13 +29,78 @@ fn gate_a_hadamard_plan_accepts_bonsai() {
     assert!(HadamardPlan::from_meta(&bad, &tensor_names, 48, 16).is_err());
 }
 
+
+
 #[test]
 #[ignore]
-fn gate_d_bonsai_loads() {
+fn gate_d_bonsai_first_32_token_parity() -> TestResult {
     if !Path::new(MODEL).exists() {
-        eprintln!("skipping: no Bonsai file");
-        return;
+        return Ok(());
     }
+    let dev = match gpu_device() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let device = grim_tensor::Device::Rocm(dev.ordinal());
+    // Fidelity with the grim-cli run path: grim-cli promotes the KV arena to
+    // f16 via its dynamic-kv probe; without this the harness decodes with an
+    // f32 arena and flips a near-tie at token 3 (369 vs 6587).
+    std::env::set_var("GRIM_KV_ARENA", "f16");
+    let model = grim_engine::model_loader::load_model_from_gguf(MODEL, device.clone())
+        .map_err(|e| format!("load_model_from_gguf failed: {e}"))?;
+    let provider = grim_format::GgufProvider::open(MODEL).map_err(|e| format!("GgufProvider::open failed: {e}"))?;
+    let _tokenizer = provider.tokenizer().map_err(|e| format!("tokenizer failed: {e}"));
+    // The exact chat-template token ids grim-cli encodes for this prompt
+    // (pinned from `[grim] Encoded prompt: 20 tokens: [...]`). Re-encoding the
+    // template string through the raw BPE gives a different tokenization
+    // (`assistant` as an ordinary piece vs the chat-template id), which
+    // silently changes the prefill and diverges at token 3.
+    let input_ids: Vec<u32> = vec![
+        248045, 1156, 198, 814, 20139, 1204, 264, 94562, 4138, 303, 1330, 41228,
+        25, 248046, 198, 248045, 17313, 198, 248068, 198,
+    ];
+    let prompt_len = input_ids.len();
+    let ids: Vec<f32> = input_ids.iter().map(|&x| x as f32).collect();
+    let dev_box: Box<dyn grim_tensor::backend::BackendDevice> = Box::new(dev);
+    let mk = |vals: &[f32]| -> grim_tensor::Tensor {
+        let shape = Shape::new(vec![1, vals.len()]);
+        let st = dev_box.from_cpu(vals, &shape, DType::F32).expect("from_cpu");
+        grim_tensor::Tensor::new(
+            std::sync::Arc::from(st),
+            shape,
+            DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            device.clone(),
+        )
+    };
+    let pos: Vec<f32> = (0..prompt_len).map(|i| i as f32).collect();
+    let input = mk(&ids);
+    let pos_t = mk(&pos);
+    let mut session = model.new_session();
+    let logits = model.forward(session.as_mut(), &input, &pos_t, &[]).map_err(|e| format!("prefill failed: {e}"))?;
+    let vocab = 248320usize;
+    let flat = logits.to_vec_f32().map_err(|e| format!("logits f32: {e}"))?;
+    let row = &flat[flat.len() - vocab..];
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap();
+    let mut generated = Vec::new();
+    let mut current = argmax(row);
+    generated.push(current);
+    for i in 1..32 {
+        let step_pos = prompt_len + i - 1;
+        let st_in = mk(&[current as f32]);
+        let st_pos = mk(&[step_pos as f32]);
+        let step_logits = model.forward(session.as_mut(), &st_in, &st_pos, &[]).map_err(|e| format!("decode failed: {e}"))?;
+        let flat = step_logits.to_vec_f32().map_err(|e| format!("step logits: {e}"))?;
+        let row = &flat[flat.len() - vocab..];
+        current = argmax(row);
+        generated.push(current);
+    }
+    let ref_path = std::path::Path::new("/tmp/bonsai_ref_tokens.txt");
+    let txt = std::fs::read_to_string(ref_path).map_err(|e| format!("read ref: {e}"))?;
+    let want: Vec<u32> = txt.split_whitespace().map(|t| t.parse().expect("token id")).collect();
+    assert_eq!(generated[..32], want[..32], "Gate D first-32 token parity failed");
+    let _ = dev_box;
+    Ok(())
 }
 
 use grim_backend_rocm::device::roc_device::RocmDevice;
