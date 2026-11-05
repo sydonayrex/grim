@@ -947,7 +947,7 @@ pub(crate) fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Resul
             let scale = f32::from_bits(scale_bits);
             let mut out = Vec::with_capacity(elem_count);
             for &byte in &raw[4..4 + elem_count] {
-                let f_val = fp8_e4m3_to_f32(byte);
+                let f_val = grim_quant::fp8_e4m3_to_f32(byte);
                 out.push(scale * f_val);
             }
             Ok(out)
@@ -974,18 +974,4 @@ pub(crate) fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Resul
         );
     }
     result
-}
-
-fn fp8_e4m3_to_f32(byte: u8) -> f32 {
-    if byte == 0x7F || byte == 0xFF {
-        return f32::NAN;
-    }
-    let sign = if (byte & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
-    let exp = (byte >> 3) & 0x0F;
-    let mant = byte & 0x07;
-    if exp == 0 {
-        sign * (mant as f32) * (1.0 / 512.0)
-    } else {
-        sign * ((1 << 3) | mant) as f32 * (2.0f32.powi(exp as i32 - 7 - 3))
-    }
 }
