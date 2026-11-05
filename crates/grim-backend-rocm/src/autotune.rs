@@ -578,6 +578,22 @@ pub fn quantize_routing_skew(skew: f32) -> u8 {
 pub type BenchFn<'a> = dyn FnOnce(KernelKey) -> Result<AutotuneConfig> + Send + 'a;
 
 /// Tuned-config cache: [see: `HashMap<KernelKey, AutotuneConfig>`, `cache_dir`, `{dir}/{gpu_arch}.json`, `hipMemcpy`]
+///
+/// ```
+/// use grim_backend_rocm::autotune::{AutotuneConfig, Autotuner, KernelKey};
+///
+/// let mut tuner = Autotuner::for_device(0, "gfx1036");
+/// assert_eq!(tuner.device_ordinal(), 0);
+/// assert!(!tuner.is_empty(), "preseeded with standard shapes");
+///
+/// let key = KernelKey::qkv_attention("gfx1036", 8, 64, 1024);
+/// let hit = tuner.lookup(key).expect("preseeded shape must hit");
+/// assert_eq!(hit.block_dim, 256);
+///
+/// let cfg = AutotuneConfig { block_dim: 128, ..Default::default() };
+/// tuner.record(KernelKey::qkv_attention("gfx1036", 4, 32, 64), cfg).unwrap();
+/// assert_eq!(tuner.lookup(KernelKey::qkv_attention("gfx1036", 4, 32, 64)).unwrap().block_dim, 128);
+/// ```
 #[derive(Debug)]
 pub struct Autotuner {
     device_ordinal: usize,

@@ -25,6 +25,13 @@ use serde::{Deserialize, Serialize};
 use grim_tensor::error::{Error, Result};
 
 /// A single measurement on the bench side.
+///
+/// ```
+/// use grim_backend_rocm::perf_gate::Measurement;
+///
+/// let m = Measurement { cycles_per_call: 1100.0 };
+/// assert!((m.delta_pct_vs(1000.0) - 10.0).abs() < 1e-9);
+/// ```
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Measurement {
     pub cycles_per_call: f64,
@@ -42,6 +49,17 @@ impl Measurement {
 }
 
 /// Per-key baseline entry.
+///
+/// ```
+/// use grim_backend_rocm::perf_gate::BaselineEntry;
+///
+/// let entry = BaselineEntry {
+///     kernel: "grim_qkv_attention".to_string(),
+///     baseline_cycles_per_call: 1000.0,
+///     threshold_pct: 5.0,
+/// };
+/// assert_eq!(entry.threshold_pct, 5.0);
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BaselineEntry {
     pub kernel: String,
@@ -51,6 +69,20 @@ pub struct BaselineEntry {
 
 /// Decoded baseline JSON carried in memory. The byte-level shape lives
 /// below in `BaselineTableJson`; public types use borrowed views.
+///
+/// ```
+/// use grim_backend_rocm::perf_gate::BaselineTable;
+///
+/// let mut table = BaselineTable::for_arch("gfx1036");
+/// assert_eq!(table.arch(), "gfx1036");
+/// table
+///     .set_entry("grim_qkv_attention", 1000.0, 5.0)
+///     .unwrap();
+/// assert!(table.entry("grim_qkv_attention").is_some());
+/// let json = table.to_json_pretty().unwrap();
+/// let reparsed = BaselineTable::from_json(&json).unwrap();
+/// assert_eq!(reparsed.arch(), "gfx1036");
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaselineTable {
     arch: String,
@@ -349,6 +381,28 @@ impl Verdict {
 
 /// The actual gate. Holds a `BaselineTable` and applies the per-key
 /// threshold when asked to compare a measurement.
+///
+/// ```
+/// use grim_backend_rocm::perf_gate::{BaselineTable, Measurement, PerfGate, Verdict};
+///
+/// let mut table = BaselineTable::for_arch("gfx1036");
+/// table
+///     .set_entry("grim_qkv_attention", 1000.0, 5.0)
+///     .unwrap();
+/// let gate = PerfGate::new(table);
+///
+/// let within = gate.compare(
+///     "grim_qkv_attention",
+///     Measurement { cycles_per_call: 1030.0 },
+/// );
+/// assert!(matches!(within, Verdict::Within { .. }));
+///
+/// let regressed = gate.compare(
+///     "grim_qkv_attention",
+///     Measurement { cycles_per_call: 1200.0 },
+/// );
+/// assert!(regressed.fails_ci());
+/// ```
 #[derive(Debug, Clone)]
 pub struct PerfGate {
     table: BaselineTable,

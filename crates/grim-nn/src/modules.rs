@@ -7,7 +7,7 @@ use grim_backend_cpu::CpuDevice;
 use grim_backend_metal::MetalDevice;
 #[cfg(feature = "vulkan-mem")]
 use grim_backend_vulkan::VulkanDevice;
-use grim_tensor::dtype::Storage;
+use grim_tensor::dtype::{BlockDtype, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::{
@@ -1090,6 +1090,21 @@ impl Linear {
                     }
                     Err(e) => return Err(e),
                 }
+            } else if matches!(self.weight.dtype().storage, Storage::Block(BlockDtype::Pq2_0)) {
+                // Prism PQ2_0 has no QuantFormat variant (it rides the GGUF dtype
+                // mapping directly) but is served by the packed ROCm GEMV
+                // `grim_dot4_pq2_0_q80_gemv`; dispatch on the storage dtype inside
+                // `quantized_matmul`, so the passed format is unused.
+                if qmm_trace {
+                    eprintln!("[linear] branch=quantized_matmul pq2_0");
+                }
+                dev.quantized_matmul(
+                    a_storage,
+                    b_storage,
+                    &[],
+                    grim_tensor::QuantFormat::Q8_0,
+                    &out_shape,
+                )?
             } else {
                 // Quantized storage with no fused kernel (block FP4/FP8, FloatPack, ...).
                 // Use the dtype's OWN format mapping: hardcoding one format here

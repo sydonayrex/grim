@@ -451,22 +451,22 @@ mod tests {
         );
         let r = 4usize;
         let hidden = 32usize;
-        let adapter = AdapterHandle {
-            id: 1,
-            a: grim_backend_cpu::cpu_tensor(
+        let adapter = AdapterHandle::new(
+            1,
+            grim_backend_cpu::cpu_tensor(
                 (0..r * hidden)
                     .map(|i| ((i as f32) - (r * hidden) as f32 / 2.0) * 0.01)
                     .collect(),
                 grim_tensor::Shape::new(vec![r, hidden]),
             ),
-            b: grim_backend_cpu::cpu_tensor(
+            grim_backend_cpu::cpu_tensor(
                 (0..32 * r)
                     .map(|i| ((i as f32) - (32 * r) as f32 / 2.0) * 0.01)
                     .collect(),
                 grim_tensor::Shape::new(vec![32, r]),
             ),
-            alpha: 1.0,
-        };
+            1.0,
+        );
         let new_logits = apply_adapters_to_logits(&logits, &[adapter], hidden).unwrap();
         let v = new_logits.to_vec_f32().unwrap();
         assert!(

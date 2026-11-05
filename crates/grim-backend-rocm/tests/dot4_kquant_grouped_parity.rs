@@ -3368,6 +3368,8 @@ fn iq4xs_gemv_rows_parity_and_speed() {
         let out_v2 = mk_out();
         let out_r2 = mk_out();
         let out_r8 = mk_out();
+        let out_hv2 = mk_out();
+        let out_hv8 = mk_out();
 
         let a_r = as_rocm(q81_st.as_ref()).unwrap();
         let b_r = as_rocm(b_st.as_ref()).unwrap();
@@ -3381,11 +3383,17 @@ fn iq4xs_gemv_rows_parity_and_speed() {
             .map_err(|e| format!("v9-r2: {e}")).unwrap();
         dev.launch_dot4_iq4xs_q81_gemv_rows8_for_ab(a_r, b_r, o_r8, m, n, k)
             .map_err(|e| format!("v9-r8: {e}")).unwrap();
+        dev.launch_dot4_iq4xs_q81_gemv_rows_hv2_for_ab(a_r, b_r, o_hv2, m, n, k)
+            .map_err(|e| format!("v9-hv2: {e}")).unwrap();
+        dev.launch_dot4_iq4xs_q81_gemv_rows_hv8_for_ab(a_r, b_r, o_hv8, m, n, k)
+            .map_err(|e| format!("v9-hv8: {e}")).unwrap();
         dev.synchronize();
 
         let got_v2 = f32_vec(&out_v2).unwrap();
         let got_r2 = f32_vec(&out_r2).unwrap();
         let got_r8 = f32_vec(&out_r8).unwrap();
+        let got_hv2 = f32_vec(&out_hv2).unwrap();
+        let got_hv8 = f32_vec(&out_hv8).unwrap();
         for (i, (x, y)) in got_v2.iter().zip(got_r2.iter()).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(),
                 "k={k} n={n} m={m}: v9-r2 diverged from v8 at [{i}]: {x} vs {y}");
@@ -3393,6 +3401,14 @@ fn iq4xs_gemv_rows_parity_and_speed() {
         for (i, (x, y)) in got_v2.iter().zip(got_r8.iter()).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(),
                 "k={k} n={n} m={m}: v9-r8 diverged from v8 at [{i}]: {x} vs {y}");
+        }
+        for (i, (x, y)) in got_v2.iter().zip(got_hv2.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(),
+                "k={k} n={n} m={m}: v9-hv2 diverged from v8 at [{i}]: {x} vs {y}");
+        }
+        for (i, (x, y)) in got_v2.iter().zip(got_hv8.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(),
+                "k={k} n={n} m={m}: v9-hv8 diverged from v8 at [{i}]: {x} vs {y}");
         }
 
         // Envelope vs host oracle per row: dot(dequant_q81(a), dequant(bq)).

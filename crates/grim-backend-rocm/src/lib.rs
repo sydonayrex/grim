@@ -177,12 +177,20 @@ pub use crate::device::util::{
     DeviceGuard, ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size,
     dtype_f32, gpu_require_enabled, gpu_target_arch, gpu_target_flag, gpu_test_enabled,
     gpu_test_lock, linear_launch, prefill_in_flight, raw_set_device, require_gpu_device,
-    set_prefill_in_flight, warp_rows_launch,
+    set_prefill_in_flight, skip_unless_arch, take_gpu_test_lock_logged, warp_rows_launch,
 };
 pub use crate::peer_access::{enable_peer_access, enumerate_devices, p2p_memcpy_async};
 
 /// Save autotune cache for all enumerated ROCm devices.
 /// Safe to call on shutdown; logs warnings rather than panicking.
+///
+/// ```rust,no_run
+/// use grim_backend_rocm::save_all_autotune_caches;
+///
+/// fn on_shutdown() {
+///     save_all_autotune_caches();
+/// }
+/// ```
 pub fn save_all_autotune_caches() {
     let count = enumerate_devices().unwrap_or(0);
     for ord in 0..count {

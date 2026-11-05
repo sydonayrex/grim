@@ -194,6 +194,24 @@ extern "C" __global__ void KNAME(                                               
 
 FWHT_TILED_KERNEL(grim_fwht_tiled_f32, float,          grim_fwht_load_f32)
 FWHT_TILED_KERNEL(grim_fwht_tiled_f16, unsigned short, fp16_to_float_device)
+
+// GDN ssm_out activation permutation (llama-graph.cpp:1696-1704): reshape
+// [hd, nk, rep] -> [hd, rep, nk] before signs + FWHT. One thread per element.
+extern "C" __global__ void grim_gdn_perm_f32(
+    const float* __restrict__ src, float* __restrict__ dst,
+    long long total, int perm_hd, int perm_nk, int perm_rep)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int n_in = perm_hd * perm_nk * perm_rep;
+    long long r = idx / n_in;
+    int off = (int)(idx % n_in);
+    int i0 = off % perm_hd;
+    int i1 = (off / perm_hd) % perm_nk;
+    int i2 = off / (perm_hd * perm_nk);
+    int new_off = i0 + i2 * perm_hd + i1 * perm_hd * perm_rep;
+    dst[r * n_in + new_off] = src[r * n_in + off];
+}
 "#;
 
 #[cfg(test)]

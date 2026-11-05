@@ -214,6 +214,15 @@ pub fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Like [`gpu_test_lock`], but logs `[gpu-lock]` to stderr once acquired so a
+/// local GPU-tier run shows which test holds the device lock (with `--nocapture`).
+/// Tests should call this instead of `gpu_test_lock()` directly.
+pub fn take_gpu_test_lock_logged() -> std::sync::MutexGuard<'static, ()> {
+    let guard = gpu_test_lock();
+    eprintln!("[gpu-lock] acquired by {}", std::thread::current().name().unwrap_or("<unnamed>"));
+    guard
+}
+
 /// Fail-loud gate for tests that opt into the GPU tier explicitly.
 ///
 /// Consumer-ROCm local-run contract (no automatic GPU CI): `GRIM_GPU_TEST=1`
@@ -244,6 +253,29 @@ pub fn require_gpu_device() -> Option<crate::RocmDevice> {
         );
     }
     dev
+}
+
+/// Standardize architecture gates: return `Some(reason)` when the device
+/// arch does not start with `prefix`, `None` when it does. Tests print the
+/// reason instead of bare `return`, so an arch mismatch is visible in the
+/// test log with the detected arch (and, when available, the ROCm version).
+///
+/// ```text
+/// if let Some(reason) = grim_backend_rocm::device::util::skip_unless_arch("gfx12") {
+///     eprintln!("{reason}");
+///     return;
+/// }
+/// ```
+pub fn skip_unless_arch(prefix: &str) -> Option<String> {
+    let arch = detect_gpu_arch(0);
+    if arch.starts_with(prefix) {
+        None
+    } else {
+        let rocm_version = crate::rocm_detect::rocm_version_string().unwrap_or("unknown".into());
+        Some(format!(
+            "[SKIP] requires {prefix} (got {arch}, ROCm {rocm_version})"
+        ))
+    }
 }
 
 /// Whether the GPU tier was explicitly required (local manual run). Defaults

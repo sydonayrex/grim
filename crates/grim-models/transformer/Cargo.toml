@@ -19,6 +19,7 @@ grim-graph = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+grim-format = { workspace = true }
 
 [features]
 default = []

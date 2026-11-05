@@ -50,6 +50,7 @@ fn qwen35_packed_graph_replay_matches_eager() {
         let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
             std::env::set_var("GRIM_KV_ARENA", format);
+            std::env::set_var("GRIM_ALLOW_INT8_GRAPH", "1");
             std::env::remove_var("GRIM_KV_ARENA_ROWS");
         }
 

@@ -3802,6 +3802,34 @@ impl RocmDevice {
                 )?;
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
+            DTypeStorage::Block(grim_tensor::dtype::BlockDtype::Pq2_0) => {
+                // Prism PQ2_0 (tag 142): quantize activation to q8_0 on device,
+                // then the dedicated wave32 GEMV. Mirrors the quantized_matmul
+                // Block(Pq2_0) arm; capture-safe because act_q81 is caller-owned.
+                let wave32 = matches!(
+                    self.props.wavefront_size,
+                    crate::device::handles::WavefrontSize::W32
+                );
+                if !wave32 || k % 128 != 0 {
+                    return Err(Error::Unimplemented(format!(
+                        "linear_decode_into: pq2_0 requires wave32 + 128-aligned K (wave32={wave32}, k={k})"
+                    )));
+                }
+                let a_rocm = a
+                    .as_any()
+                    .downcast_ref::<RocmStorage>()
+                    .ok_or_else(|| Error::Backend("linear_decode_into: a not RocmStorage".into()))?;
+                let need_q81 = m * (k / 32) * 34;
+                if act_q81.bytes < need_q81 {
+                    return Err(Error::Backend(format!(
+                        "linear_decode_into: act scratch {}B < {need_q81}B",
+                        act_q81.bytes
+                    )));
+                }
+                self.launch_quant_q8_0(a_rocm, act_q81, m * k)?;
+                self.launch_dot4_pq2_0_q80_gemv(act_q81, w, out, m, n, k)?;
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+            }
             _ => Err(Error::Unimplemented(format!(
                 "linear_decode_into: unsupported weight dtype for graph decode: {:?}",
                 w.dtype()

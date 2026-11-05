@@ -2118,6 +2118,91 @@ impl RocmDevice {
     /// Gated on k % 256 == 0 (the iq4xs superblock alignment r2/r8 assume).
     /// Not routed into `launch_dot4_iq4xs_q81_gemv` — deliberate: the M=1
     /// arm is v8 and stays the default until v9 clears its ship bars.
+    /// PLAN-iq4xs-multirow follow-up: hoisted-kv (hv) A/B entries. The hv
+    /// kernel decodes each (j,w) word-pair ONCE per superblock into
+    /// kv_lo/kv_hi registers and reuses them across R rows; only the A-side
+    /// is per-row. Separate arm; r2/r8 and the M=1 production dispatch
+    /// (v8) are untouched. Grid: blockIdx.x = ceil(N/4),
+    /// blockIdx.y = ceil(M/R); blockDim (32,1,1). R is runtime.
+    pub fn launch_dot4_iq4xs_q81_gemv_rows_hv2_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_rows_hv_with(
+            act_q81, b_storage, out_storage, m, n, k, 2,
+            "grim_dot4_iq4xs_q81_gemv_rows_hv2",
+        )
+    }
+
+    pub fn launch_dot4_iq4xs_q81_gemv_rows_hv8_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq4xs_q81_gemv_rows_hv_with(
+            act_q81, b_storage, out_storage, m, n, k, 8,
+            "grim_dot4_iq4xs_q81_gemv_rows_hv8",
+        )
+    }
+
+    fn launch_dot4_iq4xs_q81_gemv_rows_hv_with(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        rows_per_cta: usize,
+        kernel_name: &str,
+    ) -> Result<*mut c_void> {
+        assert!(
+            k % 256 == 0,
+            "iq4xs hv: k must be a multiple of 256 (got {k}); kernel assumes superblock alignment"
+        );
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("iq4xs hv: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("iq4xs hv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("iq4xs hv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_y = (m as u32).div_ceil(rows_per_cta as u32);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub fn launch_dot4_iq4xs_q81_gemv_rows2_for_ab(
         &self,
         act_q81: &RocmStorage,

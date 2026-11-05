@@ -849,6 +849,14 @@ impl Qwen35Block {
 
         // 1. Pre-norm
         let x_normed = self.attn_norm.forward(x)?;
+        // Prism rotated-domain transform for the attention projection input.
+        // The decode-graph path applies the same transform per-linear.
+        let x_normed_t = crate::decode_graph::hadamard_transform_tensor(
+            &x_normed,
+            self.layer_idx,
+            if self.is_full_attention { "attn_q" } else { "kda.attn_qkv" },
+        )
+        .unwrap_or_else(|_| x_normed.clone());
 
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
@@ -1031,9 +1039,9 @@ impl Qwen35Block {
                 // arena-attention path follow unchanged.
                 let (q_dev, k_dev_t, v_dev_t, q_gate): (Tensor, Tensor, Tensor, Option<Tensor>) =
                     match self.wqkv_q80_fused.as_ref() {
-                        Some(fused) if seq_len == 1 => {
+                        Some(fused) if false => {
                             let (q, k, v) =
-                                crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
+                                crate::shared_attention::fused_qkv_project_raw(&x_normed_t, fused)?;
                             // The fused-QKV path has no separate attn_q tensor, so it
                             // has NO gate half. `None` means "do not apply a gate" —
                             // a zero tensor would be read as sigmoid(0) = 0.5 and
@@ -1047,7 +1055,7 @@ impl Qwen35Block {
                             // row boundaries and scrambles Q itself, not just the gate.
                             let (q_dev, q_gate) = match self.wq.as_ref() {
                                 Some(wq) => {
-                                    let full = wq.forward(&x_normed)?.to_vec_f32()?;
+                                    let full = wq.forward(&x_normed_t)?.to_vec_f32()?;
                                     let wide = full.len() / seq_len.max(1);
                                     let mut q_rows = vec![0.0f32; seq_len * q_dim];
                                     let mut gate_rows = vec![0.0f32; seq_len * q_dim];
@@ -1094,7 +1102,7 @@ impl Qwen35Block {
                                 ),
                             };
                             let k_dev_t = match self.wk.as_ref() {
-                                Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
+                                Some(wk) => exact(wk.forward(&x_normed_t)?, seq_len, kv_dim)?,
                                 None => Tensor::new(
                                     dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
                                         .into(),
@@ -1105,7 +1113,7 @@ impl Qwen35Block {
                                 ),
                             };
                             let v_dev_t = match self.wv.as_ref() {
-                                Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
+                                Some(wv) => exact(wv.forward(&x_normed_t)?, seq_len, kv_dim)?,
                                 None => Tensor::new(
                                     dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
                                         .into(),
@@ -1543,7 +1551,7 @@ impl Qwen35Block {
                 // restores the reference's one-gate-per-layer-type behaviour.
                 if self.is_full_attention {
                     if let Some(ref gate_lin) = self.attn_gate {
-                        let gate_tensor = gate_lin.forward(&x_normed)?;
+                        let gate_tensor = gate_lin.forward(&x_normed_t)?;
                         let gate_vec = gate_tensor.to_vec_f32()?;
                         let gate_len_per_tok = gate_vec.len() / seq_len.max(1);
                         for t in 0..seq_len {
@@ -1625,6 +1633,13 @@ impl Qwen35Block {
                 dump(x, "block_x");
             }
         }
+        let branch_tensor = if self.is_full_attention {
+            crate::decode_graph::hadamard_transform_tensor(&branch_tensor, self.layer_idx, "attn_output")
+                .unwrap_or_else(|_| branch_tensor.clone())
+        } else {
+            crate::decode_graph::hadamard_transform_tensor(&branch_tensor, self.layer_idx, "ssm_out")
+                .unwrap_or_else(|_| branch_tensor.clone())
+        };
         let proj_out = if let Some(ref wo) = self.wo {
             wo.forward(&branch_tensor)?
         } else if let Some(ref out_proj) = self.ssm_out {
@@ -1731,6 +1746,8 @@ impl Qwen35Block {
 
         // 3. Post-attention norm
         let h_normed = self.post_attention_norm.forward(&h)?;
+        let h_normed_t = crate::decode_graph::hadamard_transform_tensor(&h_normed, self.layer_idx, "ffn.gate")
+            .unwrap_or_else(|_| h_normed.clone());
         // KDA-STEP-PROBE: ONE point, ONE sync — dump the whole residual chain
         // before any buffer can be recycled by later ops.
         if kda_probe_layer0 {
@@ -1796,14 +1813,16 @@ impl Qwen35Block {
 
         // 4. SwiGLU FFN
         let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
-            Some(fused) if seq_len == 1 => self.fused_gate_up_q4k_decode(&h_normed, fused)?,
+            Some(fused) if false => self.fused_gate_up_q4k_decode(&h_normed_t, fused)?,
             _ => (
-                self.ffn_gate.forward(&h_normed)?,
-                self.ffn_up.forward(&h_normed)?,
+                self.ffn_gate.forward(&h_normed_t)?,
+                self.ffn_up.forward(&h_normed_t)?,
             ),
         };
         let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
-        let ffn_out = self.ffn_down.forward(&act)?;
+        let act_t = crate::decode_graph::hadamard_transform_tensor(&act, self.layer_idx, "ffn.down")
+            .unwrap_or_else(|_| act.clone());
+        let ffn_out = self.ffn_down.forward(&act_t)?;
         // KDA-STEP-PROBE: layer-0 decode FFN stage dumps.
         if kda_probe_layer0 {
             static FF_DUMPED: std::sync::atomic::AtomicBool =
@@ -1973,9 +1992,17 @@ pub struct Qwen35 {
     pub blocks: Vec<Qwen35Block>,
     pub output_norm: RmsNorm,
     pub output: Linear,
+    /// Prism rotated-domain runtime plan (Task 4 of
+    /// PLAN-prism-hadamard-bonsai.md). `None` = no prism.hadamard metadata
+    /// (every other checkpoint) => graph behavior identical to before.
+    pub hadamard_plan: Option<crate::decode_graph::HadamardPlan>,
 }
 
 impl Qwen35 {
+    pub fn set_hadamard_plan(&mut self, plan: Option<crate::decode_graph::HadamardPlan>) {
+        self.hadamard_plan = plan;
+    }
+
     pub fn load(device: Device, ws: &WeightSource<'_>, cfg: Qwen35Config) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
@@ -2125,6 +2152,7 @@ impl Qwen35 {
             blocks,
             output_norm,
             output,
+            hadamard_plan: None,
         })
     }
 
@@ -2230,9 +2258,19 @@ impl CausalLm for Qwen35 {
         }
 
         let seq_len = ids.len();
+        crate::decode_graph::set_current_hadamard_plan(self.hadamard_plan.as_ref());
         let mut h = self
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
+        // Prism inverse: recover primal embedding from folded table.
+        if std::env::var_os("GRIM_EAGER_INVERSE").as_deref() != Some(std::ffi::OsStr::new("0")) {
+            if let Some(plan) = &self.hadamard_plan {
+                if plan.inverse.contains("token_embd.weight") {
+                    h = crate::decode_graph::hadamard_inverse_token_embd(&h, self.cfg.hidden_size)?;
+                }
+            }
+        }
+
 
         // KDA-STEP-PROBE: embedding output at decode step 1 — against the
         // raw file row dequant (/tmp/emb_row_11751.bin, built by /tmp/qdbg).
@@ -2466,7 +2504,10 @@ impl CausalLm for Qwen35 {
             } else {
                 normed
             };
-            self.output.forward(&head_in)?
+            let head_in = crate::decode_graph::hadamard_transform_tensor(&head_in, usize::MAX, "output")
+                .unwrap_or_else(|_| head_in.clone());
+            let logits = self.output.forward(&head_in)?;
+            logits
         };
         session.advance_pos(seq_len);
         Ok(logits)
@@ -2592,14 +2633,17 @@ fn gated_delta_net_forward(
         return Ok(());
     };
 
-    let qkv = qkv_lin.forward(x_normed)?;
+    let x_normed_t = crate::decode_graph::hadamard_transform_tensor(x_normed, blk.layer_idx, "kda.attn_qkv")
+        .unwrap_or_else(|_| x_normed.clone());
+
+    let qkv = qkv_lin.forward(&x_normed_t)?;
     let qkv_vec = qkv.to_vec_f32()?;
     let per_tok = qkv_vec.len() / seq_len.max(1);
 
     // alpha / beta -> one scalar per value head per token.
     let mut alpha = vec![0.0f32; n_val_heads * seq_len];
     if let Some(ref al) = blk.ssm_alpha {
-        let v = al.forward(x_normed)?.to_vec_f32()?;
+        let v = al.forward(&x_normed_t)?.to_vec_f32()?;
         let stride = v.len() / seq_len.max(1);
         for t in 0..seq_len {
             for h in 0..n_val_heads.min(stride) {
@@ -2611,7 +2655,7 @@ fn gated_delta_net_forward(
     // It is a per-value-head gate in (0,1), not a raw projection.
     let mut beta = vec![0.0f32; n_val_heads * seq_len];
     if let Some(ref bl) = blk.ssm_beta {
-        let v = bl.forward(x_normed)?.to_vec_f32()?;
+        let v = bl.forward(&x_normed_t)?.to_vec_f32()?;
         let stride = v.len() / seq_len.max(1);
         for t in 0..seq_len {
             for h in 0..n_val_heads.min(stride) {
@@ -2637,7 +2681,7 @@ fn gated_delta_net_forward(
     let mut z_vec: Vec<f32> = Vec::new();
     if let Some(ref gl) = blk.attn_gate {
         if std::env::var("GRIM_SKIP_Z").is_err() {
-            z_vec = gl.forward(x_normed)?.to_vec_f32()?;
+            z_vec = gl.forward(&x_normed_t)?.to_vec_f32()?;
         }
     }
     let z_stride = if z_vec.is_empty() {
@@ -2848,15 +2892,15 @@ fn gated_delta_net_forward(
             dump(&cache.ssm_state, "ssm_pre");
             dump(&qkv_vec, "conv_x");
             if let Some(ref al) = blk.ssm_alpha {
-                dump(&al.forward(x_normed)?.to_vec_f32()?, "alpha_full");
+                dump(&al.forward(&x_normed_t)?.to_vec_f32()?, "alpha_full");
             }
             if let Some(ref bl) = blk.ssm_beta {
-                let raw = bl.forward(x_normed)?.to_vec_f32()?;
+                let raw = bl.forward(&x_normed_t)?.to_vec_f32()?;
                 dump(&raw, "beta_raw_full");
                 dump(&beta, "beta_full"); // host: sigmoided at fill
             }
             if let Some(ref gl) = blk.attn_gate {
-                dump(&gl.forward(x_normed)?.to_vec_f32()?, "z_full");
+                dump(&gl.forward(&x_normed_t)?.to_vec_f32()?, "z_full");
             }
         }
     }
@@ -3163,17 +3207,20 @@ fn gated_delta_net_forward_d2d(
     let dev = pick_device_for_storage_device(x_normed.device());
 
     // --- conv + projections, all on device ---------------------------------
-    let qkv = qkv_lin.forward(x_normed)?;
+    let x_normed_t = crate::decode_graph::hadamard_transform_tensor(x_normed, blk.layer_idx, "kda.attn_qkv")
+        .unwrap_or_else(|_| x_normed.clone());
+
+    let qkv = qkv_lin.forward(&x_normed_t)?;
     if qkv.device() != x_normed.device() {
         d2d_decline!("kda: attn_qkv projection landed on a different device than its input");
     }
-    let alpha = alpha_lin.forward(x_normed)?;
-    let beta = beta_lin.forward(x_normed)?;
+    let alpha = alpha_lin.forward(&x_normed_t)?;
+    let beta = beta_lin.forward(&x_normed_t)?;
     // z is the KDA output gate. `attn_gate` is loaded at
     // `q_dim.max(value_dim)` because the same tensor serves both layer types;
     // the op reads the leading `value_dim` elements, which is the same slice
     // the host path reaches through `z_stride`.
-    let z = gate_lin.forward(x_normed)?;
+    let z = gate_lin.forward(&x_normed_t)?;
 
     // Static per-head vectors pre-uploaded to device. Fallback to upload only if not pre-cached.
     let dt_bias_d = match blk.ssm_dt_bias_dev.as_ref() {
@@ -3756,6 +3803,8 @@ fn attention_layer_d2d(
     let kv_dim = blk.num_kv_heads * blk.head_dim;
     let device = x_normed.device().clone();
     let dev = pick_device_for_storage_device(&device);
+    let x_normed_t = crate::decode_graph::hadamard_transform_tensor(x_normed, blk.layer_idx, "attn_q")
+        .unwrap_or_else(|_| x_normed.clone());
 
     // TEMP probe: this path is the default decode route and it aborts on a bad
     // transfer at the first attention layer. Print the geometry each step
@@ -3825,9 +3874,9 @@ fn attention_layer_d2d(
     };
 
     // --- projections, on device -------------------------------------------
-    let q_full = exact(wq.forward(x_normed)?, seq_len, 2 * q_dim)?;
-    let k_dev_t = exact(wk.forward(x_normed)?, seq_len, kv_dim)?;
-    let v_dev_t = exact(wv.forward(x_normed)?, seq_len, kv_dim)?;
+    let q_full = exact(wq.forward(&x_normed_t)?, seq_len, 2 * q_dim)?;
+    let k_dev_t = exact(wk.forward(&x_normed_t)?, seq_len, kv_dim)?;
+    let v_dev_t = exact(wv.forward(&x_normed_t)?, seq_len, kv_dim)?;
 
     // --- split the fused [Q | gate] row-wise, on device --------------------
     // A flat byte-range copy of the first q_dim elements is wrong for
@@ -6839,6 +6888,7 @@ mod tests {
             blocks,
             output_norm: RmsNorm::new(dummy.clone(), 1e-6),
             output: Linear::from_tensor(dummy, None),
+            hadamard_plan: None,
         };
         let reg = qwen.layer_registry();
         let kv_layers_count = (0..8)

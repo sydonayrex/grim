@@ -374,6 +374,63 @@ impl HadamardPlan {
         })
     }
 }
+thread_local! {
+    static CURRENT_HADAMARD: std::cell::Cell<*const HadamardPlan> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+pub fn set_current_hadamard_plan(plan: Option<&HadamardPlan>) {
+    CURRENT_HADAMARD.with(|c| {
+        c.set(plan.map_or(std::ptr::null(), |p| p as *const _));
+    });
+}
+pub fn current_hadamard_plan() -> Option<&'static HadamardPlan> {
+    CURRENT_HADAMARD.with(|c| {
+        let p = c.get();
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { &*p })
+        }
+    })
+}
+
+/// Process-wide scratch storage for Hadamard transforms (stable address across
+/// capture replays). One buffer per distinct size, never freed, so a transform
+/// always gets a storage whose shape matches its data exactly (reusing a
+/// larger buffer would make `linear_decode_into` misread K).
+static HADAMARD_SCRATCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(std::collections::HashMap::new())
+});
+
+pub fn hadamard_scratch_ensure(
+    dev: &Dev,
+    need: usize,
+) -> Result<&'static grim_backend_rocm::RocmStorage> {
+    let need = need.max(1);
+    let key = (dev.ordinal(), need);
+    let mut guard = HADAMARD_SCRATCHES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ptr) = guard.get(&key).copied() {
+        drop(guard);
+        return Ok(unsafe { &*(ptr as *const grim_backend_rocm::RocmStorage) });
+    }
+    let s = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &grim_tensor::Shape::new(vec![need]),
+        grim_tensor::DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::dtype::Storage::Native,
+        },
+        &dev.allocator_handle(),
+        dev.ordinal(),
+    )
+    .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+    let ptr = Box::into_raw(Box::new(s));
+    guard.insert(key, ptr as usize);
+    drop(guard);
+    Ok(unsafe { &*ptr })
+}
+
 /// Signs+FWHT prologue for a Hadamard-folded linear (Task 4).
 ///
 /// Emits `x' = mul(x, signs)`, then `y = FWHT(x')` into `fwht_out`, so the
@@ -468,13 +525,64 @@ impl HadamardPlan {
     /// Folded lookup used at every decode-graph linear site.
     /// `what` = the decode-graph linear label ("attn_q", "ffn.gate",
     /// "kda.attn_qkv", "output", ...); layer = block index.
+    /// Convenience constructor from a parsed PrismHadamardMeta (Task 4 interface).
+    pub fn from_meta(
+        meta: &grim_format::prism_hadamard::PrismHadamardMeta,
+        tensor_names: &std::collections::HashSet<String>,
+        ssm_dt_rank: u32,
+        ssm_n_group: u32,
+    ) -> Result<Self> {
+        let mut plan = Self::from_names(
+            meta.block_size,
+            &meta.sign_widths,
+            &meta.sign_values,
+            &meta.weight_names,
+            &meta.inverse_weight_names,
+            meta.gdn_v_grouped,
+            "qwen35",
+            true,
+            tensor_names,
+        )?;
+        if meta.gdn_v_grouped {
+            // Derive n_in = the sign width divisible by ssm_dt_rank.
+            let n_in = meta
+                .sign_widths
+                .iter()
+                .copied()
+                .map(|w| w as usize)
+                .find(|&w| ssm_dt_rank > 0 && w % ssm_dt_rank as usize == 0)
+                .unwrap_or(0);
+            let n_v = ssm_dt_rank as usize;
+            let n_k = ssm_n_group as usize;
+            if n_k > 0 && n_v % n_k == 0 && n_in > 0 && n_in % n_v == 0 {
+                plan.ssm_perm = Some((n_in / n_v, n_k, n_v / n_k));
+            }
+        }
+        Ok(plan)
+    }
+
     pub fn linear_folded(&self, layer: usize, what: &str) -> bool {
-        if what == "output" {
+        // Normalize graph-side labels to the fork's folded-weight kinds
+        // (llama-model.cpp:2173-2191) so transforms apply regardless of the
+        // exact launcher label ("attn.wo_out", "kda.attn_qkv", ...).
+        let canonical = match what {
+            "output" => "output",
+            "attn.wo_out" | "attn_out" | "wo" => "attn_output",
+            "kda.attn_qkv" => "attn_qkv",
+            "kda.attn_gate" => "attn_gate",
+            "kda.attn_q" => "attn_q",
+            "kda.attn_k" => "attn_k",
+            "kda.attn_v" => "attn_v",
+            other => other,
+        };
+        if canonical == "output" {
             return self.folded.contains("output.weight");
         }
-        let name_turn = what.replace('.', "_");
+        let name_turn = canonical.replace('.', "_");
         self.folded.contains(&format!("blk.{layer}.{name_turn}.weight"))
-            || self.folded.contains(&format!("blk.{layer}.{what}.weight"))
+            || self.folded.contains(&format!("blk.{layer}.{canonical}.weight"))
+            || (matches!(canonical, "attn_q" | "attn_k" | "attn_v" | "attn_qkv")
+                && self.folded.contains(&format!("blk.{layer}.attn_qkv.weight")))
     }
 
     /// Look up (and create) the signs device buffer for a full input width.
@@ -567,6 +675,130 @@ fn linear_into_named_dedup(
     let w_dims = w.shape().dims().to_vec();
     let a_dims = a.shape().dims().to_vec();
     let o_dims = out.shape().dims().to_vec();
+
+    let orig_a = a;
+    let (a, _hadamard_scratch_guard) = if let Some(plan) = current_hadamard_plan() {
+        if plan.linear_folded(layer, what) {
+            if std::env::var_os("GRIM_HADAMARD_TRACE").is_some() {
+                eprintln!("[hadamard-transform] layer={layer} what={what}");
+            }
+            *q81_ready = false;
+            *u4_ready = false;
+            let input_dim = w.shape().dims().last().copied().unwrap_or(0) as usize;
+            if input_dim > 0 {
+                let canonical_what = match what {
+                    "attn.wo_out" | "attn_out" | "wo" => "attn_output",
+                    "kda.attn_qkv" => "attn_qkv",
+                    "kda.attn_gate" => "attn_gate",
+                    "kda.attn_q" => "attn_q",
+                    "kda.attn_k" => "attn_k",
+                    "kda.attn_v" => "attn_v",
+                    other => other,
+                };
+                let rows = orig_a.shape().elem_count() / input_dim.max(1);
+                if canonical_what == "ssm_out" && std::env::var_os("GRIM_HADAMARD_NO_GDN_PERM").is_none() {
+                    if let Some((hd, nk, rep)) = plan.ssm_perm {
+                        let scratch_perm = hadamard_scratch_ensure(dev, rows * input_dim)?;
+                        let src_rocm = dst_downcast(orig_a).map_err(|e| {
+                            grim_core::error::Error::Backend(format!("hadamard src: {e}"))
+                        })?;
+                        grim_backend_rocm::device::hadamard_launch::launch_gdn_perm(
+                            dev,
+                            src_rocm,
+                            scratch_perm,
+                            rows,
+                            hd,
+                            nk,
+                            rep,
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("hadamard gdn_perm: {e}"))
+                        })?;
+                        let signs = plan.signs_for(dev, input_dim)
+                            .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                            .ok_or_else(|| {
+                                grim_core::error::Error::Backend(format!(
+                                    "prism.hadamard has no sign vector for width {input_dim}"
+                                ))
+                            })?;
+                        let n_blk = (input_dim / plan.block_size as usize) as u32;
+                        grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                            dev,
+                            scratch_perm,
+                            scratch_perm,
+                            Some(&*signs),
+                            1024,
+                            n_blk,
+                            rows,
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("hadamard fwht: {e}"))
+                        })?;
+                        (scratch_perm as &Storage, Some(()))
+                    } else {
+                        let signs = plan.signs_for(dev, input_dim)
+                            .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                            .ok_or_else(|| {
+                                grim_core::error::Error::Backend(format!(
+                                    "prism.hadamard has no sign vector for width {input_dim}"
+                                ))
+                            })?;
+                        let n_blk = (input_dim / plan.block_size as usize) as u32;
+                        let scratch = hadamard_scratch_ensure(dev, rows * input_dim)?;
+                        let src_rocm = dst_downcast(orig_a).map_err(|e| {
+                            grim_core::error::Error::Backend(format!("hadamard src: {e}"))
+                        })?;
+                        grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                            dev,
+                            src_rocm,
+                            scratch,
+                            Some(&*signs),
+                            1024,
+                            n_blk,
+                            rows,
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("hadamard fwht: {e}"))
+                        })?;
+                        (scratch as &Storage, Some(()))
+                    }
+                } else {
+                    let signs = plan.signs_for(dev, input_dim)
+                        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend(format!(
+                                "prism.hadamard has no sign vector for width {input_dim}"
+                            ))
+                        })?;
+                    let n_blk = (input_dim / plan.block_size as usize) as u32;
+                    let scratch = hadamard_scratch_ensure(dev, rows * input_dim)?;
+                    let src_rocm = dst_downcast(orig_a).map_err(|e| {
+                        grim_core::error::Error::Backend(format!("hadamard src: {e}"))
+                    })?;
+                    grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                        dev,
+                        src_rocm,
+                        scratch,
+                        Some(&*signs),
+                        1024,
+                        n_blk,
+                        rows,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("hadamard fwht: {e}"))
+                    })?;
+                    (scratch as &Storage, Some(()))
+                }
+            } else {
+                (orig_a, None)
+            }
+        } else {
+            (orig_a, None)
+        }
+    } else {
+        (orig_a, None)
+    };
+    let _ = _hadamard_scratch_guard;
 
     if std::env::var_os("GRIM_XING_TRACE").is_some() {
         eprintln!(
@@ -949,7 +1181,7 @@ impl LlamaBlock {
         let fused_qkv = self
             .wqkv_q80_fused
             .as_ref()
-            .filter(|_| dot_fused_ok(dev, hidden));
+            .filter(|_| dot_fused_ok(dev, hidden) && current_hadamard_plan().is_none());
 
         let norm_fused_qkv = fused_qkv.is_none()
             && self.attn_norm.kind == NormKind::Rms
@@ -1090,7 +1322,7 @@ impl LlamaBlock {
                 fused.n_v,
             )
             .map_err(grim_core::error::Error::Tensor)?;
-        } else if norm_fused_qkv {
+        } else if norm_fused_qkv && current_hadamard_plan().is_none() {
             let n_q = self._cfg.local_num_heads * self._cfg.head_dim;
             let n_kv = self._cfg.local_num_kv_heads * self._cfg.head_dim;
             dev.fused_qkv_dot4_norm_into(
@@ -1422,7 +1654,8 @@ impl LlamaBlock {
             let fused_residual_ffn = self.ffn_norm.kind == NormKind::Rms
                 && dot_fused_ok(dev, hidden)
                 && wg_opt.map(|w| is_q80(w.weight())).unwrap_or(false)
-                && wu_opt.map(|w| is_q80(w.weight())).unwrap_or(false);
+                && wu_opt.map(|w| is_q80(w.weight())).unwrap_or(false)
+                && current_hadamard_plan().is_none();
 
             if fused_residual_ffn {
                 let wg = wg_opt.unwrap();
@@ -1538,7 +1771,7 @@ impl LlamaBlock {
                 } else if let Some(fused_gu) = self
                     .w_gate_up_q80_fused
                     .as_ref()
-                    .filter(|_| dot_fused_ok(dev, hidden))
+                    .filter(|_| dot_fused_ok(dev, hidden) && current_hadamard_plan().is_none())
                 {
                     let norm_rocm = dst_downcast(normed_ffn)?;
                     dev.launch_quantize_q8_1(norm_rocm, act, batch, hidden)
@@ -1617,7 +1850,8 @@ impl LlamaBlock {
                 .last()
                 .copied()
                 .unwrap_or(0);
-            let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
+            let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight())
+            && current_hadamard_plan().is_none();
             if use_fused_down {
                 // M7.3: the launcher STOPS FUSING, so the IR can name the
                 // dot4 and the residual add as separate nodes. The
@@ -3078,6 +3312,8 @@ impl Qwen35Block {
             && emit.is_none()
             && batch == 1
             && !norm_already_fused
+            && current_hadamard_plan().is_none()
+            && _hadamard.is_none()
             && !matches!(
                 std::env::var("GRIM_FUSE_NORM_QUANT").as_deref(),
                 Ok("0" | "false" | "off")
@@ -3144,7 +3380,7 @@ impl Qwen35Block {
             let fused_qkv = self
                 .wqkv_q80_fused
                 .as_ref()
-                .filter(|_| dot_fused_ok(dev, self.hidden_size));
+                .filter(|_| dot_fused_ok(dev, self.hidden_size) && current_hadamard_plan().is_none() && _hadamard.is_none());
 
             if let Some(fused) = fused_qkv {
                 let norm_rocm = dst_downcast(normed)?;
@@ -4097,7 +4333,8 @@ impl Qwen35Block {
         let wg = &self.ffn_gate;
         let wu = &self.ffn_up;
         let fused_residual_ffn =
-            dot_fused_ok(dev, self.hidden_size) && is_q80(wg.weight()) && is_q80(wu.weight());
+            dot_fused_ok(dev, self.hidden_size) && is_q80(wg.weight()) && is_q80(wu.weight())
+            && current_hadamard_plan().is_none();
 
         if fused_residual_ffn {
             dev.fused_add_rms_norm_gate_up_silu_dot4_into(
@@ -4163,7 +4400,8 @@ impl Qwen35Block {
             let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
 
             let use_fused_silu =
-                dot_fused_ok(dev, self.hidden_size) && is_q80(wg.weight()) && is_q80(wu.weight());
+                dot_fused_ok(dev, self.hidden_size) && is_q80(wg.weight()) && is_q80(wu.weight())
+                && current_hadamard_plan().is_none();
 
             if use_fused_silu {
                 dev.fused_gate_up_silu_dot4_into(
@@ -4224,7 +4462,8 @@ impl Qwen35Block {
             .last()
             .copied()
             .unwrap_or(0);
-        let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight());
+        let use_fused_down = dot_fused_ok(dev, ffn_k) && is_q80(wd.weight())
+            && current_hadamard_plan().is_none();
 
         let dst_storage = dst_downcast(residual_dst)?;
         let _ = dst_storage.device_ordinal();
@@ -4296,12 +4535,14 @@ impl Qwen35Block {
                 );
             }
         } else {
-            linear_into(
+            linear_into_named(
                 dev,
                 &buffers.activated_buf[layer_idx],
                 self.ffn_down.weight(),
                 &buffers.norm_buf[layer_idx],
                 act,
+                "ffn.down",
+                layer_idx,
             )?;
             // M7.1: the FFN's down projection is its own node.
             if let Some(e) = emit.as_deref_mut() {
@@ -4600,12 +4841,14 @@ impl Qwen35Block {
             self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
                 grim_core::error::Error::Backend("missing ssm_out projection".into())
             })?;
-        linear_into(
+        linear_into_named(
             dev,
             &kda_buf.branch,
             out_proj.weight(),
             &buffers.norm_buf[layer_idx],
             act,
+            "ssm_out",
+            layer_idx,
         )?;
         Ok(())
     }
@@ -4634,6 +4877,7 @@ impl Qwen35 {
         mut ring: Option<&mut grim_backend_rocm::kernels::task_ring::TaskRingContext>,
     ) -> Result<()> {
         let dev = dev_for_qwen35(self)?;
+        set_current_hadamard_plan(self.hadamard_plan.as_ref());
         // Every segment's pos scalar starts at this step's position.
         let pos = graph.buffers.current_pos;
         graph
@@ -4664,6 +4908,54 @@ impl Qwen35 {
             batch * hidden,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        // Prism inverse side (models/qwen35.cpp:750-754): FWHT then signs.
+        if std::env::var_os("GRIM_HADAMARD_NO_INVERSE").is_none() {
+            if let Some(plan) = current_hadamard_plan() {
+                if plan.inverse.contains("token_embd.weight") {
+                    let signs = plan.signs_for(&dev, hidden)
+                        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                        .ok_or_else(|| grim_core::error::Error::Backend(
+                            "prism.hadamard has no sign vector for width ".to_string() + &hidden.to_string(),
+                        ))?;
+                    let n_blk = (hidden / plan.block_size as usize) as u32;
+                    let need = batch * hidden;
+                    let scratch = hadamard_scratch_ensure(&dev, need)?;
+                    if std::env::var_os("GRIM_HADAMARD_INVERSE_FWD").is_some() {
+                        // experimental: signs then FWHT
+                        dev.mul_into(&graph.buffers.layer_input[0], &*signs, scratch)
+                            .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse signs: {e}")))?;
+                        grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                            &dev,
+                            scratch,
+                            &graph.buffers.layer_input[0],
+                            None,
+                            1024,
+                            n_blk,
+                            batch,
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse fwht: {e}")))?;
+                    } else {
+                        grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                            &dev,
+                            &graph.buffers.layer_input[0],
+                            scratch,
+                            None,
+                            1024,
+                            n_blk,
+                            batch,
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse fwht: {e}")))?;
+                        dev.mul_into(
+                            scratch,
+                            &*signs,
+                            &graph.buffers.layer_input[0],
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse signs: {e}")))?;
+                    }
+                }
+            }
+        }
 
         // The ring's plan is derived from THIS IR, so its RECURRENT entries are
         // in the IR's node order — the same order the recurrent layers appear
@@ -4714,7 +5006,7 @@ impl Qwen35 {
             } else {
                 Some((&self.output_norm.weight, self.output_norm.eps))
             };
-            norm_already_fused = block.forward_graph(
+            norm_already_fused = block.forward_graph_with_hadamard(
                 i,
                 &graph.buffers,
                 &blk_dev,
@@ -4722,6 +5014,7 @@ impl Qwen35 {
                 None,
                 next_norm,
                 norm_already_fused,
+                self.hadamard_plan.as_ref(),
             )?;
             if i + 1 < self.blocks.len() {
                 let next_ord = match self.blocks[i + 1].device {
@@ -4845,12 +5138,14 @@ impl Qwen35 {
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
         }
-        linear_into(
+        linear_into_named(
             last_dev,
             &graph.buffers.head_input,
             self.output.weight(),
             &graph.buffers.head_output,
             &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
+            "output",
+            usize::MAX,
         )?;
         Ok(())
     }
@@ -4974,6 +5269,7 @@ impl DecodeGraphModel for Qwen35 {
         // geometry defect lands.
         if crate::qwen35::kv_arena_format_qwen(&self.device)
             == grim_backend_rocm::KvArenaFormat::Int8
+            && std::env::var_os("GRIM_ALLOW_INT8_GRAPH").as_deref() != Some(std::ffi::OsStr::new("1"))
         {
             return Err(grim_core::error::Error::Backend(
                 "decode graph: int8 KV replay is disabled (serves garbage at 27B geometry;                  eager int8 is correct) — falling back to eager"
@@ -5441,6 +5737,7 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        set_current_hadamard_plan(self.hadamard_plan.as_ref());
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled".into(),
@@ -5467,6 +5764,53 @@ impl DecodeGraphModel for Qwen35 {
             batch * hidden,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        if std::env::var_os("GRIM_HADAMARD_NO_INVERSE").is_none() {
+            if let Some(plan) = current_hadamard_plan() {
+                if plan.inverse.contains("token_embd.weight") {
+                    let signs = plan.signs_for(&dev, hidden)
+                        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                        .ok_or_else(|| grim_core::error::Error::Backend(
+                            "prism.hadamard has no sign vector for width ".to_string() + &hidden.to_string(),
+                        ))?;
+                    let n_blk = (hidden / plan.block_size as usize) as u32;
+                    let need = batch * hidden;
+                    let scratch = hadamard_scratch_ensure(&dev, need)?;
+                    if std::env::var_os("GRIM_HADAMARD_INVERSE_FWD").is_some() {
+                        // experimental: signs then FWHT
+                        dev.mul_into(&graph.buffers.layer_input[0], &*signs, scratch)
+                            .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse signs: {e}")))?;
+                        grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                            &dev,
+                            scratch,
+                            &graph.buffers.layer_input[0],
+                            None,
+                            1024,
+                            n_blk,
+                            batch,
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse fwht: {e}")))?;
+                    } else {
+                        grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                            &dev,
+                            &graph.buffers.layer_input[0],
+                            scratch,
+                            None,
+                            1024,
+                            n_blk,
+                            batch,
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse fwht: {e}")))?;
+                        dev.mul_into(
+                            scratch,
+                            &*signs,
+                            &graph.buffers.layer_input[0],
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard inverse signs: {e}")))?;
+                    }
+                }
+            }
+        }
 
         // M1/M2 emitter: one node per model-level launch, only during the
         // capture bracket (warmups run the same code with capturing=false and
@@ -5559,7 +5903,7 @@ impl DecodeGraphModel for Qwen35 {
             } else {
                 Some((&self.output_norm.weight, self.output_norm.eps))
             };
-            norm_already_fused = block.forward_graph(
+            norm_already_fused = block.forward_graph_with_hadamard(
                 i,
                 &graph.buffers,
                 &blk_dev,
@@ -5567,6 +5911,7 @@ impl DecodeGraphModel for Qwen35 {
                 emitter.as_mut(),
                 next_norm,
                 norm_already_fused,
+                self.hadamard_plan.as_ref(),
             )?;
             if let Some(e) = emitter.as_ref() {
                 emit_last = e.last();
@@ -10673,6 +11018,7 @@ mod tests {
             blocks,
             output_norm: test_norm(&dev, 0, hidden_size),
             output: test_linear(&dev, 0, vocab_size, hidden_size, 999),
+            hadamard_plan: None,
         };
 
         let mut graph = qwen
@@ -14401,5 +14747,199 @@ impl DecodeGraphModel for Xing40 {
             out.len()
         );
         Ok(out)
+    }
+}
+
+/// Eager-path Hadamard transform for a single activation tensor (prefill).
+/// Mirrors the per-linear transform in `linear_into_named_dedup` but operates
+/// on a `Tensor` instead of a `Storage`, so the prefill path can stay in the
+/// rotated domain. Returns `x` unchanged when no plan is active or the
+/// (layer, what) pair is not folded.
+pub fn hadamard_transform_tensor(x: &grim_tensor::Tensor, layer: usize, what: &str) -> Result<grim_tensor::Tensor> {
+    if std::env::var_os("GRIM_EAGER_HADAMARD").as_deref() == Some(std::ffi::OsStr::new("0")) { return Ok(x.clone()); }
+    let Some(plan) = current_hadamard_plan() else { return Ok(x.clone()); };
+    let canonical = match what {
+        "attn.wo_out" | "attn_out" | "wo" => "attn_output",
+        "kda.attn_qkv" => "attn_qkv",
+        "kda.attn_gate" => "attn_gate",
+        "kda.attn_q" => "attn_q",
+        "kda.attn_k" => "attn_k",
+        "kda.attn_v" => "attn_v",
+        other => other,
+    };
+    if !plan.linear_folded(layer, canonical) {
+        return Ok(x.clone());
+    }
+    let in_dim = x.shape().dims().last().copied().unwrap_or(0) as usize;
+    if in_dim == 0 { return Ok(x.clone()); }
+    let batch = x.shape().elem_count() / in_dim;
+    let n_blk = (in_dim / plan.block_size as usize) as u32;
+
+    match x.device() {
+        grim_tensor::Device::Rocm(ord) => {
+            let dev = grim_backend_rocm::RocmDevice::shared(*ord);
+            let out_shape = grim_tensor::Shape::new(vec![batch, in_dim]);
+            let out_storage = dev.zeros(&out_shape, grim_tensor::DType::F32)
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+            let out = grim_tensor::Tensor::new(
+                std::sync::Arc::from(out_storage),
+                out_shape,
+                grim_tensor::DType::F32,
+                grim_tensor::dtype::QuantProvenance::default(),
+                x.device().clone(),
+            );
+            let src = grim_backend_rocm::device::util::as_rocm(x.storage().as_ref())
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+            let dst = grim_backend_rocm::device::util::as_rocm(out.storage().as_ref())
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+            if canonical == "ssm_out" {
+                if let Some((hd, nk, rep)) = plan.ssm_perm {
+                    let scratch_storage = dev.zeros(
+                        &grim_tensor::Shape::new(vec![batch * in_dim]),
+                        grim_tensor::DType::F32,
+                    )
+                    .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+                    let scratch_s = grim_backend_rocm::device::util::as_rocm(scratch_storage.as_ref())
+                        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+                    grim_backend_rocm::device::hadamard_launch::launch_gdn_perm(
+                        &dev, src, scratch_s, batch, hd, nk, rep,
+                    )
+                    .map_err(|e| grim_core::error::Error::Backend(format!("hadamard gdn_perm: {e}")))?;
+                    let signs = plan.signs_for(&dev, in_dim)
+                        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                        .ok_or_else(|| grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {in_dim}")))?;
+                    grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                        &dev, scratch_s, dst, Some(&*signs), 1024, n_blk, batch,
+                    )
+                    .map_err(|e| grim_core::error::Error::Backend(format!("hadamard fwht: {e}")))?;
+                } else {
+                    let signs = plan.signs_for(&dev, in_dim)
+                        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                        .ok_or_else(|| grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {in_dim}")))?;
+                    grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                        &dev, src, dst, Some(&*signs), 1024, n_blk, batch,
+                    )
+                    .map_err(|e| grim_core::error::Error::Backend(format!("hadamard fwht: {e}")))?;
+                }
+            } else {
+                let signs = plan.signs_for(&dev, in_dim)
+                    .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                    .ok_or_else(|| grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {in_dim}")))?;
+                grim_backend_rocm::device::hadamard_launch::launch_fwht_signed_tiled(
+                    &dev, src, dst, Some(&*signs), 1024, n_blk, batch,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("hadamard fwht: {e}")))?;
+            }
+            dev.synchronize();
+            Ok(out)
+        }
+        grim_tensor::Device::Cpu => {
+            let signs = plan.signs.get(&in_dim).ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {in_dim}"))
+            })?;
+            let mut xv = x.to_vec_f32()?;
+            if canonical == "ssm_out" {
+                if let Some((hd, nk, rep)) = plan.ssm_perm {
+                    for b in 0..batch {
+                        let base = b * in_dim;
+                        let mut tmp = vec![0.0f32; in_dim];
+                        for off in 0..in_dim {
+                            let i0 = off % hd;
+                            let i1 = (off / hd) % nk;
+                            let i2 = off / (hd * nk);
+                            let new_off = i0 + i2 * hd + i1 * hd * rep;
+                            tmp[new_off] = xv[base + off];
+                        }
+                        xv[base..base + in_dim].copy_from_slice(&tmp);
+                    }
+                }
+            }
+            for b in 0..batch {
+                let base = b * in_dim;
+                for blk in 0..n_blk as usize {
+                    let off = base + blk * 1024;
+                    let mut slice = xv[off..off + 1024].to_vec();
+                    let si: Vec<i32> = signs[blk * 1024..(blk + 1) * 1024].to_vec();
+                    grim_quant::hadamard::fwht_signed_f32(&mut slice, &si);
+                    xv[off..off + 1024].copy_from_slice(&slice);
+                }
+            }
+            Ok(grim_backend_cpu::cpu_tensor(xv, x.shape().clone()))
+        }
+        _ => Ok(x.clone()),
+    }
+}
+
+/// Inverse Hadamard transform for token embeddings (FWHT then signs).
+pub fn hadamard_inverse_token_embd(x: &grim_tensor::Tensor, hidden: usize) -> Result<grim_tensor::Tensor> {
+    if std::env::var_os("GRIM_EAGER_HADAMARD").as_deref() == Some(std::ffi::OsStr::new("0")) { return Ok(x.clone()); }
+    let Some(plan) = current_hadamard_plan() else { return Ok(x.clone()); };
+    if !plan.inverse.contains("token_embd.weight") {
+        return Ok(x.clone());
+    }
+    let batch = x.shape().elem_count() / hidden;
+    let n_blk = (hidden / plan.block_size as usize) as u32;
+    match x.device() {
+        grim_tensor::Device::Rocm(ord) => {
+            let dev = grim_backend_rocm::RocmDevice::shared(*ord);
+            let signs = plan.signs_for(&dev, hidden)
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?
+                .ok_or_else(|| grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {hidden}")))?;
+            let sign_vec: Vec<i32> = {
+                let b = signs.copy_to_host().map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+                let v: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+                v.iter().map(|&x| if x < 0.0 { -1 } else { 1 }).collect()
+            };
+            let batch = x.shape().elem_count() / hidden;
+            let n_blk = hidden / plan.block_size as usize;
+            let src = grim_backend_rocm::device::util::as_rocm(x.storage().as_ref())
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+            let bytes = src.copy_to_host().map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+            let mut xv: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            for b in 0..batch {
+                let base = b * hidden;
+                for blk in 0..n_blk {
+                    let off = base + blk * 1024;
+                    let mut slice = xv[off..off + 1024].to_vec();
+                    grim_quant::hadamard::fwht_f32(&mut slice);
+                    for i in 0..1024 {
+                        slice[i] *= sign_vec[blk * 1024 + i] as f32;
+                    }
+                    xv[off..off + 1024].copy_from_slice(&slice);
+                }
+            }
+            let out_shape = grim_tensor::Shape::new(vec![batch, hidden]);
+            let out_storage = dev.from_cpu(&xv, &out_shape, grim_tensor::DType::F32)
+                .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+            let out = grim_tensor::Tensor::new(
+                std::sync::Arc::from(out_storage),
+                out_shape,
+                grim_tensor::DType::F32,
+                grim_tensor::dtype::QuantProvenance::default(),
+                x.device().clone(),
+            );
+            Ok(out)
+        }
+        grim_tensor::Device::Cpu => {
+            let signs = plan.signs.get(&hidden).ok_or_else(|| {
+                grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {hidden}"))
+            })?;
+            let mut xv = x.to_vec_f32()?;
+            for b in 0..batch {
+                let base = b * hidden;
+                for blk in 0..n_blk as usize {
+                    let off = base + blk * 1024;
+                    let mut slice = xv[off..off + 1024].to_vec();
+                    // FWHT then signs
+                    grim_quant::hadamard::fwht_f32(&mut slice);
+                    for i in 0..1024 {
+                        slice[i] *= signs[blk * 1024 + i] as f32;
+                    }
+                    xv[off..off + 1024].copy_from_slice(&slice);
+                }
+            }
+            Ok(grim_backend_cpu::cpu_tensor(xv, x.shape().clone()))
+        }
+        _ => Ok(x.clone()),
     }
 }

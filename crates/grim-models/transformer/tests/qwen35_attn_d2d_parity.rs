@@ -1431,6 +1431,7 @@ fn build_model(device: &Device, dev: Option<&RocmDevice>, c: &Qwen35Config) -> Q
         blocks: vec![build_block(device, dev)],
         output_norm: RmsNorm::new(mk(ws(13, HIDDEN, 1.0), Shape::new(vec![HIDDEN])), 1e-6),
         output: lin(w(14, HIDDEN * vocab), Shape::new(vec![HIDDEN, vocab])),
+        hadamard_plan: None,
     }
 }
 

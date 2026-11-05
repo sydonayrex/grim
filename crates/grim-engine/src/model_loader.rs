@@ -3789,7 +3789,53 @@ fn load_model_with_providers(
                 "[grim] Loading Qwen3.5/3.8 model with config: {:?}",
                 qwen35_cfg
             );
-            let m = Qwen35::load_tp(qwen_primary, &ws, qwen35_cfg, qwen_tp)?;
+            let mut hadamard_entry = {
+                let meta_map = grim_format::prism_hadamard::parse_prism_hadamard(
+                    provider.metadata_map(),
+                    &|name: &str| weight_provider_has_tensor(weight_provider, name),
+                )?;
+                match meta_map {
+                    Some(hm) => {
+                        let tensor_names: std::collections::HashSet<String> = weight_provider
+                            .tensor_names()
+                            .into_iter()
+                            .collect();
+                        let arch_ok = ModelSupportTier::classify(arch_str, path).0
+                            == ModelSupportTier::Green;
+                        Some(grim_models_transformer::decode_graph::HadamardPlan::from_names(
+                            hm.block_size,
+                            &hm.sign_widths,
+                            &hm.sign_values,
+                            &hm.weight_names,
+                            &hm.inverse_weight_names,
+                            hm.gdn_v_grouped,
+                            arch_str,
+                            arch_ok,
+                            &tensor_names,
+                        )?)
+                    }
+                    None => None,
+                }
+            };
+            let ssm_dt_rank = qwen35_cfg.ssm_dt_rank;
+            let ssm_n_group = qwen35_cfg.ssm_n_group;
+            let mut m = Qwen35::load_tp(qwen_primary, &ws, qwen35_cfg, qwen_tp)?;
+            if let Some(plan) = hadamard_entry.take() {
+                let mut plan = plan;
+                if plan.gdn_v_grouped {
+                    let n_in = 6144usize;
+                    let n_v = ssm_dt_rank;
+                    let n_k = ssm_n_group;
+                    if n_k > 0 && n_v % n_k == 0 && n_in % n_v.max(1) == 0 {
+                        plan.ssm_perm = Some((n_in / n_v, n_k, n_v / n_k));
+                    } else {
+                        return Err(Error::Config(format!(
+                            "prism.hadamard: bad GDN head geometry for ssm_out (n_in={n_in}, n_v={n_v}, n_k={n_k})"
+                        )));
+                    }
+                }
+                m.set_hadamard_plan(Some(plan));
+            }
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {

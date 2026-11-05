@@ -22,6 +22,33 @@ pub fn rocm_include_dir() -> Option<PathBuf> {
     resolve_rocm_include_dir(&workspace_root())
 }
 
+/// Installed ROCm version string (from `/opt/rocm/.info/version` or the
+/// `hipconfig --version` output when present). Used in skip banners so an
+/// arch-gated skip names the runtime it was skipped on.
+pub fn rocm_version_string() -> Option<String> {
+    for cand in ["/opt/rocm/.info/version", "/opt/rocm/share/hip/version"] {
+        if let Ok(s) = std::fs::read_to_string(cand) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                let first = s.lines().next().unwrap_or(&s).trim().to_string();
+                if !first.is_empty() {
+                    return Some(first);
+                }
+            }
+        }
+    }
+    if let Ok(out) = std::process::Command::new("hipconfig").arg("--version").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_string();
+            let first = s.lines().next().unwrap_or("").trim().to_string();
+            if !first.is_empty() {
+                return Some(first);
+            }
+        }
+    }
+    None
+}
+
 /// Auto-configure `HSA_OVERRIDE_GFX_VERSION` for consumer GPUs / APUs
 /// if the variable is not explicitly set in the environment.
 ///

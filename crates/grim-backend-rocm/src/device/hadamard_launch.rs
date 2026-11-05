@@ -188,7 +188,7 @@ pub fn launch_fwht_signed_tiled(
     dev: &RocmDevice,
     src: &RocmStorage,
     dst: &RocmStorage,
-    signs: &RocmStorage,
+    signs: Option<&RocmStorage>,
     n: u32,
     n_blk: u32,
     rows: usize,
@@ -204,18 +204,20 @@ pub fn launch_fwht_signed_tiled(
     if rows == 0 {
         return Err(Error::Backend("launch_fwht_signed_tiled: rows must be > 0".into()));
     }
-    if signs.dtype != DType::F32 {
-        return Err(Error::Backend(format!("fwht: signs must be f32, got {:?}", signs.dtype)));
-    }
     let full_width = n as usize * n_blk as usize;
-    if signs.shape.elem_count() != full_width {
-        return Err(Error::Backend(format!(
-            "fwht: signs element count {} != full width {}",
-            signs.shape.elem_count(),
-            full_width
-        )));
+    if let Some(sg) = signs {
+        if sg.dtype != DType::F32 {
+            return Err(Error::Backend(format!("fwht: signs must be f32, got {:?}", sg.dtype)));
+        }
+        if sg.shape.elem_count() != full_width {
+            return Err(Error::Backend(format!(
+                "fwht: signs element count {} != full width {}",
+                sg.shape.elem_count(),
+                full_width
+            )));
+        }
     }
-    if src.shape.elem_count() != rows * full_width || dst.shape.elem_count() != rows * full_width {
+    if src.shape.elem_count() != rows * full_width || dst.shape.elem_count() < rows * full_width {
         return Err(Error::Backend(format!(
             "fwht tiled: src/dst must hold rows*width = {} elements",
             rows * full_width
@@ -240,9 +242,12 @@ pub fn launch_fwht_signed_tiled(
     let dst_ptr = dst
         .device_ptr
         .ok_or_else(|| Error::Backend("fwht tiled: dst has no device ptr".into()))?;
-    let signs_ptr = signs
-        .device_ptr
-        .ok_or_else(|| Error::Backend("fwht tiled: signs has no device ptr".into()))?;
+    let signs_ptr = match signs {
+        Some(sg) => sg
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fwht tiled: signs has no device ptr".into()))?,
+        None => 0u64,
+    };
 
     // 2D grid: blockIdx.x = block index b, blockIdx.y = activation row r.
     // ONE launch for the whole n_blk * rows grid — a folded linear costs one
@@ -272,6 +277,53 @@ pub fn launch_fwht_signed_tiled(
             arg(&mut stride64),
             arg(&mut scale),
             arg(&mut sptr_signs),
+        ],
+    )?;
+    Ok(())
+}
+
+/// GDN ssm_out activation permutation (llama-graph.cpp:1696-1704):
+/// reshape [hd, nk, rep] -> [hd, rep, nk] before signs + FWHT.
+pub fn launch_gdn_perm(
+    dev: &RocmDevice,
+    src: &RocmStorage,
+    dst: &RocmStorage,
+    rows: usize,
+    perm_hd: usize,
+    perm_nk: usize,
+    perm_rep: usize,
+) -> Result<()> {
+    let n_in = perm_hd * perm_nk * perm_rep;
+    let total = rows * n_in;
+    if src.shape.elem_count() < total || dst.shape.elem_count() < total {
+        return Err(Error::Backend(format!(
+            "gdn_perm: src/dst must hold at least {} elements",
+            total
+        )));
+    }
+    let mut sptr = src
+        .device_ptr
+        .ok_or_else(|| Error::Backend("gdn_perm: src has no device ptr".into()))?;
+    let mut dptr = dst
+        .device_ptr
+        .ok_or_else(|| Error::Backend("gdn_perm: dst has no device ptr".into()))?;
+    let mut total_i = total as i64;
+    let mut hd = perm_hd as i32;
+    let mut nk = perm_nk as i32;
+    let mut rep = perm_rep as i32;
+    let grid = HipDim3::new((total as u32).div_ceil(256), 1, 1);
+    let block = HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_gdn_perm_f32",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut dptr),
+            arg(&mut total_i),
+            arg(&mut hd),
+            arg(&mut nk),
+            arg(&mut rep),
         ],
     )?;
     Ok(())

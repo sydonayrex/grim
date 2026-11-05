@@ -805,7 +805,11 @@ fn has_packed_matmul(storage: &Storage) -> bool {
     // W4A16 is resident-eligible by design (the MoE expert banks must stay
     // packed so quantized_matmul -> marlin reads real codes; dequantizing at
     // load turned the bank into f32 and broke every downstream consumer).
-    matches!(storage, Storage::W4A16(_))
+    // Prism PQ2_0 (GGUF tag 142) is served by the packed ROCm GEMV
+    // `grim_dot4_pq2_0_q80_gemv` and must stay packed on-device; it has no
+    // QuantFormat variant (it rides the GGUF dtype mapping directly), so
+    // special-case it here to keep it out of the host-dequant fallthrough.
+    matches!(storage, Storage::W4A16(_) | Storage::Block(grim_tensor::dtype::BlockDtype::Pq2_0))
         || grim_tensor::QuantFormat::try_from(storage).is_ok()
 }
 
