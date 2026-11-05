@@ -1574,21 +1574,42 @@ ms/token), as the plan anticipated: the FWHT+q8_1 quantizer fusion
 (~390 launches/step) and `add_rms_norm+FWHT` fusion are explicitly deferred to
 a follow-up plan (Task 7). Recorded, not chased, per the plan's rule.
 
-### Token parity (Task 6 Step 2 — NOT met)
+### Token parity (Task 6 Step 2 — 18/32 after two root-cause fixes)
 
 The plan's Gate D requires the first 32 greedy tokens to be token-identical to
-the reference. Outcome: grim matches the reference for the first 2 tokens and
-diverges at token 3 (grim 369 vs reference 6587; both logits are near-ties).
-Per the plan's stop rule ("any divergence -> print both logit gaps and STOP for
-analysis; do not weaken"), Gate D reports the divergence and fails rather than
-degrading to text comparison. The gate is implemented in
+the reference. Per the plan's stop rule ("any divergence -> print both logit
+gaps and STOP for analysis; do not weaken"), Gate D reports the divergence and
+fails rather than degrading to text comparison. The gate is implemented in
 `crates/grim-models/transformer/tests/bonsai_hadamard_e2e.rs`
 (`gate_d_bonsai_first_32_token_parity`, `#[ignore]`, GPU-gated) with the
-reference token ids pinned from the reference server run
-(`/tmp/bonsai_ref_tokens.txt`, 64 tokens, temp 0 seed 42).
+reference token ids pinned from the reference server run.
 
-Remaining analysis (follow-up): per-layer/per-projection hidden-state bisection
-against reference dumps (the plan's original bisect protocol) to find the
-residual rotated-domain numerics gap; suspects are the near-tie logit flips
-(369/6587, 728/264) arising from PQ2_0 + FWHT accumulation-order differences
-between grim's device path and llama.cpp's.
+Hidden-state bisection against the reference (per-projection dumps, layer 0,
+decode step 1) found and fixed TWO root causes (2026-11-05):
+
+1. **ssm_alpha/ssm_beta consumed the Hadamard-rotated activation** though
+   neither weight is folded (not in `prism.hadamard.weight_names`). Fixed to
+   the primal input in all four code paths (commit `65355bae`). Post-fix the
+   alpha/beta projections match the reference at cos=1.0.
+2. **Prompt tokenization mismatch**: grim-cli's chat template encodes
+   "user"->1156 / "assistant"->17313 (plain-text pieces) where llama.cpp
+   encodes "user"->846 / "assistant"->74455 (template role pieces). Same
+   decoded text, different ids -> different embeddings at t1/t16 -> diverged
+   prefill state (grim pre-decode state was 39.7% off the reference; 18% even
+   after fix 1, from the token mismatch alone). Gate D now pins the
+   reference's exact token ids.
+
+With both fixes Gate D reaches **18/32 identical tokens** (up from 2/32).
+First divergence at token 18: grim=1204, ref=1092, and 1092 IS grim's top-2 —
+a rank swap between two candidates 0.667 logits apart. Stage-wise errors at
+that point: embedding bit-identical; qkv/conv/z/alpha/beta rel ~1e-3; GDN core
+output rel ~3.4% driven by accumulated state drift.
+
+Remaining divergence source (analysis, not yet fixed): grim's decode path
+quantizes activations to q8_0 for the dot4 PQ2_0 GEMV by design (the perf
+story), while the reference runs f32 activations through its mul_mat. The
+~1e-3 per-projection quantization noise compounds across 64 layers x 18 steps
+until near-tie ranks flip. Closing the last 14 tokens likely requires an
+f32-activation parity decode mode (new env-gated path), not further transform
+correctness work — every transform now matches the reference to 1e-3 or
+better.

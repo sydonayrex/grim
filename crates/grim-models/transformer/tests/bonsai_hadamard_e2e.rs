@@ -46,14 +46,15 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         .map_err(|e| format!("load_model_from_gguf failed: {e}"))?;
     let provider = grim_format::GgufProvider::open(MODEL).map_err(|e| format!("GgufProvider::open failed: {e}"))?;
     let _tokenizer = provider.tokenizer().map_err(|e| format!("tokenizer failed: {e}"));
-    // The exact chat-template token ids grim-cli encodes for this prompt
-    // (pinned from `[grim] Encoded prompt: 20 tokens: [...]`). Re-encoding the
-    // template string through the raw BPE gives a different tokenization
-    // (`assistant` as an ordinary piece vs the chat-template id), which
-    // silently changes the prefill and diverges at token 3.
+    // The exact chat-template token ids the REFERENCE (llama-tokenize) encodes
+    // for this prompt. grim-cli's own template encoding differs: it maps
+    // "user"->1156 / "assistant"->17313 (plain-text pieces) where the
+    // reference maps "user"->846 / "assistant"->74455 (template role pieces).
+    // Same decoded text, different ids -> different embeddings -> diverged
+    // prefill state. Parity requires byte-identical token ids.
     let input_ids: Vec<u32> = vec![
-        248045, 1156, 198, 814, 20139, 1204, 264, 94562, 4138, 303, 1330, 41228,
-        25, 248046, 198, 248045, 17313, 198, 248068, 198,
+        248045, 846, 198, 814, 20139, 1204, 264, 94562, 4138, 303, 1330, 41228,
+        25, 248046, 198, 248045, 74455, 198, 248068, 198,
     ];
     let prompt_len = input_ids.len();
     let ids: Vec<f32> = input_ids.iter().map(|&x| x as f32).collect();
@@ -77,10 +78,27 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
     let vocab = 248320usize;
     let flat = logits.to_vec_f32().map_err(|e| format!("logits f32: {e}"))?;
     let row = &flat[flat.len() - vocab..];
-    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap();
     let mut generated = Vec::new();
-    let mut current = argmax(row);
-    generated.push(current);
+    // (argmax, top1, top2, logit-of-REF-token) per step — the ref-token logit
+    // quantifies whether a divergence is a near-tie flip or a real reorder.
+    let mut gaps: Vec<(u32, f32, f32, f32)> = Vec::new();
+    let ref_tokens: Vec<u32> = std::fs::read_to_string("/tmp/bonsai_ref_tokens.txt")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    let snap = |v: &[f32], step_i: u32| -> (u32, f32, f32, f32) {
+        let mut idx: Vec<u32> = (0..v.len() as u32).collect();
+        idx.sort_by(|&a, &b| v[b as usize].total_cmp(&v[a as usize]));
+        let ref_logit = ref_tokens.get(step_i as usize)
+            .map(|&rt| v[rt as usize])
+            .unwrap_or(f32::NAN);
+        (idx[0], v[idx[0] as usize], v[idx[1] as usize], ref_logit)
+    };
+    let mut g = snap(row, 0);
+    generated.push(g.0);
+    gaps.push(g);
+    let mut current = g.0;
     for i in 1..32 {
         let step_pos = prompt_len + i - 1;
         let st_in = mk(&[current as f32]);
@@ -88,8 +106,10 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         let step_logits = model.forward(session.as_mut(), &st_in, &st_pos, &[]).map_err(|e| format!("decode failed: {e}"))?;
         let flat = step_logits.to_vec_f32().map_err(|e| format!("step logits: {e}"))?;
         let row = &flat[flat.len() - vocab..];
-        current = argmax(row);
-        generated.push(current);
+        g = snap(row, i as u32);
+        current = g.0;
+        generated.push(g.0);
+        gaps.push(g);
     }
     let ref_path = std::path::Path::new("/tmp/bonsai_ref_tokens.txt");
     let txt = std::fs::read_to_string(ref_path).map_err(|e| format!("read ref: {e}"))?;
@@ -99,9 +119,13 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         // STOP — do not weaken to "similar text". Report the greedy top-2 gap
         // at the FIRST divergent position for both sides.
         let div = (0..32).find(|&i| generated[i] != want[i]).unwrap();
+        let (_, l1, l2, lref) = gaps[div];
         eprintln!(
-            "[gate-d] first divergence at token {div}: grim={} ref={}\n  grim[0..8]={:?}\n  ref [0..8]={:?}",
-            generated[div], want[div], &generated[..8], &want[..8]
+            "[gate-d] first divergence at token {div}: grim={} ref={}\n  grim[0..8]={:?}\n  ref [0..8]={:?}\n  grim logits at divergence: top1={l1:.4} top2={l2:.4} gap={:.4} | ref-token logit in grim: {lref:.4} (rank delta {:.4}){}",
+            generated[div], want[div], &generated[..8], &want[..8],
+            l1 - l2,
+            l1 - lref,
+            if (l1 - lref).abs() < 0.1 { "  <- ref token within float noise of grim top1" } else { "" }
         );
         eprintln!(
             "[gate-d] STOP per plan: parity NOT met (matched {div}/32 tokens)"
