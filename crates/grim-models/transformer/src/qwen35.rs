@@ -2643,7 +2643,7 @@ fn gated_delta_net_forward(
     // alpha / beta -> one scalar per value head per token.
     let mut alpha = vec![0.0f32; n_val_heads * seq_len];
     if let Some(ref al) = blk.ssm_alpha {
-        let v = al.forward(&x_normed_t)?.to_vec_f32()?;
+        let v = al.forward(x_normed)?.to_vec_f32()?;
         let stride = v.len() / seq_len.max(1);
         for t in 0..seq_len {
             for h in 0..n_val_heads.min(stride) {
@@ -2655,7 +2655,7 @@ fn gated_delta_net_forward(
     // It is a per-value-head gate in (0,1), not a raw projection.
     let mut beta = vec![0.0f32; n_val_heads * seq_len];
     if let Some(ref bl) = blk.ssm_beta {
-        let v = bl.forward(&x_normed_t)?.to_vec_f32()?;
+        let v = bl.forward(x_normed)?.to_vec_f32()?;
         let stride = v.len() / seq_len.max(1);
         for t in 0..seq_len {
             for h in 0..n_val_heads.min(stride) {
@@ -2892,10 +2892,10 @@ fn gated_delta_net_forward(
             dump(&cache.ssm_state, "ssm_pre");
             dump(&qkv_vec, "conv_x");
             if let Some(ref al) = blk.ssm_alpha {
-                dump(&al.forward(&x_normed_t)?.to_vec_f32()?, "alpha_full");
+                dump(&al.forward(x_normed)?.to_vec_f32()?, "alpha_full");
             }
             if let Some(ref bl) = blk.ssm_beta {
-                let raw = bl.forward(&x_normed_t)?.to_vec_f32()?;
+                let raw = bl.forward(x_normed)?.to_vec_f32()?;
                 dump(&raw, "beta_raw_full");
                 dump(&beta, "beta_full"); // host: sigmoided at fill
             }
@@ -3214,8 +3214,8 @@ fn gated_delta_net_forward_d2d(
     if qkv.device() != x_normed.device() {
         d2d_decline!("kda: attn_qkv projection landed on a different device than its input");
     }
-    let alpha = alpha_lin.forward(&x_normed_t)?;
-    let beta = beta_lin.forward(&x_normed_t)?;
+    let alpha = alpha_lin.forward(x_normed)?;
+    let beta = beta_lin.forward(x_normed)?;
     // z is the KDA output gate. `attn_gate` is loaded at
     // `q_dim.max(value_dim)` because the same tensor serves both layer types;
     // the op reads the leading `value_dim` elements, which is the same slice
