@@ -1329,14 +1329,21 @@ dependencies = [
 name = "cubecl-hip"
 version = "0.10.0"
 dependencies = [
- "grim-cl-hip",
-]
-
-[[package]]
-name = "cubecl-hip-sys"
-version = "7.16.2638501"
-dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "cubecl-core",
+ "cubecl-cpp",
+ "cubecl-runtime",
+ "cubecl-std",
+ "derive-new",
  "grim-hip-sys",
+ "half",
+ "log",
+ "paste",
+ "pretty_assertions",
+ "serde",
+ "test-log",
+ "tracing",
 ]
 
 [[package]]
@@ -2547,27 +2554,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "grim-cl-hip"
-version = "0.10.0"
-dependencies = [
- "bytemuck",
- "cubecl-common",
- "cubecl-core",
- "cubecl-cpp",
- "cubecl-hip-sys",
- "cubecl-runtime",
- "cubecl-std",
- "derive-new",
- "half",
- "log",
- "paste",
- "pretty_assertions",
- "serde",
- "test-log",
  "tracing",
 ]
 

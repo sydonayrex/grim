@@ -15,17 +15,20 @@ to `1.95`. grim already ships on 0.10.0.
 
 ## Adaptations from upstream
 
-- Renamed `cubecl-hip` → `grim-cl-hip` (lib `cubecl_hip` → `grim_cl_hip`).
+- Package renamed `grim-cl-hip` → back to `cubecl-hip` (dir name unchanged) so
+  the root `[patch.crates-io]` binds registry consumers directly to this crate;
+  no re-export shim exists anymore.
 - `Cargo.toml` de-namespaced: `workspace = true` deps → explicit registry
   versions; `path = "../cubecl-*"` dropped.
 - **No `src/` changes.**
-- `cubecl-hip-sys` dependency (`7.1.5280200`) still binds to `grim-hip-sys`
-  through the root `[patch.crates-io]` shim (`crates/cubecl-hip-sys`), which
-  carries the ROCm 7.16-generated bindings.
+- `cubecl-hip-sys` dependency binds to `grim-hip-sys` via a Cargo dep-rename
+  (`cubecl-hip-sys = { path = "../grim-hip-sys", package = "grim-hip-sys" }`),
+  which carries the ROCm 7.16-generated bindings while keeping the vendored
+  `cubecl_hip_sys::…` import paths valid.
 
 ## Consumed via
 
-`crates/cubecl-hip` re-export shim + root `[patch.crates-io] cubecl-hip`, so
+Root `[patch.crates-io] cubecl-hip = { path = "crates/grim-cl-hip" }`, so
 `grim-backend-rocm`'s `cubecl::hip` (umbrella `pub use cubecl_hip as hip`)
-resolves to this vendored source unchanged. The consumer crate never references
-`grim_cl_hip` directly.
+resolves to this vendored source unchanged. Consumers never reference the
+crate by a grim-specific name.

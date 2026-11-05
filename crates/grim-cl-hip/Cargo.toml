@@ -1,11 +1,14 @@
 [package]
-name = "grim-cl-hip"
+# Published-under name: this vendored source IS cubecl-hip 0.10.0 (see
+# PROVENANCE.md). Renamed from grim-cl-hip so the root [patch.crates-io]
+# can point registry `cubecl-hip` consumers here directly — no shim crate.
+name = "cubecl-hip"
 # Tracks the vendored upstream version (cubecl-hip 0.10.0).
 version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Vendored cubecl-hip 0.10.0 (AMD ROCm HIP runtime) for grim, renamed from upstream cubecl-hip"
+description = "Vendored cubecl-hip 0.10.0 (AMD ROCm HIP runtime) for grim"
 repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-hip"
 categories = ["science"]
 keywords = ["gpu", "amd", "rocm", "hip"]
@@ -46,9 +49,10 @@ cubecl-common = { version = "0.10.0", features = [
 ] }
 cubecl-core = { version = "0.10.0", default-features = false }
 cubecl-cpp = { version = "0.10.0", default-features = false, features = ["hip"] }
-# Already bound to grim-hip-sys via the root [patch.crates-io] shim
-# (crates/cubecl-hip-sys), so this resolves to grim's ROCm 7.16 bindings.
-cubecl-hip-sys = { version = "7.1.5280200" }
+# Bind directly to grim's ROCm 7.16 bindings (dep-rename keeps the vendored
+# `cubecl_hip_sys::…` import paths valid; the registry 7.2 file does not
+# compile against ROCm 7.16 headers).
+cubecl-hip-sys = { path = "../grim-hip-sys", package = "grim-hip-sys" }
 cubecl-runtime = { version = "0.10.0", default-features = false, features = [
     "channel-mutex",
 ] }
