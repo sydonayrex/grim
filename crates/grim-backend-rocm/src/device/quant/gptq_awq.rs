@@ -1045,9 +1045,15 @@ impl RocmDevice {
             )?);
         }
 
-        let act_codes = codes_guard.as_ref().unwrap();
-        let act_scales = scales_guard.as_ref().unwrap();
-        let act_sums = sums_guard.as_ref().unwrap();
+        let act_codes = codes_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("act_codes guard is None".into()))?;
+        let act_scales = scales_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("act_scales guard is None".into()))?;
+        let act_sums = sums_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("act_sums guard is None".into()))?;
 
         // Quantize activations to u4 groups (skipped when sibling projection already quantized `a_storage`)
         if !u4_ready {

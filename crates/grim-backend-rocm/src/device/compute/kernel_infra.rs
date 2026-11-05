@@ -53,7 +53,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let partials_buf = part_guard.as_ref().unwrap();
+        let partials_buf = part_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("reduce partials_buf is None".into()))?;
         let partials_ptr = dev_ptr(partials_buf)?;
 
         let mut out_guard = self
@@ -68,7 +70,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let out_buf = out_guard.as_ref().unwrap();
+        let out_buf = out_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("reduce out_buf is None".into()))?;
         let out_ptr = dev_ptr(out_buf)?;
 
         // Launch stage 1
@@ -144,7 +148,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let partials_buf = part_guard.as_ref().unwrap();
+        let partials_buf = part_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("reduce partials_buf is None".into()))?;
         let partials_ptr = dev_ptr(partials_buf)?;
 
         let mut out_guard = self
@@ -159,7 +165,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let out_buf = out_guard.as_ref().unwrap();
+        let out_buf = out_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("reduce out_buf is None".into()))?;
         let out_ptr = dev_ptr(out_buf)?;
 
         let mut x_p = x_ptr;
@@ -232,7 +240,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let partials_buf = part_guard.as_ref().unwrap();
+        let partials_buf = part_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("argmax partials_buf is None".into()))?;
         let partial_vals_ptr = dev_ptr(partials_buf)?;
 
         let mut idxs_guard = self
@@ -253,7 +263,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let idxs_buf = idxs_guard.as_ref().unwrap();
+        let idxs_buf = idxs_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("argmax idxs_buf is None".into()))?;
         let partial_idxs_ptr = dev_ptr(idxs_buf)?;
 
         let mut out_guard = self
@@ -268,7 +280,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let out_buf = out_guard.as_ref().unwrap();
+        let out_buf = out_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("argmax out_buf is None".into()))?;
         let out_ptr = dev_ptr(out_buf)?;
 
         let mut x_p = x_ptr;

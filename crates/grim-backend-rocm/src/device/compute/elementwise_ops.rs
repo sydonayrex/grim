@@ -495,8 +495,14 @@ impl RocmDevice {
             ));
         }
         let total = out.shape().elem_count();
-        let mut a_ptr = x_s.device_ptr.unwrap() as *mut std::ffi::c_void;
-        let mut b_ptr = out.device_ptr.unwrap() as *mut std::ffi::c_void;
+        let mut a_ptr = x_s
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mul_scalar: x device_ptr is None".into()))?
+            as *mut std::ffi::c_void;
+        let mut b_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mul_scalar: out device_ptr is None".into()))?
+            as *mut std::ffi::c_void;
         let mut s = scalar;
         let mut n = total as i32;
         let (grid, block) = crate::device::util::linear_launch(total);

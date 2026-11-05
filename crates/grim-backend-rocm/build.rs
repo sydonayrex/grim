@@ -5,7 +5,9 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build_rocm_detect.rs"));
 // Crate manifest dir is `crates/grim-backend-rocm`; workspace root is
 // two parents up.
 fn workspace_root() -> std::path::PathBuf {
-    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     manifest
         .parent()
         .and_then(|p| p.parent())

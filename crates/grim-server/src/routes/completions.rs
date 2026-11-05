@@ -66,7 +66,7 @@ pub(crate) async fn text_completions_route(
 
     let remaining = context_limit.saturating_sub(prompt_tokens.len());
     let requested_max_tokens = payload.max_tokens.unwrap_or(16);
-    let max_tokens = (requested_max_tokens as usize).min(remaining);
+    let max_tokens = requested_max_tokens.min(remaining);
     let stream_requested = payload.stream.unwrap_or(false);
     let model_name = payload
         .model
@@ -199,7 +199,12 @@ pub(crate) async fn text_completions_route(
             .header("content-type", "text/event-stream")
             .header("cache-control", "no-cache")
             .body(Body::from_stream(stream))
-            .unwrap()
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_default()
+            })
     } else {
         let timeout_secs = request_timeout_secs();
         let state_clone = state.clone();

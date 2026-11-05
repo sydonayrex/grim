@@ -160,7 +160,10 @@ pub fn copy_boundary_ordered_with_staging(
                     let _g = DeviceGuard::set(src_dev);
                     *guard = Some(crate::p2p_route::HostStagingBuffer::new(bytes.max(65536))?);
                 }
-                guard.as_ref().unwrap().as_device_ptr()
+                guard
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("copy_boundary staging guard is None".into()))?
+                    .as_device_ptr()
             }
         };
 

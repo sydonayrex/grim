@@ -806,7 +806,8 @@ impl DecodeGraphBuffers {
             // (bit-stable 1.3529 vs -1.3476 in the lfm2_graph_moe suite run,
             // clean in isolation where first-touch pages are driver-zeroed).
             // One memset per arena at graph construction, off the hot path.
-            for arena in [k_arena.last().unwrap(), v_arena.last().unwrap()] {
+            let arenas_to_zero = k_arena.last().into_iter().chain(v_arena.last().into_iter());
+            for arena in arenas_to_zero {
                 let _zg = crate::device::util::DeviceGuard::set(arena.device_ordinal() as i32);
                 let zp = arena
                     .device_ptr

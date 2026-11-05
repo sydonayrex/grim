@@ -257,10 +257,13 @@ fn take_staging(stream: *mut c_void, len: usize, ordinal: i32) -> Result<Staging
         .as_ref()
         .is_some_and(|c| c.stream == stream && c.ordinal == ordinal && c.buf.size() >= len);
     if reuse_cached {
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("p2p staging guard is None".into()))?;
         // SAFETY: the lock is held for the whole lease, so the buffer cannot be
         // swapped out or freed underneath us; same-stream reuse is additionally queue-ordered by `stream` itself.
         let ptr = unsafe {
-            std::ptr::NonNull::new_unchecked(guard.as_ref().unwrap().buf.as_device_ptr())
+            std::ptr::NonNull::new_unchecked(cached.buf.as_device_ptr())
         }
         .as_ptr();
         return Ok(StagingGuard {

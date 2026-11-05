@@ -409,7 +409,10 @@ impl RocmDevice {
             let _alloc_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             *staging = Some((bytes, RocmPinnedBuffer::<u8>::alloc(bytes)?));
         }
-        let staging_buf = &mut staging.as_mut().unwrap().1;
+        let staging_buf = &mut staging
+            .as_mut()
+            .ok_or_else(|| Error::Backend("staging buffer is None".into()))?
+            .1;
 
         // Leg 1: src device -> pinned host.
         {

@@ -310,7 +310,9 @@ fn sample_impl(
             device.ordinal,
         )?);
     }
-    let out_storage = buf_guard.as_ref().unwrap();
+    let out_storage = buf_guard
+        .as_ref()
+        .ok_or_else(|| Error::Backend("sampler out_storage guard is None".into()))?;
     let out_ptr = dev_ptr(out_storage)?;
 
     let mut logits_arg = logits_ptr;
@@ -617,7 +619,9 @@ pub fn apply_repeat_penalty_on_device(
             device.ordinal,
         )?);
     }
-    let hist_storage = guard.as_ref().unwrap();
+    let hist_storage = guard
+        .as_ref()
+        .ok_or_else(|| Error::Backend("sampler hist_storage guard is None".into()))?;
     // Bit-preserving u32 view as f32 words for the byte-copy upload.
     // SAFETY: u32/f32 identical size+align; len counted in 4-byte elements.
     let words: &[f32] =
@@ -774,7 +778,9 @@ pub fn apply_repeat_penalty_on_device_stream(
             device.ordinal,
         )?);
     }
-    let hist_storage = guard.as_ref().unwrap();
+    let hist_storage = guard
+        .as_ref()
+        .ok_or_else(|| Error::Backend("sampler hist_storage guard is None".into()))?;
     // SAFETY: u32/f32 identical size+align; len counted in 4-byte elements.
     let words: &[f32] =
         unsafe { std::slice::from_raw_parts(hist_ids.as_ptr() as *const f32, needed) };

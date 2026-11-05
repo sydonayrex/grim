@@ -191,7 +191,7 @@ impl QuantOps for RocmDevice {
                         drop(buf_guard);
                         self.launch_dot4_q4k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
@@ -311,7 +311,7 @@ impl QuantOps for RocmDevice {
                         drop(buf_guard);
                         self.launch_dot4_q5k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
@@ -430,7 +430,7 @@ impl QuantOps for RocmDevice {
                             self.ordinal,
                         )?);
                     }
-                    let act_q80 = buf_guard.as_ref().unwrap();
+                    let act_q80 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                     let _ = self.launch_quant_q8_0(a_storage, act_q80, m * k)?;
                     self.launch_dot4_q2_0_q80_gemv(act_q80, b_storage, &out_storage, m, n, k)?;
                 } else {
@@ -460,7 +460,7 @@ impl QuantOps for RocmDevice {
                             self.ordinal,
                         )?);
                     }
-                    let act_q80 = buf_guard.as_ref().unwrap();
+                    let act_q80 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                     let _ = self.launch_quant_q8_0(a_storage, act_q80, m * k)?;
                     self.launch_dot4_pq2_0_q80_gemv(act_q80, b_storage, &out_storage, m, n, k)?;
                 } else {
@@ -579,7 +579,7 @@ impl QuantOps for RocmDevice {
                                 k,
                             )?;
                         } else {
-                            let act_q81 = buf_guard.as_ref().unwrap();
+                            let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                             let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                             fence_act_quant(self, q_stream);
                             self.launch_dot4_q6k_q81_gemv(
@@ -698,7 +698,7 @@ impl QuantOps for RocmDevice {
                         drop(buf_guard);
                         self.launch_dot4_q2k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
@@ -821,7 +821,7 @@ impl QuantOps for RocmDevice {
                         drop(buf_guard);
                         self.launch_dot4_q3k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
@@ -997,7 +997,7 @@ impl QuantOps for RocmDevice {
                             k,
                         )?;
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_iq4nl_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
@@ -1057,7 +1057,7 @@ impl QuantOps for RocmDevice {
                             k,
                         )?;
                     } else {
-                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_iq4xs_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
@@ -1224,7 +1224,7 @@ impl QuantOps for RocmDevice {
                                     k,
                                 )?;
                             } else {
-                                let act_q81 = buf_guard.as_ref().unwrap();
+                                let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
                                 let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                                 self.launch_dot4_q80_q81_gemv(
                                     act_q81,

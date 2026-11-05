@@ -183,7 +183,10 @@ pub fn stage_h2d_pinned<'a>(ordinal: usize, host: &'a [u8]) -> (*const u8, bool)
                         next: 0,
                     },
                 ));
-                &mut rings.last_mut().unwrap().1
+                match rings.last_mut() {
+                    Some(r) => &mut r.1,
+                    None => unreachable!("just pushed above"),
+                }
             }
         };
         if entry.slots.len() < STAGE_RING_SLOTS {

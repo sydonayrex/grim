@@ -1669,7 +1669,11 @@ impl RocmDevice {
             )?;
             *pguard = Some((self.ordinal, np_key, po));
         }
-        let pair_out_p = pguard.as_ref().unwrap().2.device_ptr_checked()? as *mut c_void;
+        let pair_out_p = pguard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("moe pair_out guard is None".into()))?
+            .2
+            .device_ptr_checked()? as *mut c_void;
         drop(pguard);
         let mut pair_out_p = pair_out_p;
         let mut det_i: i32 = if batch_i == 1 { 1 } else { 0 };
@@ -1973,7 +1977,10 @@ impl RocmDevice {
             };
             *guard = Some((self.ordinal, s));
         }
-        let scratch = &guard.as_ref().unwrap().1;
+        let scratch = &guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("moe scratch guard is None".into()))?
+            .1;
         let _stream = self.active_stream();
 
         let gate_ptrs_p = g_ptrs.device_ptr_checked()? as *mut c_void;

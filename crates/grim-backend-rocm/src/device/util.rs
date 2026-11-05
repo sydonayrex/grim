@@ -537,6 +537,7 @@ pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
     let mut opts = vec![
         // rocWMMA 2.x targets C++17 (`inline constexpr`, nested namespace definitions, `namespace X::Y`), and its headers are pulled in by kernels on gfx11/gfx12 targets.
         // Other HIP kernels in this crate are a strict subset of C++17, so --std=c++17 is.
+        #[allow(clippy::unwrap_used)]
         CString::new("--std=c++17").unwrap(),
     ];
     if is_cdna(arch) {

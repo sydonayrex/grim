@@ -254,6 +254,7 @@ pub fn request_timeout_secs() -> u64 {
 pub struct AdmissionTicket;
 
 impl AdmissionTicket {
+    #[allow(clippy::result_large_err)]
     pub fn try_acquire() -> std::result::Result<Self, Response> {
         Self::try_acquire_in(&ADMISSION_COUNTER, max_queue_limit())
     }
@@ -263,6 +264,7 @@ impl AdmissionTicket {
     /// behaviour can be asserted without starving concurrently running tests.
     /// NOTE: the returned ticket releases `ADMISSION_COUNTER` on drop, so
     /// only the global counter may be used with a live ticket.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn try_acquire_in(
         counter: &AtomicUsize,
         max_q: usize,
@@ -3557,10 +3559,10 @@ async fn grim_chat(
                                     "role": "assistant",
                                     "content": content
                                 });
-                                if tool_calls.is_array()
-                                    && !tool_calls.as_array().unwrap().is_empty()
-                                {
-                                    message["tool_calls"] = tool_calls;
+                                if let Some(tc_arr) = tool_calls.as_array() {
+                                    if !tc_arr.is_empty() {
+                                        message["tool_calls"] = tool_calls;
+                                    }
                                 }
                                 let ollama_chunk = serde_json::json!({
                                     "model": model_name,
@@ -3568,8 +3570,11 @@ async fn grim_chat(
                                     "message": message,
                                     "done": false
                                 });
-                                let chunk_str =
-                                    format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
+                                let chunk_str = format!(
+                                    "{}\n",
+                                    serde_json::to_string(&ollama_chunk)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                );
                                 eval_count += 1;
                                 if first_content.is_none() {
                                     first_content = Some(std::time::Instant::now());
@@ -3616,8 +3621,11 @@ async fn grim_chat(
                                     "prompt_eval_duration": prompt_eval,
                                     "eval_duration": eval_dur
                                 });
-                                let chunk_str =
-                                    format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
+                                let chunk_str = format!(
+                                    "{}\n",
+                                    serde_json::to_string(&final_chunk)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                );
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
                                     (body_stream, buffer, true, eval_count, first_content),
@@ -3632,7 +3640,12 @@ async fn grim_chat(
         axum::response::Response::builder()
             .header("content-type", "application/x-ndjson")
             .body(body)
-            .unwrap()
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_default()
+            })
     } else {
         let (parts, body) = response.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX)
@@ -3650,8 +3663,10 @@ async fn grim_chat(
                 "role": "assistant",
                 "content": content
             });
-            if tool_calls.is_array() && !tool_calls.as_array().unwrap().is_empty() {
-                message["tool_calls"] = tool_calls;
+            if let Some(tc_arr) = tool_calls.as_array() {
+                if !tc_arr.is_empty() {
+                    message["tool_calls"] = tool_calls;
+                }
             }
             let ollama_res = serde_json::json!({
                 "model": model_name,
@@ -3668,9 +3683,10 @@ async fn grim_chat(
                 "eval_count": content.len().div_ceil(4),
                 "eval_duration": chat_start.elapsed().as_nanos() as u64
             });
+            let body_str = serde_json::to_string(&ollama_res).unwrap_or_else(|_| "{}".to_string());
             let mut res = Response::from_parts(
                 parts,
-                Body::from(serde_json::to_string(&ollama_res).unwrap()),
+                Body::from(body_str),
             );
             res.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
@@ -3767,8 +3783,11 @@ async fn grim_generate(
                                     "response": content,
                                     "done": false
                                 });
-                                let chunk_str =
-                                    format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
+                                let chunk_str = format!(
+                                    "{}\n",
+                                    serde_json::to_string(&ollama_chunk)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                );
                                 tracing::debug!(
                                     "[trace] generate content chunk, eval_count={eval_count}"
                                 );
@@ -3801,7 +3820,8 @@ async fn grim_generate(
                                     });
                                     let chunk_str = format!(
                                         "{}\n",
-                                        serde_json::to_string(&partial_chunk).unwrap()
+                                        serde_json::to_string(&partial_chunk)
+                                            .unwrap_or_else(|_| "{}".to_string())
                                     );
                                     eval_count += 1;
                                     return Some((
@@ -3820,8 +3840,11 @@ async fn grim_generate(
                                     "eval_count": eval_count,
                                     "eval_duration": elapsed
                                 });
-                                let chunk_str =
-                                    format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
+                                let chunk_str = format!(
+                                    "{}\n",
+                                    serde_json::to_string(&final_chunk)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                );
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
                                     (body_stream, buffer, true, eval_count),
@@ -3836,7 +3859,12 @@ async fn grim_generate(
         axum::response::Response::builder()
             .header("content-type", "application/x-ndjson")
             .body(body)
-            .unwrap()
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_default()
+            })
     } else {
         let (parts, body) = response.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX)
@@ -3865,9 +3893,10 @@ async fn grim_generate(
                 "eval_count": completion_tokens,
                 "eval_duration": elapsed_nanos
             });
+            let body_str = serde_json::to_string(&ollama_res).unwrap_or_else(|_| "{}".to_string());
             let mut res = Response::from_parts(
                 parts,
-                Body::from(serde_json::to_string(&ollama_res).unwrap()),
+                Body::from(body_str),
             );
             res.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
@@ -4826,7 +4855,12 @@ async fn serve_logo_png() -> axum::response::Response {
         .header(axum::http::header::CONTENT_TYPE, "image/png")
         .header(axum::http::header::CACHE_CONTROL, "public, max-age=86400")
         .body(axum::body::Body::from(GARAGE_LOGO_PNG))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap_or_default()
+        })
 }
 
 /// Dashboard HTML (live multi-GPU dashboard with WCAG 2.2 accessibility, responsive grid, and live polling).

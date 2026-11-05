@@ -194,7 +194,12 @@ pub async fn grim_pull_route(
     axum::response::Response::builder()
         .header("content-type", "application/x-ndjson")
         .body(body)
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap_or_default()
+        })
 }
 
 /// POST /api/upload?filename=<name>.gguf - save an uploaded model file into the local catalog.

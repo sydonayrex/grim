@@ -47,18 +47,26 @@ pub fn decode_wav_to_mono_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
 
     while offset + 8 <= bytes.len() {
         let chunk_id = &bytes[offset..offset + 4];
-        let chunk_size =
-            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk_size = u32::from_le_bytes(match bytes[offset + 4..offset + 8].try_into() {
+            Ok(b) => b,
+            Err(_) => break,
+        }) as usize;
         offset += 8;
 
         if chunk_id == b"fmt " {
             if chunk_size >= 16 && offset + 16 <= bytes.len() {
-                audio_format = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-                num_channels =
-                    u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
-                sample_rate = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-                bits_per_sample =
-                    u16::from_le_bytes(bytes[offset + 14..offset + 16].try_into().unwrap());
+                if let Ok(b) = bytes[offset..offset + 2].try_into() {
+                    audio_format = u16::from_le_bytes(b);
+                }
+                if let Ok(b) = bytes[offset + 2..offset + 4].try_into() {
+                    num_channels = u16::from_le_bytes(b);
+                }
+                if let Ok(b) = bytes[offset + 4..offset + 8].try_into() {
+                    sample_rate = u32::from_le_bytes(b);
+                }
+                if let Ok(b) = bytes[offset + 14..offset + 16].try_into() {
+                    bits_per_sample = u16::from_le_bytes(b);
+                }
             }
             offset += chunk_size;
         } else if chunk_id == b"data" {

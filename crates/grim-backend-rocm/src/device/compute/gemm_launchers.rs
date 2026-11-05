@@ -280,7 +280,9 @@ impl RocmDevice {
                 self.ordinal,
             )?);
         }
-        let w_f16 = w_guard.as_ref().unwrap();
+        let w_f16 = w_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("gemm_launchers: w_guard is None".into()))?;
 
         // 2. Dequantize packed weight directly to F16
         match format_tag {
@@ -329,7 +331,9 @@ impl RocmDevice {
                     self.ordinal,
                 )?);
             }
-            let a_f16 = a_guard.as_ref().unwrap();
+            let a_f16 = a_guard
+                .as_ref()
+                .ok_or_else(|| Error::Backend("gemm_launchers: a_guard is None".into()))?;
             let mut sptr = a_storage
                 .device_ptr
                 .ok_or_else(|| Error::Backend("cvt A: src ptr".into()))?;
@@ -348,7 +352,9 @@ impl RocmDevice {
         };
 
         let a_act = match &a_f16_storage {
-            Some(g) => g.as_ref().unwrap(),
+            Some(g) => g
+                .as_ref()
+                .ok_or_else(|| Error::Backend("gemm_launchers: a_f16_storage guard is None".into()))?,
             None => a_storage,
         };
 
