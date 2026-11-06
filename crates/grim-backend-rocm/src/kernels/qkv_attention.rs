@@ -368,19 +368,30 @@ void grim_qkv_attention(
 
     // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        // Sequential dot product Q.K on lane 0 (matching CPU reference order:
-        // q[0]*k[0] + q[1]*k[1] + ... + q[head_dim-1]*k[head_dim-1]), then
-        // broadcast score to all lanes. Replaces the __shfl_xor_sync butterfly
+        // Sequential dot product Q.K on lane 0 using DOUBLE precision accumulation
+        // (matching CPU reference which uses ggml_float=double for ggml_vec_dot_f32),
+        // then broadcast score to all lanes. Replaces the __shfl_xor_sync butterfly
         // reduction which reassociates f32 adds across lanes and diverges from
         // host reference accumulation order.
-        float score = 0.0f;
+        // __shfl_sync only carries 32 bits, so we split the double into high/low
+        // halves, shuffle each, and reconstruct on all lanes.
+        double score_d = 0.0;
         if (lane_id == 0) {
             for (int dd = 0; dd < head_dim; ++dd) {
-                score += q[q_offset + dd] * k_head[j * kv_stride + dd];
+                score_d += (double)q[q_offset + dd] * (double)k_head[j * kv_stride + dd];
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        score = __shfl_sync(shfl_mask, score, 0);
+        unsigned int score_hi = 0, score_lo = 0;
+        if (lane_id == 0) {
+            unsigned int* score_bits = (unsigned int*)&score_d;
+            score_hi = score_bits[1];
+            score_lo = score_bits[0];
+        }
+        score_hi = __shfl_sync(shfl_mask, score_hi, 0);
+        score_lo = __shfl_sync(shfl_mask, score_lo, 0);
+        unsigned int score_bits[2] = { score_lo, score_hi };
+        float score = (float)(*(double*)score_bits);
         score *= inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
@@ -1095,17 +1106,29 @@ void grim_qkv_attention_f16kv(
 
     // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        // Sequential dot product Q.K on lane 0 (matching CPU reference order),
+        // Sequential dot product Q.K on lane 0 using DOUBLE precision accumulation
+        // (matching CPU reference which uses ggml_float=double for ggml_vec_dot_f32),
         // then broadcast score to all lanes. Replaces __shfl_xor_sync butterfly
         // reduction which reassociates f32 adds across lanes.
-        float score = 0.0f;
+        // __shfl_sync only carries 32 bits, so we split the double into high/low
+        // halves, shuffle each, and reconstruct on all lanes.
+        double score_d = 0.0;
         if (lane_id == 0) {
             for (int dd = 0; dd < head_dim; ++dd) {
-                score += q[q_offset + dd] * fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
+                score_d += (double)q[q_offset + dd] * (double)fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        score = __shfl_sync(shfl_mask, score, 0);
+        unsigned int score_hi = 0, score_lo = 0;
+        if (lane_id == 0) {
+            unsigned int* score_bits = (unsigned int*)&score_d;
+            score_hi = score_bits[1];
+            score_lo = score_bits[0];
+        }
+        score_hi = __shfl_sync(shfl_mask, score_hi, 0);
+        score_lo = __shfl_sync(shfl_mask, score_lo, 0);
+        unsigned int score_bits_arr[2] = { score_lo, score_hi };
+        float score = (float)(*(double*)score_bits_arr);
         score *= inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
