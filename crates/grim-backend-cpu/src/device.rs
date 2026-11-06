@@ -1169,19 +1169,27 @@ impl AttentionOps for CpuDevice {
                 // comment in grim-backend-rocm's yarn_inv_freq_and_mscale).
                 let freq =
                     1.0 / cfg.base.powf((2 * i) as f32 / rotary_dim as f32);
+                // llama.cpp's YaRN ramp (ggml-cpu/ops.cpp `rope_yarn`), the
+                // same definition `rope` above uses: a ramp over the
+                // DIMENSION INDEX with bounds from ggml_rope_yarn_corr_dims
+                // — NOT the HF wavelength ramp this site used before the
+                // golden standard caught it (verified against the llama.cpp
+                // reference dumps on Bonsai-27B, see 528b1508).
                 if let Some(yarn) = &cfg.yarn {
-                    let wavelength = 2.0 * std::f32::consts::PI / freq;
-                    let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
-                    let high = (yarn.original_max_pos as f32) / yarn.beta_fast;
-                    if wavelength < high {
-                        freq
-                    } else if wavelength > low {
-                        freq / yarn.factor
-                    } else {
-                        let ramp = (yarn.original_max_pos as f32 / wavelength - yarn.beta_slow)
-                            / (yarn.beta_fast - yarn.beta_slow);
-                        (1.0 - ramp) * (freq / yarn.factor) + ramp * freq
-                    }
+                    let corr = |n_rot: f32| {
+                        (rotary_dim as f32)
+                            * ((yarn.original_max_pos as f32
+                                / (n_rot * 2.0 * std::f32::consts::PI))
+                                .ln())
+                            / (2.0 * cfg.base.ln())
+                    };
+                    let low = corr(yarn.beta_fast).floor().max(0.0);
+                    let high = corr(yarn.beta_slow)
+                        .ceil()
+                        .min((rotary_dim.saturating_sub(1)) as f32);
+                    let t = (i as f32 - low) / (high - low).max(0.001);
+                    let ramp = 1.0 - t.clamp(0.0, 1.0);
+                    (freq / yarn.factor) * (1.0 - ramp) + freq * ramp
                 } else {
                     freq
                 }
@@ -1203,19 +1211,39 @@ impl AttentionOps for CpuDevice {
                 let mut new_cos = vec![0.0f32; rotary_half];
                 let mut new_sin = vec![0.0f32; rotary_half];
 
+                // REROPE IS A PURE ROTATION RETARGETING: the cache holds
+                // `M·R(old)·x` (M = the YaRN mscale), and the mscale is
+                // already baked into the content — it survives as the
+                // overall scale factor. Scaling either table by M multiplies
+                // it a second time and breaks the identity
+                // rerope(old→new) == rope_at_new. Both sides therefore use
+                // the UNSCALED tables. (Caught by the rerope golden
+                // standard.)
+                let _ = mscale;
                 for i in 0..rotary_half {
                     let a_old = p_old * inv_freq[i];
-                    old_cos[i] = a_old.cos() * mscale;
-                    old_sin[i] = a_old.sin() * mscale;
+                    old_cos[i] = a_old.cos();
+                    old_sin[i] = a_old.sin();
 
                     let a_new = p_new * inv_freq[i];
-                    new_cos[i] = a_new.cos() * mscale;
-                    new_sin[i] = a_new.sin() * mscale;
+                    new_cos[i] = a_new.cos();
+                    new_sin[i] = a_new.sin();
                 }
 
+                // Pairing follows `cfg.interleaved`, exactly like the
+                // forward `rope` above: GPT-J (2i, 2i+1) when set, NeoX
+                // half-split (i, i+rotary_half) otherwise. This site
+                // previously forced GPT-J pairs on every model — on a
+                // half-split config it un-rotated the wrong partners and
+                // scrambled K (caught by the rerope golden standard).
                 for i in 0..rotary_half {
-                    let k1_rot = src[base_index + 2 * i];
-                    let k2_rot = src[base_index + 2 * i + 1];
+                    let (a1, a2) = if cfg.interleaved {
+                        (base_index + 2 * i, base_index + 2 * i + 1)
+                    } else {
+                        (base_index + i, base_index + i + rotary_half)
+                    };
+                    let k1_rot = src[a1];
+                    let k2_rot = src[a2];
 
                     // 1. Un-rotate using old cos/sin (inverse rotation matrix)
                     // Since forward is [cos, -sin; sin, cos], inverse is [cos, sin; -sin, cos]
@@ -1223,8 +1251,8 @@ impl AttentionOps for CpuDevice {
                     let k2_orig = -k1_rot * old_sin[i] + k2_rot * old_cos[i];
 
                     // 2. Re-rotate using new cos/sin
-                    src[base_index + 2 * i] = k1_orig * new_cos[i] - k2_orig * new_sin[i];
-                    src[base_index + 2 * i + 1] = k1_orig * new_sin[i] + k2_orig * new_cos[i];
+                    src[a1] = k1_orig * new_cos[i] - k2_orig * new_sin[i];
+                    src[a2] = k1_orig * new_sin[i] + k2_orig * new_cos[i];
                 }
             }
         }
