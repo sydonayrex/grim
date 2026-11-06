@@ -1383,13 +1383,11 @@ impl Qwen35Block {
                 //   llama.cpp qwen35.cpp:323-327
                 //     gate_sigmoid = ggml_sigmoid(gate);  cur = ggml_mul(cur, gate_sigmoid)
                 //
-                // A recurrent layer gates differently and exactly once, with
-                // `silu(z)`, inside `build_norm_gated` (qwen35.cpp:454). Since
-                // `attn_gate` is the tensor that supplies z on a recurrent
-                // layer, gating it here as well applied BOTH gates to the 49
-                // recurrent layers of a 65-layer model. The condition below
-                // restores the reference's one-gate-per-layer-type behaviour.
-                if self.is_full_attention {
+                // `attn_gate` supplies z for recurrent layers inside
+                // `build_norm_gated` (qwen35.cpp:454). It must NOT be applied
+                // to attention layers -- q_gate (from `wq`'s gate half) already
+                // handles the attention output gate in the host path.
+                if false {
                     if let Some(ref gate_lin) = self.attn_gate {
                         let gate_tensor = gate_lin.forward(&x_normed_t)?;
                         let gate_vec = gate_tensor.to_vec_f32()?;

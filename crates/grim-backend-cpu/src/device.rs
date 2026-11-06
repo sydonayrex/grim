@@ -1776,8 +1776,14 @@ impl QuantOps for CpuDevice {
         };
 
         // WI-E7 fast path: Q8_0 GEMM directly on the packed bytes.
-        // Skips both the [N,K] f32 dequant materialization (~240 MB for an output head) and the.
-        if matches!(format, grim_tensor::QuantFormat::Q8_0) && k % 32 == 0 {
+        // PQ2_0 weights are passed with QuantFormat::Q8_0 but have a different
+        // packed layout (128 weights per 34-byte block vs Q8_0's 32 weights per
+        // 34-byte block), so they cannot use this path. Only route actual Q8_0
+        // KQuant weights here.
+        if matches!(format, grim_tensor::QuantFormat::Q8_0) && k % 32 == 0
+            && matches!(b_packed.dtype().storage,
+                grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80))
+        {
             let c = grim_quant::gemm_q8_0_packed(a_data, b_bytes, m, n, k)?;
             return Ok((
                 Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
@@ -1788,17 +1794,6 @@ impl QuantOps for CpuDevice {
         // WI-E7 fast path: Q4_K GEMM directly on the packed bytes, same shape guard pattern as Q8_0 above.
         // A q4_K super-block covers 256 weights, so whole-block GEMM requires k % 256 == 0.
         if matches!(format, grim_tensor::QuantFormat::Q4K) && k % 256 == 0 {
-            let c = grim_quant::gemm_q4k_packed(a_data, b_bytes, m, n, k)?;
-            return Ok((
-                Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
-                Box::new(ReadyHandle),
-            ));
-        }
-
-        // WI-E7 fast path: IQ4_NL GEMM directly on the packed bytes, same guard pattern as Q8_0.
-        // IQ4_NL covers 32 weights per 18-byte block, so whole-block GEMM requires k % 32 == 0.
-        // This bypasses the ~240 MB f32 dequant materialization of the output head.
-        if matches!(format, grim_tensor::QuantFormat::Iq4Nl) && k % 32 == 0 {
             let c = grim_quant::gemm_iq4nl_packed(a_data, b_bytes, m, n, k)?;
             return Ok((
                 Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
@@ -1954,11 +1949,22 @@ impl QuantOps for CpuDevice {
                         })?
                     }
                     // GGUF Q8_0 weights are resident as the native 34-byte block stream (2-byte f16 scale + 32 int8 quants per block), and `Linear::forward` passes an empty `b_scales` (scales live in the block headers).
-                    // Decoding with the canonical `dequant_q80` - the hand-rolled loop below read stride-32 with a 1.0.
-                    grim_tensor::QuantFormat::Q8_0 => grim_quant::dequant_q80(b_bytes, k * n)
-                        .map_err(|e| {
-                            Error::Backend(format!("CPU quantized_matmul Q8_0 dequant: {e}"))
-                        })?,
+                    // Decoding with the canonical `dequant_q80`.
+                    // PQ2_0 weights ride Q8_0 format but use a different packed layout (128 weights per 34-byte block), so they need `dequant_pq2_0` instead.
+                    grim_tensor::QuantFormat::Q8_0 => {
+                        let c = if matches!(b_packed.dtype().storage,
+                            grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Pq2_0))
+                        {
+                            grim_quant::dequant_pq2_0(b_bytes, k * n).map_err(|e| {
+                                Error::Backend(format!("CPU quantized_matmul PQ2_0 dequant: {e}"))
+                            })?
+                        } else {
+                            grim_quant::dequant_q80(b_bytes, k * n).map_err(|e| {
+                                Error::Backend(format!("CPU quantized_matmul Q8_0 dequant: {e}"))
+                            })?
+                        };
+                        c
+                    }
                     grim_tensor::QuantFormat::Q4K => grim_quant::dequant_q4k(b_bytes, k * n)
                         .map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul Q4K dequant: {e}"))
