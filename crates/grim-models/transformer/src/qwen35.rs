@@ -804,49 +804,6 @@ impl Qwen35Block {
         let seq_len = positions.len();
         let device = x.device().clone();
 
-        // KDA-STEP-PROBE: x AT BLOCK ENTRY (before any op can alias it).
-        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && seq_len == 1
-            && self.layer_idx == 0
-        {
-            static ENTRY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let call = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if call == 2 {
-                // call 1 = prefill, call 2 = decode step 1. Read x TWICE
-                // back-to-back (sync + read, sync + read): differing bytes =>
-                // concurrent writer; identical => earlier interleaved reads
-                // raced the async gather.
-                for round in 0..2 {
-                    let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
-                    if let Device::Rocm(ord) = x.device() {
-                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
-                    }
-                    match grim_backend_rocm::device::util::as_rocm(x.storage().as_ref()) {
-                        Ok(r) => match r.copy_to_host() {
-                            Ok(b) => {
-                                let vals: Vec<f32> = b
-                                    .chunks_exact(4)
-                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                    .collect();
-                                eprintln!(
-                                    "[x-entry] round {round} x[0:4]={:?} sum8={:+.6}",
-                                    &vals[..4],
-                                    vals.iter().take(8).sum::<f32>()
-                                );
-                                if round == 1 {
-                                    let bytes: Vec<u8> =
-                                        vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-                                    let _ = std::fs::write("/tmp/kda_probe_x_entry.bin", &bytes);
-                                }
-                            }
-                            Err(e) => eprintln!("[x-entry] round {round} read FAILED: {e}"),
-                        },
-                        Err(e) => eprintln!("[x-entry] round {round} not rocm: {e}"),
-                    }
-                }
-            }
-        }
-
         // 1. Pre-norm
         let x_normed = self.attn_norm.forward(x)?;
         // Prism rotated-domain transform for the attention projection input.
@@ -881,40 +838,6 @@ impl Qwen35Block {
             if let Some(t) = attention_layer_d2d(self, &x_normed, positions, cache, seq_len)? {
                 branch_dev = Some(t);
             } else {
-                // TEMP probe: the attention branch aborts on a bad transfer at the
-                // first attention layer, on both the D2D and host routes. Print the
-                // geometry each step assumes so a wrong width is visible without
-                // re-deriving it.
-                if attn_shapes_debug() {
-                    let shp = |t: &Option<Linear>| {
-                        t.as_ref().map(|l| {
-                            (
-                                l.weight().shape().dims().to_vec(),
-                                l.weight().shape().elem_count(),
-                            )
-                        })
-                    };
-                    let nshp = |n: &Option<RmsNorm>| {
-                        n.as_ref().map(|x| {
-                            (
-                                x.weight.shape().dims().to_vec(),
-                                x.weight.shape().elem_count(),
-                            )
-                        })
-                    };
-                    eprintln!(
-                        "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
-                        self.layer_idx,
-                        seq_len,
-                        shp(&self.wq),
-                        shp(&self.wk),
-                        shp(&self.wv),
-                        shp(&self.wo),
-                        nshp(&self.attn_q_norm),
-                        nshp(&self.attn_k_norm),
-                        shp(&self.attn_gate),
-                    );
-                }
                 // Attention path with separated wq, wk, wv.
                 // GPU-first: projections stay on-device; RoPE runs through the device kernel; K/V are appended into the.
                 let dev = pick_device_for_storage_device(&device);
@@ -972,33 +895,6 @@ impl Qwen35Block {
                         t,
                         &Shape::new(vec![1, seq_len * heads, self.head_dim]),
                     )?;
-                    if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok()
-                        && heads == self.num_kv_heads
-                    {
-                        let pre_rope = t.to_vec_f32()?;
-                        let t3_flat = t3.to_vec_f32()?;
-                        eprintln!(
-                            "[rope_isolate pre] seq_len={} heads={} hd={} t_len={} t3_len={}",
-                            seq_len,
-                            heads,
-                            self.head_dim,
-                            pre_rope.len(),
-                            t3_flat.len()
-                        );
-                        for r in 0..seq_len.min(5) {
-                            let off = r * heads * self.head_dim;
-                            eprintln!(
-                                "[rope_isolate t_row {}] {:?} ...",
-                                r,
-                                &pre_rope[off..off + 4.min(pre_rope.len() - off)]
-                            );
-                            eprintln!(
-                                "[rope_isolate t3_row {}] {:?} ...",
-                                r,
-                                &t3_flat[off..off + 4.min(t3_flat.len() - off)]
-                            );
-                        }
-                    }
                     let (rope_s, _) =
                         dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape())?;
                     let roped = Tensor::new(
@@ -1012,25 +908,6 @@ impl Qwen35Block {
                         &roped,
                         &Shape::new(vec![seq_len, heads * self.head_dim]),
                     )?;
-                    if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok()
-                        && heads == self.num_kv_heads
-                    {
-                        let roped_raw = roped.to_vec_f32()?;
-                        let res_raw = reshaped.to_vec_f32()?;
-                        for r in 0..seq_len.min(5) {
-                            let off = r * heads * self.head_dim;
-                            eprintln!(
-                                "[rope_isolate roped_row {}] {:?} ...",
-                                r,
-                                &roped_raw[off..off + 4.min(roped_raw.len() - off)]
-                            );
-                            eprintln!(
-                                "[rope_isolate res_row {}] {:?} ...",
-                                r,
-                                &res_raw[off..off + 4.min(res_raw.len() - off)]
-                            );
-                        }
-                    }
                     Ok(reshaped)
                 };
 
@@ -1039,7 +916,7 @@ impl Qwen35Block {
                 // arena-attention path follow unchanged.
                 let (q_dev, k_dev_t, v_dev_t, q_gate): (Tensor, Tensor, Tensor, Option<Tensor>) =
                     match self.wqkv_q80_fused.as_ref() {
-                        Some(fused) if false => {
+                        Some(fused) => {
                             let (q, k, v) =
                                 crate::shared_attention::fused_qkv_project_raw(&x_normed_t, fused)?;
                             // The fused-QKV path has no separate attn_q tensor, so it
@@ -1155,26 +1032,6 @@ impl Qwen35Block {
                         let cur = k_dev_t.to_vec_f32()?;
                         let normed =
                             apply_head_rms_norm(&cur, self.num_kv_heads, self.head_dim, &w, n.eps);
-                        if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
-                            let stride = self.num_kv_heads * self.head_dim;
-                            eprintln!(
-                                "[rope_isolate k_norm] seq_len={} stride={}",
-                                seq_len, stride
-                            );
-                            for r in 0..seq_len.min(5) {
-                                let off = r * stride;
-                                eprintln!(
-                                    "[rope_isolate k_raw_row {}] {:?} ...",
-                                    r,
-                                    &cur[off..off + 4.min(cur.len() - off)]
-                                );
-                                eprintln!(
-                                    "[rope_isolate k_normed_row {}] {:?} ...",
-                                    r,
-                                    &normed[off..off + 4.min(normed.len() - off)]
-                                );
-                            }
-                        }
                         let sh = Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]);
                         Tensor::new(
                             dev.from_cpu(&normed, &sh, DType::F32)?.into(),
@@ -1186,7 +1043,6 @@ impl Qwen35Block {
                     }
                     None => k_dev_t,
                 };
-
                 let q_rope = rope_ext(&q_dev, self.num_heads)?;
                 let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
 
@@ -1296,22 +1152,6 @@ impl Qwen35Block {
                                     );
                                 }
                             }
-                        }
-                    }
-                    if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
-                        let arena_k = k_dev.to_cpu_vec_f32()?;
-                        let stride = self.head_dim;
-                        eprintln!(
-                            "[rope_isolate arena_dump] current_pos={} k_cap_rows={}",
-                            cache.current_pos, k_cap_rows
-                        );
-                        for r in 0..(cache.current_pos + k_new_rows).min(5) {
-                            let off = r * stride;
-                            eprintln!(
-                                "[rope_isolate arena_row {}] {:?} ...",
-                                r,
-                                &arena_k[off..off + 4.min(arena_k.len().saturating_sub(off))]
-                            );
                         }
                     }
                 } else {
@@ -1573,33 +1413,6 @@ impl Qwen35Block {
         let kda_probe_layer0 = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
             && self.layer_idx == 0
             && seq_len == 1;
-        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && seq_len == 1
-            && self.layer_idx <= 2
-        {
-            static X_FP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = X_FP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n <= 3 {
-                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(x.storage().as_ref()) {
-                    if let Device::Rocm(ord) = x.device() {
-                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
-                    }
-                    if let Ok(b) = r.copy_to_host() {
-                        let vals: Vec<f32> = b
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        let s: f32 = vals.iter().take(8).sum();
-                        eprintln!(
-                            "[x-fp] layer {} pre-branch x[0:4]={:?} sum8={s:+.6} shape={:?}",
-                            self.layer_idx,
-                            &vals[..4],
-                            x.shape().dims()
-                        );
-                    }
-                }
-            }
-        }
         if kda_probe_layer0 {
             static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1813,7 +1626,7 @@ impl Qwen35Block {
 
         // 4. SwiGLU FFN
         let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
-            Some(fused) if false => self.fused_gate_up_q4k_decode(&h_normed_t, fused)?,
+            Some(fused) => self.fused_gate_up_q4k_decode(&h_normed_t, fused)?,
             _ => (
                 self.ffn_gate.forward(&h_normed_t)?,
                 self.ffn_up.forward(&h_normed_t)?,

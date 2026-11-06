@@ -440,32 +440,52 @@ impl QuantOps for RocmDevice {
             DTypeStorage::Block(BlockDtype::Pq2_0) => {
                 // Task 10.5: Prism PQ2_0 (tag 142, Ternary-2) x Q8_0 GEMV —
                 // geometry clone of the Q2_0 arm at 128-weight blocks. Same
-                // wave32 requirement, same q8_0 activation quantize, K must
-                // be 128-aligned.
-                if wave32 && k % 128 == 0 && !Self::is_fp16_activation(a_storage) {
-                    let q80_bytes = (k / 32) * 34 * m;
-                    let mut buf_guard = self.act_q80_buf.write().unwrap_or_else(|e| e.into_inner());
-                    let need_alloc = match buf_guard.as_ref() {
-                        Some(s) => s.bytes < q80_bytes,
-                        None => true,
-                    };
-                    if need_alloc {
-                        *buf_guard = Some(RocmStorage::alloc_gpu(
-                            &Shape::new(vec![q80_bytes]),
-                            DType {
-                                arith: ArithType::U8,
-                                storage: DTypeStorage::Native,
-                            },
-                            &self.allocator,
-                            self.ordinal,
-                        )?);
-                    }
-                    let act_q80 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
-                    let _ = self.launch_quant_q8_0(a_storage, act_q80, m * k)?;
-                    self.launch_dot4_pq2_0_q80_gemv(act_q80, b_storage, &out_storage, m, n, k)?;
-                } else {
+                // wave32 requirement, K must be 128-aligned.
+                if !wave32 || k % 128 != 0 {
                     return self.matmul(a, b_packed, out_shape);
                 }
+                // Parity mode (GRIM_PQ2_F32ACT=1): skip the q8_0 activation
+                // quantize and run the f32-act GEMV twin. The act quantize is
+                // the last per-GEMV numeric error on this path (~1e-3 rel);
+                // it compounds across layers x steps until near-tie logits
+                // reorder (Gate D t18 flip). Slower by design: 4x activation
+                // bytes through the dot4 kernel.
+                let pq2_f32act = matches!(
+                    std::env::var("GRIM_PQ2_F32ACT").as_deref(),
+                    Ok("1" | "true" | "on")
+                );
+                if pq2_f32act {
+                    if a_storage.dtype().arith != ArithType::F32 {
+                        return Err(Error::Backend(
+                            "quantized_matmul: GRIM_PQ2_F32ACT requires f32 activation".into(),
+                        ));
+                    }
+                    self.launch_dot4_pq2_0_f32act_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    return Ok((Box::new(out_storage), Box::new(ReadyHandle)));
+                }
+                if Self::is_fp16_activation(a_storage) {
+                    return self.matmul(a, b_packed, out_shape);
+                }
+                let q80_bytes = (k / 32) * 34 * m;
+                let mut buf_guard = self.act_q80_buf.write().unwrap_or_else(|e| e.into_inner());
+                let need_alloc = match buf_guard.as_ref() {
+                    Some(s) => s.bytes < q80_bytes,
+                    None => true,
+                };
+                if need_alloc {
+                    *buf_guard = Some(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![q80_bytes]),
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?);
+                }
+                let act_q80 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
+                let _ = self.launch_quant_q8_0(a_storage, act_q80, m * k)?;
+                self.launch_dot4_pq2_0_q80_gemv(act_q80, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::KQuant(KQuantScheme::Q6K) => {
                 let is_rdna34 = self.is_rdna34;

@@ -206,17 +206,44 @@ extern "C" __global__ void grim_dot4_pq2_0_q80_gemv(
         }
     }
 
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            facc[j] += __shfl_xor(facc[j], off);
-    }
-
+    // Bit-match llama.cpp's PQ2_0 dequant matmul accumulation
+    // (`ggml_gemv_pq2_0_4x8_q8_0_generic`): the reference keeps a SINGLE
+    // f32 accumulator and adds `(sumi * d1) * d0` per activation block in
+    // strictly sequential block order, iterating ALL K blocks on lane 0.
+    // grim's previous warp-shuffle reduction reassociated that sum in
+    // per-lane strided order, drifting ~1e-3 rel per GEMV — enough to flip
+    // near-tie logits after dozens of layers x decode steps.
     if (lane == 0) {
+        const unsigned char* a_row1 =
+            A_q80 + (long long)row * n_y_blocks * GRIM_Q8_0_BYTES;
         #pragma unroll
         for (int j = 0; j < active_cols; j++) {
-            C[(long long)row * N + col_base + j] = facc[j];
+            const unsigned char* b_ptr = b_col[j];
+            float sumf = 0.0f;
+            for (int l = 0; l < n_x_blocks; l++) {
+                const unsigned char* b_blk = b_ptr + l * GRIM_PQ2_0_BYTES;
+                float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const unsigned char* qs = b_blk + 2;
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const unsigned char* a_blk =
+                        a_row1 + (long long)(l * 4 + k) * GRIM_Q8_0_BYTES;
+                    float d1 = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                    const signed char* qy = (const signed char*)(a_blk + 2);
+                    const unsigned char* qs_h = qs + k * 8;
+                    int sumi_block = 0;
+                    #pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        const unsigned char byte = qs_h[b];
+                        sumi_block += ((int)((byte >> 0) & 3) - 1) * (int)qy[b*4 + 0];
+                        sumi_block += ((int)((byte >> 2) & 3) - 1) * (int)qy[b*4 + 1];
+                        sumi_block += ((int)((byte >> 4) & 3) - 1) * (int)qy[b*4 + 2];
+                        sumi_block += ((int)((byte >> 6) & 3) - 1) * (int)qy[b*4 + 3];
+                    }
+                    sumf += (float)sumi_block * d1 * d0;
+                }
+            }
+            C[(long long)row * N + col_base + j] = sumf;
         }
     }
 }
@@ -227,6 +254,14 @@ extern "C" __global__ void grim_dot4_pq2_0_q80_gemv(
 // compounds across 64 layers x decode steps until near-tie logits reorder
 // (Gate D t18 flip). Env-gated (GRIM_PQ2_F32ACT=1): parity mode, slower than
 // the quantized path (4x activation bytes) by design.
+//
+// Accumulation order matches ggml_gemv_pq2_0_4x8_q8_0_generic verbatim:
+// lane 0 iterates ALL K blocks sequentially, computing d0 * Σ(code * a) per
+// 128-element block and adding to a single f32 accumulator. The previous
+// warp-shuffle reduction (__shfl_xor) reassociated the sum across lanes,
+// drifting ~1e-3 rel per GEMV — enough to flip near-tie logits after dozens of
+// layers x decode steps. Sequential accumulation on lane 0 eliminates that
+// reassociation error.
 extern "C" __global__ void grim_dot4_pq2_0_f32act_gemv(
     const float* __restrict__ A_f32,
     const unsigned char* __restrict__ B_pq2_0,
@@ -252,47 +287,40 @@ extern "C" __global__ void grim_dot4_pq2_0_f32act_gemv(
                  : nullptr;
     }
 
-    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    for (int blk = lane; blk < n_x_blocks; blk += 32) {
-        const float* a_blk = a_row + (long long)blk * GRIM_PQ2_0_BLOCK_SIZE;
-
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j >= active_cols) break;
-            const unsigned char* b_blk = b_col[j] + blk * GRIM_PQ2_0_BYTES;
-            float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
-            const unsigned char* qs = b_blk + 2;   // 32 bytes = 128 two-bit codes
-
-            float sumi = 0.0f;
-            #pragma unroll
-            for (int half = 0; half < 4; half++) {
-                const unsigned char* qs_h = qs + half * 8;
-                const float* a_h = a_blk + half * 32;
-                #pragma unroll
-                for (int b = 0; b < 8; ++b) {
-                    const unsigned char byte = qs_h[b];
-                    sumi += ((int)((byte >> 0) & 3) - 1) * a_h[b*4 + 0];
-                    sumi += ((int)((byte >> 2) & 3) - 1) * a_h[b*4 + 1];
-                    sumi += ((int)((byte >> 4) & 3) - 1) * a_h[b*4 + 2];
-                    sumi += ((int)((byte >> 6) & 3) - 1) * a_h[b*4 + 3];
-                }
-            }
-            facc[j] += d0 * sumi;
-        }
-    }
-
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            facc[j] += __shfl_xor(facc[j], off);
-    }
-
+    // Bit-match the reference's sequential accumulation: one f32 accumulator
+    // per output column, updated in strict block order on lane 0. Each weight
+    // block l contributes d0 * sumi_block for each of its 4 activation blocks,
+    // added separately — matching ggml_gemv_pq2_0_4x8_q8_0_generic verbatim.
     if (lane == 0) {
         #pragma unroll
         for (int j = 0; j < active_cols; j++) {
-            C[(long long)row * N + col_base + j] = facc[j];
+            const unsigned char* b_ptr = b_col[j];
+            float sumf = 0.0f;
+            for (int l = 0; l < n_x_blocks; l++) {
+                const unsigned char* b_blk = b_ptr + l * GRIM_PQ2_0_BYTES;
+                float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const unsigned char* qs = b_blk + 2;   // 32 bytes = 128 two-bit codes
+                const float* a_blk = a_row + (long long)l * GRIM_PQ2_0_BLOCK_SIZE;
+
+                // Add each of the 4 activation blocks separately (d0 * sumi_block),
+                // matching the reference's per-block accumulation order.
+                #pragma unroll
+                for (int half = 0; half < 4; half++) {
+                    const unsigned char* qs_h = qs + half * 8;
+                    const float* a_h = a_blk + half * 32;
+                    float sumi_block = 0.0f;
+                    #pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        const unsigned char byte = qs_h[b];
+                        sumi_block += ((int)((byte >> 0) & 3) - 1) * a_h[b*4 + 0];
+                        sumi_block += ((int)((byte >> 2) & 3) - 1) * a_h[b*4 + 1];
+                        sumi_block += ((int)((byte >> 4) & 3) - 1) * a_h[b*4 + 2];
+                        sumi_block += ((int)((byte >> 6) & 3) - 1) * a_h[b*4 + 3];
+                    }
+                    sumf += d0 * sumi_block;
+                }
+            }
+            C[(long long)row * N + col_base + j] = sumf;
         }
     }
 }

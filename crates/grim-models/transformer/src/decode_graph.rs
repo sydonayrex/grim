@@ -14775,8 +14775,20 @@ pub fn hadamard_transform_tensor(x: &grim_tensor::Tensor, layer: usize, what: &s
     let batch = x.shape().elem_count() / in_dim;
     let n_blk = (in_dim / plan.block_size as usize) as u32;
 
+    // `GRIM_HADAMARD_CPU=1` forces the FWHT to run on the host via
+    // `fwht_signed_f32` — the same butterfly the reference llama-prism runs on
+    // CPU (`ggml_compute_forward_fwht`). This makes the transform bit-identical
+    // to the reference, eliminating the GPU-vs-CPU rounding drift that
+    // compounds across 64 layers x decode steps and flips near-tie logits
+    // (Gate D t18 flip). Slower than the GPU kernel (D2H/H2D per transform) but
+    // used only for parity verification.
+    let use_cpu_fwht = std::env::var_os("GRIM_HADAMARD_CPU").is_some();
+
     match x.device() {
         grim_tensor::Device::Rocm(ord) => {
+            if use_cpu_fwht {
+                return hadamard_transform_tensor_cpu(x, &plan, canonical, batch, in_dim, n_blk);
+            }
             let dev = grim_backend_rocm::RocmDevice::shared(*ord);
             let out_shape = grim_tensor::Shape::new(vec![batch, in_dim]);
             let out_storage = dev.zeros(&out_shape, grim_tensor::DType::F32)
@@ -14868,6 +14880,79 @@ pub fn hadamard_transform_tensor(x: &grim_tensor::Tensor, layer: usize, what: &s
         }
         _ => Ok(x.clone()),
     }
+}
+
+/// CPU-based FWHT for a ROCm-resident activation tensor. Copies the tensor to
+/// the host, runs `fwht_signed_f32` (the same butterfly the reference
+/// llama-prism runs on CPU via `ggml_compute_forward_fwht`), and copies the
+/// result back to the device. Used with `GRIM_HADAMARD_CPU=1` to eliminate
+/// GPU-vs-CPU rounding drift in the Hadamard transform.
+fn hadamard_transform_tensor_cpu(
+    x: &grim_tensor::Tensor,
+    plan: &HadamardPlan,
+    canonical: &str,
+    batch: usize,
+    in_dim: usize,
+    n_blk: u32,
+) -> Result<grim_tensor::Tensor> {
+    let signs = plan.signs.get(&in_dim).ok_or_else(|| {
+        grim_core::error::Error::Backend(format!("prism.hadamard has no sign vector for width {in_dim}"))
+    })?;
+
+    let dev = match x.device() {
+        grim_tensor::Device::Rocm(ord) => grim_backend_rocm::RocmDevice::shared(*ord),
+        _ => return Ok(x.clone()),
+    };
+
+    // Copy GPU tensor to host
+    let src = grim_backend_rocm::device::util::as_rocm(x.storage().as_ref())
+        .map_err(|e| grim_core::error::Error::Backend(format!("hadamard cpu src: {e}")))?;
+    dev.synchronize();
+    let bytes = src.copy_to_host().map_err(|e| grim_core::error::Error::Backend(format!("hadamard cpu d2h: {e}")))?;
+    let mut xv: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    // Apply GDN perm for ssm_out (same as the CPU path above)
+    if canonical == "ssm_out" {
+        if let Some((hd, nk, rep)) = plan.ssm_perm {
+            for b in 0..batch {
+                let base = b * in_dim;
+                let mut tmp = vec![0.0f32; in_dim];
+                for off in 0..in_dim {
+                    let i0 = off % hd;
+                    let i1 = (off / hd) % nk;
+                    let i2 = off / (hd * nk);
+                    let new_off = i0 + i2 * hd + i1 * hd * rep;
+                    tmp[new_off] = xv[base + off];
+                }
+                xv[base..base + in_dim].copy_from_slice(&tmp);
+            }
+        }
+    }
+
+    // Apply signs + FWHT per 1024-bit block — same as the reference CPU path.
+    for b in 0..batch {
+        let base = b * in_dim;
+        for blk in 0..n_blk as usize {
+            let off = base + blk * 1024;
+            let mut slice = xv[off..off + 1024].to_vec();
+            let si: Vec<i32> = signs[blk * 1024..(blk + 1) * 1024].to_vec();
+            grim_quant::hadamard::fwht_signed_f32(&mut slice, &si);
+            xv[off..off + 1024].copy_from_slice(&slice);
+        }
+    }
+
+    // Copy result back to GPU
+    dev.synchronize();
+    let out_storage = dev.from_cpu(&xv, &grim_tensor::Shape::new(vec![batch, in_dim]), grim_tensor::DType::F32)
+        .map_err(|e| grim_core::error::Error::Backend(e.to_string()))?;
+    let out = grim_tensor::Tensor::new(
+        std::sync::Arc::from(out_storage),
+        grim_tensor::Shape::new(vec![batch, in_dim]),
+        grim_tensor::DType::F32,
+        grim_tensor::dtype::QuantProvenance::default(),
+        x.device().clone(),
+    );
+    Ok(out)
 }
 
 /// Inverse Hadamard transform for token embeddings (FWHT then signs).
