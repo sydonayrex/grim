@@ -1188,32 +1188,29 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
     float* o_row = out + (size_t)warp_id * row_len;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
+    // Lane 0 accumulates the sum of squares sequentially (matching CPU reference
+    // order), then broadcasts to the warp. Uses separate multiply-add (not FMA)
+    // to match the CPU reference exactly: `ss = ss + v*v` with two roundings,
+    // not `ss = fma(v, v, ss)` with one.
     float ss = 0.0f;
-    for (int col = lane; col < row_len; col += 128) {
-        const int c1 = col + 32;
-        const int c2 = col + 64;
-        const int c3 = col + 96;
-        const float v0 = x_row[col];
-        const float v1 = (c1 < row_len) ? x_row[c1] : 0.0f;
-        const float v2 = (c2 < row_len) ? x_row[c2] : 0.0f;
-        const float v3 = (c3 < row_len) ? x_row[c3] : 0.0f;
-        ss = __builtin_fmaf(v0, v0, ss);
-        ss = __builtin_fmaf(v1, v1, ss);
-        ss = __builtin_fmaf(v2, v2, ss);
-        ss = __builtin_fmaf(v3, v3, ss);
+    if (lane == 0) {
+        for (int col = 0; col < row_len; col++) {
+            const float v = x_row[col];
+            ss += v * v;
+        }
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        ss += __shfl_xor_sync(shfl_mask, ss, off);
-    float rms = sqrtf(ss / (float)row_len + eps);
+    ss = __shfl_sync(shfl_mask, ss, 0);
+    // Match CPU reference: `inv = 1.0 / sqrt(ss/dim + eps)` then `x * inv * w`
+    // (not `rms = sqrt(...)` then `x * w / rms` — these differ by 1 ulp in f32).
+    float inv_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
     for (int col = lane; col < row_len; col += 128) {
         const int c1 = col + 32;
         const int c2 = col + 64;
         const int c3 = col + 96;
-        o_row[col] = x_row[col] * w[col] / rms;
-        if (c1 < row_len) o_row[c1] = x_row[c1] * w[c1] / rms;
-        if (c2 < row_len) o_row[c2] = x_row[c2] * w[c2] / rms;
-        if (c3 < row_len) o_row[c3] = x_row[c3] * w[c3] / rms;
+        o_row[col] = x_row[col] * inv_rms * w[col];
+        if (c1 < row_len) o_row[c1] = x_row[c1] * inv_rms * w[c1];
+        if (c2 < row_len) o_row[c2] = x_row[c2] * inv_rms * w[c2];
+        if (c3 < row_len) o_row[c3] = x_row[c3] * inv_rms * w[c3];
     }
 }
 
@@ -1230,36 +1227,30 @@ grim_rms_norm_decode(const float* x, const float* __restrict__ w, float* out,
     const int lane = tid & 31;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
-    // Warp 0 reduces in the EXACT same 4-wide stride-128 order as grim_rms_norm
-    // so that rms is bit-identical to the single-warp kernel, while all 256 threads
-    // (8 warps) cooperate on the pass-2 normalization write.
+    // Warp 0 reduces in the EXACT same sequential order as CPU reference
+    // (lane 0 walks the whole row), so rms is bit-identical to host RMS norm,
+    // while all 256 threads (8 warps) cooperate on the pass-2 normalization write.
     if (warp_id == 0) {
         float ss = 0.0f;
-        for (int col = lane; col < row_len; col += 128) {
-            const int c1 = col + 32;
-            const int c2 = col + 64;
-            const int c3 = col + 96;
-            const float v0 = x[col];
-            const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
-            const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
-            const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
-            ss = __builtin_fmaf(v0, v0, ss);
-            ss = __builtin_fmaf(v1, v1, ss);
-            ss = __builtin_fmaf(v2, v2, ss);
-            ss = __builtin_fmaf(v3, v3, ss);
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            ss += __shfl_xor_sync(shfl_mask, ss, off);
         if (lane == 0) {
-            s_lane_sums[0] = sqrtf(ss / (float)row_len + eps);
+            // Sequential accumulation on lane 0, matching CPU reference order.
+            // Uses separate multiply-add (not FMA) to match host exactly.
+            for (int col = 0; col < row_len; col++) {
+                const float v = x[col];
+                ss += v * v;
+            }
+        }
+        ss = __shfl_sync(shfl_mask, ss, 0);
+        if (lane == 0) {
+            // Match CPU reference: `inv = 1.0 / sqrt(ss/dim + eps)` then `x * inv * w`.
+            s_lane_sums[0] = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float rms = s_lane_sums[0];
+    const float inv_rms = s_lane_sums[0];
     for (int col = tid; col < row_len; col += 256) {
-        out[col] = x[col] * w[col] / rms;
+        out[col] = x[col] * inv_rms * w[col];
     }
 }
 
@@ -1691,23 +1682,25 @@ grim_softmax(const float* __restrict__ x, float* __restrict__ out, int row_len, 
     float* o_row = out + (size_t)warp_id * row_len;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
+    // Lane 0 finds the row max sequentially (matching CPU reference order),
+    // then broadcasts to the warp. Replaces __shfl_xor_sync tree max which
+    // reassociates f32 comparisons across lanes.
     float maxv = -1e30f;
-    for (int col = lane; col < row_len; col += 32) {
-        float v = x_row[col];
-        if (v > maxv) maxv = v;
+    if (lane == 0) {
+        for (int col = 0; col < row_len; col++) {
+            const float v = x_row[col];
+            if (v > maxv) maxv = v;
+        }
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        float o = __shfl_xor_sync(shfl_mask, maxv, off);
-        if (o > maxv) maxv = o;
-    }
+    maxv = __shfl_sync(shfl_mask, maxv, 0);
     float sum = 0.0f;
-    for (int col = lane; col < row_len; col += 32) {
-        sum += expf(x_row[col] - maxv);
+    if (lane == 0) {
+        // Sequential sum of exp(x - maxv) on lane 0, matching CPU reference order.
+        for (int col = 0; col < row_len; col++) {
+            sum += expf(x_row[col] - maxv);
+        }
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        sum += __shfl_xor_sync(shfl_mask, sum, off);
+    sum = __shfl_sync(shfl_mask, sum, 0);
     float inv = 1.0f / sum;
     for (int col = lane; col < row_len; col += 32) {
         o_row[col] = expf(x_row[col] - maxv) * inv;

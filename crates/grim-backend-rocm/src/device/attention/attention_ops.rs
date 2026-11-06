@@ -799,6 +799,16 @@ impl AttentionOps for RocmDevice {
             }
         }
 
+        // Force single-wave (blockDim=32) for decode attention to eliminate
+        // cross-wave online-softmax merge reassociation, matching CPU reference
+        // accumulation order bit-for-bit. Env-gated for testing; default keeps
+        // the autotuned block dim for performance.
+        if seq_len == 1
+            && std::env::var("GRIM_ATTN_DECODE_SINGLE_WAVE").as_deref() == Ok("1")
+        {
+            launch_block_dim.x = 32;
+        }
+
         let stream = self.launch_compute_kernel(
             scalar_kernel,
             launch.grid_dim,

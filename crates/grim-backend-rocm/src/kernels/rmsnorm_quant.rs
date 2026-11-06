@@ -25,11 +25,16 @@ extern "C" __global__ void grim_rmsnorm_quant_i8(
     float* __restrict__ norm_cache)   // optional normalized fp32 row (nullable)
 {
     const int tid = threadIdx.x;   // 0..31
+    // Sequential sum of squares on lane 0 (matching CPU reference order),
+    // then broadcast to the warp. Replaces __shfl_xor tree reduction which
+    // reassociates f32 adds across lanes and drifts from host reference.
     float ss = 0.0f;
-    for (int k = tid; k < K; k += 32)
-        ss += x[k] * x[k];
-    for (int off = 16; off > 0; off >>= 1)
-        ss += __shfl_xor(ss, off);
+    if (tid == 0) {
+        for (int k = 0; k < K; k++) {
+            ss += x[k] * x[k];
+        }
+    }
+    ss = __shfl_sync(0xffffffffffffffffULL, ss, 0);
     const float inv_rms = 1.0f / sqrtf(ss / (float)K + eps);   // exact (not rsqrtf) for bit-exact parity with host reference
 
     const int n_blocks = K / 32;

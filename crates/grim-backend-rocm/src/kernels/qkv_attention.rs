@@ -356,8 +356,9 @@ void grim_qkv_attention(
     const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
     const int kv_stride = num_kv_heads * head_dim;
 
-    // Stage this lane's strided slice of q into registers ONCE.
-    // The previous form re-fetched the whole q head from global memory on every KV token.
+    // Stage this lane's strided slice of q into registers ONCE for the V
+    // accumulation pass (each lane owns its strided output dims). The Q·K dot
+    // product itself is computed sequentially on lane 0 below.
     float q_reg[8];
     #pragma unroll
     for (int chunk = 0; chunk < 8; ++chunk) {
@@ -367,21 +368,20 @@ void grim_qkv_attention(
 
     // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        // Lane-strided partial dot product Q.K, then butterfly reduction.
-        float partial = 0.0f;
-        #pragma unroll
-        for (int chunk = 0; chunk < 8; ++chunk) {
-            int dd = lane_id + chunk * wave_size;
-            if (dd < head_dim) {
-                partial += q_reg[chunk] * k_head[j * kv_stride + dd];
+        // Sequential dot product Q.K on lane 0 (matching CPU reference order:
+        // q[0]*k[0] + q[1]*k[1] + ... + q[head_dim-1]*k[head_dim-1]), then
+        // broadcast score to all lanes. Replaces the __shfl_xor_sync butterfly
+        // reduction which reassociates f32 adds across lanes and diverges from
+        // host reference accumulation order.
+        float score = 0.0f;
+        if (lane_id == 0) {
+            for (int dd = 0; dd < head_dim; ++dd) {
+                score += q[q_offset + dd] * k_head[j * kv_stride + dd];
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        #pragma unroll
-        for (int off = wave_size >> 1; off > 0; off >>= 1) {
-            partial += __shfl_xor_sync(shfl_mask, partial, off);
-        }
-        float score = partial * inv_sqrt_d;
+        score = __shfl_sync(shfl_mask, score, 0);
+        score *= inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
@@ -619,23 +619,20 @@ void grim_qkv_attention_i8kv(
 
     // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        // Lane-strided partial dot product Q.K, then butterfly reduction.
-        float partial = 0.0f;
-        #pragma unroll
-        for (int chunk = 0; chunk < 8; ++chunk) {
-            int dd = lane_id + chunk * wave_size;
-            if (dd < head_dim) {
+        // Sequential dot product Q.K on lane 0 (matching CPU reference order),
+        // then broadcast score to all lanes. Replaces __shfl_xor_sync butterfly
+        // reduction which reassociates f32 adds across lanes.
+        float score = 0.0f;
+        if (lane_id == 0) {
+            for (int dd = 0; dd < head_dim; ++dd) {
                 float k_dq = ((float)((int)k_u8[j * kv_stride + dd] - 128) / 127.0f)
                     * k_scales[(long long)j * num_kv_heads + kv_head];
-                partial += q_reg[chunk] * k_dq;
+                score += q[q_offset + dd] * k_dq;
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        #pragma unroll
-        for (int off = wave_size >> 1; off > 0; off >>= 1) {
-            partial += __shfl_xor_sync(shfl_mask, partial, off);
-        }
-        float score = partial * inv_sqrt_d;
+        score = __shfl_sync(shfl_mask, score, 0);
+        score *= inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
@@ -1098,21 +1095,18 @@ void grim_qkv_attention_f16kv(
 
     // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        // Lane-strided partial dot product Q.K, then butterfly reduction.
-        float partial = 0.0f;
-        #pragma unroll
-        for (int chunk = 0; chunk < 8; ++chunk) {
-            int dd = lane_id + chunk * wave_size;
-            if (dd < head_dim) {
-                partial += q_reg[chunk] * fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
+        // Sequential dot product Q.K on lane 0 (matching CPU reference order),
+        // then broadcast score to all lanes. Replaces __shfl_xor_sync butterfly
+        // reduction which reassociates f32 adds across lanes.
+        float score = 0.0f;
+        if (lane_id == 0) {
+            for (int dd = 0; dd < head_dim; ++dd) {
+                score += q[q_offset + dd] * fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        #pragma unroll
-        for (int off = wave_size >> 1; off > 0; off >>= 1) {
-            partial += __shfl_xor_sync(shfl_mask, partial, off);
-        }
-        float score = partial * inv_sqrt_d;
+        score = __shfl_sync(shfl_mask, score, 0);
+        score *= inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
