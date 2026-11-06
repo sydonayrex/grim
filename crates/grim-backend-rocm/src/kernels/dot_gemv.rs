@@ -216,41 +216,38 @@ extern "C" __global__ void grim_dot4_pq2_0_q80_gemv(
     if (lane == 0) {
         const unsigned char* a_row1 =
             A_q80 + (long long)row * n_y_blocks * GRIM_Q8_0_BYTES;
-            #pragma unroll
-            for (int j = 0; j < active_cols; j++) {
-                const unsigned char* b_ptr = b_col[j];
-                float sumf = 0.0f;
-                for (int l = 0; l < n_x_blocks; l++) {
-                    const unsigned char* b_blk = b_ptr + l * GRIM_PQ2_0_BYTES;
-                    float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
-                    const unsigned char* qs = b_blk + 2;
-                    // Match reference order: per weight block, accumulate
-                    // sumi = d1_0*s_0 + d1_1*s_1 + d1_2*s_2 + d1_3*s_3 first,
-                    // then sumf += d0 * sumi. Do NOT fold d0 into each half-block
-                    // multiply (that changes f32 rounding).
-                    float sumi = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            const unsigned char* b_ptr = b_col[j];
+            float sumf = 0.0f;
+            for (int l = 0; l < n_x_blocks; l++) {
+                const unsigned char* b_blk = b_ptr + l * GRIM_PQ2_0_BYTES;
+                float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const unsigned char* qs = b_blk + 2;
+                // Match reference order: sumf += d0 * d1_k * sumi_k per
+                // activation block (ggml_gemv_pq2_0_4x8_q8_0_generic verbatim).
+                // Do NOT accumulate sumi then multiply by d0 once — that
+                // changes f32 rounding.
+                for (int k = 0; k < 4; k++) {
+                    const unsigned char* a_blk =
+                        a_row1 + (long long)(l * 4 + k) * GRIM_Q8_0_BYTES;
+                    float d1 = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                    const signed char* qy = (const signed char*)(a_blk + 2);
+                    const unsigned char* qs_h = qs + k * 8;
+                    int sumi_block = 0;
                     #pragma unroll
-                    for (int k = 0; k < 4; k++) {
-                        const unsigned char* a_blk =
-                            a_row1 + (long long)(l * 4 + k) * GRIM_Q8_0_BYTES;
-                        float d1 = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
-                        const signed char* qy = (const signed char*)(a_blk + 2);
-                        const unsigned char* qs_h = qs + k * 8;
-                        int sumi_block = 0;
-                        #pragma unroll
-                        for (int b = 0; b < 8; ++b) {
-                            const unsigned char byte = qs_h[b];
-                            sumi_block += ((int)((byte >> 0) & 3) - 1) * (int)qy[b*4 + 0];
-                            sumi_block += ((int)((byte >> 2) & 3) - 1) * (int)qy[b*4 + 1];
-                            sumi_block += ((int)((byte >> 4) & 3) - 1) * (int)qy[b*4 + 2];
-                            sumi_block += ((int)((byte >> 6) & 3) - 1) * (int)qy[b*4 + 3];
-                        }
-                        sumi += d1 * (float)sumi_block;
+                    for (int b = 0; b < 8; ++b) {
+                        const unsigned char byte = qs_h[b];
+                        sumi_block += ((int)((byte >> 0) & 3) - 1) * (int)qy[b*4 + 0];
+                        sumi_block += ((int)((byte >> 2) & 3) - 1) * (int)qy[b*4 + 1];
+                        sumi_block += ((int)((byte >> 4) & 3) - 1) * (int)qy[b*4 + 2];
+                        sumi_block += ((int)((byte >> 6) & 3) - 1) * (int)qy[b*4 + 3];
                     }
-                    sumf += d0 * sumi;
+                    sumf += d0 * d1 * (float)sumi_block;
                 }
-                C[(long long)row * N + col_base + j] = sumf;
             }
+            C[(long long)row * N + col_base + j] = sumf;
+        }
     }
 }
 
@@ -296,9 +293,10 @@ extern "C" __global__ void grim_dot4_pq2_0_f32act_gemv(
     // Bit-match the reference's sequential accumulation: one f32 accumulator
     // per output column, updated in strict block order on lane 0. Each weight
     // block l contributes d0 * sumi where sumi = sum over 4 activation blocks
-    // of d1_k * sumi_k — matching ggml_gemv_pq2_0_4x8_q8_0_generic verbatim.
-    // NOTE: d0 is multiplied ONCE after summing all 4 activation blocks, not
-    // per-block — folding d0 into each block changes f32 rounding.
+    // Match reference order: sumf += d0 * sumi_block per activation block
+    // (ggml_gemv_pq2_0_4x8_q8_0_generic verbatim). d1=1.0 for raw f32
+    // activations. Do NOT accumulate then multiply by d0 once — that changes
+    // f32 rounding.
     if (lane == 0) {
         #pragma unroll
         for (int j = 0; j < active_cols; j++) {
@@ -309,11 +307,6 @@ extern "C" __global__ void grim_dot4_pq2_0_f32act_gemv(
                 float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
                 const unsigned char* qs = b_blk + 2;   // 32 bytes = 128 two-bit codes
                 const float* a_blk = a_row + (long long)l * GRIM_PQ2_0_BLOCK_SIZE;
-
-                // Sum over all 4 activation blocks first (d1=1.0 for raw f32),
-                // then multiply by d0 once — matching the reference order.
-                float sumi = 0.0f;
-                #pragma unroll
                 for (int half = 0; half < 4; half++) {
                     const unsigned char* qs_h = qs + half * 8;
                     const float* a_h = a_blk + half * 32;
@@ -326,9 +319,8 @@ extern "C" __global__ void grim_dot4_pq2_0_f32act_gemv(
                         sumi_block += ((int)((byte >> 4) & 3) - 1) * a_h[b*4 + 2];
                         sumi_block += ((int)((byte >> 6) & 3) - 1) * a_h[b*4 + 3];
                     }
-                    sumi += sumi_block;
+                    sumf += d0 * sumi_block;
                 }
-                sumf += d0 * sumi;
             }
             C[(long long)row * N + col_base + j] = sumf;
         }
