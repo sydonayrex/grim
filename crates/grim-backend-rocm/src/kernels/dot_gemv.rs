@@ -243,7 +243,7 @@ extern "C" __global__ void grim_dot4_pq2_0_q80_gemv(
                         sumi_block += ((int)((byte >> 4) & 3) - 1) * (int)qy[b*4 + 2];
                         sumi_block += ((int)((byte >> 6) & 3) - 1) * (int)qy[b*4 + 3];
                     }
-                    sumf += d0 * d1 * (float)sumi_block;
+                    sumf += d0 * (d1 * (float)sumi_block);
                 }
             }
             C[(long long)row * N + col_base + j] = sumf;
@@ -392,7 +392,7 @@ extern "C" __global__ void grim_dot4_qkv_q80_gemv(
                     int b4; __builtin_memcpy(&b4, b_codes + e, 4);
                     iacc = grim_sdot4(a4, b4, iacc);
                 }
-                facc[j] += (float)iacc * d_a * d_b;
+                facc[j] += d_a * (d_b * (float)iacc);
             }
         }
     }
@@ -491,7 +491,7 @@ extern "C" __global__ void grim_dot4_qkv_q80_f32act_gemv(
                     int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
                     iacc = grim_sdot4(a4_reg[p], b4, iacc);
                 }
-                facc[j] += (float)iacc * d_a * d_b;
+                facc[j] += d_a * (d_b * (float)iacc);
             }
         }
     }
@@ -616,7 +616,7 @@ extern "C" __global__ void grim_dot4_qkv_q80_norm_f32act_gemv(
                     int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
                     iacc = grim_sdot4(a4_reg[p], b4, iacc);
                 }
-                facc[j] += (float)iacc * d_a * d_b;
+                facc[j] += d_a * (d_b * (float)iacc);
             }
         }
     }
@@ -1117,7 +1117,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv_tile16(
                     __builtin_memcpy(&b4, b_codes + p * 4, 4);
                     iacc = grim_sdot4(a4_reg[p], b4, iacc);
                 }
-                facc[j] += (float)iacc * d_a * d_b;
+                facc[j] += d_a * (d_b * (float)iacc);
             }
         }
     }
@@ -1191,7 +1191,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv_tile8(
                     __builtin_memcpy(&b4, b_codes + p * 4, 4);
                     iacc = grim_sdot4(a4_reg[p], b4, iacc);
                 }
-                facc[j] += (float)iacc * d_a * d_b;
+                facc[j] += d_a * (d_b * (float)iacc);
             }
         }
     }
@@ -1278,7 +1278,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv(
                     int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
                     iacc = grim_sdot4(a4_reg[p], b4, iacc);
                 }
-                facc[j] += (float)iacc * d_a * d_b;
+                facc[j] += d_a * (d_b * (float)iacc);
             }
         }
     }
