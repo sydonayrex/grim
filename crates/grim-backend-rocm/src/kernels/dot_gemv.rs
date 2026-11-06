@@ -1311,19 +1311,33 @@ extern "C" __global__ void grim_quantize_q8_1(
 
     float val = (tid < GRIM_Q8_1_BLOCK_SIZE) ? row_src[tid] : 0.0f;
 
+    // Sequential max on lane 0 (matching CPU reference order), then broadcast.
+    // Replaces __shfl_xor tree reduction which reassociates f32 comparisons
+    // across lanes.
     float amax = __builtin_fabsf(val);
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        amax = fmaxf(amax, __shfl_xor(amax, mask));
+    if (tid == 0) {
+        for (int i = 1; i < GRIM_Q8_1_BLOCK_SIZE; i++) {
+            const float v = __builtin_fabsf(row_src[i]);
+            if (v > amax) amax = v;
+        }
+    }
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+    amax = __shfl_sync(shfl_mask, amax, 0);
 
     const float d     = amax / 127.0f;
     const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
     signed char qi = (signed char)__builtin_roundf(val * inv_d);
 
+    // Sequential sum on lane 0, then broadcast. Replaces __shfl_xor tree
+    // reduction which reassociates f32 adds across lanes.
     float fsum = (tid < GRIM_Q8_1_BLOCK_SIZE) ? (float)qi : 0.0f;
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        fsum += __shfl_xor(fsum, mask);
+    if (tid == 0) {
+        for (int i = 0; i < GRIM_Q8_1_BLOCK_SIZE; i++) {
+            const int qi_val = (signed char)__builtin_roundf(row_src[i] * inv_d);
+            fsum += (float)qi_val;
+        }
+    }
+    fsum = __shfl_sync(shfl_mask, fsum, 0);
 
     if (tid == 0) {
         _Float16 hd = (_Float16)d;
@@ -1552,19 +1566,58 @@ __device__ __forceinline__ void grim_dot4_q80_f32act_gemv_body(
                 __builtin_memcpy(&b4, b_codes + p * 4, 4);
                 iacc = grim_sdot4(a4_reg[p], b4, iacc);
             }
-            facc[j] += (float)iacc * d_a * d_b;
+            facc[j] += d_a * (d_b * (float)iacc);
         }
     }
 
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            facc[j] += __shfl_xor(facc[j], off);
-    }
-
+    // Lane 0 accumulates all Q8_0 blocks sequentially (matching CPU reference
+    // order), then writes output. Replaces the per-lane strided loop +
+    // __shfl_xor reduction which reassociates f32 adds across lanes.
     if (lane == 0) {
-        #pragma unroll
+        for (int blk = 0; blk < n_q_blocks; blk++) {
+            const float* blk_src = act_f32 + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+
+            float amax = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+                amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+            }
+
+            const float d     = amax / 127.0f;
+            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            _Float16 hd = (_Float16)d;
+            float d_a = (float)hd;
+
+            int a4_reg[8];
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+                signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+                signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+                signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+                a4_reg[p] = (int)((unsigned char)q0) |
+                            ((int)((unsigned char)q1) << 8) |
+                            ((int)((unsigned char)q2) << 16) |
+                            ((int)((unsigned char)q3) << 24);
+            }
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j >= active_cols) break;
+                const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+                float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const signed char* b_codes = (const signed char*)(b_blk + 2);
+                int iacc = 0;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                    iacc = grim_sdot4(a4_reg[p], b4, iacc);
+                }
+                facc[j] += d_a * (d_b * (float)iacc);
+            }
+        }
+    }
+    if (lane == 0) {
         for (int j = 0; j < active_cols; j++) {
             C[(long long)row * N + col_base + j] = facc[j];
         }
@@ -1661,7 +1714,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q80_f32act_gemv_v2(
             for (int p = 0; p < 8; p++) {
                 iacc = grim_sdot4(a4_reg[p], b_v[j][p], iacc);
             }
-            facc[j] += (float)iacc * d_a * d_b;
+            facc[j] += d_a * (d_b * (float)iacc);
         }
     }
 
@@ -1768,7 +1821,7 @@ extern "C" __global__ void grim_dot4_q80_norm_f32act_gemv(
                 int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
                 iacc = grim_sdot4(a4_reg[p], b4, iacc);
             }
-            facc[j] += (float)iacc * d_a * d_b;
+            facc[j] += d_a * (d_b * (float)iacc);
         }
     }
 
@@ -1847,7 +1900,7 @@ __device__ __forceinline__ void grim_dot4_q80_q81_gemv_body(
                 __builtin_memcpy(&b4, b_codes + e, 4);
                 iacc = grim_sdot4(a4, b4, iacc);
             }
-            facc[j] += (float)iacc * d_a * d_b;
+            facc[j] += d_a * (d_b * (float)iacc);
         }
     }
 
@@ -1934,7 +1987,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q80_q81_gemv_v2(
             for (int p = 0; p < 8; p++) {
                 iacc = grim_sdot4(a4_reg[p], b_v[j][p], iacc);
             }
-            facc[j] += (float)iacc * d_a * d_b;
+            facc[j] += d_a * (d_b * (float)iacc);
         }
     }
 
@@ -2000,7 +2053,7 @@ extern "C" __global__ void grim_dot4_q80_q81_add_gemv(
                 __builtin_memcpy(&b4, b_codes + e, 4);
                 iacc = grim_sdot4(a4, b4, iacc);
             }
-            facc[j] += (float)iacc * d_a * d_b;
+            facc[j] += d_a * (d_b * (float)iacc);
         }
     }
     #pragma unroll
