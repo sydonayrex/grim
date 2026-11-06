@@ -373,12 +373,16 @@ void grim_qkv_attention(
         // then broadcast score to all lanes. Replaces the __shfl_xor_sync butterfly
         // reduction which reassociates f32 adds across lanes and diverges from
         // host reference accumulation order.
+        //
+        // Critical: compute each product in f32 first (x[i]*y[i]), then convert to
+        // double for accumulation — matching ggml_vec_dot_f32's scalar path where
+        // each product is f32-rounded before double-precision accumulation.
         // __shfl_sync only carries 32 bits, so we split the double into high/low
         // halves, shuffle each, and reconstruct on all lanes.
         double score_d = 0.0;
         if (lane_id == 0) {
             for (int dd = 0; dd < head_dim; ++dd) {
-                score_d += (double)q[q_offset + dd] * (double)k_head[j * kv_stride + dd];
+                score_d += (double)(q[q_offset + dd] * k_head[j * kv_stride + dd]);
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;
@@ -390,8 +394,8 @@ void grim_qkv_attention(
         }
         score_hi = __shfl_sync(shfl_mask, score_hi, 0);
         score_lo = __shfl_sync(shfl_mask, score_lo, 0);
-        unsigned int score_bits[2] = { score_lo, score_hi };
-        float score = (float)(*(double*)score_bits);
+        unsigned int score_bits_arr[2] = { score_lo, score_hi };
+        float score = (float)(*(double*)score_bits_arr);
         score *= inv_sqrt_d;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
@@ -1115,7 +1119,9 @@ void grim_qkv_attention_f16kv(
         double score_d = 0.0;
         if (lane_id == 0) {
             for (int dd = 0; dd < head_dim; ++dd) {
-                score_d += (double)q[q_offset + dd] * (double)fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
+                // Compute product in f32 first (matching ggml_vec_dot_f32 scalar path),
+                // then convert to double for accumulation.
+                score_d += (double)(q[q_offset + dd] * fp16_bits_to_float_device(k_head16[j * kv_stride + dd]));
             }
         }
         const unsigned long long shfl_mask = 0xffffffffffffffffULL;

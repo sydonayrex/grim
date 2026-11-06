@@ -229,6 +229,61 @@ fn tiled_q4k_prefill_throughput() {
     );
 }
 
+/// Backward throughput: tiled vs scalar at representative shapes.
+/// Prints GFLOP/s for both; asserts the tiled path is not a regression
+/// (>= 0.95x scalar) and reports the measured speedup in the log.
+///
+/// This is the plan 8f decision gate for the `GRIM_Q4K_TILED` BACKWARD arm:
+/// `golden_q4k_backward` is CPU-only and never reaches this launcher, so the
+/// A/B runs here instead. First shape is golden's (m=2, k=256, n=256); the
+/// others are a mid-training shape and the prefill shape. A losing arm at
+/// any measured shape = delete the backward branch (off by default today).
+#[test]
+#[ignore]
+fn tiled_q4k_backward_throughput() {
+    if !gpu_enabled() {
+        return;
+    }
+    let fx = fixture();
+    // (m, n, k, iters): golden shape gets more iters (tiny flop count).
+    for (m, n, k, iters) in [
+        (2usize, 256usize, 256usize, 200usize),
+        (32usize, 4096usize, 4096usize, 20usize),
+        (512usize, 4096usize, 4096usize, 10usize),
+    ] {
+        let dy_data: Vec<f32> = (0..m * n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
+        let blob = make_q4k_blob(n, k);
+        let dy = upload_f32(&fx, &dy_data, &[m, n]);
+        let b = upload_q4k_blob(&fx, &blob);
+
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+
+        let bench = |tiled: bool| -> f64 {
+            // Warmup (JIT compile + allocator pool).
+            let _ = run_kernel_backward(&fx, tiled, &dy, &b, m, n, k);
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let _ = run_kernel_backward(&fx, tiled, &dy, &b, m, n, k);
+            }
+            let elapsed = t0.elapsed().as_secs_f64() / iters as f64;
+            flops / elapsed / 1e9
+        };
+
+        let scalar_gflops = bench(false);
+        let tiled_gflops = bench(true);
+        let speedup = tiled_gflops / scalar_gflops;
+        println!(
+            "q4k backward m={m} n={n} k={k}: scalar {scalar_gflops:.1} GFLOP/s, \
+             tiled {tiled_gflops:.1} GFLOP/s, speedup {speedup:.2}x"
+        );
+        assert!(
+            tiled_gflops >= scalar_gflops * 0.95,
+            "tiled backward regressed at m={m} n={n} k={k}: \
+             {tiled_gflops:.1} vs {scalar_gflops:.1} GFLOP/s"
+        );
+    }
+}
+
 /// SPEED-ROC-7: the dtype-aware gradient all-reduce must no-op cleanly on a
 /// single-GPU `RcclAllReduce` for every supported gradient dtype (the
 /// multi-GPU reduction itself requires ≥2 GPUs and is covered by tests/rccl.rs
