@@ -42,15 +42,19 @@ impl RocmDevice {
                         // The ramp is over the DIMENSION INDEX with bounds
                         // from ggml_rope_yarn_corr_dims, and mixes the
                         // interpolated angle with the extrapolated one.
+                        // ggml_rope_yarn_corr_dims uses n_dims (= n_rot,
+                        // the rotary count) for both the multiplier and the
+                        // high clamp — same denominator rule as the freq
+                        // fix above.
                         let corr = |n_rot: f32| {
-                            (d as f32)
+                            (rotary_dim as f32)
                                 * ((y.original_max_pos as f32
                                     / (n_rot * 2.0 * std::f32::consts::PI))
                                     .ln())
                                 / (2.0 * cfg.base.ln())
                         };
                         let low = corr(y.beta_fast).floor().max(0.0);
-                        let high = corr(y.beta_slow).ceil().min((d.saturating_sub(1)) as f32);
+                        let high = corr(y.beta_slow).ceil().min((rotary_dim.saturating_sub(1)) as f32);
                         let t = (i as f32 - low) / (high - low).max(0.001);
                         let ramp = 1.0 - t.clamp(0.0, 1.0);
                         (freq / y.factor) * (1.0 - ramp) + freq * ramp

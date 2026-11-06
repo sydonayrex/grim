@@ -1078,8 +1078,11 @@ impl AttentionOps for CpuDevice {
                     // ggml_rope_yarn_corr_dims, not the HF wavelength form.
                     // The two disagree by ~29% on the rotated components for
                     // Xing4.0 (measured against the reference's own dumps).
+                    // ggml_rope_yarn_corr_dims uses n_dims (= n_rot, the
+                    // rotary count) for both the multiplier and the high
+                    // clamp — matching the freq-denominator fix.
                     let corr = |n_rot: f32| {
-                        (d as f32)
+                        (rotary_dim as f32)
                             * ((yarn.original_max_pos as f32
                                 / (n_rot * 2.0 * std::f32::consts::PI))
                                 .ln())
@@ -1088,7 +1091,7 @@ impl AttentionOps for CpuDevice {
                     let low = corr(yarn.beta_fast).floor().max(0.0);
                     let high = corr(yarn.beta_slow)
                         .ceil()
-                        .min((d.saturating_sub(1)) as f32);
+                        .min((rotary_dim.saturating_sub(1)) as f32);
                     let t = (i as f32 - low) / (high - low).max(0.001);
                     let ramp = 1.0 - t.clamp(0.0, 1.0);
                     (freq / yarn.factor) * (1.0 - ramp) + freq * ramp
