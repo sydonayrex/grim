@@ -42,6 +42,29 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         None => return Ok(()),
     };
     let device = grim_tensor::Device::Rocm(dev.ordinal());
+    // Bisect affordance: GRIM_BISECT_PROBE=1 forces the host KDA path + the
+    // kda-step probes so the layer-0 dumps reflect the SAME token ids the
+    // harness feeds (grim-cli's own probe runs use its template
+    // tokenization, which differs from the reference's — see the pinned ids
+    // below). GRIM_BISECT_KV_F32=1 additionally forces the f32 KV arena.
+    if std::env::var_os("GRIM_PQ2_F32ACT").is_none() {
+        // default: exercise the quantized path (the perf design); the parity
+        // mode is exercised by an explicit GRIM_PQ2_F32ACT=1 run.
+    }
+    if std::env::var_os("GRIM_BISECT_PROBE").is_some() {
+        // SAFETY: single-threaded test start, before any other thread reads these.
+        unsafe {
+            std::env::set_var("GRIM_QWEN_KDA_D2D", "0");
+            std::env::set_var("GRIM_KDA_STEP_PROBE", "1");
+            std::env::set_var("GRIM_DECODE_GRAPH", "0");
+            // KV cache in f32: eliminates f16 round-trip noise in the
+            // attention path as a candidate for the t18 rank flip.
+            if std::env::var_os("GRIM_BISECT_KV_F32").is_some() {
+                std::env::set_var("GRIM_KV_ARENA", "f32");
+                std::env::set_var("GRIM_F16_KV", "0");
+            }
+        }
+    }
     let model = grim_engine::model_loader::load_model_from_gguf(MODEL, device.clone())
         .map_err(|e| format!("load_model_from_gguf failed: {e}"))?;
     let provider = grim_format::GgufProvider::open(MODEL).map_err(|e| format!("GgufProvider::open failed: {e}"))?;

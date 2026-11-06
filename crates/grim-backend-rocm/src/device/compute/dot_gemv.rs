@@ -298,6 +298,57 @@ impl RocmDevice {
     /// the Q2_0 launcher: 128-weight weight blocks (34 B), 4 q8_0 blocks per
     /// weight block. K must be 128-aligned; wave32 only (kernel lives in the
     /// RDNA dot_gemv guard).
+    /// Parity twin of [`launch_dot4_pq2_0_q80_gemv`] reading the activation as
+    /// raw f32 (no q8_0 act quantize). Env-gated by `GRIM_PQ2_F32ACT=1` at the
+    /// decode dispatch; slower (4x activation bytes) but numerically exact to
+    /// the dequant matmul the reference runs.
+    pub fn launch_dot4_pq2_0_f32act_gemv(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_pq2_0_f32act_gemv: K must be 128-aligned (k={k})"
+            )));
+        }
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_pq2_0_f32act_gemv: act has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_pq2_0_f32act_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_pq2_0_f32act_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_pq2_0_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub fn launch_dot4_pq2_0_q80_gemv(
         &self,
         act_q80: &RocmStorage,

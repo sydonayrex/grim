@@ -1605,11 +1605,24 @@ a rank swap between two candidates 0.667 logits apart. Stage-wise errors at
 that point: embedding bit-identical; qkv/conv/z/alpha/beta rel ~1e-3; GDN core
 output rel ~3.4% driven by accumulated state drift.
 
-Remaining divergence source (analysis, not yet fixed): grim's decode path
-quantizes activations to q8_0 for the dot4 PQ2_0 GEMV by design (the perf
-story), while the reference runs f32 activations through its mul_mat. The
-~1e-3 per-projection quantization noise compounds across 64 layers x 18 steps
-until near-tie ranks flip. Closing the last 14 tokens likely requires an
-f32-activation parity decode mode (new env-gated path), not further transform
-correctness work — every transform now matches the reference to 1e-3 or
-better.
+Remaining divergence source (bisected 2026-11-05): NOT act quantization.
+Two parity modes were built and exercised:
+
+- `grim_dot4_pq2_0_f32act_gemv` + `GRIM_PQ2_F32ACT=1`: a twin of the dot4
+  PQ2_0 GEMV that reads the activation as raw f32 (no q8_0 act quantize).
+  Eliminates the ~1e-3/act-GEMV quantization noise entirely.
+- `GRIM_BISECT_KV_F32=1`: forces the f32 KV arena (no f16 round-trip in
+  attention).
+
+Under BOTH modes the t18 divergence is IDENTICAL: grim=1204 vs ref=1092,
+ref token at grim's top-2, 0.667 logits apart, 18/32 tokens. The flip is
+deterministic across three numeric modes, so it is a small systematic
+difference in a component not yet bisected — the prime suspect is the
+full-attention layers (16 of 64: RoPE, attention softmax accumulation, or
+KV-append numerics; layer 0 is KDA and every KDA-stage now matches the
+reference to <=1e-3). Follow-up: repeat the per-projection bisect on
+layer 3 (first full-attention layer) against the reference's
+attn/rope/softmax intermediates.
+
+The f32act kernel is kept as a documented parity mode (env-gated; default
+perf path unchanged).

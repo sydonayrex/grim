@@ -3825,6 +3825,24 @@ impl RocmDevice {
                     .as_any()
                     .downcast_ref::<RocmStorage>()
                     .ok_or_else(|| Error::Backend("linear_decode_into: a not RocmStorage".into()))?;
+                // Parity mode (GRIM_PQ2_F32ACT=1): skip the q8_0 activation
+                // quantize and run the f32-act GEMV twin. The act quantize is
+                // the last per-GEMV numeric error on this path (~1e-3 rel);
+                // it compounds across layers x steps until near-tie logits
+                // reorder (Gate D t18 flip). Slower by design: 4x activation
+                // bytes through the dot4 kernel.
+                if matches!(
+                    std::env::var("GRIM_PQ2_F32ACT").as_deref(),
+                    Ok("1" | "true" | "on")
+                ) {
+                    if a_rocm.dtype().arith != grim_tensor::ArithType::F32 {
+                        return Err(Error::Backend(
+                            "linear_decode_into: GRIM_PQ2_F32ACT requires f32 activation".into(),
+                        ));
+                    }
+                    self.launch_dot4_pq2_0_f32act_gemv(a_rocm, w, out, m, n, k)?;
+                    return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                }
                 let need_q81 = m * (k / 32) * 34;
                 if act_q81.bytes < need_q81 {
                     return Err(Error::Backend(format!(

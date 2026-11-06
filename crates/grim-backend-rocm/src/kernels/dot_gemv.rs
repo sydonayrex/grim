@@ -221,6 +221,82 @@ extern "C" __global__ void grim_dot4_pq2_0_q80_gemv(
     }
 }
 
+// Parity twin of grim_dot4_pq2_0_q80_gemv that reads the activation as RAW
+// F32 instead of pre-quantized q8_0 codes. The q8_0 act quantize is the last
+// per-GEMV numeric error on the Prism PQ2_0 path (~1e-3 relative), which
+// compounds across 64 layers x decode steps until near-tie logits reorder
+// (Gate D t18 flip). Env-gated (GRIM_PQ2_F32ACT=1): parity mode, slower than
+// the quantized path (4x activation bytes) by design.
+extern "C" __global__ void grim_dot4_pq2_0_f32act_gemv(
+    const float* __restrict__ A_f32,
+    const unsigned char* __restrict__ B_pq2_0,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_x_blocks = K / GRIM_PQ2_0_BLOCK_SIZE;
+
+    const float* a_row = A_f32 + (long long)row * K;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const unsigned char* b_col[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_pq2_0 + (long long)(col_base + j) * n_x_blocks * GRIM_PQ2_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_x_blocks; blk += 32) {
+        const float* a_blk = a_row + (long long)blk * GRIM_PQ2_0_BLOCK_SIZE;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_PQ2_0_BYTES;
+            float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const unsigned char* qs = b_blk + 2;   // 32 bytes = 128 two-bit codes
+
+            float sumi = 0.0f;
+            #pragma unroll
+            for (int half = 0; half < 4; half++) {
+                const unsigned char* qs_h = qs + half * 8;
+                const float* a_h = a_blk + half * 32;
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    const unsigned char byte = qs_h[b];
+                    sumi += ((int)((byte >> 0) & 3) - 1) * a_h[b*4 + 0];
+                    sumi += ((int)((byte >> 2) & 3) - 1) * a_h[b*4 + 1];
+                    sumi += ((int)((byte >> 4) & 3) - 1) * a_h[b*4 + 2];
+                    sumi += ((int)((byte >> 6) & 3) - 1) * a_h[b*4 + 3];
+                }
+            }
+            facc[j] += d0 * sumi;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 // PLAN-kernel-launch-reduction Phase B: QKV GEMV — one launch covers the three
 // projections (each col-base 4-group lies wholly inside one section, since the
 // launcher requires Nq % 4 == 0 and Nkv % 4 == 0). Same math as
