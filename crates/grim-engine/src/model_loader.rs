@@ -3471,7 +3471,25 @@ fn load_model_with_providers(
             }
         }
     });
-    let tp = resolve_tp_config()?;
+    // TP on the CPU backend is a silent-corruption trap, not a feature: the
+    // dense transformer path shards the weights (column/row-parallel load)
+    // but grim-models has NO cross-rank collectives, so every wo/w_down
+    // output and the sharded LM-head logits are partial sums. Refuse TP when
+    // the target device is CPU so a leaked GRIM_TP_SIZE cannot turn a
+    // CPU-vs-CPU parity run into a silently-truncated model. GPU backends
+    // keep the env-driven config.
+    let tp = if device.is_cpu() {
+        let requested = TensorParallelConfig::from_env().unwrap_or_default();
+        if requested.world_size > 1 {
+            log::warn!(
+                "[grim-engine] GRIM_TP_SIZE={} ignored: the CPU backend has no                  tensor-parallel collectives (weights would load as unreduced                  shards); forcing single-device world_size=1",
+                requested.world_size
+            );
+        }
+        TensorParallelConfig::default()
+    } else {
+        resolve_tp_config()?
+    };
     let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
     ws.prefetch_all();
 

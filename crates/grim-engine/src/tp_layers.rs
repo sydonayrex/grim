@@ -134,7 +134,13 @@ impl RowParallelLinear {
             comm.all_reduce_sum_f32(&mut out_vec)?;
             Ok(tensor_from_f32_vec(out_vec, local_out.shape().clone()))
         } else {
-            Ok(local_out)
+            // world_size > 1 with no communicator: returning the local partial
+            // sum silently was a correctness cliff (every downstream consumer
+            // sees an unreduced shard). Fail loud instead.
+            Err(grim_core::error::Error::Backend(format!(
+                "row-parallel linear with world_size={} has no ParallelCommunicator                  and no device all_reduce; the output would be a partial sum",
+                self.tp_config.world_size
+            )))
         }
     }
 }

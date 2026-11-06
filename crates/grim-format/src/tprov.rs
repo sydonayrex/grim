@@ -516,7 +516,18 @@ impl TensorProvider for GgufProvider {
                     in_dim, world_size
                 )));
             }
+            // Block-quant defense: the byte-range slicer moves whole
+            // (scale,codes) blocks, so a shard whose column count is not a
+            // multiple of the block size would silently shift/drop the
+            // straddling block on every row. shard_boundary_valid encodes
+            // exactly this contract — enforce it instead of truncating.
             let shard_cols = in_dim / world_size;
+            if !grim_tensor::provider::shard_boundary_valid(in_dim, world_size, block_size) {
+                return Err(Error::Backend(format!(
+                    "sharded tensor '{name}': shard columns {} not a multiple of                      block size {} (in_dim {}, world_size {}); block-quantized                      rows cannot be split at this boundary",
+                    shard_cols, block_size, in_dim, world_size
+                )));
+            }
             let blocks_per_rank_row = (shard_cols / block_size).max(1);
             let rank_row_bytes = blocks_per_rank_row * type_size;
             let start_block = (rank * shard_cols) / block_size;
