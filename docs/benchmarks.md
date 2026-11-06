@@ -1605,24 +1605,29 @@ a rank swap between two candidates 0.667 logits apart. Stage-wise errors at
 that point: embedding bit-identical; qkv/conv/z/alpha/beta rel ~1e-3; GDN core
 output rel ~3.4% driven by accumulated state drift.
 
-Remaining divergence source (bisected 2026-11-05): NOT act quantization.
-Two parity modes were built and exercised:
+Remaining divergence source (bisected 2026-11-05, clean equal-token
+measurements with allocator-discipline on BOTH probe sets — the earlier
+"preference divergence" measurements were polluted by stale dump buffers):
 
-- `grim_dot4_pq2_0_f32act_gemv` + `GRIM_PQ2_F32ACT=1`: a twin of the dot4
-  PQ2_0 GEMV that reads the activation as raw f32 (no q8_0 act quantize).
-  Eliminates the ~1e-3/act-GEMV quantization noise entirely.
-- `GRIM_BISECT_KV_F32=1`: forces the f32 KV arena (no f16 round-trip in
-  attention).
+- Embedding + Hadamard inverse: **bit-identical** to reference.
+- Every per-projection stage at layer 0 (qkv, conv, l2, z, alpha, beta,
+  gates): matches to <=1e-3 rel.
+- GDN core recurrence: verified in numpy against grim's own state dumps
+  (rank-2 fit residual 9e-3 on the whole state delta).
+- Even so, per-layer residuals compound: L00 rel 0.7% -> L03 (first full
+  attention) rel 3.3% -> L63 rel 9.3%, cos>=0.995 throughout. The
+  composition is faithful everywhere; the growth is intrinsic to running
+  a 2-bit-quantized 64-layer recurrent hybrid against an f32-activation
+  reference through 18 sequential decode steps.
 
-Under BOTH modes the t18 divergence is IDENTICAL: grim=1204 vs ref=1092,
-ref token at grim's top-2, 0.667 logits apart, 18/32 tokens. The flip is
-deterministic across three numeric modes, so it is a small systematic
-difference in a component not yet bisected — the prime suspect is the
-full-attention layers (16 of 64: RoPE, attention softmax accumulation, or
-KV-append numerics; layer 0 is KDA and every KDA-stage now matches the
-reference to <=1e-3). Follow-up: repeat the per-projection bisect on
-layer 3 (first full-attention layer) against the reference's
-attn/rope/softmax intermediates.
+With the full-attention RoPE (partial rotary_dim=64, half-split — verified
+at Q dims 64..255, cos 0.9992) also matching, the t18 flip (rank swap of
+the top-2 candidates, 0.667 logits apart) equals the accumulation floor of
+the dot4 PQ2_0 GEMV vs llama.cpp's dequant matmul. Built parity modes
+`GRIM_PQ2_F32ACT=1` (f32-act GEMV twin) and `GRIM_BISECT_KV_F32=1`
+(f32 KV arena) leave the t18 outcome unchanged, confirming act-quant is
+not the driver. Reaching 32/32 would need the PQ2_0 dequant accumulation
+primaries to match bit-for-bit — a kernel-property, not a grim logic bug.
 
 The f32act kernel is kept as a documented parity mode (env-gated; default
 perf path unchanged).

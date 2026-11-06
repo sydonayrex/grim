@@ -2447,6 +2447,29 @@ impl CausalLm for Qwen35 {
             }
             h = block.forward(&h, &positions_vec, &mut caches[i])?;
             caches[i].current_pos += seq_len;
+            if seq_len == 1 && std::env::var_os("GRIM_LAYERS_DUMP_DIR").is_some() {
+                // Dump residuals for DECODE STEP 1 ONLY: a per-forward step
+                // counter (not per-layer) decides, so every layer file of one
+                // sweep belongs to the same decode step.
+                static LRES_STEP: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let stp = if i == 0 {
+                    LRES_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                } else {
+                    LRES_STEP.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                if stp == 1 {
+                    let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+                    if let Device::Rocm(ord) = h.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                        if let Ok(b) = r.copy_to_host() {
+                            let _ = std::fs::write(format!("{dir}/grim_lres_{i:02}.bin"), &b);
+                        }
+                    }
+                }
+            }
         }
         if trace {
             eprintln!("[qwen35-trace] all layers done, entering output norm");
