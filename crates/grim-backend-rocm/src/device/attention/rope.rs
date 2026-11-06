@@ -22,9 +22,15 @@ impl RocmDevice {
         let d = cfg.dim;
         let rotary_dim = cfg.rotary_dim.min(d);
         let rotary_half = rotary_dim / 2;
+        // ggml semantics (measured against the llama.cpp reference on
+        // Bonsai-27B, 2026-11-06): the frequency exponent denominator is the
+        // ROTARY dimension count (n_rot = rotary_dim), NOT the full head
+        // dim. For full-rotary models the two coincide; for partial rotary
+        // (rotary_dim < head_dim, e.g. Bonsai 64-of-256) using `d` skews
+        // every rotated angle by up to 4x.
         let inv_freq: Vec<f32> = (0..rotary_half)
             .map(|i| {
-                let freq = 1.0_f32 / cfg.base.powf((2 * i) as f32 / d as f32);
+                let freq = 1.0_f32 / cfg.base.powf((2 * i) as f32 / rotary_dim as f32);
                 match cfg.yarn {
                     None => freq,
                     Some(y) => {

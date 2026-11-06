@@ -702,7 +702,13 @@ extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int
         float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
         // Compute frequency in double precision matching CPU reference
         // (CPU precomputes cos/sin in f64 then stores as f32 in cache).
-        double freq_d = 1.0 / pow((double)base, (2.0 * (double)i) / (double)d);
+        // ggml semantics (verified against the llama.cpp reference on
+        // Bonsai-27B, 2026-11-06): the frequency exponent denominator is the
+        // ROTARY dimension count (2*rhalf = rotary_dim), NOT the full head
+        // dim. Full-rotary models coincide; partial rotary (rotary_dim <
+        // head_dim, e.g. Bonsai 64-of-256) skews every angle by up to
+        // head_dim/rotary_dim when `d` is used.
+        double freq_d = 1.0 / pow((double)base, (2.0 * (double)i) / (double)(2 * rhalf));
         double val_d = (double)pos * freq_d;
         float sin_val = (float)sin(val_d);
         float cos_val = (float)cos(val_d);

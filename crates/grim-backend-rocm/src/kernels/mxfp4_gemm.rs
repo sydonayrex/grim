@@ -465,7 +465,7 @@ grim_qk_norm_rope(
             float v1 = gemm_out[base + d1] * rms * gamma_q[d1];
             float freq = (inv_freq != nullptr)
                 ? inv_freq[i]
-                : 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+                : 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
             float angle = (float)pos * freq;
             float c, s;
             sincosf(angle, &s, &c);
@@ -497,7 +497,7 @@ grim_qk_norm_rope(
             float v1 = gemm_out[base + d1] * rms * gamma_k[d1];
             float freq = (inv_freq != nullptr)
                 ? inv_freq[i]
-                : 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+                : 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
             float angle = (float)pos * freq;
             float c, s;
             sincosf(angle, &s, &c);

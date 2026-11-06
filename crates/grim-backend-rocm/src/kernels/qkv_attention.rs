@@ -2731,7 +2731,7 @@ extern "C" __global__ void grim_rope_append_whitecrow_k(
     if (interleaved) {
         const int pair = i / 2;
         const float posf = (float)(past + step);
-        const float freq = 1.0f / powf(rope_base, (2.0f * (float)pair) / (float)head_dim);
+        const float freq = 1.0f / powf(rope_base, (2.0f * (float)pair) / (float)(2 * rhalf));
         const float ang = posf * freq;
         const float cos_v = __cosf(ang);
         const float sin_v = __sinf(ang);
@@ -2743,7 +2743,7 @@ extern "C" __global__ void grim_rope_append_whitecrow_k(
                    : (__fadd_rn(__fmul_rn(xp, cos_v), __fmul_rn(xs, sin_v)));
     } else if (i < rhalf) {
         const float posf = (float)(past + step);
-        const float freq = 1.0f / powf(rope_base, (2.0f * (float)i) / (float)head_dim);
+        const float freq = 1.0f / powf(rope_base, (2.0f * (float)i) / (float)(2 * rhalf));
         const float ang = posf * freq;
         const float cos_v = __cosf(ang);
         const float sin_v = __sinf(ang);
@@ -2753,7 +2753,7 @@ extern "C" __global__ void grim_rope_append_whitecrow_k(
     } else if (i < 2 * rhalf) {
         const int pi = i - rhalf;
         const float posf = (float)(past + step);
-        const float freq = 1.0f / powf(rope_base, (2.0f * (float)pi) / (float)head_dim);
+        const float freq = 1.0f / powf(rope_base, (2.0f * (float)pi) / (float)(2 * rhalf));
         const float ang = posf * freq;
         const float cos_v = __cosf(ang);
         const float sin_v = __sinf(ang);

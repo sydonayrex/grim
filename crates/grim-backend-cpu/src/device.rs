@@ -1066,7 +1066,12 @@ impl AttentionOps for CpuDevice {
 
         let inv_freq: Vec<f32> = (0..rotary_half)
             .map(|i| {
-                let freq = 1.0 / cfg.base.powf((2 * i) as f32 / d as f32);
+                // ggml semantics: the exponent denominator is the ROTARY
+                // dimension count (rotary_dim), not the full head dim — the
+                // two only coincide for full-rotary models (see the long
+                // comment in grim-backend-rocm's yarn_inv_freq_and_mscale).
+                let freq =
+                    1.0 / cfg.base.powf((2 * i) as f32 / rotary_dim as f32);
                 if let Some(yarn) = &cfg.yarn {
                     // llama.cpp's YaRN ramp (ggml-cpu/ops.cpp `rope_yarn`) — a
                     // ramp over the DIMENSION INDEX with bounds from
@@ -1155,7 +1160,12 @@ impl AttentionOps for CpuDevice {
 
         let inv_freq: Vec<f32> = (0..rotary_half)
             .map(|i| {
-                let freq = 1.0 / cfg.base.powf((2 * i) as f32 / d as f32);
+                // ggml semantics: the exponent denominator is the ROTARY
+                // dimension count (rotary_dim), not the full head dim — the
+                // two only coincide for full-rotary models (see the long
+                // comment in grim-backend-rocm's yarn_inv_freq_and_mscale).
+                let freq =
+                    1.0 / cfg.base.powf((2 * i) as f32 / rotary_dim as f32);
                 if let Some(yarn) = &cfg.yarn {
                     let wavelength = 2.0 * std::f32::consts::PI / freq;
                     let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
