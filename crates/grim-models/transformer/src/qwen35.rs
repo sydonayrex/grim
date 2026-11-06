@@ -1331,6 +1331,39 @@ impl Qwen35Block {
                         &device,
                     )?,
                 };
+                // GRIM_ATTN_DUMP_DIR: layer-localised parity dumps (decode,
+                // single token) — post-rope Q/K, V, pre-gate and post-gate
+                // attention branch. Align with the reference's per-call
+                // Qcur-3/Kcur-3/Vcur-3/attn_gated-3/attn_output-3 dumps.
+                if seq_len == 1 {
+                    if let Some(dir) = std::env::var_os("GRIM_ATTN_DUMP_DIR") {
+                        let want: usize = std::env::var("GRIM_ATTN_DUMP_LAYER")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(3);
+                        if self.layer_idx == want {
+                            let dump = |name: &str, t: &Tensor| {
+                                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(
+                                    t.storage().as_ref(),
+                                ) {
+                                    if let Device::Rocm(ord) = t.device() {
+                                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                                    }
+                                    if let Ok(b) = r.copy_to_host() {
+                                        let _ = std::fs::write(
+                                            format!("{}/grim_attn_{name}.bin", dir.to_string_lossy()),
+                                            &b,
+                                        );
+                                    }
+                                }
+                            };
+                            dump("q_rope", &q_rope);
+                            dump("k_rope", &k_rope);
+                            dump("v", &v_dev_t);
+                            dump("attn_pre_gate", &attn_tensor);
+                        }
+                    }
+                }
                 let mut attn_out = attn_tensor.to_vec_f32()?;
                 // Output gate: attn_out * sigmoid(attn_q's gate half), per
                 // llama.cpp qwen35.cpp:
@@ -1342,6 +1375,37 @@ impl Qwen35Block {
                     let g = gate_t.to_vec_f32()?;
                     for i in 0..attn_out.len().min(g.len()) {
                         attn_out[i] *= 1.0 / (1.0 + (-g[i]).exp());
+                    }
+                }
+                if seq_len == 1 {
+                    if let Some(dir) = std::env::var_os("GRIM_ATTN_DUMP_DIR") {
+                        let want: usize = std::env::var("GRIM_ATTN_DUMP_LAYER")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(3);
+                        if self.layer_idx == want {
+                            let sh = Shape::new(vec![1, attn_out.len()]);
+                            if let Ok(tg) = device_tensor(attn_out.clone(), sh, &device) {
+                                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(
+                                    tg.storage().as_ref(),
+                                ) {
+                                    if let Ok(b) = r.copy_to_host() {
+                                        let _ = std::fs::write(
+                                            format!(
+                                                "{}/grim_attn_attn_gated.bin",
+                                                dir.to_string_lossy()
+                                            ),
+                                            &b,
+                                        );
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "[attn3-dump] layer {} q_gate applied: {}",
+                                self.layer_idx,
+                                q_gate.is_some()
+                            );
+                        }
                     }
                 }
                 out_branch = attn_out;
@@ -2269,7 +2333,28 @@ impl CausalLm for Qwen35 {
                 } else {
                     LRES_STEP.load(std::sync::atomic::Ordering::Relaxed)
                 };
-                if stp == 1 {
+                // GRIM_LAYERS_DUMP_STEP selects WHICH decode call's per-layer
+                // residuals are dumped (default 1 = first decode step). Decode
+                // call k feeds the (k-1)th generated token — align with the
+                // reference dump call indices before comparing.
+                let want_step: String = std::env::var("GRIM_LAYERS_DUMP_STEP").unwrap_or_else(|_| "1".into());
+                let dump = if want_step == "all" {
+                    // every decode call: grim_lres_<step>_<layer>.bin
+                    let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+                    if let Device::Rocm(ord) = h.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                        if let Ok(b) = r.copy_to_host() {
+                            let _ =
+                                std::fs::write(format!("{dir}/grim_lres_{stp:02}_{i:02}.bin"), &b);
+                        }
+                    }
+                    false
+                } else {
+                    want_step.parse::<usize>().map(|w| stp == w).unwrap_or(false)
+                };
+                if dump {
                     let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
                     if let Device::Rocm(ord) = h.device() {
                         grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
@@ -2316,6 +2401,26 @@ impl CausalLm for Qwen35 {
             )
         } else {
             let normed = self.output_norm.forward(&h)?;
+            // result_norm analog of the reference's per-call dump: the
+            // final-norm output for the LAST row, aligned with the harness's
+            // ref_result_norm_<call>.bin / ref_rn_<call>.bin files.
+            if seq_len == 1 {
+                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(normed.storage().as_ref())
+                {
+                    if let Device::Rocm(ord) = normed.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    if let Ok(b) = r.copy_to_host() {
+                        static RN_STEP: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let k = RN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+                        if !dir.is_empty() {
+                            let _ = std::fs::write(format!("{dir}/grim_rn_{k:02}.bin"), &b);
+                        }
+                    }
+                }
+            }
             let head_in = if seq_len > 1 && !full_logits {
                 let dev = grim_nn::modules::pick_device_for_storage_device(normed.device());
                 let hidden = self.cfg.hidden_size;
@@ -3812,7 +3917,27 @@ fn attention_layer_d2d(
         r
     };
     q_dev = head_norm(&q_dev, blk.num_heads, blk.attn_q_norm.as_ref())?;
+    let k_prenorm = k_dev_t.clone();
     let k_dev_t = head_norm(&k_dev_t, blk.num_kv_heads, blk.attn_k_norm.as_ref())?;
+    // K-norm gamma dump for the parity probe (host tensor, cheap).
+    if let Some(dir) = std::env::var_os("GRIM_ATTN_DUMP_DIR") {
+        let want: usize = std::env::var("GRIM_ATTN_DUMP_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        if blk.layer_idx == want {
+            if let Some(n) = blk.attn_k_norm.as_ref() {
+                if let Ok(w) = n.weight.to_vec_f32() {
+                    let bytes: Vec<u8> =
+                        w.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let _ = std::fs::write(
+                        format!("{}/grim_attn_k_gamma.bin", dir.to_string_lossy()),
+                        &bytes,
+                    );
+                }
+            }
+        }
+    }
 
     stage!("head_norm");
     // --- RoPE, on device ---------------------------------------------------
@@ -4086,6 +4211,83 @@ fn attention_layer_d2d(
     // ROCm backend already exposes it and `grim_nn` wraps it for tensors.
     let sig = grim_nn::modules::sigmoid_on_device(&q_gate_dev)?;
     let (gated, _) = dev.mul(attn.storage().as_ref(), sig.storage().as_ref(), &q_split)?;
+
+    // GRIM_ATTN_DUMP_DIR: d2d attention parity dumps for one layer (decode,
+    // single token) — post-rope Q/K, V, pre-gate attention output, gated
+    // branch. Align with the reference's Qcur-3/Kcur-3/Vcur-3/
+    // attn_gated-3/attn_output-3 per-call dumps.
+    if let Some(dir) = std::env::var_os("GRIM_ATTN_DUMP_DIR") {
+        let want: usize = std::env::var("GRIM_ATTN_DUMP_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        if blk.layer_idx == want && seq_len == 1 {
+            // Decode-call index: the prefill call is not counted (seq_len>1),
+            // so this equals the harness's decode step number (1-based).
+            static ATTN_STEP: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let step = ATTN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let dump = |name: &str, t: &Tensor| {
+                if let Ok(r) =
+                    grim_backend_rocm::device::util::as_rocm(t.storage().as_ref())
+                {
+                    if let Device::Rocm(ord) = t.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    if let Ok(b) = r.copy_to_host() {
+                        let _ = std::fs::write(
+                            format!("{}/grim_attn_{step:02}_{name}.bin", dir.to_string_lossy()),
+                            &b,
+                        );
+                    }
+                }
+            };
+            dump("q_rope", &q_rope);
+            dump("k_rope", &k_rope);
+            dump("k_prenorm", &k_prenorm);
+            dump("q_prenorm", &q_dev);
+            dump("v", &v_dev_t);
+            dump("x_normed", &x_normed);
+            dump("x_normed_t", &x_normed_t);
+            if let Some(wv) = blk.wv.as_ref() {
+                if let Ok(r) =
+                    grim_backend_rocm::device::util::as_rocm(wv.weight().storage().as_ref())
+                {
+                    if let Ok(b) = r.copy_to_host() {
+                        let _ = std::fs::write(
+                            format!("{}/grim_attn_wv_packed.bin", dir.to_string_lossy()),
+                            &b,
+                        );
+                    }
+                }
+            }
+            if let Some(wk) = blk.wk.as_ref() {
+                // Raw packed bytes (PQ2_0 codes) — dequantized on the host by
+                // the analysis script via grim_quant::dequant_pq2_0 semantics.
+                if let Ok(r) =
+                    grim_backend_rocm::device::util::as_rocm(wk.weight().storage().as_ref())
+                {
+                    if let Ok(b) = r.copy_to_host() {
+                        let _ = std::fs::write(
+                            format!("{}/grim_attn_wk_packed.bin", dir.to_string_lossy()),
+                            &b,
+                        );
+                    }
+                }
+            }
+            dump("attn_pre_gate", &attn);
+            let gated_t = Tensor::new(
+                Arc::from(gated),
+                q_split.clone(),
+                DType::F32,
+                x_normed.provenance().clone(),
+                x_normed.device().clone(),
+            );
+            dump("attn_gated", &gated_t);
+            eprintln!("[attn3-dump-d2d] step {} dumped (total_kv={})", step, total_kv);
+            return Ok(Some(gated_t));
+        }
+    }
 
     Ok(Some(Tensor::new(
         Arc::from(gated),
