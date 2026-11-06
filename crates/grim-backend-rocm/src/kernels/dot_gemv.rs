@@ -462,7 +462,7 @@ extern "C" __global__ void grim_dot4_qkv_q80_f32act_gemv(
             }
 
             const float d     = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             _Float16 hd = (_Float16)d;
             float d_a = (float)hd;
 
@@ -587,7 +587,7 @@ extern "C" __global__ void grim_dot4_qkv_q80_norm_f32act_gemv(
             }
 
             const float d     = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             _Float16 hd = (_Float16)d;
             float d_a = (float)hd;
 
@@ -756,7 +756,7 @@ extern "C" __global__ void grim_dot4_gate_up_silu_q80_f32act_gemv(
             }
 
             const float d     = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             _Float16 hd = (_Float16)d;
             float d_a = (float)hd;
 
@@ -870,7 +870,7 @@ extern "C" __global__ void grim_dot4_gate_up_silu_q80_f32act_gemv_256(
                 amax = fmaxf(amax, __shfl_xor(amax, off));
             }
             const float d = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             d_a = (float)(_Float16)d;
             signed char q0 = (signed char)__builtin_roundf(blk_src[sub_lane * 4 + 0] * inv_d);
             signed char q1 = (signed char)__builtin_roundf(blk_src[sub_lane * 4 + 1] * inv_d);
@@ -1007,7 +1007,7 @@ extern "C" __global__ void grim_dot4_add_rms_norm_gate_up_silu_q80_gemv(
                 amax = fmaxf(amax, __builtin_fabsf(nrm[e]));
             }
             float d = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             d = fmaxf(d, 1e-12f);
             const float d_a = (float)(_Float16)d;
             int a4_reg[8];
@@ -1088,7 +1088,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv_tile16(
                 amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
             }
             const float d = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             const float d_a = (float)(_Float16)d;
             int a4_reg[8];
             #pragma unroll
@@ -1162,7 +1162,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv_tile8(
                 amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
             }
             const float d = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             const float d_a = (float)(_Float16)d;
             int a4_reg[8];
             #pragma unroll
@@ -1249,7 +1249,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv(
             }
 
             const float d     = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             _Float16 hd = (_Float16)d;
             float d_a = (float)hd;
 
@@ -1325,7 +1325,7 @@ extern "C" __global__ void grim_quantize_q8_1(
     amax = __shfl_sync(shfl_mask, amax, 0);
 
     const float d     = amax / 127.0f;
-    const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+    const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
     signed char qi = (signed char)__builtin_roundf(val * inv_d);
 
     // Sequential sum on lane 0, then broadcast. Replaces __shfl_xor tree
@@ -1584,7 +1584,7 @@ __device__ __forceinline__ void grim_dot4_q80_f32act_gemv_body(
             }
 
             const float d     = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
             _Float16 hd = (_Float16)d;
             float d_a = (float)hd;
 

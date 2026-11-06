@@ -650,10 +650,12 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     int si = rem / half;
     int i = rem - si * half;
     float pos = (float)positions[si];
-    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
-    float val = pos * freq;
-    float sin_val = sinf(val);
-    float cos_val = cosf(val);
+    // Compute frequency in double precision matching CPU reference
+    // (CPU precomputes cos/sin in f64 then stores as f32 in cache).
+    double freq_d = 1.0 / pow((double)base, (2.0 * (double)i) / (double)d);
+    double val_d = (double)pos * freq_d;
+    float sin_val = (float)sin(val_d);
+    float cos_val = (float)cos(val_d);
     int base_idx = (bi * s + si) * d;
     int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
     int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
@@ -698,10 +700,12 @@ extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int
     if (i < rhalf) {
         int step_idx = (num_heads > 0) ? (si / num_heads) : si;
         float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
-        float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
-        float val = pos * freq;
-        float sin_val = sinf(val);
-        float cos_val = cosf(val);
+        // Compute frequency in double precision matching CPU reference
+        // (CPU precomputes cos/sin in f64 then stores as f32 in cache).
+        double freq_d = 1.0 / pow((double)base, (2.0 * (double)i) / (double)d);
+        double val_d = (double)pos * freq_d;
+        float sin_val = (float)sin(val_d);
+        float cos_val = (float)cos(val_d);
         int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
         int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + rhalf + i);
         float x1 = x[a_idx];
