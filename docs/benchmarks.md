@@ -1614,20 +1614,21 @@ measurements with allocator-discipline on BOTH probe sets — the earlier
   gates): matches to <=1e-3 rel.
 - GDN core recurrence: verified in numpy against grim's own state dumps
   (rank-2 fit residual 9e-3 on the whole state delta).
-- Even so, per-layer residuals compound: L00 rel 0.7% -> L03 (first full
-  attention) rel 3.3% -> L63 rel 9.3%, cos>=0.995 throughout. The
-  composition is faithful everywhere; the growth is intrinsic to running
-  a 2-bit-quantized 64-layer recurrent hybrid against an f32-activation
-  reference through 18 sequential decode steps.
-
-With the full-attention RoPE (partial rotary_dim=64, half-split — verified
-at Q dims 64..255, cos 0.9992) also matching, the t18 flip (rank swap of
-the top-2 candidates, 0.667 logits apart) equals the accumulation floor of
-the dot4 PQ2_0 GEMV vs llama.cpp's dequant matmul. Built parity modes
-`GRIM_PQ2_F32ACT=1` (f32-act GEMV twin) and `GRIM_BISECT_KV_F32=1`
-(f32 KV arena) leave the t18 outcome unchanged, confirming act-quant is
-not the driver. Reaching 32/32 would need the PQ2_0 dequant accumulation
-primaries to match bit-for-bit — a kernel-property, not a grim logic bug.
+- Full-attention RoPE (partial rotary_dim=64, half-split — verified at
+  Q dims 64..255, cos 0.9992) also matches; the full-attn path is clean.
+- Even so, per-layer residuals compound: L00 rel 0.7% -> L63 rel 9.3%,
+  cos>=0.995 throughout. The composition is faithful everywhere; the
+  growth is intrinsic to running a 2-bit-quantized 64-layer hybrid
+  against an f32-activation reference through 18 sequential decode
+  steps. The t18 flip (rank swap of the top-2 candidates, 0.667 logits
+  apart) equals the accumulation floor of the dot4 PQ2_0 GEMV vs
+  llama.cpp's dequant matmul. Built parity modes `GRIM_PQ2_F32ACT=1`
+  (f32-act GEMV twin) and `GRIM_BISECT_KV_F32=1` (f32 KV arena) leave
+  the t18 outcome unchanged, confirming act-quant is not the driver.
+  Reaching 32/32 would need the PQ2_0 dequant accumulation primaries
+  to match bit-for-bit — a kernel-property, not a grim logic bug.
 
 The f32act kernel is kept as a documented parity mode (env-gated; default
-perf path unchanged).
+perf path unchanged). Recommended follow-up if exact 32/32 parity is
+required: a PQ2_0 fused-dequant GEMM whose accumulation matches
+llama.cpp's dequant ordering.
