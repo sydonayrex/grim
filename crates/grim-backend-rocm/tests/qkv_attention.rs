@@ -2648,6 +2648,256 @@ fn graph_i8_append_and_attend_match_eager_f32() {
     );
 }
 
+/// 27B-geometry int8 arena attention vs f32 oracle — hd=256, nkv=4, 40 KV rows
+/// (the exact geometry where the seeded int8 replay served garbage and the
+/// eager int8 CLI run degenerated; the tiny-cfg gate above passes at hd=64).
+/// One i8 append per row via launch_kv_append_i8, then
+/// launch_qkv_attention_dev_batch_i8 vs the f32 dequant oracle.
+#[test]
+#[ignore = "diagnostic gate for 27B-geometry int8 arena attention"]
+fn i8_arena_attention_matches_f32_at_27b_geometry() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
+    use grim_tensor::ArithType;
+    let hd_env = std::env::var("I8_GATE_HD").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let (nh, nkv, hd) = (24_usize, 4, hd_env);
+    let rows = 40_usize;
+    let stride = nkv * hd;
+    let mut seed = 0x51f7u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q_data: Vec<f32> = (0..(nh * hd)).map(|_| rand()).collect();
+
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    // int8 arenas sized for `rows` rows
+    let k_codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[rows, stride]),
+        u8dt.clone(),
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let k_scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[rows, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let v_codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[rows, stride]),
+        u8dt.clone(),
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let v_scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[rows, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let pos = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
+
+    // f32 oracle: dequantize the SAME way the append is supposed to encode
+    // (per row, per kv head: d = amax/127, codes = round(x/d)), then run the
+    // reference attention math for ONE query at the last position (causal over
+    // all rows).
+    let mut kdq = vec![0.0f32; rows * stride];
+    let mut vdq = vec![0.0f32; rows * stride];
+    let _k_codes_host = vec![0u8; rows * stride];
+    let _v_codes_host = vec![0u8; rows * stride];
+    let mut seed2 = seed;
+    let mut rand2 = move || {
+        seed2 = seed2.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed2 >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    for r in 0..rows {
+        for kh in 0..nkv {
+            let mut krow = vec![0.0f32; hd];
+            let mut vrow = vec![0.0f32; hd];
+            for d in 0..hd {
+                krow[d] = rand2();
+                vrow[d] = rand2();
+            }
+            let kd = krow.iter().fold(0.0f32, |a, &v| a.max(v.abs())) / 127.0;
+            let vd = vrow.iter().fold(0.0f32, |a, &v| a.max(v.abs())) / 127.0;
+            let kd = if kd < 1e-30 { 1.0 } else { kd };
+            let vd = if vd < 1e-30 { 1.0 } else { vd };
+            for d in 0..hd {
+                let kq = (krow[d] / kd).round().clamp(-127.0, 127.0) as i8 as u8;
+                let vq = (vrow[d] / vd).round().clamp(-127.0, 127.0) as i8 as u8;
+                kdq[r * stride + kh * hd + d] = kq as f32 * kd;
+                vdq[r * stride + kh * hd + d] = vq as f32 * vd;
+            }
+            // upload this row's codes + scale via the production append.
+            // k_rot must be the FULL [kv_stride] row (the kernel reads every
+            // nkv head-vector from it via src_base = step*kv_stride + kh*hd).
+            let mut krow_full = vec![0.0f32; stride];
+            let mut vrow_full = vec![0.0f32; stride];
+            krow_full[kh * hd..(kh + 1) * hd].copy_from_slice(&krow);
+            vrow_full[kh * hd..(kh + 1) * hd].copy_from_slice(&vrow);
+            let ksrc = dev
+                .from_cpu(&krow_full, &Shape::from_slice(&[1, stride]), DType::F32)
+                .unwrap();
+            let vsrc = dev
+                .from_cpu(&vrow_full, &Shape::from_slice(&[1, stride]), DType::F32)
+                .unwrap();
+            let pos_r = dev
+                // past_dev is read as `const int*` — the f32 slot must carry the INT
+            // bit pattern (r as i32), not the f32 value of r.
+            .from_cpu(&[f32::from_bits(r as i32 as u32)], &Shape::from_slice(&[1]), DType::F32)
+                .unwrap();
+            grim_backend_rocm::launch_kv_append_i8(
+                &dev,
+                ksrc.as_ref(),
+                pos_r.as_ref(),
+                &k_codes,
+                &k_scales,
+                stride,
+                nkv,
+                hd,
+                1,
+                1,
+                stride,
+                nkv,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            )
+            .unwrap();
+            grim_backend_rocm::launch_kv_append_i8(
+                &dev,
+                vsrc.as_ref(),
+                pos_r.as_ref(),
+                &v_codes,
+                &v_scales,
+                stride,
+                nkv,
+                hd,
+                1,
+                1,
+                stride,
+                nkv,
+                grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            )
+            .unwrap();
+        }
+    }
+    let _ = pos;
+    eprintln!("[i8-27B-geo] all 80 appends done, syncing");
+    {
+        let kref = grim_backend_rocm::device::util::as_rocm(&k_codes).unwrap();
+        let _ = kref.copy_to_host().map(|b| eprintln!("[i8-27B-geo] k_codes synced {} B", b.len()));
+        let vref = grim_backend_rocm::device::util::as_rocm(&v_codes).unwrap();
+        let _ = vref.copy_to_host().map(|b| eprintln!("[i8-27B-geo] v_codes synced {} B", b.len()));
+        let ksref = grim_backend_rocm::device::util::as_rocm(&k_scales).unwrap();
+        let _ = ksref.copy_to_host().map(|b| eprintln!("[i8-27B-geo] k_scales synced {} B", b.len()));
+        let vsref = grim_backend_rocm::device::util::as_rocm(&v_scales).unwrap();
+        let _ = vsref.copy_to_host().map(|b| eprintln!("[i8-27B-geo] v_scales synced {} B", b.len()));
+        let kh: Vec<f32> = ksref
+            .copy_to_host()
+            .ok()
+            .and_then(|b| {
+                if b.len() % 4 != 0 {
+                    return None;
+                }
+                Some(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+            })
+            .unwrap_or_default();
+        eprintln!("[i8-27B-geo] k_scales[:8]={:?} min_abs={:.4e}", &kh[..kh.len().min(8)],
+            kh.iter().map(|v| v.abs()).fold(f32::MAX, f32::min));
+        // dump codes for offline diff
+        let kb = kref.copy_to_host().unwrap();
+        let _ = std::fs::write("/tmp/i8gate_kcodes.bin", &kb);
+        let vb = vref.copy_to_host().unwrap();
+        let _ = std::fs::write("/tmp/i8gate_vcodes.bin", &vb);
+        let _ = std::fs::write("/tmp/i8gate_q.bin", {
+            let b: Vec<u8> = q_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            b
+        });
+        eprintln!("[i8-27B-geo] dumps written");
+    }
+
+    // Query: random, at absolute position `rows` (attends to all 40 rows).
+    let q_st = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[1, nh * hd]), DType::F32)
+        .unwrap();
+    let out_shape = Shape::from_slice(&[1, nh * hd]);
+    use grim_tensor::backend::AttentionOps;
+    let (out_i8, _) = dev.qkv_attention_i8(
+        q_st.as_ref(),
+        &k_codes,
+        &k_scales,
+        &v_codes,
+        &v_scales,
+        nkv,
+        rows,
+        // the decode query sits at absolute position rows-1 and causally
+        // attends to ALL `rows` cached rows (cache_offset = kv_seq_len - steps)
+        (rows - 1) as u32,
+        None,
+        &out_shape,
+    )
+    .unwrap();
+    let got = out_i8.to_cpu_vec_f32().unwrap();
+
+    // f32 oracle attention: softmax(q.k/sqrt(hd)) over all rows, GQA mapping.
+    let mut want = vec![0.0f32; nh * hd];
+    for h in 0..nh {
+        let kvh = h * nkv / nh;
+        let mut acc = vec![0.0f32; hd];
+        let mut mx = f32::NEG_INFINITY;
+        let mut scores = vec![0.0f32; rows];
+        for r in 0..rows {
+            let mut sc = 0.0f32;
+            for d in 0..hd {
+                sc += q_data[h * hd + d] * kdq[r * stride + kvh * hd + d];
+            }
+            sc /= (hd as f32).sqrt();
+            scores[r] = sc;
+            mx = mx.max(sc);
+        }
+        let mut sum = 0.0f32;
+        for r in 0..rows {
+            let w = (scores[r] - mx).exp();
+            sum += w;
+            for d in 0..hd {
+                acc[d] += w * vdq[r * stride + kvh * hd + d];
+            }
+        }
+        for d in 0..hd {
+            want[h * hd + d] = acc[d] / sum;
+        }
+    }
+    let mut max_diff = 0.0f32;
+    let mut at = 0usize;
+    for (i, (g, wv)) in got.iter().zip(want.iter()).enumerate() {
+        let d = (g - wv).abs();
+        if d > max_diff {
+            max_diff = d;
+            at = i;
+        }
+    }
+    eprintln!("[i8-27B-geo] hd={hd} max_diff {max_diff:.6e} at {at} (got {} want {})", got[at], want[at]);
+    assert!(
+        max_diff < 0.05,
+        "int8 arena attention diverges from the f32 oracle at 27B geometry (hd={hd}): \
+         max_diff {max_diff:.4e} at {at} (got {} want {})",
+        got[at],
+        want[at]
+    );
+}
+
 /// WS-3A: the 2-bit KEY quantizer kernel round-trips within half a step.
 ///
 /// Same per-(row, kv_head) amax scheme as the i4 quantizer, but 4 codes/byte

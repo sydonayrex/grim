@@ -566,6 +566,45 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V10: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v10 = *V10.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_MAGPIE_V10").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v10 && k % 32 == 0 {
+            return self.launch_magpie_mxfp8_v10_for_ab(
+                a_storage,
+                b_fp8_storage,
+                b_exps_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
+        self.launch_magpie_mxfp8_v1_for_ab(
+            a_storage,
+            b_fp8_storage,
+            b_exps_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_magpie_mxfp8_v1_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        b_exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         let a_ptr = a_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_dequant_gemm_mxfp8: a has no device ptr".into())
         })?;
@@ -601,6 +640,68 @@ impl RocmDevice {
 
         self.launch_compute_kernel(
             "grim_fused_dequant_gemm_mxfp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bfp8ptr),
+                arg(&mut bexpsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_magpie_mxfp8_v10_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        b_exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_mxfp8: a has no device ptr".into())
+        })?;
+        let b_fp8_ptr = b_fp8_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_mxfp8: b_fp8 has no device ptr".into())
+        })?;
+        let b_exps_ptr = b_exps_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_mxfp8: b_exps has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_mxfp8: out has no device ptr".into())
+        })?;
+
+        let (kernel_name, grid_dim, block_dim) = if m == 1 {
+            (
+                "grim_magpie_mxfp8_gemv_v10",
+                HipDim3::new(n.div_ceil(16) as u32, 1, 1),
+                HipDim3::new(128, 1, 1),
+            )
+        } else {
+            (
+                "grim_magpie_mxfp8_gemm_rows_r8_v10",
+                HipDim3::new(n.div_ceil(4) as u32, m.div_ceil(8) as u32, 1),
+                HipDim3::new(32, 1, 1),
+            )
+        };
+
+        let mut aptr = a_ptr;
+        let mut bfp8ptr = b_fp8_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        crate::device::compute::kernel_infra::record_kernel_route("grim_fused_dequant_gemm_mxfp8");
+        self.launch_compute_kernel(
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [

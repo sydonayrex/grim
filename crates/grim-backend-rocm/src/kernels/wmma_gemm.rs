@@ -568,6 +568,224 @@ extern "C" __global__ void grim_fused_dequant_gemm_mxfp8(
     C[row * N + col] = acc;
 }
 
+// Magpie (MXFP8) v10 hardware-accelerated wave-coalesced kernels:
+// - Uses RDNA4 native `V_CVT_PK_F32_FP8` (`__builtin_amdgcn_cvt_pk_f32_fp8`) to decode
+//   2x FP8 E4M3 codes into `float2` in 1 hardware instruction (16 instructions per 32-byte
+//   block instead of 32 software `fp8_e4m3_to_float_hip` + 32 `powf` calls!).
+// - `grim_magpie_mxfp8_gemv_v10` (M=1): 4-wave CTA (`__launch_bounds__(128, 2)`),
+//   cooperative LDS staging of the 32-block `float4[8]` activation tile (`s_a[32][8]`),
+//   B-first 128-bit `uint4` weight loads, and 1-instruction E8M0 scale bit-cast (`exp_val << 23`).
+// - `grim_magpie_mxfp8_gemm_rows_r8_v10` (M>1): 4-wave CTA (`MAGPIE_M_TILE = 8` rows x 16 cols/CTA),
+//   hoisted hardware-decoded `B` (`V_CVT_PK_F32_FP8`) across all 8 rows of `A`!
+__device__ __forceinline__ float magpie_e8m0_scale(unsigned char exp_val) {
+    return (exp_val == 0u) ? 0x1p-127f : __builtin_bit_cast(float, (unsigned int)exp_val << 23);
+}
+
+__device__ __forceinline__ void magpie_decode4_fp8_hw(unsigned int word, float out[4]) {
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+    auto f01 = __builtin_amdgcn_cvt_pk_f32_fp8(word, false);
+    auto f23 = __builtin_amdgcn_cvt_pk_f32_fp8(word, true);
+    out[0] = f01[0];
+    out[1] = f01[1];
+    out[2] = f23[0];
+    out[3] = f23[1];
+#else
+    out[0] = fp8_e4m3_to_float_hip((unsigned char)(word & 0xFFu));
+    out[1] = fp8_e4m3_to_float_hip((unsigned char)((word >> 8) & 0xFFu));
+    out[2] = fp8_e4m3_to_float_hip((unsigned char)((word >> 16) & 0xFFu));
+    out[3] = fp8_e4m3_to_float_hip((unsigned char)((word >> 24) & 0xFFu));
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2) grim_magpie_mxfp8_gemv_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    const unsigned char* __restrict__ B_exps,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    (void)M;
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+
+    const int active_cols  = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+    const int exps_per_row = K / 32;
+    const float4* a_v4     = (const float4*)A;
+
+    const uint4* b_v4[4];
+    const unsigned char* b_exps_col[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        int col = (c < active_cols) ? (col_base + c) : 0;
+        b_v4[c]       = (const uint4*)(B_fp8 + (size_t)col * K);
+        b_exps_col[c] = B_exps + (size_t)col * exps_per_row;
+    }
+
+    __shared__ float4 s_a[32][8];
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int bk_base = 0; bk_base < exps_per_row; bk_base += 32) {
+        const int block_k = bk_base + lane;
+        uint4 b0_v[4], b1_v[4];
+        unsigned char exp_b[4];
+        if (block_k < exps_per_row && active_cols > 0) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                b0_v[c]  = b_v4[c][block_k * 2 + 0];
+                b1_v[c]  = b_v4[c][block_k * 2 + 1];
+                exp_b[c] = b_exps_col[c][block_k];
+            }
+        }
+
+        // All 4 waves cooperatively stage the 32-block `float4[8]` activation tile into LDS (2 float4s per wave):
+        if (block_k < exps_per_row) {
+            s_a[lane][wave * 2 + 0] = a_v4[(size_t)block_k * 8 + wave * 2 + 0];
+            s_a[lane][wave * 2 + 1] = a_v4[(size_t)block_k * 8 + wave * 2 + 1];
+        }
+        __syncthreads();
+
+        if (block_k < exps_per_row && active_cols > 0) {
+            float4 av[8];
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) av[v] = s_a[lane][v];
+
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                if (c >= active_cols) break;
+                const float scale = magpie_e8m0_scale(exp_b[c]);
+                const unsigned int bw[8] = {
+                    b0_v[c].x, b0_v[c].y, b0_v[c].z, b0_v[c].w,
+                    b1_v[c].x, b1_v[c].y, b1_v[c].z, b1_v[c].w
+                };
+                float bacc = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    float wf[4];
+                    magpie_decode4_fp8_hw(bw[w], wf);
+                    bacc += av[w].x * wf[0] + av[w].y * wf[1] + av[w].z * wf[2] + av[w].w * wf[3];
+                }
+                facc[c] += bacc * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[c] += __shfl_xor(facc[c], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < active_cols; ++c)
+            C[col_base + c] = facc[c];
+    }
+}
+
+#define MAGPIE_M_TILE 8
+
+extern "C" __global__ void __launch_bounds__(32) grim_magpie_mxfp8_gemm_rows_r8_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    const unsigned char* __restrict__ B_exps,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * MAGPIE_M_TILE;
+    const int lane     = threadIdx.x;
+    if (row_base >= M || col_base >= N) return;
+
+    const int active_cols  = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int active_rows  = (row_base + MAGPIE_M_TILE <= M) ? MAGPIE_M_TILE : (M - row_base);
+    const int exps_per_row = K / 32;
+
+    const uint4* b_v4[4];
+    const unsigned char* b_exps_col[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        int col = col_base + ((c < active_cols) ? c : 0);
+        b_v4[c]       = (const uint4*)(B_fp8 + (size_t)col * K);
+        b_exps_col[c] = B_exps + (size_t)col * exps_per_row;
+    }
+
+    float facc[MAGPIE_M_TILE][4];
+    #pragma unroll
+    for (int r = 0; r < MAGPIE_M_TILE; ++r) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            facc[r][c] = 0.0f;
+        }
+    }
+
+    for (int block_k = lane; block_k < exps_per_row; block_k += 32) {
+        uint4 b0_v[4], b1_v[4];
+        float scale[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            b0_v[c]  = b_v4[c][block_k * 2 + 0];
+            b1_v[c]  = b_v4[c][block_k * 2 + 1];
+            scale[c] = magpie_e8m0_scale(b_exps_col[c][block_k]);
+        }
+
+        // Hoist hardware `V_CVT_PK_F32_FP8` weight decode + scale multiply outside the `r = 0..8` row loop:
+        float4 w_v4[4][8];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const unsigned int bw[8] = {
+                b0_v[c].x, b0_v[c].y, b0_v[c].z, b0_v[c].w,
+                b1_v[c].x, b1_v[c].y, b1_v[c].z, b1_v[c].w
+            };
+            const float sc = scale[c];
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                float wf[4];
+                magpie_decode4_fp8_hw(bw[w], wf);
+                w_v4[c][w] = make_float4(wf[0] * sc, wf[1] * sc, wf[2] * sc, wf[3] * sc);
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < MAGPIE_M_TILE; ++r) {
+            if (r < active_rows) {
+                const float4* a_blk = (const float4*)(A + (size_t)(row_base + r) * K + (size_t)block_k * 32);
+                float4 av[8];
+                #pragma unroll
+                for (int v = 0; v < 8; ++v) av[v] = a_blk[v];
+
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    if (c >= active_cols) break;
+                    float bacc = 0.0f;
+                    #pragma unroll
+                    for (int w = 0; w < 8; ++w) {
+                        bacc += av[w].x * w_v4[c][w].x + av[w].y * w_v4[c][w].y
+                              + av[w].z * w_v4[c][w].z + av[w].w * w_v4[c][w].w;
+                    }
+                    facc[r][c] += bacc;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < MAGPIE_M_TILE; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                float v = facc[r][c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v += __shfl_xor(v, off);
+                if (lane == 0 && c < active_cols)
+                    C[(size_t)(row_base + r) * N + col_base + c] = v;
+            }
+        }
+    }
+}
+
 // Magpie MXFP8 Fused Dequant Backward GEMM Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
 // B is stored as FP8 codes (1 per element) + shared FP8 exponents (1 per.
 extern "C" __global__ void grim_fused_dequant_backward_gemm_mxfp8(

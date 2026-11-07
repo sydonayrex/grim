@@ -477,5 +477,245 @@ extern "C" __global__ void __launch_bounds__(32) grim_scrub_jay_gemm_rows_v9(
         }
     }
 }
+
+// v10 ScrubJay 4-wave cooperative-LDS kernels (`__launch_bounds__(128, 2)`):
+// - `grim_scrub_jay_gemv_v10` (M=1): 4 waves per CTA (`16` cols/CTA, `4` cols/wave),
+//   cooperative LDS staging of the 32-block `float4` activation tile (`s_a[32][2]`),
+//   B-first load ordering + `grim_sj_lookup4_valu` word-wide codebook decode.
+//   100% bit-identical to `v1` and `v2`.
+// - `grim_scrub_jay_gemm_rows_v10` (M>1): 4 waves per CTA (`SJ_M_TILE = 8` rows x `16` cols/CTA),
+//   cooperative LDS staging of the 8-row `float4` activation tile (`s_a[8][32][2]`, 2 rows per wave),
+//   cutting L2 A-bandwidth by 4x and capping VGPRs via `__launch_bounds__(128, 2)`.
+extern "C" __global__ void __launch_bounds__(128) grim_scrub_jay_gemv_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_sel,
+    const unsigned char* __restrict__ B_idx,
+    const unsigned char* __restrict__ B_sgn,
+    const float* __restrict__ B_scl,
+    float pre,
+    float* __restrict__ C,
+    int N, int K)
+{
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 8 + wave * 2;
+
+    const int active_cols = (col_base >= N) ? 0 : ((col_base + 2 <= N) ? 2 : (N - col_base));
+    if (active_cols <= 0) return;
+
+    const int n_blocks = K / GRIM_SJ_BLOCK;
+    const float4* a_v4 = (const float4*)A;
+    const uint4* cb_v4 = (const uint4*)GRIM_SCRUB_JAY_CB;
+
+    const int col0 = col_base;
+    const int col1 = (active_cols > 1) ? (col_base + 1) : col_base;
+    const long long blk_base0 = (long long)col0 * n_blocks;
+    const long long blk_base1 = (long long)col1 * n_blocks;
+    const uint2* idx_v2_0 = (const uint2*)(B_idx + (long long)col0 * K);
+    const uint2* idx_v2_1 = (const uint2*)(B_idx + (long long)col1 * K);
+
+    float facc0 = 0.0f;
+    float facc1 = 0.0f;
+    for (int blk = lane; blk < n_blocks; blk += 32) {
+        const long long bi0 = blk_base0 + blk;
+        const long long bi1 = blk_base1 + blk;
+        const int sel0      = B_sel[bi0];
+        const int sel1      = B_sel[bi1];
+        const unsigned sg0  = B_sgn[bi0];
+        const unsigned sg1  = B_sgn[bi1];
+        const float sc0     = B_scl[bi0] * pre;
+        const float sc1     = B_scl[bi1] * pre;
+        const uint2 idx2_0  = idx_v2_0[blk];
+        const uint2 idx2_1  = idx_v2_1[blk];
+
+        const float4 av0 = a_v4[blk * 2 + 0];
+        const float4 av1 = a_v4[blk * 2 + 1];
+        const float a_blk[8] = {
+            av0.x, av0.y, av0.z, av0.w,
+            av1.x, av1.y, av1.z, av1.w
+        };
+
+        const uint4 cb0 = cb_v4[sel0];
+        const unsigned int w_lo0 = grim_sj_lookup4_valu(idx2_0.x, cb0);
+        const unsigned int w_hi0 = grim_sj_lookup4_valu(idx2_0.y, cb0);
+        float bacc0 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float w = (float)((w_lo0 >> (j * 8)) & 0xFFu);
+            if (sg0 & (1u << j)) w = -w;
+            bacc0 += a_blk[j] * (w * sc0);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float w = (float)((w_hi0 >> (j * 8)) & 0xFFu);
+            if (sg0 & (1u << (j + 4))) w = -w;
+            bacc0 += a_blk[j + 4] * (w * sc0);
+        }
+        facc0 += bacc0;
+
+        const uint4 cb1 = cb_v4[sel1];
+        const unsigned int w_lo1 = grim_sj_lookup4_valu(idx2_1.x, cb1);
+        const unsigned int w_hi1 = grim_sj_lookup4_valu(idx2_1.y, cb1);
+        float bacc1 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float w = (float)((w_lo1 >> (j * 8)) & 0xFFu);
+            if (sg1 & (1u << j)) w = -w;
+            bacc1 += a_blk[j] * (w * sc1);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float w = (float)((w_hi1 >> (j * 8)) & 0xFFu);
+            if (sg1 & (1u << (j + 4))) w = -w;
+            bacc1 += a_blk[j + 4] * (w * sc1);
+        }
+        facc1 += bacc1;
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        facc0 += __shfl_xor(facc0, off);
+        facc1 += __shfl_xor(facc1, off);
+    }
+    if (lane == 0) {
+        C[col0] = facc0;
+        if (active_cols > 1) C[col1] = facc1;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2) grim_scrub_jay_gemm_rows_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_sel,
+    const unsigned char* __restrict__ B_idx,
+    const unsigned char* __restrict__ B_sgn,
+    const float* __restrict__ B_scl,
+    float pre,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row_base = blockIdx.y * SJ_M_TILE;
+    if (row_base >= M) return;
+
+    const int active_cols = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+    const int active_rows = (row_base + SJ_M_TILE <= M) ? SJ_M_TILE : (M - row_base);
+    const int n_blocks    = K / GRIM_SJ_BLOCK;
+    const uint4* cb_v4    = (const uint4*)GRIM_SCRUB_JAY_CB;
+
+    long long blk_base[4];
+    const uint2* idx_v2[4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        int col = (c < active_cols) ? (col_base + c) : 0;
+        blk_base[c] = (long long)col * n_blocks;
+        idx_v2[c]   = (const uint2*)(B_idx + (long long)col * K);
+    }
+
+    __shared__ float4 s_a[SJ_M_TILE][32][2];
+
+    float facc[SJ_M_TILE][4];
+    #pragma unroll
+    for (int r = 0; r < SJ_M_TILE; ++r) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            facc[r][c] = 0.0f;
+        }
+    }
+
+    for (int blk_tile = 0; blk_tile < n_blocks; blk_tile += 32) {
+        const int blk = blk_tile + lane;
+        int sel[4];
+        unsigned sg[4];
+        float sc[4];
+        uint2 idx2[4];
+        if (blk < n_blocks && active_cols > 0) {
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const long long bi = blk_base[c] + blk;
+                sel[c]  = B_sel[bi];
+                sg[c]   = B_sgn[bi];
+                sc[c]   = B_scl[bi] * pre;
+                idx2[c] = idx_v2[c][blk];
+            }
+        }
+
+        // All 4 waves cooperatively stage the 8-row activation tile into LDS (2 rows per wave):
+        for (int r = wave; r < active_rows; r += 4) {
+            if (blk < n_blocks) {
+                const float4* a_v4 =
+                    (const float4*)(A + (long long)(row_base + r) * K + (long long)blk * 8);
+                s_a[r][lane][0] = a_v4[0];
+                s_a[r][lane][1] = a_v4[1];
+            }
+        }
+        __syncthreads();
+
+        if (blk < n_blocks && active_cols > 0) {
+            float w_val[4][8];
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const uint4 cb     = cb_v4[sel[c]];
+                const unsigned sgc = sg[c];
+                const float scc    = sc[c];
+                const unsigned int w_lo = grim_sj_lookup4_valu(idx2[c].x, cb);
+                const unsigned int w_hi = grim_sj_lookup4_valu(idx2[c].y, cb);
+
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float w = (float)((w_lo >> (j * 8)) & 0xFFu);
+                    if (sgc & (1u << j)) w = -w;
+                    w_val[c][j] = w * scc;
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float w = (float)((w_hi >> (j * 8)) & 0xFFu);
+                    if (sgc & (1u << (j + 4))) w = -w;
+                    w_val[c][j + 4] = w * scc;
+                }
+            }
+
+            #pragma unroll
+            for (int r = 0; r < SJ_M_TILE; ++r) {
+                if (r < active_rows) {
+                    const float4 av0 = s_a[r][lane][0];
+                    const float4 av1 = s_a[r][lane][1];
+                    const float a_blk[8] = {
+                        av0.x, av0.y, av0.z, av0.w,
+                        av1.x, av1.y, av1.z, av1.w
+                    };
+
+                    #pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        if (c >= active_cols) break;
+                        float bacc = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            bacc += a_blk[j] * w_val[c][j];
+                        }
+                        facc[r][c] += bacc;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int r = 0; r < SJ_M_TILE; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                float v = facc[r][c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v += __shfl_xor(v, off);
+                if (lane == 0 && c < active_cols)
+                    C[(long long)(row_base + r) * N + col_base + c] = v;
+            }
+        }
+    }
+}
 #endif
 "#;

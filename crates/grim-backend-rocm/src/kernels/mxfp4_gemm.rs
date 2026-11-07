@@ -60,6 +60,21 @@ __device__ __forceinline__ unsigned int mxfp4_e2m1x4_valu(unsigned int codes4) {
     return __builtin_amdgcn_perm(0x0c080604u, 0x03020100u, codes4 & 0x07070707u);
 }
 
+// v10 dual-nibble word-wide VALU E2M1 -> packed FP16 (`f16x2`) decode:
+// All 8 E2M1 magnitudes `{0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}` are exact IEEE FP16
+// values whose low byte is `0x00` and whose high bytes fit in two 32-bit constants:
+//   `t0 = 0x3e3c3800u` (`{0.0, 0.5, 1.0, 1.5}`)
+//   `t1 = 0x46444240u` (`{2.0, 3.0, 4.0, 6.0}`)
+// Given a single packed byte `byte_val = nib0 | (nib1 << 4)`, one `__builtin_amdgcn_perm`
+// instruction places `hi_byte(nib0)` at bits 8..15 and `hi_byte(nib1)` at bits 24..31,
+// and we OR in the two sign bits at bits 15 and 31!
+__device__ __forceinline__ unsigned int mxfp4_byte_to_f16x2_valu(unsigned int byte_val) {
+    const unsigned int sel = ((byte_val & 0x07u) << 8) | (((byte_val >> 4) & 0x07u) << 24);
+    const unsigned int f16_mag = __builtin_amdgcn_perm(0x46444240u, 0x3e3c3800u, sel) & 0xFF00FF00u;
+    const unsigned int signs   = ((byte_val & 0x08u) << 12) | ((byte_val & 0x80u) << 24);
+    return f16_mag | signs;
+}
+
 // Accumulate one 32-element MXFP4 micro-block into `acc`, vectorizing the code stream as one uint4 (16 B) and the activation stream as float4s.
 // `a_row` points at A[row*K + block_k*32] (as float4*); `gamma4` optionally points at gamma[block_k*32] (as float4*).
 __device__ __forceinline__ float mxfp4_dot_block(
@@ -639,6 +654,255 @@ grim_mxfp4_gemm_rows_r8(
                 }
             }
         }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROOK_M_TILE; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                float v = facc[r][c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v += __shfl_xor(v, off);
+                if (lane == 0 && c < active_cols)
+                    C[(size_t)(row_base + r) * N + col_base + c] = v;
+            }
+        }
+    }
+}
+
+// 3e. Rook (MXFP4) v10 4-wave cooperative-LDS + hardware `V_DOT2_F32_F16` GEMV & GEMM:
+// - `grim_mxfp4_gemv_v10` (M=1): 4-wave CTA (`__launch_bounds__(128, 2)`), cooperative LDS
+//   staging of `A` converted to packed `f16x2` (`s_a16[32][4]`), B-first load ordering,
+//   and 1-instruction `mxfp4_byte_to_f16x2_valu` + hardware `V_DOT2_F32_F16` (`grim_fdot2_f32_f16`).
+// - `grim_mxfp4_gemm_rows_r8_v10` (M>1): 4-wave CTA (`ROOK_M_TILE = 8` rows x 16 cols/CTA),
+//   cooperative LDS staging of the 8-row `f16x2` activation tile (`s_a16[8][32][4]`, 2 rows/wave),
+//   and hoisted `w01[4][16]` (`f16x2`) weights dotted against all 8 rows via `V_DOT2_F32_F16`!
+__global__ void __launch_bounds__(128, 2)
+grim_mxfp4_gemv_v10(
+    const float* __restrict__ A,                // [1, K]
+    const unsigned char* __restrict__ B_codes,  // [N, K/2]
+    const unsigned char* __restrict__ B_exps,   // [N, K/32]
+    float* __restrict__ C,                      // [1, N]
+    int M,
+    int N,
+    int K
+) {
+    (void)M;
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+
+    const int active_cols  = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+    const int exps_per_row = K / 32;
+    const float4* a_v4     = reinterpret_cast<const float4*>(A);
+
+    const uint4* b_codes_v4[4];
+    const unsigned char* b_exps_col[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        int col = (c < active_cols) ? (col_base + c) : 0;
+        b_codes_v4[c] = reinterpret_cast<const uint4*>(B_codes + (size_t)col * (K / 2));
+        b_exps_col[c] = B_exps + (size_t)col * exps_per_row;
+    }
+
+    __shared__ uint4 s_a16[32][4];
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int bk_base = 0; bk_base < exps_per_row; bk_base += 32) {
+        const int block_k = bk_base + lane;
+        uint4 packed_b[4];
+        unsigned char exp_b[4];
+        if (block_k < exps_per_row && active_cols > 0) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                packed_b[c] = b_codes_v4[c][block_k];
+                exp_b[c]    = b_exps_col[c][block_k];
+            }
+        }
+
+        // All 4 waves cooperatively load & pack A into `f16x2` in LDS (2 float4s -> 1 uint4 per wave):
+        if (block_k < exps_per_row) {
+            const float4 f0 = a_v4[(size_t)block_k * 8 + wave * 2 + 0];
+            const float4 f1 = a_v4[(size_t)block_k * 8 + wave * 2 + 1];
+            s_a16[lane][wave] = make_uint4(
+                grim_pk_f16(f0.x, f0.y),
+                grim_pk_f16(f0.z, f0.w),
+                grim_pk_f16(f1.x, f1.y),
+                grim_pk_f16(f1.z, f1.w)
+            );
+        }
+        __syncthreads();
+
+        if (block_k < exps_per_row && active_cols > 0) {
+            const uint4 av0 = s_a16[lane][0];
+            const uint4 av1 = s_a16[lane][1];
+            const uint4 av2 = s_a16[lane][2];
+            const uint4 av3 = s_a16[lane][3];
+            const unsigned int a2[16] = {
+                av0.x, av0.y, av0.z, av0.w,
+                av1.x, av1.y, av1.z, av1.w,
+                av2.x, av2.y, av2.z, av2.w,
+                av3.x, av3.y, av3.z, av3.w
+            };
+
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                if (c >= active_cols) break;
+                const float scale = mxfp4_block_scale(exp_b[c]);
+                const unsigned int pc[4] = {
+                    packed_b[c].x, packed_b[c].y, packed_b[c].z, packed_b[c].w
+                };
+                float bacc = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const unsigned int word = pc[w];
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const unsigned int byte_val = (word >> (8 * b)) & 0xFFu;
+                        const unsigned int w01 = mxfp4_byte_to_f16x2_valu(byte_val);
+                        bacc = grim_fdot2_f32_f16(a2[w * 4 + b], w01, bacc);
+                    }
+                }
+                facc[c] += bacc * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[c] += __shfl_xor(facc[c], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < active_cols; ++c)
+            C[col_base + c] = facc[c];
+    }
+}
+
+__global__ void __launch_bounds__(128, 2)
+grim_mxfp4_gemm_rows_r8_v10(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_codes,  // [N, K/2]
+    const unsigned char* __restrict__ B_exps,   // [N, K/32]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row_base = blockIdx.y * ROOK_M_TILE;
+    if (row_base >= M) return;
+
+    const int active_cols  = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+    const int active_rows  = (row_base + ROOK_M_TILE <= M) ? ROOK_M_TILE : (M - row_base);
+    const int exps_per_row = K / 32;
+
+    const uint4* b_codes_v4[4];
+    const unsigned char* b_exps_col[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        int col = (c < active_cols) ? (col_base + c) : 0;
+        b_codes_v4[c] = reinterpret_cast<const uint4*>(B_codes + (size_t)col * (K / 2));
+        b_exps_col[c] = B_exps + (size_t)col * exps_per_row;
+    }
+
+    __shared__ uint4 s_a16[ROOK_M_TILE][32][4];
+
+    float facc[ROOK_M_TILE][4];
+    #pragma unroll
+    for (int r = 0; r < ROOK_M_TILE; ++r) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            facc[r][c] = 0.0f;
+        }
+    }
+
+    for (int bk_base = 0; bk_base < exps_per_row; bk_base += 32) {
+        const int block_k = bk_base + lane;
+        uint4 packed_b[4];
+        unsigned char exp_b[4];
+        if (block_k < exps_per_row && active_cols > 0) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                packed_b[c] = b_codes_v4[c][block_k];
+                exp_b[c]    = b_exps_col[c][block_k];
+            }
+        }
+
+        // All 4 waves cooperatively load & pack 8 rows of A into `f16x2` in LDS (2 rows per wave):
+        for (int r = wave; r < active_rows; r += 4) {
+            if (block_k < exps_per_row) {
+                const float4* a_blk = reinterpret_cast<const float4*>(
+                    A + (size_t)(row_base + r) * K + (size_t)block_k * 32);
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float4 f0 = a_blk[q * 2 + 0];
+                    const float4 f1 = a_blk[q * 2 + 1];
+                    s_a16[r][lane][q] = make_uint4(
+                        grim_pk_f16(f0.x, f0.y),
+                        grim_pk_f16(f0.z, f0.w),
+                        grim_pk_f16(f1.x, f1.y),
+                        grim_pk_f16(f1.z, f1.w)
+                    );
+                }
+            }
+        }
+        __syncthreads();
+
+        if (block_k < exps_per_row && active_cols > 0) {
+            float scale[4];
+            unsigned int w01[4][16];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                scale[c] = mxfp4_block_scale(exp_b[c]);
+                const unsigned int pc[4] = {
+                    packed_b[c].x, packed_b[c].y, packed_b[c].z, packed_b[c].w
+                };
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const unsigned int word = pc[w];
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        w01[c][w * 4 + b] = mxfp4_byte_to_f16x2_valu((word >> (8 * b)) & 0xFFu);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int r = 0; r < ROOK_M_TILE; ++r) {
+                if (r < active_rows) {
+                    const uint4 av0 = s_a16[r][lane][0];
+                    const uint4 av1 = s_a16[r][lane][1];
+                    const uint4 av2 = s_a16[r][lane][2];
+                    const uint4 av3 = s_a16[r][lane][3];
+                    const unsigned int a2[16] = {
+                        av0.x, av0.y, av0.z, av0.w,
+                        av1.x, av1.y, av1.z, av1.w,
+                        av2.x, av2.y, av2.z, av2.w,
+                        av3.x, av3.y, av3.z, av3.w
+                    };
+
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        if (c >= active_cols) break;
+                        float bacc = 0.0f;
+                        #pragma unroll
+                        for (int e = 0; e < 16; ++e) {
+                            bacc = grim_fdot2_f32_f16(a2[e], w01[c][e], bacc);
+                        }
+                        facc[r][c] += bacc * scale[c];
+                    }
+                }
+            }
+        }
+        __syncthreads();
     }
 
     #pragma unroll
