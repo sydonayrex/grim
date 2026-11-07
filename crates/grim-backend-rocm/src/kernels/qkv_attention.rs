@@ -279,10 +279,6 @@ void grim_qkv_attention(
     const float* __restrict__ alibi_slopes,
     int has_alibi
 ) {
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-        printf("[DEBUG] grim_qkv_attention CALLED: seq_len=%d kv_seq_len=%d head_dim=%d num_heads=%d num_kv_heads=%d\n",
-               seq_len, kv_seq_len, head_dim, num_heads, num_kv_heads);
-    }
     // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
     // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
     const int i = blockIdx.x;             // query position (0..seq_len)
@@ -418,16 +414,10 @@ void grim_qkv_attention(
         for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
-                // Match CPU reference exactly:
-                // If score > old_max (new max): scale only, NO V addition
-                //   VKQ32 *= expf(Mold - M)
-                // If score <= old_max (no new max): add only
-                //   VKQ32 += expf(s - M) * V
                 if (score > old_max) {
                     out_acc[chunk] *= scale_old;
-                } else {
-                    out_acc[chunk] += scale_new * v_head[j * (num_kv_heads * head_dim) + d];
                 }
+                out_acc[chunk] += scale_new * v_head[j * (num_kv_heads * head_dim) + d];
             }
         }
     }
@@ -555,10 +545,6 @@ void grim_qkv_attention_i8kv(
     const float* __restrict__ alibi_slopes,
     int has_alibi
 ) {
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-        printf("[DEBUG] grim_qkv_attention CALLED: seq_len=%d kv_seq_len=%d head_dim=%d num_heads=%d num_kv_heads=%d\n",
-               seq_len, kv_seq_len, head_dim, num_heads, num_kv_heads);
-    }
     // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
     // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
     const int i = blockIdx.x;             // query position (0..seq_len)
@@ -1028,10 +1014,6 @@ void grim_qkv_attention_f16kv(
     const float* __restrict__ alibi_slopes,
     int has_alibi
 ) {
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-        printf("[DEBUG] grim_qkv_attention CALLED: seq_len=%d kv_seq_len=%d head_dim=%d num_heads=%d num_kv_heads=%d\n",
-               seq_len, kv_seq_len, head_dim, num_heads, num_kv_heads);
-    }
     // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
     // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
     const int i = blockIdx.x;             // query position (0..seq_len)
@@ -1177,14 +1159,10 @@ void grim_qkv_attention_f16kv(
         for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
-                // Match CPU reference exactly:
-                // If score > old_max (new max): scale only, NO V addition
-                // If score <= old_max (no new max): add only
                 if (score > old_max) {
                     out_acc[chunk] *= scale_old;
-                } else {
-                    out_acc[chunk] += scale_new * fp16_bits_to_float_device(v_head16[j * (num_kv_heads * head_dim) + d]);
                 }
+                out_acc[chunk] += scale_new * fp16_bits_to_float_device(v_head16[j * (num_kv_heads * head_dim) + d]);
             }
         }
     }
