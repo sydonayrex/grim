@@ -4,22 +4,24 @@
 set -euo pipefail
 
 SOAK_DURATION_SECS="${1:-7200}"
-MODEL_NAME="${2:-Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf}"
+MODEL_PATH="${2:-/drive/bigfast/grim/models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf}"
+MODEL_NAME="$(basename "${MODEL_PATH}")"
 SERVER_PORT="${GRIM_PORT:-11434}"
 SERVER_HOST="${GRIM_HOST:-127.0.0.1}"
 LOG_FILE="/tmp/grim_soak.jsonl"
 SERVER_LOG="/tmp/grim_soak_server.log"
 
 echo "=== Starting Grim Server Soak Test (${SOAK_DURATION_SECS}s) ==="
-echo "Target Model: ${MODEL_NAME}"
+echo "Target Model Path: ${MODEL_PATH}"
+echo "Target Model Name: ${MODEL_NAME}"
 echo "Telemetry log: ${LOG_FILE}"
 
 # Build server release if needed
 cargo build --release -p grim-server -p grim-cli
 
-# Start server in background
+# Start server in background via grim-cli serve
 LIBRARY_PATH=/opt/rocm/lib:${LIBRARY_PATH:-} LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH:-} \
-./target/release/grim-server --address "${SERVER_HOST}:${SERVER_PORT}" > "${SERVER_LOG}" 2>&1 &
+./target/release/grim-cli serve -m "${MODEL_PATH}" --host "${SERVER_HOST}" --port "${SERVER_PORT}" > "${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
@@ -29,11 +31,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for server /health
+# Wait for server /health (model loading may take ~20-30s)
 echo "Waiting for server to become healthy..."
-for i in {1..30}; do
+for i in {1..60}; do
     if curl -s "http://${SERVER_HOST}:${SERVER_PORT}/health" >/dev/null 2>&1; then
-        echo "Server is healthy."
+        echo "Server is healthy after ${i}s."
         break
     fi
     sleep 1
