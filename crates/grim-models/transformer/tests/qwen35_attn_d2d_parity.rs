@@ -355,9 +355,20 @@ fn qwen35_attention_device_path_engages_and_matches_host() {
     // formats: pin f32 so the device arena matches the host block's (Qwen35
     // defaults ROCm arenas to f16 otherwise). Shares the format lock with the
     // f16/int8 decode gates.
+    //
+    // GRIM_KV_ARENA alone is NOT enough: the eager fallback intercepts at
+    // kv_quant_format() BEFORE the dense arena, and its default (unset) is
+    // WhiteCrow 4-bit paged KV — the host side then attends over quantized K/V
+    // (16-level code grid, branch energy ~0.67x) while the device d2d path
+    // runs the dense f32 arena, and the comparison fails with a huge bogus
+    // divergence (2026-11-07: worst_rel 1.922e0, values on an exact
+    // k*(243/128) grid — diagnosed to this default via a numpy full-block
+    // oracle + a stage-by-stage CPU chain dump). GRIM_KV_QUANT=off gives BOTH
+    // sides dense f32 KV, which is what this gate's contract is.
     let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     unsafe {
         std::env::set_var("GRIM_KV_ARENA", "f32");
+        std::env::set_var("GRIM_KV_QUANT", "off");
     }
     let mut cpu_cache = Qwen35LayerCache::new(&c);
     let mut gpu_cache = Qwen35LayerCache::new(&c);
