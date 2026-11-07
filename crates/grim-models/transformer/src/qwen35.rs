@@ -5561,6 +5561,22 @@ fn arena_append_from_f32(
 /// the paged path would reintroduce the reinterpretation bug the paged path
 /// is designed to avoid; use the dense f16 arenas (Qwen35 default) instead.
 fn kv_quant_format() -> Option<grim_tensor::PagedKvQuantFormat> {
+    // Least-surprise rule (2026-11-07): an EXPLICITLY set GRIM_KV_ARENA is the
+    // user's dense-KV contract — it routes the eager path to the dense arena
+    // arms (which honor GRIM_KV_ARENA's dtype) and disables the paged-quant
+    // default. Before this rule, GRIM_KV_ARENA=f32/int8 still ran WhiteCrow
+    // 4-bit paged KV (the unset default), silently: a host-vs-device parity
+    // gate compared f32 against 4-bit KV (worst_rel 1.922e0), and the CLI
+    // "int8" opt-in seeded WhiteCrow-formatted data into int8-shaped arenas
+    // (garbage output). GRIM_KV_QUANT set explicitly always wins (paged opt-in).
+    if std::env::var("GRIM_KV_QUANT").is_err() && std::env::var("GRIM_KV_ARENA").is_ok() {
+        let arena = std::env::var("GRIM_KV_ARENA").unwrap_or_default();
+        eprintln!(
+            "[qwen35] GRIM_KV_ARENA={arena:?} set explicitly: dense-KV arena route, \
+             paged-quant default (WhiteCrow) disabled for this process"
+        );
+        return None;
+    }
     match std::env::var("GRIM_KV_QUANT").as_deref() {
         Ok("int8" | "q8_0" | "q8") => Some(grim_tensor::PagedKvQuantFormat::Int8),
         Ok("fp8" | "fp8_e4m3") => Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3),
@@ -6867,13 +6883,24 @@ mod tests {
             assert_eq!(kv_quant_format(), expect, "GRIM_KV_QUANT={val}");
             unsafe { std::env::remove_var("GRIM_KV_QUANT") };
         }
-        // Defaults to WhiteCrow when unset
+        // Defaults to WhiteCrow when unset (and GRIM_KV_ARENA not explicitly set)
         unsafe { std::env::remove_var("GRIM_KV_QUANT") };
+        unsafe { std::env::remove_var("GRIM_KV_ARENA") };
         assert_eq!(
             kv_quant_format(),
             Some(grim_tensor::PagedKvQuantFormat::WhiteCrow),
             "unset GRIM_KV_QUANT must default to WhiteCrow"
         );
+        // Least-surprise: an explicit GRIM_KV_ARENA disables the paged default
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        assert_eq!(
+            kv_quant_format(),
+            None,
+            "explicit GRIM_KV_ARENA must route to the dense arena (paged-quant off)"
+        );
+        unsafe { std::env::remove_var("GRIM_KV_ARENA") };
     }
 
     /// Packed sizing must match the real host encoders byte for byte, or the
