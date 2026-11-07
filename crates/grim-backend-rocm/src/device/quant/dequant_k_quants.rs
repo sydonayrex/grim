@@ -361,25 +361,6 @@ impl RocmDevice {
             Error::Backend("fused_dequant_backward_q4k: dX has no device ptr".into())
         })?;
 
-        // SPEED-ROC-6b: opt-in tiled backward path (same GRIM_Q4K_TILED flag).
-        static TILED_BWD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let tiled_enabled = *TILED_BWD.get_or_init(|| {
-            matches!(
-                std::env::var("GRIM_Q4K_TILED").as_deref(),
-                Ok("1" | "true" | "on")
-            )
-        });
-        if tiled_enabled && n >= 64 && k % 256 == 0 {
-            return self.launch_fused_dequant_gemm_q4k_backward_tiled(
-                dy_storage,
-                b_q4k_storage,
-                dx_storage,
-                m,
-                n,
-                k,
-            );
-        }
-
         const BLOCK_SIZE: usize = 256;
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
@@ -403,54 +384,6 @@ impl RocmDevice {
 
         self.launch_compute_kernel(
             "grim_fused_dequant_backward_gemm_q4k",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut dyptr),
-                arg(&mut bptr),
-                arg(&mut dxptr),
-                arg(&mut mm),
-                arg(&mut nn),
-                arg(&mut kk),
-            ],
-        )
-    }
-
-    /// SPEED-ROC-6b: LDS-tiled Q4_K backward GEMM launcher.
-    /// Grid: (ceil(K/64), ceil(M/4)), block: (64, 4, 1).
-    pub(crate) fn launch_fused_dequant_gemm_q4k_backward_tiled(
-        &self,
-        dy_storage: &RocmStorage,
-        b_q4k_storage: &RocmStorage,
-        dx_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("fused_dequant_backward_q4k_tiled: dY has no device ptr".into())
-        })?;
-        let b_ptr = b_q4k_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("fused_dequant_backward_q4k_tiled: B has no device ptr".into())
-        })?;
-        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("fused_dequant_backward_q4k_tiled: dX has no device ptr".into())
-        })?;
-
-        let grid_x: u32 = k.div_ceil(64) as u32;
-        let grid_y: u32 = m.div_ceil(4) as u32;
-        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-        let block_dim = HipDim3::new(64, 4, 1);
-
-        let mut dyptr = dy_ptr;
-        let mut bptr = b_ptr;
-        let mut dxptr = dx_ptr;
-        let mut mm = m as i32;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-
-        self.launch_compute_kernel(
-            "grim_fused_dequant_gemm_q4k_backward_tiled",
             grid_dim,
             block_dim,
             &mut [

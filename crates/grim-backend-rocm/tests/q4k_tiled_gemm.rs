@@ -131,59 +131,6 @@ fn tiled_q4k_parity_prefill_shapes() {
     parity_case(18, 128, 512, 1e-3);
 }
 
-fn run_kernel_backward(
-    fx: &Fixture,
-    tiled: bool,
-    dy: &RocmStorage,
-    b: &RocmStorage,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
-    let out = RocmStorage::alloc_gpu(&Shape::new(vec![m, k]), DType::F32, &fx.alloc, 0).unwrap();
-    let stream = if tiled {
-        q4k_test_shim::launch_backward_tiled(&fx.dev, dy, b, &out, m, n, k)
-    } else {
-        q4k_test_shim::launch_backward_scalar(&fx.dev, dy, b, std::ptr::null(), &out, m, n, k)
-    }
-    .unwrap();
-    unsafe { grim_backend_rocm::hipStreamSynchronize(stream) };
-    out.to_cpu_vec_f32().unwrap()
-}
-
-/// Parity: tiled vs scalar backward outputs.
-fn backward_parity_case(m: usize, n: usize, k: usize, atol: f32) {
-    let fx = fixture();
-    let dy_data: Vec<f32> = (0..m * n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
-    let blob = make_q4k_blob(n, k);
-    let dy = upload_f32(&fx, &dy_data, &[m, n]);
-    let b = upload_q4k_blob(&fx, &blob);
-
-    let scalar = run_kernel_backward(&fx, false, &dy, &b, m, n, k);
-    let tiled = run_kernel_backward(&fx, true, &dy, &b, m, n, k);
-
-    let mut max_abs = 0.0f32;
-    for (s, t) in scalar.iter().zip(tiled.iter()) {
-        max_abs = max_abs.max((s - t).abs());
-    }
-    assert!(
-        max_abs <= atol,
-        "backward parity failed at m={m} n={n} k={k}: max_abs_diff={max_abs} (atol={atol})"
-    );
-}
-
-#[test]
-#[ignore]
-fn tiled_q4k_backward_parity() {
-    if !gpu_enabled() {
-        return;
-    }
-    backward_parity_case(4, 16, 256, 1e-4);
-    backward_parity_case(32, 512, 512, 1e-3);
-    // N not a multiple of 64, M not a multiple of 4 — exercise guards.
-    backward_parity_case(18, 100, 768, 1e-3);
-}
-
 /// Prefill throughput: tiled vs scalar at a representative LLM FFN shape.
 /// Prints GFLOP/s for both; asserts the tiled path is not a regression
 /// (>= 1x scalar) and reports the measured speedup in the log.
@@ -227,61 +174,6 @@ fn tiled_q4k_prefill_throughput() {
         tiled_gflops >= scalar_gflops * 0.95,
         "tiled kernel regressed vs scalar: {tiled_gflops:.1} vs {scalar_gflops:.1} GFLOP/s"
     );
-}
-
-/// Backward throughput: tiled vs scalar at representative shapes.
-/// Prints GFLOP/s for both; asserts the tiled path is not a regression
-/// (>= 0.95x scalar) and reports the measured speedup in the log.
-///
-/// This is the plan 8f decision gate for the `GRIM_Q4K_TILED` BACKWARD arm:
-/// `golden_q4k_backward` is CPU-only and never reaches this launcher, so the
-/// A/B runs here instead. First shape is golden's (m=2, k=256, n=256); the
-/// others are a mid-training shape and the prefill shape. A losing arm at
-/// any measured shape = delete the backward branch (off by default today).
-#[test]
-#[ignore]
-fn tiled_q4k_backward_throughput() {
-    if !gpu_enabled() {
-        return;
-    }
-    let fx = fixture();
-    // (m, n, k, iters): golden shape gets more iters (tiny flop count).
-    for (m, n, k, iters) in [
-        (2usize, 256usize, 256usize, 200usize),
-        (32usize, 4096usize, 4096usize, 20usize),
-        (512usize, 4096usize, 4096usize, 10usize),
-    ] {
-        let dy_data: Vec<f32> = (0..m * n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
-        let blob = make_q4k_blob(n, k);
-        let dy = upload_f32(&fx, &dy_data, &[m, n]);
-        let b = upload_q4k_blob(&fx, &blob);
-
-        let flops = 2.0 * m as f64 * n as f64 * k as f64;
-
-        let bench = |tiled: bool| -> f64 {
-            // Warmup (JIT compile + allocator pool).
-            let _ = run_kernel_backward(&fx, tiled, &dy, &b, m, n, k);
-            let t0 = Instant::now();
-            for _ in 0..iters {
-                let _ = run_kernel_backward(&fx, tiled, &dy, &b, m, n, k);
-            }
-            let elapsed = t0.elapsed().as_secs_f64() / iters as f64;
-            flops / elapsed / 1e9
-        };
-
-        let scalar_gflops = bench(false);
-        let tiled_gflops = bench(true);
-        let speedup = tiled_gflops / scalar_gflops;
-        println!(
-            "q4k backward m={m} n={n} k={k}: scalar {scalar_gflops:.1} GFLOP/s, \
-             tiled {tiled_gflops:.1} GFLOP/s, speedup {speedup:.2}x"
-        );
-        assert!(
-            tiled_gflops >= scalar_gflops * 0.95,
-            "tiled backward regressed at m={m} n={n} k={k}: \
-             {tiled_gflops:.1} vs {scalar_gflops:.1} GFLOP/s"
-        );
-    }
 }
 
 /// SPEED-ROC-7: the dtype-aware gradient all-reduce must no-op cleanly on a

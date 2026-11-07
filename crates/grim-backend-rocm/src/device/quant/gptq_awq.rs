@@ -784,29 +784,17 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("ostquant gemv: out has no device ptr".into()))?;
 
-        // Default is v5 (unified with dot_gemv.rs). GRIM_WHITECROW_V2=1 keeps v2 reachable as an A/B rollback arm.
-        // v1 (grim_dot8_w4a4_gemv) is selected only when explicitly requested (GRIM_WHITECROW_V1=1 or GRIM_WHITECROW_V5=0 / V3=0).
-        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v2 = *V2.get_or_init(|| {
-            matches!(
-                std::env::var("GRIM_WHITECROW_V2").as_deref(),
-                Ok("1" | "true" | "on")
-            )
-        });
-        static V3_OR_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let use_v5 = *V3_OR_V5.get_or_init(|| {
-            if v2 {
-                false
-            } else if matches!(
+        // Default is v5 (unified with dot_gemv.rs).
+        // v1 (grim_dot8_w4a4_gemv) is selected only when explicitly requested (GRIM_WHITECROW_V1=1 or GRIM_WHITECROW_V5=0).
+        static USE_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_v5 = *USE_V5.get_or_init(|| {
+            if matches!(
                 std::env::var("GRIM_WHITECROW_V1").as_deref(),
                 Ok("1" | "true" | "on")
             ) {
                 false
             } else {
                 !matches!(
-                    std::env::var("GRIM_WHITECROW_V3").as_deref(),
-                    Ok("0" | "false" | "off")
-                ) && !matches!(
                     std::env::var("GRIM_WHITECROW_V5").as_deref(),
                     Ok("0" | "false" | "off")
                 )
@@ -835,7 +823,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
 
-        if v2 || use_v5 {
+        if use_v5 {
             crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
         }
         // Default routes to v5: v3's layout and loads with the
@@ -843,8 +831,6 @@ impl RocmDevice {
         self.launch_compute_kernel(
             if use_v5 {
                 "grim_dot8_w4a4_gemv_v5"
-            } else if v2 {
-                "grim_dot8_w4a4_gemv_v2"
             } else {
                 "grim_dot8_w4a4_gemv"
             },

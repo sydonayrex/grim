@@ -347,71 +347,6 @@ extern "C" {
         }
     }
 
-    // SPEED-ROC-6b: LDS-tiled Q4_K backward GEMM — dX[M,K] = dY[M,N] * W[N,K].
-    // Same tiling discipline as the forward variant: block computes a
-    // 4-row x 64-k tile of dX, staging the W super-block elements through LDS
-    // once per N-chunk instead of re-dequantizing per output element.
-    __global__ void grim_fused_dequant_gemm_q4k_backward_tiled(
-        const float* __restrict__ dY,      // [M, N]
-        const unsigned char* __restrict__ B_q4k,
-        float* __restrict__ dX,            // [M, K]
-        int M, int N, int K)
-    {
-        __shared__ float sW[64][65];  // [n_local][k_local] — 16 KB + bank padding
-        __shared__ float sY[4][64];   // [row][n_local] — 1 KB
-
-        const int k0 = blockIdx.x * 64;
-        const int row0 = blockIdx.y * 4;
-        const int tx = threadIdx.x;   // 0..63 -> k within tile
-        const int ty = threadIdx.y;   // 0..3  -> row within tile
-
-        const int row = row0 + ty;
-        const int kcol = k0 + tx;
-        const bool tile_ok = (row < M) && (kcol < K);
-
-        const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 144;
-
-        float acc = 0.0f;
-
-        for (int n0 = 0; n0 < N; n0 += 64) {
-            // Cooperative weight dequant: 256 threads cover the 64x64 tile.
-            // sW[cc][kk] = W[n0+cc][k0+kk].
-            for (int t = ty * 64 + tx; t < 64 * 64; t += 256) {
-                int kk = t >> 6;
-                int cc = t & 63;
-                int gk = k0 + kk;
-                int gn = n0 + cc;
-                float w = 0.0f;
-                if (gn < N && gk < K) {
-                    w = dequant_q4k_element(
-                        B_q4k + (long long)gn * row_bytes + (long long)(gk / 256) * 144,
-                        gk % 256);
-                }
-                sW[cc][kk] = w;
-            }
-            // dY fragment: 4 rows x 64 n-cols = exactly 256 elements.
-            {
-                int gn = n0 + tx;
-                int rr = row0 + ty;
-                sY[ty][tx] = (rr < M && gn < N) ? dY[(long long)rr * N + gn] : 0.0f;
-            }
-            __syncthreads();
-
-            if (tile_ok) {
-                #pragma unroll 8
-                for (int cc = 0; cc < 64; ++cc) {
-                    acc += sY[ty][cc] * sW[cc][tx];
-                }
-            }
-            __syncthreads();
-        }
-
-        if (tile_ok) {
-            dX[(long long)row * K + kcol] = acc;
-        }
-    }
-
 }
 "#;
 
@@ -557,6 +492,5 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_q4k"));
         // SPEED-ROC-6: the LDS-tiled prefill variant rides the same aggregate.
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q4k_tiled"));
-        assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q4k_backward_tiled"));
     }
 }

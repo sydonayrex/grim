@@ -1342,17 +1342,7 @@ impl RocmDevice {
                 self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
                 self.launch_dot4_gate_up_silu_q80_gemv_into(act_q81, wg, wu, out, m, n, k)
             } else {
-                let use_256 = matches!(
-                    std::env::var("GRIM_DOT4_256").as_deref(),
-                    Ok("1") | Ok("true") | Ok("on")
-                );
-                if use_256 {
-                    self.launch_dot4_gate_up_silu_q80_f32act_gemv_256_into(
-                        a_rocm, wg, wu, out, m, n, k,
-                    )
-                } else {
-                    self.launch_dot4_gate_up_silu_q80_f32act_gemv_into(a_rocm, wg, wu, out, m, n, k)
-                }
+                self.launch_dot4_gate_up_silu_q80_f32act_gemv_into(a_rocm, wg, wu, out, m, n, k)
             }
         } else {
             self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
@@ -1392,53 +1382,6 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_dot4_gate_up_silu_q80_f32act_gemv",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut aptr),
-                arg(&mut wgptr),
-                arg(&mut wuptr),
-                arg(&mut optr),
-                arg(&mut mm),
-                arg(&mut nn),
-                arg(&mut kk),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Eight-wave RDNA4 experiment: 256 threads per workgroup with a
-    /// cross-wave LDS reduction. Opt-in through `GRIM_DOT4_256=1`.
-    pub fn launch_dot4_gate_up_silu_q80_f32act_gemv_256_into(
-        &self,
-        act_f32: &RocmStorage,
-        wg: &RocmStorage,
-        wu: &RocmStorage,
-        out: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()> {
-        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
-            Error::Backend("dot4_gate_up_silu_256: act_f32 has no device ptr".into())
-        })?;
-        let wg_ptr = wg.device_ptr.ok_or_else(|| {
-            Error::Backend("dot4_gate_up_silu_256: gate has no device ptr".into())
-        })?;
-        let wu_ptr = wu
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_256: up has no device ptr".into()))?;
-        let out_ptr = out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_256: out has no device ptr".into()))?;
-        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
-        let block_dim = HipDim3::new(256, 1, 1);
-        let (mut aptr, mut wgptr, mut wuptr, mut optr) = (a_ptr, wg_ptr, wu_ptr, out_ptr);
-        let mut mm = m as i32;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-        self.launch_compute_kernel(
-            "grim_dot4_gate_up_silu_q80_f32act_gemv_256",
             grid_dim,
             block_dim,
             &mut [
@@ -3665,23 +3608,10 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
 
-        // v5 is the SHIPPED kernel (bit-identical to v1/v2, predicated tail;
-        // truly cold the whole family sits at 96.8-98.4% of the 601 GB/s
-        // ceiling, so the routing choice is about warm behavior and code
-        // count, not cold GB/s). GRIM_WHITECROW_V2=1 keeps v2 reachable as
-        // the A/B arm; v1 remains the in-tree reference. v3/v4 were deleted:
-        // v3 because v5 is its strict superset, v4 because its lane-
-        // contiguous layout measured no cold benefit (see the true-cold bench).
-        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v2 = *V2.get_or_init(|| {
-            matches!(std::env::var("GRIM_WHITECROW_V2").as_deref(), Ok("1" | "true" | "on"))
-        });
+        // v5 is the SHIPPED kernel (bit-identical to v1, predicated tail);
+        // v1 remains the in-tree reference.
         self.launch_dot8_w4a4_gemv_named(
-            if v2 {
-                "grim_dot8_w4a4_gemv_v2"
-            } else {
-                "grim_dot8_w4a4_gemv_v5"
-            },
+            "grim_dot8_w4a4_gemv_v5",
             a_codes,
             a_scales,
             a_sums,
@@ -3710,36 +3640,6 @@ impl RocmDevice {
     ) -> Result<*mut c_void> {
         self.launch_dot8_w4a4_gemv_named(
             "grim_dot8_w4a4_gemv",
-            a_codes,
-            a_scales,
-            a_sums,
-            b_qweight,
-            b_scales,
-            b_zeros,
-            out_storage,
-            m,
-            n,
-            k,
-        )
-    }
-    /// v2 A/B launcher: kept as the rotation arm of the true-cold bench
-    /// (`corvid_w4a4_true_cold_ab`), reachable under GRIM_WHITECROW_V2=1.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_dot8_w4a4_gemv_v2_for_ab(
-        &self,
-        a_codes: &RocmStorage,
-        a_scales: &RocmStorage,
-        a_sums: &RocmStorage,
-        b_qweight: &RocmStorage,
-        b_scales: &RocmStorage,
-        b_zeros: &RocmStorage,
-        out_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        self.launch_dot8_w4a4_gemv_named(
-            "grim_dot8_w4a4_gemv_v2",
             a_codes,
             a_scales,
             a_sums,
@@ -4222,41 +4122,17 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // Note: Benchmark shows ScrubJay v1 achieves higher bandwidth (~300-330 GB/s)
-        // due to lower VGPR footprint in the 16-way codebook lookup loop. Default is v1;
-        // set GRIM_SCRUB_JAY_V2=1 to enable the 4-column batched v2.
-        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v2 = *V2.get_or_init(|| {
-            matches!(
-                std::env::var("GRIM_SCRUB_JAY_V2").as_deref(),
-                Ok("1" | "true" | "on")
-            )
-        });
-        if v2 {
-            self.launch_scrub_jay_gemv_v2_for_ab(
-                a_storage,
-                b_sel,
-                b_idx,
-                b_sgn,
-                b_scl,
-                out_storage,
-                pre_scale,
-                n,
-                k,
-            )
-        } else {
-            self.launch_scrub_jay_gemv_v1_for_ab(
-                a_storage,
-                b_sel,
-                b_idx,
-                b_sgn,
-                b_scl,
-                out_storage,
-                pre_scale,
-                n,
-                k,
-            )
-        }
+        self.launch_scrub_jay_gemv_v1_for_ab(
+            a_storage,
+            b_sel,
+            b_idx,
+            b_sgn,
+            b_scl,
+            out_storage,
+            pre_scale,
+            n,
+            k,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4311,75 +4187,6 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_scrub_jay_gemv",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut aptr),
-                arg(&mut selp),
-                arg(&mut idxp),
-                arg(&mut sgnp),
-                arg(&mut sclp),
-                arg(&mut pre),
-                arg(&mut optr),
-                arg(&mut nn),
-                arg(&mut kk),
-            ],
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_scrub_jay_gemv_v2_for_ab(
-        &self,
-        a_storage: &RocmStorage,
-        b_sel: &RocmStorage,
-        b_idx: &RocmStorage,
-        b_sgn: &RocmStorage,
-        b_scl: &RocmStorage,
-        out_storage: &RocmStorage,
-        pre_scale: f32,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        if k % 8 != 0 {
-            return Err(Error::Backend(format!(
-                "scrub_jay_gemv: K={k} must be a multiple of 8 (ScrubJay blocks are 8 values)"
-            )));
-        }
-        if n == 0 {
-            return Err(Error::Backend("scrub_jay_gemv: N must be > 0".into()));
-        }
-        let a_ptr = a_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemv: a has no device ptr".into()))?;
-        let sel_ptr = b_sel
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sel has no device ptr".into()))?;
-        let idx_ptr = b_idx
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_idx has no device ptr".into()))?;
-        let sgn_ptr = b_sgn
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sgn has no device ptr".into()))?;
-        let scl_ptr = b_scl
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_scl has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemv: out has no device ptr".into()))?;
-        let grid_dim = HipDim3::new((n as u32).div_ceil(4), 1, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
-        let mut aptr = a_ptr;
-        let mut selp = sel_ptr;
-        let mut idxp = idx_ptr;
-        let mut sgnp = sgn_ptr;
-        let mut sclp = scl_ptr;
-        let mut pre = pre_scale;
-        let mut optr = out_ptr;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-        crate::device::compute::kernel_infra::record_kernel_route("grim_scrub_jay_gemv");
-        self.launch_compute_kernel(
-            "grim_scrub_jay_gemv_v2",
             grid_dim,
             block_dim,
             &mut [

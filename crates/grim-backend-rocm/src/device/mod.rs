@@ -128,19 +128,6 @@ pub mod q4k_test_shim {
         dev.launch_fused_deq_backward_gemm_simple(kernel, dy, b, dx, m, n, k)
     }
 
-    /// Launch the tiled Q4_K fused dequant-GEMM (backward, dX).
-    pub fn launch_backward_tiled(
-        dev: &RocmDevice,
-        dy: &RocmStorage,
-        b: &RocmStorage,
-        dx: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut std::ffi::c_void> {
-        dev.launch_fused_dequant_gemm_q4k_backward_tiled(dy, b, dx, m, n, k)
-    }
-
     /// Launch the scalar Q4_K fused dequant-GEMM (backward, dX).
     pub fn launch_backward_scalar(
         dev: &RocmDevice,
