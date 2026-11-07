@@ -6,7 +6,7 @@ set -euo pipefail
 SOAK_DURATION_SECS="${1:-7200}"
 MODEL_PATH="${2:-/drive/bigfast/grim/models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf}"
 MODEL_NAME="$(basename "${MODEL_PATH}")"
-SERVER_PORT="${GRIM_PORT:-11434}"
+SERVER_PORT="${GRIM_PORT:-11435}"
 SERVER_HOST="${GRIM_HOST:-127.0.0.1}"
 LOG_FILE="/tmp/grim_soak.jsonl"
 SERVER_LOG="/tmp/grim_soak_server.log"
