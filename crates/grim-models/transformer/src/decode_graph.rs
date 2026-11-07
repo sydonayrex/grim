@@ -1622,16 +1622,26 @@ impl LlamaBlock {
         // FILL `q_gate_buf` here first; until something does, the graph's job is
         // to reproduce the eager path, and the eager path has no gate.
 
-        // 7. Output projection (wo) + residual add
-        linear_into_named(
-            dev,
-            &buffers.attn_out_buf[layer_idx],
-            self.wo.weight(),
-            &buffers.norm_buf[layer_idx],
-            act,
-            "attn.wo_out",
-            layer_idx,
-        )?;
+        // 7. Output projection (wo) + residual add — through the grim-graph
+        // emitter (5B.5 deletion: no hand-rolled launch/record duality; the
+        // node contract is unchanged, record_ir=false preserves today's IR).
+        {
+            let mut graph_emitter = RocmGraphEmitter {
+                dev,
+                emit: None,
+            };
+            let _ = grim_graph::emit_linear_dedup(
+                &mut graph_emitter,
+                &buffers.attn_out_buf[layer_idx],
+                self.wo.weight(),
+                &buffers.norm_buf[layer_idx],
+                act,
+                "attn.wo_out",
+                layer_idx,
+                grim_graph::QuantFlags::default(),
+                false,
+            )?;
+        }
 
         // Publish destination for block output (Fix 3: residual add writes directly into next layer or head_input)
         let n_layers = buffers.layer_input.len();
@@ -1813,24 +1823,34 @@ impl LlamaBlock {
                         .w_up
                         .as_ref()
                         .ok_or_else(|| grim_core::error::Error::Backend("missing w_up".into()))?;
-                    linear_into_named(
-                        dev,
-                        normed_ffn,
-                        wg.weight(),
-                        &buffers.gate_buf[layer_idx],
-                        act,
-                        "ffn.gate",
-                        layer_idx,
-                    )?;
-                    linear_into_named(
-                        dev,
-                        normed_ffn,
-                        wu.weight(),
-                        &buffers.up_buf[layer_idx],
-                        act,
-                        "ffn.up",
-                        layer_idx,
-                    )?;
+                    {
+                        let mut graph_emitter = RocmGraphEmitter {
+                            dev,
+                            emit: None,
+                        };
+                        let _ = grim_graph::emit_linear_dedup(
+                            &mut graph_emitter,
+                            normed_ffn,
+                            wg.weight(),
+                            &buffers.gate_buf[layer_idx],
+                            act,
+                            "ffn.gate",
+                            layer_idx,
+                            grim_graph::QuantFlags::default(),
+                            false,
+                        )?;
+                        let _ = grim_graph::emit_linear_dedup(
+                            &mut graph_emitter,
+                            normed_ffn,
+                            wu.weight(),
+                            &buffers.up_buf[layer_idx],
+                            act,
+                            "ffn.up",
+                            layer_idx,
+                            grim_graph::QuantFlags::default(),
+                            false,
+                        )?;
+                    }
                     dev.silu_mul_into(
                         &buffers.gate_buf[layer_idx],
                         &buffers.up_buf[layer_idx],
@@ -1878,15 +1898,23 @@ impl LlamaBlock {
                     dev,
                 )?;
             } else {
-                linear_into_named(
-                    dev,
-                    &buffers.activated_buf[layer_idx],
-                    wd.weight(),
-                    &buffers.norm_buf[layer_idx],
-                    act,
-                    "ffn.down",
-                    layer_idx,
-                )?;
+                {
+                    let mut graph_emitter = RocmGraphEmitter {
+                        dev,
+                        emit: None,
+                    };
+                    let _ = grim_graph::emit_linear_dedup(
+                        &mut graph_emitter,
+                        &buffers.activated_buf[layer_idx],
+                        wd.weight(),
+                        &buffers.norm_buf[layer_idx],
+                        act,
+                        "ffn.down",
+                        layer_idx,
+                        grim_graph::QuantFlags::default(),
+                        false,
+                    )?;
+                }
 
                 add_graph(
                     &buffers.layer_output[layer_idx],
@@ -4841,14 +4869,23 @@ impl Qwen35Block {
             self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
                 grim_core::error::Error::Backend("missing ssm_out projection".into())
             })?;
-        linear_into_named(
+        // 5B.5 deletion: routed through the grim-graph emitter (this fn has no
+        // IR emitter in scope — today's behaviour records no node here, and
+        // record_ir=false preserves that exactly).
+        let mut graph_emitter = RocmGraphEmitter {
             dev,
+            emit: None,
+        };
+        let _ = grim_graph::emit_linear_dedup(
+            &mut graph_emitter,
             &kda_buf.branch,
             out_proj.weight(),
             &buffers.norm_buf[layer_idx],
             act,
             "ssm_out",
             layer_idx,
+            grim_graph::QuantFlags::default(),
+            false,
         )?;
         Ok(())
     }
@@ -5138,14 +5175,22 @@ impl Qwen35 {
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
         }
-        linear_into_named(
-            last_dev,
+        // 5B.5 deletion: routed through the grim-graph emitter (the head path
+        // records no IR node today; record_ir=false preserves that exactly).
+        let mut graph_emitter = RocmGraphEmitter {
+            dev: last_dev,
+            emit: None,
+        };
+        let _ = grim_graph::emit_linear_dedup(
+            &mut graph_emitter,
             &graph.buffers.head_input,
             self.output.weight(),
             &graph.buffers.head_output,
             &graph.buffers.act_q81_buf[self.blocks.len().saturating_sub(1)],
             "output",
             usize::MAX,
+            grim_graph::QuantFlags::default(),
+            false,
         )?;
         Ok(())
     }
