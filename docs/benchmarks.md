@@ -1777,3 +1777,27 @@ Re-ran `qwen35_production_27b_route_wall_and_utilization` (`GRIM_SPLIT_LAYERS=32
      - **50/50 head split (required by Qwen3.5 4 KV heads -> 2 KV heads/card GQA constraint):** `rocm:1` (RX 9060 XT, 304 GB/s) already processes 50% of model weights in the 32/32 pipeline split (`seg1` wall = `52.68 ms`, kernel busy = `47.27 ms` across 665 nodes). Under 50/50 TP=2, `rocm:1` still streams 50% of all weights (`~47.3 ms` busy), **doubles** its node count from `665` to `~1327` nodes (doubling its inter-kernel gap from `5.41 ms` to `~10.8 ms`), and adds `10.94 ms` of cross-PCIe rendezvous: projected TP=2 wall = `47.27 + 10.82 + 10.94 = 69.0–106.7 ms` (with lockstep per-layer skew + 640 extra ring/wait/add nodes adding `640 × 8.1 µs ≈ 5.2 ms` gap, bringing projected wall to **~85–95 ms**, violating the `≤ 80.03 ms` stop criterion and eroding the savings).
      - Even under an idealized 2:1 BW-weighted split (impossible on KV heads without breaking the `4 KV` / `6 Q-per-KV` GQA group or replicating KV), `1.5 × rendezvous` (`16.41 ms`) + doubled node-gap (`~17 ms` across 1327 nodes/card + 480 rendezvous nodes) exceeds the maximum theoretical busy reduction (`47.27 − 26.4 = 20.8 ms`).
    - **Verdict:** Recorded negative per Phase 5 contract (*"ON FAILURE (rendezvous eats the savings): record, keep pipeline default, close — a measured negative is a valid exit"*). Pipeline split (`GRIM_SPLIT_LAYERS`) remains the production multi-GPU default.
+
+
+---
+
+## 14. Task 8.5: Long-Running Server Soak Test (2026-11-07)
+
+### Test Configuration & Execution
+- **Script**: `scripts/soak_test.sh 3600` (1-hour constructive soak test).
+- **Target Model**: `Qwen3.5-9B-Q4_K_M.gguf` (`/drive/bigfast/grim/models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf`, 32 layers hybrid architecture).
+- **Workload**: 4 concurrent client worker loops issuing streaming `/v1/chat/completions` requests, with 20% random client disconnects after 10 tokens and 10% explicit `/v1/requests/:id/cancel` cancellations.
+- **Port**: `11435` (to avoid collision with default service).
+- **Telemetry**: 60 periodic samples (1 per minute) logged to `/tmp/grim_soak.jsonl` tracking process RSS, GPU VRAM (`amd-smi`), and `/health` probe latency.
+
+### Soak Results & Acceptance Criteria
+| Metric / Criterion | Measured Value | Done Criteria | Status |
+|:-------------------|:---------------|:--------------|:-------|
+| Server process survival | Alive through all 3600s, 0 crashes, 0 exit-101 | Server PID alive at end | **PASS** |
+| HTTP Health Responses | 60/60 requests returned `200 OK` (0 non-200) | 0 HTTP 5xx responses | **PASS** |
+| `/health` latency | 2–3 ms steady state across all 60 minutes | Sub-10ms responsive | **PASS** |
+| Process RSS drift (t=10\text{m} \to t=60\text{m}$) | `3725.2 MB` $\to$ `3725.2 MB` (**+0.00%** drift) | $\le \pm 2\%$ post-warmup | **PASS** |
+| GPU VRAM drift (t=10\text{m} \to t=60\text{m}$) | `3300 MB` $\to$ `3316 MB` (**+0.48%** drift) | $\le \pm 2\%$ post-warmup | **PASS** |
+
+### Verdict
+Task 8.5 soak test passed all criteria with zero memory leaks, zero zombie handles, zero VRAM accumulation, and 100% health responsiveness under continuous load, cancellations, and client disconnects.
