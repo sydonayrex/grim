@@ -803,6 +803,19 @@ impl Qwen35Block {
     ) -> Result<Tensor> {
         let seq_len = positions.len();
         let device = x.device().clone();
+        // GRIM_I8_PROBE_DIR: block entry probe — is the decode step reaching
+        // Qwen35Block::forward at all? (2026-11-07 parity defect.)
+        if seq_len == 1 && std::env::var_os("GRIM_I8_PROBE_DIR").is_some() {
+            static BLK_SEEN: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = BLK_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 {
+                eprintln!(
+                    "[i8-probe] block fwd entry layer {} seq_len=1",
+                    self.layer_idx
+                );
+            }
+        }
 
         // 1. Pre-norm
         let x_normed = self.attn_norm.forward(x)?;
@@ -3785,8 +3798,20 @@ fn attention_layer_d2d(
     cache: &mut Qwen35LayerCache,
     seq_len: usize,
 ) -> Result<Option<Tensor>> {
+    // GRIM_I8_PROBE_DIR: entry probe — did the decode step reach the d2d arm
+    // at all, and if not, which gate declined? (2026-11-07 CLI-decode defect.)
+    let i8_probe = seq_len == 1 && std::env::var_os("GRIM_I8_PROBE_DIR").is_some();
+    if i8_probe {
+        eprintln!(
+            "[i8-probe] d2d entry layer {} seq_len={} cur_pos={}",
+            blk.layer_idx, seq_len, cache.current_pos
+        );
+    }
     // Accelerators only: the CPU reference stays the production path there.
     if x_normed.device().is_cpu() {
+        if i8_probe {
+            eprintln!("[i8-probe] d2d DECLINE (cpu) layer {}", blk.layer_idx);
+        }
         return Ok(None);
     }
     // The device attention kernel this path calls had a real defect: it staged
@@ -4179,6 +4204,29 @@ fn attention_layer_d2d(
                 if let Ok(b) = xr.copy_to_host() {
                     let _ = std::fs::write(
                         format!("{}/probe_in_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                        &b,
+                    );
+                }
+            }
+        }
+    }
+    // GRIM_FULLSEQ_PROBE_DIR: the SAME per-layer dump for the full-sequence
+    // path (any seq_len) — pairs with cli_decode_parity's path A so the
+    // cached-decode vs full-sequence divergence can be bisected per layer.
+    if let Some(dir) = std::env::var_os("GRIM_FULLSEQ_PROBE_DIR") {
+        static FS_DUMPED: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = FS_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 64 {
+            if let Ok(xr) = grim_backend_rocm::device::util::as_rocm(x_normed.storage().as_ref()) {
+                if let Ok(b) = xr.copy_to_host() {
+                    let _ = std::fs::write(
+                        format!(
+                            "{}/probe_fs_layer{}_call{}.bin",
+                            dir.to_string_lossy(),
+                            blk.layer_idx,
+                            n / 64 + 1
+                        ),
                         &b,
                     );
                 }

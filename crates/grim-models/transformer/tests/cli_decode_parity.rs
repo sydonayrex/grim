@@ -22,6 +22,13 @@ fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Err
         return Ok(());
     }
     let device = Device::Rocm(0);
+    // Per-layer hidden-state dumps for both routes (probe hooks in qwen35.rs):
+    // GRIM_FULLSEQ_PROBE_DIR fires on every forward (any seq_len), gated to the
+    // first 64 layer-dumps per call; GRIM_I8_PROBE_DIR fires per d2d layer on
+    // decode steps. Run this test once with ONLY_FULLSEQ=1 (path A only) and
+    // once with only CACHED=1 to bisect the first divergent layer.
+    let only_fullseq = std::env::var("GRIM_PARITY_ONLY_FULLSEQ").is_ok();
+    let only_cached = std::env::var("GRIM_PARITY_ONLY_CACHED").is_ok();
     let model = grim_engine::model_loader::load_model_from_gguf(MODEL, device.clone())
         .map_err(|e| format!("load: {e}"))?;
     // The exact CLI prompt ids (grim template, "Explain how a transistor...")
@@ -50,6 +57,10 @@ fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Err
     eprintln!("[parity] prefill top5 = {:?}", &idx[..5]);
 
     // ── Path A: full-sequence forward over prompt + gen0 ──────────────────
+    if only_cached {
+        eprintln!("[parity] GRIM_PARITY_ONLY_CACHED=1: skipping path A forward");
+        return Ok(());
+    }
     let mut full = prompt.clone();
     full.push(gen0);
     let mut sess_a = model.new_session();
@@ -67,6 +78,10 @@ fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Err
     eprintln!("[parity] path A top5 = {:?}", &idx_a[..5]);
 
     // ── Path B: cached incremental decode ─────────────────────────────────
+    if only_fullseq {
+        eprintln!("[parity] GRIM_PARITY_ONLY_FULLSEQ=1: skipping path B forward");
+        return Ok(());
+    }
     let mut sess_b = model.new_session();
     let pos_b0: Vec<f32> = (0..prompt.len()).map(|i| i as f32).collect();
     let in_b0 = mk(&prompt.iter().map(|&v| v as f32).collect::<Vec<_>>(), prompt.len());
