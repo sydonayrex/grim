@@ -2716,82 +2716,79 @@ fn i8_arena_attention_matches_f32_at_27b_geometry() {
     // all rows).
     let mut kdq = vec![0.0f32; rows * stride];
     let mut vdq = vec![0.0f32; rows * stride];
-    let _k_codes_host = vec![0u8; rows * stride];
-    let _v_codes_host = vec![0u8; rows * stride];
+    let mut k_codes_host = vec![0u8; rows * stride];
+    let mut v_codes_host = vec![0u8; rows * stride];
     let mut seed2 = seed;
     let mut rand2 = move || {
         seed2 = seed2.wrapping_mul(6364136223846793005).wrapping_add(1);
         ((seed2 >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
     for r in 0..rows {
+        // ONE launch per row: the kernel's grid spans ALL nkv head-vectors and
+        // reads the FULL [kv_stride] row — a per-kh launch with a single-slice
+        // row makes the other blocks read zeros and overwrite their slices
+        // with code 128 (dequant zero).
+        let mut krow_full = vec![0.0f32; stride];
+        let mut vrow_full = vec![0.0f32; stride];
         for kh in 0..nkv {
-            let mut krow = vec![0.0f32; hd];
-            let mut vrow = vec![0.0f32; hd];
+            let krow: Vec<f32> = (0..hd).map(|_| rand2()).collect();
+            let vrow: Vec<f32> = (0..hd).map(|_| rand2()).collect();
             for d in 0..hd {
-                krow[d] = rand2();
-                vrow[d] = rand2();
+                // kernel convention: scale = maxabs, codes biased +128,
+                // dequant = (code-128)/127*scale
+                let kq = (krow[d] * 127.0).round().clamp(-127.0, 127.0);
+                let vq = (vrow[d] * 127.0).round().clamp(-127.0, 127.0);
+                k_codes_host[r * stride + kh * hd + d] = (kq as i16 + 128) as u8;
+                v_codes_host[r * stride + kh * hd + d] = (vq as i16 + 128) as u8;
+                kdq[r * stride + kh * hd + d] = kq / 127.0;
+                vdq[r * stride + kh * hd + d] = vq / 127.0;
             }
-            let kd = krow.iter().fold(0.0f32, |a, &v| a.max(v.abs())) / 127.0;
-            let vd = vrow.iter().fold(0.0f32, |a, &v| a.max(v.abs())) / 127.0;
-            let kd = if kd < 1e-30 { 1.0 } else { kd };
-            let vd = if vd < 1e-30 { 1.0 } else { vd };
-            for d in 0..hd {
-                let kq = (krow[d] / kd).round().clamp(-127.0, 127.0) as i8 as u8;
-                let vq = (vrow[d] / vd).round().clamp(-127.0, 127.0) as i8 as u8;
-                kdq[r * stride + kh * hd + d] = kq as f32 * kd;
-                vdq[r * stride + kh * hd + d] = vq as f32 * vd;
-            }
-            // upload this row's codes + scale via the production append.
-            // k_rot must be the FULL [kv_stride] row (the kernel reads every
-            // nkv head-vector from it via src_base = step*kv_stride + kh*hd).
-            let mut krow_full = vec![0.0f32; stride];
-            let mut vrow_full = vec![0.0f32; stride];
             krow_full[kh * hd..(kh + 1) * hd].copy_from_slice(&krow);
             vrow_full[kh * hd..(kh + 1) * hd].copy_from_slice(&vrow);
-            let ksrc = dev
-                .from_cpu(&krow_full, &Shape::from_slice(&[1, stride]), DType::F32)
-                .unwrap();
-            let vsrc = dev
-                .from_cpu(&vrow_full, &Shape::from_slice(&[1, stride]), DType::F32)
-                .unwrap();
-            let pos_r = dev
-                // past_dev is read as `const int*` — the f32 slot must carry the INT
+        }
+        let ksrc = dev
+            .from_cpu(&krow_full, &Shape::from_slice(&[1, stride]), DType::F32)
+            .unwrap();
+        let vsrc = dev
+            .from_cpu(&vrow_full, &Shape::from_slice(&[1, stride]), DType::F32)
+            .unwrap();
+        let pos_r = dev
+            // past_dev is read as `const int*` — the f32 slot must carry the INT
             // bit pattern (r as i32), not the f32 value of r.
             .from_cpu(&[f32::from_bits(r as i32 as u32)], &Shape::from_slice(&[1]), DType::F32)
-                .unwrap();
-            grim_backend_rocm::launch_kv_append_i8(
-                &dev,
-                ksrc.as_ref(),
-                pos_r.as_ref(),
-                &k_codes,
-                &k_scales,
-                stride,
-                nkv,
-                hd,
-                1,
-                1,
-                stride,
-                nkv,
-                grim_backend_rocm::KvRingPolicy::UNLIMITED,
-            )
             .unwrap();
-            grim_backend_rocm::launch_kv_append_i8(
-                &dev,
-                vsrc.as_ref(),
-                pos_r.as_ref(),
-                &v_codes,
-                &v_scales,
-                stride,
-                nkv,
-                hd,
-                1,
-                1,
-                stride,
-                nkv,
-                grim_backend_rocm::KvRingPolicy::UNLIMITED,
-            )
-            .unwrap();
-        }
+        grim_backend_rocm::launch_kv_append_i8(
+            &dev,
+            ksrc.as_ref(),
+            pos_r.as_ref(),
+            &k_codes,
+            &k_scales,
+            stride,
+            nkv,
+            hd,
+            1,
+            1,
+            stride,
+            nkv,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+        )
+        .unwrap();
+        grim_backend_rocm::launch_kv_append_i8(
+            &dev,
+            vsrc.as_ref(),
+            pos_r.as_ref(),
+            &v_codes,
+            &v_scales,
+            stride,
+            nkv,
+            hd,
+            1,
+            1,
+            stride,
+            nkv,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+        )
+        .unwrap();
     }
     let _ = pos;
     eprintln!("[i8-27B-geo] all 80 appends done, syncing");

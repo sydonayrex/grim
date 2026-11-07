@@ -5314,6 +5314,11 @@ fn arena_append_kv_rows<'a>(
 ) -> grim_tensor::error::Result<()> {
     use grim_backend_rocm::KvArenaFormat as F;
     let stride = nkv * head_dim;
+    // UNIT NOTE: the quantize launchers take src_off in ELEMENTS of the f32
+    // source (kernel: src_base = src_off + row*kv_stride + kh*head_dim) — the
+    // run's source ROW offset converts by *stride, or every run after the
+    // first reads shifted data.
+    let src_elem_off = src_row_off * stride;
     let kv_elems = n_tok_rows * stride;
     let format = kv_arena_format_qwen(device);
     if matches!(format, F::WhiteCrow) {
@@ -5336,7 +5341,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
             rocm.as_ref(),
             k_src,
-            src_row_off,
+            src_elem_off,
             k_dst,
             dst_off,
             n_tok_rows,
@@ -5348,7 +5353,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
             rocm.as_ref(),
             v_src,
-            src_row_off,
+            src_elem_off,
             v_dst,
             dst_off,
             n_tok_rows,
@@ -5361,9 +5366,8 @@ fn arena_append_kv_rows<'a>(
     }
     if !matches!(format, F::Int8 | F::Int4 | F::Int2V4) {
         let dst_off = row_off * stride;
-        let src_off = src_row_off * stride;
-        arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, src_off, kv_elems)?;
-        arena_append_from_f32(dev.as_ref(), v_dst, dst_off, v_src, src_off, kv_elems)?;
+        arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, src_elem_off, kv_elems)?;
+        arena_append_from_f32(dev.as_ref(), v_dst, dst_off, v_src, src_elem_off, kv_elems)?;
         return Ok(());
     }
     let ksc = k_scales.ok_or_else(|| {
@@ -5397,7 +5401,7 @@ fn arena_append_kv_rows<'a>(
             grim_backend_rocm::launch_kv_quantize_rows_i2(
                 rocm.as_ref(),
                 k_src,
-                src_row_off,
+                src_elem_off,
                 k_dst,
                 k_off_bytes,
                 ksc,
@@ -5412,7 +5416,7 @@ fn arena_append_kv_rows<'a>(
             grim_backend_rocm::launch_kv_quantize_rows_i4(
                 rocm.as_ref(),
                 k_src,
-                src_row_off,
+                src_elem_off,
                 k_dst,
                 k_off_bytes,
                 ksc,
@@ -5427,7 +5431,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_i4(
             rocm.as_ref(),
             v_src,
-            src_row_off,
+            src_elem_off,
             v_dst,
             v_off_bytes,
             vsc,
@@ -5443,7 +5447,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_i8(
             rocm.as_ref(),
             k_src,
-            src_row_off,
+            src_elem_off,
             k_dst,
             dst_off,
             ksc,
@@ -5457,7 +5461,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_i8(
             rocm.as_ref(),
             v_src,
-            src_row_off,
+            src_elem_off,
             v_dst,
             dst_off,
             vsc,
