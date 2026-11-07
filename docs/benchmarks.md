@@ -1472,6 +1472,47 @@ Pre-existing failures investigated (2026-11-07, both on HEAD `cab5c94f`):
   follow-up work. Temporary GRIM_D2D_DUMP probe kept in the test
   (env-gated) for whoever picks it up.
 
+## 10b. Phase 5 TP=2 — Stage A close (2026-11-07, post-5B.5 `f665616a`)
+
+The 27B production harness (`qwen35_production_27b_route_wall_and_utilization`,
+32/32 split, dev0 RX 9070 XT / dev1 RX 9060 XT, clocks logged per arm, 5-run
+medians, window = full decode step) — the Stage A exit numbers:
+
+| Arm | Nodes | warm median | busy dev0 | busy dev1 | busy total |
+|---|---|---|---|---|---|
+| OLD-AE75E0C6 | 1438 | 100.98 ms | 33.53 ms | 49.67 ms | 83.20 ms |
+| STEP1-RES1 | 1374 | 93.31 ms | 29.57 ms | 45.38 ms | 74.95 ms |
+| STEP2-RES2 | 1327 | 96.41 ms | 31.99 ms | 47.24 ms | 79.22 ms |
+| STEP3-DEDUP | 1327 | 96.55 ms | 32.03 ms | 47.09 ms | 79.12 ms |
+
+STEP3-DEDUP segment timing (5 walks): seg0(dev0, layers 0..32) = 43.70 ms,
+seg1(dev1, layers 32..64) = 52.42 ms, wall 96.4 ms, **handoff (rendezvous)
+0.07-0.41 ms** — an order of magnitude below REV 2's 130-190 us per-boundary
+estimate; the wall is seg0+seg1+~0.3 ms of cross-device handoff.
+
+Correctness gates inside the run: STEP2 vs STEP3-DEDUP LOGITS bit-identical
+(0.000e0, top1 163749 both); OLD vs STEP3 max_abs 4.005e-2 (worst_rel 3.7e-3,
+top1 agrees); Task-0.5 PPL-512 |dNLL| = 0.019 nats (OLD 13.134 vs NEW 13.153 —
+the arms now differ by kernel-level accumulation reworks landed after the
+2026-11-03 bit-identical record: b885fa8e V-accumulation, fb8b98dd Q*K,
+8cf36d5d, the add_rms_norm sequential reduction; top1 agreement holds and the
+in-harness LOGITS-GATE accepts the envelope).
+
+Stage A findings (measured, not derived):
+1. **STEP1-RES1 is the FASTEST pipeline arm (93.3 ms)** — STEP2's fused
+   residual2 norms dropped 47 nodes but COST 3.1 ms of wall vs STEP1. Node
+   count is not wall time; the fused residual2 kernels run longer than the
+   launches they save on this geometry (matches `f00fda0f` "headroom already
+   consumed").
+2. dev0 (9070 XT) runs sclk 1678-1800 MHz under load vs dev1's 3413 MHz — the
+   display-GPU clock cap is STILL the wall bottleneck on seg0 (43.7 ms vs a
+   32.0 ms busy = 11.7 ms of in-segment gap).
+3. Stage A exit for TP=2 Stage B derivation: pipeline wall 96.5 ms, busy
+   79.1 ms summed, rendezvous ~0.3 ms. A perfect TP=2 halving of the summed
+   busy (39.6 ms/card) + measured rendezvous puts the Stage B target band at
+   **~40-45 ms wall**; the stop criterion must be written into the plan before
+   implementing REV 2.
+
 ## 10. Task 2.3 Step 0 — KV-quant census (2026-11-03)
 
 Env vars / branches selecting the KV representation (crates/grim-models/transformer/src/):
