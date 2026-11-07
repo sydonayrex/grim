@@ -78,6 +78,7 @@ pub mod task_ring;
 /// TreePie (WS-A) 5.0 bpw decode + M=1 GEMV over V_DOT2_F32_F16.
 pub mod tree_pie;
 
+#[cfg(any(test, feature = "gpu-test-shims"))]
 pub mod rho_microbench;
 pub mod selective_scan;
 pub mod shared_device_fns;

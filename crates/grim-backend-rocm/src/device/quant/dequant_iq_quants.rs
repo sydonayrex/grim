@@ -289,7 +289,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ2XXS oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq2xxs_scalar(
         &self,
         a: &RocmStorage,
@@ -345,7 +345,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ2XS oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq2xs_scalar(
         &self,
         a: &RocmStorage,
@@ -442,7 +442,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ2_S oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq2s_scalar(
         &self,
         a: &RocmStorage,
@@ -541,7 +541,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ3_XXS oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq3xxs_scalar(
         &self,
         a: &RocmStorage,
@@ -681,7 +681,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ3_S oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq3s_scalar(
         &self,
         a: &RocmStorage,
@@ -799,7 +799,7 @@ impl RocmDevice {
     /// The original per-weight scalar IQ1_S GEMM, kept as the parity oracle for
     /// the grouped kernel (and as the fallback if the grouped one regresses).
     /// Only the parity gate calls it in-tree, hence the allow.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq1s_scalar(
         &self,
         a: &RocmStorage,
@@ -835,7 +835,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ1_M oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq1m_scalar(
         &self,
         a: &RocmStorage,
@@ -976,7 +976,7 @@ impl RocmDevice {
     }
 
     /// Scalar IQ4_XS oracle for the grouped kernel's parity gate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn launch_fused_dequant_gemm_iq4xs_scalar(
         &self,
         a: &RocmStorage,

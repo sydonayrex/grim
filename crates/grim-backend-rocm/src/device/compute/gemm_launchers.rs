@@ -4766,6 +4766,7 @@ pub fn last_captured_head_gemv_a() -> Option<usize> {
 /// ρ microbench entry: memory-free fp32-FMA (VALU) and f16-WMMA (TC) loops.
 /// Returns (cc_tflops, tc_tflops); ρ = tc/cc decides whether dequant-on-the-
 /// fly is structurally right for this silicon (APEX4 framework, old/res4).
+#[cfg(any(test, feature = "gpu-test-shims"))]
 pub fn rho_microbench_for_test(dev: &RocmDevice, iters: i32) -> Result<(f64, f64)> {
     use grim_tensor::CoreTensorOps;
     use std::time::Instant;

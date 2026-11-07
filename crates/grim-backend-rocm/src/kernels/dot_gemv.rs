@@ -5454,30 +5454,6 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_v2(
 
 #endif // RDNA3/RDNA4
 
-// RDNA2 ISA probe: v_dot4_i32_i8 semantics on known packed operands.
-extern "C" __global__ void grim_sdot4_probe(
-    const int* __restrict__ a_packed,
-    const int* __restrict__ b_packed,
-    float* __restrict__ out,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1035__) || defined(__gfx1036__)
-    int acc = __builtin_amdgcn_sdot4(a_packed[i], b_packed[i], 0, false);
-    // Chained + negative intermediate (mimics GEMV accumulation pattern).
-    acc = __builtin_amdgcn_sdot4(a_packed[i], b_packed[i], acc, false);
-    acc = __builtin_amdgcn_sdot4(b_packed[i], a_packed[i], -acc, false);
-    out[i] = (float)acc;
-#else
-    int acc = __builtin_amdgcn_sudot4(true, a_packed[i], true, b_packed[i], 0, false);
-    acc = __builtin_amdgcn_sudot4(true, a_packed[i], true, b_packed[i], acc, false);
-    acc = __builtin_amdgcn_sudot4(true, b_packed[i], true, a_packed[i], -acc, false);
-    out[i] = (float)acc;
-#endif
-    if (i == 0) out[n] = (float)warpSize; // wave-size report (buffer sized n+1)
-}
-
 // SPEED-DOT Phase 2 (9B perf plan Step 2): word-wide-mask variant of
 // grim_dot4_q4k_q81_gemv. The floor probe (tests/dot4_gemv_floor_probe.rs)
 // measured the stock kernel at ~23 GB/s vs ~304 GB/s for the q8_0 kernel

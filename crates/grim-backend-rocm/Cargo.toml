@@ -203,6 +203,7 @@ harness = true
 [[bench]]
 name = "m1_decode_regime_probe"
 harness = true
+required-features = ["gpu-test-shims"]
 
 [[bench]]
 name = "paged_whitecrow_bench"
@@ -223,6 +224,7 @@ harness = true
 [[bench]]
 name = "rdna4_rho_microbench"
 harness = true
+required-features = ["gpu-test-shims"]
 
 [[bench]]
 name = "rocblas_f16_gemm_bench"

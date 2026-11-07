@@ -216,6 +216,7 @@ pub use crate::decode_graph_buffers::{
     decode_graph_enabled, launch_attention, launch_attention_ring, launch_qkv_gemv,
     launch_qkv_gemv_ring, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
 };
+#[cfg(any(test, feature = "gpu-test-shims"))]
 pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::device::parallel_comm::{
     CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,
