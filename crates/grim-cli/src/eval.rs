@@ -98,6 +98,18 @@ fn chrono_like_now() -> String {
 }
 
 pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)> {
+    // The per-token NLL estimator below scores EVERY position of the window,
+    // which needs the model's full [seq, vocab] prefill logits. The default
+    // prefill path returns the LAST row only (the slicing optimization), which
+    // collapsed the vocab estimate to vocab/window_len and surfaced as
+    // "target token N out of vocab" (2026-11-07, 27B two-card gate). Models
+    // are loaded before this fn runs, so request full logits via the session
+    // skip flag's counterpart: the env is read inside qwen35's forward per
+    // call, and set here only when the caller did not opt out.
+    if std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_none() {
+        // SAFETY: single-threaded eval setup, before the first forward.
+        unsafe { std::env::set_var("GRIM_FULL_PREFILL_LOGITS", "1") };
+    }
     if tokens.len() < ppl_window() + 1 {
         return Err(Error::Config(format!(
             "corpus too small: { } tokens, need >= {}",
@@ -156,10 +168,27 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
         // ladders). Full-matrix readback is required; at window=256 the
         // block is 128 MB. GRIM_EVAL_LAST_ROW_ONLY=1 restores the old
         // single-target read for smoke runs.
-        let vocab = logits.shape().elem_count() / ctx.len().max(1);
-        let last_row_only = std::env::var("GRIM_EVAL_LAST_ROW_ONLY")
+        // Rows/vocab from the TENSOR SHAPE, never divided by the window
+        // length: qwen35 prefill returns [1, vocab] (last row only) unless
+        // GRIM_FULL_PREFILL_LOGITS is set, and dividing by ctx.len() produced
+        // a phantom vocab (this was the "target token out of vocab" defect).
+        let dims = logits.shape().dims().to_vec();
+        let (rows, vocab) = match dims.as_slice() {
+            [r, v] => (*r, *v),
+            [v] => (1, *v),
+            _ => (0, 0),
+        };
+        let env_last_row_only = std::env::var("GRIM_EVAL_LAST_ROW_ONLY")
             .map(|v| v != "0")
             .unwrap_or(false);
+        // A model that returned one row (env missed or a backend override)
+        // degrades to last-row scoring instead of misreading the buffer.
+        let last_row_only = env_last_row_only || rows <= 1;
+        if rows <= 1 && !env_last_row_only {
+            eprintln!(
+                "[eval] window {n_windows}: forward returned {rows} logit row(s)                  (last-row only); scoring the single next-token prediction.                  Set GRIM_FULL_PREFILL_LOGITS=1 for per-token scoring."
+            );
+        }
         if last_row_only {
             let all = logits.to_vec_f32()?;
             let v = all.len() / ctx.len().max(1);

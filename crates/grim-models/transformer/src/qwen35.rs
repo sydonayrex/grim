@@ -1106,20 +1106,28 @@ impl Qwen35Block {
                     let v_dev = cache.v_device.as_ref().ok_or_else(|| {
                         grim_core::error::Error::Backend("cache.v_device missing".into())
                     })?;
-                    arena_append_kv_rows(
-                        &dev,
-                        &device,
-                        k_dev.as_ref(),
-                        v_dev.as_ref(),
-                        evict.arena_row(cache.current_pos),
-                        k_rope.storage().as_ref(),
-                        v_dev_t.storage().as_ref(),
-                        seq_len,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        cache.k_scales_device.as_deref(),
-                        cache.v_scales_device.as_deref(),
-                    )?;
+                    // Ring-aware append: split into contiguous runs so no
+                    // launch ever writes past the arena's wrap boundary
+                    // (seq_len can exceed cap_rows during prefill windows).
+                    for (r, count, src_off) in
+                        ring_append_runs(|a| evict.arena_row(a), cache.current_pos, seq_len)
+                    {
+                        arena_append_kv_rows(
+                            &dev,
+                            &device,
+                            k_dev.as_ref(),
+                            v_dev.as_ref(),
+                            r,
+                            k_rope.storage().as_ref(),
+                            v_dev_t.storage().as_ref(),
+                            src_off,
+                            count,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            cache.k_scales_device.as_deref(),
+                            cache.v_scales_device.as_deref(),
+                        )?;
+                    }
                     if cache.current_pos == 24 {
                         use grim_backend_rocm::device::util::as_rocm;
                         if let Ok(rocm) = as_rocm(k_dev.as_ref()) {
@@ -1207,20 +1215,26 @@ impl Qwen35Block {
                         cache.k_device.as_ref().expect("just installed"),
                         cache.v_device.as_ref().expect("just installed"),
                     );
-                    arena_append_kv_rows(
-                        &dev,
-                        &device,
-                        k_g.as_ref(),
-                        v_g.as_ref(),
-                        cache.current_pos,
-                        k_rope.storage().as_ref(),
-                        v_dev_t.storage().as_ref(),
-                        seq_len,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        cache.k_scales_device.as_deref(),
-                        cache.v_scales_device.as_deref(),
-                    )?;
+                    // Ring-aware append (contiguous runs only).
+                    for (r, count, src_off) in
+                        ring_append_runs(|a| evict.arena_row(a), cache.current_pos, seq_len)
+                    {
+                        arena_append_kv_rows(
+                            &dev,
+                            &device,
+                            k_g.as_ref(),
+                            v_g.as_ref(),
+                            r,
+                            k_rope.storage().as_ref(),
+                            v_dev_t.storage().as_ref(),
+                            src_off,
+                            count,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            cache.k_scales_device.as_deref(),
+                            cache.v_scales_device.as_deref(),
+                        )?;
+                    }
                 }
 
                 // WS-4.3: CurDKV compaction at the eviction boundary. Survivors
@@ -3995,20 +4009,26 @@ fn attention_layer_d2d(
             .v_device
             .as_ref()
             .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
-        arena_append_kv_rows(
-            &dev,
-            &device,
-            k_dev.as_ref(),
-            v_dev.as_ref(),
-            evict.arena_row(cache.current_pos),
-            k_rope.storage().as_ref(),
-            v_dev_t.storage().as_ref(),
-            seq_len,
-            blk.num_kv_heads,
-            blk.head_dim,
-            cache.k_scales_device.as_deref(),
-            cache.v_scales_device.as_deref(),
-        )?;
+        // Ring-aware append: contiguous runs only (see ring_append_runs).
+        for (r, count, src_off) in
+            ring_append_runs(|a| evict.arena_row(a), cache.current_pos, seq_len)
+        {
+            arena_append_kv_rows(
+                &dev,
+                &device,
+                k_dev.as_ref(),
+                v_dev.as_ref(),
+                r,
+                k_rope.storage().as_ref(),
+                v_dev_t.storage().as_ref(),
+                src_off,
+                count,
+                blk.num_kv_heads,
+                blk.head_dim,
+                cache.k_scales_device.as_deref(),
+                cache.v_scales_device.as_deref(),
+            )?;
+        }
     } else {
         // Growth is clamped to the eviction capacity: past it the arena is
         // reused, never resized, so the KV footprint is a known quantity.
@@ -4064,20 +4084,26 @@ fn attention_layer_d2d(
             cache.k_device.as_ref().expect("just installed"),
             cache.v_device.as_ref().expect("just installed"),
         );
-        arena_append_kv_rows(
-            &dev,
-            &device,
-            k_g.as_ref(),
-            v_g.as_ref(),
-            cache.current_pos,
-            k_rope.storage().as_ref(),
-            v_dev_t.storage().as_ref(),
-            seq_len,
-            blk.num_kv_heads,
-            blk.head_dim,
-            cache.k_scales_device.as_deref(),
-            cache.v_scales_device.as_deref(),
-        )?;
+        // Ring-aware append: contiguous runs only (see ring_append_runs).
+        for (r, count, src_off) in
+            ring_append_runs(|a| evict.arena_row(a), cache.current_pos, seq_len)
+        {
+            arena_append_kv_rows(
+                &dev,
+                &device,
+                k_g.as_ref(),
+                v_g.as_ref(),
+                r,
+                k_rope.storage().as_ref(),
+                v_dev_t.storage().as_ref(),
+                src_off,
+                count,
+                blk.num_kv_heads,
+                blk.head_dim,
+                cache.k_scales_device.as_deref(),
+                cache.v_scales_device.as_deref(),
+            )?;
+        }
     }
 
     stage!("arena_append");
@@ -5243,6 +5269,34 @@ type KvStor<'a> = &'a dyn grim_tensor::BackendStorage;
 /// rather than a raw byte copy. K and V always share the format, so one
 /// decision covers both.
 #[allow(clippy::too_many_arguments)]
+/// Split an append of `n` token rows starting at absolute row `start` into
+/// CONTIGUOUS arena runs under the ring map. The eager append kernels write
+/// consecutive rows from a base offset, so a run must never cross the ring
+/// wrap — writing `seq_len` rows from the wrapped base overflows the arena
+/// when `seq_len` exceeds the live span (the cap-47 / window-2048 eval fault,
+/// 2026-11-07). Returns (arena_row, count, src_row_off) triples; the source
+/// rows are consumed in order.
+fn ring_append_runs(
+    arena_row: impl Fn(usize) -> usize,
+    start: usize,
+    n: usize,
+) -> Vec<(usize, usize, usize)> {
+    let mut runs = Vec::new();
+    let mut t = start;
+    let mut done = 0usize;
+    while done < n {
+        let r0 = arena_row(t);
+        let mut k = 1usize;
+        while done + k < n && arena_row(t + k) == r0 + k {
+            k += 1;
+        }
+        runs.push((r0, k, done));
+        t += k;
+        done += k;
+    }
+    runs
+}
+
 fn arena_append_kv_rows<'a>(
     dev: &Arc<dyn grim_tensor::BackendDevice>,
     device: &Device,
@@ -5251,6 +5305,7 @@ fn arena_append_kv_rows<'a>(
     row_off: usize,
     k_src: KvStor<'a>,
     v_src: KvStor<'a>,
+    src_row_off: usize,
     n_tok_rows: usize,
     nkv: usize,
     head_dim: usize,
@@ -5281,7 +5336,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
             rocm.as_ref(),
             k_src,
-            0,
+            src_row_off,
             k_dst,
             dst_off,
             n_tok_rows,
@@ -5293,7 +5348,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
             rocm.as_ref(),
             v_src,
-            0,
+            src_row_off,
             v_dst,
             dst_off,
             n_tok_rows,
@@ -5306,8 +5361,9 @@ fn arena_append_kv_rows<'a>(
     }
     if !matches!(format, F::Int8 | F::Int4 | F::Int2V4) {
         let dst_off = row_off * stride;
-        arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, 0, kv_elems)?;
-        arena_append_from_f32(dev.as_ref(), v_dst, dst_off, v_src, 0, kv_elems)?;
+        let src_off = src_row_off * stride;
+        arena_append_from_f32(dev.as_ref(), k_dst, dst_off, k_src, src_off, kv_elems)?;
+        arena_append_from_f32(dev.as_ref(), v_dst, dst_off, v_src, src_off, kv_elems)?;
         return Ok(());
     }
     let ksc = k_scales.ok_or_else(|| {
@@ -5341,7 +5397,7 @@ fn arena_append_kv_rows<'a>(
             grim_backend_rocm::launch_kv_quantize_rows_i2(
                 rocm.as_ref(),
                 k_src,
-                0,
+                src_row_off,
                 k_dst,
                 k_off_bytes,
                 ksc,
@@ -5356,7 +5412,7 @@ fn arena_append_kv_rows<'a>(
             grim_backend_rocm::launch_kv_quantize_rows_i4(
                 rocm.as_ref(),
                 k_src,
-                0,
+                src_row_off,
                 k_dst,
                 k_off_bytes,
                 ksc,
@@ -5371,7 +5427,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_i4(
             rocm.as_ref(),
             v_src,
-            0,
+            src_row_off,
             v_dst,
             v_off_bytes,
             vsc,
@@ -5387,7 +5443,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_i8(
             rocm.as_ref(),
             k_src,
-            0,
+            src_row_off,
             k_dst,
             dst_off,
             ksc,
@@ -5401,7 +5457,7 @@ fn arena_append_kv_rows<'a>(
         grim_backend_rocm::launch_kv_quantize_rows_i8(
             rocm.as_ref(),
             v_src,
-            0,
+            src_row_off,
             v_dst,
             dst_off,
             vsc,
@@ -6533,6 +6589,39 @@ mod tests {
     /// same work on a 4x-slower GPU. This is the seam the in-bone capability
     /// system exists to close - Scythe2 measures `GpuCapability`, and
     /// `plan_layer_devices` was discarding every field of it except VRAM.
+    /// The cap-47/window-2048 eval fault (2026-11-07): the eager append wrote
+    /// seq_len contiguous rows from the wrapped base — past the arena end.
+    /// ring_append_runs must split at EVERY wrap so no run crosses the arena
+    /// end, and each run's source offset must consume rows in order.
+    #[test]
+    fn ring_append_runs_never_crosses_the_wrap() {
+        let cap = 47usize;
+        let sinks = 2usize;
+        let ring = |a: usize| grim_backend_rocm::KvRingPolicy::new(cap, sinks).row(a);
+        for (start, n) in [
+            (0usize, 47usize),
+            (46, 10),
+            (2048, 2048),
+            (1000, 1),
+            (0, 5000),
+        ] {
+            let runs = ring_append_runs(&ring, start, n);
+            assert_eq!(runs.iter().map(|(_, c, _)| *c).sum::<usize>(), n);
+            let mut expected_src = 0usize;
+            for (r, c, src) in &runs {
+                assert_eq!(*src, expected_src);
+                // every arena row of the run stays inside [sinks, cap) — no
+                // run crosses the wrap
+                for k in 0..*c {
+                    let row = ring(start + src + k);
+                    assert_eq!(row, r + k, "run not contiguous at abs {}", start + src + k);
+                    assert!(row < cap, "row {row} outside the arena (cap {cap})");
+                }
+                expected_src += c;
+            }
+        }
+    }
+
     #[test]
     fn placement_follows_measured_capability_not_only_free_vram() {
         let layers = vec![100u64; 8];

@@ -1408,6 +1408,53 @@ nodes / STEP3-DEDUP 1327), LOGITS-GATE and Task-0.5 PPL-512 bit-identical
 82.9 ms / cold 82.7 ms (vs the 92.6 ms AE75E0C6 baseline), structure
 share 4.1% (<50% band: node reduction remains the lever).
 
+## 9b. Phase 3 remaining closure — ring-during-prefill fault + PPL gate (2026-11-07)
+
+The plan's last Phase 3 REMAINING ("root-cause the 27B decode regression, then
+re-run the 27B PPL-at-cap-47 gate") closed with two distinct root causes on top
+of 7ca66aba:
+
+1. **Decode fault (cross-device sampling)** — resolved 2026-11-03 (`7ca66aba`).
+   Re-verified 2026-11-07 on HEAD: `GRIM_SPLIT_LAYERS=32,32` two-card decode
+   runs clean, exit 0, zero faults (was 3/3 page faults).
+2. **NEW: eager ring append overflowed the arena** — `GRIM_KV_ARENA_ROWS=47`
+   faulted the GPU (dev1, "Page not present") whenever a single prefill
+   forward exceeded the cap (eval default window 2048 >> 47 rows). Root
+   cause: `arena_append_kv_rows` wrote `seq_len` CONTIGUOUS rows from the
+   WRAPPED base `evict.arena_row(current_pos)`; the graph append is
+   ring-aware per row (`grim_kv_ring_row` in-kernel) but the eager append
+   was not. The 9B eviction sweep only exercised 1-token decode appends, so
+   this was never covered. Fix: `ring_append_runs` splits the append into
+   contiguous runs that never cross the wrap (unit test
+   `ring_append_runs_never_crosses_the_wrap`); all 4 eager append sites loop
+   over runs.
+3. **Eval PPL harness defect** — `compute_ppl` divided the logits element
+   count by the window length, but qwen35 prefill returns LAST-ROW-ONLY
+   logits (the slicing optimization), collapsing the phantom vocab below the
+   target id ("target token 283 out of vocab"). Fix: eval requests
+   `GRIM_FULL_PREFILL_LOGITS=1` for per-position scoring and derives
+   rows/vocab from the TENSOR SHAPE with a last-row fallback.
+
+**PPL-at-cap-47 gate (27B, `GRIM_SPLIT_LAYERS=32,32 GRIM_PREFILL_CHUNK_SIZE=256
+GRIM_CONTEXT=4096`, wikitext2 sample, 8 windows x 2048 tokens): fault-free,
+PPL 18.50 (16384 scored tokens). Uncapped control: PPL 6.12.** The gap is the
+legitimate eviction effect: a 47-row ring retains ~2 sinks + 45 recent rows of
+a 2048-token window, so nearly all scored positions see evicted context.
+Fault-free completion is the M3 gate; the 9B single-card numbers in section 9
+remain the correctness reference.
+
+Default-split note (unchanged, capacity not placement): with no
+`GRIM_SPLIT_LAYERS`, the planner reports `12/64 layers exceed aggregate
+plannable VRAM` (90% plan fraction + embed/head + per-layer graph reserve) and
+degrades them to managed memory; decode then fails loud on a 178 MB workspace
+alloc (`GRIM_ROCM_MANAGED_FALLBACK=deny` default). No layer split fixes an
+AGGREGATE shortfall — this is Task 4.2 policy territory, not a Phase 3 defect.
+
+Pre-existing failures recorded (NOT from the ring fix; verified identical
+with the fix stashed, 14/2 on HEAD `cab5c94f`):
+`qwen35_attention_device_path_engages_and_matches_host` (step-0 host/device
+attention divergence 1.922e0) and `graph_int4_kv_arena_is_half_of_int8`.
+
 ## 10. Task 2.3 Step 0 — KV-quant census (2026-11-03)
 
 Env vars / branches selecting the KV representation (crates/grim-models/transformer/src/):
