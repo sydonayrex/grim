@@ -24,6 +24,45 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *V2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_MXFP4_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if v2 {
+            return self.launch_mxfp4_gemm_v2_for_ab(
+                a_storage,
+                b_codes_ptr,
+                b_exps_ptr,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
+        self.launch_mxfp4_gemm_v1_for_ab(
+            a_storage,
+            b_codes_ptr,
+            b_exps_ptr,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn launch_mxfp4_gemm_v1_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_codes_ptr: u64,
+        b_exps_ptr: u64,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
         // The kernels read activations as float4 and codes as uint4; both
         // require K to be a multiple of 32 (one MXFP4 micro-block).
         if k % 32 != 0 {
@@ -66,6 +105,67 @@ impl RocmDevice {
 
         self.launch_compute_kernel(
             "grim_mxfp4_gemm_tiled",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bcodesptr),
+                arg(&mut bexpsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    pub fn launch_mxfp4_gemm_v2_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_codes_ptr: u64,
+        b_exps_ptr: u64,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "mxfp4_gemm_tiled: K must be a multiple of 32, got {k}"
+            )));
+        }
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: a has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: out has no device ptr".into()))?;
+
+        let (kernel_name, grid_dim, block_dim) = if m == 1 {
+            (
+                "grim_mxfp4_gemv_v2",
+                HipDim3::new(n.div_ceil(16) as u32, 1, 1),
+                HipDim3::new(128, 1, 1),
+            )
+        } else {
+            (
+                "grim_mxfp4_gemm_rows_r8",
+                HipDim3::new(n.div_ceil(4) as u32, m.div_ceil(8) as u32, 1),
+                HipDim3::new(32, 1, 1),
+            )
+        };
+
+        let mut aptr = a_ptr;
+        let mut bcodesptr = b_codes_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        crate::device::compute::kernel_infra::record_kernel_route("grim_mxfp4_gemm_tiled");
+        self.launch_compute_kernel(
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [

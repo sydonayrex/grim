@@ -3231,3 +3231,384 @@ fn iq4xs_gemv_rows_parity_and_speed() {
         }
     }
 }
+
+/// Corvid v9 upgrades (Raven FP8, ForestRaven, TreePie, ScrubJay, Rook MXFP4):
+/// Verifies bit-exact or IEEE-754 parity and runs warm/cold A/B throughput benchmarks
+/// across M=1 and M=8 shapes.
+#[test]
+#[ignore = "requires AMD GPU; run with GRIM_RUN_GPU_TEST=1 HIP_VISIBLE_DEVICES=0"]
+fn corvid_v9_raven_treepie_scrubjay_rook_parity_and_ab() -> Result<(), String> {
+    if std::env::var("GRIM_RUN_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set GRIM_RUN_GPU_TEST=1 to run");
+        return Ok(());
+    }
+    let dev = RocmDevice::try_new(0).map_err(|e| format!("no ROCm device: {e}"))?;
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] requires RDNA4 (gfx1200/gfx1201)");
+        return Ok(());
+    }
+    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let f16ty = DType { arith: ArithType::F16, storage: Storage::Native };
+    let u32ty = DType { arith: ArithType::U32, storage: Storage::Native };
+    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+
+    const ROT: usize = 8;
+    const WARMUP: usize = 8;
+    const ITERS: usize = 64;
+
+    println!("\n{:<20} {:<15} {:>10} {:>10} {:>7} | {:>10} {:>10} {:>7}",
+        "family", "shape(NxKxM)", "warm_v1", "warm_v9", "w_spdup", "cold_v1", "cold_v9", "c_spdup");
+    println!("{}", "-".repeat(98));
+
+    // 1. Raven FP8 (`grim_dot4_fp8_gemv` vs `v2` (M=1) and `rows_r8` (M=8))
+    for &(n, k, m) in &[(4096usize, 5120usize, 1usize), (4096, 5120, 8), (17408, 5120, 8)] {
+        let mut rng = Lcg(0xBEEF_0001 ^ (n as u64) ^ ((k as u64) << 16) ^ ((m as u64) << 32));
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let b_fp8: Vec<u8> = (0..n * k).map(|i| (((i * 13 + 7) % 96) + 0x10) as u8).collect();
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let b_sts: Vec<_> = (0..ROT)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![n * k]), u8ty.clone()))
+            .collect::<grim_tensor::Result<_>>()
+            .map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_r = as_rocm(a_st.as_ref()).unwrap();
+        let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
+        let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
+
+        dev.launch_dot4_fp8_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot4_fp8_gemv_for_ab(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.synchronize();
+        let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(diffs, 0, "raven_fp8 v8/v9 not bit-identical to v1 at {n}x{k}x{m}");
+
+        let bytes = (n * k + m * k * 4 + m * n * 4) as f64;
+        for _ in 0..WARMUP {
+            dev.launch_dot4_fp8_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).unwrap();
+            dev.launch_dot4_fp8_gemv_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap();
+        }
+        dev.synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS { dev.launch_dot4_fp8_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS { dev.launch_dot4_fp8_gemv_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let w_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS { dev.launch_dot4_fp8_gemv_v1_for_ab(a_r, b_rs[i % ROT], o1_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS { dev.launch_dot4_fp8_gemv_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let c_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        println!("{:<20} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x",
+            "raven_fp8", format!("{n}x{k}x{m}"), w_v1, w_v9, w_v9 / w_v1, c_v1, c_v9, c_v9 / c_v1);
+    }
+
+    // 2. ForestRaven (`grim_dot4_forest_gemv` vs `v2` (M=1) and `rows_r8` (M=8))
+    for &(n, k, m) in &[(4096usize, 5120usize, 1usize), (4096, 5120, 8), (17408, 5120, 8)] {
+        let mut rng = Lcg(0xBEEF_0002 ^ (n as u64) ^ ((k as u64) << 16) ^ ((m as u64) << 32));
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let blob_len = 16 + n * k + 4 * n;
+        let mut blob = vec![0u8; blob_len];
+        for i in 0..(n * k) { blob[8 + i] = ((i * 7 + 3) % 200) as u8; }
+        for j in 0..n {
+            let sc = 0.01f32 * (1.0 + (j % 17) as f32 * 0.1);
+            blob[16 + n * k + j * 4..16 + n * k + (j + 1) * 4].copy_from_slice(&sc.to_le_bytes());
+        }
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone())
+            .map_err(|e| e.to_string())?;
+        let b_sts: Vec<_> = (0..ROT)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, &blob, &Shape::new(vec![blob_len]), u8ty.clone()))
+            .collect::<grim_tensor::Result<_>>()
+            .map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_r = as_rocm(a_st.as_ref()).unwrap();
+        let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
+        let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
+
+        dev.launch_dot4_forest_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.launch_dot4_forest_gemv(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        dev.synchronize();
+        let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(diffs, 0, "forest_raven v8/v9 not bit-identical to v1 at {n}x{k}x{m}");
+
+        let bytes = (blob_len + m * k * 4 + m * n * 4) as f64;
+        for _ in 0..WARMUP {
+            dev.launch_dot4_forest_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).unwrap();
+            dev.launch_dot4_forest_gemv(a_r, b_rs[0], o2_r, m, n, k).unwrap();
+        }
+        dev.synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS { dev.launch_dot4_forest_gemv_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS { dev.launch_dot4_forest_gemv(a_r, b_rs[0], o2_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let w_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS { dev.launch_dot4_forest_gemv_v1_for_ab(a_r, b_rs[i % ROT], o1_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS { dev.launch_dot4_forest_gemv(a_r, b_rs[i % ROT], o2_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let c_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        println!("{:<20} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x",
+            "forest_raven", format!("{n}x{k}x{m}"), w_v1, w_v9, w_v9 / w_v1, c_v1, c_v9, c_v9 / c_v1);
+    }
+
+    // 3. TreePie (`grim_tree_pie_gemv` vs `v2` at M=1, and `grim_tree_pie_gemm` vs `v2` at M=8)
+    for &(n, k, m) in &[(17408usize, 5120usize, 1usize), (17408, 5120, 8)] {
+        let mut rng = Lcg(0xBEEF_0003 ^ (n as u64) ^ ((k as u64) << 16) ^ ((m as u64) << 32));
+        let a_f16: Vec<u16> = (0..m * k).map(|_| half::f16::from_f32(rng.next_f32()).to_bits()).collect();
+        let w_f32: Vec<f32> = (0..n * k).map(|_| rng.next_f32() * 6.0).collect();
+        let packed_i32 = grim_quant::tree_pie::pack_tree_pie(&w_f32);
+        let packed_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(packed_i32.as_ptr() as *const u8, packed_i32.len() * 4)
+        };
+        let a_bytes: Vec<u8> = a_f16.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let a_st = MemoryOps::from_cpu_bytes(&dev, &a_bytes, &Shape::new(vec![m * k]), f16ty.clone())
+            .map_err(|e| e.to_string())?;
+        let b_sts: Vec<_> = (0..ROT)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, packed_bytes, &Shape::new(vec![packed_i32.len()]), u32ty.clone()))
+            .collect::<grim_tensor::Result<_>>()
+            .map_err(|e| e.to_string())?;
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).map_err(|e| e.to_string())?;
+        let a_r = as_rocm(a_st.as_ref()).unwrap();
+        let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
+        let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
+
+        if m == 1 {
+            dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o1_r, n, k).map_err(|e| e.to_string())?;
+            dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k).map_err(|e| e.to_string())?;
+        } else {
+            dev.launch_tree_pie_gemm_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).map_err(|e| e.to_string())?;
+            dev.launch_tree_pie_gemm_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).map_err(|e| e.to_string())?;
+        }
+        dev.synchronize();
+        let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+        let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(diffs, 0, "tree_pie v2 not bit-identical to v1 at {n}x{k}x{m}");
+
+        let row_bytes = (k / 32) * 20;
+        let bytes = (n * row_bytes + m * k * 2 + m * n * 4) as f64;
+        for _ in 0..WARMUP {
+            if m == 1 {
+                dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o1_r, n, k).unwrap();
+                dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k).unwrap();
+            } else {
+                dev.launch_tree_pie_gemm_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).unwrap();
+                dev.launch_tree_pie_gemm_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap();
+            }
+        }
+        dev.synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            if m == 1 { dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[0], o1_r, n, k).unwrap(); }
+            else { dev.launch_tree_pie_gemm_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            if m == 1 { dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[0], o2_r, n, k).unwrap(); }
+            else { dev.launch_tree_pie_gemm_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let w_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS {
+            if m == 1 { dev.launch_tree_pie_gemv_v1_for_ab(a_r, b_rs[i % ROT], o1_r, n, k).unwrap(); }
+            else { dev.launch_tree_pie_gemm_v1_for_ab(a_r, b_rs[i % ROT], o1_r, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS {
+            if m == 1 { dev.launch_tree_pie_gemv_v2_for_ab(a_r, b_rs[i % ROT], o2_r, n, k).unwrap(); }
+            else { dev.launch_tree_pie_gemm_v2_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let c_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        println!("{:<20} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x",
+            "tree_pie", format!("{n}x{k}x{m}"), w_v1, w_v9, w_v9 / w_v1, c_v1, c_v9, c_v9 / c_v1);
+    }
+
+    // 4. ScrubJay (`grim_scrub_jay_gemv` vs `v2` at M=1, and `gemm_tiled` vs `rows_v9` at M=8)
+    for &(n, k, m) in &[(4096usize, 5120usize, 1usize), (4096, 5120, 8), (17408, 5120, 8)] {
+        let mut rng = Lcg(0xBEEF_0004 ^ (n as u64) ^ ((k as u64) << 16) ^ ((m as u64) << 32));
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let n_blocks = n * (k / 8);
+        let sel_v: Vec<u8> = (0..n_blocks).map(|i| (i % 16) as u8).collect();
+        let idx_v: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
+        let sgn_v: Vec<u8> = (0..n_blocks).map(|i| ((i * 29 + 5) & 0xFF) as u8).collect();
+        let scl_v: Vec<f32> = (0..n_blocks).map(|i| 0.02f32 * (1.0 + (i % 11) as f32 * 0.1)).collect();
+        let pre = 0.5f32;
+
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).unwrap();
+        let sel_st = MemoryOps::from_cpu_bytes(&dev, &sel_v, &Shape::new(vec![n_blocks]), u8ty.clone()).unwrap();
+        let sgn_st = MemoryOps::from_cpu_bytes(&dev, &sgn_v, &Shape::new(vec![n_blocks]), u8ty.clone()).unwrap();
+        let scl_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&scl_v), &Shape::new(vec![n_blocks]), f32ty.clone()).unwrap();
+        let idx_sts: Vec<_> = (0..ROT)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, &idx_v, &Shape::new(vec![n * k]), u8ty.clone()).unwrap())
+            .collect();
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).unwrap();
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).unwrap();
+
+        let a_r = as_rocm(a_st.as_ref()).unwrap();
+        let sel_r = as_rocm(sel_st.as_ref()).unwrap();
+        let sgn_r = as_rocm(sgn_st.as_ref()).unwrap();
+        let scl_r = as_rocm(scl_st.as_ref()).unwrap();
+        let idx_rs: Vec<_> = idx_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
+        let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
+
+        if m == 1 {
+            dev.launch_scrub_jay_gemv_v1_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o1_r, pre, n, k).unwrap();
+            dev.launch_scrub_jay_gemv_v2_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o2_r, pre, n, k).unwrap();
+            dev.synchronize();
+            let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+            let diffs = v1_out.iter().zip(&v2_out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            assert_eq!(diffs, 0, "scrub_jay_gemv_v2 not bit-identical to v1 at {n}x{k}");
+        } else {
+            dev.launch_scrub_jay_gemm_v1_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o1_r, pre, m, n, k).unwrap();
+            dev.launch_scrub_jay_gemm_v9_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o2_r, pre, m, n, k).unwrap();
+            dev.synchronize();
+            let (v1_out, v9_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+            let max_abs = v1_out.iter().fold(0.0f32, |mx, v| mx.max(v.abs())).max(1e-6);
+            for (x, y) in v1_out.iter().zip(&v9_out) {
+                assert!((x - y).abs() / max_abs <= 1e-4, "scrub_jay_gemm_v9 diverged: {x} vs {y}");
+            }
+        }
+
+        let bytes = (n * k + n_blocks * 6 + m * k * 4 + m * n * 4) as f64;
+        for _ in 0..WARMUP {
+            if m == 1 {
+                dev.launch_scrub_jay_gemv_v1_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o1_r, pre, n, k).unwrap();
+                dev.launch_scrub_jay_gemv_v2_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o2_r, pre, n, k).unwrap();
+            } else {
+                dev.launch_scrub_jay_gemm_v1_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o1_r, pre, m, n, k).unwrap();
+                dev.launch_scrub_jay_gemm_v9_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o2_r, pre, m, n, k).unwrap();
+            }
+        }
+        dev.synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            if m == 1 { dev.launch_scrub_jay_gemv_v1_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o1_r, pre, n, k).unwrap(); }
+            else { dev.launch_scrub_jay_gemm_v1_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o1_r, pre, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            if m == 1 { dev.launch_scrub_jay_gemv_v2_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o2_r, pre, n, k).unwrap(); }
+            else { dev.launch_scrub_jay_gemm_v9_for_ab(a_r, sel_r, idx_rs[0], sgn_r, scl_r, o2_r, pre, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let w_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS {
+            if m == 1 { dev.launch_scrub_jay_gemv_v1_for_ab(a_r, sel_r, idx_rs[i % ROT], sgn_r, scl_r, o1_r, pre, n, k).unwrap(); }
+            else { dev.launch_scrub_jay_gemm_v1_for_ab(a_r, sel_r, idx_rs[i % ROT], sgn_r, scl_r, o1_r, pre, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS {
+            if m == 1 { dev.launch_scrub_jay_gemv_v2_for_ab(a_r, sel_r, idx_rs[i % ROT], sgn_r, scl_r, o2_r, pre, n, k).unwrap(); }
+            else { dev.launch_scrub_jay_gemm_v9_for_ab(a_r, sel_r, idx_rs[i % ROT], sgn_r, scl_r, o2_r, pre, m, n, k).unwrap(); }
+        }
+        dev.synchronize();
+        let c_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        println!("{:<20} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x",
+            "scrub_jay", format!("{n}x{k}x{m}"), w_v1, w_v9, w_v9 / w_v1, c_v1, c_v9, c_v9 / c_v1);
+    }
+
+    // 5. Rook MXFP4 (`launch_mxfp4_gemm_v1_for_ab` vs `launch_mxfp4_gemm_v2_for_ab` at M=1, M=8, M=16)
+    for &(n, k, m) in &[(4096usize, 5120usize, 1usize), (4096, 5120, 8), (17408, 5120, 8), (17408, 5120, 16)] {
+        let mut rng = Lcg(0xBEEF_0005 ^ (n as u64) ^ ((k as u64) << 16) ^ ((m as u64) << 32));
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
+        let codes_len = n * (k / 2);
+        let exps_len = n * (k / 32);
+        let codes_v: Vec<u8> = (0..codes_len).map(|i| ((i * 37 + 11) & 0xFF) as u8).collect();
+        let exps_v: Vec<u8> = (0..exps_len).map(|i| (124 + (i % 5)) as u8).collect();
+
+        let a_st = MemoryOps::from_cpu_bytes(&dev, f32_bytes(&a), &Shape::new(vec![m * k]), f32ty.clone()).unwrap();
+        let exps_st = MemoryOps::from_cpu_bytes(&dev, &exps_v, &Shape::new(vec![exps_len]), u8ty.clone()).unwrap();
+        let codes_sts: Vec<_> = (0..ROT)
+            .map(|_| MemoryOps::from_cpu_bytes(&dev, &codes_v, &Shape::new(vec![codes_len]), u8ty.clone()).unwrap())
+            .collect();
+        let o1 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).unwrap();
+        let o2 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![m * n]), f32ty.clone()).unwrap();
+
+        let a_r = as_rocm(a_st.as_ref()).unwrap();
+        let exps_ptr = as_rocm(exps_st.as_ref()).unwrap().device_ptr().unwrap() as u64;
+        let codes_ptrs: Vec<u64> = codes_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap().device_ptr().unwrap() as u64).collect();
+        let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
+
+        dev.launch_mxfp4_gemm_v1_for_ab(a_r, codes_ptrs[0], exps_ptr, o1_r, m, n, k).unwrap();
+        dev.launch_mxfp4_gemm_v2_for_ab(a_r, codes_ptrs[0], exps_ptr, o2_r, m, n, k).unwrap();
+        dev.synchronize();
+        let (v1_out, v2_out) = (f32_vec(&o1)?, f32_vec(&o2)?);
+        let max_abs = v1_out.iter().fold(0.0f32, |mx, v| mx.max(v.abs())).max(1e-6);
+        for (x, y) in v1_out.iter().zip(&v2_out) {
+            assert!((x - y).abs() / max_abs <= 1e-4, "rook mxfp4 v2 diverged: {x} vs {y}");
+        }
+
+        let bytes = (codes_len + exps_len + m * k * 4 + m * n * 4) as f64;
+        for _ in 0..WARMUP {
+            dev.launch_mxfp4_gemm_v1_for_ab(a_r, codes_ptrs[0], exps_ptr, o1_r, m, n, k).unwrap();
+            dev.launch_mxfp4_gemm_v2_for_ab(a_r, codes_ptrs[0], exps_ptr, o2_r, m, n, k).unwrap();
+        }
+        dev.synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS { dev.launch_mxfp4_gemm_v1_for_ab(a_r, codes_ptrs[0], exps_ptr, o1_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let w_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS { dev.launch_mxfp4_gemm_v2_for_ab(a_r, codes_ptrs[0], exps_ptr, o2_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let w_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS { dev.launch_mxfp4_gemm_v1_for_ab(a_r, codes_ptrs[i % ROT], exps_ptr, o1_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let c_v1 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        let t0 = std::time::Instant::now();
+        for i in 0..ITERS { dev.launch_mxfp4_gemm_v2_for_ab(a_r, codes_ptrs[i % ROT], exps_ptr, o2_r, m, n, k).unwrap(); }
+        dev.synchronize();
+        let c_v9 = bytes / (t0.elapsed().as_secs_f64() / ITERS as f64) / 1e9;
+
+        println!("{:<20} {:<15} {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x | {:>7.1} GB/s {:>7.1} GB/s {:>6.3}x",
+            "rook_mxfp4", format!("{n}x{k}x{m}"), w_v1, w_v9, w_v9 / w_v1, c_v1, c_v9, c_v9 / c_v1);
+    }
+
+    Ok(())
+}

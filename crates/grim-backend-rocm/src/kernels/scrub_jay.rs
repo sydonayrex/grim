@@ -31,7 +31,7 @@ pub const KERNEL_SOURCE: &str = r#"
 /// here is silent, because the decode is table-driven and still returns
 /// plausible numbers. `scrub_jay_gpu.rs` pins this table against the host
 /// constant so a drift cannot reach hardware.
-__constant__ static const signed char GRIM_SCRUB_JAY_CB[256] = {
+__constant__ static const signed char __attribute__((aligned(16))) GRIM_SCRUB_JAY_CB[256] = {
      1,  8, 11, 14, 16, 18, 20, 21, 23, 24, 25, 27, 28, 29, 30, 31,   // book 0
      0,  1,  9, 12, 14, 16, 18, 20, 21, 23, 24, 26, 27, 28, 30, 31,   // book 1
      0,  1,  8, 10, 12, 14, 16, 18, 20, 22, 23, 25, 27, 28, 30, 31,   // book 2
@@ -49,6 +49,23 @@ __constant__ static const signed char GRIM_SCRUB_JAY_CB[256] = {
      0,  1,  1,  1,  2,  2,  5,  7,  9, 12, 14, 17, 20, 24, 27, 31,   // book 14
      0,  1,  1,  1,  2,  2,  5,  7,  9, 11, 14, 17, 20, 23, 27, 31,   // book 15
 };
+
+// v7/v9 word-wide VALU codebook lookup: given 4 unpacked 4-bit indices packed into
+// the 4 bytes of `idx4` (`0..15`) and a 16-byte codebook row in `cb` (`uint4`),
+// returns the 4 corresponding codebook entries packed into the 4 bytes of the
+// output word using a single `__builtin_amdgcn_perm` pair (zero divergent scalar
+// constant-cache sub-dword loads).
+__device__ __forceinline__ unsigned int grim_sj_lookup4_valu(
+    unsigned int idx4,
+    uint4 cb)
+{
+    const unsigned int sel  = idx4 & 0x07070707u;
+    const unsigned int lo   = __builtin_amdgcn_perm(cb.y, cb.x, sel);
+    const unsigned int hi   = __builtin_amdgcn_perm(cb.w, cb.z, sel);
+    const unsigned int h    = (idx4 >> 3) & 0x01010101u;
+    const unsigned int m_hi = h * 0xFFu;
+    return (lo & ~m_hi) | (hi & m_hi);
+}
 
 /// Values per ScrubJay block.
 #define GRIM_SJ_BLOCK 8
@@ -97,6 +114,76 @@ extern "C" __global__ void grim_scrub_jay_gemv(
         facc += bacc;
     }
 
+    for (int off = 16; off > 0; off >>= 1)
+        facc += __shfl_xor(facc, off);
+    if (lane == 0) C[col] = facc;
+}
+
+// ScrubJay v2 decode GEMV (v8/v9 architecture):
+// - 4-wave CTA (`__launch_bounds__(128)`, 4 columns per CTA, 1 column per wave):
+//   keeps per-lane VGPR footprint minimal (no 4-column index/selector spilling)
+//   while packing 4 waves per CTA and using `uint2` (8-byte) index loads +
+//   `float4` activation loads + `grim_sj_lookup4_valu` (`__builtin_amdgcn_perm`)
+//   codebook decode with B-first load ordering.
+// - Preserves exact per-lane `blk` and `j=0..7` accumulation order of `v1` (0 bit diffs).
+extern "C" __global__ void __launch_bounds__(128) grim_scrub_jay_gemv_v2(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_sel,
+    const unsigned char* __restrict__ B_idx,
+    const unsigned char* __restrict__ B_sgn,
+    const float* __restrict__ B_scl,
+    float pre,
+    float* __restrict__ C,
+    int N, int K)
+{
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int col  = blockIdx.x * 4 + wave;
+    if (col >= N) return;
+
+    const int n_blocks = K / GRIM_SJ_BLOCK;
+    const long long blk_base = (long long)col * n_blocks;
+    const uint2* idx_v2 = (const uint2*)(B_idx + (long long)col * K);
+    const float4* a_v4  = (const float4*)A;
+    const uint4* cb_v4  = (const uint4*)GRIM_SCRUB_JAY_CB;
+
+    float facc = 0.0f;
+    for (int blk = lane; blk < n_blocks; blk += 32) {
+        // v8 B-first load ordering: issue B loads before A loads.
+        const long long bi = blk_base + blk;
+        const int sel      = B_sel[bi];
+        const unsigned sg  = B_sgn[bi];
+        const float sc     = B_scl[bi] * pre;
+        const uint2 idx2   = idx_v2[blk];
+
+        const float4 av0 = a_v4[blk * 2 + 0];
+        const float4 av1 = a_v4[blk * 2 + 1];
+        const float a_blk[8] = {
+            av0.x, av0.y, av0.z, av0.w,
+            av1.x, av1.y, av1.z, av1.w
+        };
+
+        const uint4 cb = cb_v4[sel];
+        const unsigned int w_lo = grim_sj_lookup4_valu(idx2.x, cb);
+        const unsigned int w_hi = grim_sj_lookup4_valu(idx2.y, cb);
+
+        float bacc = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float w = (float)((w_lo >> (j * 8)) & 0xFFu);
+            if (sg & (1u << j)) w = -w;
+            bacc += a_blk[j] * (w * sc);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float w = (float)((w_hi >> (j * 8)) & 0xFFu);
+            if (sg & (1u << (j + 4))) w = -w;
+            bacc += a_blk[j + 4] * (w * sc);
+        }
+        facc += bacc;
+    }
+
+    #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         facc += __shfl_xor(facc, off);
     if (lane == 0) C[col] = facc;
@@ -272,6 +359,123 @@ extern "C" __global__ void __launch_bounds__(256) grim_scrub_jay_gemm_tiled(
     }
 
     C[(long long)row * N + col] = acc;
+}
+
+#define SJ_M_TILE 8
+
+// v9 multi-row 4-column hoisted-B ScrubJay GEMM (`SJ_M_TILE = 8` rows x 4 columns
+// per wave):
+// - grid = (ceil(N / 4), ceil(M / SJ_M_TILE)), block = (32, 1, 1).
+// - Coalesced K-loads across the 32-lane wave (`blk = lane; blk < n_blocks; blk += 32`),
+//   replacing the uncoalesced 16x16 thread-per-(row,col) loop in `grim_scrub_jay_gemm_tiled`.
+// - Decodes 4 B columns ONCE per 8-value block using `grim_sj_lookup4_valu`, then
+//   dots against all `SJ_M_TILE = 8` rows of `A` (`float4` loads) and reduces via
+//   `__shfl_xor` (100% bit-identical to `grim_scrub_jay_gemv_v2` per row).
+extern "C" __global__ void __launch_bounds__(32) grim_scrub_jay_gemm_rows_v9(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_sel,
+    const unsigned char* __restrict__ B_idx,
+    const unsigned char* __restrict__ B_sgn,
+    const float* __restrict__ B_scl,
+    float pre,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * SJ_M_TILE;
+    const int lane     = threadIdx.x;
+    if (row_base >= M || col_base >= N) return;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int active_rows = (row_base + SJ_M_TILE <= M) ? SJ_M_TILE : (M - row_base);
+    const int n_blocks    = K / GRIM_SJ_BLOCK;
+    const uint4* cb_v4    = (const uint4*)GRIM_SCRUB_JAY_CB;
+
+    long long blk_base[4];
+    const uint2* idx_v2[4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        int col = col_base + ((c < active_cols) ? c : 0);
+        blk_base[c] = (long long)col * n_blocks;
+        idx_v2[c]   = (const uint2*)(B_idx + (long long)col * K);
+    }
+
+    float facc[SJ_M_TILE][4];
+    #pragma unroll
+    for (int r = 0; r < SJ_M_TILE; ++r) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            facc[r][c] = 0.0f;
+        }
+    }
+
+    for (int blk = lane; blk < n_blocks; blk += 32) {
+        float w_val[4][8];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const long long bi = blk_base[c] + blk;
+            const int sel      = B_sel[bi];
+            const unsigned sg  = B_sgn[bi];
+            const float sc     = B_scl[bi] * pre;
+            const uint2 idx2   = idx_v2[c][blk];
+            const uint4 cb     = cb_v4[sel];
+            const unsigned int w_lo = grim_sj_lookup4_valu(idx2.x, cb);
+            const unsigned int w_hi = grim_sj_lookup4_valu(idx2.y, cb);
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float w = (float)((w_lo >> (j * 8)) & 0xFFu);
+                if (sg & (1u << j)) w = -w;
+                w_val[c][j] = w * sc;
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float w = (float)((w_hi >> (j * 8)) & 0xFFu);
+                if (sg & (1u << (j + 4))) w = -w;
+                w_val[c][j + 4] = w * sc;
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < SJ_M_TILE; ++r) {
+            if (r < active_rows) {
+                const float4* a_v4 =
+                    (const float4*)(A + (long long)(row_base + r) * K + (long long)blk * 8);
+                const float4 av0 = a_v4[0];
+                const float4 av1 = a_v4[1];
+                const float a_blk[8] = {
+                    av0.x, av0.y, av0.z, av0.w,
+                    av1.x, av1.y, av1.z, av1.w
+                };
+
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    if (c >= active_cols) break;
+                    float bacc = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        bacc += a_blk[j] * w_val[c][j];
+                    }
+                    facc[r][c] += bacc;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < SJ_M_TILE; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                float v = facc[r][c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v += __shfl_xor(v, off);
+                if (lane == 0 && c < active_cols)
+                    C[(long long)(row_base + r) * N + col_base + c] = v;
+            }
+        }
+    }
 }
 #endif
 "#;

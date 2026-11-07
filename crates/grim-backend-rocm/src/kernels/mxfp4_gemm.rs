@@ -48,6 +48,18 @@ __device__ __forceinline__ float nutcracker_decode_code(unsigned char code, floa
     return mxfp4_to_float_hip(code, 127) * scale;
 }
 
+// v7/v9 word-wide VALU E2M1 lookup:
+// The 8 E2M1 magnitudes are {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+// Their doubled integer values are {0, 1, 2, 3, 4, 6, 8, 12} — 8 bytes that fit
+// in two 32-bit constants (`0x03020100u` and `0x0c080604u`)!
+// Given 4 E2M1 codes packed in the 4 bytes of `codes4`, one `__builtin_amdgcn_perm`
+// instruction looks up all 4 doubled magnitudes in registers with zero constant-cache
+// reads. Multiplying by `half_scale = 0.5f * block_scale` is 100% IEEE-754 bit-exact
+// because `block_scale = 2^(shared_exp - 127)` is a pure power of two.
+__device__ __forceinline__ unsigned int mxfp4_e2m1x4_valu(unsigned int codes4) {
+    return __builtin_amdgcn_perm(0x0c080604u, 0x03020100u, codes4 & 0x07070707u);
+}
+
 // Accumulate one 32-element MXFP4 micro-block into `acc`, vectorizing the code stream as one uint4 (16 B) and the activation stream as float4s.
 // `a_row` points at A[row*K + block_k*32] (as float4*); `gamma4` optionally points at gamma[block_k*32] (as float4*).
 __device__ __forceinline__ float mxfp4_dot_block(
@@ -70,15 +82,23 @@ __device__ __forceinline__ float mxfp4_dot_block(
         }
     }
     const float* xf = reinterpret_cast<const float*>(x);
-    const unsigned int* pc = reinterpret_cast<const unsigned int*>(&packed);
+    const unsigned int pc[4] = { packed.x, packed.y, packed.z, packed.w };
+    const float half_scale = 0.5f * block_scale;
     #pragma unroll
     for (int w = 0; w < 4; ++w) {
-        unsigned int word = pc[w];
+        const unsigned int word = pc[w];
+        const unsigned int lo_c4 = word & 0x0F0F0F0Fu;
+        const unsigned int hi_c4 = (word >> 4) & 0x0F0F0F0Fu;
+        const unsigned int lo_m4 = mxfp4_e2m1x4_valu(lo_c4);
+        const unsigned int hi_m4 = mxfp4_e2m1x4_valu(hi_c4);
         #pragma unroll
         for (int b = 0; b < 4; ++b) {
-            unsigned int byte_val = (word >> (8 * b)) & 0xFFu;
-            float w0 = MXFP4_E2M1_LUT[byte_val & 0x0F] * block_scale;
-            float w1 = MXFP4_E2M1_LUT[(byte_val >> 4) & 0x0F] * block_scale;
+            float m0 = (float)((lo_m4 >> (8 * b)) & 0xFFu);
+            float m1 = (float)((hi_m4 >> (8 * b)) & 0xFFu);
+            if (lo_c4 & (0x08u << (8 * b))) m0 = -m0;
+            if (hi_c4 & (0x08u << (8 * b))) m1 = -m1;
+            float w0 = m0 * half_scale;
+            float w1 = m1 * half_scale;
             int k0 = w * 8 + b * 2;
             acc += xf[k0 + 0] * w0 + xf[k0 + 1] * w1;
         }
@@ -419,6 +439,222 @@ grim_mxfp4_splitk_reduce(
         acc += partials[((size_t)s * M) * N + idx];
     }
     C[idx] = acc;
+}
+
+// 3c. Rook (MXFP4) v8/v9 wave-coalesced 4-column GEMV (`M == 1`):
+// - 4 waves per CTA (`__launch_bounds__(128)`, 16 columns per CTA, 4 columns per wave),
+//   eliminating the 2-launch split-K + `partials` allocation overhead at M=1.
+// - Coalesced K-loads across the 32 lanes of each wave (`block_k = lane; block_k < exps_per_row; block_k += 32`):
+//   adjacent lanes read contiguous `uint4` 16-byte code chunks (`512` contiguous bytes per wave per column)
+//   and contiguous `float4` activation chunks, instead of striding across `N` by `K/2` bytes!
+// - B-first load ordering (`packed_b[4]` + `exp_b[4]` issued before `a_row` loads) +
+//   VALU `__builtin_amdgcn_perm` E2M1 decode (`mxfp4_e2m1x4_valu`).
+__global__ void __launch_bounds__(128)
+grim_mxfp4_gemv_v2(
+    const float* __restrict__ A,                // [1, K]
+    const unsigned char* __restrict__ B_codes,  // [N, K/2]
+    const unsigned char* __restrict__ B_exps,   // [N, K/32]
+    float* __restrict__ C,                      // [1, N]
+    int M,
+    int N,
+    int K
+) {
+    (void)M;
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    if (col_base >= N) return;
+
+    const int active_cols  = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int exps_per_row = K / 32;
+    const float4* a_v4     = reinterpret_cast<const float4*>(A);
+
+    const uint4* b_codes_v4[4];
+    const unsigned char* b_exps_col[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        int col = col_base + ((c < active_cols) ? c : 0);
+        b_codes_v4[c] = reinterpret_cast<const uint4*>(B_codes + (size_t)col * (K / 2));
+        b_exps_col[c] = B_exps + (size_t)col * exps_per_row;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int block_k = lane; block_k < exps_per_row; block_k += 32) {
+        // v8 B-first load ordering: issue all 4 columns' B loads before reading A.
+        uint4 packed_b[4];
+        unsigned char exp_b[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            packed_b[c] = b_codes_v4[c][block_k];
+            exp_b[c]    = b_exps_col[c][block_k];
+        }
+
+        float4 x[8];
+        const float4* a_blk = a_v4 + (size_t)block_k * 8;
+        #pragma unroll
+        for (int v = 0; v < 8; ++v) x[v] = a_blk[v];
+        const float* xf = reinterpret_cast<const float*>(x);
+
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            if (c >= active_cols) break;
+            const float half_scale = 0.5f * mxfp4_block_scale(exp_b[c]);
+            const unsigned int pc[4] = {
+                packed_b[c].x, packed_b[c].y, packed_b[c].z, packed_b[c].w
+            };
+            float bacc = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const unsigned int word = pc[w];
+                const unsigned int lo_c4 = word & 0x0F0F0F0Fu;
+                const unsigned int hi_c4 = (word >> 4) & 0x0F0F0F0Fu;
+                const unsigned int lo_m4 = mxfp4_e2m1x4_valu(lo_c4);
+                const unsigned int hi_m4 = mxfp4_e2m1x4_valu(hi_c4);
+                #pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    float m0 = (float)((lo_m4 >> (8 * b)) & 0xFFu);
+                    float m1 = (float)((hi_m4 >> (8 * b)) & 0xFFu);
+                    if (lo_c4 & (0x08u << (8 * b))) m0 = -m0;
+                    if (hi_c4 & (0x08u << (8 * b))) m1 = -m1;
+                    int k0 = w * 8 + b * 2;
+                    bacc += (xf[k0 + 0] * m0 + xf[k0 + 1] * m1) * half_scale;
+                }
+            }
+            facc[c] += bacc;
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[c] += __shfl_xor(facc[c], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int c = 0; c < active_cols; ++c)
+            C[col_base + c] = facc[c];
+    }
+}
+
+#define ROOK_M_TILE 8
+
+// 3d. Rook (MXFP4) v9 multi-row 4-column hoisted-B GEMM (`ROOK_M_TILE = 8` rows x 4 cols per wave):
+// - grid = (ceil(N / 4), ceil(M / ROOK_M_TILE)), block = (32, 1, 1).
+// - Coalesced K-loads across the 32-lane wave (`block_k = lane; block_k < exps_per_row; block_k += 32`).
+// - Decodes 4 B columns ONCE per 32-element micro-block in registers, then dots against
+//   up to `ROOK_M_TILE = 8` rows of `A`, amortizing B DRAM reads and B VALU decode by 8x!
+__global__ void __launch_bounds__(32)
+grim_mxfp4_gemm_rows_r8(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_codes,  // [N, K/2]
+    const unsigned char* __restrict__ B_exps,   // [N, K/32]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * ROOK_M_TILE;
+    const int lane     = threadIdx.x;
+    if (row_base >= M || col_base >= N) return;
+
+    const int active_cols  = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int active_rows  = (row_base + ROOK_M_TILE <= M) ? ROOK_M_TILE : (M - row_base);
+    const int exps_per_row = K / 32;
+
+    const uint4* b_codes_v4[4];
+    const unsigned char* b_exps_col[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        int col = col_base + ((c < active_cols) ? c : 0);
+        b_codes_v4[c] = reinterpret_cast<const uint4*>(B_codes + (size_t)col * (K / 2));
+        b_exps_col[c] = B_exps + (size_t)col * exps_per_row;
+    }
+
+    float facc[ROOK_M_TILE][4];
+    #pragma unroll
+    for (int r = 0; r < ROOK_M_TILE; ++r) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            facc[r][c] = 0.0f;
+        }
+    }
+
+    for (int block_k = lane; block_k < exps_per_row; block_k += 32) {
+        uint4 packed_b[4];
+        float half_scale[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            packed_b[c]   = b_codes_v4[c][block_k];
+            half_scale[c] = 0.5f * mxfp4_block_scale(b_exps_col[c][block_k]);
+        }
+
+        unsigned int lo_c4[4][4], hi_c4[4][4], lo_m4[4][4], hi_m4[4][4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const unsigned int pc[4] = {
+                packed_b[c].x, packed_b[c].y, packed_b[c].z, packed_b[c].w
+            };
+            #pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                lo_c4[c][w] = pc[w] & 0x0F0F0F0Fu;
+                hi_c4[c][w] = (pc[w] >> 4) & 0x0F0F0F0Fu;
+                lo_m4[c][w] = mxfp4_e2m1x4_valu(lo_c4[c][w]);
+                hi_m4[c][w] = mxfp4_e2m1x4_valu(hi_c4[c][w]);
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < ROOK_M_TILE; ++r) {
+            if (r < active_rows) {
+                const float4* a_blk = reinterpret_cast<const float4*>(
+                    A + (size_t)(row_base + r) * K + (size_t)block_k * 32);
+                float4 x[8];
+                #pragma unroll
+                for (int v = 0; v < 8; ++v) x[v] = a_blk[v];
+                const float* xf = reinterpret_cast<const float*>(x);
+
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    if (c >= active_cols) break;
+                    float bacc = 0.0f;
+                    #pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        const unsigned int lc = lo_c4[c][w];
+                        const unsigned int hc = hi_c4[c][w];
+                        const unsigned int lm = lo_m4[c][w];
+                        const unsigned int hm = hi_m4[c][w];
+                        #pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            float m0 = (float)((lm >> (8 * b)) & 0xFFu);
+                            float m1 = (float)((hm >> (8 * b)) & 0xFFu);
+                            if (lc & (0x08u << (8 * b))) m0 = -m0;
+                            if (hc & (0x08u << (8 * b))) m1 = -m1;
+                            int k0 = w * 8 + b * 2;
+                            bacc += (xf[k0 + 0] * m0 + xf[k0 + 1] * m1) * half_scale[c];
+                        }
+                    }
+                    facc[r][c] += bacc;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROOK_M_TILE; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                float v = facc[r][c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v += __shfl_xor(v, off);
+                if (lane == 0 && c < active_cols)
+                    C[(size_t)(row_base + r) * N + col_base + c] = v;
+            }
+        }
+    }
 }
 
 // LFM2-style: per-head QK-Norm + RoPE (consumes a raw QKV GEMM output) Fuses the post-projection normalization used by QK-norm models (e.g.

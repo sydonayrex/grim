@@ -2366,15 +2366,9 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_fp8_gemv_v2(
     float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int chunk = lane; chunk < n_chunks; chunk += 32) {
-        const float* a_chunk = a_row + (long long)chunk * 32;
-        int a4_words[8];
-        #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            a4_words[e] = grim_pack4_fp8(a_chunk + e * 4);
-        }
-
-        // Batch all 4 columns' 32 B chunk loads as two 128-bit `uint4` vectors
-        // per column before the `grim_fdot4_fp8` compute loop.
+        // v8 B-first load ordering: issue all 4 columns' 32 B chunk loads as
+        // two 128-bit `uint4` vectors BEFORE touching A and running software
+        // `grim_pack4_fp8`, so B DRAM reads are in flight while VALU packs A.
         uint4 b0_v[4], b1_v[4];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
@@ -2386,6 +2380,13 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_fp8_gemv_v2(
                 b0_v[j] = make_uint4(0u, 0u, 0u, 0u);
                 b1_v[j] = make_uint4(0u, 0u, 0u, 0u);
             }
+        }
+
+        const float* a_chunk = a_row + (long long)chunk * 32;
+        int a4_words[8];
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            a4_words[e] = grim_pack4_fp8(a_chunk + e * 4);
         }
 
         #pragma unroll
@@ -2417,6 +2418,125 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_fp8_gemv_v2(
             C[(long long)row * N + col_base + j] = facc[j];
         }
     }
+}
+
+// v9 multi-row hoisted-B Raven FP8 GEMV: one wave loads 4 B columns ONCE per
+// 32-element chunk and dots them against R activation rows (`facc[R][4]`),
+// amortizing B DRAM reads by R while remaining 100% bit-identical to `v2`.
+template <int R>
+__device__ __forceinline__ void grim_dot4_fp8_gemv_rows_impl(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row_base = blockIdx.y * R;
+
+    if (row_base >= M || col_base >= N) return;
+
+    const int n_chunks = K / 32;
+    const unsigned char* b0 = B_fp8 + (long long)col_base * K;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int active_rows = (row_base + R <= M) ? R : (M - row_base);
+
+    float facc[R][4];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            facc[r][j] = 0.0f;
+        }
+    }
+
+    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
+        uint4 b0_v[4], b1_v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const uint4* b4p = (const uint4*)(b0 + (long long)j * K + (long long)chunk * 32);
+                b0_v[j] = b4p[0];
+                b1_v[j] = b4p[1];
+            } else {
+                b0_v[j] = make_uint4(0u, 0u, 0u, 0u);
+                b1_v[j] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+
+        int bw[4][8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            bw[j][0] = (int)b0_v[j].x;
+            bw[j][1] = (int)b0_v[j].y;
+            bw[j][2] = (int)b0_v[j].z;
+            bw[j][3] = (int)b0_v[j].w;
+            bw[j][4] = (int)b1_v[j].x;
+            bw[j][5] = (int)b1_v[j].y;
+            bw[j][6] = (int)b1_v[j].z;
+            bw[j][7] = (int)b1_v[j].w;
+        }
+
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r < active_rows) {
+                const float* a_chunk = A + (long long)(row_base + r) * K + (long long)chunk * 32;
+                int a4_words[8];
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    a4_words[e] = grim_pack4_fp8(a_chunk + e * 4);
+                }
+
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    if (j >= active_cols) break;
+                    float acc = 0.0f;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        acc = grim_fdot4_fp8(acc, a4_words[e], bw[j][e]);
+                    }
+                    facc[r][j] += acc;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+            if (lane == 0) {
+                #pragma unroll
+                for (int j = 0; j < active_cols; j++) {
+                    C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_fp8_gemv_rows_r2(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_fp8_gemv_rows_impl<2>(A, B_fp8, C, M, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_fp8_gemv_rows_r8(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_fp8_gemv_rows_impl<8>(A, B_fp8, C, M, N, K);
 }
 
 
@@ -5110,6 +5230,27 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_v2(
     float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int blk = lane; blk < n_blocks; blk += 32) {
+        // v8 B-first load ordering: issue all 4 columns' `uint2` weight loads
+        // BEFORE reading and dynamic-quantizing A (`amax` + `__builtin_roundf`),
+        // hiding B DRAM latency behind in-register A quantization.
+        uint2 b_v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const uint2* b2p =
+                    (const uint2*)(Bcodes + (long long)(col_base + j) * K + (long long)blk * 32);
+                b_v[j][0] = b2p[0];
+                b_v[j][1] = b2p[1];
+                b_v[j][2] = b2p[2];
+                b_v[j][3] = b2p[3];
+            } else {
+                b_v[j][0] = make_uint2(0u, 0u);
+                b_v[j][1] = make_uint2(0u, 0u);
+                b_v[j][2] = make_uint2(0u, 0u);
+                b_v[j][3] = make_uint2(0u, 0u);
+            }
+        }
+
         const float* blk_src = a_row + (long long)blk * 32;
 
         float amax = 0.0f;
@@ -5130,24 +5271,6 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_v2(
                         ((int)((unsigned char)q1) << 8) |
                         ((int)((unsigned char)q2) << 16) |
                         ((int)((unsigned char)q3) << 24);
-        }
-
-        uint2 b_v[4][4];
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j < active_cols) {
-                const uint2* b2p =
-                    (const uint2*)(Bcodes + (long long)(col_base + j) * K + (long long)blk * 32);
-                b_v[j][0] = b2p[0];
-                b_v[j][1] = b2p[1];
-                b_v[j][2] = b2p[2];
-                b_v[j][3] = b2p[3];
-            } else {
-                b_v[j][0] = make_uint2(0u, 0u);
-                b_v[j][1] = make_uint2(0u, 0u);
-                b_v[j][2] = make_uint2(0u, 0u);
-                b_v[j][3] = make_uint2(0u, 0u);
-            }
         }
 
         #pragma unroll
@@ -5181,6 +5304,150 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_v2(
             C[(long long)row * N + col_base + j] = facc[j];
         }
     }
+}
+
+// v9 multi-row hoisted-B ForestRaven GEMV: one wave loads 4 B columns ONCE per
+// 32-element block and dots them against R activation rows (`facc[R][4]`),
+// amortizing B DRAM reads by R while remaining 100% bit-identical to `v2`.
+template <int R>
+__device__ __forceinline__ void grim_dot4_forest_gemv_rows_impl(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * R;
+    const int lane     = threadIdx.x;
+
+    if (row_base >= M || col_base >= N) return;
+
+    const signed char* Bcodes = (const signed char*)(Bblob + 8);
+    const float* Bscales = (const float*)(Bblob + 8 + (long long)N * K + 8);
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int active_rows = (row_base + R <= M) ? R : (M - row_base);
+    float s_b[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        s_b[j] = (j < active_cols) ? Bscales[col_base + j] : 0.0f;
+
+    const int n_blocks = K / 32;
+    float facc[R][4];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            facc[r][j] = 0.0f;
+        }
+    }
+
+    for (int blk = lane; blk < n_blocks; blk += 32) {
+        uint2 b_v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const uint2* b2p =
+                    (const uint2*)(Bcodes + (long long)(col_base + j) * K + (long long)blk * 32);
+                b_v[j][0] = b2p[0];
+                b_v[j][1] = b2p[1];
+                b_v[j][2] = b2p[2];
+                b_v[j][3] = b2p[3];
+            } else {
+                b_v[j][0] = make_uint2(0u, 0u);
+                b_v[j][1] = make_uint2(0u, 0u);
+                b_v[j][2] = make_uint2(0u, 0u);
+                b_v[j][3] = make_uint2(0u, 0u);
+            }
+        }
+
+        int bw[4][8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            bw[j][0] = (int)b_v[j][0].x;
+            bw[j][1] = (int)b_v[j][0].y;
+            bw[j][2] = (int)b_v[j][1].x;
+            bw[j][3] = (int)b_v[j][1].y;
+            bw[j][4] = (int)b_v[j][2].x;
+            bw[j][5] = (int)b_v[j][2].y;
+            bw[j][6] = (int)b_v[j][3].x;
+            bw[j][7] = (int)b_v[j][3].y;
+        }
+
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r < active_rows) {
+                const float* blk_src = A + (long long)(row_base + r) * K + (long long)blk * 32;
+
+                float amax = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < 32; e++)
+                    amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+                const float d_a   = amax / 127.0f;
+                const float inv_a = (amax == 0.0f) ? 0.0f : (127.0f / amax);
+
+                int a4_reg[8];
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_a);
+                    signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_a);
+                    signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_a);
+                    signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_a);
+                    a4_reg[p] = (int)((unsigned char)q0) |
+                                ((int)((unsigned char)q1) << 8) |
+                                ((int)((unsigned char)q2) << 16) |
+                                ((int)((unsigned char)q3) << 24);
+                }
+
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    if (j >= active_cols) break;
+                    int iacc = 0;
+                    #pragma unroll
+                    for (int p = 0; p < 8; p++) {
+                        iacc = grim_sdot4(a4_reg[p], bw[j][p], iacc);
+                    }
+                    facc[r][j] += (float)iacc * d_a * s_b[j];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+            if (lane == 0) {
+                #pragma unroll
+                for (int j = 0; j < active_cols; j++) {
+                    C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_rows_r2(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_forest_gemv_rows_impl<2>(A, Bblob, C, M, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_rows_r8(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_forest_gemv_rows_impl<8>(A, Bblob, C, M, N, K);
 }
 
 #endif // RDNA3/RDNA4

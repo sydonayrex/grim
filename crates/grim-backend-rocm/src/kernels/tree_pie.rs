@@ -136,6 +136,30 @@ __device__ __forceinline__ unsigned short grim_tree_pie_f16_valu(
     return (unsigned short)((sign_bit << 15) | (hi_byte << 8));
 }
 
+// v7/v9 dual-nibble word-wide VALU decode: decodes TWO E2M2 nibbles `(nib0, nib1)`
+// and their sign bits `(s0, s1)` into a packed FP16 pair `(lo_f16 | (hi_f16 << 16))`
+// using a SINGLE `__builtin_amdgcn_perm` pair (cutting `v_perm_b32` count in half).
+// Because the low byte of every E2M2 FP16 value is `0x00`, placing `(nib0 & 7)` in
+// selector byte 1 and `(nib1 & 7)` in selector byte 3 puts `hi_byte(nib0)` at bits
+// 8..15 and `hi_byte(nib1)` at bits 24..31 with zero output shifts.
+__device__ __forceinline__ unsigned grim_tree_pie_f16x2_valu(
+    unsigned nib0,
+    unsigned nib1,
+    unsigned s0,
+    unsigned s1)
+{
+    const unsigned t0 = 0x3e3c3800u;
+    const unsigned t1 = 0x43424140u;
+    const unsigned t2 = 0x47464544u;
+    const unsigned t3 = 0x4b4a4948u;
+    const unsigned sel = ((nib0 & 7u) << 8) | ((nib1 & 7u) << 24);
+    const unsigned pair01 = __builtin_amdgcn_perm(t1, t0, sel);
+    const unsigned pair23 = __builtin_amdgcn_perm(t3, t2, sel);
+    const unsigned hi0 = ((nib0 & 8u) ? pair23 : pair01) & 0x0000FF00u;
+    const unsigned hi1 = ((nib1 & 8u) ? pair23 : pair01) & 0xFF000000u;
+    return hi0 | hi1 | (s0 << 15) | (s1 << 31);
+}
+
 extern "C" __global__ void __launch_bounds__(32) grim_tree_pie_gemv_v2(
     const unsigned short* __restrict__ act_f16,
     const int*             __restrict__ B_tree,
@@ -160,17 +184,8 @@ extern "C" __global__ void __launch_bounds__(32) grim_tree_pie_gemv_v2(
 
     float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int g = lane; g < groups; g += 32) {
-        const uint4 av0 = act_v4[g * 4 + 0];
-        const uint4 av1 = act_v4[g * 4 + 1];
-        const uint4 av2 = act_v4[g * 4 + 2];
-        const uint4 av3 = act_v4[g * 4 + 3];
-        const unsigned a2[16] = {
-            av0.x, av0.y, av0.z, av0.w,
-            av1.x, av1.y, av1.z, av1.w,
-            av2.x, av2.y, av2.z, av2.w,
-            av3.x, av3.y, av3.z, av3.w
-        };
-
+        // v8 B-first load ordering: issue all 4 columns' 5-word B group loads
+        // before touching A (`act_v4`).
         unsigned payload[4][4];
         unsigned signs[4];
         #pragma unroll
@@ -182,6 +197,17 @@ extern "C" __global__ void __launch_bounds__(32) grim_tree_pie_gemv_v2(
             payload[c][3] = (unsigned)gp[3];
             signs[c]      = (unsigned)gp[4];
         }
+
+        const uint4 av0 = act_v4[g * 4 + 0];
+        const uint4 av1 = act_v4[g * 4 + 1];
+        const uint4 av2 = act_v4[g * 4 + 2];
+        const uint4 av3 = act_v4[g * 4 + 3];
+        const unsigned a2[16] = {
+            av0.x, av0.y, av0.z, av0.w,
+            av1.x, av1.y, av1.z, av1.w,
+            av2.x, av2.y, av2.z, av2.w,
+            av3.x, av3.y, av3.z, av3.w
+        };
 
         #pragma unroll
         for (int c = 0; c < 4; c++) {
@@ -197,8 +223,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_tree_pie_gemv_v2(
                     const unsigned nib1 = (pw >> (p * 8 + 4)) & 0xFu;
                     const unsigned s0   = (sg >> (p * 2 + 0)) & 1u;
                     const unsigned s1   = (sg >> (p * 2 + 1)) & 1u;
-                    const unsigned w01  = (unsigned)grim_tree_pie_f16_valu(nib0, s0)
-                                        | ((unsigned)grim_tree_pie_f16_valu(nib1, s1) << 16);
+                    const unsigned w01  = grim_tree_pie_f16x2_valu(nib0, nib1, s0, s1);
                     bacc = grim_fdot2_f32_f16(a2[w * 4 + p], w01, bacc);
                 }
             }
@@ -266,26 +291,32 @@ extern "C" __global__ void grim_tree_pie_gemm(
                                 (unsigned)gp[2], (unsigned)gp[3] };
         unsigned signs = (unsigned)gp[4];
 
-        for (int j = 0; j < 32; j += 2) {
-            // Decode once, use for every row in the tile.
-            unsigned w01 = (unsigned)grim_tree_pie_f16(payload, signs, j)
-                         | ((unsigned)grim_tree_pie_f16(payload, signs, j + 1) << 16);
-            // Loop to TP_M_TILE, not to `rows`, and guard inside. `acc` is indexed
-            // by a *compile-time* constant on every iteration, so it stays in
-            // registers. The previous form looped to `rows`, which made the index
-            // runtime-dependent, forced the array into scratch memory, and faulted
-            // the GPU with a page-not-present on every launch -- including from a
-            // standalone module, so it was never the aggregate source.
+        float bacc[TP_M_TILE] = { 0.0f };
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const unsigned pw = payload[w];
+            const unsigned sg = signs >> (w * 8);
             #pragma unroll
-            for (int t = 0; t < TP_M_TILE; ++t) {
-                if (t < rows) {
-                    // A row is GLOBAL (m0 + t): t alone re-reads tile 0's rows
-                    // for every later tile while C advanced correctly -- ragged
-                    // and multi-tile prefill silently computed the wrong rows.
-                    unsigned a01 = act2[(((size_t)(m0 + t) * K) + (g * 32 + j)) >> 1];
-                    acc[t] = grim_fdot2_f32_f16(a01, w01, acc[t]);
+            for (int p = 0; p < 4; ++p) {
+                const int j = (w * 4 + p) * 2;
+                const unsigned nib0 = (pw >> (p * 8 + 0)) & 0xFu;
+                const unsigned nib1 = (pw >> (p * 8 + 4)) & 0xFu;
+                const unsigned s0   = (sg >> (p * 2 + 0)) & 1u;
+                const unsigned s1   = (sg >> (p * 2 + 1)) & 1u;
+                // Decode once via dual-nibble VALU, use for every row in the tile.
+                unsigned w01 = grim_tree_pie_f16x2_valu(nib0, nib1, s0, s1);
+                #pragma unroll
+                for (int t = 0; t < TP_M_TILE; ++t) {
+                    if (t < rows) {
+                        unsigned a01 = act2[(((size_t)(m0 + t) * K) + (g * 32 + j)) >> 1];
+                        bacc[t] = grim_fdot2_f32_f16(a01, w01, bacc[t]);
+                    }
                 }
             }
+        }
+        #pragma unroll
+        for (int t = 0; t < TP_M_TILE; ++t) {
+            acc[t] += bacc[t];
         }
     }
 
@@ -295,6 +326,124 @@ extern "C" __global__ void grim_tree_pie_gemm(
             float v = acc[t];
             for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
             if (lane == 0) C[(size_t)(m0 + t) * N + col] = v;
+        }
+    }
+}
+
+// v9 multi-row 4-column hoisted-B TreePie GEMM (`TP_M_TILE = 8` rows x 4 columns
+// per wave):
+// - grid = (ceil(N / 4), ceil(M / TP_M_TILE)), block = (32, 1, 1).
+// - Each wave loads and VALU-decodes 4 B columns ONCE per 32-value group (`w01[4][16]`),
+//   then streams `uint4` activations for each active row `t < rows` and dots against
+//   all 4 decoded columns, amortizing B decode across 8 rows AND A loads across 4 cols!
+extern "C" __global__ void __launch_bounds__(32) grim_tree_pie_gemm_v2(
+    const unsigned short* __restrict__ act_f16,
+    const int*             __restrict__ B_tree,
+    float*                 __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int tile     = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (col_base >= N) return;
+
+    const int m0   = tile * TP_M_TILE;
+    const int rows = min(TP_M_TILE, M - m0);
+    if (rows <= 0) return;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const int groups      = K / 32;
+    const int row_words   = groups * 5;
+
+    const int* b_cols[4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        int col = col_base + ((c < active_cols) ? c : 0);
+        b_cols[c] = B_tree + (long long)col * row_words;
+    }
+
+    float acc[TP_M_TILE][4];
+    #pragma unroll
+    for (int t = 0; t < TP_M_TILE; ++t) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            acc[t][c] = 0.0f;
+        }
+    }
+
+    for (int g = lane; g < groups; g += 32) {
+        unsigned payload[4][4];
+        unsigned signs[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const int* __restrict__ gp = b_cols[c] + (long long)g * 5;
+            payload[c][0] = (unsigned)gp[0];
+            payload[c][1] = (unsigned)gp[1];
+            payload[c][2] = (unsigned)gp[2];
+            payload[c][3] = (unsigned)gp[3];
+            signs[c]      = (unsigned)gp[4];
+        }
+
+        unsigned w01[4][16];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const unsigned pw = payload[c][w];
+                const unsigned sg = signs[c] >> (w * 8);
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    const unsigned nib0 = (pw >> (p * 8 + 0)) & 0xFu;
+                    const unsigned nib1 = (pw >> (p * 8 + 4)) & 0xFu;
+                    const unsigned s0   = (sg >> (p * 2 + 0)) & 1u;
+                    const unsigned s1   = (sg >> (p * 2 + 1)) & 1u;
+                    w01[c][w * 4 + p] = grim_tree_pie_f16x2_valu(nib0, nib1, s0, s1);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int t = 0; t < TP_M_TILE; ++t) {
+            if (t < rows) {
+                const uint4* act_v4 =
+                    (const uint4*)(act_f16 + (size_t)(m0 + t) * K + (size_t)g * 32);
+                const uint4 av0 = act_v4[0];
+                const uint4 av1 = act_v4[1];
+                const uint4 av2 = act_v4[2];
+                const uint4 av3 = act_v4[3];
+                const unsigned a2[16] = {
+                    av0.x, av0.y, av0.z, av0.w,
+                    av1.x, av1.y, av1.z, av1.w,
+                    av2.x, av2.y, av2.z, av2.w,
+                    av3.x, av3.y, av3.z, av3.w
+                };
+
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    if (c >= active_cols) break;
+                    float bacc = 0.0f;
+                    #pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        bacc = grim_fdot2_f32_f16(a2[e], w01[c][e], bacc);
+                    }
+                    acc[t][c] += bacc;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < TP_M_TILE; ++t) {
+        if (t < rows) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                float v = acc[t][c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    v += __shfl_xor(v, off);
+                if (lane == 0 && c < active_cols)
+                    C[(size_t)(m0 + t) * N + col_base + c] = v;
+            }
         }
     }
 }
