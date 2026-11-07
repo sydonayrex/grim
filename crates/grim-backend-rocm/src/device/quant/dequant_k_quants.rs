@@ -65,7 +65,6 @@ const LANE_GEMM_MAX_M_DEFAULT: usize = 4096;
 
 impl RocmDevice {
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
-    #[allow(dead_code)] // kernel launcher, not yet wired into this build's call graph
     /// Public A/B wrapper around [`Self::launch_fused_dequant_gemm_q4k`].
     ///
     /// B7 needs to time the Q4_K fused-dequant path against a candidate format

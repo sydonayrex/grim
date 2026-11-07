@@ -502,7 +502,6 @@ impl RocmDevice {
     }
 
     /// Launch the JIT compiled MXFP4 fused dequantization matmul kernel (Jay Tier).
-    #[allow(dead_code)]
     pub(crate) fn launch_fused_dequant_gemm_mxfp4(
         &self,
         a_storage: &RocmStorage,

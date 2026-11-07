@@ -2923,7 +2923,7 @@ pub(crate) fn choose_block_dim(num_pairs: usize, wave_size: u32) -> u32 {
 
 /// Pure planner: resolve the grid/block for a fused dispatch given the routing assignment and the device's wavefront size.
 /// Extracted from the launcher so G-A2 can prove the parameter blob is built correctly without.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn plan_fused_dispatch(
     assignment: &RoutingAssignment,
     wave_size: u32,
@@ -2940,7 +2940,6 @@ pub(crate) fn plan_fused_dispatch(
 
 /// MoE autotune-aware launch planner. Consults `tuner` for a
 /// measured `MoeKernelKey` launch parameter before falling back to `choose_block_dim`.
-#[allow(dead_code)]
 pub(crate) fn plan_fused_dispatch_with_autotuner(
     assignment: &RoutingAssignment,
     wave_size: u32,
@@ -2993,7 +2992,6 @@ impl SortedRouting {
 
 /// Pure planner for the grouped (token-sorted) fused dispatch.
 /// Grid x = number of expert-blocks in the sorted layout (one block per `block_size` slot).
-#[allow(dead_code)]
 pub(crate) fn plan_grouped_dispatch(sorted: &SortedRouting, wave_size: u32) -> CharonLaunchPlan {
     let grid_x = sorted.num_blocks();
     let block_x = choose_block_dim(sorted.block_size, wave_size).max(wave_size);
@@ -3010,7 +3008,6 @@ pub(crate) fn plan_grouped_dispatch(sorted: &SortedRouting, wave_size: u32) -> C
 /// Validate the host-side inputs to a grouped fused dispatch *before* any device pointer is dereferenced.
 /// Pure, allocation-free, unit-testable without a GPU (G-A2).
 /// `allow_null_up` — when `true`, skip the null check on `expert_up_w` (GELU kernel passes 0).
-#[allow(dead_code)]
 pub(crate) fn validate_grouped_inputs(
     activations: *mut c_void,
     expert_gate_w: *mut c_void,
@@ -3060,7 +3057,6 @@ pub(crate) fn validate_grouped_inputs(
 
 /// Validate the host-side inputs to a fused dispatch *before* any device pointer is dereferenced.
 /// Pure, allocation-free, unit-testable without a GPU (G-A2).
-#[allow(dead_code)]
 pub(crate) fn validate_launch_inputs(
     activations: *mut c_void,
     expert_gate_w: *mut c_void,
@@ -3100,7 +3096,6 @@ pub(crate) fn validate_launch_inputs(
 
 /// A polymorphic kernel variant in the Charon population.
 /// The plan caps the v1 population at three (small-batch/decode, large-group prefill, high-skew) - collapsed from.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CharonVariant {
     /// (a) Small-batch / decode tile — few tokens, many experts.
@@ -3244,7 +3239,6 @@ pub struct VariantRow {
 
 /// Default v1 variant table — three rows, memory-leaning priors, covering
 /// the skew range [0, 1]. Coefficients re-fit on-device for G-B2.
-#[allow(dead_code)]
 pub fn default_variant_table() -> Vec<VariantRow> {
     vec![
         VariantRow {
@@ -3282,7 +3276,6 @@ pub fn default_variant_table() -> Vec<VariantRow> {
 
 /// Build `CharonSelector`'s `Vec<VariantRow>` from measured `Autotuner` configurations.
 /// `moe_autotuning_design.md` §3: replaces static priors in `default_variant_table` with measured launch parameters from `Autotuner` per skew.
-#[allow(dead_code)]
 pub fn build_variant_table_from_autotuner(
     tuner: &crate::autotune::Autotuner,
     gpu_arch: &str,
@@ -3354,7 +3347,6 @@ pub fn charon_autotune_launch_config(
 
 /// Compute the routing skew of a histogram - the fraction of tokens going to the single hottest expert.
 /// `0.0` = perfectly uniform, `1.0` = all tokens to one expert.
-#[allow(dead_code)]
 pub fn routing_skew(per_expert_token_counts: &[u32]) -> f32 {
     let total: u32 = per_expert_token_counts.iter().sum();
     if total == 0 || per_expert_token_counts.is_empty() {
@@ -3374,7 +3366,6 @@ pub fn routing_skew(per_expert_token_counts: &[u32]) -> f32 {
 
 /// GPU-resident variant selector with a de-sync (min-hold) guard.
 /// The selector emits the `variant_idx` for the next launch from the live routing skew, **without.
-#[allow(dead_code)]
 pub struct CharonSelector {
     table: Vec<VariantRow>,
     current_variant: CharonVariant,

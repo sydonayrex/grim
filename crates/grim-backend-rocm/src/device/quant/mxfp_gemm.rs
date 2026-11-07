@@ -355,60 +355,6 @@ impl RocmDevice {
         )
     }
 
-    /// Launch the JIT compiled backward MXFP4 GEMM kernel (dA = dY @ B^T).
-    #[allow(dead_code)]
-    pub(crate) fn launch_mxfp4_backward_gemm(
-        &self,
-        dy_storage: &RocmStorage,
-        b_codes_storage: &RocmStorage,
-        b_exps_storage: &RocmStorage,
-        dx_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        let dy_ptr = dy_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dy has no device ptr".into()))?;
-        let b_codes_ptr = b_codes_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("mxfp4_backward_gemm: b_codes has no device ptr".into())
-        })?;
-        let b_exps_ptr = b_exps_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("mxfp4_backward_gemm: b_exps has no device ptr".into())
-        })?;
-        let dx_ptr = dx_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dx has no device ptr".into()))?;
-
-        let block_dim = HipDim3::new(16, 16, 1);
-        let grid_x = k.div_ceil(16) as u32;
-        let grid_y = m.div_ceil(16) as u32;
-        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-
-        let mut dyptr = dy_ptr;
-        let mut bcodesptr = b_codes_ptr;
-        let mut bexpsptr = b_exps_ptr;
-        let mut dxptr = dx_ptr;
-        let mut mm = m as i32;
-        let mut nn = n as i32;
-        let mut kk = k as i32;
-
-        self.launch_compute_kernel(
-            "grim_mxfp4_backward_gemm",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut dyptr),
-                arg(&mut bcodesptr),
-                arg(&mut bexpsptr),
-                arg(&mut dxptr),
-                arg(&mut mm),
-                arg(&mut nn),
-                arg(&mut kk),
-            ],
-        )
-    }
-
     /// Launch the fused RMSNorm + MXFP4 GEMM kernel (e.g. for MLP projections).
     pub fn launch_fused_rmsnorm_mxfp4_gemm(
         &self,

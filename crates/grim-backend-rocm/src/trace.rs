@@ -373,14 +373,6 @@ impl SampleLogger {
     }
 }
 
-fn self_file_preview(p: &Path) -> String {
-    p.to_string_lossy().to_string()
-}
-#[allow(dead_code)]
-fn _self_file_preview_used_in_warnings_only(p: &Path) -> String {
-    self_file_preview(p)
-}
-
 // Convenience: wrap an existing BenchFn so it logs every candidate it measures.
 // A dispatch site that already has a `BenchFn` closure can wrap it with `SampleLogger::wrap` to.
 

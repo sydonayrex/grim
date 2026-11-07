@@ -4,7 +4,7 @@
 /// MSB-first N-bit decoder: from a byte stream, extract the N-bit code for element `lane_in_block` (0-based) within its block.
 /// Codes are packed MSB first, crossing byte boundaries as needed.
 #[inline]
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_msb_nbit(
     code_bytes: &[u8],
     block_offset_bytes: usize,
@@ -27,7 +27,7 @@ fn decode_msb_nbit(
 /// Simple variant used for embedding (row-major, one row at a time): same MSB-first
 /// across the row's packed bytes.
 #[inline]
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_msb_nbit_row(code_bytes: &[u8], row_byte_offset: usize, col: usize, n_bit: u8) -> u32 {
     let n = n_bit as usize;
     let start_bit = col * n;

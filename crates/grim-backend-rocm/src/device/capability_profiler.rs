@@ -14,18 +14,9 @@ use libloading::Symbol;
 
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────
 
-/// HIP device attribute: active clock throttle reasons.
-/// **No such attribute exists in ROCm 7.x** - the old constant here (74) actually selected.
-#[allow(dead_code)]
-const HIP_DEVICE_ATTR_THROTTLE_REMOVED: i32 = 74;
-
 /// HIP device attribute: current core clock rate in kHz (`hipDeviceAttributeClockRate`,
 /// enum value 5 in ROCm 7.x — not CUDA's 13). Part of the calibration cache key.
 const HIP_DEVICE_ATTR_CLOCK_RATE: i32 = 5;
-
-/// HIP device attribute: constant memory in bytes (attribute 23 in hip_runtime_api.h).
-#[allow(dead_code)]
-const HIP_DEVICE_ATTR_TOTAL_CONST_MEM: i32 = 23;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 

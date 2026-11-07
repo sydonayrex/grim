@@ -31,7 +31,6 @@ pub fn ring_routing_enabled() -> bool {
 
 /// One persistent channel per device ordinal: device-resident slot array plus the tail/head/stop scalars the wave polls.
 /// Owned for the process lifetime; the head/tail counters are monotonic, so a channel is single-use.
-#[allow(dead_code)]
 pub struct RingChannel {
     /// Peer link type per device ordinal (only populated for known peers).
     pub peer_links: HashMap<usize, LinkType>,
@@ -40,8 +39,10 @@ pub struct RingChannel {
     pub head: Box<dyn BackendStorage>,
     pub stop: Box<dyn BackendStorage>,
     /// Pinned 64-byte staging cell for the descriptor upload.
+    #[allow(dead_code)]
     pub staging: RocmPinnedBuffer<u8>,
     /// Pinned 4-byte cell for the head publish.
+    #[allow(dead_code)]
     pub head_cell: RocmPinnedBuffer<u8>,
     pub slots_dev: u64,
     pub head_dev: u64,
@@ -132,7 +133,7 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
 /// OP_ROW_GEMM (2) — B is [N, K], computes C = A @ B^T (matmul_op convention).
 /// Kept for the descriptor-packing ABI test; the dispatch path now writes
 /// descriptors on-device via `grim_scythe_write_slot` (HIP-graph capturable).
-#[allow(dead_code)]
+#[cfg(test)]
 fn pack_gemm_descriptor(
     cell: &mut [u8],
     opcode: u32,
@@ -242,14 +243,12 @@ pub fn route_gemm(
 /// Get (or create) the ring channel for a target device ordinal.
 /// Used when routing ops cross-device: the descriptor goes to the
 /// TARGET device's ring, not the caller's.
-#[allow(dead_code)]
 pub fn channel_for_ordinal(ordinal: usize) -> Result<Arc<Mutex<RingChannel>>> {
     let dev = RocmDevice::try_new(ordinal)?;
     channel_for(&dev)
 }
 
 /// Check if peer access is available between two device ordinals.
-#[allow(dead_code)]
 pub fn peer_link_type(src_ordinal: usize, dst_ordinal: usize) -> Option<LinkType> {
     let map = channels().lock().unwrap_or_else(|e| e.into_inner());
     let chan = map.get(&src_ordinal)?;
@@ -263,7 +262,6 @@ pub fn peer_link_type(src_ordinal: usize, dst_ordinal: usize) -> Option<LinkType
 /// MG-2: route one GEMM through a specific device's ring channel.
 /// The caller specifies which device executes the GEMM; input/output
 /// pointers use peer-access-enabled addresses when crossing devices.
-#[allow(dead_code)]
 pub fn route_gemm_to(
     target_ordinal: usize,
     stream: *mut c_void,
@@ -281,7 +279,6 @@ pub fn route_gemm_to(
 /// MG-3: route an OP_COMMFUSE descriptor — copies src to both peer_dst
 /// (remote device memory, via peer access) and local_out (local memory).
 /// The persistent wave on the SOURCE device executes this inline.
-#[allow(dead_code)]
 pub fn route_commfuse(
     device: &RocmDevice,
     stream: *mut c_void,
@@ -357,7 +354,6 @@ pub fn route_commfuse_ptrs(
 
 /// MG-4: route an OP_PEER_REDUCE descriptor (all-reduce partials: result = local + peer).
 /// Executed inline by the persistent wave on `device`.
-#[allow(dead_code)]
 pub fn route_peer_reduce(
     device: &RocmDevice,
     stream: *mut c_void,
@@ -424,7 +420,6 @@ pub fn route_peer_reduce(
 }
 
 /// MG-4: route an OP_PEER_BROADCAST descriptor: writes root's src to remote peer dst.
-#[allow(dead_code)]
 pub fn route_peer_broadcast(
     device: &RocmDevice,
     stream: *mut c_void,
@@ -487,7 +482,6 @@ pub fn route_peer_broadcast(
 }
 
 /// MG-4: route an OP_PEER_GATHER descriptor: reads from remote peer src into local out.
-#[allow(dead_code)]
 pub fn route_peer_gather(
     device: &RocmDevice,
     stream: *mut c_void,
@@ -553,7 +547,6 @@ pub fn route_peer_gather(
 
 /// Record an event on `device`'s stream.
 /// Returns the raw `hipEvent_t` handle.
-#[allow(dead_code)]
 pub fn record_event_on(device: &RocmDevice, stream: *mut c_void) -> Result<*mut c_void> {
     let stream = if stream.is_null() {
         device.active_stream()
@@ -576,7 +569,6 @@ pub fn record_event_on(device: &RocmDevice, stream: *mut c_void) -> Result<*mut 
 
 /// Enqueue a stream wait on an event recorded on a potentially foreign device.
 /// Enables cross-device zero-copy ordering without host sync when peer access is active.
-#[allow(dead_code)]
 pub fn stream_wait_event(
     waiting_device: &RocmDevice,
     waiting_stream: *mut c_void,
@@ -599,7 +591,6 @@ pub fn stream_wait_event(
 }
 
 /// Destroy a recorded event.
-#[allow(dead_code)]
 pub fn destroy_event(event: *mut c_void) {
     if !event.is_null() {
         unsafe {

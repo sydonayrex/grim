@@ -20,7 +20,6 @@ use crate::{
 impl RocmDevice {
     /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
     /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing layout (`SortedRouting`) produced by `moe_align_block_size` and calls `grim_moe_fused_grouped`.
-    #[allow(dead_code)]
     pub(crate) fn launch_charon_grouped_dispatch(
         &self,
         activations: &RocmStorage,
@@ -211,7 +210,6 @@ impl RocmDevice {
 
     /// Device launcher for the #2 FP8 W8A8 token-sorted grouped dispatch.
     /// Mirrors `launch_charon_grouped_dispatch` (same sorted layout + grid/block) but weights are FP8 E4M3 bytes with per-block-16.
-    #[allow(dead_code)]
     pub(crate) fn launch_charon_grouped_dispatch_fp8(
         &self,
         activations: &RocmStorage,

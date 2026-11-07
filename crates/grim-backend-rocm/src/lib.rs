@@ -1,4 +1,5 @@
 //! ROCm backend for Grim — primary GPU target per architecture §4.
+#![deny(dead_code)]
 #![allow(
     clippy::too_many_arguments,
     clippy::type_complexity,

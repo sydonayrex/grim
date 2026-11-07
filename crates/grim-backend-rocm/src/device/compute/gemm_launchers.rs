@@ -25,7 +25,6 @@ use crate::{
 
 impl RocmDevice {
     /// WI 2.4.4-2c — dispatch `grim_decode_gemm_f16` and return the [see: `launch_compute_kernel`, `DecodeGemmConfig::enabled`]
-    #[allow(dead_code)]
     pub(crate) fn launch_decode_gemm_f16(
         &self,
         a_storage: &RocmStorage,
@@ -441,7 +440,6 @@ impl RocmDevice {
     }
 
     /// Enqueues the pre-transposed / column-major B WMMA kernel (fastest path).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_gemm_b_transposed(
         &self,
         a_storage: &RocmStorage,
@@ -535,7 +533,6 @@ impl RocmDevice {
     }
 
     /// Enqueues the RDNA4-specific multi-wave (16x64 tile per block) WMMA kernel.
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_gemm_b_transposed_rdna4(
         &self,
         a_storage: &RocmStorage,
@@ -598,7 +595,6 @@ impl RocmDevice {
     /// SPEED-ROC: WMMA fused-dequant Q8_0 GEMM launcher (RDNA3/4).
     /// Computes C[M,N] = A[M,K] @ B^T where B is Q8_0 packed.
     /// Uses rocWMMA 16×16×16 tensor-core tiles with inline Q8_0 dequantization.
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q8_0(
         &self,
         a_storage: &RocmStorage,
@@ -649,7 +645,6 @@ impl RocmDevice {
     /// SPEED-ROC: FP16-input Q8_0 WMMA launcher — reads activations as
     /// `_Float16` directly (no per-element cast), halving A-read bandwidth.
     /// Kernel: `grim_wmma_fused_dequant_q8_0_fp16`.
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q8_0_fp16(
         &self,
         a_storage: &RocmStorage,
@@ -694,7 +689,6 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q4_K GEMM launcher (RDNA3/4).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q4k(
         &self,
         a_storage: &RocmStorage,
@@ -1246,7 +1240,6 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q5_K GEMM launcher (RDNA3/4).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q5k(
         &self,
         a: &RocmStorage,
@@ -1260,7 +1253,6 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q2_K GEMM launcher (RDNA3/4).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q2k(
         &self,
         a: &RocmStorage,
@@ -1274,7 +1266,6 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q3_K GEMM launcher (RDNA3/4).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q3k(
         &self,
         a: &RocmStorage,
@@ -1288,7 +1279,6 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q6_K GEMM launcher (RDNA3/4).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q6k(
         &self,
         a: &RocmStorage,
@@ -1302,7 +1292,6 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: WMMA fused-dequant IQ-family GEMM launchers (RDNA3/4).
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq2xxs(
         &self,
         a: &RocmStorage,
@@ -1324,7 +1313,6 @@ impl RocmDevice {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq2xs(
         &self,
         a: &RocmStorage,
@@ -1346,7 +1334,6 @@ impl RocmDevice {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq2s(
         &self,
         a: &RocmStorage,
@@ -1359,7 +1346,6 @@ impl RocmDevice {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k, 16)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq3xxs(
         &self,
         a: &RocmStorage,
@@ -1381,7 +1367,6 @@ impl RocmDevice {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq3s(
         &self,
         a: &RocmStorage,
@@ -1394,7 +1379,6 @@ impl RocmDevice {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k, 16)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq4nl(
         &self,
         a: &RocmStorage,
@@ -1416,7 +1400,6 @@ impl RocmDevice {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq4xs(
         &self,
         a: &RocmStorage,
