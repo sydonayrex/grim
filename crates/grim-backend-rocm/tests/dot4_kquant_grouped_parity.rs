@@ -229,7 +229,7 @@ fn grouped_parity(scheme_name: &str, k: usize, n: usize, m: usize) -> Result<(),
                 .map_err(|e| format!("launch new: {e}"))?;
         }
         "q5k" => {
-            dev.launch_dot4_q5k_q81_gemv_ref_for_ab(a_r, b_r, o_ref, m, n, k)
+            dev.launch_dot4_q5k_q81_gemv_sub_for_ab(a_r, b_r, o_ref, m, n, k)
                 .map_err(|e| format!("launch ref: {e}"))?;
             dev.launch_dot4_q5k_q81_gemv_for_ab(a_r, b_r, o_new, m, n, k)
                 .map_err(|e| format!("launch new: {e}"))?;
@@ -434,7 +434,7 @@ fn speed_ab(scheme_name: &str) -> Result<(), String> {
                     .map_err(|e| e.to_string())
             },
             |d, a, b, o, m, n, k| {
-                d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k)
+                d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k)
                     .map_err(|e| e.to_string())
             },
         ),
@@ -777,7 +777,7 @@ fn q5k_sub_lane_parity_and_speed() -> Result<(), String> {
         176,
         grim_quant::quant_q5k,
         |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_for_ab(a, b, o, m, n, k),
-        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
         |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
     )
 }
@@ -1034,7 +1034,7 @@ fn q5k_sub_v2_parity_then_ab() -> Result<(), String> {
         176,
         grim_quant::quant_q5k,
         grim_quant::dequant_q5k,
-        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_ref_for_ab(a, b, o, m, n, k),
+        |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
         |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_for_ab(a, b, o, m, n, k),
         |d, a, b, o, m, n, k| d.launch_dot4_q5k_q81_gemv_sub_v2_for_ab(a, b, o, m, n, k),
     )
@@ -2182,7 +2182,7 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
         let b_rs: Vec<_> = b_sts.iter().map(|s| as_rocm(s.as_ref()).unwrap()).collect();
         let (o1_r, o2_r) = (as_rocm(o1.as_ref()).unwrap(), as_rocm(o2.as_ref()).unwrap());
 
-        dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o1_r, m, n, k)
+        dev.launch_wmma_gemm_fp8_e4m3_blocked(a_r, b_rs[0], o1_r, m, n, k)
             .map_err(|e| e.to_string())?;
         dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
             .map_err(|e| e.to_string())?;
@@ -2197,12 +2197,12 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             diffs, 0,
             "white_raven_blocked_v2 not bit-identical at n={n} k={k} m={m}"
         );
-        println!("white_raven    v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to v1 (0 diffs)");
+        println!("white_raven    v2 parity n={n:<5} k={k:<5} m={m}: bit-identical to default (0 diffs)");
 
         if timed {
             let bytes = (n * k + m_pad * k + m * n * 4) as f64;
             for _ in 0..WARMUP {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+                dev.launch_wmma_gemm_fp8_e4m3_blocked(a_r, b_rs[0], o2_r, m, n, k)
                     .unwrap();
                 dev.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a_r, b_rs[0], o2_r, m, n, k)
                     .unwrap();
@@ -2210,7 +2210,7 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
             dev.synchronize();
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[0], o2_r, m, n, k)
+                dev.launch_wmma_gemm_fp8_e4m3_blocked(a_r, b_rs[0], o2_r, m, n, k)
                     .unwrap();
             }
             dev.synchronize();
@@ -2226,7 +2226,7 @@ fn corvid_gemv_v2_parity_then_ab() -> Result<(), String> {
 
             let t0 = std::time::Instant::now();
             for i in 0..ITERS {
-                dev.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a_r, b_rs[i % ROT], o2_r, m, n, k)
+                dev.launch_wmma_gemm_fp8_e4m3_blocked(a_r, b_rs[i % ROT], o2_r, m, n, k)
                     .unwrap();
             }
             dev.synchronize();

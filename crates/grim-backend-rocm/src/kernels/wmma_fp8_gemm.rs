@@ -106,81 +106,6 @@ extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3(
     }
 }
 
-// WhiteRaven-blocked: same math as grim_wmma_gemm_fp8_e4m3, but B arrives in
-// 16x16-blocked order (grim_quant::block_fp8_16x16): tile (nt, kb) holds B rows
-// nt*16..+16, cols kb*16..+16 contiguously, row-major within the block. The old
-// entry's col_major fragment load with ldm=K pulled 16 K-strided 16B segments
-// (~25% DRAM efficiency, measured 149 GB/s on a 640 GB/s card); with ldm=16
-// the same fragment is ONE contiguous 256B read (4x64B transactions, all
-// useful). A stays row-major: at decode shapes it is L2-resident, so its
-// strided fragment load costs cache bandwidth, not DRAM. N%16==0, K%16==0
-// enforced by the launcher; the epilogue store masking is unchanged.
-extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3_blocked(
-    const float8_t* __restrict__ A,  // [M, K] FP8 E4M3, row-major (unchanged)
-    const float8_t* __restrict__ Bb, // blocked B: [N/16][K/16][16][16] FP8
-    float* __restrict__ C,           // [M, N] FP32, tightly packed
-    int M, int N, int K) {
-
-    const int tile_row = blockIdx.y;
-    const int tile_col_base = blockIdx.x * 2;  // two 16-wide N tiles per block
-
-    if (tile_row * 16 >= M || tile_col_base * 16 >= N) return;
-
-    const int row_base = tile_row * 16;
-    const int col_base = tile_col_base * 16;
-    const bool valid_col1 = ((tile_col_base + 1) * 16 < N);
-    const int KB = K >> 4;  // K-blocks per N-tile; K%16==0 by launcher contract
-
-    fragment<matrix_a, 16, 16, 16, float8_t, row_major> frag_a;
-    fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b0;
-    fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b1;
-    fragment<accumulator, 16, 16, 16, float> frag_c0;
-    fragment<accumulator, 16, 16, 16, float> frag_c1;
-    fill_fragment(frag_c0, 0.0f);
-    fill_fragment(frag_c1, 0.0f);
-
-    __shared__ float c_out[16 * 16];
-
-    for (int kb = 0, k0 = 0; k0 < K; ++kb, k0 += 16) {
-        // A is reused by both N tiles: one load serves both mma_sync calls.
-        load_matrix_sync(frag_a, A + (long long)row_base * K + k0, K);
-        // Contiguous 256B tile (N-tile tile_col_base, K-block kb), ldm 16.
-        load_matrix_sync(frag_b0, Bb + ((long long)tile_col_base * KB + kb) * 256, 16);
-        mma_sync(frag_c0, frag_a, frag_b0, frag_c0);
-#if GRIM_SCHED_GROUP_BARRIER
-        __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
-#endif
-        if (valid_col1) {
-            load_matrix_sync(frag_b1, Bb + ((long long)(tile_col_base + 1) * KB + kb) * 256, 16);
-            mma_sync(frag_c1, frag_a, frag_b1, frag_c1);
-        }
-#if GRIM_SCHED_GROUP_BARRIER
-        __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
-#endif
-    }
-
-    float* c0_ptr = C + (long long)row_base * N + col_base;
-    store_matrix_sync(c_out, frag_c0, 16, layout_t::mem_row_major);
-    __builtin_amdgcn_wave_barrier();
-    for (int idx = threadIdx.x; idx < 256; idx += 32) {
-        int i = idx / 16;
-        int j = idx % 16;
-        if (row_base + i < M && col_base + j < N) c0_ptr[(long long)i * N + j] = c_out[idx];
-    }
-
-    if (valid_col1) {
-        float* c1_ptr = C + (long long)row_base * N + (col_base + 16);
-        store_matrix_sync(c_out, frag_c1, 16, layout_t::mem_row_major);
-        __builtin_amdgcn_wave_barrier();
-        for (int idx = threadIdx.x; idx < 256; idx += 32) {
-            int i = idx / 16;
-            int j = idx % 16;
-            if (row_base + i < M && col_base + 16 + j < N)
-                c1_ptr[(long long)i * N + j] = c_out[idx];
-        }
-    }
-}
-
 // WhiteRaven-blocked v2:
 // - #1: Batches frag_a, frag_b0, and frag_b1 loads before issuing mma_sync,
 //       and unrolls 2x along K (kb, kb+1) so 6 fragments (2x A, 4x B) are loaded
@@ -400,23 +325,15 @@ mod self_tests {
 
     #[test]
     fn a_fragment_is_loaded_once_for_both_n_tiles() {
-        // The win over the old kernel is that A is staged once and reused; two
-        // mma_sync calls must share one A load -- per entry point. Scoped to
-        // each entry because the blocked twin repeats the same structure.
-        let (old, rest) = KERNEL_SOURCE
-            .split_once("grim_wmma_gemm_fp8_e4m3_blocked(")
-            .expect("blocked entry must exist");
-        let (blocked, _v2) = rest
+        let (old, _rest) = KERNEL_SOURCE
             .split_once("grim_wmma_gemm_fp8_e4m3_blocked_v2(")
-            .unwrap_or((rest, ""));
-        for (name, src) in [("row-major", old), ("blocked", blocked)] {
-            assert_eq!(
-                src.matches("load_matrix_sync(frag_a").count(),
-                1,
-                "{name} entry: frag_a must be loaded once per k-step and reused across both N tiles"
-            );
-            assert_eq!(src.matches("mma_sync(frag_c").count(), 2);
-        }
+            .expect("blocked_v2 entry must exist");
+        assert_eq!(
+            old.matches("load_matrix_sync(frag_a").count(),
+            1,
+            "row-major entry: frag_a must be loaded once per k-step and reused across both N tiles"
+        );
+        assert_eq!(old.matches("mma_sync(frag_c").count(), 2);
     }
 
     #[test]

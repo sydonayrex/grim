@@ -2705,32 +2705,6 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv: out has no device ptr".into()))?;
-        // SPEED-DOT Phase 2: GRIM_DOT4_FAST=1 selects the word-wide-mask
-        // unpack variant. The floor probe measured the stock kernel at
-        // 23 GB/s vs 304 GB/s for q8_0 with the same sdot4 loop — the
-        // per-byte unpack chain is the bottleneck. The parity gate
-        // (dot4_q4k_gemv_fast_parity) must be green before this goes default.
-        static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        //
-        // Now the default. It was opt-in because dot4_q4k_gemv_fast_parity was
-        // a gate that had to be green first -- and that gate called the kernel
-        // directly with its own grid, so it validated the unpack math (always
-        // right) while the launcher fed the kernel a grid covering half the
-        // columns. The parity gate was green *because* it could not see the bug.
-        // With the grid fixed, dot4_q4k_arch_probe covers what the gate missed:
-        // it goes through the launcher, checks every column against an oracle,
-        // sentinel-fills the output so an uncovered column is detectable, and
-        // sweeps N over 1, 2, 3, 5, 7, 63, 65 so the div_ceil remainder path is
-        // exercised rather than only powers of two. Both variants agree to
-        // 4e-4 scale-normalised at every one of those, and the fast one is 3.7x
-        // faster (86.4 vs 23.1 GB/s at N=K=4096). GRIM_DOT4_FAST=0 keeps the
-        // stock kernel reachable as an escape hatch.
-        let fast = *FAST.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_DOT4_FAST").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
         static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub_v2 = *SUB_V2.get_or_init(|| {
             !matches!(
@@ -2749,10 +2723,8 @@ impl RocmDevice {
             ("grim_dot4_q4k_q81_gemv_sub_v2", 4)
         } else if sub {
             ("grim_dot4_q4k_q81_gemv_sub", 4)
-        } else if fast {
-            ("grim_dot4_q4k_q81_gemv_fast", 2)
         } else {
-            ("grim_dot4_q4k_q81_gemv", 4)
+            ("grim_dot4_q4k_q81_gemv_fast", 2)
         };
         let grid_x = (n as u32).div_ceil(cols_per_block);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
@@ -2780,11 +2752,6 @@ impl RocmDevice {
 
     /// SPEED-DOT: Q5_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
     /// Public A/B wrapper around [`Self::launch_dot4_q5k_q81_gemv`] -- Q5_K (176 B / 256 weights).
-    ///
-    /// The dispatch gates this kernel to RDNA2 on a claim that was never
-    /// tested, and the parity tests that could refute it are themselves
-    /// gfx103x-gated. `dot4_q4k_arch_probe` needs the launcher reachable to
-    /// settle the same question for this scheme. Adds no behaviour.
     pub fn launch_dot4_q5k_q81_gemv_for_ab(
         &self,
         act_q81: &RocmStorage,
@@ -2794,21 +2761,10 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_dot4_q5k_q81_gemv_named(
-            "grim_dot4_q5k_q81_gemv",
-            act_q81,
-            b_storage,
-            out_storage,
-            m,
-            n,
-            k,
-        )
+        self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
     }
 
-    /// Dispatch entry. Step 2.1: defaults to the sub-block-per-lane kernel
-    /// (`grim_dot4_q5k_q81_gemv_sub`, 4-8x the stock kernel on gfx1200,
-    /// tolerance-gated by `q5k_sub_lane_parity_and_speed`).
-    /// `GRIM_Q5K_SUB=0` restores the stock kernel.
+    /// Dispatch entry: defaults to the sub-block-per-lane kernel (`grim_dot4_q5k_q81_gemv_sub_v2`).
     pub(crate) fn launch_dot4_q5k_q81_gemv(
         &self,
         act_q81: &RocmStorage,
@@ -2825,45 +2781,12 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        static SUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let sub = *SUB.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_Q5K_SUB").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
         self.launch_dot4_q5k_q81_gemv_named(
-            if sub && sub_v2 {
+            if sub_v2 {
                 "grim_dot4_q5k_q81_gemv_sub_v2"
-            } else if sub {
-                "grim_dot4_q5k_q81_gemv_sub"
             } else {
-                "grim_dot4_q5k_q81_gemv"
+                "grim_dot4_q5k_q81_gemv_sub"
             },
-            act_q81,
-            b_storage,
-            out_storage,
-            m,
-            n,
-            k,
-        )
-    }
-
-    /// M7.2b: the RETAINED ORACLE for the Q5_K group hoist — the pre-change
-    /// kernel body, kept alive so the hoist can be gated on BYTE-IDENTICAL
-    /// output rather than a hand-written oracle. Not on any dispatch path;
-    /// only tests/dot4_q5k_grouped_parity.rs launches it.
-    pub fn launch_dot4_q5k_q81_gemv_ref_for_ab(
-        &self,
-        act_q81: &RocmStorage,
-        b_storage: &RocmStorage,
-        out_storage: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        self.launch_dot4_q5k_q81_gemv_named(
-            "grim_dot4_q5k_q81_gemv_ref",
             act_q81,
             b_storage,
             out_storage,

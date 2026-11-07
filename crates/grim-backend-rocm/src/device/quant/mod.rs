@@ -2663,28 +2663,9 @@ fn wmma_quant_tile_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) ->
     m > 0 && wave32 && n % 64 == 0 && k % blk == 0
 }
 
-/// Policy switch for the f16-WMMA quantized path, split into a pure predicate so
-/// it can be tested without mutating process-global environment state (the same
-/// reason `u4_lane_cache_enabled_for` exists).
-fn wmma_quant_enabled_for(raw: Option<&str>) -> bool {
-    !matches!(raw, Some("0" | "false" | "off"))
-}
-
-/// Whether the f16-WMMA matrix-core path may serve quantized GEMMs at all.
-///
-/// Default ON. `GRIM_WMM_QUANT=0` restores the pre-change routing — it is the
-/// A/B control for the partial-M tile-gate change (without it there is no way to
-/// measure the tiled fallback against the matrix-core path on the same build)
-/// and the rollback switch if the WMMA path misbehaves on some model.
-fn wmma_quant_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| wmma_quant_enabled_for(std::env::var("GRIM_WMM_QUANT").ok().as_deref()))
-}
-
-/// Shape gate AND policy, the single predicate the five per-scheme dispatch arms
-/// consult.
+/// Shape gate for the five per-scheme WMMA dispatch arms (`GRIM_WMM_QUANT` retired in Phase 7 item 11).
 fn wmma_quant_path_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) -> bool {
-    wmma_quant_enabled() && wmma_quant_tile_ok(wave32, m, n, k, blk)
+    wmma_quant_tile_ok(wave32, m, n, k, blk)
 }
 
 /// Whether decode GEMVs should use the exact fused-dequant leg instead of
@@ -2822,19 +2803,5 @@ mod wmma_tile_gate_tests {
             !wmma_quant_tile_ok(true, 5, 63, 256, BLK),
             "n % 64 is retained: conservative, not required by the kernel"
         );
-    }
-
-    /// The A/B control must be reachable without mutating the environment:
-    /// `wmma_quant_enabled_for` is the pure predicate the OnceLock wraps, so the
-    /// opt-out is tested as a value rather than by `set_var` (which would race
-    /// every other test in the binary that reads the same variable).
-    #[test]
-    fn policy_switch_defaults_on_and_opts_out() {
-        assert!(super::wmma_quant_enabled_for(None), "unset must mean ON");
-        assert!(super::wmma_quant_enabled_for(Some("1")));
-        assert!(super::wmma_quant_enabled_for(Some("true")));
-        assert!(!super::wmma_quant_enabled_for(Some("0")));
-        assert!(!super::wmma_quant_enabled_for(Some("false")));
-        assert!(!super::wmma_quant_enabled_for(Some("off")));
     }
 }

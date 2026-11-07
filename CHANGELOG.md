@@ -28,3 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GRIM_DEDUP_PARITY_DEBUG`
   - `GRIM_DEBUG_TRACE_KV`
   - `GRIM_TOTALS_TRACE`
+- Retired default-on rollback switches and experimental kernel A/B flags (Phase 7):
+  - `GRIM_WHITE_RAVEN_V2` (`grim_wmma_gemm_fp8_e4m3_blocked` fallback retired; `v2` is sole path)
+  - `GRIM_Q5K_SUB` (`grim_dot4_q5k_q81_gemv` and `_ref` fallbacks retired; `_sub` is sole path)
+  - `GRIM_DOT4_FAST` (`grim_dot4_q4k_q81_gemv_sub` fast path is sole path)
+  - `GRIM_IQ_LDS` (`grim_fused_dequant_gemm_iq2s_lds` and `iq3xxs_lds` are sole paths)
+  - `GRIM_WMM_QUANT` (`wmma_quant` routing is always enabled when applicable)
+  - `GRIM_DEDUP_QUANT` (`linear_decode_into_prequant` deduplicated activation reuse is always enabled)
+  - `GRIM_Q4K_TILED` (`grim_fused_dequant_gemm_q4k_backward_tiled` retired)
+  - `GRIM_SCRUB_JAY_V2` (`grim_scrub_jay_gemv_v2` retired)
+  - `GRIM_DOT4_256` (`grim_dot4_gate_up_silu_q80_f32act_gemv_256` retired)
+  - `GRIM_WHITECROW_V2` / `GRIM_WHITECROW_V3` (`grim_dot8_w4a4_gemv_v2` and `v3` retired; `v5` is sole path)

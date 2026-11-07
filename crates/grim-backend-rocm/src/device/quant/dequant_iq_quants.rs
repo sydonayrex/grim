@@ -423,22 +423,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // res0-T1: the codebook-cache LDS variant is the DEFAULT — 2.04x at
-        // n=4096, 1.11x at n=17408, byte-identical both. GRIM_IQ_LDS=0 is
-        // the escape hatch; the scalar entry stays as the parity oracle.
-        static LDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let lds = *LDS.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_IQ_LDS").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
-        let kernel_name = if lds {
-            "grim_fused_dequant_gemm_iq2s_grouped_lds"
-        } else {
-            "grim_fused_dequant_gemm_iq2s_grouped"
-        };
-        self.launch_fused_deq_gemm_simple(kernel_name, a, b, out, m, n, k, 1)
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq2s_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
     }
 
     /// Scalar IQ2_S oracle for the grouped kernel's parity gate.
@@ -520,24 +514,16 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // res0-T1: the codebook-cache LDS variant is the DEFAULT — it beat
-        // the plain grouped kernel at BOTH A/B shapes (1.81x at n=4096,
-        // 1.15x at n=17408, byte-identical both). GRIM_IQ_LDS=0 keeps the
-        // plain grouped kernel reachable as an escape hatch; the scalar
-        // entry stays as the parity oracle.
-        static LDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let lds = *LDS.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_IQ_LDS").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
-        let kernel_name = if lds {
-            "grim_fused_dequant_gemm_iq3xxs_grouped_lds"
-        } else {
-            "grim_fused_dequant_gemm_iq3xxs_grouped"
-        };
-        self.launch_fused_deq_gemm_simple(kernel_name, a, b, out, m, n, k, 1)
+        self.launch_fused_deq_gemm_simple(
+            "grim_fused_dequant_gemm_iq3xxs_grouped_lds",
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            1,
+        )
     }
 
     /// Scalar IQ3_XXS oracle for the grouped kernel's parity gate.

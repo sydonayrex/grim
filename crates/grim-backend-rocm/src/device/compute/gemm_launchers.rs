@@ -2139,38 +2139,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v2 = *V2.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_WHITE_RAVEN_V2").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
-        if v2 {
-            self.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a, b_blocked, out, m, n, k)
-        } else {
-            self.launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(a, b_blocked, out, m, n, k)
-        }
-    }
-
-    pub fn launch_wmma_gemm_fp8_e4m3_blocked_v1_for_ab(
-        &self,
-        a: &RocmStorage,
-        b_blocked: &RocmStorage,
-        out: &RocmStorage,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<*mut c_void> {
-        self.launch_wmma_gemm_fp8_e4m3_blocked_named(
-            "grim_wmma_gemm_fp8_e4m3_blocked",
-            a,
-            b_blocked,
-            out,
-            m,
-            n,
-            k,
-        )
+        self.launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(a, b_blocked, out, m, n, k)
     }
 
     pub fn launch_wmma_gemm_fp8_e4m3_blocked_v2_for_ab(
@@ -3129,12 +3098,6 @@ impl RocmDevice {
         q81_ready: bool,
         u4_ready: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
-        let dedup_enabled = !matches!(
-            std::env::var("GRIM_DEDUP_QUANT").as_deref(),
-            Ok("0" | "false" | "off")
-        );
-        let q81_ready = q81_ready && dedup_enabled;
-        let u4_ready = u4_ready && dedup_enabled;
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::KQuantScheme;
         let a_dims = a.shape().dims();
