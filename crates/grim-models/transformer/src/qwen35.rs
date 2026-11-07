@@ -1055,6 +1055,9 @@ impl Qwen35Block {
                 // into paged buffers, and read back through the quant paged kernel.
                 // The dense f32 arena below is the default and is left untouched.
                 if let Some(fmt) = kv_quant_format() {
+                    if seq_len == 1 && std::env::var_os("GRIM_I8_PROBE_DIR").is_some() {
+                        eprintln!("[i8-probe] layer {} PAGED-QUANT early-return fmt={:?}", self.layer_idx, fmt);
+                    }
                     return crate::shared_attention::fused_or_scalar_attention_paged_quant(
                         &q_all,
                         k_dev_t.storage().as_ref(),
@@ -1317,6 +1320,60 @@ impl Qwen35Block {
                         )?
                     }
                     (Some(ks), Some(vs)) => {
+                        // GRIM_I8_PROBE_DIR: decode-step-1 accounting + arena dump
+                        // for the int8 CLI defect (garbage from decode step ~2 while
+                        // prefill logits are correct).
+                        if seq_len == 1 {
+                            if let Some(dir) = std::env::var_os("GRIM_I8_PROBE_DIR") {
+                                static LAYER_SEEN: std::sync::atomic::AtomicUsize =
+                                    std::sync::atomic::AtomicUsize::new(0);
+                                let seen =
+                                    LAYER_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                eprintln!(
+                                    "[i8-probe] layer {} decode-step-1: total_kv={} cur_pos={} ks_ptr={:#x} vs_ptr={:#x} ks_scale_ptr={:#x}",
+                                    self.layer_idx,
+                                    total_kv,
+                                    cache.current_pos,
+                                    k_dev.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().map(|s| s.device_ptr_u64().unwrap_or(0)).unwrap_or(0),
+                                    v_dev.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().map(|s| s.device_ptr_u64().unwrap_or(0)).unwrap_or(0),
+                                    ks.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().map(|s| s.device_ptr_u64().unwrap_or(0)).unwrap_or(0),
+                                );
+                                if seen == 0 {
+                                    if let Ok(kr) = grim_backend_rocm::device::util::as_rocm(
+                                        k_dev.as_ref(),
+                                    ) {
+                                        if let Ok(b) = kr.copy_to_host() {
+                                            let _ = std::fs::write(
+                                                format!(
+                                                    "{}/probe_k_codes_layer{}.bin",
+                                                    dir.to_string_lossy(),
+                                                    self.layer_idx
+                                                ),
+                                                &b,
+                                            );
+                                            eprintln!(
+                                                "[i8-probe] k_codes {} B dumped",
+                                                b.len()
+                                            );
+                                        }
+                                    }
+                                    if let Ok(sr) = grim_backend_rocm::device::util::as_rocm(
+                                        ks.as_ref(),
+                                    ) {
+                                        if let Ok(b) = sr.copy_to_host() {
+                                            let _ = std::fs::write(
+                                                format!(
+                                                    "{}/probe_k_scales_layer{}.bin",
+                                                    dir.to_string_lossy(),
+                                                    self.layer_idx
+                                                ),
+                                                &b,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         crate::shared_attention::fused_or_scalar_attention_i8_arena(
                             &q_all,
                             k_dev.as_ref(),
@@ -1332,18 +1389,23 @@ impl Qwen35Block {
                             &device,
                         )?
                     }
-                    _ => crate::shared_attention::fused_or_scalar_attention_arena(
-                        &q_all,
-                        k_dev.as_ref(),
-                        v_dev.as_ref(),
-                        total_kv,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        seq_len,
-                        None,
-                        &device,
-                    )?,
+                    _ => {
+                        if seq_len == 1 && std::env::var_os("GRIM_I8_PROBE_DIR").is_some() {
+                            eprintln!("[i8-probe] layer {} F32-FALLBACK arm (sidecar missing or format mismatch!) total_kv={}", self.layer_idx, total_kv);
+                        }
+                        crate::shared_attention::fused_or_scalar_attention_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            v_dev.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
                 };
                 // GRIM_ATTN_DUMP_DIR: layer-localised parity dumps (decode,
                 // single token) — post-rope Q/K, V, pre-gate and post-gate
@@ -4107,6 +4169,23 @@ fn attention_layer_d2d(
     }
 
     stage!("arena_append");
+
+    // GRIM_I8_PROBE_DIR: per-layer input dump BEFORE the format dispatch —
+    // fires on BOTH the int8 and f32 routes so the first divergent layer
+    // between the two KV representations can be bisected.
+    if seq_len == 1 {
+        if let Some(dir) = std::env::var_os("GRIM_I8_PROBE_DIR") {
+            if let Ok(xr) = grim_backend_rocm::device::util::as_rocm(x_normed.storage().as_ref()) {
+                if let Ok(b) = xr.copy_to_host() {
+                    let _ = std::fs::write(
+                        format!("{}/probe_in_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                        &b,
+                    );
+                }
+            }
+        }
+    }
+
     // WS-4.3: CurDKV compaction at the eviction boundary (see the host-q path).
     if evict.mode == EvictionMode::Curdkv {
         curdkv_compact_arena(&dev, &mut *cache, &evict, blk.num_kv_heads, blk.head_dim)?;
@@ -4204,7 +4283,79 @@ fn attention_layer_d2d(
                 &device,
             )?
         }
-        (Some(ks), Some(vs)) => crate::shared_attention::fused_or_scalar_attention_i8_arena_device(
+        (Some(ks), Some(vs)) => {
+            // GRIM_I8_PROBE_DIR: d2d int8 decode-step-1 accounting + arena dump
+            if seq_len == 1 {
+                if let Some(dir) = std::env::var_os("GRIM_I8_PROBE_DIR") {
+                    // per-layer input dump: the residual stream entering this
+                    // layer's attention — bisects WHICH layer first diverges
+                    // between the int8 and f32 routes
+                    if let Ok(xr) = grim_backend_rocm::device::util::as_rocm(x_normed.storage().as_ref()) {
+                        if let Ok(b) = xr.copy_to_host() {
+                            let _ = std::fs::write(
+                                format!("{}/probe_in_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                &b,
+                            );
+                        }
+                    }
+                    static D2D_SEEN: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let seen = D2D_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[i8-probe] d2d layer {} decode-step-1: total_kv={} cur_pos={} nkv={} hd={} ks_scale_ptr={:#x}",
+                        blk.layer_idx,
+                        total_kv,
+                        cache.current_pos,
+                        blk.num_kv_heads,
+                        blk.head_dim,
+                        ks.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().map(|x| x.device_ptr_u64().unwrap_or(0)).unwrap_or(0),
+                    );
+                    if seen == 0 {
+                        if let Ok(kr) = grim_backend_rocm::device::util::as_rocm(k_arena.as_ref()) {
+                            if let Ok(b) = kr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_d2d_k_codes_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                                eprintln!("[i8-probe] d2d k_codes {} B dumped", b.len());
+                            }
+                        }
+                        if let Ok(sr) = grim_backend_rocm::device::util::as_rocm(ks.as_ref()) {
+                            if let Ok(b) = sr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_d2d_k_scales_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                            }
+                        }
+                        if let Ok(qr) = grim_backend_rocm::device::util::as_rocm(q_rope.storage().as_ref()) {
+                            if let Ok(b) = qr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_d2d_q_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                            }
+                        }
+                        if let Ok(vr) = grim_backend_rocm::device::util::as_rocm(v_arena.as_ref()) {
+                            if let Ok(b) = vr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_d2d_v_codes_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                            }
+                        }
+                        if let Ok(vsr) = grim_backend_rocm::device::util::as_rocm(vs.as_ref()) {
+                            if let Ok(b) = vsr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_d2d_v_scales_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let i8_out = crate::shared_attention::fused_or_scalar_attention_i8_arena_device(
             q_rope.storage().as_ref(),
             k_arena.as_ref(),
             ks.as_ref(),
@@ -4217,19 +4368,59 @@ fn attention_layer_d2d(
             seq_len,
             None,
             &device,
-        )?,
-        _ => crate::shared_attention::fused_or_scalar_attention_arena_device(
-            q_rope.storage().as_ref(),
-            k_arena.as_ref(),
-            v_arena.as_ref(),
-            total_kv,
-            blk.num_heads,
-            blk.num_kv_heads,
-            blk.head_dim,
-            seq_len,
-            None,
-            &device,
-        )?,
+        )?;
+            if seq_len == 1 {
+                if let Some(dir) = std::env::var_os("GRIM_I8_PROBE_DIR") {
+                    static OUT_SEEN: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if OUT_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        if let Ok(orr) = grim_backend_rocm::device::util::as_rocm(i8_out.storage().as_ref()) {
+                            if let Ok(b) = orr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_d2d_i8out_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                                eprintln!("[i8-probe] d2d i8 attention output dumped ({} B)", b.len());
+                            }
+                        }
+                    }
+                }
+            }
+            i8_out
+        }
+        _ => {
+            // GRIM_I8_PROBE_DIR: f32-route arena row dump — pairs with the
+            // int8-route code dump for a dequant-vs-f32 content diff.
+            if seq_len == 1 {
+                if let Some(dir) = std::env::var_os("GRIM_I8_PROBE_DIR") {
+                    static F32_SEEN: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if F32_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        if let Ok(kr) = grim_backend_rocm::device::util::as_rocm(k_arena.as_ref()) {
+                            if let Ok(b) = kr.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{}/probe_f32_k_layer{}.bin", dir.to_string_lossy(), blk.layer_idx),
+                                    &b,
+                                );
+                                eprintln!("[i8-probe] f32 k_arena dumped ({} B)", b.len());
+                            }
+                        }
+                    }
+                }
+            }
+            crate::shared_attention::fused_or_scalar_attention_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
     };
 
     // --- output gate: attn_out * sigmoid(gate), on device ------------------
