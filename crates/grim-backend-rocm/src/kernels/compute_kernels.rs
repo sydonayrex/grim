@@ -1423,39 +1423,23 @@ grim_add_rms_norm(const float* x, const float* residual,
     float* n_row = norm_out + (size_t)warp_id * row_len;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
-    // Pass 1: y = x + residual (write-through) + 4-wide unrolled sum of squares
+    // Pass 1: y = x + residual (write-through) + sequential sum of squares on lane 0
     // matching grim_rms_norm reduction order bit-for-bit.
-    float ss = 0.0f;
-    for (int col = lane; col < row_len; col += 128) {
-        const int c1 = col + 32;
-        const int c2 = col + 64;
-        const int c3 = col + 96;
-        const float y0 = x_row[col] + r_row[col];
-        y_row[col] = y0;
-        const float y1 = (c1 < row_len) ? (x_row[c1] + r_row[c1]) : 0.0f;
-        if (c1 < row_len) y_row[c1] = y1;
-        const float y2 = (c2 < row_len) ? (x_row[c2] + r_row[c2]) : 0.0f;
-        if (c2 < row_len) y_row[c2] = y2;
-        const float y3 = (c3 < row_len) ? (x_row[c3] + r_row[c3]) : 0.0f;
-        if (c3 < row_len) y_row[c3] = y3;
-        ss = __builtin_fmaf(y0, y0, ss);
-        ss = __builtin_fmaf(y1, y1, ss);
-        ss = __builtin_fmaf(y2, y2, ss);
-        ss = __builtin_fmaf(y3, y3, ss);
+    for (int col = lane; col < row_len; col += 32) {
+        y_row[col] = x_row[col] + r_row[col];
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        ss += __shfl_xor_sync(shfl_mask, ss, off);
-    float rms = sqrtf(ss / (float)row_len + eps);
+    float ss = 0.0f;
+    if (lane == 0) {
+        for (int col = 0; col < row_len; col++) {
+            const float y = y_row[col];
+            ss += y * y;
+        }
+    }
+    ss = __shfl_sync(shfl_mask, ss, 0);
+    float inv_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
     // Pass 2: normalize (y_row is L1/L2-hot from pass 1).
-    for (int col = lane; col < row_len; col += 128) {
-        const int c1 = col + 32;
-        const int c2 = col + 64;
-        const int c3 = col + 96;
-        n_row[col] = y_row[col] * w[col] / rms;
-        if (c1 < row_len) n_row[c1] = y_row[c1] * w[c1] / rms;
-        if (c2 < row_len) n_row[c2] = y_row[c2] * w[c2] / rms;
-        if (c3 < row_len) n_row[c3] = y_row[c3] * w[c3] / rms;
+    for (int col = lane; col < row_len; col += 32) {
+        n_row[col] = y_row[col] * inv_rms * w[col];
     }
 }
 
@@ -1490,31 +1474,24 @@ grim_add_rms_norm_decode(const float* x, const float* residual,
 
     if (warp_id == 0) {
         float ss = 0.0f;
-        for (int col = lane; col < row_len; col += 128) {
-            const int c1 = col + 32;
-            const int c2 = col + 64;
-            const int c3 = col + 96;
-            const float y0 = y_out[col];
-            const float y1 = (c1 < row_len) ? y_out[c1] : 0.0f;
-            const float y2 = (c2 < row_len) ? y_out[c2] : 0.0f;
-            const float y3 = (c3 < row_len) ? y_out[c3] : 0.0f;
-            ss = __builtin_fmaf(y0, y0, ss);
-            ss = __builtin_fmaf(y1, y1, ss);
-            ss = __builtin_fmaf(y2, y2, ss);
-            ss = __builtin_fmaf(y3, y3, ss);
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            ss += __shfl_xor_sync(shfl_mask, ss, off);
         if (lane == 0) {
-            s_rms = sqrtf(ss / (float)row_len + eps);
+            // Sequential accumulation on lane 0, matching CPU reference and grim_rms_norm_decode order.
+            // Uses separate multiply-add (not FMA) to match host exactly.
+            for (int col = 0; col < row_len; col++) {
+                const float y = y_out[col];
+                ss += y * y;
+            }
+        }
+        ss = __shfl_sync(shfl_mask, ss, 0);
+        if (lane == 0) {
+            s_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float rms = s_rms;
+    const float inv_rms = s_rms;
     for (int col = tid; col < row_len; col += 256) {
-        norm_out[col] = y_out[col] * w[col] / rms;
+        norm_out[col] = y_out[col] * inv_rms * w[col];
     }
 }
 
@@ -1537,34 +1514,25 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
 
     if (warp_id == 0) {
         float ss = 0.0f;
-        for (int col = lane; col < row_len; col += 128) {
-            const int c1 = col + 32;
-            const int c2 = col + 64;
-            const int c3 = col + 96;
-            const float v0 = x[col];
-            const float v1 = (c1 < row_len) ? x[c1] : 0.0f;
-            const float v2 = (c2 < row_len) ? x[c2] : 0.0f;
-            const float v3 = (c3 < row_len) ? x[c3] : 0.0f;
-            ss = __builtin_fmaf(v0, v0, ss);
-            ss = __builtin_fmaf(v1, v1, ss);
-            ss = __builtin_fmaf(v2, v2, ss);
-            ss = __builtin_fmaf(v3, v3, ss);
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            ss += __shfl_xor_sync(shfl_mask, ss, off);
         if (lane == 0) {
-            s_lane_sums[0] = sqrtf(ss / (float)row_len + eps);
+            for (int col = 0; col < row_len; col++) {
+                const float v = x[col];
+                ss += v * v;
+            }
+        }
+        ss = __shfl_sync(shfl_mask, ss, 0);
+        if (lane == 0) {
+            s_lane_sums[0] = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float rms = s_lane_sums[0];
+    const float inv_rms = s_lane_sums[0];
     const int n_q_blocks = (row_len + 31) / 32;
     for (int blk = warp_id; blk < n_q_blocks; blk += 8) {
         const int col = blk * 32 + lane;
         const bool live = col < row_len;
-        const float v = live ? (x[col] * w[col] / rms) : 0.0f;
+        const float v = live ? (x[col] * inv_rms * w[col]) : 0.0f;
         if (live) out[col] = v;
 
         float amax = __builtin_fabsf(v);
@@ -1620,35 +1588,26 @@ grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
 
     if (warp_id == 0) {
         float ss = 0.0f;
-        for (int col = lane; col < row_len; col += 128) {
-            const int c1 = col + 32;
-            const int c2 = col + 64;
-            const int c3 = col + 96;
-            const float y0 = y_out[col];
-            const float y1 = (c1 < row_len) ? y_out[c1] : 0.0f;
-            const float y2 = (c2 < row_len) ? y_out[c2] : 0.0f;
-            const float y3 = (c3 < row_len) ? y_out[c3] : 0.0f;
-            ss = __builtin_fmaf(y0, y0, ss);
-            ss = __builtin_fmaf(y1, y1, ss);
-            ss = __builtin_fmaf(y2, y2, ss);
-            ss = __builtin_fmaf(y3, y3, ss);
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            ss += __shfl_xor_sync(shfl_mask, ss, off);
         if (lane == 0) {
-            s_rms = sqrtf(ss / (float)row_len + eps);
+            for (int col = 0; col < row_len; col++) {
+                const float y = y_out[col];
+                ss += y * y;
+            }
+        }
+        ss = __shfl_sync(shfl_mask, ss, 0);
+        if (lane == 0) {
+            s_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float rms = s_rms;
+    const float inv_rms = s_rms;
     const int n_q_blocks = (row_len + 31) / 32;
     for (int blk = warp_id; blk < n_q_blocks; blk += 8) {
         const int col = blk * 32 + lane;
         const bool live = col < row_len;
         const float y = live ? y_out[col] : 0.0f;
-        const float v = live ? (y * w[col] / rms) : 0.0f;
+        const float v = live ? (y * inv_rms * w[col]) : 0.0f;
         if (live) norm_out[col] = v;
 
         float amax = __builtin_fabsf(v);

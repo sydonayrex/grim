@@ -1696,3 +1696,43 @@ The f32act kernel is kept as a documented parity mode (env-gated; default
 perf path unchanged). Recommended follow-up if exact 32/32 parity is
 required: a PQ2_0 fused-dequant GEMM whose accumulation matches
 llama.cpp's dequant ordering.
+
+---
+
+## 13. Phase 5 (M5) — TP=2 Stage A Closeout & Stage B Stop-Criterion Verdict (2026-11-06)
+
+### Stage A Closeout (post-M1 / M2 / M5B / `1fabfcb9` sequential lane-0 norm reduction)
+
+Re-ran `qwen35_production_27b_route_wall_and_utilization` (`GRIM_SPLIT_LAYERS=32,32`, `Qwen3.8-27B-Q4_K_M.gguf`, 64 layers: 16 full-attention + 48 KDA, `rocm:0` RX 9070 XT + `rocm:1` RX 9060 XT, clocks forced `high`):
+
+- **Aligned fused norm kernels** (`grim_add_rms_norm`, `grim_add_rms_norm_decode`, `grim_rms_norm_quant_q81_dual`, `grim_add_rms_norm_quant_q81_dual` in `crates/grim-backend-rocm/src/kernels/compute_kernels.rs`) to sequential lane-0 accumulation matching `grim_rms_norm` / `grim_rms_norm_decode` from `1fabfcb9`.
+- **VRAM post-prewarm:** `dev0` free **3.75 GiB** / 15.92 GiB (used 12.17 GiB), `dev1` free **2.00 GiB** / 15.92 GiB (used 13.92 GiB).
+- **4-Arm Progression (same-session):**
+  - `OLD-AE75E0C6` (1438 nodes, 1509 launches): warm **101.05 ms**, cold **100.86 ms** | eager busy: `dev0 = 33.44 ms`, `dev1 = 49.70 ms`, total = `83.14 ms`.
+  - `STEP1-RES1` (1374 nodes, 1445 launches): warm **93.49 ms** (-7.56 ms), cold **93.24 ms** (-7.62 ms).
+  - `STEP2-RES2` (1327 nodes): warm **96.58 ms** (-4.47 ms), cold **96.33 ms** (-4.52 ms).
+  - `STEP3-DEDUP` (1327 nodes: `seg0(dev0)=662`, `seg1(dev1)=665`, 1398 launches): warm **96.68 ms** (-4.37 ms), cold **96.44 ms** (-4.42 ms) | eager busy: `dev0 = 32.01 ms`, `dev1 = 47.27 ms`, total = `79.28 ms`.
+- **Segment wall decomposition (`STEP3-DEDUP`):** `seg0(dev0) = 43.68 ms` (gap `11.67 ms`), `seg1(dev1) = 52.68 ms` (gap `5.41 ms`), cross-device handoff = `0.25 ms`, total wall = **96.44 ms** cold / **96.68 ms** warm.
+- **Numerics & 512-token teacher-forced PPL gate (Task 0.5):**
+  - `OLD` vs `STEP1-RES1`: `max_abs_diff = 0.000e0` (bit-exact).
+  - `STEP1-RES1` vs `STEP2-RES2`: `max_abs_diff = 4.005e-2` (worst rel `3.738e-3` across 64 fused residual+norm layers; top-1 token 100% identical `(163749, 9.4209)` vs `(163749, 9.4393)`).
+  - `STEP2-RES2` vs `STEP3-DEDUP`: `max_abs_diff = 0.000e0` (bit-exact).
+  - 512-token teacher-forced PPL: `OLD` mean NLL = `13.134362` nats, `NEW` mean NLL = `13.153183` nats, `|ΔNLL| = 0.018821` nats (`<= 0.02` nats gate), step-0 KL = `3.101e-5` (`<= 1e-4` gate), top-1 agreement = **510/512 (99.61%)**.
+
+### Stage B P0 Probes & Stop-Criterion Evaluation (`tp2_stage_b_p0_probes` in `scythe_multi_gpu.rs`)
+
+1. **Per-card true-cold DRAM stream bandwidth (256 MiB `launch_stream_read_probe`):**
+   - `rocm:0` (RX 9070 XT, `gfx1201`): median `439.4 us` -> **610.9 GB/s**
+   - `rocm:1` (RX 9060 XT, `gfx1200`): median `882.9 us` -> **304.0 GB/s** (2.01:1 BW ratio)
+2. **P2P copy bandwidth (16 MiB `BoundaryHandoff` `0 -> 1`):**
+   - Median `8920.6 us` -> **1.88 GB/s** over consumer PCIe bridge.
+3. **Per-rendezvous latency at `hidden = 5120` f32 (`20,480` bytes), 160 rendezvous/token (64 layers × 2.5 row-parallel arms/layer):**
+   - M6 `BoundaryHandoff` bidirectional (`copy 0->1` + `copy 1->0` + `wait 1` + `wait 0` + `add_into`): **68.3 µs / rendezvous** (`10.94 ms` total per token for 160 rendezvous; `58.1 µs / rendezvous` or `9.30 ms` without the elementwise add).
+   - Host-event-ordered `OP_PEER_REDUCE` (`all_reduce_sum_peer_pair_ordered`): `107.7 ms / rendezvous` (`17.23 s` for 160 rendezvous — unviable due to per-op persistent wave dispatch + event round-trip).
+4. **Predeclared Stop-Criterion Verdict (CLOSED ON-FAILURE — pipeline remains default):**
+   - Stop criterion rule: *"Ship TP if wall ≤ pipeline-wall − X ms, X ≥ rendezvous × 1.5, measured."*
+   - Measured `rendezvous` (160 rendezvous/token via M6 ring + add) = **10.94 ms/token** -> required wall reduction `X = 1.5 × 10.94 ms = 16.41 ms` -> target TP wall ≤ `96.44 − 16.41 = 80.03 ms`.
+   - Why TP=2 cannot meet this target on RX 9070 XT + RX 9060 XT:
+     - **50/50 head split (required by Qwen3.5 4 KV heads -> 2 KV heads/card GQA constraint):** `rocm:1` (RX 9060 XT, 304 GB/s) already processes 50% of model weights in the 32/32 pipeline split (`seg1` wall = `52.68 ms`, kernel busy = `47.27 ms` across 665 nodes). Under 50/50 TP=2, `rocm:1` still streams 50% of all weights (`~47.3 ms` busy), **doubles** its node count from `665` to `~1327` nodes (doubling its inter-kernel gap from `5.41 ms` to `~10.8 ms`), and adds `10.94 ms` of cross-PCIe rendezvous: projected TP=2 wall = `47.27 + 10.82 + 10.94 = 69.0–106.7 ms` (with lockstep per-layer skew + 640 extra ring/wait/add nodes adding `640 × 8.1 µs ≈ 5.2 ms` gap, bringing projected wall to **~85–95 ms**, violating the `≤ 80.03 ms` stop criterion and eroding the savings).
+     - Even under an idealized 2:1 BW-weighted split (impossible on KV heads without breaking the `4 KV` / `6 Q-per-KV` GQA group or replicating KV), `1.5 × rendezvous` (`16.41 ms`) + doubled node-gap (`~17 ms` across 1327 nodes/card + 480 rendezvous nodes) exceeds the maximum theoretical busy reduction (`47.27 − 26.4 = 20.8 ms`).
+   - **Verdict:** Recorded negative per Phase 5 contract (*"ON FAILURE (rendezvous eats the savings): record, keep pipeline default, close — a measured negative is a valid exit"*). Pipeline split (`GRIM_SPLIT_LAYERS`) remains the production multi-GPU default.

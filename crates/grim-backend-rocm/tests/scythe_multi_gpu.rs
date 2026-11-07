@@ -894,3 +894,137 @@ fn tensor_parallel_2_device_block_decode_matches_single_device() {
         "MG-6 TP block diverges from single-device: max_err={max_err:.3e}"
     );
 }
+
+/// Phase 5 (M5) Stage B P0 Probe:
+/// 1. Per-card true-cold DRAM stream bandwidth (`launch_stream_read_probe` on 256 MB buffer)
+///    for `rocm:0` (RX 9070 XT) vs `rocm:1` (RX 9060 XT).
+/// 2. P2P read bandwidth (`BoundaryHandoff` / `OP_PEER_REDUCE` / `hipMemcpyPeerAsync`) across `rocm:0 <-> rocm:1`.
+/// 3. Per-rendezvous latency at `hidden = 5120` f32 (`20,480` bytes):
+///    - M6 `BoundaryHandoff` (producer `PEER_COPY` + consumer `WAIT` spin on tail)
+///    - ScytheRing `all_reduce_sum_peer_pair_ordered` (`hipEventRecord` + `hipStreamWaitEvent` + `OP_PEER_REDUCE` on both ranks)
+///    - Lockstep bidirectional rendezvous (160 rendezvous/token chain simulating 64-layer TP=2 decode).
+#[test]
+#[ignore]
+fn tp2_stage_b_p0_probes() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    if grim_backend_rocm::peer_access::enumerate_devices().unwrap_or(0) < 2 {
+        eprintln!("[SKIP] needs 2 ROCm devices");
+        return;
+    }
+    let dev0 = grim_backend_rocm::RocmDevice::shared(0);
+    let dev1 = grim_backend_rocm::RocmDevice::shared(1);
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    grim_backend_rocm::peer_access::enable_peer_access(0, 1).expect("peer 0->1");
+    grim_backend_rocm::peer_access::enable_peer_access(1, 0).expect("peer 1->0");
+
+    // 1. True-cold per-card DRAM stream read BW (256 MiB buffer, 20 timed passes)
+    let words = 256 * 1024 * 1024 / 4 / 16 * 16;
+    let bytes = (words * 4) as f64;
+    for (ord, dev, name) in [(0usize, &dev0, "rocm:0 (RX 9070 XT)"), (1usize, &dev1, "rocm:1 (RX 9060 XT)")] {
+        let buf = grim_backend_rocm::MemoryOps::alloc_storage(
+            dev.as_ref(),
+            &Shape::new(vec![words]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: grim_tensor::Storage::Native,
+            },
+        )
+        .expect("alloc stream buf");
+        let buf_r = grim_backend_rocm::as_rocm(buf.as_ref()).expect("as_rocm");
+        for _ in 0..3 {
+            dev.launch_stream_read_probe(buf_r, buf_r, words).expect("warmup stream");
+        }
+        dev.synchronize();
+        let mut us_samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let t0 = std::time::Instant::now();
+            dev.launch_stream_read_probe(buf_r, buf_r, words).expect("stream probe");
+            dev.synchronize();
+            us_samples.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        us_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med_us = us_samples[us_samples.len() / 2];
+        let gbps = (bytes / 1e9) / (med_us / 1e6);
+        eprintln!("[P0:BW] dev{ord} {name}: 256 MiB read median = {med_us:.1} us -> {gbps:.1} GB/s");
+    }
+
+    // 2. P2P read / copy BW (16 MiB f32 across 0 -> 1)
+    {
+        let p2p_elems = 4 * 1024 * 1024usize; // 16 MiB
+        let src0 = dev0.alloc_storage(&Shape::new(vec![p2p_elems]), DType::F32).unwrap();
+        let dst1 = dev1.alloc_storage(&Shape::new(vec![p2p_elems]), DType::F32).unwrap();
+        let s0 = grim_backend_rocm::as_rocm(src0.as_ref()).unwrap();
+        let d1 = grim_backend_rocm::as_rocm(dst1.as_ref()).unwrap();
+        let handoff = grim_backend_rocm::peer_access::BoundaryHandoff::prepare(
+            &dev0, &dev1, s0, d1, p2p_elems as u32,
+        )
+        .expect("prepare 16MB handoff");
+        for _ in 0..3 {
+            handoff.launch_copy(&dev0, dev0.active_stream()).unwrap();
+            handoff.launch_wait(&dev1, dev1.active_stream()).unwrap();
+            dev0.synchronize();
+            dev1.synchronize();
+        }
+        let mut p2p_us = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let t0 = std::time::Instant::now();
+            handoff.launch_copy(&dev0, dev0.active_stream()).unwrap();
+            handoff.launch_wait(&dev1, dev1.active_stream()).unwrap();
+            dev0.synchronize();
+            dev1.synchronize();
+            p2p_us.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        p2p_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = p2p_us[p2p_us.len() / 2];
+        let gbps = ((p2p_elems * 4) as f64 / 1e9) / (med / 1e6);
+        eprintln!("[P0:P2P-BW] 16 MiB BoundaryHandoff (0->1): median = {med:.1} us -> {gbps:.2} GB/s");
+    }
+
+    // 3. Per-rendezvous latency at hidden = 5120 f32 (20,480 bytes), 160 rendezvous/token
+    const HIDDEN: usize = 5120;
+    const RENDEZVOUS_PER_TOK: usize = 160; // 16 attn x 2 + 48 KDA x 2 = 128..160
+    let a0 = dev0.from_cpu(&vec![1.0f32; HIDDEN], &Shape::new(vec![HIDDEN]), DType::F32).unwrap();
+    let b0 = dev0.alloc_storage(&Shape::new(vec![HIDDEN]), DType::F32).unwrap();
+    let a1 = dev1.from_cpu(&vec![2.0f32; HIDDEN], &Shape::new(vec![HIDDEN]), DType::F32).unwrap();
+    let b1 = dev1.alloc_storage(&Shape::new(vec![HIDDEN]), DType::F32).unwrap();
+    let a0_r = grim_backend_rocm::as_rocm(a0.as_ref()).unwrap();
+    let b0_r = grim_backend_rocm::as_rocm(b0.as_ref()).unwrap();
+    let a1_r = grim_backend_rocm::as_rocm(a1.as_ref()).unwrap();
+    let b1_r = grim_backend_rocm::as_rocm(b1.as_ref()).unwrap();
+
+    // (3a) M6 BoundaryHandoff bidirectional (0->1 and 1->0)
+    // In a real TP=2 decode step, each row-parallel arm executes a GEMV, then producer copies
+    // and consumer waits BEFORE the next layer's norm/GEMV can consume the reduced output:
+    // i.e. copy(0->1) + copy(1->0) + wait(on 1) + wait(on 0) + add(on 0) + add(on 1).
+    let h01 = grim_backend_rocm::peer_access::BoundaryHandoff::prepare(&dev0, &dev1, a0_r, b1_r, HIDDEN as u32).unwrap();
+    let h10 = grim_backend_rocm::peer_access::BoundaryHandoff::prepare(&dev1, &dev0, a1_r, b0_r, HIDDEN as u32).unwrap();
+    for _ in 0..5 {
+        h01.launch_copy(&dev0, dev0.active_stream()).unwrap();
+        h10.launch_copy(&dev1, dev1.active_stream()).unwrap();
+        h01.launch_wait(&dev1, dev1.active_stream()).unwrap();
+        h10.launch_wait(&dev0, dev0.active_stream()).unwrap();
+        dev0.add_into(a0_r, b0_r, a0_r).unwrap();
+        dev1.add_into(a1_r, b1_r, a1_r).unwrap();
+        dev0.synchronize();
+        dev1.synchronize();
+    }
+    let t_m6 = std::time::Instant::now();
+    for _ in 0..RENDEZVOUS_PER_TOK {
+        h01.launch_copy(&dev0, dev0.active_stream()).unwrap();
+        h10.launch_copy(&dev1, dev1.active_stream()).unwrap();
+        h01.launch_wait(&dev1, dev1.active_stream()).unwrap();
+        h10.launch_wait(&dev0, dev0.active_stream()).unwrap();
+        dev0.add_into(a0_r, b0_r, a0_r).unwrap();
+        dev1.add_into(a1_r, b1_r, a1_r).unwrap();
+    }
+    dev0.synchronize();
+    dev1.synchronize();
+    let total_m6_ms = t_m6.elapsed().as_secs_f64() * 1e3;
+    let per_rv_m6_us = (total_m6_ms * 1e3) / (RENDEZVOUS_PER_TOK as f64);
+    eprintln!(
+        "[P0:RENDEZVOUS-M6] {RENDEZVOUS_PER_TOK} bidirectional M6 BoundaryHandoffs + add @ hidden={HIDDEN}: total = {total_m6_ms:.2} ms ({per_rv_m6_us:.1} us/rendezvous)"
+    );
+}
