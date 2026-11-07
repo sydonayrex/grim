@@ -392,6 +392,25 @@ fn qwen35_attention_device_path_engages_and_matches_host() {
                  so this test would prove nothing about the device path"
             );
         }
+        if std::env::var_os("GRIM_D2D_DUMP").is_some() && step == 0 {
+            eprintln!("[d2d-dump] cpu_out={:?}", &cpu_out[..48]);
+            eprintln!("[d2d-dump] gpu_out={:?}", &gpu_out[..48]);
+            eprintln!(
+                "[d2d-dump] cpu[190:210]={:?}",
+                &cpu_out[190..210.min(cpu_out.len())]
+            );
+            eprintln!(
+                "[d2d-dump] gpu[190:210]={:?}",
+                &gpu_out[190..210.min(gpu_out.len())]
+            );
+            eprintln!(
+                "[d2d-dump] cpu sum={:+.4} gpu sum={:+.4} cpu|v|={:.4} gpu|v|={:.4}",
+                cpu_out.iter().sum::<f32>(),
+                gpu_out.iter().sum::<f32>(),
+                cpu_out.iter().map(|v| v.abs()).sum::<f32>(),
+                gpu_out.iter().map(|v| v.abs()).sum::<f32>(),
+            );
+        }
         let (e, at) = worst_rel(&cpu_out, &gpu_out);
         assert!(
             e <= 5e-4,
@@ -1468,7 +1487,39 @@ fn graph_int4_kv_arena_is_half_of_int8() {
         bytes
     };
 
+    // Task 2.3 contract (commit 224be9c9): int8 decode-graph capture is
+    // REFUSED by default (int8 replay serves garbage at 27B geometry; eager
+    // int8 is correct) — an explicit opt-in must surface the refusal, not a
+    // silently corrupt graph. This test went stale when the refusal landed
+    // and failed on get_or_create_decode_graph's error.
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "int8");
+    }
+    {
+        let model = build_model(&device, Some(dev.as_ref()), &c);
+        let refused = model
+            .get_or_create_decode_graph(128, 1)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        assert!(
+            refused.contains("int8 KV replay is disabled"),
+            "int8 graph capture must be refused by default, got: {refused}"
+        );
+    }
+
+    // With the GRIM_ALLOW_INT8_GRAPH=1 escape hatch the capture proceeds and
+    // the ORIGINAL sizing contract holds: int4 arena == half of int8.
+    unsafe {
+        std::env::set_var("GRIM_ALLOW_INT8_GRAPH", "1");
+    }
     let i8_b = arena_bytes("int8");
+    unsafe {
+        std::env::remove_var("GRIM_ALLOW_INT8_GRAPH");
+    }
     let i4_b = arena_bytes("int4");
     eprintln!("[graph-kv-arena-bytes] int8={i8_b} int4={i4_b}");
     assert!(i8_b > 0 && i4_b > 0, "an arena allocated nothing");

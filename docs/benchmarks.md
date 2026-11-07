@@ -1450,10 +1450,27 @@ degrades them to managed memory; decode then fails loud on a 178 MB workspace
 alloc (`GRIM_ROCM_MANAGED_FALLBACK=deny` default). No layer split fixes an
 AGGREGATE shortfall — this is Task 4.2 policy territory, not a Phase 3 defect.
 
-Pre-existing failures recorded (NOT from the ring fix; verified identical
-with the fix stashed, 14/2 on HEAD `cab5c94f`):
-`qwen35_attention_device_path_engages_and_matches_host` (step-0 host/device
-attention divergence 1.922e0) and `graph_int4_kv_arena_is_half_of_int8`.
+Pre-existing failures investigated (2026-11-07, both on HEAD `cab5c94f`):
+- `graph_int4_kv_arena_is_half_of_int8` — STALE TEST, fixed: Task 2.3's int8
+  decode-graph capture refusal (`224be9c9`) landed after the test; it now
+  asserts the refusal contract by default AND the original int4==int8/2
+  sizing under the `GRIM_ALLOW_INT8_GRAPH=1` escape hatch. Green.
+- `qwen35_attention_device_path_engages_and_matches_host` — TRUE DEFECT, in
+  the CPU HOST path, NOT the device path. Evidence: an independent numpy
+  full-block oracle (weights regenerated from the test's own `w()` formula;
+  attention kv_len=1 → out=V, gate, wo, residual, post-norm, SwiGLU FFN)
+  matches the GPU d2d output COS 1.0 with per-element ratio exactly 1.0 —
+  the device path is reference-exact. The CPU output instead snaps to a
+  16-level integer grid: values are exactly k·(243/128), k ∈ ±1..8, branch
+  energy 0.67x of reference (classic int4 retention), i.e. an activation/
+  output quantization stage engages in the CPU block path (suspect: the
+  host fallback arm's wo/residual stage consuming a prequantized output —
+  the dedup `linear_decode_quant_kind` machinery is ROCm-only, so the CPU
+  route hits some other quantized emitter). The CPU path is not the
+  production route (ROCm d2d is, and it is Gate-D-validated + numpy-proven
+  here); root-causing the CPU-side quantize insertion is tracked as
+  follow-up work. Temporary GRIM_D2D_DUMP probe kept in the test
+  (env-gated) for whoever picks it up.
 
 ## 10. Task 2.3 Step 0 — KV-quant census (2026-11-03)
 
