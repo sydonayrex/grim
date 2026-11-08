@@ -1201,24 +1201,32 @@ extern "C" __global__ void grim_quantize_q8_1(
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
     amax = __shfl_sync(shfl_mask, amax, 0);
 
-    const float d     = amax / 127.0f;
-    const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
-    signed char qi = (signed char)__builtin_roundf(val * inv_d);
+    const float d = (amax > 1e-9f) ? (amax / 127.0f) : 0.0f;
+    float q_flt = (d > 0.0f) ? __builtin_roundf(val / d) : 0.0f;
+    if (q_flt > 127.0f) q_flt = 127.0f;
+    if (q_flt < -127.0f) q_flt = -127.0f;
+    signed char qi = (signed char)q_flt;
 
     // Sequential sum on lane 0, then broadcast. Replaces __shfl_xor tree
     // reduction which reassociates f32 adds across lanes.
     float fsum = (tid < GRIM_Q8_1_BLOCK_SIZE) ? (float)qi : 0.0f;
     if (tid == 0) {
         for (int i = 0; i < GRIM_Q8_1_BLOCK_SIZE; i++) {
-            const int qi_val = (signed char)__builtin_roundf(row_src[i] * inv_d);
-            fsum += (float)qi_val;
+            float qi_f = (d > 0.0f) ? __builtin_roundf(row_src[i] / d) : 0.0f;
+            if (qi_f > 127.0f) qi_f = 127.0f;
+            if (qi_f < -127.0f) qi_f = -127.0f;
+            fsum += qi_f;
         }
     }
     fsum = __shfl_sync(shfl_mask, fsum, 0);
 
     if (tid == 0) {
-        _Float16 hd = (_Float16)d;
-        _Float16 hs = (_Float16)(fsum * d);
+        // Strata #606 overflow guard: clamp scale and sum to finite half range (-65504 to 65504)
+        const float d_finite = (d > 65504.0f) ? 65504.0f : d;
+        const float s_val = fsum * d;
+        const float s_finite = (s_val > 65504.0f) ? 65504.0f : ((s_val < -65504.0f) ? -65504.0f : s_val);
+        _Float16 hd = (_Float16)d_finite;
+        _Float16 hs = (_Float16)s_finite;
         unsigned short wd, ws;
         __builtin_memcpy(&wd, &hd, 2);
         __builtin_memcpy(&ws, &hs, 2);
