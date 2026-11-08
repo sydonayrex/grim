@@ -3176,6 +3176,135 @@ impl RocmDevice {
         )
     }
 
+    /// Q3_K M=1 Variation 1: 128-bit vectorized loads (`grim_dot4_q3k_q81_gemv_sub_v4_vec`).
+    pub fn launch_dot4_q3k_q81_gemv_sub_v4_vec_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_sub_v4_vec",
+        )
+    }
+
+    /// Q3_K M=1 Variation 2: 128-bit vectorized loads + double-buffered prefetch.
+    pub fn launch_dot4_q3k_q81_gemv_sub_v4_vec_prefetch_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_q3k_q81_gemv_sub_v4_vec_prefetch",
+        )
+    }
+
+    /// Q3_K M=1 Variation 3: 128-bit vectorized loads + 8-column wave tile.
+    pub fn launch_dot4_q3k_q81_gemv_sub_v6_vec_col8_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(8);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q3k_q81_gemv_sub_v6_vec_col8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Q3_K M=2 Variation 4: Vectorized Dual-Row Weight Reuse (`grim_dot4_q3k_q81_gemv_rows_r2_vec`).
+    pub fn launch_dot4_q3k_q81_gemv_rows_r2_vec_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_y = (m as u32).div_ceil(2);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q3k_q81_gemv_rows_r2_vec",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// The STOCK Q3_K dot4 kernel (per-byte magnitude loads), kept as the
     /// fast kernel's byte-identity oracle and A/B counterpart. NOT what the
     /// default dispatch runs once the word-wide-mask variant is live.
@@ -3208,6 +3337,40 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static ROWS_R2_VEC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let rows_r2_vec = *ROWS_R2_VEC.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_ROWS_R2_VEC").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if m == 2 && rows_r2_vec {
+            return self.launch_dot4_q3k_q81_gemv_rows_r2_vec_for_ab(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
+        static SUB_V4_VEC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sub_v4_vec = *SUB_V4_VEC.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q3K_SUB_V4_VEC").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if m == 1 && sub_v4_vec {
+            return self.launch_dot4_q3k_q81_gemv_sub_v4_vec_for_ab(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub_v2 = *SUB_V2.get_or_init(|| {
             !matches!(

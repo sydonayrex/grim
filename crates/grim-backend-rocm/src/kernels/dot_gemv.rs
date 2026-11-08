@@ -4412,6 +4412,7 @@ for (int j = 0; j < active_cols; j++) {
 // unpacked word-wide into `q4` in [0..7], then the -4 offset is folded in
 // int32 via `pos - 4*asum`, cutting `sudot4` calls in half vs `_fast`.
 typedef unsigned int __attribute__((aligned(2))) grim_u32_a2;
+typedef struct { unsigned x, y, z, w; } __attribute__((aligned(2))) grim_u128_a2;
 extern "C" __global__ void __launch_bounds__(32) grim_dot4_q3k_q81_gemv_sub(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q3k,
@@ -4614,6 +4615,644 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q3k_q81_gemv_sub_v2(
     if (lane == 0) {
         for (int j = 0; j < active_cols; j++)
             C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+// Q3_K Variation 1: Vectorized 128-bit loads (`grim_dot4_q3k_q81_gemv_sub_v4_vec`)
+// Replaces 4x32-bit scalar loads for qs and hmask with 128-bit vector loads (`grim_u128_a2`),
+// reducing load instruction count from 44 to 20 per wave step.
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q3k_q81_gemv_sub_v4_vec(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q3k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub   = lane & 7;
+    const int slot  = lane >> 3;
+    const int half  = sub >> 2;
+    const int j4    = sub & 3;
+    const int odd   = sub & 1;
+    const int shift = 2 * j4;
+    const int is0   = 2 * sub;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_q3k + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a = 0.0f;
+        int a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (sb_valid) {
+            const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+            __builtin_memcpy(a4, a_blk + 4, 32);
+        }
+
+        unsigned short d_v[4];
+        unsigned short sc_lo_v[4];
+        unsigned short sc_hi_v[4];
+        grim_u128_a2 q_own_v[4];
+        grim_u128_a2 h_own_v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+                d_v[j]     = ((const unsigned short*)b_sb)[54];
+                sc_lo_v[j] = *(const unsigned short*)(b_sb + 96 + (is0 & 6));
+                sc_hi_v[j] = *(const unsigned short*)(b_sb + 104 + (is0 & 2));
+                h_own_v[j] = *(const grim_u128_a2*)(b_sb + odd * 16);
+                q_own_v[j] = *(const grim_u128_a2*)(b_sb + 32 + half * 32 + odd * 16);
+            } else {
+                d_v[j]     = 0u;
+                sc_lo_v[j] = 0u;
+                sc_hi_v[j] = 0u;
+                h_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+                q_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d = fp16_to_float_device(d_v[j]);
+            const unsigned s0_lo = (unsigned)sc_lo_v[j] & 0xFFu;
+            const unsigned s1_lo = (unsigned)sc_lo_v[j] >> 8;
+            const unsigned s0_hi_b = (unsigned)sc_hi_v[j] & 0xFFu;
+            const unsigned s1_hi_b = (unsigned)sc_hi_v[j] >> 8;
+            const unsigned s0_hi = (s0_hi_b >> (4 * half + 2 * ((is0 >> 2) & 1))) & 0x03u;
+            const unsigned s1_hi = (s1_hi_b >> (4 * half + 2 * (((is0 + 1) >> 2) & 1))) & 0x03u;
+            const unsigned v0 = (half ? ((s0_lo >> 4) & 0x0Fu) : (s0_lo & 0x0Fu)) | (s0_hi << 4);
+            const unsigned v1 = (half ? ((s1_lo >> 4) & 0x0Fu) : (s1_lo & 0x0Fu)) | (s1_hi << 4);
+            const int sc0 = (int)(v0 >= 128u ? (int)v0 - 256 : (int)v0) - 32;
+            const int sc1 = (int)(v1 >= 128u ? (int)v1 - 256 : (int)v1) - 32;
+
+            const grim_u128_a2 q_own = q_own_v[j];
+            const grim_u128_a2 h_own = h_own_v[j];
+            grim_u128_a2 q_part, h_part;
+            q_part.x = (unsigned)__shfl_xor((int)q_own.x, 1);
+            q_part.y = (unsigned)__shfl_xor((int)q_own.y, 1);
+            q_part.z = (unsigned)__shfl_xor((int)q_own.z, 1);
+            q_part.w = (unsigned)__shfl_xor((int)q_own.w, 1);
+            h_part.x = (unsigned)__shfl_xor((int)h_own.x, 1);
+            h_part.y = (unsigned)__shfl_xor((int)h_own.y, 1);
+            h_part.z = (unsigned)__shfl_xor((int)h_own.z, 1);
+            h_part.w = (unsigned)__shfl_xor((int)h_own.w, 1);
+
+            const unsigned qw[8] = {
+                odd ? q_part.x : q_own.x, odd ? q_part.y : q_own.y,
+                odd ? q_part.z : q_own.z, odd ? q_part.w : q_own.w,
+                odd ? q_own.x : q_part.x, odd ? q_own.y : q_part.y,
+                odd ? q_own.z : q_part.z, odd ? q_own.w : q_part.w
+            };
+            const unsigned hw[8] = {
+                odd ? h_part.x : h_own.x, odd ? h_part.y : h_own.y,
+                odd ? h_part.z : h_own.z, odd ? h_part.w : h_own.w,
+                odd ? h_own.x : h_part.x, odd ? h_own.y : h_part.y,
+                odd ? h_own.z : h_part.z, odd ? h_own.w : h_part.w
+            };
+
+            int pos0 = 0, pos1 = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned mag = (qw[w] >> shift) & 0x03030303u;
+                const unsigned hbit = (((~hw[w]) >> sub) & 0x01010101u) * 0xFCu;
+                const int q4 = (int)(mag | hbit);
+                if (w < 4) pos0 = grim_sdot4(a4[w], q4, pos0);
+                else       pos1 = grim_sdot4(a4[w], q4, pos1);
+            }
+            if (sb_valid) {
+                facc[j] += d * d_a * ((float)sc0 * (float)pos0 + (float)sc1 * (float)pos1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+// Q3_K Variation 2: Vectorized loads + Software Pipelining (`grim_dot4_q3k_q81_gemv_sub_v4_vec_prefetch`)
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q3k_q81_gemv_sub_v4_vec_prefetch(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q3k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub   = lane & 7;
+    const int slot  = lane >> 3;
+    const int half  = sub >> 2;
+    const int j4    = sub & 3;
+    const int odd   = sub & 1;
+    const int shift = 2 * j4;
+    const int is0   = 2 * sub;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_q3k + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    int sb_base = 0;
+
+    // Prefetch first stage
+    float cur_d_a = 0.0f;
+    int cur_a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    bool cur_sb_valid = (sb_base + slot < n_sb);
+
+    unsigned short cur_d_v[4] = {0, 0, 0, 0};
+    unsigned short cur_sc_lo_v[4] = {0, 0, 0, 0};
+    unsigned short cur_sc_hi_v[4] = {0, 0, 0, 0};
+    grim_u128_a2 cur_q_own_v[4];
+    grim_u128_a2 cur_h_own_v[4];
+
+    if (cur_sb_valid) {
+        const int sb = sb_base + slot;
+        const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+        cur_d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        __builtin_memcpy(cur_a4, a_blk + 4, 32);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+                cur_d_v[j]     = ((const unsigned short*)b_sb)[54];
+                cur_sc_lo_v[j] = *(const unsigned short*)(b_sb + 96 + (is0 & 6));
+                cur_sc_hi_v[j] = *(const unsigned short*)(b_sb + 104 + (is0 & 2));
+                cur_h_own_v[j] = *(const grim_u128_a2*)(b_sb + odd * 16);
+                cur_q_own_v[j] = *(const grim_u128_a2*)(b_sb + 32 + half * 32 + odd * 16);
+            } else {
+                cur_d_v[j]     = 0u;
+                cur_sc_lo_v[j] = 0u;
+                cur_sc_hi_v[j] = 0u;
+                cur_h_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+                cur_q_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+            }
+        }
+    }
+
+    for (; sb_base + 4 < n_sb; sb_base += 4) {
+        // Prefetch next stage (sb_base + 4)
+        const int next_sb = sb_base + 4 + slot;
+        const bool next_sb_valid = (next_sb < n_sb);
+        float next_d_a = 0.0f;
+        int next_a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+        unsigned short next_d_v[4] = {0, 0, 0, 0};
+        unsigned short next_sc_lo_v[4] = {0, 0, 0, 0};
+        unsigned short next_sc_hi_v[4] = {0, 0, 0, 0};
+        grim_u128_a2 next_q_own_v[4];
+        grim_u128_a2 next_h_own_v[4];
+
+        if (next_sb_valid) {
+            const unsigned char* next_a_blk = a_row + (next_sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            next_d_a = fp16_to_float_device(((const unsigned short*)next_a_blk)[0]);
+            __builtin_memcpy(next_a4, next_a_blk + 4, 32);
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j < active_cols) {
+                    const unsigned char* b_sb = b0 + j * col_stride + (long long)next_sb * 110;
+                    next_d_v[j]     = ((const unsigned short*)b_sb)[54];
+                    next_sc_lo_v[j] = *(const unsigned short*)(b_sb + 96 + (is0 & 6));
+                    next_sc_hi_v[j] = *(const unsigned short*)(b_sb + 104 + (is0 & 2));
+                    next_h_own_v[j] = *(const grim_u128_a2*)(b_sb + odd * 16);
+                    next_q_own_v[j] = *(const grim_u128_a2*)(b_sb + 32 + half * 32 + odd * 16);
+                } else {
+                    next_d_v[j]     = 0u;
+                    next_sc_lo_v[j] = 0u;
+                    next_sc_hi_v[j] = 0u;
+                    next_h_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+                    next_q_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+                }
+            }
+        }
+
+        // Compute current stage
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d = fp16_to_float_device(cur_d_v[j]);
+            const unsigned s0_lo = (unsigned)cur_sc_lo_v[j] & 0xFFu;
+            const unsigned s1_lo = (unsigned)cur_sc_lo_v[j] >> 8;
+            const unsigned s0_hi_b = (unsigned)cur_sc_hi_v[j] & 0xFFu;
+            const unsigned s1_hi_b = (unsigned)cur_sc_hi_v[j] >> 8;
+            const unsigned s0_hi = (s0_hi_b >> (4 * half + 2 * ((is0 >> 2) & 1))) & 0x03u;
+            const unsigned s1_hi = (s1_hi_b >> (4 * half + 2 * (((is0 + 1) >> 2) & 1))) & 0x03u;
+            const unsigned v0 = (half ? ((s0_lo >> 4) & 0x0Fu) : (s0_lo & 0x0Fu)) | (s0_hi << 4);
+            const unsigned v1 = (half ? ((s1_lo >> 4) & 0x0Fu) : (s1_lo & 0x0Fu)) | (s1_hi << 4);
+            const int sc0 = (int)(v0 >= 128u ? (int)v0 - 256 : (int)v0) - 32;
+            const int sc1 = (int)(v1 >= 128u ? (int)v1 - 256 : (int)v1) - 32;
+
+            const grim_u128_a2 q_own = cur_q_own_v[j];
+            const grim_u128_a2 h_own = cur_h_own_v[j];
+            grim_u128_a2 q_part, h_part;
+            q_part.x = (unsigned)__shfl_xor((int)q_own.x, 1);
+            q_part.y = (unsigned)__shfl_xor((int)q_own.y, 1);
+            q_part.z = (unsigned)__shfl_xor((int)q_own.z, 1);
+            q_part.w = (unsigned)__shfl_xor((int)q_own.w, 1);
+            h_part.x = (unsigned)__shfl_xor((int)h_own.x, 1);
+            h_part.y = (unsigned)__shfl_xor((int)h_own.y, 1);
+            h_part.z = (unsigned)__shfl_xor((int)h_own.z, 1);
+            h_part.w = (unsigned)__shfl_xor((int)h_own.w, 1);
+
+            const unsigned qw[8] = {
+                odd ? q_part.x : q_own.x, odd ? q_part.y : q_own.y,
+                odd ? q_part.z : q_own.z, odd ? q_part.w : q_own.w,
+                odd ? q_own.x : q_part.x, odd ? q_own.y : q_part.y,
+                odd ? q_own.z : q_part.z, odd ? q_own.w : q_part.w
+            };
+            const unsigned hw[8] = {
+                odd ? h_part.x : h_own.x, odd ? h_part.y : h_own.y,
+                odd ? h_part.z : h_own.z, odd ? h_part.w : h_own.w,
+                odd ? h_own.x : h_part.x, odd ? h_own.y : h_part.y,
+                odd ? h_own.z : h_part.z, odd ? h_own.w : h_part.w
+            };
+
+            int pos0 = 0, pos1 = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned mag = (qw[w] >> shift) & 0x03030303u;
+                const unsigned hbit = (((~hw[w]) >> sub) & 0x01010101u) * 0xFCu;
+                const int q4 = (int)(mag | hbit);
+                if (w < 4) pos0 = grim_sdot4(cur_a4[w], q4, pos0);
+                else       pos1 = grim_sdot4(cur_a4[w], q4, pos1);
+            }
+            if (cur_sb_valid) {
+                facc[j] += d * cur_d_a * ((float)sc0 * (float)pos0 + (float)sc1 * (float)pos1);
+            }
+        }
+
+        // Rotate stage registers
+        cur_d_a = next_d_a;
+        #pragma unroll
+        for (int w = 0; w < 8; w++) cur_a4[w] = next_a4[w];
+        cur_sb_valid = next_sb_valid;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            cur_d_v[j]     = next_d_v[j];
+            cur_sc_lo_v[j] = next_sc_lo_v[j];
+            cur_sc_hi_v[j] = next_sc_hi_v[j];
+            cur_q_own_v[j] = next_q_own_v[j];
+            cur_h_own_v[j] = next_h_own_v[j];
+        }
+    }
+
+    // Process remainder/final stage
+    if (cur_sb_valid) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d = fp16_to_float_device(cur_d_v[j]);
+            const unsigned s0_lo = (unsigned)cur_sc_lo_v[j] & 0xFFu;
+            const unsigned s1_lo = (unsigned)cur_sc_lo_v[j] >> 8;
+            const unsigned s0_hi_b = (unsigned)cur_sc_hi_v[j] & 0xFFu;
+            const unsigned s1_hi_b = (unsigned)cur_sc_hi_v[j] >> 8;
+            const unsigned s0_hi = (s0_hi_b >> (4 * half + 2 * ((is0 >> 2) & 1))) & 0x03u;
+            const unsigned s1_hi = (s1_hi_b >> (4 * half + 2 * (((is0 + 1) >> 2) & 1))) & 0x03u;
+            const unsigned v0 = (half ? ((s0_lo >> 4) & 0x0Fu) : (s0_lo & 0x0Fu)) | (s0_hi << 4);
+            const unsigned v1 = (half ? ((s1_lo >> 4) & 0x0Fu) : (s1_lo & 0x0Fu)) | (s1_hi << 4);
+            const int sc0 = (int)(v0 >= 128u ? (int)v0 - 256 : (int)v0) - 32;
+            const int sc1 = (int)(v1 >= 128u ? (int)v1 - 256 : (int)v1) - 32;
+
+            const grim_u128_a2 q_own = cur_q_own_v[j];
+            const grim_u128_a2 h_own = cur_h_own_v[j];
+            grim_u128_a2 q_part, h_part;
+            q_part.x = (unsigned)__shfl_xor((int)q_own.x, 1);
+            q_part.y = (unsigned)__shfl_xor((int)q_own.y, 1);
+            q_part.z = (unsigned)__shfl_xor((int)q_own.z, 1);
+            q_part.w = (unsigned)__shfl_xor((int)q_own.w, 1);
+            h_part.x = (unsigned)__shfl_xor((int)h_own.x, 1);
+            h_part.y = (unsigned)__shfl_xor((int)h_own.y, 1);
+            h_part.z = (unsigned)__shfl_xor((int)h_own.z, 1);
+            h_part.w = (unsigned)__shfl_xor((int)h_own.w, 1);
+
+            const unsigned qw[8] = {
+                odd ? q_part.x : q_own.x, odd ? q_part.y : q_own.y,
+                odd ? q_part.z : q_own.z, odd ? q_part.w : q_own.w,
+                odd ? q_own.x : q_part.x, odd ? q_own.y : q_part.y,
+                odd ? q_own.z : q_part.z, odd ? q_own.w : q_part.w
+            };
+            const unsigned hw[8] = {
+                odd ? h_part.x : h_own.x, odd ? h_part.y : h_own.y,
+                odd ? h_part.z : h_own.z, odd ? h_part.w : h_own.w,
+                odd ? h_own.x : h_part.x, odd ? h_own.y : h_part.y,
+                odd ? h_own.z : h_part.z, odd ? h_own.w : h_part.w
+            };
+
+            int pos0 = 0, pos1 = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned mag = (qw[w] >> shift) & 0x03030303u;
+                const unsigned hbit = (((~hw[w]) >> sub) & 0x01010101u) * 0xFCu;
+                const int q4 = (int)(mag | hbit);
+                if (w < 4) pos0 = grim_sdot4(cur_a4[w], q4, pos0);
+                else       pos1 = grim_sdot4(cur_a4[w], q4, pos1);
+            }
+            facc[j] += d * cur_d_a * ((float)sc0 * (float)pos0 + (float)sc1 * (float)pos1);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+// Q3_K Variation 3: Vectorized loads + 8-column wave tile (`grim_dot4_q3k_q81_gemv_sub_v6_vec_col8`)
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q3k_q81_gemv_sub_v6_vec_col8(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q3k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 8;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub   = lane & 7;
+    const int slot  = lane >> 3;
+    const int half  = sub >> 2;
+    const int j4    = sub & 3;
+    const int odd   = sub & 1;
+    const int shift = 2 * j4;
+    const int is0   = 2 * sub;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 8 <= N) ? 8 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_q3k + (long long)col_base * col_stride;
+
+    float facc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a = 0.0f;
+        int a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (sb_valid) {
+            const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+            __builtin_memcpy(a4, a_blk + 4, 32);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (j >= active_cols) break;
+            if (!sb_valid) continue;
+
+            const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+            const float d = fp16_to_float_device(((const unsigned short*)b_sb)[54]);
+            const unsigned sc_lo = (unsigned)*(const unsigned short*)(b_sb + 96 + (is0 & 6));
+            const unsigned sc_hi = (unsigned)*(const unsigned short*)(b_sb + 104 + (is0 & 2));
+
+            const unsigned s0_lo = sc_lo & 0xFFu;
+            const unsigned s1_lo = sc_lo >> 8;
+            const unsigned s0_hi_b = sc_hi & 0xFFu;
+            const unsigned s1_hi_b = sc_hi >> 8;
+            const unsigned s0_hi = (s0_hi_b >> (4 * half + 2 * ((is0 >> 2) & 1))) & 0x03u;
+            const unsigned s1_hi = (s1_hi_b >> (4 * half + 2 * (((is0 + 1) >> 2) & 1))) & 0x03u;
+            const unsigned v0 = (half ? ((s0_lo >> 4) & 0x0Fu) : (s0_lo & 0x0Fu)) | (s0_hi << 4);
+            const unsigned v1 = (half ? ((s1_lo >> 4) & 0x0Fu) : (s1_lo & 0x0Fu)) | (s1_hi << 4);
+            const int sc0 = (int)(v0 >= 128u ? (int)v0 - 256 : (int)v0) - 32;
+            const int sc1 = (int)(v1 >= 128u ? (int)v1 - 256 : (int)v1) - 32;
+
+            const grim_u128_a2 h_own = *(const grim_u128_a2*)(b_sb + odd * 16);
+            const grim_u128_a2 q_own = *(const grim_u128_a2*)(b_sb + 32 + half * 32 + odd * 16);
+
+            grim_u128_a2 q_part, h_part;
+            q_part.x = (unsigned)__shfl_xor((int)q_own.x, 1);
+            q_part.y = (unsigned)__shfl_xor((int)q_own.y, 1);
+            q_part.z = (unsigned)__shfl_xor((int)q_own.z, 1);
+            q_part.w = (unsigned)__shfl_xor((int)q_own.w, 1);
+            h_part.x = (unsigned)__shfl_xor((int)h_own.x, 1);
+            h_part.y = (unsigned)__shfl_xor((int)h_own.y, 1);
+            h_part.z = (unsigned)__shfl_xor((int)h_own.z, 1);
+            h_part.w = (unsigned)__shfl_xor((int)h_own.w, 1);
+
+            const unsigned qw[8] = {
+                odd ? q_part.x : q_own.x, odd ? q_part.y : q_own.y,
+                odd ? q_part.z : q_own.z, odd ? q_part.w : q_own.w,
+                odd ? q_own.x : q_part.x, odd ? q_own.y : q_part.y,
+                odd ? q_own.z : q_part.z, odd ? q_own.w : q_part.w
+            };
+            const unsigned hw[8] = {
+                odd ? h_part.x : h_own.x, odd ? h_part.y : h_own.y,
+                odd ? h_part.z : h_own.z, odd ? h_part.w : h_own.w,
+                odd ? h_own.x : h_part.x, odd ? h_own.y : h_part.y,
+                odd ? h_own.z : h_part.z, odd ? h_own.w : h_part.w
+            };
+
+            int pos0 = 0, pos1 = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned mag = (qw[w] >> shift) & 0x03030303u;
+                const unsigned hbit = (((~hw[w]) >> sub) & 0x01010101u) * 0xFCu;
+                const int q4 = (int)(mag | hbit);
+                if (w < 4) pos0 = grim_sdot4(a4[w], q4, pos0);
+                else       pos1 = grim_sdot4(a4[w], q4, pos1);
+            }
+            facc[j] += d * d_a * ((float)sc0 * (float)pos0 + (float)sc1 * (float)pos1);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+// Q3_K Variation 4: Vectorized Dual-Row Weight Reuse (`grim_dot4_q3k_q81_gemv_rows_r2_vec`) for M=2
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q3k_q81_gemv_rows_r2_vec(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q3k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * 2;
+    if (row_base >= M || col_base >= N) return;
+
+    const bool r1_valid = (row_base + 1 < M);
+
+    const int sub   = lane & 7;
+    const int slot  = lane >> 3;
+    const int half  = sub >> 2;
+    const int j4    = sub & 3;
+    const int odd   = sub & 1;
+    const int shift = 2 * j4;
+    const int is0   = 2 * sub;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const unsigned char* a_row0 = A_q81 + (long long)row_base * a_row_stride;
+    const unsigned char* a_row1 = A_q81 + (long long)(r1_valid ? (row_base + 1) : row_base) * a_row_stride;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_q3k + (long long)col_base * col_stride;
+
+    float facc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float facc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a0 = 0.0f;
+        float d_a1 = 0.0f;
+        int a4_0[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int a4_1[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+        if (sb_valid) {
+            const unsigned char* a_blk0 = a_row0 + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[0]);
+            __builtin_memcpy(a4_0, a_blk0 + 4, 32);
+
+            if (r1_valid) {
+                const unsigned char* a_blk1 = a_row1 + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+                d_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[0]);
+                __builtin_memcpy(a4_1, a_blk1 + 4, 32);
+            }
+        }
+
+        unsigned short d_v[4];
+        unsigned short sc_lo_v[4];
+        unsigned short sc_hi_v[4];
+        grim_u128_a2 q_own_v[4];
+        grim_u128_a2 h_own_v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+                d_v[j]     = ((const unsigned short*)b_sb)[54];
+                sc_lo_v[j] = *(const unsigned short*)(b_sb + 96 + (is0 & 6));
+                sc_hi_v[j] = *(const unsigned short*)(b_sb + 104 + (is0 & 2));
+                h_own_v[j] = *(const grim_u128_a2*)(b_sb + odd * 16);
+                q_own_v[j] = *(const grim_u128_a2*)(b_sb + 32 + half * 32 + odd * 16);
+            } else {
+                d_v[j]     = 0u;
+                sc_lo_v[j] = 0u;
+                sc_hi_v[j] = 0u;
+                h_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+                q_own_v[j] = (grim_u128_a2){0, 0, 0, 0};
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d = fp16_to_float_device(d_v[j]);
+            const unsigned s0_lo = (unsigned)sc_lo_v[j] & 0xFFu;
+            const unsigned s1_lo = (unsigned)sc_lo_v[j] >> 8;
+            const unsigned s0_hi_b = (unsigned)sc_hi_v[j] & 0xFFu;
+            const unsigned s1_hi_b = (unsigned)sc_hi_v[j] >> 8;
+            const unsigned s0_hi = (s0_hi_b >> (4 * half + 2 * ((is0 >> 2) & 1))) & 0x03u;
+            const unsigned s1_hi = (s1_hi_b >> (4 * half + 2 * (((is0 + 1) >> 2) & 1))) & 0x03u;
+            const unsigned v0 = (half ? ((s0_lo >> 4) & 0x0Fu) : (s0_lo & 0x0Fu)) | (s0_hi << 4);
+            const unsigned v1 = (half ? ((s1_lo >> 4) & 0x0Fu) : (s1_lo & 0x0Fu)) | (s1_hi << 4);
+            const int sc0 = (int)(v0 >= 128u ? (int)v0 - 256 : (int)v0) - 32;
+            const int sc1 = (int)(v1 >= 128u ? (int)v1 - 256 : (int)v1) - 32;
+
+            const grim_u128_a2 q_own = q_own_v[j];
+            const grim_u128_a2 h_own = h_own_v[j];
+            grim_u128_a2 q_part, h_part;
+            q_part.x = (unsigned)__shfl_xor((int)q_own.x, 1);
+            q_part.y = (unsigned)__shfl_xor((int)q_own.y, 1);
+            q_part.z = (unsigned)__shfl_xor((int)q_own.z, 1);
+            q_part.w = (unsigned)__shfl_xor((int)q_own.w, 1);
+            h_part.x = (unsigned)__shfl_xor((int)h_own.x, 1);
+            h_part.y = (unsigned)__shfl_xor((int)h_own.y, 1);
+            h_part.z = (unsigned)__shfl_xor((int)h_own.z, 1);
+            h_part.w = (unsigned)__shfl_xor((int)h_own.w, 1);
+
+            const unsigned qw[8] = {
+                odd ? q_part.x : q_own.x, odd ? q_part.y : q_own.y,
+                odd ? q_part.z : q_own.z, odd ? q_part.w : q_own.w,
+                odd ? q_own.x : q_part.x, odd ? q_own.y : q_part.y,
+                odd ? q_own.z : q_part.z, odd ? q_own.w : q_part.w
+            };
+            const unsigned hw[8] = {
+                odd ? h_part.x : h_own.x, odd ? h_part.y : h_own.y,
+                odd ? h_part.z : h_own.z, odd ? h_part.w : h_own.w,
+                odd ? h_own.x : h_part.x, odd ? h_own.y : h_part.y,
+                odd ? h_own.z : h_part.z, odd ? h_own.w : h_part.w
+            };
+
+            int pos0_0 = 0, pos1_0 = 0;
+            int pos0_1 = 0, pos1_1 = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned mag = (qw[w] >> shift) & 0x03030303u;
+                const unsigned hbit = (((~hw[w]) >> sub) & 0x01010101u) * 0xFCu;
+                const int q4 = (int)(mag | hbit);
+                if (w < 4) {
+                    pos0_0 = grim_sdot4(a4_0[w], q4, pos0_0);
+                    if (r1_valid) pos0_1 = grim_sdot4(a4_1[w], q4, pos0_1);
+                } else {
+                    pos1_0 = grim_sdot4(a4_0[w], q4, pos1_0);
+                    if (r1_valid) pos1_1 = grim_sdot4(a4_1[w], q4, pos1_1);
+                }
+            }
+            if (sb_valid) {
+                facc0[j] += d * d_a0 * ((float)sc0 * (float)pos0_0 + (float)sc1 * (float)pos1_0);
+                if (r1_valid) {
+                    facc1[j] += d * d_a1 * ((float)sc0 * (float)pos0_1 + (float)sc1 * (float)pos1_1);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc0[j] += __shfl_xor(facc0[j], off);
+            if (r1_valid) facc1[j] += __shfl_xor(facc1[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row_base * N + col_base + j] = facc0[j];
+            if (r1_valid) C[(long long)(row_base + 1) * N + col_base + j] = facc1[j];
+        }
     }
 }
 
