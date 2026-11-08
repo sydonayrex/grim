@@ -3772,15 +3772,20 @@ impl RocmDevice {
                         }
                     }
                     KQuantScheme::Q2K => self.launch_dot4_q2k_q81_gemv(act_q81, w, out, m, n, k)?,
-                    // IQ3_S has NO dot4 GEMV, and it must never reach the
-                    // catch-all below: IQ3_S and Q3_K share the 110 B / 256
-                    // block size but not the layout, so decoding IQ3_S bytes
-                    // with the Q3_K kernel silently yields garbage (measured:
-                    // every Xing4.0 projection came out zero, because the whole
-                    // model is IQ3_S). The fused-dequant leg reads A as f32 and
-                    // dequantizes inline, so it needs no act_q81 either.
+                    // IQ3_S dot4 GEMV decode:
                     KQuantScheme::IQ3S => {
-                        self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ3S_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        if self.is_dot4_arch && !dot_disabled && k % 256 == 0 {
+                            self.launch_dot4_iq3s_q81_gemv(act_q81, w, out, m, n, k)?
+                        } else {
+                            self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?
+                        }
                     }
                     // IQ1_S/IQ1_M/IQ2 family: the scalar fused-dequant GEMMs
                     // (ported from llama.cpp dequantize_row_iq1_s/iq1_m,
@@ -3805,7 +3810,18 @@ impl RocmDevice {
                         self.launch_fused_dequant_gemm_iq2xxs(a_s, w, out, m, n, k)?
                     }
                     KQuantScheme::IQ3XXS => {
-                        self.launch_fused_dequant_gemm_iq3xxs(a_s, w, out, m, n, k)?
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ3XXS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        if self.is_dot4_arch && !dot_disabled && k % 256 == 0 {
+                            self.launch_dot4_iq3xxs_q81_gemv(act_q81, w, out, m, n, k)?
+                        } else {
+                            self.launch_fused_dequant_gemm_iq3xxs(a_s, w, out, m, n, k)?
+                        }
                     }
                     // IQ4_XS fast dot4 decode: sub-block-per-lane v2 kernel with 4-column
                     // load batching and pure VALU byte permute LUT.

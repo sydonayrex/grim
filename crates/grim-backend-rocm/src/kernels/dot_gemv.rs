@@ -11122,6 +11122,448 @@ GRIM_ROWS_HV_KERNEL(grim_dot4_iq4xs_q81_gemv_rows_hv2, 2)
 GRIM_ROWS_HV_KERNEL(grim_dot4_iq4xs_q81_gemv_rows_hv8, 8)
 #undef GRIM_ROWS_HV_KERNEL
 
+// ============================================================================
+// IQ3 Family dot4 INT8 GEMV (Wave32 sub-block-per-lane)
+// ============================================================================
+
+__device__ __forceinline__ uint32_t grim_iq_sign_bytes(uint32_t s4) {
+    return ((s4 & 0xFu) * 0x00204081u) & 0x01010101u;
+}
+
+__device__ __forceinline__ int grim_iq_negate(uint32_t grid, uint32_t t) {
+    return (int)((grid ^ (t * 0xFFu)) + t);
+}
+
+__device__ __forceinline__ uint32_t grim_unpack_ksigns(const uint8_t v) {
+    const uint32_t p = (uint32_t)__builtin_popcount((unsigned int)v) & 1u;
+    const uint32_t s = (uint32_t)v ^ (p << 7);
+    return s * 0x01010101u;
+}
+
+// ----------------------------------------------------------------------------
+// IQ3_XXS dot4 GEMV (98 bytes per 256 weights, 8 sub-blocks of 32 weights)
+// ----------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3xxs_q81_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq3xxs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / 256;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 98;
+    const unsigned char* b0 = B_iq3xxs + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a = 0.0f;
+        int a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (sb_valid) {
+            const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+            __builtin_memcpy(a4, a_blk + 4, 32);
+        }
+
+        float db_col[4];
+        uint2 q_col[4];
+        uint32_t aux_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 98;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* ss = b_sb + 66;
+                const uint32_t aux = ((const uint32_t*)ss)[sub];
+                db_col[j] = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                aux_col[j] = aux;
+                const unsigned char* qs = b_sb + 2;
+                q_col[j] = ((const uint2*)(qs + sub * 8))[0];
+            } else {
+                db_col[j] = 0.0f;
+                aux_col[j] = 0u;
+                q_col[j] = make_uint2(0u, 0u);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* q_sub = (const uint8_t*)&q_col[j];
+            const uint32_t aux = aux_col[j];
+            int sumi = 0;
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const uint32_t g0 = IQ3XXS_GRID[q_sub[2 * l + 0]];
+                const uint32_t g1 = IQ3XXS_GRID[q_sub[2 * l + 1]];
+                const uint32_t s = grim_unpack_ksigns((uint8_t)(aux >> (7 * l))) & 0xFFu;
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                sumi = grim_sdot4(a4[2 * l + 0], grid_l, sumi);
+                sumi = grim_sdot4(a4[2 * l + 1], grid_h, sumi);
+            }
+            facc[j] += db_col[j] * d_a * (float)sumi;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+// ----------------------------------------------------------------------------
+// IQ3_XXS Dual-Row Weight Reuse dot4 GEMV (M=2)
+// ----------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3xxs_q81_gemv_rows_r2(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq3xxs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * 2;
+    if (row_base >= M || col_base >= N) return;
+
+    const bool r1_valid = (row_base + 1 < M);
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / 256;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const unsigned char* a_row0 = A_q81 + (long long)row_base * a_row_stride;
+    const unsigned char* a_row1 = A_q81 + (long long)(r1_valid ? (row_base + 1) : row_base) * a_row_stride;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 98;
+    const unsigned char* b0 = B_iq3xxs + (long long)col_base * col_stride;
+
+    float facc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float facc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a0 = 0.0f, d_a1 = 0.0f;
+        int a4_0[8] = {0}, a4_1[8] = {0};
+        if (sb_valid) {
+            const unsigned char* a_blk0 = a_row0 + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[0]);
+            __builtin_memcpy(a4_0, a_blk0 + 4, 32);
+
+            if (r1_valid) {
+                const unsigned char* a_blk1 = a_row1 + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+                d_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[0]);
+                __builtin_memcpy(a4_1, a_blk1 + 4, 32);
+            }
+        }
+
+        float db_col[4];
+        uint2 q_col[4];
+        uint32_t aux_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 98;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* ss = b_sb + 66;
+                const uint32_t aux = ((const uint32_t*)ss)[sub];
+                db_col[j] = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                aux_col[j] = aux;
+                const unsigned char* qs = b_sb + 2;
+                q_col[j] = ((const uint2*)(qs + sub * 8))[0];
+            } else {
+                db_col[j] = 0.0f;
+                aux_col[j] = 0u;
+                q_col[j] = make_uint2(0u, 0u);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* q_sub = (const uint8_t*)&q_col[j];
+            const uint32_t aux = aux_col[j];
+            int sumi0 = 0, sumi1 = 0;
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const uint32_t g0 = IQ3XXS_GRID[q_sub[2 * l + 0]];
+                const uint32_t g1 = IQ3XXS_GRID[q_sub[2 * l + 1]];
+                const uint32_t s = grim_unpack_ksigns((uint8_t)(aux >> (7 * l))) & 0xFFu;
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                sumi0 = grim_sdot4(a4_0[2 * l + 0], grid_l, sumi0);
+                sumi0 = grim_sdot4(a4_0[2 * l + 1], grid_h, sumi0);
+                if (r1_valid) {
+                    sumi1 = grim_sdot4(a4_1[2 * l + 0], grid_l, sumi1);
+                    sumi1 = grim_sdot4(a4_1[2 * l + 1], grid_h, sumi1);
+                }
+            }
+            facc0[j] += db_col[j] * d_a0 * (float)sumi0;
+            if (r1_valid) {
+                facc1[j] += db_col[j] * d_a1 * (float)sumi1;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc0[j] += __shfl_xor(facc0[j], off);
+            if (r1_valid) facc1[j] += __shfl_xor(facc1[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row_base * N + col_base + j] = facc0[j];
+            if (r1_valid)
+                C[(long long)(row_base + 1) * N + col_base + j] = facc1[j];
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// IQ3_S dot4 GEMV (110 bytes per 256 weights, 8 sub-blocks of 32 weights)
+// ----------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3s_q81_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq3s,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / 256;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_iq3s + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a = 0.0f;
+        int a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (sb_valid) {
+            const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+            __builtin_memcpy(a4, a_blk + 4, 32);
+        }
+
+        float db_col[4];
+        uint2 q_col[4];
+        uint32_t signs_col[4];
+        uint8_t qh_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* scales = b_sb + 106;
+                const uint8_t sc = scales[sub / 2];
+                const int sc_val = (sub & 1) ? (sc >> 4) : (sc & 0x0Fu);
+                db_col[j] = d * (1.0f + 2.0f * (float)sc_val);
+                
+                const unsigned char* qs = b_sb + 2;
+                q_col[j] = ((const uint2*)(qs + sub * 8))[0];
+                
+                const unsigned char* qh = b_sb + 66;
+                qh_col[j] = qh[sub];
+                
+                const unsigned char* signs = b_sb + 74;
+                signs_col[j] = ((const uint32_t*)(signs + sub * 4))[0];
+            } else {
+                db_col[j] = 0.0f;
+                q_col[j] = make_uint2(0u, 0u);
+                qh_col[j] = 0;
+                signs_col[j] = 0u;
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* q_sub = (const uint8_t*)&q_col[j];
+            const uint32_t signs32 = signs_col[j];
+            const uint32_t qh = qh_col[j];
+            int sumi = 0;
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const uint32_t idx0 = (uint32_t)q_sub[2 * l + 0] | (((qh >> (2 * l)) & 1u) << 8);
+                const uint32_t idx1 = (uint32_t)q_sub[2 * l + 1] | (((qh >> (2 * l + 1)) & 1u) << 8);
+                const uint32_t g0 = IQ3S_GRID[idx0];
+                const uint32_t g1 = IQ3S_GRID[idx1];
+                const uint32_t s = (signs32 >> (8 * l)) & 0xFFu;
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                sumi = grim_sdot4(a4[2 * l + 0], grid_l, sumi);
+                sumi = grim_sdot4(a4[2 * l + 1], grid_h, sumi);
+            }
+            facc[j] += db_col[j] * d_a * (float)sumi;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+// ----------------------------------------------------------------------------
+// IQ3_S Dual-Row Weight Reuse dot4 GEMV (M=2)
+// ----------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3s_q81_gemv_rows_r2(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq3s,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * 2;
+    if (row_base >= M || col_base >= N) return;
+
+    const bool r1_valid = (row_base + 1 < M);
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / 256;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const unsigned char* a_row0 = A_q81 + (long long)row_base * a_row_stride;
+    const unsigned char* a_row1 = A_q81 + (long long)(r1_valid ? (row_base + 1) : row_base) * a_row_stride;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_iq3s + (long long)col_base * col_stride;
+
+    float facc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float facc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a0 = 0.0f, d_a1 = 0.0f;
+        int a4_0[8] = {0}, a4_1[8] = {0};
+        if (sb_valid) {
+            const unsigned char* a_blk0 = a_row0 + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[0]);
+            __builtin_memcpy(a4_0, a_blk0 + 4, 32);
+
+            if (r1_valid) {
+                const unsigned char* a_blk1 = a_row1 + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+                d_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[0]);
+                __builtin_memcpy(a4_1, a_blk1 + 4, 32);
+            }
+        }
+
+        float db_col[4];
+        uint2 q_col[4];
+        uint32_t signs_col[4];
+        uint8_t qh_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* scales = b_sb + 106;
+                const uint8_t sc = scales[sub / 2];
+                const int sc_val = (sub & 1) ? (sc >> 4) : (sc & 0x0Fu);
+                db_col[j] = d * (1.0f + 2.0f * (float)sc_val);
+                
+                const unsigned char* qs = b_sb + 2;
+                q_col[j] = ((const uint2*)(qs + sub * 8))[0];
+                
+                const unsigned char* qh = b_sb + 66;
+                qh_col[j] = qh[sub];
+                
+                const unsigned char* signs = b_sb + 74;
+                signs_col[j] = ((const uint32_t*)(signs + sub * 4))[0];
+            } else {
+                db_col[j] = 0.0f;
+                q_col[j] = make_uint2(0u, 0u);
+                qh_col[j] = 0;
+                signs_col[j] = 0u;
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* q_sub = (const uint8_t*)&q_col[j];
+            const uint32_t signs32 = signs_col[j];
+            const uint32_t qh = qh_col[j];
+            int sumi0 = 0, sumi1 = 0;
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const uint32_t idx0 = (uint32_t)q_sub[2 * l + 0] | (((qh >> (2 * l)) & 1u) << 8);
+                const uint32_t idx1 = (uint32_t)q_sub[2 * l + 1] | (((qh >> (2 * l + 1)) & 1u) << 8);
+                const uint32_t g0 = IQ3S_GRID[idx0];
+                const uint32_t g1 = IQ3S_GRID[idx1];
+                const uint32_t s = (signs32 >> (8 * l)) & 0xFFu;
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                sumi0 = grim_sdot4(a4_0[2 * l + 0], grid_l, sumi0);
+                sumi0 = grim_sdot4(a4_0[2 * l + 1], grid_h, sumi0);
+                if (r1_valid) {
+                    sumi1 = grim_sdot4(a4_1[2 * l + 0], grid_l, sumi1);
+                    sumi1 = grim_sdot4(a4_1[2 * l + 1], grid_h, sumi1);
+                }
+            }
+            facc0[j] += db_col[j] * d_a0 * (float)sumi0;
+            if (r1_valid) {
+                facc1[j] += db_col[j] * d_a1 * (float)sumi1;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc0[j] += __shfl_xor(facc0[j], off);
+            if (r1_valid) facc1[j] += __shfl_xor(facc1[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row_base * N + col_base + j] = facc0[j];
+            if (r1_valid)
+                C[(long long)(row_base + 1) * N + col_base + j] = facc1[j];
+        }
+    }
+}
+
 "#;
 
 #[cfg(test)]
