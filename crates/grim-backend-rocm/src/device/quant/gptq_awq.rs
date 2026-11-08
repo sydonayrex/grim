@@ -786,6 +786,13 @@ impl RocmDevice {
 
         // Default is v5 (unified with dot_gemv.rs).
         // v1 (grim_dot8_w4a4_gemv) is selected only when explicitly requested (GRIM_WHITECROW_V1=1 or GRIM_WHITECROW_V5=0).
+        static ROWS_R2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let rows_r2 = *ROWS_R2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITECROW_ROWS_R2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static USE_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let use_v5 = *USE_V5.get_or_init(|| {
             if matches!(
@@ -800,12 +807,18 @@ impl RocmDevice {
                 )
             }
         });
+        let use_r2 = m == 2 && rows_r2 && use_v5;
         let grid_x = if use_v5 {
             (n as u32).div_ceil(16)
         } else {
             (n as u32).div_ceil(4)
         };
-        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let grid_y = if use_r2 {
+            (m as u32).div_ceil(2)
+        } else {
+            m as u32
+        };
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
         let block_dim = if use_v5 {
             HipDim3::new(128, 1, 1)
         } else {
@@ -826,14 +839,15 @@ impl RocmDevice {
         if use_v5 {
             crate::device::compute::kernel_infra::record_kernel_route("grim_dot8_w4a4_gemv");
         }
-        // Default routes to v5: v3's layout and loads with the
-        // scalar tail replaced by the predicated 4-group structure.
+        let kernel_name = if use_r2 {
+            "grim_dot8_w4a4_gemv_rows_r2"
+        } else if use_v5 {
+            "grim_dot8_w4a4_gemv_v5"
+        } else {
+            "grim_dot8_w4a4_gemv"
+        };
         self.launch_compute_kernel(
-            if use_v5 {
-                "grim_dot8_w4a4_gemv_v5"
-            } else {
-                "grim_dot8_w4a4_gemv"
-            },
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
