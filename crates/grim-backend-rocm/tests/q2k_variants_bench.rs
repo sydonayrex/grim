@@ -1,9 +1,7 @@
-//! Comprehensive benchmark comparing all Q2_K improvement variations on a 60 MB weight tensor:
+//! Benchmark comparing Q2_K wired production variants on a 60 MB weight tensor:
 //! - Baseline: `grim_dot4_q2k_q81_gemv_sub_v2`
-//! - Var 1:    `grim_dot4_q2k_q81_gemv_sub_v4_vec` (128-bit vector loads)
-//! - Var 2:    `grim_dot4_q2k_q81_gemv_sub_v3_prefetch` (software prefetch)
-//! - Var 3:    `grim_dot4_q2k_q81_gemv_sub_v6_vec_col8` (8-column wave tile)
-//! - Var 4:    `grim_dot4_q2k_q81_gemv_rows_r2` (Dual-row weight reuse at M=2)
+//! - M=1 Optimal: `grim_dot4_q2k_q81_gemv_sub_v6_vec_col8` (8-column wave tile)
+//! - M=2 Optimal: `grim_dot4_q2k_q81_gemv_rows_r2` (Dual-row weight reuse)
 
 use grim_backend_rocm::{as_rocm, RocmDevice};
 use grim_tensor::{ArithType, DType, MemoryOps, Shape, Storage};
@@ -30,14 +28,14 @@ fn gpu_device() -> Option<RocmDevice> {
 }
 
 #[test]
-fn bench_q2k_all_variants() -> TestResult {
+fn bench_q2k_variants() -> TestResult {
     let Some(dev) = gpu_device() else {
         println!("GPU tests disabled.");
         return Ok(());
     };
 
     println!("==========================================================================================");
-    println!("Q2_K COMPREHENSIVE VARIANT BENCHMARK (60 MB WEIGHT TENSOR: N=37632, K=5120)");
+    println!("Q2_K PRODUCTION VARIANT BENCHMARK (60 MB WEIGHT TENSOR: N=37632, K=5120)");
     println!("==========================================================================================");
 
     let (n, k) = (37632, 5120);
@@ -106,42 +104,7 @@ fn bench_q2k_all_variants() -> TestResult {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect::<Vec<f32>>();
 
-        // 2. Parity check Var 1 (v4_vec)
-        dev.launch_dot4_q2k_q81_gemv_sub_v4_vec_for_ab(a_st, w_st, y_st, m, n, k)?;
-        dev.synchronize();
-        let res_v4 = y_st
-            .copy_to_host()?
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect::<Vec<f32>>();
-        let mut diff_v4 = 0;
-        for (g, x) in res_v4.iter().zip(&res_base) {
-            if (g - x).abs() > 0.0 {
-                diff_v4 += 1;
-            }
-        }
-        println!("\nParity Checks for M={m}:");
-        println!("  sub_v4_vec vs baseline: diff_count = {diff_v4}");
-        assert_eq!(diff_v4, 0, "sub_v4_vec parity check");
-
-        // 3. Parity check Var 2 (prefetch)
-        dev.launch_dot4_q2k_q81_gemv_sub_v3_prefetch_for_ab(a_st, w_st, y_st, m, n, k)?;
-        dev.synchronize();
-        let res_pref = y_st
-            .copy_to_host()?
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect::<Vec<f32>>();
-        let mut diff_pref = 0;
-        for (g, x) in res_pref.iter().zip(&res_base) {
-            if (g - x).abs() > 0.0 {
-                diff_pref += 1;
-            }
-        }
-        println!("  sub_v3_prefetch vs baseline: diff_count = {diff_pref}");
-        assert_eq!(diff_pref, 0, "sub_v3_prefetch parity check");
-
-        // 4. Parity check Var 3 (col8)
+        // 2. Parity check Var 3 (col8)
         dev.launch_dot4_q2k_q81_gemv_sub_v6_vec_col8_for_ab(a_st, w_st, y_st, m, n, k)?;
         dev.synchronize();
         let res_col8 = y_st
@@ -155,6 +118,7 @@ fn bench_q2k_all_variants() -> TestResult {
                 diff_col8 += 1;
             }
         }
+        println!("\nParity Checks for M={m}:");
         println!("  sub_v6_vec_col8 vs baseline: diff_count = {diff_col8}");
         assert_eq!(diff_col8, 0, "sub_v6_vec_col8 parity check");
 
@@ -190,30 +154,6 @@ fn bench_q2k_all_variants() -> TestResult {
         dev.synchronize();
         let dur_base = t0.elapsed().as_secs_f64() * 1e6 / (iters as f64);
 
-        // Timing Var 1: v4_vec
-        for _ in 0..5 {
-            dev.launch_dot4_q2k_q81_gemv_sub_v4_vec_for_ab(a_st, w_st, y_st, m, n, k)?;
-        }
-        dev.synchronize();
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            dev.launch_dot4_q2k_q81_gemv_sub_v4_vec_for_ab(a_st, w_st, y_st, m, n, k)?;
-        }
-        dev.synchronize();
-        let dur_v4 = t1.elapsed().as_secs_f64() * 1e6 / (iters as f64);
-
-        // Timing Var 2: prefetch
-        for _ in 0..5 {
-            dev.launch_dot4_q2k_q81_gemv_sub_v3_prefetch_for_ab(a_st, w_st, y_st, m, n, k)?;
-        }
-        dev.synchronize();
-        let t2 = Instant::now();
-        for _ in 0..iters {
-            dev.launch_dot4_q2k_q81_gemv_sub_v3_prefetch_for_ab(a_st, w_st, y_st, m, n, k)?;
-        }
-        dev.synchronize();
-        let dur_pref = t2.elapsed().as_secs_f64() * 1e6 / (iters as f64);
-
         // Timing Var 3: col8
         for _ in 0..5 {
             dev.launch_dot4_q2k_q81_gemv_sub_v6_vec_col8_for_ab(a_st, w_st, y_st, m, n, k)?;
@@ -231,9 +171,7 @@ fn bench_q2k_all_variants() -> TestResult {
 
         println!("\nLatency & Bandwidth for M={m}:");
         println!("  Baseline (sub_v2):          {dur_base:6.2} us | eff BW: {:6.1} GB/s", bw(dur_base));
-        println!("  Var 1 (sub_v4_vec):         {dur_v4:6.2} us | eff BW: {:6.1} GB/s (speedup: {:4.2}x)", bw(dur_v4), dur_base / dur_v4);
-        println!("  Var 2 (sub_v3_prefetch):    {dur_pref:6.2} us | eff BW: {:6.1} GB/s (speedup: {:4.2}x)", bw(dur_pref), dur_base / dur_pref);
-        println!("  Var 3 (sub_v6_vec_col8):    {dur_col8:6.2} us | eff BW: {:6.1} GB/s (speedup: {:4.2}x)", bw(dur_col8), dur_base / dur_col8);
+        println!("  Col 8 Tile (sub_v6_vec):    {dur_col8:6.2} us | eff BW: {:6.1} GB/s (speedup: {:4.2}x)", bw(dur_col8), dur_base / dur_col8);
 
         if m == 2 {
             for _ in 0..5 {
@@ -247,7 +185,7 @@ fn bench_q2k_all_variants() -> TestResult {
             dev.synchronize();
             let dur_r2 = t4.elapsed().as_secs_f64() * 1e6 / (iters as f64);
             println!(
-                "  Var 4 (rows_r2):            {dur_r2:6.2} us | eff BW: {:6.1} GB/s (speedup: {:4.2}x total, {:6.2} us/tok)",
+                "  Dual Row Reuse (rows_r2):   {dur_r2:6.2} us | eff BW: {:6.1} GB/s (speedup: {:4.2}x total, {:6.2} us/tok)",
                 bw(dur_r2),
                 dur_base / dur_r2,
                 dur_r2 / 2.0
