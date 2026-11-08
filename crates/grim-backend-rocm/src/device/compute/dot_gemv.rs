@@ -3233,6 +3233,23 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static ROWS_HV2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let rows_hv2 = *ROWS_HV2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_IQ4XS_ROWS_HV2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if m == 2 && rows_hv2 && k % 256 == 0 {
+            return self.launch_dot4_iq4xs_q81_gemv_rows_hv2_for_ab(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         static SUB_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sub_v2 = *SUB_V2.get_or_init(|| {
             !matches!(
