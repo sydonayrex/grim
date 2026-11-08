@@ -2477,6 +2477,52 @@ extern "C" __global__ void grim_kda_head_norm_gate(
     kda_head_norm_gate_dev(acc, norm_weight, z, out, h, num_v, head_dim, eps, has_z);
 }
 
+// SPEED-KDA-FUSE: Single cooperative launch fusing short-conv causal step,
+// batched gated delta rule, and head norm gating into one dispatch.
+// Eliminates 2 kernel launches per layer and synchronizes across stages via shared barrier.
+extern "C" __global__ void __launch_bounds__(256) grim_kda_fused_step(
+    const float* __restrict__ conv_in,
+    const float* __restrict__ conv_w,
+    const float* __restrict__ conv_bias,
+    float* __restrict__ conv_state,
+    float* __restrict__ conv_out,
+    const float* __restrict__ alpha,
+    const float* __restrict__ beta,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ ssm_norm,
+    const float* __restrict__ z,
+    float* __restrict__ state,
+    float* __restrict__ acc,
+    float* __restrict__ branch,
+    int batch,
+    int channels,
+    int kernel_size,
+    int num_v,
+    int num_k,
+    int head_dim,
+    float eps,
+    int has_z
+) {
+    // Stage 1: Short-conv causal step
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < batch * channels; idx += gridDim.x * blockDim.x) {
+        short_conv1d_causal_step_dev(conv_in, conv_w, conv_bias, conv_state, conv_out, idx, channels, kernel_size);
+    }
+    __syncthreads();
+
+    // Stage 2: Batched KDA gated delta rule
+    const int total = num_v * head_dim;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x) {
+        kda_delta_rule_batched_dev(conv_out, alpha, beta, dt_bias, ssm_a, state, acc, idx, num_v, num_k, head_dim, eps);
+    }
+    __syncthreads();
+
+    // Stage 3: Gated head norm
+    for (int h = blockIdx.x * blockDim.x + threadIdx.x; h < num_v; h += gridDim.x * blockDim.x) {
+        kda_head_norm_gate_dev(acc, ssm_norm, z, branch, h, num_v, head_dim, eps, has_z);
+    }
+}
+
 // GPU KDA Recurrent Prefill scan kernel for seq_len > 1.
 // Runs across all value heads and recurrent state rows over time t in 0..seq_len.
 // Conv stream layout per token: [q (num_k * head_dim) | k (num_k * head_dim) | v (num_v * head_dim)].

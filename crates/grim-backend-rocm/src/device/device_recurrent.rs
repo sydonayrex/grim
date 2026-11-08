@@ -1513,4 +1513,117 @@ impl RocmDevice {
 
         Ok(())
     }
+
+    /// SPEED-KDA-FUSE: Single-launch fused short-conv + KDA delta rule + head norm gate.
+    /// Replaces separate short_conv1d_causal_step, kda_gated_delta_rule_batched,
+    /// and kda_head_norm_gate launches with 1 kernel dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kda_fused_step_into(
+        &self,
+        conv_in: &dyn BackendStorage,
+        conv_w: &dyn BackendStorage,
+        conv_bias: Option<&dyn BackendStorage>,
+        conv_state: &dyn BackendStorage,
+        conv_out: &RocmStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        acc_scratch: &RocmStorage,
+        branch_out: &RocmStorage,
+        batch: usize,
+        channels: usize,
+        kernel_size: usize,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let ci_s = as_rocm(conv_in)?;
+        let cw_s = as_rocm(conv_w)?;
+        let cb_s = match conv_bias {
+            Some(b) => Some(as_rocm(b)?),
+            None => None,
+        };
+        let cs_s = as_rocm(conv_state)?;
+        let al_s = as_rocm(alpha)?;
+        let be_s = as_rocm(beta)?;
+        let db_s = as_rocm(dt_bias)?;
+        let sa_s = as_rocm(ssm_a)?;
+        let nw_s = as_rocm(norm_weight)?;
+        let z_s = match z {
+            Some(zz) => Some(as_rocm(zz)?),
+            None => None,
+        };
+        let s_s = as_rocm(state)?;
+
+        let mut ci_ptr = dev_ptr(ci_s)?;
+        let mut cw_ptr = dev_ptr(cw_s)?;
+        let mut cb_ptr = match cb_s {
+            Some(b) => dev_ptr(b)?,
+            None => 0u64,
+        };
+        let mut cs_ptr = dev_ptr(cs_s)?;
+        let mut co_ptr = dev_ptr(conv_out)?;
+        let mut al_ptr = dev_ptr(al_s)?;
+        let mut be_ptr = dev_ptr(be_s)?;
+        let mut db_ptr = dev_ptr(db_s)?;
+        let mut sa_ptr = dev_ptr(sa_s)?;
+        let mut nw_ptr = dev_ptr(nw_s)?;
+        let mut z_ptr = match z_s {
+            Some(zz) => dev_ptr(zz)?,
+            None => 0u64,
+        };
+        let mut s_ptr = dev_ptr(s_s)?;
+        let mut acc_ptr = dev_ptr(acc_scratch)?;
+        let mut br_ptr = dev_ptr(branch_out)?;
+
+        let mut b_i = batch as i32;
+        let mut ch_i = channels as i32;
+        let mut ks_i = kernel_size as i32;
+        let mut nv_i = num_value_heads as i32;
+        let mut nk_i = num_key_heads as i32;
+        let mut hd_i = head_dim as i32;
+        let mut eps_f = eps;
+        let mut has_z_i = i32::from(z_s.is_some());
+
+        // Single block of 256 threads handles all three phases cooperatively
+        let grid = crate::HipDim3::new(1, 1, 1);
+        let block = crate::HipDim3::new(256, 1, 1);
+
+        self.launch_compute_kernel(
+            "grim_kda_fused_step",
+            grid,
+            block,
+            &mut [
+                arg(&mut ci_ptr),
+                arg(&mut cw_ptr),
+                arg(&mut cb_ptr),
+                arg(&mut cs_ptr),
+                arg(&mut co_ptr),
+                arg(&mut al_ptr),
+                arg(&mut be_ptr),
+                arg(&mut db_ptr),
+                arg(&mut sa_ptr),
+                arg(&mut nw_ptr),
+                arg(&mut z_ptr),
+                arg(&mut s_ptr),
+                arg(&mut acc_ptr),
+                arg(&mut br_ptr),
+                arg(&mut b_i),
+                arg(&mut ch_i),
+                arg(&mut ks_i),
+                arg(&mut nv_i),
+                arg(&mut nk_i),
+                arg(&mut hd_i),
+                arg(&mut eps_f),
+                arg(&mut has_z_i),
+            ],
+        )?;
+
+        Ok(())
+    }
 }

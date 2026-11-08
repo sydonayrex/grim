@@ -4720,44 +4720,80 @@ impl Qwen35Block {
                 ))
             })?;
 
-        // 2. Short conv causal step into kda_buf.conv_out
+        // 2 & 3. Fused Short-conv + Batched KDA gated delta rule + head norm gate
         if layer_idx >= buffers.sc_state.len() {
             return Err(grim_core::error::Error::Backend(format!(
                 "layer {layer_idx} >= sc_state {}",
                 buffers.sc_state.len()
             )));
         }
-        dev.short_conv1d_causal_step_into(
-            &buffers.q_buf[layer_idx],
-            conv_w.storage().as_ref(),
-            None,
-            &buffers.sc_state[layer_idx],
-            &kda_buf.conv_out,
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
-
-        // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
         let n_val_heads = self.cfg_ssm_num_value_heads();
         let n_key_heads = self.cfg_ssm_num_key_heads();
         let head_dim = self.cfg_ssm_head_dim();
         let eps = self.attn_norm.eps;
-        dev.kda_gated_delta_rule_batched_into(
-            &kda_buf.conv_out,
-            &kda_buf.alpha,
-            &kda_buf.beta,
-            dt_bias_d.as_ref(),
-            ssm_a_d.as_ref(),
-            ssm_norm_d.as_ref(),
-            Some(&kda_buf.gate),
-            &kda_buf.state,
-            &kda_buf.acc_scratch,
-            &kda_buf.branch,
-            n_val_heads,
-            n_key_heads,
-            head_dim,
-            eps,
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
+        let batch = buffers.batch.max(1);
+        let dims = conv_w.shape().dims();
+        let channels = dims.first().copied().unwrap_or(0);
+        let kernel_size = dims.get(1).copied().unwrap_or(0);
+
+        let use_fused_kda = !matches!(
+            std::env::var("GRIM_KDA_FUSED_STEP").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+
+        if use_fused_kda && batch == 1 {
+            dev.kda_fused_step_into(
+                &buffers.q_buf[layer_idx],
+                conv_w.storage().as_ref(),
+                None,
+                &buffers.sc_state[layer_idx],
+                &kda_buf.conv_out,
+                &kda_buf.alpha,
+                &kda_buf.beta,
+                dt_bias_d.as_ref(),
+                ssm_a_d.as_ref(),
+                ssm_norm_d.as_ref(),
+                Some(&kda_buf.gate),
+                &kda_buf.state,
+                &kda_buf.acc_scratch,
+                &kda_buf.branch,
+                batch,
+                channels,
+                kernel_size,
+                n_val_heads,
+                n_key_heads,
+                head_dim,
+                eps,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kda fused step: {e}")))?;
+        } else {
+            dev.short_conv1d_causal_step_into(
+                &buffers.q_buf[layer_idx],
+                conv_w.storage().as_ref(),
+                None,
+                &buffers.sc_state[layer_idx],
+                &kda_buf.conv_out,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
+
+            dev.kda_gated_delta_rule_batched_into(
+                &kda_buf.conv_out,
+                &kda_buf.alpha,
+                &kda_buf.beta,
+                dt_bias_d.as_ref(),
+                ssm_a_d.as_ref(),
+                ssm_norm_d.as_ref(),
+                Some(&kda_buf.gate),
+                &kda_buf.state,
+                &kda_buf.acc_scratch,
+                &kda_buf.branch,
+                n_val_heads,
+                n_key_heads,
+                head_dim,
+                eps,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
+        }
         Ok(())
     }
 
