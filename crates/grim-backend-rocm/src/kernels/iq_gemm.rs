@@ -4,7 +4,7 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-static const unsigned long long IQ2S_GRID[1024] = {
+__constant__ unsigned long long IQ2S_GRID[1024] = {
     0x0808080808080808ULL,
     0x080808080808082bULL,
     0x0808080808081919ULL,

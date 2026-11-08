@@ -266,7 +266,20 @@ impl RocmDevice {
         )
     }
 
-    pub(crate) fn launch_fused_dequant_gemm_iq2xxs(
+        /// res0-T1 A/B wrapper for IQ2_XXS fused dequant GEMM.
+    pub fn launch_fused_dequant_gemm_iq2xxs_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq2xxs(a, b, out, m, n, k)
+    }
+
+pub(crate) fn launch_fused_dequant_gemm_iq2xxs(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -322,7 +335,20 @@ impl RocmDevice {
         )
     }
 
-    pub(crate) fn launch_fused_dequant_gemm_iq2xs(
+        /// res0-T1 A/B wrapper for IQ2_XS fused dequant GEMM.
+    pub fn launch_fused_dequant_gemm_iq2xs_stock_for_ab(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_iq2xs(a, b, out, m, n, k)
+    }
+
+pub(crate) fn launch_fused_dequant_gemm_iq2xs(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,

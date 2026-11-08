@@ -179,21 +179,23 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 #### $M=1$ Single-Token Decode
 | Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: |
-| Fused Stock | Original grouped FP32 dequant | 504.87 $\mu$s | 127.2 GB/s | 1.00x |
-| Fused LDS | LDS cached codebook FP32 dequant | 573.23 $\mu$s | 112.0 GB/s | 0.88x |
-| Dot4 Base | `grim_dot4_iq3xxs_q81_gemv` (INT8 hardware dot4 + constant grid) | 186.12 $\mu$s | 345.1 GB/s | 2.71x |
-| **Dot4 v2_lds [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_v2_lds` (LDS codebook staging)** | **159.71 $\mu$s** | **402.1 GB/s** | **3.16x** |
-| Dot4 v3_col8 | `grim_dot4_iq3xxs_q81_gemv_v3_col8` (8-column wave tile) | 191.08 $\mu$s | 336.1 GB/s | 2.64x |
+| Fused Stock | Original grouped FP32 dequant | 589.69 $\mu$s | 108.9 GB/s | 1.00x |
+| Fused LDS | LDS cached codebook FP32 dequant | 565.49 $\mu$s | 113.6 GB/s | 1.04x |
+| Dot4 Base | `grim_dot4_iq3xxs_q81_gemv` (INT8 hardware dot4 + constant grid) | 194.27 $\mu$s | 330.6 GB/s | 3.04x |
+| **Dot4 v2_lds [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_v2_lds` (LDS codebook staging)** | **164.72 $\mu$s** | **389.9 GB/s** | **3.58x** |
+| Dot4 v4_pref | `grim_dot4_iq3xxs_q81_gemv_v4_prefetch` (pipelined refill) | 174.08 $\mu$s | 368.9 GB/s | 3.39x |
+| Dot4 v3_col8 | `grim_dot4_iq3xxs_q81_gemv_v3_col8` (8-column wave tile) | 192.00 $\mu$s | 334.5 GB/s | 3.07x |
 
 #### $M=2$ Dual-Token Decode
 | Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| Fused Stock | Original grouped single-row loop | 1680.95 $\mu$s | 840.48 $\mu$s | 76.4 GB/s | 1.00x |
-| Fused LDS | LDS cached single-row loop | 1689.42 $\mu$s | 844.71 $\mu$s | 76.0 GB/s | 0.99x |
-| Dot4 Base | Dot4 single-row loop | 346.40 $\mu$s | 173.20 $\mu$s | 370.8 GB/s | 4.85x |
-| Dot4 v2_lds | LDS grid single-row loop | 311.01 $\mu$s | 155.51 $\mu$s | 413.0 GB/s | 5.40x |
-| Dot4 v3_col8 | 8-column wave tile single-row loop | 343.81 $\mu$s | 171.91 $\mu$s | 373.6 GB/s | 4.89x |
-| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_rows_r2` (Dual-row weight reuse + LDS grid)** | **192.25 $\mu$s** | **96.12 $\mu$s** | **668.1 GB/s** | **8.74x total (8.74x per-tok)** |
+| Fused Stock | Original grouped single-row loop | 1729.36 $\mu$s | 864.68 $\mu$s | 74.3 GB/s | 1.00x |
+| Fused LDS | LDS cached single-row loop | 1638.80 $\mu$s | 819.40 $\mu$s | 78.4 GB/s | 1.06x |
+| Dot4 Base | Dot4 single-row loop | 349.71 $\mu$s | 174.86 $\mu$s | 367.3 GB/s | 4.95x |
+| Dot4 v2_lds | LDS grid single-row loop | 300.45 $\mu$s | 150.23 $\mu$s | 427.5 GB/s | 5.76x |
+| Dot4 v4_pref | Pipelined single-row loop | 332.27 $\mu$s | 166.14 $\mu$s | 386.6 GB/s | 5.20x |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 354.25 $\mu$s | 177.13 $\mu$s | 362.6 GB/s | 4.88x |
+| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_rows_r2` (Dual-row weight reuse + LDS grid)** | **199.78 $\mu$s** | **99.89 $\mu$s** | **643.0 GB/s** | **8.66x total (8.66x per-tok)** |
 
 ---
 
@@ -204,21 +206,97 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 #### $M=1$ Single-Token Decode
 | Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: |
-| Fused Stock | Original grouped FP32 dequant | 573.63 $\mu$s | 110.0 GB/s | 1.00x |
-| Fused LDS | LDS cached codebook FP32 dequant | 554.12 $\mu$s | 113.8 GB/s | 1.04x |
-| **Dot4 Base [LIVE]** | **`grim_dot4_iq3s_q81_gemv` (INT8 hardware dot4 + branchless sign expansion)** | **139.81 $\mu$s** | **451.2 GB/s** | **4.10x** |
-| Dot4 v2_lds | `grim_dot4_iq3s_q81_gemv_v2_lds` (LDS codebook staging) | 142.19 $\mu$s | 443.6 GB/s | 4.03x |
-| Dot4 v3_col8 | `grim_dot4_iq3s_q81_gemv_v3_col8` (8-column wave tile) | 145.35 $\mu$s | 434.0 GB/s | 3.95x |
+| Fused Stock | Original grouped FP32 dequant | 660.58 $\mu$s | 95.5 GB/s | 1.00x |
+| Fused LDS | LDS cached codebook FP32 dequant | 570.53 $\mu$s | 110.6 GB/s | 1.16x |
+| Dot4 Base | `grim_dot4_iq3s_q81_gemv` (constant grid) | 142.44 $\mu$s | 442.9 GB/s | 4.64x |
+| **Dot4 v2_lds [LIVE]** | **`grim_dot4_iq3s_q81_gemv_v2_lds` (LDS codebook staging)** | **142.30 $\mu$s** | **443.3 GB/s** | **4.64x** |
+| Dot4 v4_pref | `grim_dot4_iq3s_q81_gemv_v4_prefetch` (pipelined refill) | 147.56 $\mu$s | 427.5 GB/s | 4.48x |
+| Dot4 v3_col8 | `grim_dot4_iq3s_q81_gemv_v3_col8` (8-column wave tile) | 145.10 $\mu$s | 434.7 GB/s | 4.55x |
 
 #### $M=2$ Dual-Token Decode
 | Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| Fused Stock | Original grouped single-row loop | 1465.27 $\mu$s | 732.64 $\mu$s | 86.1 GB/s | 1.00x |
-| Fused LDS | LDS cached single-row loop | 1159.93 $\mu$s | 579.97 $\mu$s | 108.8 GB/s | 1.26x |
-| Dot4 Base | Dot4 single-row loop | 257.78 $\mu$s | 128.89 $\mu$s | 489.4 GB/s | 5.68x |
-| Dot4 v2_lds | LDS grid single-row loop | 259.29 $\mu$s | 129.65 $\mu$s | 486.5 GB/s | 5.65x |
-| Dot4 v3_col8 | 8-column wave tile single-row loop | 256.53 $\mu$s | 128.27 $\mu$s | 491.8 GB/s | 5.71x |
-| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3s_q81_gemv_rows_r2` (Dual-row weight reuse)** | **161.41 $\mu$s** | **80.71 $\mu$s** | **781.6 GB/s** | **9.08x total (9.08x per-tok)** |
+| Fused Stock | Original grouped single-row loop | 1419.49 $\mu$s | 709.75 $\mu$s | 88.9 GB/s | 1.00x |
+| Fused LDS | LDS cached single-row loop | 1121.22 $\mu$s | 560.61 $\mu$s | 112.5 GB/s | 1.27x |
+| Dot4 Base | Dot4 single-row loop | 258.97 $\mu$s | 129.49 $\mu$s | 487.1 GB/s | 5.48x |
+| Dot4 v2_lds | LDS grid single-row loop | 259.22 $\mu$s | 129.61 $\mu$s | 486.7 GB/s | 5.48x |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 258.93 $\mu$s | 129.47 $\mu$s | 487.2 GB/s | 5.48x |
+| Dot4 v4_pref | Pipelined single-row loop | 274.17 $\mu$s | 137.09 $\mu$s | 460.1 GB/s | 5.18x |
+| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3s_q81_gemv_rows_r2` (Dual-row weight reuse)** | **163.01 $\mu$s** | **81.50 $\mu$s** | **773.9 GB/s** | **8.71x total (8.71x per-tok)** |
+
+---
+
+
+### 10. IQ2_XXS (66 bytes / 256 weights)
+- **Shape:** $N=48640, K=5120 \implies 64.20$ MB weight tensor.
+- **Test File:** `crates/grim-backend-rocm/tests/iq2_variants_bench.rs`
+
+#### $M=1$ Single-Token Decode
+| Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
+| :--- | :--- | :---: | :---: | :---: |
+| Fused Stock | Original grouped FP32 dequant | 3527.31 $\mu$s | 18.2 GB/s | 1.00x |
+| Fused LDS | LDS cached codebook FP32 dequant | 3463.88 $\mu$s | 18.5 GB/s | 1.02x |
+| **Dot4 Base [LIVE]** | **`grim_dot4_iq2xxs_q81_gemv` (INT8 hardware dot4 + constant grid)** | **178.90 $\mu$s** | **358.9 GB/s** | **19.72x** |
+| Dot4 v2_lds | `grim_dot4_iq2xxs_q81_gemv_v2_lds` (LDS codebook staging) | 197.72 $\mu$s | 324.7 GB/s | 17.84x |
+| Dot4 v3_col8 | `grim_dot4_iq2xxs_q81_gemv_v3_col8` (8-column wave tile) | 203.14 $\mu$s | 316.1 GB/s | 17.36x |
+
+#### $M=2$ Dual-Token Decode
+| Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| Fused Stock | Original grouped single-row loop | 6208.30 $\mu$s | 3104.15 $\mu$s | 20.7 GB/s | 1.00x |
+| Fused LDS | LDS cached single-row loop | 6143.76 $\mu$s | 3071.88 $\mu$s | 20.9 GB/s | 1.01x |
+| Dot4 Base | Dot4 single-row loop | 312.46 $\mu$s | 156.23 $\mu$s | 411.0 GB/s | 19.87x |
+| Dot4 v2_lds | LDS grid single-row loop | 322.04 $\mu$s | 161.02 $\mu$s | 398.7 GB/s | 19.28x |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 348.13 $\mu$s | 174.07 $\mu$s | 368.9 GB/s | 17.83x |
+| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq2xxs_q81_gemv_rows_r2` (Dual-row weight reuse)** | **241.81 $\mu$s** | **120.91 $\mu$s** | **531.0 GB/s** | **25.67x total (25.67x per-tok)** |
+
+---
+
+### 11. IQ2_XS (74 bytes / 256 weights)
+- **Shape:** $N=43520, K=5120 \implies 64.41$ MB weight tensor.
+- **Test File:** `crates/grim-backend-rocm/tests/iq2_variants_bench.rs`
+
+#### $M=1$ Single-Token Decode
+| Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
+| :--- | :--- | :---: | :---: | :---: |
+| Fused Stock | Original grouped FP32 dequant | 5180.20 $\mu$s | 12.4 GB/s | 1.00x |
+| **Dot4 Base [LIVE]** | **`grim_dot4_iq2xs_q81_gemv` (INT8 hardware dot4 + constant grid)** | **198.10 $\mu$s** | **325.1 GB/s** | **26.15x** |
+| Dot4 v3_col8 | `grim_dot4_iq2xs_q81_gemv_v3_col8` (8-column wave tile) | 217.09 $\mu$s | 296.7 GB/s | 23.86x |
+| Dot4 v2_lds | `grim_dot4_iq2xs_q81_gemv_v2_lds` (LDS codebook staging) | 256.74 $\mu$s | 250.9 GB/s | 20.18x |
+
+#### $M=2$ Dual-Token Decode
+| Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| Fused Stock | Original grouped single-row loop | 8729.17 $\mu$s | 4364.59 $\mu$s | 14.8 GB/s | 1.00x |
+| Dot4 Base | Dot4 single-row loop | 402.54 $\mu$s | 201.27 $\mu$s | 320.0 GB/s | 21.69x |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 379.56 $\mu$s | 189.78 $\mu$s | 339.4 GB/s | 23.00x |
+| Dot4 v2_lds | LDS grid single-row loop | 470.87 $\mu$s | 235.44 $\mu$s | 273.6 GB/s | 18.54x |
+| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq2xs_q81_gemv_rows_r2` (Dual-row weight reuse)** | **288.63 $\mu$s** | **144.31 $\mu$s** | **446.3 GB/s** | **30.24x total (30.24x per-tok)** |
+
+---
+
+### 12. IQ2_S (82 bytes / 256 weights)
+- **Shape:** $N=39424, K=5120 \implies 64.66$ MB weight tensor.
+- **Test File:** `crates/grim-backend-rocm/tests/iq2_variants_bench.rs`
+
+#### $M=1$ Single-Token Decode
+| Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
+| :--- | :--- | :---: | :---: | :---: |
+| Fused Stock | Original grouped FP32 dequant | 935.47 $\mu$s | 69.1 GB/s | 1.00x |
+| Fused LDS | LDS cached codebook FP32 dequant | 969.05 $\mu$s | 66.7 GB/s | 0.97x |
+| **Dot4 Base [LIVE]** | **`grim_dot4_iq2s_q81_gemv` (INT8 hardware dot4 + branchless sign expansion)** | **169.36 $\mu$s** | **381.8 GB/s** | **5.52x** |
+| Dot4 v3_col8 | `grim_dot4_iq2s_q81_gemv_v3_col8` (8-column wave tile) | 190.70 $\mu$s | 339.0 GB/s | 4.91x |
+| Dot4 v2_lds | `grim_dot4_iq2s_q81_gemv_v2_lds` (LDS codebook staging) | 363.21 $\mu$s | 178.0 GB/s | 2.58x |
+
+#### $M=2$ Dual-Token Decode
+| Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| Fused Stock | Original grouped single-row loop | 2537.31 $\mu$s | 1268.66 $\mu$s | 51.0 GB/s | 1.00x |
+| Fused LDS | LDS cached single-row loop | 2509.22 $\mu$s | 1254.61 $\mu$s | 51.5 GB/s | 1.01x |
+| **Dot4 Base [LIVE M=2]** | **Dot4 single-row loop** | **305.95 $\mu$s** | **152.98 $\mu$s** | **422.7 GB/s** | **8.29x total (8.29x per-tok)** |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 340.10 $\mu$s | 170.05 $\mu$s | 380.2 GB/s | 7.46x |
+| Dot4 rows_r2 | Dual-row weight reuse | 423.90 $\mu$s | 211.95 $\mu$s | 305.0 GB/s | 5.99x |
+| Dot4 v2_lds | LDS grid single-row loop | 721.91 $\mu$s | 360.96 $\mu$s | 179.1 GB/s | 3.51x |
 
 ---
 
@@ -233,5 +311,8 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 | **Q6_K** | **100.31 $\mu$s** | **603.2 GB/s** | `grim_dot4_q6k_q81_gemv_sub_v2` | **109.76 $\mu$s** | **54.88 $\mu$s** | **1102.5 GB/s** | **1.75x (2.18x per-tok)** |
 | **IQ4_NL** | **92.07 $\mu$s** | **672.7 GB/s** | `grim_dot4_iq4nl_q81_gemv_fast` | **113.66 $\mu$s** | **56.83 $\mu$s** | **1089.8 GB/s** | **2.87x (2.87x per-tok)** |
 | **IQ4_XS** | **87.95 $\mu$s** | **728.4 GB/s** | `grim_dot4_iq4xs_q81_gemv_sub_v8` | **101.58 $\mu$s** | **50.79 $\mu$s** | **1261.3 GB/s** | **3.48x (3.48x per-tok)** |
-| **IQ3_XXS** | **159.71 $\mu$s** | **402.1 GB/s** | `grim_dot4_iq3xxs_q81_gemv_v2_lds` | **192.25 $\mu$s** | **96.12 $\mu$s** | **668.1 GB/s** | **8.74x total vs stock** |
-| **IQ3_S** | **139.81 $\mu$s** | **451.2 GB/s** | `grim_dot4_iq3s_q81_gemv` | **161.41 $\mu$s** | **80.71 $\mu$s** | **781.6 GB/s** | **9.08x total vs stock** |
+| **IQ3_XXS** | **164.72 $\mu$s** | **389.9 GB/s** | `grim_dot4_iq3xxs_q81_gemv_v2_lds` | **199.78 $\mu$s** | **99.89 $\mu$s** | **643.0 GB/s** | **8.66x total vs stock** |
+| **IQ3_S** | **142.30 $\mu$s** | **443.3 GB/s** | `grim_dot4_iq3s_q81_gemv_v2_lds` | **163.01 $\mu$s** | **81.50 $\mu$s** | **773.9 GB/s** | **8.71x total vs stock** |
+| **IQ2_XXS** | **178.90 $\mu$s** | **358.9 GB/s** | `grim_dot4_iq2xxs_q81_gemv` | **241.81 $\mu$s** | **120.91 $\mu$s** | **531.0 GB/s** | **25.67x total vs stock** |
+| **IQ2_XS** | **198.10 $\mu$s** | **325.1 GB/s** | `grim_dot4_iq2xs_q81_gemv` | **288.63 $\mu$s** | **144.31 $\mu$s** | **446.3 GB/s** | **30.24x total vs stock** |
+| **IQ2_S** | **169.36 $\mu$s** | **381.8 GB/s** | `grim_dot4_iq2s_q81_gemv` | **305.95 $\mu$s** | **152.98 $\mu$s** | **422.7 GB/s** | **8.29x total vs stock** |
