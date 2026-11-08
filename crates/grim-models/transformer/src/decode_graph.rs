@@ -1112,47 +1112,6 @@ impl<'a, 'b, 'e> grim_graph::LinearEmitter<Storage, grim_tensor::Tensor, grim_ba
     }
 }
 
-#[allow(dead_code)]
-struct DevNormEmitter<'a>(pub &'a Dev);
-
-impl<'a, A: ?Sized, W: ?Sized, Out: ?Sized> grim_graph::NormEmitter<A, W, Out> for DevNormEmitter<'a> {
-    fn emit_norm(
-        &mut self,
-        _input: &A,
-        _weight: &W,
-        _out: &Out,
-        _eps: f32,
-        _kind: grim_graph::NormKind,
-        _m: usize,
-        _k: usize,
-    ) -> Result<()> {
-        let _ = self.0;
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-struct DevLinearEmitter<'a>(pub &'a Dev);
-
-impl<'a, A: ?Sized, W: ?Sized, Out: ?Sized, Scratch: ?Sized> grim_graph::LinearEmitter<A, W, Out, Scratch>
-    for DevLinearEmitter<'a>
-{
-    fn emit_linear(
-        &mut self,
-        _input: &A,
-        _weight: &W,
-        _out: &Out,
-        _scratch_q81: &Scratch,
-        _what: &str,
-        _layer: usize,
-        flags: grim_graph::QuantFlags,
-        _record_ir: bool,
-    ) -> Result<grim_graph::QuantFlags> {
-        let _ = self.0;
-        Ok(flags)
-    }
-}
-
 // ─── Llama Block Graph Forward ────────────────────────────────────────────
 
 impl LlamaBlock {
@@ -1237,18 +1196,6 @@ impl LlamaBlock {
             // norm + first quantize. Byte-identity to the split path is
             // pinned by rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity.
             // m == 1 only: the dual kernel is decode-shaped (single row).
-            // Task 5B.4: Validate norm via grim_graph
-            let batch_m = buffers.batch.max(1);
-            let _norm_kind_graph = grim_graph::emit_norm(
-                &mut DevNormEmitter(dev),
-                attn_in,
-                &attn_w,
-                &buffers.norm_buf[layer_idx],
-                self.attn_norm.eps,
-                batch_m,
-                hidden,
-            )?;
-
             match self.attn_norm.kind {
                 NormKind::Rms if fuse_norm_quant => {
                     let norm_w = rocm_storage(&attn_w)?;
@@ -1263,14 +1210,19 @@ impl LlamaBlock {
                     .map_err(|e| grim_core::error::Error::Backend(format!("fused norm+q81: {e}")))?;
                 }
                 NormKind::Rms => {
-                    dev.rms_norm_into(
+                    // 5B.5: routed through the grim_graph emit layer
+                    // (RocmGraphEmitter performs the launch; the fused dual
+                    // kernel above and LayerNorm below stay hand-rolled).
+                    let batch_m = buffers.batch.max(1);
+                    grim_graph::emit_norm(
+                        &mut RocmGraphEmitter { dev, emit: None },
                         attn_in,
-                        &**attn_w.storage(),
-                        self.attn_norm.eps,
+                        &attn_w,
                         &buffers.norm_buf[layer_idx],
-                        &attn_in.shape().clone(),
-                    )
-                    .map_err(grim_core::error::Error::Tensor)?;
+                        self.attn_norm.eps,
+                        batch_m,
+                        hidden,
+                    )?;
                 }
                 NormKind::LayerNorm => {
                     let b = self.attn_norm.bias.as_ref().map(|t| t.storage());
@@ -1341,96 +1293,41 @@ impl LlamaBlock {
             )
                 .map_err(|e| grim_core::error::Error::Backend(format!("fused norm qkv dot4: {e}")))?;
         } else if fuse_norm_quant {
-            // Task 2.6 / 5B.4: Track via grim_graph linear dedup emitter
-            let mut q_flags = grim_graph::QuantFlags { q81_ready: true, u4_ready: false };
-            let mut linear_emitter = DevLinearEmitter(dev);
-            q_flags = grim_graph::emit_linear_dedup(
-                &mut linear_emitter,
-                normed,
-                self.wq.weight(),
-                &buffers.q_buf[layer_idx],
-                act,
-                "attn_q",
-                layer_idx,
-                q_flags,
-                false,
+            // Task 2.6 / 5B.5: launched via the grim_graph linear dedup
+            // emitter. The dual norm+q81 kernel already filled `act`, so
+            // every qkv consumer starts q81_ready=true (per-call fresh flags
+            // — matches the pre-migration linear_into_named_ready literals).
+            let mut em = RocmGraphEmitter { dev, emit: None };
+            let flags = grim_graph::QuantFlags { q81_ready: true, u4_ready: false };
+            grim_graph::emit_linear_dedup(
+                &mut em, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act,
+                "attn_q", layer_idx, flags, false,
             )?;
-            linear_into_named_ready(
-                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, q_flags.q81_ready,
+            grim_graph::emit_linear_dedup(
+                &mut em, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act,
+                "attn_k", layer_idx, flags, false,
             )?;
-            q_flags = grim_graph::emit_linear_dedup(
-                &mut linear_emitter,
-                normed,
-                self.wk.weight(),
-                &buffers.k_buf[layer_idx],
-                act,
-                "attn_k",
-                layer_idx,
-                q_flags,
-                false,
-            )?;
-            linear_into_named_ready(
-                dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, q_flags.q81_ready,
-            )?;
-            let _ = grim_graph::emit_linear_dedup(
-                &mut linear_emitter,
-                normed,
-                self.wv.weight(),
-                &buffers.v_buf[layer_idx],
-                act,
-                "attn_v",
-                layer_idx,
-                q_flags,
-                false,
-            )?;
-            linear_into_named_ready(
-                dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, q_flags.q81_ready,
+            grim_graph::emit_linear_dedup(
+                &mut em, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act,
+                "attn_v", layer_idx, flags, false,
             )?;
         } else {
-            let mut q_flags = grim_graph::QuantFlags { q81_ready: false, u4_ready: false };
-            let mut linear_emitter = DevLinearEmitter(dev);
-            q_flags = grim_graph::emit_linear_dedup(
-                &mut linear_emitter,
-                normed,
-                self.wq.weight(),
-                &buffers.q_buf[layer_idx],
-                act,
-                "attn_q",
-                layer_idx,
-                q_flags,
-                false,
+            // 5B.5: same emitter; q runs cold, k/v reuse the q8_1 the q
+            // launch produced (per-call fresh flags as before).
+            let mut em = RocmGraphEmitter { dev, emit: None };
+            grim_graph::emit_linear_dedup(
+                &mut em, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act,
+                "attn_q", layer_idx,
+                grim_graph::QuantFlags { q81_ready: false, u4_ready: false }, false,
             )?;
-            linear_into_named_ready(
-                dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act, "attn_q", layer_idx, false,
+            let kv_flags = grim_graph::QuantFlags { q81_ready: true, u4_ready: false };
+            grim_graph::emit_linear_dedup(
+                &mut em, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act,
+                "attn_k", layer_idx, kv_flags, false,
             )?;
-            q_flags.q81_ready = true;
-            q_flags = grim_graph::emit_linear_dedup(
-                &mut linear_emitter,
-                normed,
-                self.wk.weight(),
-                &buffers.k_buf[layer_idx],
-                act,
-                "attn_k",
-                layer_idx,
-                q_flags,
-                false,
-            )?;
-            linear_into_named_ready(
-                dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act, "attn_k", layer_idx, true,
-            )?;
-            let _ = grim_graph::emit_linear_dedup(
-                &mut linear_emitter,
-                normed,
-                self.wv.weight(),
-                &buffers.v_buf[layer_idx],
-                act,
-                "attn_v",
-                layer_idx,
-                q_flags,
-                false,
-            )?;
-            linear_into_named_ready(
-                dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act, "attn_v", layer_idx, true,
+            grim_graph::emit_linear_dedup(
+                &mut em, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act,
+                "attn_v", layer_idx, kv_flags, false,
             )?;
         }
 
@@ -1720,27 +1617,18 @@ impl LlamaBlock {
                         dev,
                     )?;
 
-                    // Task 5B.4: Validate ffn norm via grim_graph
-                    let _ffn_norm_kind_graph = grim_graph::emit_norm(
-                        &mut DevNormEmitter(dev),
-                        &buffers.layer_output[layer_idx],
-                        &ffn_w,
-                        &buffers.norm_buf[layer_idx],
-                        self.ffn_norm.eps,
-                        batch,
-                        hidden,
-                    )?;
-
                     match self.ffn_norm.kind {
                         NormKind::Rms => {
-                            dev.rms_norm_into(
+                            // 5B.5: routed through the grim_graph emit layer
+                            grim_graph::emit_norm(
+                                &mut RocmGraphEmitter { dev, emit: None },
                                 &buffers.layer_output[layer_idx],
-                                &**ffn_w.storage(),
-                                self.ffn_norm.eps,
+                                &ffn_w,
                                 &buffers.norm_buf[layer_idx],
-                                &ffn_shape,
-                            )
-                            .map_err(grim_core::error::Error::Tensor)?;
+                                self.ffn_norm.eps,
+                                batch,
+                                hidden,
+                            )?;
                         }
                         NormKind::LayerNorm => {
                             let b = self.ffn_norm.bias.as_ref().map(|t| t.storage());
