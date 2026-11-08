@@ -1862,3 +1862,24 @@ restricted to m=1 calls to learn whether decode rows have dead groups there
 at all — this decides if decode-skip is viable anywhere or is only a
 chunked-prefill lever; (2) bisect the tau=0.02 degradation (per-layer logits
 dumps) since ~1.5% skipped groups should be well inside noise.
+
+### Sec 15 addendum 2 — decode-route probe: 9B decode rows carry the dead-group structure (2026-11-08)
+
+New probe hook `GRIM_SPARSE_PROBE` in `launch_quantize_q8_1` (tag
+`[sparse-probe-q]`): the linear_decode_into* probes miss prequantized and
+graph-captured routes, but every decode projection quantizes through this
+launcher, so it sees the real m=1 decode activation rows.
+
+Qwen3.5-9B (Q4_K_M), greedy generation, 138 m=1 decode rows / 25,856 groups:
+
+| tau   | dead fraction (all) | k=4096 | k=12288 |
+|-------|--------------------:|-------:|--------:|
+| 0.02  | 10.3%               | 12.8%  | 7.5%    |
+| 0.05  | 36.0%               | 37.1%  | 34.8%   |
+| 0.10  | **65.7%**           | 65.8%  | 65.7%   |
+
+Verdict: the 70%@tau0.10 structure IS present on the 9B's decode rows — the
+earlier near-zero reading was an LFM2.5-350M small-model artifact. Decode
+skip remains worth ~2.9x on the 9B class per the sec-15 A/B curve, pending
+an accuracy gate ON THE 9B itself (the tau=0.02 LFM2 degradation at ~1.5%
+skipped is still unexplained and keeps the default off).

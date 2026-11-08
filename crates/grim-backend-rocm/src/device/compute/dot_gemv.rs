@@ -21,6 +21,56 @@ impl RocmDevice {
         m: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // res0-T2 SPARSITY PROBE (decode-route): the linear_decode_into*
+        // probes miss every path that arrives prequantized or through the
+        // graph capture — but EVERY decode projection quantizes through
+        // HERE, so this sees the real m=1 decode activation rows. Same JSONL
+        // shape as the gemm_launchers probe (tag [sparse-probe-q]); filter
+        // on "m":1 post-hoc. Slow by design (D2H sync); cap with
+        // GRIM_SPARSE_PROBE_MAX_CALLS.
+        if std::env::var("GRIM_SPARSE_PROBE").as_deref() == Ok("1") {
+            static CALLS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let max_calls: usize = std::env::var("GRIM_SPARSE_PROBE_MAX_CALLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000);
+            let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c < max_calls {
+                if let Ok(host) = src.copy_to_host() {
+                    let vals: Vec<f32> = host
+                        .chunks_exact(4)
+                        .map(|ch| f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]))
+                        .collect();
+                    let mut gmax = 0f32;
+                    for v in &vals {
+                        gmax = gmax.max(v.abs());
+                    }
+                    let groups_per_row = k / 32;
+                    let mut dead = [0usize; 3];
+                    let taus = [0.02f32, 0.05, 0.1];
+                    let mut total_groups = 0usize;
+                    for row in 0..m {
+                        for g0 in 0..groups_per_row {
+                            let start = (row * k) + g0 * 32;
+                            let g = vals[start..start + 32]
+                                .iter()
+                                .fold(0f32, |mx, v| mx.max(v.abs()));
+                            total_groups += 1;
+                            for (ti, tau) in taus.iter().enumerate() {
+                                if g < tau * gmax {
+                                    dead[ti] += 1;
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[sparse-probe-q] {{\"call\":{c},\"m\":{m},\"k\":{k},\"groups\":{total_groups},\"dead02\":{},\"dead05\":{},\"dead10\":{},\"gmax\":{gmax:.4}}}",
+                        dead[0], dead[1], dead[2]
+                    );
+                }
+            }
+        }
         let src_ptr = src
             .device_ptr
             .ok_or_else(|| Error::Backend("quantize_q8_1: src has no device ptr".into()))?;
@@ -4483,6 +4533,27 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static ROWS_R2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let rows_r2 = *ROWS_R2.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_WHITECROW_ROWS_R2").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if m == 2 && rows_r2 {
+            return self.launch_dot8_w4a4_gemv_rows_r2_for_ab(
+                a_codes,
+                a_scales,
+                a_sums,
+                b_qweight,
+                b_scales,
+                b_zeros,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
 
         // v5 is the SHIPPED kernel (bit-identical to v1, predicated tail);
         // v1 remains the in-tree reference.
