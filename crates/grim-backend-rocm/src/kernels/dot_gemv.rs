@@ -1362,6 +1362,268 @@ extern "C" __global__ void __launch_bounds__(32) grim_fp32_gemv_v2(
     }
 }
 
+// ──────────────────────────────────────────────────────────────────── grim_fp32_mm_tile
+// 2D CTA-tiled MM / GEMV variant based on Charon/Scythe architectural lessons:
+// 1. CTA parallelism (256 threads = 8 waves on RDNA4)
+// 2. 128-bit vectorized float4 loads across K
+// 3. Tile size: M_tile = 1, N_tile = 64 columns per CTA.
+// 4. Each wave of 32 threads computes 8 output columns cooperatively over K.
+extern "C" __global__ void __launch_bounds__(256) grim_fp32_mm_tile(
+    const float* __restrict__ act,    // [M, K]
+    const float* __restrict__ weight, // [N, K]
+    float* __restrict__ out,          // [M, N]
+    int M, int N, int K)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row          = blockIdx.y;
+    if (row >= M || cta_col_base >= N) return;
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    if (wave_col_base >= N) return;
+
+    const int active_cols = (wave_col_base + 8 <= N) ? 8 : (N - wave_col_base);
+    const float* a_row = act + (long long)row * K;
+    const float4* a_vec = reinterpret_cast<const float4*>(a_row);
+    const int K_vec = K / 4;
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const float4* w_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            w_vec[j] = reinterpret_cast<const float4*>(weight + (long long)(wave_col_base + j) * K);
+        } else {
+            w_vec[j] = nullptr;
+        }
+    }
+
+    // Each lane in the wave strides across K_vec by 32
+    for (int k_idx = lane; k_idx < K_vec; k_idx += 32) {
+        float4 a4 = a_vec[k_idx];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j >= active_cols) break;
+            float4 w4 = w_vec[j][k_idx];
+            acc[j] += a4.x * w4.x + a4.y * w4.y + a4.z * w4.z + a4.w * w4.w;
+        }
+    }
+
+    // Intra-wave shuffle reduction
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[j] += __shfl_xor(acc[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; ++j) {
+            out[(long long)row * N + wave_col_base + j] = acc[j];
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_fp32_mm_splitk_lds
+// Step 1: Split-K Parallelism + Cooperative LDS Activation Caching.
+// Grid: (N.div_ceil(64), M, split_k)
+// Each block computes partial dot-product over slice of K, storing activations in LDS,
+// and uses atomicAdd into out.
+extern "C" __global__ void __launch_bounds__(256) grim_fp32_mm_splitk_lds(
+    const float* __restrict__ act,    // [M, K]
+    const float* __restrict__ weight, // [N, K]
+    float* __restrict__ out,          // [M, N]
+    int M, int N, int K, int split_k)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row          = blockIdx.y;
+    const int k_slice      = blockIdx.z;
+
+    if (row >= M || cta_col_base >= N || k_slice >= split_k) return;
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    const int active_cols = (wave_col_base < N)
+        ? ((wave_col_base + 8 <= N) ? 8 : (N - wave_col_base))
+        : 0;
+
+    const int K_vec = K / 4;
+    const int k_per_slice = (K_vec + split_k - 1) / split_k;
+    const int k_start = k_slice * k_per_slice;
+    const int k_end = (k_start + k_per_slice < K_vec) ? (k_start + k_per_slice) : K_vec;
+
+    const float* a_row = act + (long long)row * K;
+    const float4* a_vec = reinterpret_cast<const float4*>(a_row);
+
+    const float4* w_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            w_vec[j] = reinterpret_cast<const float4*>(weight + (long long)(wave_col_base + j) * K);
+        } else {
+            w_vec[j] = nullptr;
+        }
+    }
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Process chunk in tiles of 256 float4s (1024 floats) via cooperative LDS staging
+    __shared__ float4 s_a[256];
+
+    for (int chunk_base = k_start; chunk_base < k_end; chunk_base += 256) {
+        // Cooperative load of activation slice into LDS by all 256 threads
+        int load_idx = chunk_base + threadIdx.x;
+        s_a[threadIdx.x] = (load_idx < k_end) ? a_vec[load_idx] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        __syncthreads();
+
+        const int chunk_limit = (k_end - chunk_base < 256) ? (k_end - chunk_base) : 256;
+
+        if (active_cols > 0) {
+            for (int k_off = lane; k_off < chunk_limit; k_off += 32) {
+                float4 a4 = s_a[k_off];
+                int glob_k = chunk_base + k_off;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    if (j >= active_cols) break;
+                    float4 w4 = w_vec[j][glob_k];
+                    acc[j] += a4.x * w4.x + a4.y * w4.y + a4.z * w4.z + a4.w * w4.w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active_cols > 0) {
+        // Intra-wave shuffle reduction
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc[j] += __shfl_xor(acc[j], off);
+            }
+        }
+
+        if (lane == 0) {
+            if (split_k == 1) {
+                #pragma unroll
+                for (int j = 0; j < active_cols; ++j) {
+                    out[(long long)row * N + wave_col_base + j] = acc[j];
+                }
+            } else {
+                #pragma unroll
+                for (int j = 0; j < active_cols; ++j) {
+                    atomicAdd(out + ((long long)row * N + wave_col_base + j), acc[j]);
+                }
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_fp32_gate_up_silu_mm_tile
+// Step 2: Fused Gate-Up GEMV + SwiGLU in-register epilogue.
+// In a standard SwiGLU layer:
+//   gate = act * W_gate
+//   up   = act * W_up
+//   out  = silu(gate) * up
+// This kernel streams W_gate and W_up concurrently in a single launch, caches `act` in LDS,
+// computes both gate and up projections in registers, and writes `silu(g) * u` directly to out.
+// Grid: (N.div_ceil(64), M, 1), Block: 256
+extern "C" __global__ void __launch_bounds__(256) grim_fp32_gate_up_silu_mm_tile(
+    const float* __restrict__ act,     // [M, K]
+    const float* __restrict__ gate_w,  // [N, K]
+    const float* __restrict__ up_w,    // [N, K]
+    float* __restrict__ out,           // [M, N]
+    int M, int N, int K)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row          = blockIdx.y;
+
+    if (row >= M || cta_col_base >= N) return;
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    const int active_cols = (wave_col_base < N)
+        ? ((wave_col_base + 8 <= N) ? 8 : (N - wave_col_base))
+        : 0;
+
+    const int K_vec = K / 4;
+    const float* a_row = act + (long long)row * K;
+    const float4* a_vec = reinterpret_cast<const float4*>(a_row);
+
+    const float4* gw_vec[8];
+    const float4* uw_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            gw_vec[j] = reinterpret_cast<const float4*>(gate_w + (long long)(wave_col_base + j) * K);
+            uw_vec[j] = reinterpret_cast<const float4*>(up_w   + (long long)(wave_col_base + j) * K);
+        } else {
+            gw_vec[j] = nullptr;
+            uw_vec[j] = nullptr;
+        }
+    }
+
+    float g_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float u_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    __shared__ float4 s_a[256];
+
+    for (int chunk_base = 0; chunk_base < K_vec; chunk_base += 256) {
+        int load_idx = chunk_base + threadIdx.x;
+        s_a[threadIdx.x] = (load_idx < K_vec) ? a_vec[load_idx] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        __syncthreads();
+
+        const int chunk_limit = (K_vec - chunk_base < 256) ? (K_vec - chunk_base) : 256;
+
+        if (active_cols > 0) {
+            for (int k_off = lane; k_off < chunk_limit; k_off += 32) {
+                float4 a4 = s_a[k_off];
+                int glob_k = chunk_base + k_off;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    if (j >= active_cols) break;
+                    float4 g4 = gw_vec[j][glob_k];
+                    float4 u4 = uw_vec[j][glob_k];
+                    g_acc[j] += a4.x * g4.x + a4.y * g4.y + a4.z * g4.z + a4.w * g4.w;
+                    u_acc[j] += a4.x * u4.x + a4.y * u4.y + a4.z * u4.z + a4.w * u4.w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active_cols > 0) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                g_acc[j] += __shfl_xor(g_acc[j], off);
+                u_acc[j] += __shfl_xor(u_acc[j], off);
+            }
+        }
+
+        if (lane == 0) {
+            #pragma unroll
+            for (int j = 0; j < active_cols; ++j) {
+                float g = g_acc[j];
+                float u = u_acc[j];
+                // In-register SiLU(g) * u
+                float silu_g = g / (1.0f + expf(-g));
+                out[(long long)row * N + wave_col_base + j] = silu_g * u;
+            }
+        }
+    }
+}
+
 // PLAN 2 (Phase D launch reduction): Fused activation quantize + dot4 GEMV.
 // Cooperatively quantizes 32-element blocks of act_f32 into LDS, then computes
 // dot4 against Q8_0 weights with zero separate quantize launch.
@@ -1664,11 +1926,6 @@ extern "C" __global__ void grim_dot4_q80_f32act_gemv_skip(
         }
     }
 }
-
-// Step 2.2 (#1 + #2): Q8_0 × f32-activation GEMV v2 with 4-column load
-// batching (`d_b` + 2-byte-aligned 32-bit `b_codes` words loaded across all
-// 4 columns before the `grim_sdot4` loop). 100% bit-identical to `grim_dot4_q80_f32act_gemv`.
-typedef int __attribute__((aligned(2))) grim_i32_a2;
 
 // Step 2.2 (#1 + #2): Q8_0 × f32-activation GEMV v2 with 4-column load
 // batching (`d_b` + 2-byte-aligned 32-bit `b_codes` words loaded across all
@@ -2158,6 +2415,417 @@ __device__ __forceinline__ unsigned short grim_float_to_bf16_rn(float f) {
     unsigned int rounding = 0x7fff + lsb;
     x += rounding;
     return (unsigned short)(x >> 16);
+}
+
+__device__ __forceinline__ unsigned short grim_float_to_f16_rn(float f) {
+    _Float16 h = (_Float16)f;
+    unsigned short res;
+    __builtin_memcpy(&res, &h, 2);
+    return res;
+}
+
+// ─── Native FP16 × FP16 dot2 GEMV (V_DOT2_F32_F16) ─────────────────────────
+// B is row-major/transposed natural weights [N, K] as FP16 (2 bytes/weight).
+// A is activation [M, K] as FP16 (2 bytes/act).
+// Accumulates natively in FP32 with 2 FP16 products per instruction via grim_fdot2_f32_f16, outputs FP16.
+extern "C" __global__ void grim_dot2_f16_gemv(
+    const unsigned short* __restrict__ A,
+    const unsigned short* __restrict__ B,
+    unsigned short* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_pairs = K / 2;
+    const unsigned* a_row = (const unsigned*)(A + (long long)row * K);
+
+    const unsigned* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? (const unsigned*)(B + (long long)(col_base + j) * K)
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int p = lane; p < n_pairs; p += 32) {
+        unsigned a2 = a_row[p];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            unsigned b2 = b_col[j][p];
+            facc[j] = grim_fdot2_f32_f16(a2, b2, facc[j]);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = grim_float_to_f16_rn(facc[j]);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_f16_mm_tile
+// 2D CTA-tiled MM / GEMV for FP16 using 256 threads (8 waves) + 128-bit vector loads (uint4 = 8 x f16)
+// + hardware v_dot2_f32_f16 instructions.
+extern "C" __global__ void __launch_bounds__(256) grim_f16_mm_tile(
+    const unsigned short* __restrict__ act,    // [M, K]
+    const unsigned short* __restrict__ weight, // [N, K]
+    unsigned short* __restrict__ out,          // [M, N]
+    int M, int N, int K)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row          = blockIdx.y;
+    if (row >= M || cta_col_base >= N) return;
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    if (wave_col_base >= N) return;
+
+    const int active_cols = (wave_col_base + 8 <= N) ? 8 : (N - wave_col_base);
+    const unsigned* a_row = (const unsigned*)(act + (long long)row * K);
+    const uint4* a_vec = reinterpret_cast<const uint4*>(a_row);
+    const int K_vec8 = K / 8; // each uint4 has 4 unsigned = 8 FP16s
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint4* w_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            w_vec[j] = reinterpret_cast<const uint4*>(weight + (long long)(wave_col_base + j) * K);
+        } else {
+            w_vec[j] = nullptr;
+        }
+    }
+
+    for (int k_idx = lane; k_idx < K_vec8; k_idx += 32) {
+        uint4 a4 = a_vec[k_idx];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j >= active_cols) break;
+            uint4 w4 = w_vec[j][k_idx];
+            acc[j] = grim_fdot2_f32_f16(a4.x, w4.x, acc[j]);
+            acc[j] = grim_fdot2_f32_f16(a4.y, w4.y, acc[j]);
+            acc[j] = grim_fdot2_f32_f16(a4.z, w4.z, acc[j]);
+            acc[j] = grim_fdot2_f32_f16(a4.w, w4.w, acc[j]);
+        }
+    }
+
+    // Intra-wave shuffle reduction
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[j] += __shfl_xor(acc[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; ++j) {
+            out[(long long)row * N + wave_col_base + j] = grim_float_to_f16_rn(acc[j]);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_f16_mm_tile_prefetch (Variant 3)
+// Double-buffered / software-pipelined vector loads to overlap memory latency with compute.
+extern "C" __global__ void __launch_bounds__(256) grim_f16_mm_tile_prefetch(
+    const unsigned short* __restrict__ act,    // [M, K]
+    const unsigned short* __restrict__ weight, // [N, K]
+    unsigned short* __restrict__ out,          // [M, N]
+    int M, int N, int K)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row          = blockIdx.y;
+    if (row >= M || cta_col_base >= N) return;
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    if (wave_col_base >= N) return;
+
+    const int active_cols = (wave_col_base + 8 <= N) ? 8 : (N - wave_col_base);
+    const unsigned* a_row = (const unsigned*)(act + (long long)row * K);
+    const uint4* a_vec = reinterpret_cast<const uint4*>(a_row);
+    const int K_vec8 = K / 8;
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint4* w_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            w_vec[j] = reinterpret_cast<const uint4*>(weight + (long long)(wave_col_base + j) * K);
+        } else {
+            w_vec[j] = nullptr;
+        }
+    }
+
+    int k_idx = lane;
+    uint4 cur_a4 = (k_idx < K_vec8) ? a_vec[k_idx] : make_uint4(0,0,0,0);
+    uint4 cur_w4[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols && k_idx < K_vec8) {
+            cur_w4[j] = w_vec[j][k_idx];
+        }
+    }
+
+    while (k_idx < K_vec8) {
+        int next_k = k_idx + 32;
+        uint4 next_a4 = (next_k < K_vec8) ? a_vec[next_k] : make_uint4(0,0,0,0);
+        uint4 next_w4[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < active_cols && next_k < K_vec8) {
+                next_w4[j] = w_vec[j][next_k];
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j >= active_cols) break;
+            acc[j] = grim_fdot2_f32_f16(cur_a4.x, cur_w4[j].x, acc[j]);
+            acc[j] = grim_fdot2_f32_f16(cur_a4.y, cur_w4[j].y, acc[j]);
+            acc[j] = grim_fdot2_f32_f16(cur_a4.z, cur_w4[j].z, acc[j]);
+            acc[j] = grim_fdot2_f32_f16(cur_a4.w, cur_w4[j].w, acc[j]);
+        }
+
+        cur_a4 = next_a4;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            cur_w4[j] = next_w4[j];
+        }
+        k_idx = next_k;
+    }
+
+    // Intra-wave shuffle reduction
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[j] += __shfl_xor(acc[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; ++j) {
+            out[(long long)row * N + wave_col_base + j] = grim_float_to_f16_rn(acc[j]);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_f16_mm_tile_2row (Variant 1)
+// Multi-row weight reuse for M=2 (or even batch pairs).
+// Each CTA processes 2 rows simultaneously, streaming weights ONCE from HBM and computing acc0 and acc1.
+extern "C" __global__ void __launch_bounds__(256) grim_f16_mm_tile_2row(
+    const unsigned short* __restrict__ act,    // [M, K]
+    const unsigned short* __restrict__ weight, // [N, K]
+    unsigned short* __restrict__ out,          // [M, N]
+    int M, int N, int K)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row0         = blockIdx.y * 2;
+    const int row1         = row0 + 1;
+    if (row0 >= M || cta_col_base >= N) return;
+    const bool has_row1 = (row1 < M);
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    if (wave_col_base >= N) return;
+
+    const int active_cols = (wave_col_base + 8 <= N) ? 8 : (N - wave_col_base);
+    const uint4* a0_vec = reinterpret_cast<const uint4*>((const unsigned*)(act + (long long)row0 * K));
+    const uint4* a1_vec = has_row1 ? reinterpret_cast<const uint4*>((const unsigned*)(act + (long long)row1 * K)) : nullptr;
+    const int K_vec8 = K / 8;
+
+    float acc0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint4* w_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            w_vec[j] = reinterpret_cast<const uint4*>(weight + (long long)(wave_col_base + j) * K);
+        } else {
+            w_vec[j] = nullptr;
+        }
+    }
+
+    for (int k_idx = lane; k_idx < K_vec8; k_idx += 32) {
+        uint4 a0_4 = a0_vec[k_idx];
+        uint4 a1_4 = has_row1 ? a1_vec[k_idx] : make_uint4(0,0,0,0);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j >= active_cols) break;
+            uint4 w4 = w_vec[j][k_idx];
+            acc0[j] = grim_fdot2_f32_f16(a0_4.x, w4.x, acc0[j]);
+            acc0[j] = grim_fdot2_f32_f16(a0_4.y, w4.y, acc0[j]);
+            acc0[j] = grim_fdot2_f32_f16(a0_4.z, w4.z, acc0[j]);
+            acc0[j] = grim_fdot2_f32_f16(a0_4.w, w4.w, acc0[j]);
+
+            if (has_row1) {
+                acc1[j] = grim_fdot2_f32_f16(a1_4.x, w4.x, acc1[j]);
+                acc1[j] = grim_fdot2_f32_f16(a1_4.y, w4.y, acc1[j]);
+                acc1[j] = grim_fdot2_f32_f16(a1_4.z, w4.z, acc1[j]);
+                acc1[j] = grim_fdot2_f32_f16(a1_4.w, w4.w, acc1[j]);
+            }
+        }
+    }
+
+    // Intra-wave shuffle reduction
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc0[j] += __shfl_xor(acc0[j], off);
+            if (has_row1) {
+                acc1[j] += __shfl_xor(acc1[j], off);
+            }
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; ++j) {
+            out[(long long)row0 * N + wave_col_base + j] = grim_float_to_f16_rn(acc0[j]);
+            if (has_row1) {
+                out[(long long)row1 * N + wave_col_base + j] = grim_float_to_f16_rn(acc1[j]);
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_f16_mm_tile_2row_prefetch (Variant 1 + 3)
+// Combined 2-row weight reuse + software-pipelined double buffering.
+extern "C" __global__ void __launch_bounds__(256) grim_f16_mm_tile_2row_prefetch(
+    const unsigned short* __restrict__ act,    // [M, K]
+    const unsigned short* __restrict__ weight, // [N, K]
+    unsigned short* __restrict__ out,          // [M, N]
+    int M, int N, int K)
+{
+    const int cta_col_base = blockIdx.x * 64;
+    const int row0         = blockIdx.y * 2;
+    const int row1         = row0 + 1;
+    if (row0 >= M || cta_col_base >= N) return;
+    const bool has_row1 = (row1 < M);
+
+    const int wave_id = threadIdx.x / 32; // 0..7
+    const int lane    = threadIdx.x % 32; // 0..31
+
+    const int wave_col_base = cta_col_base + wave_id * 8;
+    if (wave_col_base >= N) return;
+
+    const int active_cols = (wave_col_base + 8 <= N) ? 8 : (N - wave_col_base);
+    const uint4* a0_vec = reinterpret_cast<const uint4*>((const unsigned*)(act + (long long)row0 * K));
+    const uint4* a1_vec = has_row1 ? reinterpret_cast<const uint4*>((const unsigned*)(act + (long long)row1 * K)) : nullptr;
+    const int K_vec8 = K / 8;
+
+    float acc0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint4* w_vec[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols) {
+            w_vec[j] = reinterpret_cast<const uint4*>(weight + (long long)(wave_col_base + j) * K);
+        } else {
+            w_vec[j] = nullptr;
+        }
+    }
+
+    int k_idx = lane;
+    uint4 cur_a0 = (k_idx < K_vec8) ? a0_vec[k_idx] : make_uint4(0,0,0,0);
+    uint4 cur_a1 = (has_row1 && k_idx < K_vec8) ? a1_vec[k_idx] : make_uint4(0,0,0,0);
+    uint4 cur_w4[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < active_cols && k_idx < K_vec8) {
+            cur_w4[j] = w_vec[j][k_idx];
+        }
+    }
+
+    while (k_idx < K_vec8) {
+        int next_k = k_idx + 32;
+        uint4 next_a0 = (next_k < K_vec8) ? a0_vec[next_k] : make_uint4(0,0,0,0);
+        uint4 next_a1 = (has_row1 && next_k < K_vec8) ? a1_vec[next_k] : make_uint4(0,0,0,0);
+        uint4 next_w4[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < active_cols && next_k < K_vec8) {
+                next_w4[j] = w_vec[j][next_k];
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j >= active_cols) break;
+            uint4 w4 = cur_w4[j];
+            acc0[j] = grim_fdot2_f32_f16(cur_a0.x, w4.x, acc0[j]);
+            acc0[j] = grim_fdot2_f32_f16(cur_a0.y, w4.y, acc0[j]);
+            acc0[j] = grim_fdot2_f32_f16(cur_a0.z, w4.z, acc0[j]);
+            acc0[j] = grim_fdot2_f32_f16(cur_a0.w, w4.w, acc0[j]);
+
+            if (has_row1) {
+                acc1[j] = grim_fdot2_f32_f16(cur_a1.x, w4.x, acc1[j]);
+                acc1[j] = grim_fdot2_f32_f16(cur_a1.y, w4.y, acc1[j]);
+                acc1[j] = grim_fdot2_f32_f16(cur_a1.z, w4.z, acc1[j]);
+                acc1[j] = grim_fdot2_f32_f16(cur_a1.w, w4.w, acc1[j]);
+            }
+        }
+
+        cur_a0 = next_a0;
+        cur_a1 = next_a1;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            cur_w4[j] = next_w4[j];
+        }
+        k_idx = next_k;
+    }
+
+    // Intra-wave shuffle reduction
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc0[j] += __shfl_xor(acc0[j], off);
+            if (has_row1) {
+                acc1[j] += __shfl_xor(acc1[j], off);
+            }
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; ++j) {
+            out[(long long)row0 * N + wave_col_base + j] = grim_float_to_f16_rn(acc0[j]);
+            if (has_row1) {
+                out[(long long)row1 * N + wave_col_base + j] = grim_float_to_f16_rn(acc1[j]);
+            }
+        }
+    }
 }
 
 // ─── Phase 4.5d: BF16 × BF16 dot2 GEMV (V_DOT2_F32_BF16, dot12-insts) ─────
@@ -2938,6 +3606,131 @@ extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_fp8_gemv_rows_r8_
     int M, int N, int K)
 {
     grim_dot4_fp8_gemv_rows_v10_impl<8>(A, B_fp8, C, M, N, K);
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_dot4_fp8_gemv_rows_r2_v10
+// 2-row weight reuse for dual-token decode (M=2)
+extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_fp8_gemv_rows_r2_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_fp8_gemv_rows_v10_impl<2>(A, B_fp8, C, M, N, K);
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_dot4_fp8_gate_up_silu_v10
+// Concurrent streaming of W_gate and W_up FP8 weights with in-register SwiGLU:
+// out = silu(gate) * up
+extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_fp8_gate_up_silu_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ W_gate_fp8,
+    const unsigned char* __restrict__ W_up_fp8,
+    float* __restrict__ Out,
+    int M, int N, int K)
+{
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row      = blockIdx.y;
+
+    if (row >= M) return;
+
+    const int n_chunks = K / 32;
+    const float4* a_row4 = (const float4*)(A + (long long)row * K);
+    const unsigned char* g0 = W_gate_fp8 + (long long)col_base * K;
+    const unsigned char* u0 = W_up_fp8 + (long long)col_base * K;
+    const int active_cols = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+
+    __shared__ uint4 s_a4[32][2];
+
+    float g_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float u_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int chunk_base = 0; chunk_base < n_chunks; chunk_base += 32) {
+        const int chunk = chunk_base + lane;
+        uint4 g0_v[4], g1_v[4];
+        uint4 u0_v[4], u1_v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols && chunk < n_chunks) {
+                const uint4* g4p = (const uint4*)(g0 + (long long)j * K + (long long)chunk * 32);
+                g0_v[j] = g4p[0];
+                g1_v[j] = g4p[1];
+
+                const uint4* u4p = (const uint4*)(u0 + (long long)j * K + (long long)chunk * 32);
+                u0_v[j] = u4p[0];
+                u1_v[j] = u4p[1];
+            } else {
+                g0_v[j] = make_uint4(0u, 0u, 0u, 0u);
+                g1_v[j] = make_uint4(0u, 0u, 0u, 0u);
+                u0_v[j] = make_uint4(0u, 0u, 0u, 0u);
+                u1_v[j] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+
+        // Quantize A cooperatively
+        const int c_coop = chunk_base + wave * 8 + (lane >> 2);
+        const int sub4   = lane & 3;
+        if (c_coop < n_chunks) {
+            const float4* ap = a_row4 + (long long)c_coop * 8 + sub4 * 2;
+            const int w0 = grim_pack4_fp8_hw(ap[0]);
+            const int w1 = grim_pack4_fp8_hw(ap[1]);
+            reinterpret_cast<int2*>(&s_a4[wave * 8 + (lane >> 2)][0])[sub4] = make_int2(w0, w1);
+        }
+        __syncthreads();
+
+        if (chunk < n_chunks && active_cols > 0) {
+            const uint4 av0 = s_a4[lane][0];
+            const uint4 av1 = s_a4[lane][1];
+            const int a4_words[8] = {
+                (int)av0.x, (int)av0.y, (int)av0.z, (int)av0.w,
+                (int)av1.x, (int)av1.y, (int)av1.z, (int)av1.w
+            };
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j >= active_cols) break;
+                const int gw[8] = {
+                    (int)g0_v[j].x, (int)g0_v[j].y, (int)g0_v[j].z, (int)g0_v[j].w,
+                    (int)g1_v[j].x, (int)g1_v[j].y, (int)g1_v[j].z, (int)g1_v[j].w
+                };
+                const int uw[8] = {
+                    (int)u0_v[j].x, (int)u0_v[j].y, (int)u0_v[j].z, (int)u0_v[j].w,
+                    (int)u1_v[j].x, (int)u1_v[j].y, (int)u1_v[j].z, (int)u1_v[j].w
+                };
+                float cur_g = 0.0f;
+                float cur_u = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    cur_g = grim_fdot4_fp8(cur_g, a4_words[e], gw[e]);
+                    cur_u = grim_fdot4_fp8(cur_u, a4_words[e], uw[e]);
+                }
+                g_acc[j] += cur_g;
+                u_acc[j] += cur_u;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            g_acc[j] += __shfl_xor(g_acc[j], off);
+            u_acc[j] += __shfl_xor(u_acc[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            float g = g_acc[j];
+            float u = u_acc[j];
+            float silu_g = g / (1.0f + __builtin_amdgcn_exp2f(-g * 1.4426950408889634f));
+            Out[(long long)row * N + col_base + j] = silu_g * u;
+        }
+    }
 }
 
 
@@ -6131,6 +6924,278 @@ extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_forest_gemv_rows_
     int M, int N, int K)
 {
     grim_dot4_forest_gemv_rows_v10_impl<8>(A, Bblob, C, M, N, K);
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_dot4_forest_gemv_v11_coop
+// ForestRaven Variant A: 4-wave cooperative quantization of A (eliminates wave 0 serialization bottleneck)
+// + 128-bit uint4 vectorized loads for B (replaces 4x uint2 with 2x uint4)
+extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_forest_gemv_v11_coop(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row      = blockIdx.y;
+
+    if (row >= M) return;
+
+    const signed char* Bcodes = (const signed char*)(Bblob + 8);
+    const float* Bscales = (const float*)(Bblob + 8 + (long long)N * K + 8);
+    const float* a_row = A + (long long)row * K;
+
+    const int active_cols = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+    float s_b[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        s_b[j] = (j < active_cols) ? Bscales[col_base + j] : 0.0f;
+
+    const int n_blocks = K / 32;
+    __shared__ uint4 s_a4[32][2];
+    __shared__ float s_da[32];
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk_base = 0; blk_base < n_blocks; blk_base += 32) {
+        const int blk = blk_base + lane;
+
+        // 128-bit vector loads: 2x uint4 per column instead of 4x uint2
+        uint4 b_v4[4][2];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols && blk < n_blocks) {
+                const uint4* b4p =
+                    (const uint4*)(Bcodes + (long long)(col_base + j) * K + (long long)blk * 32);
+                b_v4[j][0] = b4p[0];
+                b_v4[j][1] = b4p[1];
+            } else {
+                b_v4[j][0] = make_uint4(0u, 0u, 0u, 0u);
+                b_v4[j][1] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+
+        // Cooperative quantization: All 4 waves quantize 8 blocks each (wave*8 + lane/4)
+        const int b_idx = wave * 8 + (lane >> 2);
+        const int target_blk = blk_base + b_idx;
+        if (target_blk < n_blocks && (lane & 3) == 0) {
+            const float* blk_src = a_row + (long long)target_blk * 32;
+            float amax = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 32; e++)
+                amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+            const float d_a   = amax / 127.0f;
+            const float inv_a = (amax == 0.0f) ? 0.0f : (127.0f / amax);
+
+            unsigned int a4_reg[8];
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_a);
+                signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_a);
+                signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_a);
+                signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_a);
+                a4_reg[p] = (unsigned int)((unsigned char)q0) |
+                            ((unsigned int)((unsigned char)q1) << 8) |
+                            ((unsigned int)((unsigned char)q2) << 16) |
+                            ((unsigned int)((unsigned char)q3) << 24);
+            }
+            s_a4[b_idx][0] = make_uint4(a4_reg[0], a4_reg[1], a4_reg[2], a4_reg[3]);
+            s_a4[b_idx][1] = make_uint4(a4_reg[4], a4_reg[5], a4_reg[6], a4_reg[7]);
+            s_da[b_idx]    = d_a;
+        }
+        __syncthreads();
+
+        if (blk < n_blocks && active_cols > 0) {
+            const uint4 av0 = s_a4[lane][0];
+            const uint4 av1 = s_a4[lane][1];
+            const float d_a = s_da[lane];
+            const int a4_reg[8] = {
+                (int)av0.x, (int)av0.y, (int)av0.z, (int)av0.w,
+                (int)av1.x, (int)av1.y, (int)av1.z, (int)av1.w
+            };
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j >= active_cols) break;
+                const int bw[8] = {
+                    (int)b_v4[j][0].x, (int)b_v4[j][0].y, (int)b_v4[j][0].z, (int)b_v4[j][0].w,
+                    (int)b_v4[j][1].x, (int)b_v4[j][1].y, (int)b_v4[j][1].z, (int)b_v4[j][1].w
+                };
+                int iacc = 0;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    iacc = grim_sdot4(a4_reg[p], bw[p], iacc);
+                }
+                facc[j] += (float)iacc * d_a * s_b[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_dot4_forest_gemv_rows_r2_v10
+// ForestRaven Variant B: 2-row weight reuse for dual decode (M=2)
+extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_forest_gemv_rows_r2_v10(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    grim_dot4_forest_gemv_rows_v10_impl<2>(A, Bblob, C, M, N, K);
+}
+
+// ──────────────────────────────────────────────────────────────────── grim_dot4_forest_gemv_rows_r2_v11_coop
+// ForestRaven Variant A+B (Combined): 2-row weight reuse (M=2) + 128-bit uint4 vectorized loads + cooperative A-quantization
+extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_forest_gemv_rows_r2_v11_coop(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row_base = blockIdx.y * 2;
+
+    if (row_base >= M) return;
+
+    const signed char* Bcodes = (const signed char*)(Bblob + 8);
+    const float* Bscales = (const float*)(Bblob + 8 + (long long)N * K + 8);
+
+    const int active_cols = (col_base >= N) ? 0 : ((col_base + 4 <= N) ? 4 : (N - col_base));
+    const int active_rows = (row_base + 2 <= M) ? 2 : (M - row_base);
+    float s_b[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        s_b[j] = (j < active_cols) ? Bscales[col_base + j] : 0.0f;
+
+    const int n_blocks = K / 32;
+    __shared__ uint4 s_a4[2][32][2];
+    __shared__ float s_da[2][32];
+
+    float facc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+
+    for (int blk_base = 0; blk_base < n_blocks; blk_base += 32) {
+        const int blk = blk_base + lane;
+
+        // 128-bit vector loads: 2x uint4 per column instead of 4x uint2
+        uint4 b_v4[4][2];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols && blk < n_blocks) {
+                const uint4* b4p =
+                    (const uint4*)(Bcodes + (long long)(col_base + j) * K + (long long)blk * 32);
+                b_v4[j][0] = b4p[0];
+                b_v4[j][1] = b4p[1];
+            } else {
+                b_v4[j][0] = make_uint4(0u, 0u, 0u, 0u);
+                b_v4[j][1] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+
+        // Cooperative quantization for both rows:
+        // Wave 0 & 1 handle row 0; Wave 2 & 3 handle row 1 (each wave does 16 blocks)
+        const int r_target = wave >> 1; // 0 or 1
+        const int w_sub    = wave & 1;  // 0 or 1
+        const int b_idx    = w_sub * 16 + (lane >> 1); // 0..31
+        const int target_blk = blk_base + b_idx;
+        if (r_target < active_rows && target_blk < n_blocks && (lane & 1) == 0) {
+            const float* blk_src = A + (long long)(row_base + r_target) * K + (long long)target_blk * 32;
+            float amax = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 32; e++)
+                amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+            const float d_a   = amax / 127.0f;
+            const float inv_a = (amax == 0.0f) ? 0.0f : (127.0f / amax);
+
+            unsigned int a4_reg[8];
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_a);
+                signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_a);
+                signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_a);
+                signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_a);
+                a4_reg[p] = (unsigned int)((unsigned char)q0) |
+                            ((unsigned int)((unsigned char)q1) << 8) |
+                            ((unsigned int)((unsigned char)q2) << 16) |
+                            ((unsigned int)((unsigned char)q3) << 24);
+            }
+            s_a4[r_target][b_idx][0] = make_uint4(a4_reg[0], a4_reg[1], a4_reg[2], a4_reg[3]);
+            s_a4[r_target][b_idx][1] = make_uint4(a4_reg[4], a4_reg[5], a4_reg[6], a4_reg[7]);
+            s_da[r_target][b_idx]    = d_a;
+        }
+        __syncthreads();
+
+        if (blk < n_blocks && active_cols > 0) {
+            const int bw[4][8] = {
+                { (int)b_v4[0][0].x, (int)b_v4[0][0].y, (int)b_v4[0][0].z, (int)b_v4[0][0].w,
+                  (int)b_v4[0][1].x, (int)b_v4[0][1].y, (int)b_v4[0][1].z, (int)b_v4[0][1].w },
+                { (int)b_v4[1][0].x, (int)b_v4[1][0].y, (int)b_v4[1][0].z, (int)b_v4[1][0].w,
+                  (int)b_v4[1][1].x, (int)b_v4[1][1].y, (int)b_v4[1][1].z, (int)b_v4[1][1].w },
+                { (int)b_v4[2][0].x, (int)b_v4[2][0].y, (int)b_v4[2][0].z, (int)b_v4[2][0].w,
+                  (int)b_v4[2][1].x, (int)b_v4[2][1].y, (int)b_v4[2][1].z, (int)b_v4[2][1].w },
+                { (int)b_v4[3][0].x, (int)b_v4[3][0].y, (int)b_v4[3][0].z, (int)b_v4[3][0].w,
+                  (int)b_v4[3][1].x, (int)b_v4[3][1].y, (int)b_v4[3][1].z, (int)b_v4[3][1].w },
+            };
+
+            #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                if (r < active_rows) {
+                    const uint4 av0 = s_a4[r][lane][0];
+                    const uint4 av1 = s_a4[r][lane][1];
+                    const float d_a = s_da[r][lane];
+                    const int a4_reg[8] = {
+                        (int)av0.x, (int)av0.y, (int)av0.z, (int)av0.w,
+                        (int)av1.x, (int)av1.y, (int)av1.z, (int)av1.w
+                    };
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        if (j >= active_cols) break;
+                        int iacc = 0;
+                        #pragma unroll
+                        for (int p = 0; p < 8; p++) {
+                            iacc = grim_sdot4(a4_reg[p], bw[j][p], iacc);
+                        }
+                        facc[r][j] += (float)iacc * d_a * s_b[j];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        if (r < active_rows) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+            if (lane == 0) {
+                #pragma unroll
+                for (int j = 0; j < active_cols; j++) {
+                    C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+                }
+            }
+        }
+    }
 }
 
 #endif // RDNA3/RDNA4

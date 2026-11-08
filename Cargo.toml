@@ -109,8 +109,10 @@ codegen-units = 1
 
 [patch.crates-io]
 convert_case = { path = "third-party/convert_case-0.10.1" }
-# cubecl-hip 0.10 + cubecl-hip-sys: bind to grim's vendored source. The
-# vendored crate is named `cubecl-hip` (crates/grim-cl-hip) and deps
-# `cubecl-hip-sys` via a path dep-rename onto grim-hip-sys, so the registry
-# copies never enter the graph. See crates/grim-cl-hip/PROVENANCE.md.
-cubecl-hip = { path = "crates/grim-cl-hip" }
+# NOTE: no [patch] for cubecl-hip. The HIP runtime is grim's own fork
+# (`grim-cl-hip`, crates/grim-cl-hip) — a [patch] entry requires the patched
+# package name to match, so a renamed fork cannot be patched in. Instead
+# grim-backend-rocm depends on the fork by path and the `cubecl` umbrella
+# is used WITHOUT its `hip` feature, so the registry `cubecl-hip` (and its
+# cubecl-hip-sys 7.2 bindings, which do not compile against ROCm 7.16)
+# never enter the graph. See crates/grim-cl-hip/PROVENANCE.md.

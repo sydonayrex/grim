@@ -186,8 +186,20 @@ pub(crate) fn lfm2_moe_fields(
 
 /// Resolve this process's tensor-parallel config from `GRIM_TP_*` and validate the `(rank, world_size)` contract.
 /// Returns the default `{rank:0, world_size:1}` when `GRIM_TP_SIZE` is unset or `1` (single-device).
-fn resolve_tp_config() -> Result<TensorParallelConfig> {
+/// When the target device is CPU, TP is refused because the dense transformer path
+/// has no cross-rank collectives — weights would load as unreduced shards and every
+/// output would be a partial sum.
+fn resolve_tp_config(device: &Device) -> Result<TensorParallelConfig> {
     let tp = TensorParallelConfig::from_env().unwrap_or_default();
+    if tp.world_size > 1 && device.is_cpu() {
+        log::warn!(
+            "[grim-engine] GRIM_TP_SIZE={} ignored: the CPU backend has no \
+             tensor-parallel collectives — weights would load as unreduced shards \
+             and every output would be a partial sum. Forcing world_size=1.",
+            tp.world_size
+        );
+        return Ok(TensorParallelConfig::default());
+    }
     if let Err(msg) = tp.validate() {
         return Err(Error::Config(format!(
             "invalid tensor-parallel configuration (GRIM_TP_SIZE / GRIM_TP_RANK): {msg}"
@@ -1509,7 +1521,7 @@ fn load_model_from_config(
         vocab_size
     );
 
-    let tp = resolve_tp_config()?;
+    let tp = resolve_tp_config(&device)?;
     // Gemma 4 keeps its text stack under `model.language_model.*` (the
     // checkpoint also carries a vision and an audio tower), so the provider
     // rewrites the text-model names.
@@ -3488,7 +3500,7 @@ fn load_model_with_providers(
         }
         TensorParallelConfig::default()
     } else {
-        resolve_tp_config()?
+        resolve_tp_config(&device)?
     };
     let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
     ws.prefetch_all();
@@ -5929,7 +5941,7 @@ pub fn load_eagle3_from_path(
     path: &str,
     device: Device,
 ) -> Result<std::sync::Arc<grim_models_transformer::Eagle3>> {
-    let tp = resolve_tp_config()?;
+    let tp = resolve_tp_config(&device)?;
     let tprov = SafetensorsProvider::open(path)?;
     let ws = WeightSource::root(&tprov, device.clone()).with_tp_config(tp);
     let cfg = grim_models_transformer::Eagle3Config {

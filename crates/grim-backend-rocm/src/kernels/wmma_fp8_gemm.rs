@@ -202,6 +202,71 @@ extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3_blocked
         }
     }
 }
+
+// WhiteRaven-blocked v3 (Variant A: 16x64 quad-tile output per block):
+// Processes 4 output fragments (64 output columns: frag_c0..c3) per block.
+// Staged frag_a is reused across FOUR mma_sync calls per K step, doubling arithmetic intensity.
+extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3_blocked_v3_quad(
+    const float8_t* __restrict__ A,
+    const float8_t* __restrict__ Bb,
+    float* __restrict__ C,
+    int M, int N, int K) {
+
+    const int tile_row = blockIdx.y;
+    const int tile_col_base = blockIdx.x * 4;
+
+    if (tile_row * 16 >= M || tile_col_base * 16 >= N) return;
+
+    const int row_base = tile_row * 16;
+    const int col_base = tile_col_base * 16;
+    const int KB = K >> 4;
+
+    fragment<accumulator, 16, 16, 16, float> frag_c[4];
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        fill_fragment(frag_c[t], 0.0f);
+    }
+
+    __shared__ float c_out[16 * 16];
+
+    const float8_t* a_row = A + (long long)row_base * K;
+    const float8_t* b_bases[4];
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        int c_idx = tile_col_base + t;
+        b_bases[t] = (c_idx * 16 < N) ? (Bb + (long long)c_idx * KB * 256) : nullptr;
+    }
+
+    for (int kb = 0; kb < KB; ++kb) {
+        fragment<matrix_a, 16, 16, 16, float8_t, row_major> frag_a;
+        load_matrix_sync(frag_a, a_row + kb * 16, K);
+
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            if (b_bases[t]) {
+                fragment<matrix_b, 16, 16, 16, float8_t, col_major> frag_b;
+                load_matrix_sync(frag_b, b_bases[t] + (long long)kb * 256, 16);
+                mma_sync(frag_c[t], frag_a, frag_b, frag_c[t]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        if ((tile_col_base + t) * 16 < N) {
+            float* ct_ptr = C + (long long)row_base * N + (col_base + t * 16);
+            store_matrix_sync(c_out, frag_c[t], 16, layout_t::mem_row_major);
+            __builtin_amdgcn_wave_barrier();
+            for (int idx = threadIdx.x; idx < 256; idx += 32) {
+                int i = idx / 16;
+                int j = idx % 16;
+                if (row_base + i < M && col_base + t * 16 + j < N) {
+                    ct_ptr[(long long)i * N + j] = c_out[idx];
+                }
+            }
+        }
+    }
+}
 // WhiteRaven act prologue: quantize an F32 activation [M, K] to FP8 E4M3
 // codes padded to whole 16-row tiles ([16*ceil(M/16), K], pad rows = +0.0).
 // This is what makes the blocked GEMM capture-safe: the host-side conversion

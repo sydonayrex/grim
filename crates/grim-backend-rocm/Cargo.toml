@@ -25,13 +25,16 @@ serde_json = "1.0"
 # via libloading and error cleanly if missing — never panic (rust-gpu-discipline §2 #12).
 libloading = "0.8"
 libc = "0.2"
-cubecl = { version = "0.10.0", features = ["hip"], optional = true }
-cubecl-hip = { version = "0.10.0", optional = true }
+# NOTE: umbrella WITHOUT `hip` — the HIP runtime is grim's fork
+# (`grim-cl-hip` below), not the registry `cubecl-hip` the umbrella's
+# `hip` feature would pull. See crates/grim-cl-hip/PROVENANCE.md.
+cubecl = { version = "0.10.0", optional = true }
+grim-cl-hip = { path = "../grim-cl-hip", optional = true }
 # Vendored HIP bindings (from cubecl-hip-sys) — see crates/grim-hip-sys/PROVENANCE.md.
 grim-hip-sys = { path = "../grim-hip-sys" }
 # Force cubecl-runtime's `std` feature on so its `std_io` cfg is active, which
 # compiles the on-disk kernel compilation cache (`cubecl::config::CacheConfig`).
-# Without this, `cubecl-hip`'s `cubecl-runtime` dep (default-features = false) keeps
+# Without this, `grim-cl-hip`'s `cubecl-runtime` dep (default-features = false) keeps
 # `std` off and the cache module is cfg'd out.
 cubecl-runtime = { version = "0.10.0", features = ["std"], optional = true }
 
@@ -69,7 +72,7 @@ rocm-aiter = ["rocm"]
 # against the vendored CK headers. grim is Rust-centric now: the
 # decode-GEMM kernel is an embedded HIP source literal in
 # `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime.
-cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "rocm"]
+cubecl = ["dep:cubecl", "dep:grim-cl-hip", "dep:cubecl-runtime", "rocm"]
 # Parity/test umbrella: everything a non-shipping A/B run needs (currently
 # just cubecl). Never enable in a release build.
 parity-tests = ["cubecl"]

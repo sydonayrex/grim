@@ -1517,6 +1517,13 @@ impl Qwen35Block {
                         seq_len,
                         branch_width,
                     )?;
+                    // Prefill→decode handoff: the D2D decode step reads the
+                    // device state buffers — publish the just-advanced host
+                    // mirrors so decode does not start from zeros.
+                    {
+                        let dev = pick_device_for_storage_device(&device);
+                        kda_upload_host_state_to_dev(self, cache, &dev)?;
+                    }
                 }
             }
         }
@@ -2630,6 +2637,57 @@ fn gdn_l2_norm(v: &[f32], eps: f32) -> Vec<f32> {
         return v.to_vec();
     }
     v.iter().map(|x| x / denom).collect()
+}
+
+/// Upload the host KDA mirrors (`cache.conv_state` / `cache.ssm_state`) into
+/// the device-resident state buffers the D2D decode path reads.
+///
+/// THE PREFILL→DECODE HANDOFF (2026-11-07): a multi-token prefill runs the
+/// host KDA path (gated_delta_net_forward — the D2D path declines for
+/// seq_len > 1), which updates the HOST mirrors; the D2D decode path then
+/// reads `conv_state_dev` / `ssm_state_dev`, which were allocated as ZEROS on
+/// first use and never seeded — the decode step computed with no conv history
+/// and a zero SSM state, degenerating free-running generation into
+/// "terasteras" repetition (cli_decode_parity: 33-logit gap vs full-sequence).
+/// This helper restores the handoff: call it after every host-path KDA pass.
+/// Layouts are byte-identical: conv mirror holds whatever the device kernel's
+/// in-place state write produced for shape [1, taps-1, conv_dim]; ssm mirror
+/// is head-major [head][dk][dv], matching the device [heads, dk, dv].
+fn kda_upload_host_state_to_dev(
+    blk: &Qwen35Block,
+    cache: &mut Qwen35LayerCache,
+    dev: &Arc<dyn grim_tensor::BackendDevice>,
+) -> Result<()> {
+    let taps = blk.cfg_ssm_d_conv().max(1);
+    let n_val = blk.cfg_ssm_num_value_heads();
+    let head_dim = blk.cfg_ssm_head_dim().max(1);
+    let d_state = blk.cfg_ssm_d_state().max(1);
+    // conv_dim per the cache's own sizing: (dt_rank + 2*n_group) * d_state
+    // (see Qwen35LayerCache::new). The d2d arm derives the same value as
+    // 2*key_dim + value_dim.
+    let conv_dim = (blk.ssm_dt_rank_hint + 2 * blk.ssm_n_group_hint) * d_state;
+    let need = (taps - 1) * conv_dim;
+    let ssm_len = n_val * head_dim * d_state;
+
+    if cache.conv_state.len() >= need {
+        let data = cache.conv_state[..need].to_vec();
+        let storage = dev.from_cpu(
+            &data,
+            &grim_tensor::Shape::new(vec![1, taps - 1, conv_dim]),
+            grim_tensor::dtype::DType::F32,
+        )?;
+        cache.conv_state_dev = Some(storage);
+    }
+    if cache.ssm_state.len() >= ssm_len {
+        let data = cache.ssm_state[..ssm_len].to_vec();
+        let storage = dev.from_cpu(
+            &data,
+            &grim_tensor::Shape::new(vec![n_val, head_dim, d_state]),
+            grim_tensor::dtype::DType::F32,
+        )?;
+        cache.ssm_state_dev = Some(storage);
+    }
+    Ok(())
 }
 
 fn gated_delta_net_forward(

@@ -1,14 +1,17 @@
 [package]
-# Published-under name: this vendored source IS cubecl-hip 0.10.0 (see
-# PROVENANCE.md). Renamed from grim-cl-hip so the root [patch.crates-io]
-# can point registry `cubecl-hip` consumers here directly — no shim crate.
-name = "cubecl-hip"
-# Tracks the vendored upstream version (cubecl-hip 0.10.0).
+# Grim fork of cubecl-hip 0.10.0 (see PROVENANCE.md). NOT a verbatim vendor
+# copy: this crate carries grim-specific fixes and optimizations on top of
+# upstream, so it is published under its own name. Consumers depend on it by
+# path (`grim-cl-hip = { path = "../grim-cl-hip" }`); the registry
+# `cubecl-hip` never enters the graph.
+name = "grim-cl-hip"
+# Tracks the upstream base version (cubecl-hip 0.10.0); grim fork changes
+# do not bump this — divergence is recorded in PROVENANCE.md.
 version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Vendored cubecl-hip 0.10.0 (AMD ROCm HIP runtime) for grim"
+description = "Grim fork of cubecl-hip 0.10.0 (AMD ROCm HIP runtime) with grim-specific fixes"
 repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-hip"
 categories = ["science"]
 keywords = ["gpu", "amd", "rocm", "hip"]

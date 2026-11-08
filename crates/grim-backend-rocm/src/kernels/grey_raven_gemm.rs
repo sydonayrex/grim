@@ -247,6 +247,213 @@ extern "C" __global__ void grim_grey_raven_b_prologue(
         v = X[(long long)m * K + k];
     Bfrag[idx] = float_to_fp8_e4m3_hip(v);
 }
+
+// B-prologue v2: Hardware-accelerated vectorized E4M3 quantization.
+// Processes 4 adjacent elements along j (j in 0, 4, 8, 12) per thread using
+// native RDNA4 V_CVT_PK_FP8_F32 instructions, writing 4 bytes at a time.
+extern "C" __global__ void grim_grey_raven_b_prologue_v2(
+    const float* __restrict__ X,  // dense activations [M, K] row-major
+    unsigned char* __restrict__ Bfrag,  // out: [m_tiles][n_windows][512 B]
+    int M, int K,
+    int m_tiles,      // ceil(M / 16)
+    int n_windows)    // ceil(K / 32)
+{
+    const long long quad_idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total_quads = (long long)m_tiles * n_windows * 128;
+    if (quad_idx >= total_quads) return;
+
+    const int tmp = (int)(quad_idx / 128);
+    const int off = (int)(quad_idx % 128);
+    const int mt = tmp / n_windows;
+    const int w  = tmp % n_windows;
+    const int chunk = off / 4;
+    const int j4 = (off % 4) * 4;
+    const int m = mt * 16 + (chunk & 15);
+    const int k_base = w * 32 + ((chunk >= 16) ? 16 : 0) + j4;
+
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+    if (m < M) {
+        if (k_base + 0 < K) v0 = X[(long long)m * K + k_base + 0];
+        if (k_base + 1 < K) v1 = X[(long long)m * K + k_base + 1];
+        if (k_base + 2 < K) v2 = X[(long long)m * K + k_base + 2];
+        if (k_base + 3 < K) v3 = X[(long long)m * K + k_base + 3];
+    }
+
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
+    float x0 = (__builtin_isnan(v0)) ? v0 : __builtin_amdgcn_fmed3f(v0, 448.0f, -448.0f);
+    float x1 = (__builtin_isnan(v1)) ? v1 : __builtin_amdgcn_fmed3f(v1, 448.0f, -448.0f);
+    float x2 = (__builtin_isnan(v2)) ? v2 : __builtin_amdgcn_fmed3f(v2, 448.0f, -448.0f);
+    float x3 = (__builtin_isnan(v3)) ? v3 : __builtin_amdgcn_fmed3f(v3, 448.0f, -448.0f);
+    int packed = __builtin_amdgcn_cvt_pk_fp8_f32(x0, x1, 0, false);
+    packed = __builtin_amdgcn_cvt_pk_fp8_f32(x2, x3, packed, true);
+    *(int*)(Bfrag + quad_idx * 4) = packed;
+#else
+    unsigned char b0 = float_to_fp8_e4m3_hip(v0);
+    unsigned char b1 = float_to_fp8_e4m3_hip(v1);
+    unsigned char b2 = float_to_fp8_e4m3_hip(v2);
+    unsigned char b3 = float_to_fp8_e4m3_hip(v3);
+    int packed = (int)b0 | ((int)b1 << 8) | ((int)b2 << 16) | ((int)b3 << 24);
+    *(int*)(Bfrag + quad_idx * 4) = packed;
+#endif
+}
+
+// GreyRaven v3 GEMM: Dual N-tile + double-buffered software pipelining (prefetch).
+// Prefetches next 2 K-windows' A, B, and sidx while computing the current 2 K-windows.
+extern "C" __global__ void __launch_bounds__(32) grim_grey_raven_gemm_v3_prefetch(
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ Bfrag,
+    float*               __restrict__ Y,
+    int M, int N, int K,
+    int n_tiles,
+    int n_windows,
+    int m_tiles)
+{
+    const int tileN0 = blockIdx.x * 2;
+    const int tileN1 = tileN0 + 1;
+    const int tileM  = blockIdx.y;
+    const int lane   = threadIdx.x;
+    if (lane >= 32 || tileN0 >= n_tiles) return;
+
+    const bool valid_n1 = (tileN1 < n_tiles);
+    const int half = (lane >= 16) ? 1 : 0;
+    const int lmod = lane & 15;
+
+    gg_v8f c0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    gg_v8f c1 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const unsigned char* w_row0 = W + (long long)tileN0 * n_windows * 260;
+    const unsigned char* w_row1 = W + (long long)(valid_n1 ? tileN1 : tileN0) * n_windows * 260;
+    const unsigned char* b_row  = Bfrag + (long long)tileM * n_windows * 512;
+
+    int w = 0;
+
+    // Prologue: prefetch first window pair if available
+    gg_v2i cur_a0_w0, cur_a1_w0, cur_a0_w1, cur_a1_w1;
+    unsigned int cur_sidx0_w0, cur_sidx1_w0, cur_sidx0_w1, cur_sidx1_w1;
+    gg_v4i cur_b_w0, cur_b_w1;
+
+    if (w + 1 < n_windows) {
+        const unsigned char* s0_w0 = w_row0 + (long long)(w + 0) * 260;
+        const unsigned char* s1_w0 = w_row1 + (long long)(w + 0) * 260;
+        const unsigned char* s0_w1 = w_row0 + (long long)(w + 1) * 260;
+        const unsigned char* s1_w1 = w_row1 + (long long)(w + 1) * 260;
+
+        __builtin_memcpy(&cur_b_w0, b_row + (long long)(w + 0) * 512 + lane * 16, 16);
+        __builtin_memcpy(&cur_a0_w0, s0_w0 + lane * 8, 8);
+        __builtin_memcpy(&cur_sidx0_w0, s0_w0 + 256, 4);
+        __builtin_memcpy(&cur_a1_w0, s1_w0 + lane * 8, 8);
+        __builtin_memcpy(&cur_sidx1_w0, s1_w0 + 256, 4);
+
+        __builtin_memcpy(&cur_b_w1, b_row + (long long)(w + 1) * 512 + lane * 16, 16);
+        __builtin_memcpy(&cur_a0_w1, s0_w1 + lane * 8, 8);
+        __builtin_memcpy(&cur_sidx0_w1, s0_w1 + 256, 4);
+        __builtin_memcpy(&cur_a1_w1, s1_w1 + lane * 8, 8);
+        __builtin_memcpy(&cur_sidx1_w1, s1_w1 + 256, 4);
+    }
+
+    for (; w + 3 < n_windows; w += 2) {
+        // Prefetch next window pair (w+2, w+3)
+        gg_v2i nxt_a0_w0, nxt_a1_w0, nxt_a0_w1, nxt_a1_w1;
+        unsigned int nxt_sidx0_w0, nxt_sidx1_w0, nxt_sidx0_w1, nxt_sidx1_w1;
+        gg_v4i nxt_b_w0, nxt_b_w1;
+
+        const unsigned char* next_s0_w0 = w_row0 + (long long)(w + 2) * 260;
+        const unsigned char* next_s1_w0 = w_row1 + (long long)(w + 2) * 260;
+        const unsigned char* next_s0_w1 = w_row0 + (long long)(w + 3) * 260;
+        const unsigned char* next_s1_w1 = w_row1 + (long long)(w + 3) * 260;
+
+        __builtin_memcpy(&nxt_b_w0, b_row + (long long)(w + 2) * 512 + lane * 16, 16);
+        __builtin_memcpy(&nxt_a0_w0, next_s0_w0 + lane * 8, 8);
+        __builtin_memcpy(&nxt_sidx0_w0, next_s0_w0 + 256, 4);
+        __builtin_memcpy(&nxt_a1_w0, next_s1_w0 + lane * 8, 8);
+        __builtin_memcpy(&nxt_sidx1_w0, next_s1_w0 + 256, 4);
+
+        __builtin_memcpy(&nxt_b_w1, b_row + (long long)(w + 3) * 512 + lane * 16, 16);
+        __builtin_memcpy(&nxt_a0_w1, next_s0_w1 + lane * 8, 8);
+        __builtin_memcpy(&nxt_sidx0_w1, next_s0_w1 + 256, 4);
+        __builtin_memcpy(&nxt_a1_w1, next_s1_w1 + lane * 8, 8);
+        __builtin_memcpy(&nxt_sidx1_w1, next_s1_w1 + 256, 4);
+
+        // Compute on cur
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a0_w0, cur_b_w0, c0, cur_sidx0_w0);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a1_w0, cur_b_w0, c1, cur_sidx1_w0);
+        }
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a0_w1, cur_b_w1, c0, cur_sidx0_w1);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a1_w1, cur_b_w1, c1, cur_sidx1_w1);
+        }
+
+        // Advance
+        cur_a0_w0 = nxt_a0_w0;
+        cur_a1_w0 = nxt_a1_w0;
+        cur_sidx0_w0 = nxt_sidx0_w0;
+        cur_sidx1_w0 = nxt_sidx1_w0;
+        cur_b_w0 = nxt_b_w0;
+
+        cur_a0_w1 = nxt_a0_w1;
+        cur_a1_w1 = nxt_a1_w1;
+        cur_sidx0_w1 = nxt_sidx0_w1;
+        cur_sidx1_w1 = nxt_sidx1_w1;
+        cur_b_w1 = nxt_b_w1;
+    }
+
+    // Compute remaining buffered window pair
+    if (w + 1 < n_windows) {
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a0_w0, cur_b_w0, c0, cur_sidx0_w0);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a1_w0, cur_b_w0, c1, cur_sidx1_w0);
+        }
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a0_w1, cur_b_w1, c0, cur_sidx0_w1);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(cur_a1_w1, cur_b_w1, c1, cur_sidx1_w1);
+        }
+        w += 2;
+    }
+
+    // Tail loop for odd window
+    for (; w < n_windows; w++) {
+        const unsigned char* s0 = w_row0 + (long long)w * 260;
+        const unsigned char* s1 = w_row1 + (long long)w * 260;
+        gg_v2i a0, a1;
+        unsigned int sidx0, sidx1;
+        gg_v4i b_frag;
+
+        __builtin_memcpy(&b_frag, b_row + (long long)w * 512 + lane * 16, 16);
+        __builtin_memcpy(&a0, s0 + lane * 8, 8);
+        __builtin_memcpy(&sidx0, s0 + 256, 4);
+        __builtin_memcpy(&a1, s1 + lane * 8, 8);
+        __builtin_memcpy(&sidx1, s1 + 256, 4);
+
+        c0 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a0, b_frag, c0, sidx0);
+        if (valid_n1) {
+            c1 = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a1, b_frag, c1, sidx1);
+        }
+    }
+
+    float cacc0[8], cacc1[8];
+    __builtin_memcpy(cacc0, &c0, 32);
+    __builtin_memcpy(cacc1, &c1, 32);
+
+    const int m = tileM * 16 + lmod;
+    if (m < M) {
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const int n0 = tileN0 * 16 + half * 8 + s;
+            if (n0 < N)
+                Y[(long long)m * N + n0] = cacc0[s];
+        }
+        if (valid_n1) {
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                const int n1 = tileN1 * 16 + half * 8 + s;
+                if (n1 < N)
+                    Y[(long long)m * N + n1] = cacc1[s];
+            }
+        }
+    }
+}
+
 #endif // __gfx1200__ || __gfx1201__
 "#;
 

@@ -2,7 +2,7 @@
 
 #![cfg(feature = "cubecl")]
 
-use cubecl::hip::{AmdDevice, HipRuntime};
+use grim_cl_hip::{AmdDevice, HipRuntime};
 use cubecl::prelude::*;
 use grim_hip_sys::{hipDeviceProp_tR0600, hipGetDevicePropertiesR0600};
 use std::sync::OnceLock;

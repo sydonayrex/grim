@@ -473,6 +473,24 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // res0-T2 SPARSITY LEVER: opt-in k-group skip (GRIM_KGROUP_SKIP_TAU,
+        // e.g. 0.10) routes every production caller through the skip variant.
+        // Off by default — the skip kernel trades exact dense output for
+        // weight-byte skipping; accuracy is gated by oracle closeness + PPL,
+        // not byte-identity (tests/q80_dot4_kgroup_skip.rs,
+        // docs/benchmarks.md sec 15).
+        static SKIP_TAU: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let skip_tau = *SKIP_TAU.get_or_init(|| {
+            std::env::var("GRIM_KGROUP_SKIP_TAU")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|t: &f32| *t > 0.0)
+        });
+        if let Some(t) = skip_tau {
+            return self.launch_dot4_q80_f32act_gemv_skip(
+                act_f32, b_storage, out_storage, m, n, k, t,
+            );
+        }
         static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v2 = *V2.get_or_init(|| {
             !matches!(
@@ -811,10 +829,38 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static V11_COOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v11 = *V11_COOP.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_FOREST_V11_COOP").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         if m == 1 {
+            let kernel_name = if v11 {
+                "grim_dot4_forest_gemv_v11_coop"
+            } else {
+                "grim_dot4_forest_gemv_v10"
+            };
             self.launch_dot4_forest_gemv_v10_named(
-                "grim_dot4_forest_gemv_v10",
+                kernel_name,
                 1,
+                act_f32,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            )
+        } else if m <= 2 {
+            let kernel_name = if v11 {
+                "grim_dot4_forest_gemv_rows_r2_v11_coop"
+            } else {
+                "grim_dot4_forest_gemv_rows_r2_v10"
+            };
+            self.launch_dot4_forest_gemv_v10_named(
+                kernel_name,
+                2,
                 act_f32,
                 b_storage,
                 out_storage,
@@ -834,6 +880,72 @@ impl RocmDevice {
                 k,
             )
         }
+    }
+
+    /// ForestRaven Variant A: 4-wave cooperative quantization + 128-bit uint4 B vector loads.
+    pub fn launch_dot4_forest_gemv_v11_coop_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_forest_gemv_v10_named(
+            "grim_dot4_forest_gemv_v11_coop",
+            1,
+            act_f32,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// ForestRaven Variant B: 2-row weight reuse for dual decode (M=2).
+    pub fn launch_dot4_forest_gemv_rows_r2_v10_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_forest_gemv_v10_named(
+            "grim_dot4_forest_gemv_rows_r2_v10",
+            2,
+            act_f32,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
+    }
+
+    /// ForestRaven Variant A+B (Combined): 2-row weight reuse (M=2) + 128-bit uint4 vector loads + cooperative LDS.
+    pub fn launch_dot4_forest_gemv_rows_r2_v11_coop_for_ab(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_forest_gemv_v10_named(
+            "grim_dot4_forest_gemv_rows_r2_v11_coop",
+            2,
+            act_f32,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+        )
     }
 
     fn launch_dot4_forest_gemv_v10_named(
@@ -1889,6 +2001,8 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("dot4_fp8_gemv: out has no device ptr".into()))?;
         let (kernel_name, rows_per_block) = if m == 1 {
             ("grim_dot4_fp8_gemv_v10", 1usize)
+        } else if m <= 2 {
+            ("grim_dot4_fp8_gemv_rows_r2_v10", 2usize)
         } else {
             ("grim_dot4_fp8_gemv_rows_r8_v10", 8usize)
         };
@@ -1908,6 +2022,60 @@ impl RocmDevice {
             &mut [
                 arg(&mut aptr),
                 arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Fused Gate-Up + SwiGLU FP8 kernel launch.
+    pub fn launch_dot4_fp8_gate_up_silu_v10_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        gate_w_storage: &RocmStorage,
+        up_w_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 || k == 0 {
+            return Err(Error::Backend(format!(
+                "dot4_fp8_gate_up: K must be a nonzero multiple of 32, got k={k}"
+            )));
+        }
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gate_up: a has no device ptr".into()))?;
+        let gw_ptr = gate_w_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gate_up: gate_w has no device ptr".into()))?;
+        let uw_ptr = up_w_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gate_up: up_w has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gate_up: out has no device ptr".into()))?;
+
+        let grid_x = n.div_ceil(16) as u32;
+        let grid_y = m as u32;
+        let mut aptr = a_ptr;
+        let mut gwptr = gw_ptr;
+        let mut uwptr = uw_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_fp8_gate_up_silu_v10",
+            HipDim3::new(grid_x, grid_y, 1),
+            HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut aptr),
+                arg(&mut gwptr),
+                arg(&mut uwptr),
                 arg(&mut optr),
                 arg(&mut mm),
                 arg(&mut nn),
@@ -3760,6 +3928,13 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static TILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tile = *TILE.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_FP32_MM_TILE").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
         static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v2 = *V2.get_or_init(|| {
             !matches!(
@@ -3767,6 +3942,14 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
+
+        // 2D MM-Tile with 256-thread CTA + float4 vectorization when K is divisible by 4
+        if tile && k % 4 == 0 {
+            if let Some(act_rocm) = act.as_any().downcast_ref::<RocmStorage>() {
+                return self.launch_fp32_mm_tile_for_ab(act_rocm, weight, out, m, n, k);
+            }
+        }
+
         self.launch_fp32_gemv_named(
             if v2 {
                 "grim_fp32_gemv_v2"
@@ -3804,6 +3987,157 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
         self.launch_fp32_gemv_named("grim_fp32_gemv_v2", act, weight, out, m, n, k)
+    }
+
+    /// 2D CTA-tiled MM / GEMV variant based on Charon/Scythe architectural lessons.
+    pub fn launch_fp32_mm_tile_for_ab(
+        &self,
+        act: &RocmStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("fp32_mm_tile: act has no device ptr".into()))?;
+        let w_ptr = weight
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_mm_tile: weight has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_mm_tile: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut wptr = w_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fp32_mm_tile",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Step 1: Launch Split-K + Cooperative LDS Activation Caching FP32 MM-tile.
+    pub fn launch_fp32_mm_splitk_lds_for_ab(
+        &self,
+        act: &RocmStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        split_k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("fp32_mm_splitk_lds: act has no device ptr".into()))?;
+        let w_ptr = weight
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_mm_splitk_lds: weight has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_mm_splitk_lds: out has no device ptr".into()))?;
+
+        if split_k > 1 {
+            crate::check_hip("fp32_mm_splitk hipMemset(output, 0)", unsafe {
+                crate::device::handles::hipMemsetAsync(
+                    out_ptr as *mut c_void,
+                    0,
+                    out.bytes(),
+                    self.active_stream(),
+                )
+            })?;
+        }
+
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_dim = HipDim3::new(grid_x, m as u32, split_k as u32);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut wptr = w_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut sk = split_k as i32;
+        self.launch_compute_kernel(
+            "grim_fp32_mm_splitk_lds",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sk),
+            ],
+        )
+    }
+
+    /// Step 2: Fused Gate-Up GEMV + SwiGLU in-register epilogue launch.
+    pub fn launch_fp32_gate_up_silu_mm_tile_for_ab(
+        &self,
+        act: &RocmStorage,
+        gate_w: &RocmStorage,
+        up_w: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("fp32_gate_up: act has no device ptr".into()))?;
+        let gw_ptr = gate_w
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_gate_up: gate_w has no device ptr".into()))?;
+        let uw_ptr = up_w
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_gate_up: up_w has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_gate_up: out has no device ptr".into()))?;
+
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut gwptr = gw_ptr;
+        let mut uwptr = uw_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fp32_gate_up_silu_mm_tile",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut gwptr),
+                arg(&mut uwptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     fn launch_fp32_gemv_named(
@@ -5259,5 +5593,243 @@ impl RocmDevice {
                 arg(&mut kk),
             ],
         )
+    }
+
+    /// Launch FP16 dot2 GEMV baseline (`grim_dot2_f16_gemv`).
+    pub fn launch_dot2_f16_gemv_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_f16_gemv: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_f16_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_f16_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot2_f16_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch FP16 MM-Tile (`grim_f16_mm_tile`).
+    pub fn launch_f16_mm_tile_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_f16_mm_tile",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch FP16 MM-Tile Prefetch (`grim_f16_mm_tile_prefetch` - Variant 3).
+    pub fn launch_f16_mm_tile_prefetch_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_prefetch: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_prefetch: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_prefetch: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_f16_mm_tile_prefetch",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch FP16 MM-Tile 2-Row (`grim_f16_mm_tile_2row` - Variant 1).
+    pub fn launch_f16_mm_tile_2row_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_2row: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_2row: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_2row: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_y = (m as u32).div_ceil(2);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_f16_mm_tile_2row",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch FP16 MM-Tile 2-Row Prefetch (`grim_f16_mm_tile_2row_prefetch` - Variant 1 + 3).
+    pub fn launch_f16_mm_tile_2row_prefetch_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_2row_prefetch: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_2row_prefetch: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("f16_mm_tile_2row_prefetch: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_y = (m as u32).div_ceil(2);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_f16_mm_tile_2row_prefetch",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Unified FP16 Dispatch:
+    /// - For decode (M <= 2), routes to memory-coalesced + software-pipelined `grim_f16_mm_tile_2row_prefetch`.
+    ///   - M=1: 316.57 us (563.24 GB/s, 1.71x faster than WMMA)
+    ///   - M=2: 313.99 us total / 157.00 us per token (1.71x faster than WMMA)
+    /// - For batched/prefill (M >= 3), routes to Matrix Core `grim_wmma_gemm_b_transposed`.
+    pub fn launch_f16_dispatch_optimal(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if m <= 2 {
+            self.launch_f16_mm_tile_2row_prefetch_for_ab(a_storage, b_storage, out_storage, m, n, k)
+        } else {
+            self.launch_wmma_gemm_b_transposed(a_storage, b_storage, out_storage, m, n, k)
+        }
     }
 }

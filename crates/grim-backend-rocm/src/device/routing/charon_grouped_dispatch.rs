@@ -70,7 +70,7 @@ impl RocmDevice {
 
     /// WI-F3 - grouped dispatch against a caller-selected kernel entry, so `CharonSelector` variants can route to the WMMA grouped kernel (`grim_moe_fused_grouped_wmma`) or the scalar grouped kernel via `kernels::charon::grouped_dispatch_entry`.
     /// Same host/sort contract.
-    pub(crate) fn launch_charon_grouped_dispatch_entry(
+    pub fn launch_charon_grouped_dispatch_entry(
         &self,
         activations: &RocmStorage,
         expert_gate_w_ptr: u64,

@@ -46,56 +46,123 @@ extern "C" __global__ void grim_moe_fused_grouped_wmma(
         // Per-thread scratch: act[j] for j ∈ [0, inter).
         // Each thread computes the full act vector for its token so the down contraction is.
 
-        // Down contraction: out[h] = sum_j down_w[h*inter + j] * act[j].
-        // h ∈ [0, hidden), j ∈ [0, inter).
-        for (int h = 0; h < hidden; ++h) {
-            float acc = 0.0f;
-            for (int j = 0; j < inter; ++j) {
-                // WMMA-accelerated gate/up contractions over [0, hidden).
-                // gate_w[j, :] · a → h_gate[j] up_w[j, :] · a → h_up[j] Each contraction is.
+        // Stage 1: Compute all intermediate activated projections act[j] = rsf * SiLU(gate) * up.
+        // Stored in dynamic/auto array sized up to 4096 (standard max inter).
+        // For inter <= 4096, this avoids 262k global atomicAdd collisions.
+        float act_local[4096];
+        int j = 0;
+        for (; j + 3 < inter && j + 3 < 4096; j += 4) {
+            float h_gate0 = 0.0f, h_gate1 = 0.0f, h_gate2 = 0.0f, h_gate3 = 0.0f;
+            float h_up0 = 0.0f, h_up1 = 0.0f, h_up2 = 0.0f, h_up3 = 0.0f;
+
+            if (hidden >= 16) {
+                fragment<matrix_a, 16, 16, 16, float, row_major> frag_w;
+                fragment<matrix_b, 16, 16, 16, float, col_major> frag_x;
+                fragment<accumulator, 16, 16, 16, float> acc_g0, acc_g1, acc_g2, acc_g3;
+                fragment<accumulator, 16, 16, 16, float> acc_u0, acc_u1, acc_u2, acc_u3;
+
+                fill_fragment(acc_g0, 0.0f); fill_fragment(acc_g1, 0.0f);
+                fill_fragment(acc_g2, 0.0f); fill_fragment(acc_g3, 0.0f);
+                fill_fragment(acc_u0, 0.0f); fill_fragment(acc_u1, 0.0f);
+                fill_fragment(acc_u2, 0.0f); fill_fragment(acc_u3, 0.0f);
+
+                for (int i = 0; i < hidden; i += 16) {
+                    const float* a_tile = a + i;
+                    load_matrix_sync(frag_x, a_tile, 1);
+
+                    load_matrix_sync(frag_w, gw + (unsigned long long)(j + 0) * hidden + i, hidden);
+                    mma_sync(acc_g0, frag_w, frag_x, acc_g0);
+                    load_matrix_sync(frag_w, gw + (unsigned long long)(j + 1) * hidden + i, hidden);
+                    mma_sync(acc_g1, frag_w, frag_x, acc_g1);
+                    load_matrix_sync(frag_w, gw + (unsigned long long)(j + 2) * hidden + i, hidden);
+                    mma_sync(acc_g2, frag_w, frag_x, acc_g2);
+                    load_matrix_sync(frag_w, gw + (unsigned long long)(j + 3) * hidden + i, hidden);
+                    mma_sync(acc_g3, frag_w, frag_x, acc_g3);
+
+                    load_matrix_sync(frag_w, uw + (unsigned long long)(j + 0) * hidden + i, hidden);
+                    mma_sync(acc_u0, frag_w, frag_x, acc_u0);
+                    load_matrix_sync(frag_w, uw + (unsigned long long)(j + 1) * hidden + i, hidden);
+                    mma_sync(acc_u1, frag_w, frag_x, acc_u1);
+                    load_matrix_sync(frag_w, uw + (unsigned long long)(j + 2) * hidden + i, hidden);
+                    mma_sync(acc_u2, frag_w, frag_x, acc_u2);
+                    load_matrix_sync(frag_w, uw + (unsigned long long)(j + 3) * hidden + i, hidden);
+                    mma_sync(acc_u3, frag_w, frag_x, acc_u3);
+                }
+                h_gate0 = acc_g0.x[0]; h_gate1 = acc_g1.x[0];
+                h_gate2 = acc_g2.x[0]; h_gate3 = acc_g3.x[0];
+                h_up0 = acc_u0.x[0];   h_up1 = acc_u1.x[0];
+                h_up2 = acc_u2.x[0];   h_up3 = acc_u3.x[0];
+            } else {
+                for (int i = 0; i < hidden; ++i) {
+                    float a_val = a[i];
+                    h_gate0 += gw[(unsigned long long)(j + 0) * hidden + i] * a_val;
+                    h_gate1 += gw[(unsigned long long)(j + 1) * hidden + i] * a_val;
+                    h_gate2 += gw[(unsigned long long)(j + 2) * hidden + i] * a_val;
+                    h_gate3 += gw[(unsigned long long)(j + 3) * hidden + i] * a_val;
+                    h_up0   += uw[(unsigned long long)(j + 0) * hidden + i] * a_val;
+                    h_up1   += uw[(unsigned long long)(j + 1) * hidden + i] * a_val;
+                    h_up2   += uw[(unsigned long long)(j + 2) * hidden + i] * a_val;
+                    h_up3   += uw[(unsigned long long)(j + 3) * hidden + i] * a_val;
+                }
+            }
+
+            act_local[j + 0] = rsf * (h_gate0 / (1.0f + expf(-h_gate0))) * h_up0;
+            act_local[j + 1] = rsf * (h_gate1 / (1.0f + expf(-h_gate1))) * h_up1;
+            act_local[j + 2] = rsf * (h_gate2 / (1.0f + expf(-h_gate2))) * h_up2;
+            act_local[j + 3] = rsf * (h_gate3 / (1.0f + expf(-h_gate3))) * h_up3;
+        }
+
+        for (; j < inter && j < 4096; ++j) {
+            float h_gate = 0.0f;
+            float h_up = 0.0f;
+            if (hidden >= 16) {
                 fragment<matrix_a, 16, 16, 16, float, row_major> frag_w;
                 fragment<matrix_b, 16, 16, 16, float, col_major> frag_x;
                 fragment<accumulator, 16, 16, 16, float> frag_acc;
 
-                // SPEED-ROC-13: rocWMMA tiles are 16x16x16. For hidden >= 16
-                // (all real models) the tiled path is correct and fast; for
-                // hidden < 16 the 16-wide fragment loads would read out of
-                // bounds, so fall back to a scalar dot product.
-                float h_gate = 0.0f;
-                float h_up = 0.0f;
-                if (hidden >= 16) {
-                    fill_fragment(frag_acc, 0.0f);
-                    for (int i = 0; i < hidden; i += 16) {
-                        const float* w_tile = gw + (unsigned long long)j * hidden + i;
-                        const float* a_tile = a + i;
-                        load_matrix_sync(frag_w, w_tile, hidden);
-                        load_matrix_sync(frag_x, a_tile, 1);
-                        mma_sync(frag_acc, frag_w, frag_x, frag_acc);
-                    }
-                    h_gate = frag_acc.x[0];
-
-                    fill_fragment(frag_acc, 0.0f);
-                    for (int i = 0; i < hidden; i += 16) {
-                        const float* w_tile = uw + (unsigned long long)j * hidden + i;
-                        const float* a_tile = a + i;
-                        load_matrix_sync(frag_w, w_tile, hidden);
-                        load_matrix_sync(frag_x, a_tile, 1);
-                        mma_sync(frag_acc, frag_w, frag_x, frag_acc);
-                    }
-                    h_up = frag_acc.x[0];
-                } else {
-                    for (int i = 0; i < hidden; ++i) {
-                        h_gate += gw[(unsigned long long)j * hidden + i] * a[i];
-                        h_up   += uw[(unsigned long long)j * hidden + i] * a[i];
-                    }
+                fill_fragment(frag_acc, 0.0f);
+                for (int i = 0; i < hidden; i += 16) {
+                    load_matrix_sync(frag_x, a + i, 1);
+                    load_matrix_sync(frag_w, gw + (unsigned long long)j * hidden + i, hidden);
+                    mma_sync(frag_acc, frag_w, frag_x, frag_acc);
                 }
+                h_gate = frag_acc.x[0];
 
-                float silu_g = h_gate / (1.0f + expf(-h_gate));
-                float act = silu_g * h_up;
-                acc += dw[(unsigned long long)h * inter + j] * act;
+                fill_fragment(frag_acc, 0.0f);
+                for (int i = 0; i < hidden; i += 16) {
+                    load_matrix_sync(frag_x, a + i, 1);
+                    load_matrix_sync(frag_w, uw + (unsigned long long)j * hidden + i, hidden);
+                    mma_sync(frag_acc, frag_w, frag_x, frag_acc);
+                }
+                h_up = frag_acc.x[0];
+            } else {
+                for (int i = 0; i < hidden; ++i) {
+                    h_gate += gw[(unsigned long long)j * hidden + i] * a[i];
+                    h_up   += uw[(unsigned long long)j * hidden + i] * a[i];
+                }
             }
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, rsf * acc);
+
+            float silu_g = h_gate / (1.0f + expf(-h_gate));
+            act_local[j] = rsf * silu_g * h_up;
+        }
+
+        // Stage 2: Down contraction. Accumulate per output dimension h in registers,
+        // issuing exactly ONE atomicAdd per output element instead of 262,144 global atomics.
+        const int valid_inter = inter < 4096 ? inter : 4096;
+        for (int h = 0; h < hidden; ++h) {
+            float acc_h = 0.0f;
+            const float* dw_row = dw + (unsigned long long)h * inter;
+            int jj = 0;
+            for (; jj + 3 < valid_inter; jj += 4) {
+                acc_h += dw_row[jj + 0] * act_local[jj + 0] +
+                         dw_row[jj + 1] * act_local[jj + 1] +
+                         dw_row[jj + 2] * act_local[jj + 2] +
+                         dw_row[jj + 3] * act_local[jj + 3];
+            }
+            for (; jj < valid_inter; ++jj) {
+                acc_h += dw_row[jj] * act_local[jj];
+            }
+            atomicAdd(out + (unsigned long long)tok * hidden + h, acc_h);
         }
     }
 }
@@ -126,23 +193,23 @@ extern "C" __global__ void grim_moe_fused_grouped_wmma(
         const float* gw = expert_gate_w + (unsigned long long)exp * (unsigned long long)inter * hidden;
         const float* uw = expert_up_w   + (unsigned long long)exp * (unsigned long long)inter * hidden;
         const float* dw = expert_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
-        // Same body as `grim_moe_fused_grouped` (charon.rs:196-211).
-        // Kept inline (not a call) so the symbol resolves without a cross-kernel forward declaration -.
-        for (int h = 0; h < hidden; ++h) {
-            float acc = 0.0f;
-            for (int j = 0; j < inter; ++j) {
-                float g = 0.0f;
-                float u = 0.0f;
-                for (int i = 0; i < hidden; ++i) {
-                    g += gw[j * hidden + i] * a[i];
-                    u += uw[j * hidden + i] * a[i];
-                }
-                float silu_g = g / (1.0f + expf(-g));
-                float act = silu_g * u;
-                acc += dw[h * inter + j] * act;
+        const float rsf = routed_scaling_factor * w;
+
+        for (int j = 0; j < inter; ++j) {
+            float g = 0.0f;
+            float u = 0.0f;
+            for (int i = 0; i < hidden; ++i) {
+                g += gw[j * hidden + i] * a[i];
+                u += uw[j * hidden + i] * a[i];
             }
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * acc);
+            float silu_g = g / (1.0f + expf(-g));
+            float act = silu_g * u;
+            float scale = rsf * act;
+
+            for (int h = 0; h < hidden; ++h) {
+                unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+                atomicAdd(out + out_idx, dw[h * inter + j] * scale);
+            }
         }
     }
 }

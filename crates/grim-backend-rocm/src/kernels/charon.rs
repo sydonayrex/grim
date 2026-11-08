@@ -68,6 +68,321 @@ extern "C" {
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────── grim_moe_fused_dispatch_cta (Variant A).
+    // CTA-parallel: 1 CTA (256 threads) per routed pair, parallelizing gate/up dot products across hidden
+    // and down projection across output columns h.
+    __global__ void grim_moe_fused_dispatch_cta(
+        const float* __restrict__ activations,     // [batch, hidden]
+        const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
+        const float* __restrict__ expert_up_w,     // [num_experts, inter*hidden]
+        const float* __restrict__ expert_down_w,   // [num_experts, hidden*inter]
+        const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+        const unsigned int* __restrict__ router_experts, // [num_pairs]
+        const float* __restrict__ router_weights,        // [num_pairs]
+        float* __restrict__ out,                     // [batch, hidden]
+        int hidden, int inter, int num_pairs,
+        float routed_scaling_factor)
+    {
+        const unsigned int pair = blockIdx.x;
+        if (pair >= (unsigned int)num_pairs) return;
+
+        const unsigned int tok = router_tokens[pair];
+        const unsigned int exp = router_experts[pair];
+        const float w = router_weights[pair];
+
+        const float* a  = activations + (unsigned long long)tok * hidden;
+        const float* gw = expert_gate_w + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* uw = expert_up_w   + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* dw = expert_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
+
+        __shared__ float s_g[256];
+        __shared__ float s_u[256];
+        __shared__ float s_scale;
+
+        for (int j = 0; j < inter; ++j) {
+            float g_lane = 0.0f;
+            float u_lane = 0.0f;
+            for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+                float a_val = a[i];
+                g_lane += gw[(unsigned long long)j * hidden + i] * a_val;
+                u_lane += uw[(unsigned long long)j * hidden + i] * a_val;
+            }
+            s_g[threadIdx.x] = g_lane;
+            s_u[threadIdx.x] = u_lane;
+            __syncthreads();
+
+            // Reduction across threads
+            for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+                if (threadIdx.x < offset) {
+                    s_g[threadIdx.x] += s_g[threadIdx.x + offset];
+                    s_u[threadIdx.x] += s_u[threadIdx.x + offset];
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                float g = s_g[0];
+                float u = s_u[0];
+                float silu_g = g / (1.0f + expf(-g));
+                float act = silu_g * u;
+                s_scale = routed_scaling_factor * w * act;
+            }
+            __syncthreads();
+
+            float scale = s_scale;
+            for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+                unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+                atomicAdd(out + out_idx, dw[(unsigned long long)h * inter + j] * scale);
+            }
+            __syncthreads();
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────── grim_moe_fused_dispatch_ab (Variant A + B).
+    // CTA-parallel (Variant A) + Local Intermediate Buffer & Single Atomic per Output (Variant B).
+    // In Stage 1: Compute and store act[j] into dynamic/static LDS.
+    // In Stage 2: Parallelize across output columns h (each thread processes a subset of h, loops over j locally,
+    // and performs exactly ONE atomicAdd per h).
+    __global__ void grim_moe_fused_dispatch_ab(
+        const float* __restrict__ activations,     // [batch, hidden]
+        const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
+        const float* __restrict__ expert_up_w,     // [num_experts, inter*hidden]
+        const float* __restrict__ expert_down_w,   // [num_experts, hidden*inter]
+        const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+        const unsigned int* __restrict__ router_experts, // [num_pairs]
+        const float* __restrict__ router_weights,        // [num_pairs]
+        float* __restrict__ out,                     // [batch, hidden]
+        int hidden, int inter, int num_pairs,
+        float routed_scaling_factor)
+    {
+        const unsigned int pair = blockIdx.x;
+        if (pair >= (unsigned int)num_pairs) return;
+
+        const unsigned int tok = router_tokens[pair];
+        const unsigned int exp = router_experts[pair];
+        const float w = router_weights[pair];
+
+        const float* a  = activations + (unsigned long long)tok * hidden;
+        const float* gw = expert_gate_w + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* uw = expert_up_w   + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* dw = expert_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
+
+        // Shared memory for intermediate activation vector: act_local[j] = routed_scaling_factor * w * silu(g) * u
+        // Max intermediate dimension dynamically sized in launch (or up to 4096 elements = 16KB).
+        extern __shared__ float s_mem[];
+        float* s_act = s_mem; // [inter]
+        float* s_red = s_mem + inter; // [256] reduction scratch
+
+        // Stage 1: Gate + Up GEMV -> act_local[j]
+        for (int j = 0; j < inter; ++j) {
+            float g_lane = 0.0f;
+            float u_lane = 0.0f;
+            for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+                float a_val = a[i];
+                g_lane += gw[(unsigned long long)j * hidden + i] * a_val;
+                u_lane += uw[(unsigned long long)j * hidden + i] * a_val;
+            }
+            s_red[threadIdx.x] = g_lane;
+            s_red[threadIdx.x + blockDim.x] = u_lane;
+            __syncthreads();
+
+            // Reduction across threads
+            for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+                if (threadIdx.x < offset) {
+                    s_red[threadIdx.x] += s_red[threadIdx.x + offset];
+                    s_red[threadIdx.x + blockDim.x] += s_red[threadIdx.x + blockDim.x + offset];
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                float g = s_red[0];
+                float u = s_red[blockDim.x];
+                float silu_g = g / (1.0f + expf(-g));
+                float act = silu_g * u;
+                s_act[j] = routed_scaling_factor * w * act;
+            }
+            __syncthreads();
+        }
+
+        // Stage 2: Down projection with exactly ONE atomic add per output element h
+        for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+            float acc = 0.0f;
+            const float* dw_row = dw + (unsigned long long)h * inter;
+            for (int j = 0; j < inter; ++j) {
+                acc += dw_row[j] * s_act[j];
+            }
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, acc);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────── grim_moe_fused_dispatch_abc (Variant A + B + C).
+    // CTA-parallel (Variant A) + Local Intermediate Buffer (Variant B) + Vectorized float4 memory loads (Variant C).
+    __global__ void grim_moe_fused_dispatch_abc(
+        const float* __restrict__ activations,     // [batch, hidden]
+        const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
+        const float* __restrict__ expert_up_w,     // [num_experts, inter*hidden]
+        const float* __restrict__ expert_down_w,   // [num_experts, hidden*inter]
+        const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+        const unsigned int* __restrict__ router_experts, // [num_pairs]
+        const float* __restrict__ router_weights,        // [num_pairs]
+        float* __restrict__ out,                     // [batch, hidden]
+        int hidden, int inter, int num_pairs,
+        float routed_scaling_factor)
+    {
+        const unsigned int pair = blockIdx.x;
+        if (pair >= (unsigned int)num_pairs) return;
+
+        const unsigned int tok = router_tokens[pair];
+        const unsigned int exp = router_experts[pair];
+        const float w = router_weights[pair];
+
+        const float* a  = activations + (unsigned long long)tok * hidden;
+        const float* gw = expert_gate_w + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* uw = expert_up_w   + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* dw = expert_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
+
+        extern __shared__ float s_mem[];
+        float* s_act = s_mem; // [inter]
+        float* s_red = s_mem + inter; // [256] reduction scratch
+
+        const float4* a_vec = reinterpret_cast<const float4*>(a);
+        const int hidden_vec = hidden / 4;
+
+        // Stage 1: Gate + Up GEMV with float4 vectorized loads -> act_local[j]
+        for (int j = 0; j < inter; ++j) {
+            float g_lane = 0.0f;
+            float u_lane = 0.0f;
+            const float4* gw_vec = reinterpret_cast<const float4*>(gw + (unsigned long long)j * hidden);
+            const float4* uw_vec = reinterpret_cast<const float4*>(uw + (unsigned long long)j * hidden);
+
+            for (int i = threadIdx.x; i < hidden_vec; i += blockDim.x) {
+                float4 a4 = a_vec[i];
+                float4 g4 = gw_vec[i];
+                float4 u4 = uw_vec[i];
+
+                g_lane += g4.x * a4.x + g4.y * a4.y + g4.z * a4.z + g4.w * a4.w;
+                u_lane += u4.x * a4.x + u4.y * a4.y + u4.z * a4.z + u4.w * a4.w;
+            }
+            s_red[threadIdx.x] = g_lane;
+            s_red[threadIdx.x + blockDim.x] = u_lane;
+            __syncthreads();
+
+            // Reduction across threads
+            for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+                if (threadIdx.x < offset) {
+                    s_red[threadIdx.x] += s_red[threadIdx.x + offset];
+                    s_red[threadIdx.x + blockDim.x] += s_red[threadIdx.x + blockDim.x + offset];
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                float g = s_red[0];
+                float u = s_red[blockDim.x];
+                float silu_g = g / (1.0f + expf(-g));
+                float act = silu_g * u;
+                s_act[j] = routed_scaling_factor * w * act;
+            }
+            __syncthreads();
+        }
+
+        const float4* s_act_vec = reinterpret_cast<const float4*>(s_act);
+        const int inter_vec = inter / 4;
+
+        // Stage 2: Down projection with float4 loads along inter dimension
+        for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+            float acc = 0.0f;
+            const float4* dw_row_vec = reinterpret_cast<const float4*>(dw + (unsigned long long)h * inter);
+            for (int j = 0; j < inter_vec; ++j) {
+                float4 d4 = dw_row_vec[j];
+                float4 a4 = s_act_vec[j];
+                acc += d4.x * a4.x + d4.y * a4.y + d4.z * a4.z + d4.w * a4.w;
+            }
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, acc);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────── grim_moe_fused_dispatch_normal_ca (Normal + C + A).
+    // CTA-parallel (A) with float4 loads (C), but retaining immediate atomic down projection per j step (Normal style).
+    __global__ void grim_moe_fused_dispatch_normal_ca(
+        const float* __restrict__ activations,     // [batch, hidden]
+        const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
+        const float* __restrict__ expert_up_w,     // [num_experts, inter*hidden]
+        const float* __restrict__ expert_down_w,   // [num_experts, hidden*inter]
+        const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+        const unsigned int* __restrict__ router_experts, // [num_pairs]
+        const float* __restrict__ router_weights,        // [num_pairs]
+        float* __restrict__ out,                     // [batch, hidden]
+        int hidden, int inter, int num_pairs,
+        float routed_scaling_factor)
+    {
+        const unsigned int pair = blockIdx.x;
+        if (pair >= (unsigned int)num_pairs) return;
+
+        const unsigned int tok = router_tokens[pair];
+        const unsigned int exp = router_experts[pair];
+        const float w = router_weights[pair];
+
+        const float* a  = activations + (unsigned long long)tok * hidden;
+        const float* gw = expert_gate_w + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* uw = expert_up_w   + (unsigned long long)exp * (unsigned long long)inter * hidden;
+        const float* dw = expert_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
+
+        const float4* a_vec = reinterpret_cast<const float4*>(a);
+        const int hidden_vec = hidden / 4;
+
+        __shared__ float s_g[256];
+        __shared__ float s_u[256];
+        __shared__ float s_scale;
+
+        for (int j = 0; j < inter; ++j) {
+            float g_lane = 0.0f;
+            float u_lane = 0.0f;
+            const float4* gw_vec = reinterpret_cast<const float4*>(gw + (unsigned long long)j * hidden);
+            const float4* uw_vec = reinterpret_cast<const float4*>(uw + (unsigned long long)j * hidden);
+
+            for (int i = threadIdx.x; i < hidden_vec; i += blockDim.x) {
+                float4 a4 = a_vec[i];
+                float4 g4 = gw_vec[i];
+                float4 u4 = uw_vec[i];
+
+                g_lane += g4.x * a4.x + g4.y * a4.y + g4.z * a4.z + g4.w * a4.w;
+                u_lane += u4.x * a4.x + u4.y * a4.y + u4.z * a4.z + u4.w * a4.w;
+            }
+            s_g[threadIdx.x] = g_lane;
+            s_u[threadIdx.x] = u_lane;
+            __syncthreads();
+
+            // Reduction across threads
+            for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+                if (threadIdx.x < offset) {
+                    s_g[threadIdx.x] += s_g[threadIdx.x + offset];
+                    s_u[threadIdx.x] += s_u[threadIdx.x + offset];
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                float g = s_g[0];
+                float u = s_u[0];
+                float silu_g = g / (1.0f + expf(-g));
+                float act = silu_g * u;
+                s_scale = routed_scaling_factor * w * act;
+            }
+            __syncthreads();
+
+            float scale = s_scale;
+            for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+                unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+                atomicAdd(out + out_idx, dw[(unsigned long long)h * inter + j] * scale);
+            }
+            __syncthreads();
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────────── grim_charon_gmem_bytes - WI-A traffic counter (G-A5).
     // Pure arithmetic: returns the GMEM bytes a fused dispatch would touch for the given shape,.
     __device__ unsigned long long charon_fused_bytes(int hidden, int inter, int num_pairs, int batch) {
@@ -116,38 +431,35 @@ extern "C" {
             const float* uw = expert_up_w   + (unsigned long long)exp * inter * hidden;
             const float* dw = expert_down_w + (unsigned long long)exp * hidden * inter;
 
-            float acc_prev = 0.0f;
             const bool odd_hidden = (hidden & 1) != 0;
-            for (int h = 0; h < hidden; ++h) {
-                float acc = 0.0f;
-                for (int j = 0; j < inter; ++j) {
-                    float g = 0.0f;
-                    float u = 0.0f;
-                    for (int i = 0; i < hidden; ++i) {
-                        g += gw[j * hidden + i] * a[i];
-                        u += uw[j * hidden + i] * a[i];
-                    }
-                    float silu_g = g / (1.0f + expf(-g));
-                    float act = silu_g * u;
-                    // SPEED-ROC-14: stash the gate/up pre-activations for this
-                    // (slot, j) so the backward kernel reads them instead of
-                    // recomputing the full projections. Indexed by sorted slot
-                    // to match the backward's cur_shg = stash_hg + s*inter.
-                    if (stash_hg != nullptr) {
-                        stash_hg[s * inter + j] = g;
-                        stash_hu[s * inter + j] = u;
-                    }
-                    acc += dw[h * inter + j] * act;
+            // Optimized fused gate+up and down projection:
+            // Interleaved O(hidden * inter) computation instead of redundant O(hidden * inter * hidden).
+            for (int j = 0; j < inter; ++j) {
+                float g = 0.0f;
+                float u = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    g += gw[j * hidden + i] * a[i];
+                    u += uw[j * hidden + i] * a[i];
                 }
-                if (odd_hidden) {
-                    atomicAdd(out + (unsigned long long)tok * hidden + h,
-                              routed_scaling_factor * w * acc);
-                } else if (h & 1) {
-                    charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
-                                       routed_scaling_factor * w * acc_prev,
-                                       routed_scaling_factor * w * acc);
-                } else {
-                    acc_prev = acc;
+                float silu_g = g / (1.0f + expf(-g));
+                float act = silu_g * u;
+                if (stash_hg != nullptr) {
+                    stash_hg[s * inter + j] = g;
+                    stash_hu[s * inter + j] = u;
+                }
+                float scale = routed_scaling_factor * w * act;
+
+                float acc_prev = 0.0f;
+                for (int h = 0; h < hidden; ++h) {
+                    float term = dw[h * inter + j] * scale;
+                    if (odd_hidden) {
+                        atomicAdd(out + (unsigned long long)tok * hidden + h, term);
+                    } else if (h & 1) {
+                        charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                           acc_prev, term);
+                    } else {
+                        acc_prev = term;
+                    }
                 }
             }
         }

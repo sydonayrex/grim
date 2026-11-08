@@ -961,6 +961,11 @@ pub(crate) fn is_q80(t: &grim_tensor::Tensor) -> bool {
     )
 }
 
+pub(crate) fn is_f32_native(t: &grim_tensor::Tensor) -> bool {
+    t.dtype().arith == grim_tensor::dtype::ArithType::F32
+        && matches!(t.dtype().storage, grim_tensor::Storage::Native)
+}
+
 pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
     hidden != 0
         && hidden % 32 == 0
@@ -1711,40 +1716,64 @@ impl LlamaBlock {
                         .w_up
                         .as_ref()
                         .ok_or_else(|| grim_core::error::Error::Backend("missing w_up".into()))?;
-                    {
-                        let mut graph_emitter = RocmGraphEmitter {
-                            dev,
-                            emit: None,
-                        };
-                        let _ = grim_graph::emit_linear_dedup(
-                            &mut graph_emitter,
-                            normed_ffn,
-                            wg.weight(),
+
+                    // Fused FP32 Gate-Up + SwiGLU: When weights are native FP32, batch=1, and K % 4 == 0,
+                    // run fused in-register SwiGLU kernel to stream weights simultaneously and save roundtrips.
+                    let n_dim = wg.weight().shape().dim(0).unwrap_or(0);
+                    let use_fp32_fused = batch == 1
+                        && hidden % 4 == 0
+                        && is_f32_native(wg.weight())
+                        && is_f32_native(wu.weight())
+                        && !matches!(
+                            std::env::var("GRIM_FP32_GATE_UP_FUSED").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+
+                    if use_fp32_fused {
+                        let a_rocm = dst_downcast(normed_ffn)?;
+                        let gw_rocm = rocm_storage(wg.weight())?;
+                        let uw_rocm = rocm_storage(wu.weight())?;
+                        let out_rocm = &buffers.activated_buf[layer_idx];
+                        dev.launch_fp32_gate_up_silu_mm_tile_for_ab(
+                            a_rocm, gw_rocm, uw_rocm, out_rocm, batch, n_dim, hidden,
+                        )
+                        .map_err(|e| grim_core::error::Error::Backend(format!("fp32 fused gateup: {e}")))?;
+                    } else {
+                        {
+                            let mut graph_emitter = RocmGraphEmitter {
+                                dev,
+                                emit: None,
+                            };
+                            let _ = grim_graph::emit_linear_dedup(
+                                &mut graph_emitter,
+                                normed_ffn,
+                                wg.weight(),
+                                &buffers.gate_buf[layer_idx],
+                                act,
+                                "ffn.gate",
+                                layer_idx,
+                                grim_graph::QuantFlags::default(),
+                                false,
+                            )?;
+                            let _ = grim_graph::emit_linear_dedup(
+                                &mut graph_emitter,
+                                normed_ffn,
+                                wu.weight(),
+                                &buffers.up_buf[layer_idx],
+                                act,
+                                "ffn.up",
+                                layer_idx,
+                                grim_graph::QuantFlags::default(),
+                                false,
+                            )?;
+                        }
+                        dev.silu_mul_into(
                             &buffers.gate_buf[layer_idx],
-                            act,
-                            "ffn.gate",
-                            layer_idx,
-                            grim_graph::QuantFlags::default(),
-                            false,
-                        )?;
-                        let _ = grim_graph::emit_linear_dedup(
-                            &mut graph_emitter,
-                            normed_ffn,
-                            wu.weight(),
                             &buffers.up_buf[layer_idx],
-                            act,
-                            "ffn.up",
-                            layer_idx,
-                            grim_graph::QuantFlags::default(),
-                            false,
-                        )?;
+                            &buffers.activated_buf[layer_idx],
+                        )
+                        .map_err(grim_core::error::Error::Tensor)?;
                     }
-                    dev.silu_mul_into(
-                        &buffers.gate_buf[layer_idx],
-                        &buffers.up_buf[layer_idx],
-                        &buffers.activated_buf[layer_idx],
-                    )
-                    .map_err(grim_core::error::Error::Tensor)?;
                 }
             }
 

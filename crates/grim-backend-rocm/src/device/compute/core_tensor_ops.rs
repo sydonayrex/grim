@@ -94,10 +94,8 @@ impl CoreTensorOps for RocmDevice {
         b: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // SPEED-FP32-GEMV: For FP32 weights with M=1 (decode) and large N,
-        // use the custom FP32 GEMV kernel instead of rocBLAS. rocBLAS is
-        // pathologically slow at M=1 GEMV due to workspace allocation and
-        // teardown per call. The custom kernel is ~3x faster.
+        // SPEED-FP32-GEMV / SPEED-FP16-GEMV: For M <= 2 (decode), route to
+        // custom high-throughput memory-coalesced / WMMA kernels instead of rocBLAS.
         let dims = out_shape.dims();
         let m = dims[..dims.len().saturating_sub(1)]
             .iter()
@@ -105,16 +103,18 @@ impl CoreTensorOps for RocmDevice {
             .max(1);
         let n = dims.last().copied().unwrap_or(0);
         let k = a.shape().dims().last().copied().unwrap_or(0);
-        if m == 1 && n >= 2048 {
-            if let (Some(a_s), Some(b_s)) = (
-                a.as_any().downcast_ref::<RocmStorage>(),
-                b.as_any().downcast_ref::<RocmStorage>(),
-            ) {
+
+        if let (Some(a_s), Some(b_s)) = (
+            a.as_any().downcast_ref::<RocmStorage>(),
+            b.as_any().downcast_ref::<RocmStorage>(),
+        ) {
+            if a_s.device_ptr_is_valid() && b_s.device_ptr_is_valid() {
+                // FP32 GEMV bypass for decode M=1
                 let a_is_f32 = a_s.dtype().arith == ArithType::F32
                     && matches!(a_s.dtype().storage, crate::DTypeStorage::Native);
                 let b_is_f32 = b_s.dtype().arith == ArithType::F32
                     && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
-                if a_is_f32 && b_is_f32 && a_s.device_ptr_is_valid() && b_s.device_ptr_is_valid() {
+                if m == 1 && n >= 2048 && a_is_f32 && b_is_f32 {
                     let out_storage = RocmStorage::alloc_gpu(
                         out_shape,
                         grim_tensor::DType {
@@ -125,6 +125,28 @@ impl CoreTensorOps for RocmDevice {
                         self.ordinal,
                     )?;
                     let stream = self.launch_fp32_gemv(a_s, b_s, &out_storage, m, n, k)?;
+                    return Ok((
+                        Box::new(out_storage),
+                        Box::new(RocmHandle::new(Some(stream))),
+                    ));
+                }
+
+                // FP16 Unified optimal dispatch for decode M <= 2 (or batched WMMA)
+                let a_is_f16 = a_s.dtype().arith == ArithType::F16
+                    && matches!(a_s.dtype().storage, crate::DTypeStorage::Native);
+                let b_is_f16 = b_s.dtype().arith == ArithType::F16
+                    && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
+                if m <= 2 && n >= 512 && k % 8 == 0 && a_is_f16 && b_is_f16 {
+                    let out_storage = RocmStorage::alloc_gpu(
+                        out_shape,
+                        grim_tensor::DType {
+                            arith: ArithType::F16,
+                            storage: crate::DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    let stream = self.launch_f16_dispatch_optimal(a_s, b_s, &out_storage, m, n, k)?;
                     return Ok((
                         Box::new(out_storage),
                         Box::new(RocmHandle::new(Some(stream))),
