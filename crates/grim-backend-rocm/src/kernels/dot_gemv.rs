@@ -1773,18 +1773,24 @@ extern "C" __global__ void grim_dot4_q80_f32act_gemv(
         act_f32, B_q80, C, M, N, K, blockIdx.y, blockIdx.x * 4, threadIdx.x);
 }
 
+typedef int __attribute__((aligned(2))) grim_i32_a2;
 // res0-T2 SPARSITY LEVER: activation-dead k-group skip variant of
-// grim_dot4_q80_f32act_gemv. A 32-wide activation block whose max|a| is below
-// tau * row-max contributes negligibly to every output column; the skip
-// variant drops its ENTIRE weight stream (32 codes per column per block), so
-// the skipped fraction of k-blocks is the skipped fraction of weight bytes —
-// the probe (189e047d) measured 70% dead at tau=0.10 on real decode
-// activations. Self-contained: the row max is recomputed here with an
-// order-free bitwise max prepass (no FP reassociation, exact), so no bitmap
-// producer or extra launch is needed. At tau=0 nothing is skipped and the
-// result is bit-identical to the dense kernel — that identity is the parity
-// gate; accuracy at tau>0 is NOT byte-identity territory and is gated on
-// oracle closeness + PPL elsewhere.
+// grim_dot4_q80_f32act_gemv_v2 (the PRODUCTION dense kernel). A 32-wide
+// activation block whose max|a| < tau * row-max contributes negligibly to
+// every output column; the skip variant drops its ENTIRE weight stream, so
+// the skipped block fraction IS the skipped weight-byte fraction (probe
+// 189e047d + sec-15 addendum 2: 65.7% of the 9B's real decode rows at
+// tau=0.10). Self-contained: an order-free bitwise-max row-max prepass.
+//
+// NUMERICS CONTRACT: this is a MIRROR OF V2 — same per-block quantization,
+// same 32-lane shuffle-tree reduction (offsets 16..1), NOT the v1 lane-0
+// recompute. v1 and v2 were believed bit-identical; they are NOT (measured:
+// 1024/1024 outputs differ, max|delta| 11.3 at m=1 n=1024 k=1024), and the
+// first skip variant mirrored v1 — production tau>0 runs diverged from the
+// v2 baseline even at tau=0.005 with ~zero groups skipped, garbling
+// generation. At tau=0 this kernel is bit-identical to v2; that identity is
+// the parity gate (tests/v2_skip_check.rs). Accuracy at tau>0 is NOT
+// byte-identity territory: oracle closeness + PPL gate it.
 extern "C" __global__ void grim_dot4_q80_f32act_gemv_skip(
     const float* __restrict__ act_f32,
     const unsigned char* __restrict__ B_q80,
@@ -1799,18 +1805,12 @@ extern "C" __global__ void grim_dot4_q80_f32act_gemv_skip(
 
     const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
     const float* a_row = act_f32 + (long long)row * K;
-    const unsigned char* b_col[4];
+    const long long col_stride = (long long)n_q_blocks * GRIM_Q8_0_BYTES;
+    const unsigned char* b0 = B_q80 + (long long)col_base * col_stride;
     const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        b_col[j] = (j < active_cols)
-                 ? B_q80 + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
-                 : nullptr;
-    }
 
-    // Prepass: per-lane max over its strided blocks, then a bitwise max
-    // reduction across the wave. Max is exact under any association, so this
-    // cannot perturb the dense result.
+    // Prepass: per-lane max over its strided blocks, then bitwise max across
+    // the wave. Max is exact under any association.
     float row_max = 0.0f;
     for (int blk = lane; blk < n_q_blocks; blk += 32) {
         const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
@@ -1841,7 +1841,7 @@ extern "C" __global__ void grim_dot4_q80_f32act_gemv_skip(
         const float d     = amax / 127.0f;
         const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
         _Float16 hd = (_Float16)d;
-        float d_a = (float)hd;
+        const float d_a = (float)hd;
 
         int a4_reg[8];
         #pragma unroll
@@ -1856,81 +1856,55 @@ extern "C" __global__ void grim_dot4_q80_f32act_gemv_skip(
                         ((int)((unsigned char)q3) << 24);
         }
 
+        unsigned short db_v[4];
+        int b_v[4][8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_blk = b0 + j * col_stride + (long long)blk * GRIM_Q8_0_BYTES;
+                db_v[j] = ((const unsigned short*)b_blk)[0];
+                const grim_i32_a2* bw = (const grim_i32_a2*)(b_blk + 2);
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    b_v[j][p] = bw[p];
+                }
+            } else {
+                db_v[j] = 0u;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    b_v[j][p] = 0;
+                }
+            }
+        }
+
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j >= active_cols) break;
-            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
-            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
-            const signed char* b_codes = (const signed char*)(b_blk + 2);
-
+            float d_b = fp16_to_float_device(db_v[j]);
             int iacc = 0;
             #pragma unroll
             for (int p = 0; p < 8; p++) {
-                int b4;
-                __builtin_memcpy(&b4, b_codes + p * 4, 4);
-                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+                iacc = grim_sdot4(a4_reg[p], b_v[j][p], iacc);
             }
             facc[j] += d_a * (d_b * (float)iacc);
         }
     }
 
-    // Lane 0 sequential recompute (same accumulation order as the dense
-    // kernel) restricted to live blocks — identical results when no block is
-    // skipped.
+    // SAME 32-lane shuffle-tree reduction as v2 (offsets 16..1).
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
     if (lane == 0) {
-        for (int blk = 0; blk < n_q_blocks; blk++) {
-            const float* blk_src = act_f32 + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
-
-            float amax = 0.0f;
-            #pragma unroll
-            for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
-                amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
-            }
-            if (amax < thresh) continue;
-
-            const float d     = amax / 127.0f;
-            const float inv_d = (amax > 1e-9f) ? (1.0f / d) : 0.0f;
-            _Float16 hd = (_Float16)d;
-            float d_a = (float)hd;
-
-            int a4_reg[8];
-            #pragma unroll
-            for (int p = 0; p < 8; p++) {
-                signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
-                signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
-                signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
-                signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
-                a4_reg[p] = (int)((unsigned char)q0) |
-                            ((int)((unsigned char)q1) << 8) |
-                            ((int)((unsigned char)q2) << 16) |
-                            ((int)((unsigned char)q3) << 24);
-            }
-
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                if (j >= active_cols) break;
-                const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
-                float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
-                const signed char* b_codes = (const signed char*)(b_blk + 2);
-                int iacc = 0;
-                #pragma unroll
-                for (int p = 0; p < 8; p++) {
-                    int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
-                    iacc = grim_sdot4(a4_reg[p], b4, iacc);
-                }
-                facc[j] += d_a * (d_b * (float)iacc);
-            }
-        }
         for (int j = 0; j < active_cols; j++) {
             C[(long long)row * N + col_base + j] = facc[j];
         }
     }
 }
 
-// Step 2.2 (#1 + #2): Q8_0 × f32-activation GEMV v2 with 4-column load
-// batching (`d_b` + 2-byte-aligned 32-bit `b_codes` words loaded across all
-// 4 columns before the `grim_sdot4` loop). 100% bit-identical to `grim_dot4_q80_f32act_gemv`.
-typedef int __attribute__((aligned(2))) grim_i32_a2;
 extern "C" __global__ void __launch_bounds__(32) grim_dot4_q80_f32act_gemv_v2(
     const float* __restrict__ act_f32,
     const unsigned char* __restrict__ B_q80,

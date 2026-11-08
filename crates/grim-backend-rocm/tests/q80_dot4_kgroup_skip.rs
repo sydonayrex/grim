@@ -102,7 +102,12 @@ fn run_dense(
     n: usize,
     k: usize,
 ) {
-    dev.launch_dot4_q80_f32act_gemv_v1_for_ab(a, b, out, m, n, k)
+    // PRODUCTION launcher (dispatches v2 by default). The skip kernel is a
+    // v2 mirror — v1's lane-0 recompute is a DIFFERENT reduction order (and
+    // ~6x slower: single-lane second pass). GRIM_KGROUP_SKIP_TAU must be
+    // unset here or this launcher would route to the skip kernel itself.
+    debug_assert!(std::env::var("GRIM_KGROUP_SKIP_TAU").is_err());
+    dev.launch_dot4_q80_f32act_gemv(a, b, out, m, n, k)
         .expect("dense gemv");
 }
 
@@ -255,7 +260,11 @@ fn kgroup_skip_cold_ab_at_27b_shapes() {
     let m = 1usize;
     let shapes = [(17408usize, 5120usize), (5120, 17408)]; // down-proj, gate/up
     for (n, k) in shapes {
-        let copies = 8usize;
+        // 32 copies: the 8-copy rotation fit gfx1201's Infinity Cache (v2
+        // measured 612 GB/s > the 311 GB/s stream ceiling) and hid the
+        // DRAM-bound regime where byte skipping pays. 32 x 22-47 MB is
+        // several hundred MB — decisively past cache.
+        let copies = 32usize;
         let blobs: Vec<Box<dyn grim_tensor::backend::BackendStorage>> = (0..copies)
             .map(|c| upload_bytes(&dev, &weight_blob(n, k, 0xABCD + c as u64), q80ty()))
             .collect();
@@ -270,7 +279,7 @@ fn kgroup_skip_cold_ab_at_27b_shapes() {
             let o_r = as_rocm(out_st.as_ref()).unwrap();
 
             let time = |f: &dyn Fn(&RocmStorage)| -> f64 {
-                for i in 0..4 {
+                for i in 0..8 {
                     f(as_rocm(blobs[i % copies].as_ref()).unwrap());
                 }
                 dev.synchronize();

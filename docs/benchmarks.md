@@ -1883,3 +1883,31 @@ earlier near-zero reading was an LFM2.5-350M small-model artifact. Decode
 skip remains worth ~2.9x on the 9B class per the sec-15 A/B curve, pending
 an accuracy gate ON THE 9B itself (the tau=0.02 LFM2 degradation at ~1.5%
 skipped is still unexplained and keeps the default off).
+
+### Sec 15 addendum 3 — ROOT CAUSE of the tau>0 degradation + corrected perf story (2026-11-08)
+
+**Root cause (found and fixed):** the first skip kernel mirrored **v1**'s
+reduction (lane-0 sequential recompute), but the production dense launcher
+dispatches **v2** (32-lane shuffle-tree). The "100% bit-identical" comment on
+v1-vs-v2 is STALE — measured: 1024/1024 outputs differ, max|delta| 11.3 at
+m=1 n=1024 k=1024. So every tau>0 run replaced v2 summation with v1
+summation: a systematic per-launch divergence even with ZERO groups skipped
+(tau=0.005 still garbled LFM2-350M generation; GRIM_DECODE_GRAPH=0 ruled out
+capture interaction). Fix: the skip kernel is now a faithful V2 MIRROR
+(same per-block quantization, same shuffle-tree reduction); at tau=0 it is
+bit-identical to the production launcher (tests/v2_skip_check.rs: 0/1024
+bit diffs) and all three kgroup gates are green with the production launcher
+as the dense oracle. Gate D re-run 32/32 after the rewrite.
+
+**Corrected perf story (supersedes the sec-15 table):** the original
+1.49-1.93x "speedup" at 50-70% dead was measured against `v1_for_ab` as the
+dense baseline — v1's single-lane second pass makes it ~6x slower than v2 at
+these shapes, so most of that ratio was the reduction-order artifact, not
+byte skipping. Against production v2, skip shows ~1.0x at 50-70% dead and
+1.13x at 90%/0% in this harness — and v2 itself runs at ~600 GB/s effective
+even with a 32-copy rotation, i.e. the harness cannot reach the DRAM-bound
+regime where weight-byte skipping pays. The decisive measurement is the 27B
+production decode wall (GRIM_PHASE_TRACE) dense vs GRIM_KGROUP_SKIP_TAU=0.1
+on a model whose decode rides the q80 arm; until that exists, the skip
+kernel remains default-off and the lever's decode value is UNPROVEN (the
+65.7%-dead structure is real; the wall-clock win is not yet demonstrated).
