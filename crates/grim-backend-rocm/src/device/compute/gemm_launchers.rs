@@ -440,7 +440,7 @@ impl RocmDevice {
     }
 
     /// Enqueues the pre-transposed / column-major B WMMA kernel (fastest path).
-    pub(crate) fn launch_wmma_gemm_b_transposed(
+    pub fn launch_wmma_gemm_b_transposed(
         &self,
         a_storage: &RocmStorage,
         b_col_storage: &RocmStorage,
