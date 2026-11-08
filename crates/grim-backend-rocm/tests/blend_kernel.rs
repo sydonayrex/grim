@@ -7,6 +7,8 @@ fn test_blend_kernel_fuses_rope_and_scatter() {
         num_heads: 4,
         head_dim: 64,
         divergence_token: 8,
+        rotary_dim: 64,
+        interleaved: false,
     };
 
     let total_len = cfg.block_size * cfg.num_heads * cfg.head_dim;

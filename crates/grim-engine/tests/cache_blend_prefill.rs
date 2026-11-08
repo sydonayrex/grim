@@ -55,6 +55,8 @@ fn test_cache_blend_prefill_and_rope_rotation() {
         num_heads: 4,
         head_dim: 16,
         divergence_token: 8,
+        rotary_dim: 16,
+        interleaved: false,
     };
     let total_len = cfg.block_size * cfg.num_heads * cfg.head_dim;
     let k_src = vec![1.5f32; total_len];
@@ -101,6 +103,8 @@ fn test_cache_blend_prefill_and_rope_rotation() {
         num_heads: 4,
         head_dim: 16,
         divergence_token: 0,
+        rotary_dim: 16,
+        interleaved: false,
     };
 
     // 1. Direct rotation from pre-RoPE raw keys to new_pos
