@@ -3473,6 +3473,70 @@ impl RocmDevice {
         )
     }
 
+    /// Launch IQ3_XXS dot4 GEMV with LDS Codebook Preload (`grim_dot4_iq3xxs_q81_gemv_v2_lds`).
+    pub fn launch_dot4_iq3xxs_q81_gemv_v2_lds_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq3xxs_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq3xxs_q81_gemv_v2_lds",
+        )
+    }
+
+    /// Launch IQ3_XXS 8-column Wave Tile (`grim_dot4_iq3xxs_q81_gemv_v3_col8`).
+    pub fn launch_dot4_iq3xxs_q81_gemv_v3_col8_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq3xxs_q81_gemv_v3_col8: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq3xxs_q81_gemv_v3_col8: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq3xxs_q81_gemv_v3_col8: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(8);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_iq3xxs_q81_gemv_v3_col8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Launch IQ3_XXS Dual-Row Weight Reuse dot4 GEMV (`grim_dot4_iq3xxs_q81_gemv_rows_r2`).
     pub fn launch_dot4_iq3xxs_q81_gemv_rows_r2_for_ab(
         &self,
@@ -3529,7 +3593,7 @@ impl RocmDevice {
         if m == 2 {
             self.launch_dot4_iq3xxs_q81_gemv_rows_r2_for_ab(act_q81, b_storage, out_storage, m, n, k)
         } else {
-            self.launch_dot4_iq3xxs_q81_gemv_for_ab(act_q81, b_storage, out_storage, m, n, k)
+            self.launch_dot4_iq3xxs_q81_gemv_v2_lds_for_ab(act_q81, b_storage, out_storage, m, n, k)
         }
     }
 
@@ -3594,6 +3658,70 @@ impl RocmDevice {
             n,
             k,
             "grim_dot4_iq3s_q81_gemv",
+        )
+    }
+
+    /// Launch IQ3_S dot4 GEMV with LDS Codebook Preload (`grim_dot4_iq3s_q81_gemv_v2_lds`).
+    pub fn launch_dot4_iq3s_q81_gemv_v2_lds_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_iq3s_q81_gemv_with(
+            act_q81,
+            b_storage,
+            out_storage,
+            m,
+            n,
+            k,
+            "grim_dot4_iq3s_q81_gemv_v2_lds",
+        )
+    }
+
+    /// Launch IQ3_S 8-column Wave Tile (`grim_dot4_iq3s_q81_gemv_v3_col8`).
+    pub fn launch_dot4_iq3s_q81_gemv_v3_col8_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq3s_q81_gemv_v3_col8: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq3s_q81_gemv_v3_col8: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq3s_q81_gemv_v3_col8: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(8);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_iq3s_q81_gemv_v3_col8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 

@@ -179,17 +179,21 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 #### $M=1$ Single-Token Decode
 | Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: |
-| Fused Stock | Original grouped FP32 dequant | 520.60 $\mu$s | 123.4 GB/s | 1.00x |
-| Fused LDS | LDS cached codebook FP32 dequant | 566.49 $\mu$s | 113.4 GB/s | 0.92x |
-| **Dot4 GEMV [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv` (INT8 hardware dot4 + branchless sign expansion)** | **201.45 $\mu$s** | **318.8 GB/s** | **2.58x** |
+| Fused Stock | Original grouped FP32 dequant | 504.87 $\mu$s | 127.2 GB/s | 1.00x |
+| Fused LDS | LDS cached codebook FP32 dequant | 573.23 $\mu$s | 112.0 GB/s | 0.88x |
+| Dot4 Base | `grim_dot4_iq3xxs_q81_gemv` (INT8 hardware dot4 + constant grid) | 186.12 $\mu$s | 345.1 GB/s | 2.71x |
+| **Dot4 v2_lds [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_v2_lds` (LDS codebook staging)** | **159.71 $\mu$s** | **402.1 GB/s** | **3.16x** |
+| Dot4 v3_col8 | `grim_dot4_iq3xxs_q81_gemv_v3_col8` (8-column wave tile) | 191.08 $\mu$s | 336.1 GB/s | 2.64x |
 
 #### $M=2$ Dual-Token Decode
 | Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| Fused Stock | Original grouped single-row loop | 1647.00 $\mu$s | 823.50 $\mu$s | 78.0 GB/s | 1.00x |
-| Fused LDS | LDS cached single-row loop | 1726.86 $\mu$s | 863.43 $\mu$s | 74.4 GB/s | 0.95x |
-| Dot4 GEMV | Dot4 single-row loop | 361.59 $\mu$s | 180.80 $\mu$s | 355.2 GB/s | 4.55x total |
-| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_rows_r2` (Dual-row weight reuse)** | **220.75 $\mu$s** | **110.38 $\mu$s** | **581.9 GB/s** | **7.46x total (7.46x per-tok)** |
+| Fused Stock | Original grouped single-row loop | 1680.95 $\mu$s | 840.48 $\mu$s | 76.4 GB/s | 1.00x |
+| Fused LDS | LDS cached single-row loop | 1689.42 $\mu$s | 844.71 $\mu$s | 76.0 GB/s | 0.99x |
+| Dot4 Base | Dot4 single-row loop | 346.40 $\mu$s | 173.20 $\mu$s | 370.8 GB/s | 4.85x |
+| Dot4 v2_lds | LDS grid single-row loop | 311.01 $\mu$s | 155.51 $\mu$s | 413.0 GB/s | 5.40x |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 343.81 $\mu$s | 171.91 $\mu$s | 373.6 GB/s | 4.89x |
+| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3xxs_q81_gemv_rows_r2` (Dual-row weight reuse + LDS grid)** | **192.25 $\mu$s** | **96.12 $\mu$s** | **668.1 GB/s** | **8.74x total (8.74x per-tok)** |
 
 ---
 
@@ -200,17 +204,21 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 #### $M=1$ Single-Token Decode
 | Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: |
-| Fused Stock | Original grouped FP32 dequant | 602.43 $\mu$s | 104.7 GB/s | 1.00x |
-| Fused LDS | LDS cached codebook FP32 dequant | 593.23 $\mu$s | 106.3 GB/s | 1.02x |
-| **Dot4 GEMV [LIVE]** | **`grim_dot4_iq3s_q81_gemv` (INT8 hardware dot4 + branchless sign expansion)** | **147.46 $\mu$s** | **427.8 GB/s** | **4.09x** |
+| Fused Stock | Original grouped FP32 dequant | 573.63 $\mu$s | 110.0 GB/s | 1.00x |
+| Fused LDS | LDS cached codebook FP32 dequant | 554.12 $\mu$s | 113.8 GB/s | 1.04x |
+| **Dot4 Base [LIVE]** | **`grim_dot4_iq3s_q81_gemv` (INT8 hardware dot4 + branchless sign expansion)** | **139.81 $\mu$s** | **451.2 GB/s** | **4.10x** |
+| Dot4 v2_lds | `grim_dot4_iq3s_q81_gemv_v2_lds` (LDS codebook staging) | 142.19 $\mu$s | 443.6 GB/s | 4.03x |
+| Dot4 v3_col8 | `grim_dot4_iq3s_q81_gemv_v3_col8` (8-column wave tile) | 145.35 $\mu$s | 434.0 GB/s | 3.95x |
 
 #### $M=2$ Dual-Token Decode
 | Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Stock |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| Fused Stock | Original grouped single-row loop | 1479.83 $\mu$s | 739.92 $\mu$s | 85.3 GB/s | 1.00x |
-| Fused LDS | LDS cached single-row loop | 1191.58 $\mu$s | 595.79 $\mu$s | 105.9 GB/s | 1.24x |
-| Dot4 GEMV | Dot4 single-row loop | 286.96 $\mu$s | 143.48 $\mu$s | 439.6 GB/s | 5.16x total |
-| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3s_q81_gemv_rows_r2` (Dual-row weight reuse)** | **177.71 $\mu$s** | **88.86 $\mu$s** | **709.9 GB/s** | **8.33x total (8.33x per-tok)** |
+| Fused Stock | Original grouped single-row loop | 1465.27 $\mu$s | 732.64 $\mu$s | 86.1 GB/s | 1.00x |
+| Fused LDS | LDS cached single-row loop | 1159.93 $\mu$s | 579.97 $\mu$s | 108.8 GB/s | 1.26x |
+| Dot4 Base | Dot4 single-row loop | 257.78 $\mu$s | 128.89 $\mu$s | 489.4 GB/s | 5.68x |
+| Dot4 v2_lds | LDS grid single-row loop | 259.29 $\mu$s | 129.65 $\mu$s | 486.5 GB/s | 5.65x |
+| Dot4 v3_col8 | 8-column wave tile single-row loop | 256.53 $\mu$s | 128.27 $\mu$s | 491.8 GB/s | 5.71x |
+| **Dot4 rows_r2 [LIVE]** | **`grim_dot4_iq3s_q81_gemv_rows_r2` (Dual-row weight reuse)** | **161.41 $\mu$s** | **80.71 $\mu$s** | **781.6 GB/s** | **9.08x total (9.08x per-tok)** |
 
 ---
 
@@ -225,5 +233,5 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 | **Q6_K** | **100.31 $\mu$s** | **603.2 GB/s** | `grim_dot4_q6k_q81_gemv_sub_v2` | **109.76 $\mu$s** | **54.88 $\mu$s** | **1102.5 GB/s** | **1.75x (2.18x per-tok)** |
 | **IQ4_NL** | **92.07 $\mu$s** | **672.7 GB/s** | `grim_dot4_iq4nl_q81_gemv_fast` | **113.66 $\mu$s** | **56.83 $\mu$s** | **1089.8 GB/s** | **2.87x (2.87x per-tok)** |
 | **IQ4_XS** | **87.95 $\mu$s** | **728.4 GB/s** | `grim_dot4_iq4xs_q81_gemv_sub_v8` | **101.58 $\mu$s** | **50.79 $\mu$s** | **1261.3 GB/s** | **3.48x (3.48x per-tok)** |
-| **IQ3_XXS** | **201.45 $\mu$s** | **318.8 GB/s** | `grim_dot4_iq3xxs_q81_gemv` | **220.75 $\mu$s** | **110.38 $\mu$s** | **581.9 GB/s** | **7.46x total vs stock** |
-| **IQ3_S** | **147.46 $\mu$s** | **427.8 GB/s** | `grim_dot4_iq3s_q81_gemv` | **177.71 $\mu$s** | **88.86 $\mu$s** | **709.9 GB/s** | **8.33x total vs stock** |
+| **IQ3_XXS** | **159.71 $\mu$s** | **402.1 GB/s** | `grim_dot4_iq3xxs_q81_gemv_v2_lds` | **192.25 $\mu$s** | **96.12 $\mu$s** | **668.1 GB/s** | **8.74x total vs stock** |
+| **IQ3_S** | **139.81 $\mu$s** | **451.2 GB/s** | `grim_dot4_iq3s_q81_gemv` | **161.41 $\mu$s** | **80.71 $\mu$s** | **781.6 GB/s** | **9.08x total vs stock** |

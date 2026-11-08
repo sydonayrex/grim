@@ -145,15 +145,49 @@ fn test_iq3_parity_and_variants() -> TestResult {
 
             let mut max_diff = 0.0f32;
             let mut sum_diff = 0.0f32;
+            let mut max_rel = 0.0f32;
             for i in 0..m * n_test {
                 let diff = (out_ref[i] - out_dot4[i]).abs();
                 if diff > max_diff {
                     max_diff = diff;
                 }
                 sum_diff += diff;
+                let rel = diff / (out_ref[i].abs().max(1.0));
+                if rel > max_rel {
+                    max_rel = rel;
+                }
             }
             let avg_diff = sum_diff / (m * n_test) as f32;
-            println!("  IQ3_XXS M={m} vs fused stock: max_diff={max_diff:.4}, avg_diff={avg_diff:.6}");
+            println!("  IQ3_XXS M={m} vs fused stock: max_diff={max_diff:.4}, avg_diff={avg_diff:.6}, max_rel={max_rel:.4}");
+
+            // Parity check v2_lds matches base dot4 exactly
+            let out_v2_lds_st = MemoryOps::alloc_storage(
+                &dev,
+                &Shape::new(vec![m * n_test]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: Storage::Native,
+                },
+            )?;
+            dev.launch_dot4_iq3xxs_q81_gemv_v2_lds_for_ab(
+                as_rocm(q81_st.as_ref()).unwrap(),
+                as_rocm(w_st.as_ref()).unwrap(),
+                as_rocm(out_v2_lds_st.as_ref()).unwrap(),
+                m,
+                n_test,
+                k,
+            )?;
+            dev.synchronize();
+            let out_v2_lds = f32_vec(&out_v2_lds_st)?;
+            let mut max_diff_lds = 0.0f32;
+            for i in 0..m * n_test {
+                let diff = (out_dot4[i] - out_v2_lds[i]).abs();
+                if diff > max_diff_lds {
+                    max_diff_lds = diff;
+                }
+            }
+            println!("  IQ3_XXS M={m} v2_lds vs dot4: max_diff={max_diff_lds:.6}");
+            assert!(max_diff_lds < 1e-4, "IQ3_XXS v2_lds matches base dot4");
 
             if m == 2 {
                 let out_r2_st = MemoryOps::alloc_storage(
@@ -275,15 +309,49 @@ fn test_iq3_parity_and_variants() -> TestResult {
 
             let mut max_diff = 0.0f32;
             let mut sum_diff = 0.0f32;
+            let mut max_rel = 0.0f32;
             for i in 0..m * n_test {
                 let diff = (out_ref[i] - out_dot4[i]).abs();
                 if diff > max_diff {
                     max_diff = diff;
                 }
                 sum_diff += diff;
+                let rel = diff / (out_ref[i].abs().max(1.0));
+                if rel > max_rel {
+                    max_rel = rel;
+                }
             }
             let avg_diff = sum_diff / (m * n_test) as f32;
-            println!("  IQ3_S M={m} vs fused stock: max_diff={max_diff:.4}, avg_diff={avg_diff:.6}");
+            println!("  IQ3_S M={m} vs fused stock: max_diff={max_diff:.4}, avg_diff={avg_diff:.6}, max_rel={max_rel:.4}");
+
+            // Parity check v2_lds matches base dot4 exactly
+            let out_v2_lds_st = MemoryOps::alloc_storage(
+                &dev,
+                &Shape::new(vec![m * n_test]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: Storage::Native,
+                },
+            )?;
+            dev.launch_dot4_iq3s_q81_gemv_v2_lds_for_ab(
+                as_rocm(q81_st.as_ref()).unwrap(),
+                as_rocm(w_st.as_ref()).unwrap(),
+                as_rocm(out_v2_lds_st.as_ref()).unwrap(),
+                m,
+                n_test,
+                k,
+            )?;
+            dev.synchronize();
+            let out_v2_lds = f32_vec(&out_v2_lds_st)?;
+            let mut max_diff_lds = 0.0f32;
+            for i in 0..m * n_test {
+                let diff = (out_dot4[i] - out_v2_lds[i]).abs();
+                if diff > max_diff_lds {
+                    max_diff_lds = diff;
+                }
+            }
+            println!("  IQ3_S M={m} v2_lds vs dot4: max_diff={max_diff_lds:.6}");
+            assert!(max_diff_lds < 1e-4, "IQ3_S v2_lds matches base dot4");
 
             if m == 2 {
                 let out_r2_st = MemoryOps::alloc_storage(
@@ -442,12 +510,38 @@ fn bench_iq3_all_variants_60mb() -> TestResult {
             dev.synchronize();
             let dur_dot4 = t2.elapsed().as_secs_f64() * 1e6 / (iters as f64);
 
+            // Timing Dot4 v2_lds
+            for _ in 0..3 {
+                dev.launch_dot4_iq3xxs_q81_gemv_v2_lds_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let t_lds = Instant::now();
+            for _ in 0..iters {
+                dev.launch_dot4_iq3xxs_q81_gemv_v2_lds_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let dur_v2_lds = t_lds.elapsed().as_secs_f64() * 1e6 / (iters as f64);
+
+            // Timing Dot4 v3_col8
+            for _ in 0..3 {
+                dev.launch_dot4_iq3xxs_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let t_col8 = Instant::now();
+            for _ in 0..iters {
+                dev.launch_dot4_iq3xxs_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let dur_v3_col8 = t_col8.elapsed().as_secs_f64() * 1e6 / (iters as f64);
+
             let bw = |dur: f64| (tensor_bytes as f64 * m as f64) / (dur * 1e-6) / 1e9;
 
             println!("\nLatency & Bandwidth for IQ3_XXS M={m}:");
             println!("  Fused Stock:                {dur_stock:6.2} us | eff BW: {:6.1} GB/s", bw(dur_stock));
             println!("  Fused LDS:                  {dur_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_lds), dur_stock / dur_lds);
-            println!("  Dot4 GEMV:                  {dur_dot4:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_dot4), dur_stock / dur_dot4);
+            println!("  Dot4 GEMV (base):           {dur_dot4:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_dot4), dur_stock / dur_dot4);
+            println!("  Dot4 v2_lds (LDS grid):     {dur_v2_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v2_lds), dur_stock / dur_v2_lds);
+            println!("  Dot4 v3_col8 (8-col tile):  {dur_v3_col8:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v3_col8), dur_stock / dur_v3_col8);
 
             if m == 2 {
                 for _ in 0..3 {
@@ -577,12 +671,38 @@ fn bench_iq3_all_variants_60mb() -> TestResult {
             dev.synchronize();
             let dur_dot4 = t2.elapsed().as_secs_f64() * 1e6 / (iters as f64);
 
+            // Timing Dot4 v2_lds
+            for _ in 0..3 {
+                dev.launch_dot4_iq3s_q81_gemv_v2_lds_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let t_lds = Instant::now();
+            for _ in 0..iters {
+                dev.launch_dot4_iq3s_q81_gemv_v2_lds_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let dur_v2_lds = t_lds.elapsed().as_secs_f64() * 1e6 / (iters as f64);
+
+            // Timing Dot4 v3_col8
+            for _ in 0..3 {
+                dev.launch_dot4_iq3s_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let t_col8 = Instant::now();
+            for _ in 0..iters {
+                dev.launch_dot4_iq3s_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
+            }
+            dev.synchronize();
+            let dur_v3_col8 = t_col8.elapsed().as_secs_f64() * 1e6 / (iters as f64);
+
             let bw = |dur: f64| (tensor_bytes as f64 * m as f64) / (dur * 1e-6) / 1e9;
 
             println!("\nLatency & Bandwidth for IQ3_S M={m}:");
             println!("  Fused Stock:                {dur_stock:6.2} us | eff BW: {:6.1} GB/s", bw(dur_stock));
             println!("  Fused LDS:                  {dur_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_lds), dur_stock / dur_lds);
-            println!("  Dot4 GEMV:                  {dur_dot4:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_dot4), dur_stock / dur_dot4);
+            println!("  Dot4 GEMV (base):           {dur_dot4:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_dot4), dur_stock / dur_dot4);
+            println!("  Dot4 v2_lds (LDS grid):     {dur_v2_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v2_lds), dur_stock / dur_v2_lds);
+            println!("  Dot4 v3_col8 (8-col tile):  {dur_v3_col8:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v3_col8), dur_stock / dur_v3_col8);
 
             if m == 2 {
                 for _ in 0..3 {
