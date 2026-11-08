@@ -230,9 +230,9 @@ pub(crate) fn emit_startup_config_banner(
         std::env::var("GRIM_KV_ARENA")
             .ok()
             .as_deref()
-            .unwrap_or("int4"),
+            .unwrap_or("q8_1"),
     )
-    .unwrap_or(grim_backend_rocm::KvArenaFormat::Int4);
+    .unwrap_or(grim_backend_rocm::KvArenaFormat::Q8_1);
     let kv_cap: usize = std::env::var("GRIM_KV_CACHE_LEN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1419,21 +1419,16 @@ pub async fn cmd_run(
 
         // Format selection if not explicitly set:
         if std::env::var("GRIM_KV_ARENA").is_err() {
-            // F16: 2 bytes/elem = 32,768 bytes/row
-            let f16_row_bytes = elems_per_token_row * 2;
+            // Q8_1 Dot4: 36 bytes per 32 elems (1.125 B/elem, no scale sidecar) = 18,432 bytes/row
+            let q81_row_bytes = (elems_per_token_row * 36) / 32;
             // INT8: 1 byte/elem + scale sidecars (8 layers * 4 heads * 4 bytes * 2 (K+V) = 256 bytes) = 16,640 bytes/row
             let int8_row_bytes = elems_per_token_row * 1 + (attn_layers_per_card * 4 * 4 * 2);
             // INT4: 0.5 bytes/elem + scale sidecars = 8,448 bytes/row
             let _int4_row_bytes = (elems_per_token_row / 2) + (attn_layers_per_card * 4 * 4 * 2);
 
-            // Task 2.3 ON-FAILURE (2026-11-03): int8's decode-graph replay
-            // serves garbage at real 27B geometry, so the promotion ladder
-            // stays f16-first; int8 is reachable only via an explicit
-            // GRIM_KV_ARENA / GRIM_KV_DTYPE and the capture layer refuses it
-            // into the correct eager path.
             let chosen_format =
-                if (total_budget_needed as u64) * f16_row_bytes <= min_headroom_bytes {
-                    "f16"
+                if (total_budget_needed as u64) * q81_row_bytes <= min_headroom_bytes {
+                    "q8_1"
                 } else if (total_budget_needed as u64) * int8_row_bytes <= min_headroom_bytes {
                     "int8"
                 } else {
@@ -1456,15 +1451,16 @@ pub async fn cmd_run(
                 std::env::var("GRIM_KV_ARENA")
                     .ok()
                     .as_deref()
-                    .unwrap_or("int4"),
+                    .unwrap_or("q8_1"),
             )
-            .unwrap_or(grim_backend_rocm::KvArenaFormat::Int4);
+            .unwrap_or(grim_backend_rocm::KvArenaFormat::Q8_1);
 
             let bytes_per_elem = kv_fmt.bytes_per_elem();
             let sidecar_bytes = match kv_fmt {
-                grim_backend_rocm::KvArenaFormat::F32 | grim_backend_rocm::KvArenaFormat::F16 => {
-                    0u64
-                }
+                grim_backend_rocm::KvArenaFormat::F32
+                | grim_backend_rocm::KvArenaFormat::F16
+                | grim_backend_rocm::KvArenaFormat::Q8_1
+                | grim_backend_rocm::KvArenaFormat::WhiteCrow => 0u64,
                 _ => attn_layers_per_card * 4 * 4 * 2,
             };
             let row_bytes =

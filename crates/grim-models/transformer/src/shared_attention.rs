@@ -706,6 +706,77 @@ pub fn fused_or_scalar_attention_i2v4_arena(
     )
 }
 
+/// SPEED-DOT4: Q8_1 Dot4 attention for device-resident KV arena.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_q81_arena_device(
+    q_st: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let ordinal = match device {
+        Device::Rocm(ord) => *ord as usize,
+        _ => 0,
+    };
+    let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = rocm.qkv_attention_q81(
+        q_st,
+        k_arena,
+        v_arena,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+        true,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_q81_arena(
+    q: &[f32],
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_q81_arena_device(
+        q_st.as_ref(),
+        k_arena,
+        v_arena,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
 /// WhiteCrow (u4 group-128) dense-arena attention for a device-resident
 /// query. `k_arena`/`v_arena` hold interleaved 67-byte blocks with the scale
 /// inline, so unlike the i8/i4/i2v4 wrappers there are no scale arguments.

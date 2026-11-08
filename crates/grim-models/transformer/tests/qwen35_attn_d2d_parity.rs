@@ -1756,3 +1756,67 @@ fn qwen35_kv_eviction_churn_3x_cap_matches_last_writer_spec() {
         );
     }
 }
+
+/// SPEED-DOT4: Q8_1 KV decode matches F32 reference.
+#[test]
+fn qwen35_q81_kv_decode_matches_f32() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let run = |format: &str| -> (Vec<Vec<f32>>, bool) {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        let mut outs = Vec::new();
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let out = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            outs.push(out);
+            cache.current_pos += 1;
+        }
+        let engaged = cache
+            .k_device
+            .as_ref()
+            .map(|s| s.as_ref().dtype().arith == grim_tensor::ArithType::U8)
+            .unwrap_or(false);
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        (outs, engaged)
+    };
+
+    let (out32, _) = run("f32");
+    let (out_q81, engaged_q81) = run("q8_1");
+    assert!(
+        engaged_q81,
+        "q8_1 run built no u8 storage: Q8_1 eager path not engaged"
+    );
+    for (step, (a, b)) in out32.iter().zip(out_q81.iter()).enumerate() {
+        assert!(
+            b.iter().all(|x| x.is_finite()),
+            "step {step}: q8_1 decode produced non-finite output"
+        );
+        let (e, at, abs) = worst_scaled(a, b);
+        eprintln!("[q81-parity] step {step}: worst {e:.3e} at {at} (abs {abs:.3e})");
+        assert!(
+            e <= 0.15,
+            "step {step}: q8_1-vs-f32 decode diverges: worst {e:.3e} at {at} (f32 {}, q81 {})",
+            a[at],
+            b[at]
+        );
+    }
+}
+

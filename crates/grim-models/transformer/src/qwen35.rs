@@ -1286,6 +1286,20 @@ impl Qwen35Block {
                     // intercept BEFORE the `_` f32 fallthrough — falling
                     // through would hand the byte-arena to the f32 reader
                     // and silently reinterpret quantized bytes as floats.
+                    _ if format == grim_backend_rocm::KvArenaFormat::Q8_1 => {
+                        crate::shared_attention::fused_or_scalar_attention_q81_arena(
+                            &q_all,
+                            k_dev.as_ref(),
+                            v_dev.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            None,
+                            &device,
+                        )?
+                    }
                     _ if format == grim_backend_rocm::KvArenaFormat::WhiteCrow => {
                         crate::shared_attention::fused_or_scalar_attention_whitecrow_arena(
                             &q_all,
@@ -4343,6 +4357,20 @@ fn attention_layer_d2d(
         // scale lives INSIDE each 67-byte block, so scales are None and this
         // arm must beat the `_` f32 fallthrough or the byte arena would be
         // read as raw floats.
+        _ if format == grim_backend_rocm::KvArenaFormat::Q8_1 => {
+            crate::shared_attention::fused_or_scalar_attention_q81_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?
+        }
         _ if format == grim_backend_rocm::KvArenaFormat::WhiteCrow => {
             crate::shared_attention::fused_or_scalar_attention_whitecrow_arena_device(
                 q_rope.storage().as_ref(),
@@ -5364,30 +5392,19 @@ pub(crate) fn resolve_kv_arena_format_qwen(
             Some(f) => f,
             None => {
                 eprintln!(
-                    "[qwen35] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using the f16 default"
+                    "[qwen35] GRIM_KV_ARENA={v:?} unrecognized; using Q8_1 default"
                 );
-                F::F16
+                F::Q8_1
             }
         },
         None => {
-            // Task 2.3 Step 1, ON-FAILURE posture (2026-11-03): int8 measured
-            // BETTER than f16 on the 27B teacher-forced gate (dNLL -0.031
-            // nats, wall 82.8 vs 85.1 ms) and its EAGER path is correct at
-            // every geometry — but the int8 DECODE-GRAPH replay serves
-            // garbage/early-EOS at real 27B geometry (the tiny-cfg
-            // graph_i8_append_and_attend gate stays green, so the defect is
-            // geometry- or seeding-dependent). Per the plan: f16 stays the
-            // DEFAULT; int8 is opt-in via `GRIM_KV_DTYPE=int8` (or
-            // `GRIM_KV_ARENA=int8`), and the capture layer refuses int8 so
-            // opt-ins get the correct eager path loudly (see
-            // get_or_create_decode_graph). An explicit off spelling of
-            // `GRIM_F16_KV` still drops to f32 (DISABLED sense, complement
-            // of `parse_f16_kv_env`).
             match kv_dtype {
+                Some(v) if v.eq_ignore_ascii_case("q8_1") || v.eq_ignore_ascii_case("q81") => F::Q8_1,
                 Some(v) if v.eq_ignore_ascii_case("int8") || v.eq_ignore_ascii_case("i8") => F::Int8,
                 Some(v) if v.eq_ignore_ascii_case("f32") => F::F32,
+                Some(v) if v.eq_ignore_ascii_case("f16") => F::F16,
                 _ if grim_backend_rocm::f16_kv_explicitly_disabled(f16_kv) => F::F32,
-                _ => F::F16,
+                _ => F::Q8_1,
             }
         }
     }
@@ -5428,7 +5445,7 @@ pub(crate) fn kv_arena_dtype_for(format: grim_backend_rocm::KvArenaFormat) -> DT
         // WhiteCrow is also byte-addressed: its arena is a sequence of
         // interleaved 67-byte blocks (64 B u4 codes + 2 B bf16 scale + 1 B u8
         // zero per 128 values), so the storage element is a U8 byte.
-        F::Int8 | F::Int4 | F::Int2V4 | F::WhiteCrow => DType {
+        F::Int8 | F::Int4 | F::Int2V4 | F::WhiteCrow | F::Q8_1 => DType {
             arith: ArithType::U8,
             storage: Storage::Native,
         },
@@ -5462,6 +5479,7 @@ pub(crate) fn kv_arena_head_extent(
     use grim_backend_rocm::KvArenaFormat as F;
     match format {
         F::F32 | F::F16 | F::Int8 => head_dim,
+        F::Q8_1 => (head_dim.div_ceil(32)) * 36,
         F::Int4 => head_dim / 2,
         F::Int2V4 => head_dim / 2,
         // WhiteCrow: one 67-byte block per 128 values of the head vector, so a
@@ -5491,6 +5509,7 @@ pub(crate) fn kv_arena_bytes_per_kv_elem(format: grim_backend_rocm::KvArenaForma
         F::F32 => 4.0,
         F::F16 => 2.0,
         F::Int8 => 1.0,
+        F::Q8_1 => 36.0 / 32.0,
         // Key 0.25, value 0.5; the reservation takes the wider side.
         F::Int4 | F::Int2V4 => 0.5,
         // WhiteCrow: the amortized width of its interleaved blocks — 67 bytes
@@ -5511,7 +5530,7 @@ pub(crate) fn kv_arena_row_scale_bytes(
     use grim_backend_rocm::KvArenaFormat as F;
     match format {
         F::Int8 | F::Int4 | F::Int2V4 => nkv * 4 * 2,
-        F::F32 | F::F16 | F::WhiteCrow => 0,
+        F::F32 | F::F16 | F::WhiteCrow | F::Q8_1 => 0,
     }
 }
 
@@ -5540,7 +5559,7 @@ fn kv_arena_scale_dtype(device: &Device) -> Option<DType> {
     use grim_backend_rocm::KvArenaFormat as F;
     match kv_arena_format_qwen(device) {
         F::Int8 | F::Int4 | F::Int2V4 => Some(DType::F32),
-        F::WhiteCrow => None, // inline bf16 scale + u8 zero per 128-value block
+        F::WhiteCrow | F::Q8_1 => None,
         _ => None,
     }
 }
@@ -5648,6 +5667,38 @@ fn arena_append_kv_rows<'a>(
         )
         .map(|_| ())?;
         grim_backend_rocm::launch_kv_quantize_rows_whitecrow(
+            rocm.as_ref(),
+            v_src,
+            src_elem_off,
+            v_dst,
+            dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        return Ok(());
+    }
+    if matches!(format, F::Q8_1) {
+        let ordinal = k_dst.device_ordinal() as usize;
+        let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let num_blocks = head_dim / 32;
+        let row_bytes = nkv * num_blocks * 36;
+        let dst_off = row_off * row_bytes;
+        grim_backend_rocm::launch_kv_quantize_rows_q81(
+            rocm.as_ref(),
+            k_src,
+            src_elem_off,
+            k_dst,
+            dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        grim_backend_rocm::launch_kv_quantize_rows_q81(
             rocm.as_ref(),
             v_src,
             src_elem_off,

@@ -498,10 +498,12 @@ impl MemoryOps for RocmDevice {
             )));
         }
         // GRAVE Phase 1: element size follows the storage dtype — the f16 KV
-        // arena has 2-byte elements; the old f32 hardcode copied 2x the bytes
-        // and D2D-failed (or overread) on f16 arenas.
+        // arena has 2-byte elements; U8 has 1-byte elements; the old f32 hardcode
+        // copied 4x the bytes and D2D-failed (or overread) on U8/f16 arenas.
         let elem_size = match dst.dtype().arith {
+            grim_tensor::ArithType::U8 => 1usize,
             grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => 2usize,
+            grim_tensor::ArithType::I64 => 8usize,
             _ => 4usize,
         };
         let bytes = count * elem_size;

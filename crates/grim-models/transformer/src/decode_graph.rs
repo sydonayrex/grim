@@ -6345,7 +6345,7 @@ impl DecodeGraphModel for Qwen35 {
             let eager_is_i8 = k_rocm.dtype().arith == grim_tensor::ArithType::U8
                 && !matches!(
                     crate::qwen35::kv_arena_format_qwen(&self.device),
-                    grim_backend_rocm::KvArenaFormat::WhiteCrow
+                    grim_backend_rocm::KvArenaFormat::WhiteCrow | grim_backend_rocm::KvArenaFormat::Q8_1
                 );
             let (ksc_ptr, vsc_ptr) = if eager_is_i8 {
                 let ks = cache
