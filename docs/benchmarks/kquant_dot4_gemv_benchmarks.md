@@ -128,6 +128,50 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 
 ---
 
+### 6. IQ4_NL (18 bytes / 32 weights, QK4_NL = 32)
+- **Shape:** $N=10752, K=10240 \implies 60.48$ MB weight tensor.
+- **Test File:** `crates/grim-backend-rocm/tests/iq4nl_variants_bench.rs`
+
+#### $M=1$ Single-Token Decode
+| Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Base |
+| :--- | :--- | :---: | :---: | :---: |
+| Baseline (`grim_dot4_iq4nl_q81_gemv`) | Byte-wide dequant lookups | 184.37 $\mu$s | 335.9 GB/s | 1.00x |
+| **Var 1 (`fast`) [LIVE]** | **Word-wide dequant (`grim_kv4_iq4xs_valu_fast`) + 128-bit loads** | **92.07 $\mu$s** | **672.7 GB/s** | **2.00x** |
+| Var 2 (`prefetch`) | Word-wide dequant + software prefetch | 92.11 $\mu$s | 672.4 GB/s | 2.00x |
+| Var 3 (`col8`) | Word-wide dequant + 8-column wave tile | 99.08 $\mu$s | 625.0 GB/s | 1.86x |
+
+#### $M=2$ Dual-Token Decode
+| Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Base |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| Baseline | Byte-wide single-row loop | 326.26 $\mu$s | 163.13 $\mu$s | 379.6 GB/s | 1.00x |
+| Var 1 (`fast`) | Word-wide single-row loop | 157.51 $\mu$s | 78.76 $\mu$s | 786.4 GB/s | 2.07x |
+| Var 2 (`prefetch`) | Word-wide single-row prefetch | 165.78 $\mu$s | 82.89 $\mu$s | 747.2 GB/s | 1.97x |
+| Var 3 (`col8`) | Word-wide single-row 8-col tile | 161.59 $\mu$s | 80.80 $\mu$s | 766.5 GB/s | 2.02x |
+| **Var 4 (`rows_r2`) [LIVE]** | **Dual-row weight reuse + word-wide dequant** | **113.66 $\mu$s** | **56.83 $\mu$s** | **1089.8 GB/s** | **2.87x total (2.87x per-tok)** |
+
+---
+
+### 7. IQ4_XS (136 bytes / 256 weights)
+- **Shape:** $N=23552, K=5120 \implies 61.09$ MB weight tensor.
+- **Test File:** `crates/grim-backend-rocm/tests/iq4xs_variants_bench.rs`
+
+#### $M=1$ Single-Token Decode
+| Variant | Implementation Details | Latency ($\mu$s) | Eff. GB/s | Speedup vs Base |
+| :--- | :--- | :---: | :---: | :---: |
+| Baseline (`sub_v2`) | Byte-wide nibble decode | 189.14 $\mu$s | 338.7 GB/s | 1.00x |
+| **Var 1 (`sub_v8`) [LIVE]** | **Word-wide nibble decode + B-first load order** | **87.95 $\mu$s** | **728.4 GB/s** | **2.15x** |
+| Var 2 (`sub_v5b`) | Column-refill pipelined v2 | 182.10 $\mu$s | 351.8 GB/s | 1.04x |
+
+#### $M=2$ Dual-Token Decode
+| Variant | Implementation Details | Total Latency ($\mu$s) | Per-Tok ($\mu$s) | Eff. GB/s | Speedup vs Base |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| Baseline (`sub_v2`) | Byte-wide single-row loop | 353.96 $\mu$s | 176.98 $\mu$s | 362.0 GB/s | 1.00x |
+| Var 1 (`sub_v8`) | Word-wide single-row loop | 165.74 $\mu$s | 82.87 $\mu$s | 773.0 GB/s | 2.14x |
+| Var 2 (`rows_r2`) | Multi-row 2-token reuse (recomputing kv) | 161.65 $\mu$s | 80.82 $\mu$s | 792.6 GB/s | 2.19x |
+| **Var 3 (`rows_hv2`) [LIVE]** | **Hoisted-KV 2-token reuse** | **101.58 $\mu$s** | **50.79 $\mu$s** | **1261.3 GB/s** | **3.48x total (3.48x per-tok)** |
+
+---
+
 ## Overall Summary Matrix (60 MB Tensor)
 
 | Format | $M=1$ Latency ($\mu$s) | $M=1$ Eff. BW | $M=1$ Optimal Kernel | $M=2$ Total ($\mu$s) | $M=2$ Per-Tok ($\mu$s) | $M=2$ Eff. BW | $M=2$ Multi-Row Speedup |
@@ -137,3 +181,5 @@ Across all major K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), systematic optimizatio
 | **Q4_K** | **76.12 $\mu$s** | **794.3 GB/s** | `grim_dot4_q4k_q81_gemv_sub_v3_prefetch` | **88.82 $\mu$s** | **44.41 $\mu$s** | **1361.6 GB/s** | **1.68x (2.81x per-tok)** |
 | **Q5_K** | **89.69 $\mu$s** | **703.3 GB/s** | `grim_dot4_q5k_q81_gemv_sub_v2` | **101.79 $\mu$s** | **50.89 $\mu$s** | **1239.4 GB/s** | **1.68x (2.13x per-tok)** |
 | **Q6_K** | **100.31 $\mu$s** | **603.2 GB/s** | `grim_dot4_q6k_q81_gemv_sub_v2` | **109.76 $\mu$s** | **54.88 $\mu$s** | **1102.5 GB/s** | **1.75x (2.18x per-tok)** |
+| **IQ4_NL** | **92.07 $\mu$s** | **672.7 GB/s** | `grim_dot4_iq4nl_q81_gemv_fast` | **113.66 $\mu$s** | **56.83 $\mu$s** | **1089.8 GB/s** | **2.87x (2.87x per-tok)** |
+| **IQ4_XS** | **87.95 $\mu$s** | **728.4 GB/s** | `grim_dot4_iq4xs_q81_gemv_sub_v8` | **101.58 $\mu$s** | **50.79 $\mu$s** | **1261.3 GB/s** | **3.48x (3.48x per-tok)** |
