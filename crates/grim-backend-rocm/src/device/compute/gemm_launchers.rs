@@ -3231,7 +3231,7 @@ impl RocmDevice {
                     }
                 }
                 if crate::device::quant::exact_decode_gemv()
-                    && matches!(scheme, KQuantScheme::Q4K | KQuantScheme::IQ3S)
+                    && matches!(scheme, KQuantScheme::Q4K)
                 {
                     return (false, false);
                 }
@@ -3736,10 +3736,6 @@ impl RocmDevice {
                                 }
                             }
                             self.launch_fused_dequant_gemm_q4k(a_s, w, out, m, n, k)?;
-                            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
-                        }
-                        KQuantScheme::IQ3S => {
-                            self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?;
                             return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
                         }
                         _ => {}
