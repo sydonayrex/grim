@@ -1835,3 +1835,30 @@ activation dead-group clustering may shift DRAM efficiency either way; the
 accuracy gate here is synthetic — production wiring needs oracle closeness +
 PPL on the 9B/27B eval harness (NOT byte-identity) before GRIM_KGROUP_SKIP
 ships. Gate D re-run 32/32 after the kernel-source edit (standing rule).
+
+### Sec 15 addendum — production wiring + decode-path accuracy verdict (2026-11-07/08)
+
+Wiring: `GRIM_KGROUP_SKIP_TAU` (default off) in `launch_dot4_q80_f32act_gemv`
+routes every production caller (gemm_launchers, lfm2_graph FFN-down,
+decode_graph FFN-down) through the skip variant; the decode-graph capture
+picks it up (kernel census shows `grim_dot4_q80_f32act_gemv_skip` serving all
+250 decode launches on LFM2.5-350M-Q8_0). tau=0 generation is text-identical
+to dense. `grim-cli eval ppl` does NOT exercise the decode GEMV (pure
+full-window prefill) — identical PPL at tau=0/0.10/2.0 is expected, not a
+gate.
+
+Decode-path reality check on LFM2.5-350M-Q8_0 (GRIM_SPARSE_PROBE, m=1 decode
+calls): dead-group fractions are TINY — aggregate dead02 ~1.5%, dead10 ~11%
+(0-9 of 32 groups per call). The 70%@tau0.10 probe figure (189e047d) came
+from captures dominated by prefill-window calls on the 9B; decode rows have
+almost no dead groups here, so decode-skip savings on this model are
+negligible REGARDLESS of accuracy.
+
+Accuracy: greedy generation on LFM2.5-350M-Q8_0 DEGRADES at tau=0.02 and
+tau=0.10 (coherent answer -> repetition loops) despite the tiny skip
+fraction — real sensitivity or an interaction to root-cause; do NOT ship the
+default-on gate. Next diagnostics: (1) re-run GRIM_SPARSE_PROBE on the 9B
+restricted to m=1 calls to learn whether decode rows have dead groups there
+at all — this decides if decode-skip is viable anywhere or is only a
+chunked-prefill lever; (2) bisect the tau=0.02 degradation (per-layer logits
+dumps) since ~1.5% skipped groups should be well inside noise.
