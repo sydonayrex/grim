@@ -5682,8 +5682,14 @@ impl DecodeGraphModel for Qwen35 {
         graph.set_layer_devices(&ords);
 
         // Pre-capture VRAM guard: verify each device has sufficient free VRAM headroom
-        // (minimum 1.5 GB) for lazy kernel module loads (hsaco), activation scratch, and driver state.
-        let min_free_bytes: u64 = 1536 * 1024 * 1024; // 1.5 GB minimum
+        // for lazy kernel module loads (hsaco), activation scratch, and driver state.
+        // Default lowered to 256 MB (configurable via GRIM_GRAPH_MIN_FREE_MB) so dense/quant 27B+
+        // models on 16GB cards can capture decode graphs instead of falling back to eager.
+        let min_free_mb = std::env::var("GRIM_GRAPH_MIN_FREE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256);
+        let min_free_bytes: u64 = min_free_mb * 1024 * 1024;
         for &ord in &ords {
             let (free, total) = grim_backend_rocm::vram_info(ord);
             if total > 0 && free < min_free_bytes {
