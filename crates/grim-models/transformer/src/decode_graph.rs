@@ -3661,6 +3661,10 @@ impl Qwen35Block {
                 Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW) => {
                     buffers.max_ctx * nkv * hd.div_ceil(128) * 67
                 }
+                // Q8_1 Dot4: 36 bytes per 32 elements.
+                Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1) => {
+                    buffers.max_ctx * nkv * (hd / 32) * 36
+                }
                 _ => buffers.max_ctx * kv_stride,
             };
             let max_ctx = buffers.max_ctx;
@@ -3690,7 +3694,11 @@ impl Qwen35Block {
             // error here rather than a silent fallthrough to the 8-bit kernels.
             let packed_bits = buffers.kv_arena_packed_width();
             match packed_bits {
-                None | Some(8) | Some(4) | Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW) => {}
+                None
+                | Some(8)
+                | Some(4)
+                | Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW)
+                | Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1) => {}
                 Some(bits) => {
                     return Err(grim_core::error::Error::Backend(format!(
                         "graph KV append: no device-total kernel pair for {bits}-bit KV codes (eager fallback)"
@@ -3699,10 +3707,8 @@ impl Qwen35Block {
             }
             let arena_i8 = packed_bits == Some(8);
             let arena_i4 = packed_bits == Some(4);
-            // WhiteCrow records the BLOCK width (67 B / 128 values) rather
-            // than a code width, so it is matched against the marker const —
-            // never against `Some(4)`, which is the int4 family (sidecar).
             let arena_whitecrow = packed_bits == Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW);
+            let arena_q81 = packed_bits == Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1);
             // The i4 kernels' per-row and per-head code terms are PACKED BYTES
             // (`kv_stride/2`, `head_dim/2`), so the slot stride they receive
             // must be the arena's BYTE extent. `arena_slot_stride` is ALREADY
@@ -3868,6 +3874,30 @@ impl Qwen35Block {
                             ))
                         })?;
                     }
+                }
+            } else if arena_q81 {
+                for (src, dst, tag) in [
+                    (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], "k"),
+                    (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], "v"),
+                ] {
+                    grim_backend_rocm::launch_kv_append_q81(
+                        dev,
+                        src,
+                        &buffers.layer_totals[layer_idx],
+                        dst,
+                        kv_stride,
+                        nkv,
+                        hd,
+                        steps,
+                        batch,
+                        arena_slot_stride,
+                        buffers.kv_ring,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!(
+                            "kv_append_q81 {tag}: {e}"
+                        ))
+                    })?;
                 }
             } else {
                 grim_backend_rocm::launch_kv_append_batch(
@@ -4071,6 +4101,38 @@ impl Qwen35Block {
                         ))
                     })?;
                 }
+            } else if arena_q81 {
+                grim_backend_rocm::launch_qkv_attention_dev_batch_q81(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    &buffers.v_arena[layer_idx],
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.layer_totals[layer_idx],
+                    nh as u32,
+                    nkv as u32,
+                    hd as u32,
+                    steps as u32,
+                    steps as u32,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    0.0,
+                    buffers.attn_dummy_for(dev.ordinal()),
+                    0,
+                    0,
+                    buffers.attn_dummy_for(dev.ordinal()),
+                    0,
+                    batch,
+                    arena_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!(
+                        "qkv_attention_dev_q81: {e}"
+                    ))
+                })?;
             } else {
                 grim_backend_rocm::launch_qkv_attention_dev_batch(
                     dev,
@@ -5438,10 +5500,13 @@ impl DecodeGraphModel for Qwen35 {
                 grim_backend_rocm::KvArenaFormat::Int8 => Some(8),
                 grim_backend_rocm::KvArenaFormat::Int4 => Some(4),
                 grim_backend_rocm::KvArenaFormat::Int2V4 => Some(2),
-                // WhiteCrow: the BLOCK width (67 B), not a code width — see
-                // `KV_ARENA_BITS_WHITECROW`.
+                // WhiteCrow: the BLOCK width (67 B), not a code width — see `KV_ARENA_BITS_WHITECROW`.
                 grim_backend_rocm::KvArenaFormat::WhiteCrow => {
                     Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW)
+                }
+                // Q8_1 Dot4: 36 bytes per 32 elements.
+                grim_backend_rocm::KvArenaFormat::Q8_1 => {
+                    Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1)
                 }
                 _ => None,
             };
@@ -5457,12 +5522,8 @@ impl DecodeGraphModel for Qwen35 {
                 let packed_factor: f64 = match fmt {
                     grim_backend_rocm::KvArenaFormat::Int4
                     | grim_backend_rocm::KvArenaFormat::Int2V4 => 0.5,
-                    // WhiteCrow: 67 bytes per 128 values. The base arena's
-                    // last dim is `nkv*hd` ELEMENTS (see the `n_k` passed at
-                    // allocation), so scaling by 67/128 lands exactly on the
-                    // block extent `nkv * (hd/128) * 67` — exact in f64
-                    // (power-of-two denominator) for every valid head_dim.
                     grim_backend_rocm::KvArenaFormat::WhiteCrow => 67.0 / 128.0,
+                    grim_backend_rocm::KvArenaFormat::Q8_1 => 36.0 / 32.0,
                     _ => 1.0,
                 };
                 for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {

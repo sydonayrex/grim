@@ -99,6 +99,7 @@ pub fn capture_fp8_pad_scratch() -> Option<&'static RocmStorage> {
 /// these geometries), and every consumer needs the block geometry anyway:
 /// a slot's byte extent is `max_ctx * nkv * (head_dim/128) * 67`.
 pub const KV_ARENA_BITS_WHITECROW: u32 = 67;
+pub const KV_ARENA_BITS_Q8_1: u32 = 36;
 
 /// Spec §Phase 1: owns all decode intermediates at fixed addresses.
 /// Allocated once at model load, never freed until unload.
@@ -1819,12 +1820,13 @@ impl DecodeGraphBuffers {
             // means something reassigned the flag mid-run; fail loud rather
             // than quantize the prompt silently.
             //
-            // WhiteCrow (`KV_ARENA_BITS_WHITECROW`) stores its bf16 scale +
-            // u8 zero INLINE in each 67-byte block: there is no f32 sidecar on
-            // either side, so its codes skip the sidecar block entirely and
-            // seed through the raw 1-byte/elem copy below (which also
-            // byte-compares eager vs graph).
-            if arena_elem_bytes == 1 && self.kv_arena_bits != Some(KV_ARENA_BITS_WHITECROW) {
+            // WhiteCrow (`KV_ARENA_BITS_WHITECROW`) and Q8_1 (`KV_ARENA_BITS_Q8_1`) store
+            // their scales inline: there is no f32 sidecar on either side, so they
+            // skip the sidecar block entirely and seed through the raw 1-byte/elem copy below.
+            if arena_elem_bytes == 1
+                && self.kv_arena_bits != Some(KV_ARENA_BITS_WHITECROW)
+                && self.kv_arena_bits != Some(KV_ARENA_BITS_Q8_1)
+            {
                 if src.src_elem_bytes != 1 {
                     return Err(Error::Backend(format!(
                         "seed_kv_arena: layer {layer_idx} int8 graph arena but eager source is \
@@ -1991,95 +1993,60 @@ impl DecodeGraphBuffers {
                     "[seed-debug] layer {layer_idx}: copied {n_bytes} bytes ({n_rows} rows), tail {} bytes zeroed. total_arena={total_k_bytes}",
                     total_k_bytes.saturating_sub(n_bytes)
                 );
-                // BYTE-COMPARE CHECK: Verify graph arena matches eager arena bit-for-bit on rows 0..n_rows
-                crate::check_hip("seed_kv_arena hipStreamSynchronize", unsafe {
-                    crate::device::handles::hipStreamSynchronize(stream)
-                })?;
-                let mut host_eager_k = vec![0u8; n_bytes];
-                let mut host_graph_k = vec![0u8; n_bytes];
-                let mut host_eager_v = vec![0u8; n_bytes];
-                let mut host_graph_v = vec![0u8; n_bytes];
-                check_hip("seed_kv_arena D2H eager_k", unsafe {
-                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
-                    crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(
-                        host_eager_k.as_mut_ptr() as *mut std::ffi::c_void,
-                        src_k,
-                        n_bytes,
-                        HipMemcpyKind::DeviceToHost,
-                    )
-                })?;
-                check_hip("seed_kv_arena D2H graph_k", unsafe {
-                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
-                    crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(
-                        host_graph_k.as_mut_ptr() as *mut std::ffi::c_void,
-                        dst_k,
-                        n_bytes,
-                        HipMemcpyKind::DeviceToHost,
-                    )
-                })?;
-                check_hip("seed_kv_arena D2H eager_v", unsafe {
-                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
-                    crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(
-                        host_eager_v.as_mut_ptr() as *mut std::ffi::c_void,
-                        src_v,
-                        n_bytes,
-                        HipMemcpyKind::DeviceToHost,
-                    )
-                })?;
-                check_hip("seed_kv_arena D2H graph_v", unsafe {
-                    // BLOCKING D2H: a host round-trip that drains the pipeline (see `blocking_d2h_count`).
-                    crate::memory::storage::count_blocking_d2h();
-                    crate::hipMemcpy(
-                        host_graph_v.as_mut_ptr() as *mut std::ffi::c_void,
-                        dst_v,
-                        n_bytes,
-                        HipMemcpyKind::DeviceToHost,
-                    )
-                })?;
-                let k_diff = host_eager_k
-                    .iter()
-                    .zip(host_graph_k.iter())
-                    .filter(|(a, b)| a != b)
-                    .count();
-                let v_diff = host_eager_v
-                    .iter()
-                    .zip(host_graph_v.iter())
-                    .filter(|(a, b)| a != b)
-                    .count();
-                // Check for NaNs in rows 0..n_rows
-                let k_u16: &[u16] = unsafe {
-                    std::slice::from_raw_parts(host_graph_k.as_ptr() as *const u16, n_bytes / 2)
-                };
-                let v_u16: &[u16] = unsafe {
-                    std::slice::from_raw_parts(host_graph_v.as_ptr() as *const u16, n_bytes / 2)
-                };
-                let k_nans = k_u16
-                    .iter()
-                    .filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0)
-                    .count();
-                let v_nans = v_u16
-                    .iter()
-                    .filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0)
-                    .count();
-                eprintln!(
-                    "[seed-verify] layer {layer_idx}: k_diff_bytes={k_diff}/{n_bytes}, v_diff_bytes={v_diff}/{n_bytes}, k_nans={k_nans}, v_nans={v_nans}"
-                );
-                if k_nans > 0 {
-                    for (idx, &val) in k_u16.iter().enumerate() {
-                        if (val & 0x7c00) == 0x7c00 && (val & 0x03ff) != 0 {
-                            let row = idx / 1024;
-                            let col = idx % 1024;
-                            eprintln!(
-                                "[seed-nan-k] layer {layer_idx}: row={row} col={col} val=0x{val:04x}"
-                            );
-                            if row > 0 {
-                                break;
-                            }
-                        }
-                    }
+                // BYTE-COMPARE CHECK (only if debug copy enabled)
+                if std::env::var("GRIM_DEBUG_COPY").is_ok() {
+                    crate::check_hip("seed_kv_arena hipStreamSynchronize", unsafe {
+                        crate::device::handles::hipStreamSynchronize(stream)
+                    })?;
+                    let mut host_eager_k = vec![0u8; n_bytes];
+                    let mut host_graph_k = vec![0u8; n_bytes];
+                    let mut host_eager_v = vec![0u8; n_bytes];
+                    let mut host_graph_v = vec![0u8; n_bytes];
+                    check_hip("seed_kv_arena D2H eager_k", unsafe {
+                        crate::hipMemcpy(
+                            host_eager_k.as_mut_ptr() as *mut std::ffi::c_void,
+                            src_k,
+                            n_bytes,
+                            HipMemcpyKind::DeviceToHost,
+                        )
+                    })?;
+                    check_hip("seed_kv_arena D2H graph_k", unsafe {
+                        crate::hipMemcpy(
+                            host_graph_k.as_mut_ptr() as *mut std::ffi::c_void,
+                            dst_k,
+                            n_bytes,
+                            HipMemcpyKind::DeviceToHost,
+                        )
+                    })?;
+                    check_hip("seed_kv_arena D2H eager_v", unsafe {
+                        crate::hipMemcpy(
+                            host_eager_v.as_mut_ptr() as *mut std::ffi::c_void,
+                            src_v,
+                            n_bytes,
+                            HipMemcpyKind::DeviceToHost,
+                        )
+                    })?;
+                    check_hip("seed_kv_arena D2H graph_v", unsafe {
+                        crate::hipMemcpy(
+                            host_graph_v.as_mut_ptr() as *mut std::ffi::c_void,
+                            dst_v,
+                            n_bytes,
+                            HipMemcpyKind::DeviceToHost,
+                        )
+                    })?;
+                    let k_diff = host_eager_k
+                        .iter()
+                        .zip(host_graph_k.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    let v_diff = host_eager_v
+                        .iter()
+                        .zip(host_graph_v.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    eprintln!(
+                        "[seed-verify] layer {layer_idx}: k_diff_bytes={k_diff}/{n_bytes}, v_diff_bytes={v_diff}/{n_bytes}"
+                    );
                 }
                 continue;
             }

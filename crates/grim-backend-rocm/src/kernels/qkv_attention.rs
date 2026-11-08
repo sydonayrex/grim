@@ -198,7 +198,7 @@ impl KvArenaFormat {
     pub fn graph_kernel_pair(self) -> bool {
         matches!(
             self,
-            KvArenaFormat::Int8 | KvArenaFormat::Int4 | KvArenaFormat::WhiteCrow
+            KvArenaFormat::Q8_1 | KvArenaFormat::Int8 | KvArenaFormat::Int4 | KvArenaFormat::WhiteCrow
         )
     }
 }
@@ -3149,6 +3149,71 @@ extern "C" __global__ void grim_rope_append_whitecrow_k(
     }
 }
 
+// SPEED-DOT4: Graph-capturable Q8_1 KV append.
+// Quantizes incoming f32 tokens into 36-byte Q8_1 blocks [d: fp16][sum: fp16][32 x int8]
+// at the ring position past_dev[slot] + step.
+extern "C" __global__ void grim_kv_append_q81(
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ dst,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,
+    int cap_rows,
+    int sink_rows) {
+    const int g = blockIdx.x;
+    const int num_blocks = head_dim / 32;
+    if (num_blocks <= 0) return;
+    const int per_slot = steps * nkv_heads * num_blocks;
+    const int total = batch * per_slot;
+    if (g >= total) return;
+    const int slot = g / per_slot;
+    const int r = g - slot * per_slot;
+    const int step = r / (nkv_heads * num_blocks);
+    const int rem = r - step * nkv_heads * num_blocks;
+    const int kh = rem / num_blocks;
+    const int blk = rem - kh * num_blocks;
+    const int past = past_dev[slot];
+
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    bool _keep = true;
+    for (int _j = step + 1; _j < steps; ++_j) {
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) { _keep = false; break; }
+    }
+    if (!_keep) return;
+
+    const long long src_base = ((long long)slot * steps + step) * kv_stride
+                             + (long long)kh * head_dim + (long long)blk * 32;
+    const long long row_bytes = (long long)nkv_heads * num_blocks * 36;
+    const long long dst_base = (long long)slot * arena_slot_stride
+                             + (long long)abs_row * row_bytes
+                             + (long long)kh * num_blocks * 36
+                             + (long long)blk * 36;
+    const int e = threadIdx.x; // 0..31
+
+    float v = k_rot[src_base + e];
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_xor(amax, off);
+        if (other > amax) amax = other;
+    }
+    float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
+    unsigned char* out_blk = dst + dst_base;
+    if (e == 0) {
+        __half dhalf = __float2half(d);
+        __builtin_memcpy(out_blk, &dhalf, sizeof(dhalf));
+        __half zero = __float2half(0.0f);
+        __builtin_memcpy(out_blk + 2, &zero, sizeof(zero));
+    }
+    int q = __float2int_rn(v / d);
+    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+    out_blk[4 + e] = (unsigned char)((signed char)q);
+}
+
 extern "C" __global__ void grim_kv_append_whitecrow(
     const float* __restrict__ k_rot,
     const int* __restrict__ past_dev,
@@ -4162,6 +4227,198 @@ __device__ inline float grim_dequant_whitecrow(
 //     caps nothing; keeping tanhf here means both WhiteCrow forms agree.
 // head_dim must be a multiple of 128 (groups align to head vectors) and
 // <= 256; anything else writes NaN (caught by the launcher check).
+// SPEED-DOT4: Graph-capturable device Q8_1 KV attention kernel.
+// Evaluates QK via cooperative dot4 (v_dot4_i32_iu8 / sudot4) directly against
+// 36-byte Q8_1 blocks with ring eviction and slot stride support.
+extern "C" __global__ void grim_qkv_attention_dev_q81(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,
+    int cap_rows
+) {
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+
+    const int lane_id = threadIdx.x % 32;
+    const int wave_id = threadIdx.x / 32;
+    const int num_waves = blockDim.x / 32;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int num_blocks = head_dim / 32;
+    __shared__ float sq_d[8];
+    __shared__ signed char sq_qs[8][32];
+
+    if (threadIdx.x < (unsigned int)(num_blocks * 32)) {
+        int blk = threadIdx.x / 32;
+        int e = threadIdx.x % 32;
+        float v = q[q_offset + blk * 32 + e];
+        float amax = fabsf(v);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float other = __shfl_xor(amax, off);
+            if (other > amax) amax = other;
+        }
+        float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
+        if (e == 0) sq_d[blk] = d;
+        int qv = __float2int_rn(v / d);
+        sq_qs[blk][e] = (signed char)((qv < -127) ? -127 : ((qv > 127) ? 127 : qv));
+    }
+    __syncthreads();
+
+    int live_rows = total_dev[slot] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int blk_stride = 36;
+    const int row_stride = num_kv_heads * num_blocks * blk_stride;
+    const long long slot_base = (long long)slot * arena_slot_stride;
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float lane_contrib = 0.0f;
+        int blk = lane_id / 8;
+        int sub = (lane_id % 8) * 4;
+        if (blk < num_blocks) {
+            const unsigned char* k_blk = k_tensor + slot_base + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+            __half khalf;
+            __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
+            float kd = __half2float(khalf);
+            const signed char* k_codes = (const signed char*)(k_blk + 4);
+
+            int q4, k4;
+            __builtin_memcpy(&q4, &sq_qs[blk][sub], 4);
+            __builtin_memcpy(&k4, k_codes + sub, 4);
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+            int iacc = __builtin_amdgcn_sudot4(true, q4, true, k4, 0, false);
+#else
+            int iacc = (int)((char)(q4 & 0xff)) * ((int)(char)(k4 & 0xff))
+                 + (int)((char)((q4 >> 8) & 0xff)) * ((int)(char)((k4 >> 8) & 0xff))
+                 + (int)((char)((q4 >> 16) & 0xff)) * ((int)(char)((k4 >> 16) & 0xff))
+                 + (int)((char)((q4 >> 24) & 0xff)) * ((int)(char)((k4 >> 24) & 0xff));
+#endif
+            lane_contrib = (float)iacc * (sq_d[blk] * kd);
+        }
+
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lane_contrib += __shfl_xor(lane_contrib, off);
+        }
+        float score = lane_contrib * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) score += alibi_slopes[h] * ((float)j - (float)abs_i);
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * 32;
+            if (d < head_dim) {
+                int blk = d / 32;
+                int e = d % 32;
+                const unsigned char* v_blk = v_tensor + slot_base + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+                __half vhalf;
+                __builtin_memcpy(&vhalf, v_blk, sizeof(vhalf));
+                float vd = __half2float(vhalf);
+                signed char code = ((const signed char*)(v_blk + 4))[e];
+                float v_val = (float)code * vd;
+
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+
+    if (lane_id == 0) {
+        if (out_max != nullptr) out_max[slot * (seq_len * num_heads) + i * num_heads + h] = m_final;
+        if (out_sum != nullptr) out_sum[slot * (seq_len * num_heads) + i * num_heads + h] = sum_final;
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_tensor,
@@ -7140,6 +7397,84 @@ pub fn launch_rope_append_whitecrow_k(
     )
 }
 
+pub fn launch_kv_append_q81(
+    dev: &crate::RocmDevice,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    dst: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let dst_s = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_append_q81: dst must be RocmStorage".into())
+    })?;
+    if dst_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_append_q81: dst arena must be U8 (byte storage for Q8_1 blocks)".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim % 32 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_q81: head_dim {head_dim} must be a multiple of 32"
+        )));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_q81")?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_q81: past_dev must be RocmStorage".into())
+        })?;
+    let mut dst_ptr = dst_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_q81: dst has no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_q81: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend("kv_append_q81: arena_slot_stride exceeds i32::MAX".into())
+    })?;
+    let num_blocks = head_dim / 32;
+    let grid = crate::HipDim3::new(
+        (batch.max(1) * steps * nkv_heads * num_blocks) as u32,
+        1,
+        1,
+    );
+    let block = crate::HipDim3::new(32, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_append_q81",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut dst_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
+        ],
+    )
+}
+
 pub fn launch_kv_append_whitecrow(
     dev: &crate::RocmDevice,
     k_rot: &dyn BackendStorage,
@@ -7793,6 +8128,163 @@ pub fn launch_qkv_attention_dev_batch_i4(
             arg(&mut ksc_ptr),
             arg(&mut vsc_ptr),
             arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+        ],
+    )
+}
+
+/// Graph launcher for `grim_qkv_attention_dev_q81`.
+/// Same contract as [`launch_qkv_attention_dev_batch_whitecrow`]:
+/// scale lives inside each 36-byte Q8_1 block, no sidecar.
+pub fn launch_qkv_attention_dev_batch_q81(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut cap_rows_i = ring.cap_rows;
+    const KERNEL: &str = "grim_qkv_attention_dev_q81";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{KERNEL}: head_dim {head_dim} exceeds kernel cap of 256"
+        )));
+    }
+    if head_dim % 32 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "{KERNEL}: head_dim {head_dim} must be a multiple of 32"
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{KERNEL}: q must be RocmStorage")))?;
+    for (buf, what) in [(k_arena, "k_arena"), (v_arena, "v_arena")] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{KERNEL}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != ArithType::U8 {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} must be U8, got {:?}",
+                r.dtype.arith
+            )));
+        }
+        if !r.device_ptr_is_valid() {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} lacks a valid device pointer"
+            )));
+        }
+    }
+    fn dc<'a>(
+        b: &'a dyn BackendStorage,
+        what: &'static str,
+    ) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!(
+                "grim_qkv_attention_dev_q81: {what} must be RocmStorage"
+            ))
+        })
+    }
+    let out_s = dc(out, "out")?;
+    let om_s = dc(out_max, "out_max")?;
+    let os_s = dc(out_sum, "out_sum")?;
+    let total_s = dc(total_dev, "total_dev")?;
+    let oproj_s = dc(o_proj_w, "o_proj_w")?;
+    let alibi_s = dc(alibi_slopes, "alibi_slopes")?;
+    let kq = dc(k_arena, "k_arena")?;
+    let vq = dc(v_arena, "v_arena")?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = kq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_arena has no ptr".into()))?;
+    let mut v_ptr = vq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_arena has no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi_slopes has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = i32::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend(format!("{KERNEL}: arena_slot_stride exceeds i32::MAX"))
+    })?;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
             arg(&mut cap_rows_i),
         ],
     )
