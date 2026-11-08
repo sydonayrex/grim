@@ -522,39 +522,12 @@ fn bench_iq3_all_variants_60mb() -> TestResult {
             dev.synchronize();
             let dur_v2_lds = t_lds.elapsed().as_secs_f64() * 1e6 / (iters as f64);
 
-            // Timing Dot4 v3_col8
-            for _ in 0..3 {
-                dev.launch_dot4_iq3xxs_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let t_col8 = Instant::now();
-            for _ in 0..iters {
-                dev.launch_dot4_iq3xxs_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let dur_v3_col8 = t_col8.elapsed().as_secs_f64() * 1e6 / (iters as f64);
-
-            // Timing Dot4 v4_prefetch
-            for _ in 0..3 {
-                dev.launch_dot4_iq3xxs_q81_gemv_v4_prefetch_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let t_pref = Instant::now();
-            for _ in 0..iters {
-                dev.launch_dot4_iq3xxs_q81_gemv_v4_prefetch_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let dur_v4_pref = t_pref.elapsed().as_secs_f64() * 1e6 / (iters as f64);
-
             let bw = |dur: f64| (tensor_bytes as f64 * m as f64) / (dur * 1e-6) / 1e9;
-
             println!("\nLatency & Bandwidth for IQ3_XXS M={m}:");
             println!("  Fused Stock:                {dur_stock:6.2} us | eff BW: {:6.1} GB/s", bw(dur_stock));
             println!("  Fused LDS:                  {dur_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_lds), dur_stock / dur_lds);
             println!("  Dot4 GEMV (base):           {dur_dot4:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_dot4), dur_stock / dur_dot4);
             println!("  Dot4 v2_lds (LDS grid):     {dur_v2_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v2_lds), dur_stock / dur_v2_lds);
-            println!("  Dot4 v3_col8 (8-col tile):  {dur_v3_col8:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v3_col8), dur_stock / dur_v3_col8);
-            println!("  Dot4 v4_pref (pipelined):   {dur_v4_pref:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v4_pref), dur_stock / dur_v4_pref);
 
             if m == 2 {
                 for _ in 0..3 {
@@ -696,39 +669,12 @@ fn bench_iq3_all_variants_60mb() -> TestResult {
             dev.synchronize();
             let dur_v2_lds = t_lds.elapsed().as_secs_f64() * 1e6 / (iters as f64);
 
-            // Timing Dot4 v3_col8
-            for _ in 0..3 {
-                dev.launch_dot4_iq3s_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let t_col8 = Instant::now();
-            for _ in 0..iters {
-                dev.launch_dot4_iq3s_q81_gemv_v3_col8_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let dur_v3_col8 = t_col8.elapsed().as_secs_f64() * 1e6 / (iters as f64);
-
-            // Timing Dot4 v4_prefetch
-            for _ in 0..3 {
-                dev.launch_dot4_iq3s_q81_gemv_v4_prefetch_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let t_pref = Instant::now();
-            for _ in 0..iters {
-                dev.launch_dot4_iq3s_q81_gemv_v4_prefetch_for_ab(q81_r, w_r, y_r, m, n, k)?;
-            }
-            dev.synchronize();
-            let dur_v4_pref = t_pref.elapsed().as_secs_f64() * 1e6 / (iters as f64);
-
             let bw = |dur: f64| (tensor_bytes as f64 * m as f64) / (dur * 1e-6) / 1e9;
-
             println!("\nLatency & Bandwidth for IQ3_S M={m}:");
             println!("  Fused Stock:                {dur_stock:6.2} us | eff BW: {:6.1} GB/s", bw(dur_stock));
             println!("  Fused LDS:                  {dur_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_lds), dur_stock / dur_lds);
             println!("  Dot4 GEMV (base):           {dur_dot4:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_dot4), dur_stock / dur_dot4);
             println!("  Dot4 v2_lds (LDS grid):     {dur_v2_lds:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v2_lds), dur_stock / dur_v2_lds);
-            println!("  Dot4 v3_col8 (8-col tile):  {dur_v3_col8:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v3_col8), dur_stock / dur_v3_col8);
-            println!("  Dot4 v4_pref (pipelined):   {dur_v4_pref:6.2} us | eff BW: {:6.1} GB/s (speedup vs stock: {:4.2}x)", bw(dur_v4_pref), dur_stock / dur_v4_pref);
 
             if m == 2 {
                 for _ in 0..3 {

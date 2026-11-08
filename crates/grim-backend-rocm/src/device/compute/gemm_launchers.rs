@@ -3236,9 +3236,18 @@ impl RocmDevice {
                     return (false, false);
                 }
                 let needs_q81 = match scheme {
-                    KQuantScheme::IQ3S
-                    | KQuantScheme::IQ1S
+                    KQuantScheme::IQ1S
                     | KQuantScheme::IQ1M => false,
+                    KQuantScheme::IQ3S => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ3S_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
                     KQuantScheme::IQ2S => {
                         let dot_disabled = matches!(
                             std::env::var("GRIM_DOT_GEMV").as_deref(),
@@ -3737,13 +3746,58 @@ impl RocmDevice {
                     }
                 }
                 let needs_q81 = match scheme {
-                    KQuantScheme::IQ3S
-                    | KQuantScheme::IQ1S
-                    | KQuantScheme::IQ1M
-                    | KQuantScheme::IQ2S
-                    | KQuantScheme::IQ2XS
-                    | KQuantScheme::IQ2XXS
-                    | KQuantScheme::IQ3XXS => false,
+                    KQuantScheme::IQ1S
+                    | KQuantScheme::IQ1M => false,
+                    KQuantScheme::IQ2S => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ2S_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
+                    KQuantScheme::IQ2XS => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ2XS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
+                    KQuantScheme::IQ2XXS => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ2XXS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
+                    KQuantScheme::IQ3XXS => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ3XXS_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
+                    KQuantScheme::IQ3S => {
+                        let dot_disabled = matches!(
+                            std::env::var("GRIM_DOT_GEMV").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ) || matches!(
+                            std::env::var("GRIM_IQ3S_DOT4").as_deref(),
+                            Ok("0" | "false" | "off")
+                        );
+                        self.is_dot4_arch && !dot_disabled && k % 256 == 0
+                    }
                     KQuantScheme::Q6K => {
                         !matches!(
                             std::env::var("GRIM_Q6K_DOT4").as_deref(),

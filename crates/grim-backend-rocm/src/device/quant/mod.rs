@@ -905,78 +905,268 @@ impl QuantOps for RocmDevice {
                 self.launch_fused_dequant_gemm_iq1m(a_storage, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq2xxs,
-                    true,
-                    Self::launch_fused_dequant_gemm_iq2xxs,
-                    None,
-                )?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ2XXS_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if self.is_dot4_arch && (m == 1 || m == 2) && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq2xxs_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq2xxs_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq2xxs,
+                        true,
+                        Self::launch_fused_dequant_gemm_iq2xxs,
+                        None,
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2XS) => {
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq2xs,
-                    true,
-                    Self::launch_fused_dequant_gemm_iq2xs,
-                    None,
-                )?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ2XS_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if self.is_dot4_arch && (m == 1 || m == 2) && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq2xs_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq2xs_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq2xs,
+                        true,
+                        Self::launch_fused_dequant_gemm_iq2xs,
+                        None,
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2S) => {
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq2s,
-                    true,
-                    Self::launch_fused_dequant_gemm_iq2s,
-                    None,
-                )?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ2S_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if self.is_dot4_arch && (m == 1 || m == 2) && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq2s_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq2s_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq2s,
+                        true,
+                        Self::launch_fused_dequant_gemm_iq2s,
+                        None,
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => {
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq3xxs,
-                    true,
-                    Self::launch_fused_dequant_gemm_iq3xxs,
-                    None,
-                )?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ3XXS_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if self.is_dot4_arch && (m == 1 || m == 2) && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq3xxs_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq3xxs_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq3xxs,
+                        true,
+                        Self::launch_fused_dequant_gemm_iq3xxs,
+                        None,
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
-                // The fused WMMA IQ3_S GEMM does NOT match the CPU reference
-                // on real weights (Xing4.0 oracle: rel 0.76 vs 2.6e-6 with
-                // the scalar kernel) - no bit-exact gate covered the IQ
-                // family, and this kernel reads garbage. Scalar until it does.
-                self.launch_iq_wmma_fallback(
-                    a_storage,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                    Self::launch_wmma_fused_dequant_iq3s,
-                    false,
-                    Self::launch_fused_dequant_gemm_iq3s,
-                    Some("iq3s"),
-                )?;
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                ) || matches!(
+                    std::env::var("GRIM_IQ3S_DOT4").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if self.is_dot4_arch && (m == 1 || m == 2) && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_iq3s_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
+                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        fence_act_quant(self, q_stream);
+                        self.launch_dot4_iq3s_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
+                    }
+                } else {
+                    // The fused WMMA IQ3_S GEMM does NOT match the CPU reference
+                    // on real weights (Xing4.0 oracle: rel 0.76 vs 2.6e-6 with
+                    // the scalar kernel) - no bit-exact gate covered the IQ
+                    // family, and this kernel reads garbage. Scalar until it does.
+                    self.launch_iq_wmma_fallback(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        Self::launch_wmma_fused_dequant_iq3s,
+                        false,
+                        Self::launch_fused_dequant_gemm_iq3s,
+                        Some("iq3s"),
+                    )?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
                 let dot_disabled = matches!(
