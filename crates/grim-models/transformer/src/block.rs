@@ -1132,8 +1132,21 @@ impl LlamaBlock {
             && self.w_down.as_ref().is_some_and(|w| {
                 matches!(
                     w.weight().dtype().storage,
-                    grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80)
-                        | grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K)
+                    grim_tensor::Storage::KQuant(
+                        grim_tensor::KQuantScheme::Q80
+                            | grim_tensor::KQuantScheme::Q4K
+                            | grim_tensor::KQuantScheme::Q5K
+                            | grim_tensor::KQuantScheme::Q6K
+                            | grim_tensor::KQuantScheme::Q2K
+                            | grim_tensor::KQuantScheme::Q3K
+                            | grim_tensor::KQuantScheme::IQ4XS
+                            | grim_tensor::KQuantScheme::IQ4NL
+                            | grim_tensor::KQuantScheme::IQ3S
+                            | grim_tensor::KQuantScheme::IQ3XXS
+                            | grim_tensor::KQuantScheme::IQ2S
+                            | grim_tensor::KQuantScheme::IQ2XS
+                            | grim_tensor::KQuantScheme::IQ2XXS
+                    )
                 )
             })
             && gate.shape().dims().last().copied().unwrap_or(0) % 32 == 0
