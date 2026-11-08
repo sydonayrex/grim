@@ -35,10 +35,13 @@ fn bench_q4k_variants() -> TestResult {
     };
 
     println!("==========================================================================================");
-    println!("Q4_K INT8 DOT4 GEMV VARIANT BENCHMARK (N=17408, K=5120)");
+    println!("Q4_K INT8 DOT4 GEMV VARIANT BENCHMARK (60 MB WEIGHT TENSOR: N=22016, K=5120)");
     println!("==========================================================================================");
 
-    let (n, k) = (17408, 5120);
+    // K=5120: 20 super-blocks (256 weights, 144 bytes) -> 2880 bytes/column.
+    // N=22016 -> 22016 * 2880 = 63,406,080 bytes = 60.47 MB weight tensor.
+    // Exceeds / completely saturates the 60 MB footprint to eliminate cache skew.
+    let (n, k) = (22016, 5120);
 
     for m in [1, 2] {
         let mut rng = Lcg(0x6E67 ^ (m as u64));
