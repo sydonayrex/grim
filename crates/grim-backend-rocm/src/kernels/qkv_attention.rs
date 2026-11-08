@@ -516,6 +516,359 @@ void grim_qkv_attention(
 // int8-KV variant of `grim_qkv_attention` (Phase 2 KV shrink): identical
 // math, K/V rows read as biased-u8 codes with f32 per-(row,kv_head)
 // scales. q, out, and all epilogues are untouched f32.
+// SPEED-DOT4: Q8_1 KV Dot4 Variant 1 (Sequential dot4 across 32-elem blocks on lane 0)
+// K and V tensors store contiguous 36-byte Q8_1 blocks: [d: f16][s: f16][qs: 32 x int8].
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_q81kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+
+    const int lane_id = threadIdx.x % 32;
+    const int wave_id = threadIdx.x / 32;
+    const int num_waves = blockDim.x / 32;
+
+    const int abs_i = cache_offset + i;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int num_blocks = head_dim / 32;
+    float q_d[8];
+    signed char q_qs[8][32];
+
+    for (int blk = 0; blk < num_blocks && blk < 8; ++blk) {
+        float amax = 0.0f;
+        for (int e = 0; e < 32; ++e) {
+            float v = fabsf(q[q_offset + blk * 32 + e]);
+            if (v > amax) amax = v;
+        }
+        float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
+        q_d[blk] = d;
+        for (int e = 0; e < 32; ++e) {
+            float v = q[q_offset + blk * 32 + e] / d;
+            int qv = __float2int_rn(v);
+            q_qs[blk][e] = (signed char)((qv < -127) ? -127 : ((qv > 127) ? 127 : qv));
+        }
+    }
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int blk_stride = 36;
+    const int row_stride = num_kv_heads * num_blocks * blk_stride;
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float score = 0.0f;
+        if (lane_id == 0) {
+            for (int blk = 0; blk < num_blocks && blk < 8; ++blk) {
+                const unsigned char* k_blk = k_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+                __half khalf;
+                __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
+                float kd = __half2float(khalf);
+                const signed char* k_codes = (const signed char*)(k_blk + 4);
+
+                int iacc = 0;
+                #pragma unroll
+                for (int e = 0; e < 32; e += 4) {
+                    int q4, k4;
+                    __builtin_memcpy(&q4, &q_qs[blk][e], 4);
+                    __builtin_memcpy(&k4, k_codes + e, 4);
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+                    iacc = __builtin_amdgcn_sudot4(true, q4, true, k4, iacc, false);
+#else
+                    iacc = (int)((char)(q4 & 0xff)) * ((int)(char)(k4 & 0xff))
+                         + (int)((char)((q4 >> 8) & 0xff)) * ((int)(char)((k4 >> 8) & 0xff))
+                         + (int)((char)((q4 >> 16) & 0xff)) * ((int)(char)((k4 >> 16) & 0xff))
+                         + (int)((char)((q4 >> 24) & 0xff)) * ((int)(char)((k4 >> 24) & 0xff))
+                         + iacc;
+#endif
+                }
+                score += (float)iacc * (q_d[blk] * kd);
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        score = __shfl_sync(shfl_mask, score, 0);
+        score *= inv_sqrt_d;
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * 32;
+            if (d < head_dim) {
+                int blk = d / 32;
+                int e = d % 32;
+                const unsigned char* v_blk = v_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+                __half vhalf;
+                __builtin_memcpy(&vhalf, v_blk, sizeof(vhalf));
+                float vd = __half2float(vhalf);
+                signed char code = ((const signed char*)(v_blk + 4))[e];
+                float v_val = (float)code * vd;
+
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        if (out_max != nullptr) out_max[i * num_heads + h] = m_final;
+        if (out_sum != nullptr) out_sum[i * num_heads + h] = sum_final;
+    }
+}
+
+// SPEED-DOT4: Q8_1 KV Dot4 Variant 2 (Cooperative Warp-Distributed Dot4 with Warp Shuffle Reduction)
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_q81kv_v2_coop(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+
+    const int lane_id = threadIdx.x % 32;
+    const int wave_id = threadIdx.x / 32;
+    const int num_waves = blockDim.x / 32;
+
+    const int abs_i = cache_offset + i;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int num_blocks = head_dim / 32;
+    __shared__ float sq_d[8];
+    __shared__ signed char sq_qs[8][32];
+
+    if (threadIdx.x < (unsigned int)(num_blocks * 32)) {
+        int blk = threadIdx.x / 32;
+        int e = threadIdx.x % 32;
+        float v = q[q_offset + blk * 32 + e];
+        float amax = fabsf(v);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float other = __shfl_xor(amax, off);
+            if (other > amax) amax = other;
+        }
+        float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
+        if (e == 0) sq_d[blk] = d;
+        int qv = __float2int_rn(v / d);
+        sq_qs[blk][e] = (signed char)((qv < -127) ? -127 : ((qv > 127) ? 127 : qv));
+    }
+    __syncthreads();
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int blk_stride = 36;
+    const int row_stride = num_kv_heads * num_blocks * blk_stride;
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float lane_contrib = 0.0f;
+        int blk = lane_id / 8;
+        int sub = (lane_id % 8) * 4;
+        if (blk < num_blocks) {
+            const unsigned char* k_blk = k_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+            __half khalf;
+            __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
+            float kd = __half2float(khalf);
+            const signed char* k_codes = (const signed char*)(k_blk + 4);
+
+            int q4, k4;
+            __builtin_memcpy(&q4, &sq_qs[blk][sub], 4);
+            __builtin_memcpy(&k4, k_codes + sub, 4);
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+            int iacc = __builtin_amdgcn_sudot4(true, q4, true, k4, 0, false);
+#else
+            int iacc = (int)((char)(q4 & 0xff)) * ((int)(char)(k4 & 0xff))
+                 + (int)((char)((q4 >> 8) & 0xff)) * ((int)(char)((k4 >> 8) & 0xff))
+                 + (int)((char)((q4 >> 16) & 0xff)) * ((int)(char)((k4 >> 16) & 0xff))
+                 + (int)((char)((q4 >> 24) & 0xff)) * ((int)(char)((k4 >> 24) & 0xff));
+#endif
+            lane_contrib = (float)iacc * (sq_d[blk] * kd);
+        }
+
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lane_contrib += __shfl_xor(lane_contrib, off);
+        }
+        float score = lane_contrib * inv_sqrt_d;
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * 32;
+            if (d < head_dim) {
+                int blk = d / 32;
+                int e = d % 32;
+                const unsigned char* v_blk = v_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+                __half vhalf;
+                __builtin_memcpy(&vhalf, v_blk, sizeof(vhalf));
+                float vd = __half2float(vhalf);
+                signed char code = ((const signed char*)(v_blk + 4))[e];
+                float v_val = (float)code * vd;
+
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        if (out_max != nullptr) out_max[i * num_heads + h] = m_final;
+        if (out_sum != nullptr) out_sum[i * num_heads + h] = sum_final;
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256)
 void grim_qkv_attention_i8kv(
     const float* __restrict__ q,

@@ -269,6 +269,10 @@ harness = true
 name = "wmma_q4k_shape_bench"
 harness = true
 
+[[bench]]
+name = "q81_kv_dot4_bench"
+harness = true
+
 [[test]]
 name = "gptq_gemm_gpu_parity"
 required-features = ["gpu-test-shims"]

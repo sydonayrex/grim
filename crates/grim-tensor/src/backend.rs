@@ -2859,6 +2859,33 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
         )
     }
 
+    fn qkv_attention_i8(
+        &self,
+        q: &dyn BackendStorage,
+        k_codes: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_codes: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).qkv_attention_i8(
+            q,
+            k_codes,
+            k_scales,
+            v_codes,
+            v_scales,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            out_shape,
+        )
+    }
+
     fn mla_q_kv_norm_split(
         &self,
         q_raw: &dyn BackendStorage,

@@ -2010,3 +2010,124 @@ impl AttentionOps for RocmDevice {
         ))
     }
 }
+
+impl RocmDevice {
+    /// SPEED-DOT4: Q8_1 KV Dot4 Attention launcher.
+    /// Runs Variant 1 (Lane 0 sequential dot4) or Variant 2 (Cooperative warp-distributed dot4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_attention_q81(
+        &self,
+        q: &dyn BackendStorage,
+        k_q81: &dyn BackendStorage,
+        v_q81: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+        cooperative: bool,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        use grim_tensor::dtype::ArithType as AT;
+        let check = |s: &dyn BackendStorage, want: AT, what: &str| -> Result<()> {
+            let a = as_rocm(s)?;
+            if a.dtype.arith != want {
+                return Err(Error::Backend(format!(
+                    "launch_qkv_attention_q81: {what} must be {want:?}, got {:?}",
+                    a.dtype.arith
+                )));
+            }
+            if !a.device_ptr_is_valid() {
+                return Err(Error::Backend(format!(
+                    "launch_qkv_attention_q81: {what} lacks a valid device pointer"
+                )));
+            }
+            Ok(())
+        };
+        check(q, AT::F32, "q")?;
+        check(k_q81, AT::U8, "k_q81")?;
+        check(v_q81, AT::U8, "v_q81")?;
+
+        let dims = out_shape.dims();
+        let (seq_len, num_heads, head_dim) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else if dims.len() == 2 {
+            let hd = 128;
+            (dims[0], dims[1] / hd, hd)
+        } else {
+            return Err(Error::Shape(format!(
+                "qkv_attention_q81: out_shape must be [seq, heads, dim], got {dims:?}"
+            )));
+        };
+
+        let window_lo_i: i32 = match window {
+            None => 0,
+            Some(w) => {
+                let abs_first = cache_offset as usize;
+                let win_lo = abs_first.saturating_sub(w.saturating_sub(1));
+                i32::try_from(win_lo).map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
+            }
+        };
+
+        let storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![seq_len, num_heads * head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut qptr = dev_ptr(as_rocm(q)?)?;
+        let mut kptr = dev_ptr(as_rocm(k_q81)?)?;
+        let mut vptr = dev_ptr(as_rocm(v_q81)?)?;
+        let mut optr = dev_ptr(&storage)?;
+        let mut max_ptr: u64 = 0;
+        let mut sum_ptr: u64 = 0;
+        let mut nh = num_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut co = cache_offset as i32;
+        let mut isd = 1.0 / (head_dim as f32).sqrt();
+        let mut wlo = window_lo_i;
+
+        let grid = crate::HipDim3::new(seq_len as u32, num_heads as u32, 1);
+        let block_dim_x = if matches!(
+            self.props.wavefront_size,
+            crate::device::handles::WavefrontSize::W32
+        ) {
+            128
+        } else {
+            256
+        };
+        let block = crate::HipDim3::new(block_dim_x, 1, 1);
+
+        let kernel_name = if cooperative {
+            "grim_qkv_attention_q81kv_v2_coop"
+        } else {
+            "grim_qkv_attention_q81kv"
+        };
+
+        let stream = self.launch_compute_kernel(
+            kernel_name,
+            grid,
+            block,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut max_ptr),
+                arg(&mut sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
+                arg(&mut wlo),
+            ],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+}
