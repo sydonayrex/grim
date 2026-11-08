@@ -1801,3 +1801,37 @@ Re-ran `qwen35_production_27b_route_wall_and_utilization` (`GRIM_SPLIT_LAYERS=32
 
 ### Verdict
 Task 8.5 soak test passed all criteria with zero memory leaks, zero zombie handles, zero VRAM accumulation, and 100% health responsiveness under continuous load, cancellations, and client disconnects.
+
+## 15. res0-T2 sparsity lever — k-group skip GEMV, first increment (2026-11-07)
+
+`grim_dot4_q80_f32act_gemv_skip` (kernels/dot_gemv.rs): variant of the dense
+q8_0-weight × f32-activation decode GEMV that drops 32-wide activation blocks
+whose max|a| < tau × row-max from the weight stream. Self-contained: an exact
+(order-free bitwise-max) row-max prepass replaces any bitmap/collector
+plumbing; the skipped block fraction IS the skipped weight-byte fraction.
+Gates in tests/q80_dot4_kgroup_skip.rs (GRIM_GPU_TEST=1):
+
+- tau=0 BIT-IDENTICAL to dense at n=k=1024 and both 27B shapes (the skip
+  machinery is an exact no-op at tau=0).
+- Error scales linearly with dead-block magnitude at 70%-dead: rel 2.23e-2 /
+  2.28e-3 / 2.28e-4 for dead_scale 1e-2/1e-3/1e-4; tau=2.0 (all dead) gives
+  exactly zero output — skip honored structurally.
+- Cold A/B (8 rotated weight copies, d84fcb32 protocol, dev0, debug build —
+  absolute numbers are build-sensitive, RATIOS are the finding):
+
+| dead | n=17408 k=5120 | n=5120 k=17408 |
+|------|----------------|----------------|
+| 0%   | 0.87x (prepass overhead) | 1.07x |
+| 50%  | 1.49x | 1.50x |
+| 70%  | 1.92x | 1.93x |
+| 90%  | 2.84x | 2.89x |
+
+Speedup tracks 1/(1-dead) almost exactly — the byte-skip model holds on
+hardware. At the probe's operating point (70% dead at tau=0.10, 189e047d) the
+lever is worth ~1.9x on this kernel. Honest costs/caveats: tau=0 overhead is
+the row-max prepass (a production integration should fuse it into the norm or
+quantize launch); synthetic dead blocks are evenly interleaved — real
+activation dead-group clustering may shift DRAM efficiency either way; the
+accuracy gate here is synthetic — production wiring needs oracle closeness +
+PPL on the 9B/27B eval harness (NOT byte-identity) before GRIM_KGROUP_SKIP
+ships. Gate D re-run 32/32 after the kernel-source edit (standing rule).

@@ -517,6 +517,54 @@ impl RocmDevice {
         )
     }
 
+    /// res0-T2 SPARSITY LEVER: skip variant of [`Self::launch_dot4_q80_f32act_gemv`].
+    /// `tau > 0` drops 32-wide activation blocks whose max|a| < tau * row-max
+    /// from the weight stream (bit-identical to dense at tau = 0). Opt-in:
+    /// production callers gate on `GRIM_KGROUP_SKIP_TAU` before choosing this.
+    pub fn launch_dot4_q80_f32act_gemv_skip(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        tau: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_gemv_skip: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv_skip: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv_skip: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut tt = tau;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_f32act_gemv_skip",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut tt),
+            ],
+        )
+    }
+
     pub fn launch_dot4_q80_f32act_gemv_v1_for_ab(
         &self,
         act_f32: &RocmStorage,
