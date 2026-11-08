@@ -1540,9 +1540,11 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
         for (int mask = 16; mask > 0; mask >>= 1)
             amax = fmaxf(amax, __shfl_xor_sync(shfl_mask, amax, mask));
 
-        const float d     = amax / 127.0f;
-        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
-        const signed char qi = (signed char)__builtin_roundf(v * inv_d);
+        const float d = (amax > 1e-9f) ? (amax / 127.0f) : 0.0f;
+        float q_flt = (d > 0.0f) ? __builtin_roundf(v / d) : 0.0f;
+        if (q_flt > 127.0f) q_flt = 127.0f;
+        if (q_flt < -127.0f) q_flt = -127.0f;
+        const signed char qi = (signed char)q_flt;
 
         float fsum = (float)qi;
         #pragma unroll
@@ -1551,8 +1553,12 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
 
         unsigned char* row_dst = out_q81 + (long long)blk * 36;
         if (lane == 0) {
-            _Float16 hd = (_Float16)d;
-            _Float16 hs = (_Float16)(fsum * d);
+            // Strata #606 overflow guard: clamp scale and sum to finite half range (-65504 to 65504)
+            const float d_finite = (d > 65504.0f) ? 65504.0f : d;
+            const float s_val = fsum * d;
+            const float s_finite = (s_val > 65504.0f) ? 65504.0f : ((s_val < -65504.0f) ? -65504.0f : s_val);
+            _Float16 hd = (_Float16)d_finite;
+            _Float16 hs = (_Float16)s_finite;
             unsigned short wd, ws;
             __builtin_memcpy(&wd, &hd, 2);
             __builtin_memcpy(&ws, &hs, 2);
@@ -1615,9 +1621,11 @@ grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
         for (int mask = 16; mask > 0; mask >>= 1)
             amax = fmaxf(amax, __shfl_xor_sync(shfl_mask, amax, mask));
 
-        const float d     = amax / 127.0f;
-        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
-        const signed char qi = (signed char)__builtin_roundf(v * inv_d);
+        const float d = (amax > 1e-9f) ? (amax / 127.0f) : 0.0f;
+        float q_flt = (d > 0.0f) ? __builtin_roundf(v / d) : 0.0f;
+        if (q_flt > 127.0f) q_flt = 127.0f;
+        if (q_flt < -127.0f) q_flt = -127.0f;
+        const signed char qi = (signed char)q_flt;
 
         float fsum = (float)qi;
         #pragma unroll
@@ -1626,8 +1634,12 @@ grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
 
         unsigned char* row_dst = out_q81 + (long long)blk * 36;
         if (lane == 0) {
-            _Float16 hd = (_Float16)d;
-            _Float16 hs = (_Float16)(fsum * d);
+            // Strata #606 overflow guard: clamp scale and sum to finite half range (-65504 to 65504)
+            const float d_finite = (d > 65504.0f) ? 65504.0f : d;
+            const float s_val = fsum * d;
+            const float s_finite = (s_val > 65504.0f) ? 65504.0f : ((s_val < -65504.0f) ? -65504.0f : s_val);
+            _Float16 hd = (_Float16)d_finite;
+            _Float16 hs = (_Float16)s_finite;
             unsigned short wd, ws;
             __builtin_memcpy(&wd, &hd, 2);
             __builtin_memcpy(&ws, &hs, 2);

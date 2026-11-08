@@ -77,22 +77,26 @@ extern "C" __global__ void grim_silu_mul_quant_q8_1(
             amax = fmaxf(amax, fabsf(val));
         }
 
-        const float d = amax / 127.0f;
-        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        const float d = (amax > 1e-9f) ? (amax / 127.0f) : 0.0f;
         unsigned char* dst = out_q81 + (long long)blk * 36;
         float fsum = 0.0f;
 
         #pragma unroll
         for (int j = 0; j < 32; ++j) {
-            int q = (int)roundf(act[j] * inv_d);
-            if (q > 127) q = 127;
-            if (q < -127) q = -127;
-            dst[4 + j] = (unsigned char)(signed char)q;
+            float q_flt = (d > 0.0f) ? roundf(act[j] / d) : 0.0f;
+            if (q_flt > 127.0f) q_flt = 127.0f;
+            if (q_flt < -127.0f) q_flt = -127.0f;
+            signed char q = (signed char)q_flt;
+            dst[4 + j] = (unsigned char)q;
             fsum += (float)q;
         }
 
-        _Float16 hd = (_Float16)d;
-        _Float16 hs = (_Float16)(fsum * d);
+        // Strata #606 overflow guard: clamp scale and sum to finite half range (-65504 to 65504)
+        const float d_finite = (d > 65504.0f) ? 65504.0f : d;
+        const float s_val = fsum * d;
+        const float s_finite = (s_val > 65504.0f) ? 65504.0f : ((s_val < -65504.0f) ? -65504.0f : s_val);
+        _Float16 hd = (_Float16)d_finite;
+        _Float16 hs = (_Float16)s_finite;
         unsigned short wd, ws;
         __builtin_memcpy(&wd, &hd, 2);
         __builtin_memcpy(&ws, &hs, 2);
