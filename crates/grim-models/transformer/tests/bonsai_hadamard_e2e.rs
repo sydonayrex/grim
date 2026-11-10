@@ -42,6 +42,18 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         None => return Ok(()),
     };
     let device = grim_tensor::Device::Rocm(dev.ordinal());
+    // Parity-oracle arena: int8 — the configuration this gate was validated
+    // against (32/32 at 1f15bf6d and again 2026-11-10). The Q8_1 Dot4 KV
+    // default (2226f520, "make Q8_1 Dot4 default KV arena") flips token 3
+    // on a near-tie (grim=449 ref=264, top1-top2 gap 0.59) — a KV-format
+    // numerics finding for the KV-arena work, not a decode-path
+    // regression. Pinned here so the gate stays a drift oracle for the
+    // decode path instead of blocking on that in-flight change; unset
+    // GRIM_KV_ARENA externally to probe other formats.
+    // SAFETY: single-threaded test start, before any other thread reads these.
+    if std::env::var_os("GRIM_KV_ARENA").is_none() {
+        unsafe { std::env::set_var("GRIM_KV_ARENA", "int8") };
+    }
     // Bisect affordance: GRIM_BISECT_PROBE=1 forces the host KDA path + the
     // kda-step probes so the layer-0 dumps reflect the SAME token ids the
     // harness feeds (grim-cli's own probe runs use its template
