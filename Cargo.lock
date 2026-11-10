@@ -2521,6 +2521,7 @@ dependencies = [
  "grim-format",
  "grim-hip-sys",
  "grim-kvquant",
+ "grim-memory",
  "grim-nn",
  "grim-quant",
  "grim-tensor",

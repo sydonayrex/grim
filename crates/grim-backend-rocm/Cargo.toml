@@ -12,6 +12,7 @@ grim-backend-cpu = { workspace = true }
 grim-format = { workspace = true }
 grim-quant = { workspace = true }
 grim-core = { workspace = true }
+grim-memory = { workspace = true }
 thiserror = { workspace = true }
 log = "0.4"
 half = "2.0"

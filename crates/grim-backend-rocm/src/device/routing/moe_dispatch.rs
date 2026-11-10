@@ -1,9 +1,13 @@
 //! MoE routing and Charon kernel dispatchers for `RocmDevice`.
 
 //! Fused MoE resident-dispatch launchers (routing, w8a8, awq, mxfp4 variants).
+//!
+//! astrum P3 (gated, default OFF): route-prior/residency/trace plumbing composes
+//! `grim_memory::moe_budget` primitives.
 
 use std::ffi::c_void;
 
+use grim_memory::moe_budget::{ExpertRouteTrace, ResidentProfileFreq};
 use grim_tensor::backend::BackendStorage;
 use grim_tensor::dtype::DType;
 use grim_tensor::error::{Error, Result};
@@ -15,6 +19,97 @@ use crate::device::roc_device::CharonBackwardResult;
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{HipDim3, RocmHandle, arg, check_hip, dtype_f32, hipMemsetAsync};
+
+// ── astrum P3: route-prior / residency / trace plumbing (default OFF) ──────
+
+/// Apply selection-only cache-conditioned route prior to host logits.
+/// `logits` layout: `[seq_len, num_experts]` row-major. Adds
+/// `profile.route_bonus(layer, expert, resident_slots, lambda)` to each token's
+/// logit for resident experts. No-op when lambda <= 0, slots == 0, or dims mismatch.
+/// Does NOT renormalize (softmax/top-k downstream handles selection weights).
+pub fn astrum_apply_route_prior_to_logits(
+    logits: &mut [f32],
+    num_experts: usize,
+    layer: usize,
+    profile: &ResidentProfileFreq,
+    resident_slots: usize,
+    lambda: f32,
+) {
+    if lambda <= 0.0 || resident_slots == 0 || num_experts == 0 {
+        return;
+    }
+    for token_logits in logits.chunks_mut(num_experts) {
+        if token_logits.len() != num_experts {
+            break;
+        }
+        for (expert, slot) in token_logits.iter_mut().enumerate() {
+            let bonus = profile.route_bonus(layer, expert, resident_slots, lambda);
+            if bonus != 0.0 {
+                *slot += bonus;
+            }
+        }
+    }
+}
+
+/// Record routed expert selections from a host `RoutingAssignment` into a trace.
+/// Counts each (layer, expert) occurrence (per token-pair in assignment).
+pub fn astrum_record_routing_assignment(
+    trace: &mut ExpertRouteTrace,
+    layer: usize,
+    assignment: &crate::kernels::charon::RoutingAssignment,
+) {
+    for &expert in &assignment.experts {
+        trace.record(layer, expert as usize);
+    }
+}
+
+/// Record routed experts from device-resident routing buffers (u32 expert ids).
+/// Caller is responsible for D2H readback when needed; this is a CPU-side ingest hook.
+pub fn astrum_record_routed_experts(
+    trace: &mut ExpertRouteTrace,
+    layer: usize,
+    experts: &[u32],
+) {
+    for &e in experts {
+        trace.record(layer, e as usize);
+    }
+}
+
+/// Consult residency for an expert using profile when available, else fallback.
+pub fn astrum_is_resident<F>(
+    layer: usize,
+    expert: usize,
+    profile: Option<&ResidentProfileFreq>,
+    resident_slots: usize,
+    fallback: F,
+) -> bool
+where
+    F: FnOnce(usize) -> bool,
+{
+    if resident_slots > 0 {
+        if let Some(p) = profile {
+            return p.is_resident(layer, expert);
+        }
+    }
+    fallback(expert)
+}
+
+/// env-gated route prior lambda (0.0 when unset/off).
+pub fn astrum_route_prior_lambda_from_env() -> f32 {
+    std::env::var("GRIM_ASTRUM_ROUTE_PRIOR")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0)
+}
+
+/// env-gated resident slots (0 when unset/off).
+pub fn astrum_expert_resident_slots_from_env() -> usize {
+    std::env::var("GRIM_ASTRUM_EXPERT_RESIDENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 impl RocmDevice {
     /// Fused MoE dispatch helper: allocates output buffer, uploads flat expert weights,
     /// and launches `grim_moe_fused_dispatch`.
@@ -2680,3 +2775,33 @@ impl RocmDevice {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod astrum_p3_moe_dispatch_tests {
+    use super::*;
+    use grim_memory::moe_budget::{ExpertRouteTrace, ResidentProfileFreq};
+
+    #[test]
+    fn astrum_route_prior_applies_to_logits_when_enabled() {
+        let mut logits = vec![0.0f32, 0.0, 1.0, 0.0]; // token 0: experts 0,1,2,3
+        let mut trace = ExpertRouteTrace::new(1, 4);
+        for _ in 0..50 { trace.record(0, 2); }
+        let profile = ResidentProfileFreq::from_trace(&trace, 1);
+        astrum_apply_route_prior_to_logits(&mut logits, 4, 0, &profile, 1, 2.0);
+        assert!(logits[2] > 1.0); // resident expert got bonus
+    }
+
+    #[test]
+    fn astrum_record_routing_assignment_updates_trace() {
+        let mut trace = ExpertRouteTrace::new(1, 8);
+        let assignment = crate::kernels::charon::RoutingAssignment {
+            tokens: vec![0, 1],
+            experts: vec![3, 7],
+            weights: vec![0.5, 0.5],
+        };
+        astrum_record_routing_assignment(&mut trace, 0, &assignment);
+        assert_eq!(trace.count(0, 3), 1);
+        assert_eq!(trace.count(0, 7), 1);
+    }
+}
+

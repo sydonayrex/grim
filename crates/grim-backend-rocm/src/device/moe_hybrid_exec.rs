@@ -1,8 +1,12 @@
 //! ROCm/HIP hybrid MoE decode executor with bandwidth-adaptive CPU-GPU co-execution.
 //! When serving frontier MoE models (DeepSeek-V4, Qwen3.6-MoE, GLM-5.2) on consumer/workstation AMD GPUs, the full expert.
+//!
+//! astrum P3 (gated, default OFF): route-prior/residency/trace plumbing composes
+//! `grim_memory::moe_budget` primitives (`ExpertRouteTrace`, `ResidentProfileFreq`).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use grim_memory::moe_budget::{ExpertRouteTrace, ResidentProfileFreq};
 use grim_tensor::error::{Error, Result};
 
 /// Mapped pinned memory flag for HIP-graph-compatible CPU/GPU handshake without CUDA/HIP host synchronization stalls.
@@ -98,6 +102,130 @@ impl MoeHybridExecutionPlan {
     }
 }
 
+/// astrum P3: env-gated residency/trace/route-prior config (default OFF).
+/// Composes `grim_memory::moe_budget` primitives without changing default math.
+#[derive(Debug, Clone, Default)]
+pub struct AstrumMoeResidencyConfig {
+    /// `GRIM_ASTRUM_EXPERT_RESIDENT=<N>` slots per layer (0/unset => off).
+    pub resident_slots: usize,
+    /// `GRIM_ASTRUM_ROUTE_PRIOR=<lambda>` (0/unset => no selection bonus).
+    pub route_prior_lambda: f32,
+    /// `GRIM_ASTRUM_EXPERT_TRACE=1` enables in-memory trace recording hooks.
+    pub trace_enabled: bool,
+}
+
+impl AstrumMoeResidencyConfig {
+    pub fn from_env() -> Self {
+        let resident_slots = std::env::var("GRIM_ASTRUM_EXPERT_RESIDENT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let route_prior_lambda = std::env::var("GRIM_ASTRUM_ROUTE_PRIOR")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        let trace_enabled = std::env::var("GRIM_ASTRUM_EXPERT_TRACE")
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(false);
+        Self {
+            resident_slots,
+            route_prior_lambda,
+            trace_enabled,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.resident_slots > 0 || self.route_prior_lambda > 0.0 || self.trace_enabled
+    }
+}
+
+/// astrum P3: mutable residency/trace state for MoE dispatch planning.
+/// Default OFF: when disabled, consults fall back to caller-provided residency and record is a no-op.
+#[derive(Debug, Clone, Default)]
+pub struct AstrumMoeResidencyState {
+    pub config: AstrumMoeResidencyConfig,
+    /// Optional frequency-ranked profile built from trace (selection-only residency/prior input).
+    pub profile: Option<ResidentProfileFreq>,
+    /// Optional activation trace (layer, expert hit counts).
+    pub trace: Option<ExpertRouteTrace>,
+}
+
+impl AstrumMoeResidencyState {
+    pub fn from_env(layers: usize, experts: usize) -> Self {
+        let config = AstrumMoeResidencyConfig::from_env();
+        let trace = if config.trace_enabled && layers > 0 && experts > 0 {
+            Some(ExpertRouteTrace::new(layers, experts))
+        } else {
+            None
+        };
+        Self {
+            config,
+            profile: None,
+            trace,
+        }
+    }
+
+    /// Rebuild frequency-ranked profile from current trace (if any).
+    pub fn rebuild_profile_from_trace(&mut self) {
+        let n = self.config.resident_slots;
+        self.profile = match (&self.trace, n > 0) {
+            (Some(t), true) => Some(ResidentProfileFreq::from_trace(t, n)),
+            _ => None,
+        };
+    }
+
+    /// Record routed experts for `layer_idx` into trace (no-op when tracing disabled/unavailable).
+    pub fn record_routed(&mut self, layer_idx: usize, routed_experts: &[usize]) {
+        if let Some(trace) = self.trace.as_mut() {
+            for &e in routed_experts {
+                trace.record(layer_idx, e);
+            }
+        }
+    }
+
+    /// Record routed expert ids for `layer_idx` from an iterator (e.g. device-readback or assignment pairs).
+    pub fn record_routed_iter<I>(&mut self, layer_idx: usize, experts: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        if let Some(trace) = self.trace.as_mut() {
+            for e in experts {
+                trace.record(layer_idx, e);
+            }
+        }
+    }
+
+    /// Selection-only route bonus for (layer, expert). Returns 0.0 when disabled/profile absent.
+    pub fn route_bonus(&self, layer_idx: usize, expert: usize) -> f32 {
+        let lambda = self.config.route_prior_lambda;
+        if lambda <= 0.0 {
+            return 0.0;
+        }
+        match &self.profile {
+            Some(p) => p.route_bonus(layer_idx, expert, self.config.resident_slots.max(1), lambda),
+            None => 0.0,
+        }
+    }
+
+    /// Consult residency: profile-driven when available, else fallback.
+    pub fn is_resident_or<F>(&self, layer_idx: usize, expert: usize, fallback: F) -> bool
+    where
+        F: FnOnce(usize) -> bool,
+    {
+        if self.config.resident_slots > 0 {
+            if let Some(p) = &self.profile {
+                return p.is_resident(layer_idx, expert);
+            }
+        }
+        fallback(expert)
+    }
+}
+
+
 /// Hybrid MoE execution coordinator for ROCm/HIP devices.
 pub struct MoeHybridExecutor {
     /// PCIe transfer bandwidth in MB/s (B_P).
@@ -121,6 +249,95 @@ impl MoeHybridExecutor {
     /// Plan the hybrid execution partition for a token's routed top-k experts.
     /// # Contract `resident_check` returns `true` if expert `e` is currently resident in GPU cache.
     pub fn plan_step<F>(
+        &self,
+        layer_idx: usize,
+        routed_experts: &[usize],
+        is_resident: F,
+    ) -> MoeHybridExecutionPlan
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.plan_step_inner(layer_idx, routed_experts, is_resident)
+    }
+
+    /// astrum P3: plan using a frequency-ranked residency profile when present (gated/default OFF).
+    /// Falls back to `is_resident_fallback` for experts/layers not covered by the profile.
+    pub fn plan_step_with_profile<F>(
+        &self,
+        layer_idx: usize,
+        routed_experts: &[usize],
+        profile: Option<&ResidentProfileFreq>,
+        resident_slots: usize,
+        mut is_resident_fallback: F,
+    ) -> MoeHybridExecutionPlan
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let use_profile = profile.is_some() && resident_slots > 0;
+        self.plan_step_inner(layer_idx, routed_experts, |e| {
+            if use_profile {
+                if let Some(p) = profile {
+                    return p.is_resident(layer_idx, e);
+                }
+            }
+            is_resident_fallback(e)
+        })
+    }
+
+    /// astrum P3: plan and optionally record routed experts into trace (default OFF).
+    pub fn plan_step_traced<F>(
+        &self,
+        layer_idx: usize,
+        routed_experts: &[usize],
+        trace: Option<&mut ExpertRouteTrace>,
+        is_resident: F,
+    ) -> MoeHybridExecutionPlan
+    where
+        F: FnMut(usize) -> bool,
+    {
+        if let Some(t) = trace {
+            for &e in routed_experts {
+                t.record(layer_idx, e);
+            }
+        }
+        self.plan_step_inner(layer_idx, routed_experts, is_resident)
+    }
+
+    /// astrum P3: compose residency/trace state (profile consult + optional recording) in one call.
+    pub fn plan_step_with_astrum<F>(
+        &self,
+        layer_idx: usize,
+        routed_experts: &[usize],
+        state: Option<&mut AstrumMoeResidencyState>,
+        mut is_resident_fallback: F,
+    ) -> MoeHybridExecutionPlan
+    where
+        F: FnMut(usize) -> bool,
+    {
+        match state {
+            Some(st) if st.config.enabled() => {
+                st.record_routed(layer_idx, routed_experts);
+                // consult profile if available, else fallback
+                if st.config.resident_slots > 0 {
+                    if let Some(profile) = st.profile.as_ref() {
+                        let p = profile;
+                        return self.plan_step_inner(layer_idx, routed_experts, |e| {
+                            p.is_resident(layer_idx, e)
+                        });
+                    }
+                }
+                self.plan_step_inner(layer_idx, routed_experts, |e| is_resident_fallback(e))
+            }
+            Some(st) => {
+                // tracing might be enabled independently? config.enabled covers it, but be safe
+                st.record_routed(layer_idx, routed_experts);
+                self.plan_step_inner(layer_idx, routed_experts, is_resident_fallback)
+            }
+            None => self.plan_step_inner(layer_idx, routed_experts, is_resident_fallback),
+        }
+    }
+
+    fn plan_step_inner<F>(
         &self,
         layer_idx: usize,
         routed_experts: &[usize],
@@ -304,5 +521,48 @@ mod tests {
         let cpu_out = vec![0.5, 0.5, 0.5, 0.5];
         MoeHybridExecutor::merge_outputs(&mut gpu_out, &cpu_out).unwrap();
         assert_eq!(gpu_out, vec![1.5, 2.5, 3.5, 4.5]);
+    }
+
+    #[test]
+    fn astrum_p3_trace_records_and_profile_consults_residency() {
+        let executor = MoeHybridExecutor::new(25_000.0, 50_000.0);
+        let mut trace = ExpertRouteTrace::new(2, 8);
+        // route: expert 3,7 hot on layer 0 (strict frequency ranking)
+        for _ in 0..40 {
+            executor.plan_step_traced(0, &[3, 7, 1], Some(&mut trace), |_| false);
+        }
+        for _ in 0..30 {
+            executor.plan_step_traced(0, &[3], Some(&mut trace), |_| false);
+        }
+        for _ in 0..10 {
+            executor.plan_step_traced(0, &[7], Some(&mut trace), |_| false);
+        }
+        assert!(trace.count(0, 3) > trace.count(0, 7));
+        assert!(trace.count(0, 7) > trace.count(0, 1));
+        let profile = ResidentProfileFreq::from_trace(&trace, 2);
+        assert!(profile.is_resident(0, 3));
+        assert!(profile.is_resident(0, 7));
+        assert!(!profile.is_resident(0, 1));
+        let plan = executor.plan_step_with_profile(0, &[3, 7, 1], Some(&profile), 2, |_| false);
+        // 3,7 resident, 1 miss -> split by q*
+        assert!(plan.gpu_resident_experts.contains(&3));
+        assert!(plan.gpu_resident_experts.contains(&7));
+        assert_eq!(plan.total_active_experts(), 3);
+    }
+
+    #[test]
+    fn astrum_p3_route_bonus_gated() {
+        let mut st = AstrumMoeResidencyState::default();
+        assert_eq!(st.route_bonus(0, 0), 0.0);
+        st.config.route_prior_lambda = 2.0;
+        st.config.resident_slots = 2;
+        // no profile => 0
+        assert_eq!(st.route_bonus(0, 0), 0.0);
+        let mut t = ExpertRouteTrace::new(1, 4);
+        for _ in 0..10 { t.record(0, 1); }
+        st.trace = Some(t);
+        st.rebuild_profile_from_trace();
+        assert!(st.route_bonus(0, 1) > 0.0);
+        assert_eq!(st.route_bonus(0, 2), 0.0);
     }
 }
