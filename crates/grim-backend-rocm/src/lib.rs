@@ -61,7 +61,7 @@ pub use device::capability_profiler::{
     CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch,
     free_device_memory, vram_info, vram_info_detailed,
 };
-pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
+pub use device::moe_hybrid_exec::{AstrumMoeResidencyConfig, AstrumMoeResidencyState, MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
 pub use device::util::{
     arm_rocm_watchdog, disarm_rocm_watchdog, ensure_rocm_watchdog_started,
     notify_model_loading_bytes, report_rocm_progress, watchdog_armed,

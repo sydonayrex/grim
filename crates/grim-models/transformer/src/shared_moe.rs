@@ -2729,10 +2729,48 @@ fn per_expert_loop(
 /// logit, descending) with softmax-normalized combine weights (no architecture
 /// scaling applied — multiply by `routed_scaling_factor` at dispatch time).
 pub fn route_topk(logits_v: &[f32], num_experts: usize, top_k: usize) -> Result<Vec<TokenRouting>> {
-    let seq_len = logits_v.len().checked_div(num_experts).unwrap_or(0);
+    route_topk_with_astrum_prior(logits_v, num_experts, top_k, None, 0, 0, 0.0)
+}
+
+/// astrum P3 (gated, default OFF): CPU route-topk with optional selection-only
+/// cache-conditioned route prior applied to logits before top-k selection.
+/// When `profile` is None or `lambda`/`resident_slots` are 0, behavior matches `route_topk`.
+pub fn route_topk_with_astrum_prior(
+    logits_v: &[f32],
+    num_experts: usize,
+    top_k: usize,
+    profile: Option<&grim_memory::moe_budget::ResidentProfileFreq>,
+    layer: usize,
+    resident_slots: usize,
+    lambda: f32,
+) -> Result<Vec<TokenRouting>> {
+    if num_experts == 0 {
+        return Ok(Vec::new());
+    }
+    let mut logits = if profile.is_some() && resident_slots > 0 && lambda > 0.0 {
+        logits_v.to_vec()
+    } else {
+        Vec::new()
+    };
+    let src = if !logits.is_empty() {
+        if let Some(p) = profile {
+            grim_backend_rocm::device::routing::astrum_apply_route_prior_to_logits(
+                &mut logits,
+                num_experts,
+                layer,
+                p,
+                resident_slots,
+                lambda,
+            );
+        }
+        &logits[..]
+    } else {
+        logits_v
+    };
+    let seq_len = src.len().checked_div(num_experts).unwrap_or(0);
     let mut out = Vec::with_capacity(seq_len);
     for s in 0..seq_len {
-        let row = &logits_v[s * num_experts..(s + 1) * num_experts];
+        let row = &src[s * num_experts..(s + 1) * num_experts];
         let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let k = top_k.min(num_experts);

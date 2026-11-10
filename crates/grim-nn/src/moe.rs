@@ -2060,6 +2060,25 @@ impl MoeFfn {
         executor: &grim_backend_rocm::MoeHybridExecutor,
         is_resident: impl Fn(usize) -> bool,
     ) -> Result<Tensor, grim_tensor::error::Error> {
+        let mut fallback = is_resident;
+        self.forward_moe_aware_hybrid_with_astrum(x, executor, 0, None, &mut fallback)
+    }
+
+    /// astrum P3: hybrid decode forward with optional residency/trace plumbing (gated, default OFF).
+    /// When `astrum_state` is enabled with a profile, planning consults it for residency; when tracing
+    /// is enabled, routed experts are recorded per token/layer. Prior application to routing selection
+    /// is exercised at router/logit call sites (CPU paths); this method wires planning/trace.
+    pub fn forward_moe_aware_hybrid_with_astrum<F>(
+        &self,
+        x: &Tensor,
+        executor: &grim_backend_rocm::MoeHybridExecutor,
+        layer_idx: usize,
+        mut astrum_state: Option<&mut grim_backend_rocm::AstrumMoeResidencyState>,
+        is_resident_fallback: &mut F,
+    ) -> Result<Tensor, grim_tensor::error::Error>
+    where
+        F: FnMut(usize) -> bool,
+    {
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
         let hidden = self
@@ -2077,8 +2096,13 @@ impl MoeFfn {
             let w = &weights[t];
             let xt = slice_row(x, t)?;
 
-            // Build hybrid plan for this token's active experts
-            let plan = executor.plan_step(0, experts, &is_resident);
+            // Build hybrid plan for this token's active experts (astrum P3: profile/trace aware when gated).
+            let plan = executor.plan_step_with_astrum(
+                layer_idx,
+                experts,
+                astrum_state.as_deref_mut(),
+                &mut *is_resident_fallback,
+            );
             let gpu_set: std::collections::HashSet<usize> = plan
                 .gpu_resident_experts
                 .iter()
