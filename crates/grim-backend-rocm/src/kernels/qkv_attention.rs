@@ -569,21 +569,15 @@ void grim_qkv_attention_q81kv(
     __shared__ float s_acc[8][260];
 
     const int num_blocks = head_dim / 32;
-    float q_d[8];
-    signed char q_qs[8][32];
-
-    for (int blk = 0; blk < num_blocks && blk < 8; ++blk) {
-        float amax = 0.0f;
-        for (int e = 0; e < 32; ++e) {
-            float v = fabsf(q[q_offset + blk * 32 + e]);
-            if (v > amax) amax = v;
-        }
-        float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
-        q_d[blk] = d;
-        for (int e = 0; e < 32; ++e) {
-            float v = q[q_offset + blk * 32 + e] / d;
-            int qv = __float2int_rn(v);
-            q_qs[blk][e] = (signed char)((qv < -127) ? -127 : ((qv > 127) ? 127 : qv));
+    // Q stays in full f32 — the reference keeps Q in f16, and quantizing Q
+    // to int8 per block (the previous sudot4 form) injected a per-block
+    // error the reference does not have (Gate D token 3 near-tie flip).
+    float q_reg[8];
+    if (lane_id < head_dim) {
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
         }
     }
 
@@ -596,35 +590,23 @@ void grim_qkv_attention_q81kv(
 
     for (int j = lo + j_start; j < lo + j_end; ++j) {
         float score = 0.0f;
-        if (lane_id == 0) {
-            for (int blk = 0; blk < num_blocks && blk < 8; ++blk) {
-                const unsigned char* k_blk = k_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            if (idx < head_dim) {
+                const unsigned char* k_blk = k_tensor + (long long)j * row_stride
+                    + ((long long)kv_head * num_blocks + (idx >> 5)) * blk_stride;
                 __half khalf;
                 __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
                 float kd = __half2float(khalf);
-                const signed char* k_codes = (const signed char*)(k_blk + 4);
-
-                int iacc = 0;
-                #pragma unroll
-                for (int e = 0; e < 32; e += 4) {
-                    int q4, k4;
-                    __builtin_memcpy(&q4, &q_qs[blk][e], 4);
-                    __builtin_memcpy(&k4, k_codes + e, 4);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
-                    iacc = __builtin_amdgcn_sudot4(true, q4, true, k4, iacc, false);
-#else
-                    iacc = (int)((char)(q4 & 0xff)) * ((int)(char)(k4 & 0xff))
-                         + (int)((char)((q4 >> 8) & 0xff)) * ((int)(char)((k4 >> 8) & 0xff))
-                         + (int)((char)((q4 >> 16) & 0xff)) * ((int)(char)((k4 >> 16) & 0xff))
-                         + (int)((char)((q4 >> 24) & 0xff)) * ((int)(char)((k4 >> 24) & 0xff))
-                         + iacc;
-#endif
-                }
-                score += (float)iacc * (q_d[blk] * kd);
+                signed char kcode = ((const signed char*)(k_blk + 4))[idx & 31];
+                score += q_reg[c] * ((float)kcode * kd);
             }
         }
-        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
-        score = __shfl_sync(shfl_mask, score, 0);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            score += __shfl_xor(score, off);
+        }
         score *= inv_sqrt_d;
 
         const float old_max = running_max;
@@ -745,25 +727,16 @@ void grim_qkv_attention_q81kv_v2_coop(
     __shared__ float s_acc[8][260];
 
     const int num_blocks = head_dim / 32;
-    __shared__ float sq_d[8];
-    __shared__ signed char sq_qs[8][32];
-
-    if (threadIdx.x < (unsigned int)(num_blocks * 32)) {
-        int blk = threadIdx.x / 32;
-        int e = threadIdx.x % 32;
-        float v = q[q_offset + blk * 32 + e];
-        float amax = fabsf(v);
+    // Q stays in full f32 — see the V1/graph-kernel notes: quantizing Q to
+    // int8 per block injected an error the reference does not have.
+    float q_reg[8];
+    if (lane_id < head_dim) {
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            float other = __shfl_xor(amax, off);
-            if (other > amax) amax = other;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
         }
-        float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
-        if (e == 0) sq_d[blk] = d;
-        int qv = __float2int_rn(v / d);
-        sq_qs[blk][e] = (signed char)((qv < -127) ? -127 : ((qv > 127) ? 127 : qv));
     }
-    __syncthreads();
 
     float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
@@ -774,27 +747,18 @@ void grim_qkv_attention_q81kv_v2_coop(
 
     for (int j = lo + j_start; j < lo + j_end; ++j) {
         float lane_contrib = 0.0f;
-        int blk = lane_id / 8;
-        int sub = (lane_id % 8) * 4;
-        if (blk < num_blocks) {
-            const unsigned char* k_blk = k_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
-            __half khalf;
-            __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
-            float kd = __half2float(khalf);
-            const signed char* k_codes = (const signed char*)(k_blk + 4);
-
-            int q4, k4;
-            __builtin_memcpy(&q4, &sq_qs[blk][sub], 4);
-            __builtin_memcpy(&k4, k_codes + sub, 4);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
-            int iacc = __builtin_amdgcn_sudot4(true, q4, true, k4, 0, false);
-#else
-            int iacc = (int)((char)(q4 & 0xff)) * ((int)(char)(k4 & 0xff))
-                 + (int)((char)((q4 >> 8) & 0xff)) * ((int)(char)((k4 >> 8) & 0xff))
-                 + (int)((char)((q4 >> 16) & 0xff)) * ((int)(char)((k4 >> 16) & 0xff))
-                 + (int)((char)((q4 >> 24) & 0xff)) * ((int)(char)((k4 >> 24) & 0xff));
-#endif
-            lane_contrib = (float)iacc * (sq_d[blk] * kd);
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            if (idx < head_dim) {
+                const unsigned char* k_blk = k_tensor + (long long)j * row_stride
+                    + ((long long)kv_head * num_blocks + (idx >> 5)) * blk_stride;
+                __half khalf;
+                __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
+                float kd = __half2float(khalf);
+                signed char kcode = ((const signed char*)(k_blk + 4))[idx & 31];
+                lane_contrib += q_reg[c] * ((float)kcode * kd);
+            }
         }
 
         #pragma unroll
@@ -4273,25 +4237,19 @@ extern "C" __global__ void grim_qkv_attention_dev_q81(
     __shared__ float s_acc[8][260];
 
     const int num_blocks = head_dim / 32;
-    __shared__ float sq_d[8];
-    __shared__ signed char sq_qs[8][32];
-
-    if (threadIdx.x < (unsigned int)(num_blocks * 32)) {
-        int blk = threadIdx.x / 32;
-        int e = threadIdx.x % 32;
-        float v = q[q_offset + blk * 32 + e];
-        float amax = fabsf(v);
+    // Q stays in full f32 (the reference keeps Q in f16; the int8 arena
+    // path — which matches the reference token-for-token — also keeps Q
+    // in f32). Quantizing Q to int8 per block (the previous sudot4 form)
+    // injected a per-block error the reference does not have and flipped
+    // near-tie tokens (Gate D token 3, gap 0.59).
+    float q_reg[8];
+    if (lane_id < head_dim) {
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            float other = __shfl_xor(amax, off);
-            if (other > amax) amax = other;
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
         }
-        float d = (amax / 127.0f > 1e-30f) ? (amax / 127.0f) : 1e-30f;
-        if (e == 0) sq_d[blk] = d;
-        int qv = __float2int_rn(v / d);
-        sq_qs[blk][e] = (signed char)((qv < -127) ? -127 : ((qv > 127) ? 127 : qv));
     }
-    __syncthreads();
 
     int live_rows = total_dev[slot] + steps;
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
@@ -4314,27 +4272,18 @@ extern "C" __global__ void grim_qkv_attention_dev_q81(
 
     for (int j = lo + j_start; j < lo + j_end; ++j) {
         float lane_contrib = 0.0f;
-        int blk = lane_id / 8;
-        int sub = (lane_id % 8) * 4;
-        if (blk < num_blocks) {
-            const unsigned char* k_blk = k_tensor + slot_base + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
-            __half khalf;
-            __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
-            float kd = __half2float(khalf);
-            const signed char* k_codes = (const signed char*)(k_blk + 4);
-
-            int q4, k4;
-            __builtin_memcpy(&q4, &sq_qs[blk][sub], 4);
-            __builtin_memcpy(&k4, k_codes + sub, 4);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
-            int iacc = __builtin_amdgcn_sudot4(true, q4, true, k4, 0, false);
-#else
-            int iacc = (int)((char)(q4 & 0xff)) * ((int)(char)(k4 & 0xff))
-                 + (int)((char)((q4 >> 8) & 0xff)) * ((int)(char)((k4 >> 8) & 0xff))
-                 + (int)((char)((q4 >> 16) & 0xff)) * ((int)(char)((k4 >> 16) & 0xff))
-                 + (int)((char)((q4 >> 24) & 0xff)) * ((int)(char)((k4 >> 24) & 0xff));
-#endif
-            lane_contrib = (float)iacc * (sq_d[blk] * kd);
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            if (idx < head_dim) {
+                const unsigned char* k_blk = k_tensor + slot_base + (long long)j * row_stride
+                    + ((long long)kv_head * num_blocks + (idx >> 5)) * blk_stride;
+                __half khalf;
+                __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
+                float kd = __half2float(khalf);
+                signed char kcode = ((const signed char*)(k_blk + 4))[idx & 31];
+                lane_contrib += q_reg[c] * ((float)kcode * kd);
+            }
         }
 
         #pragma unroll
