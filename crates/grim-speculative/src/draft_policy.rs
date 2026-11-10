@@ -73,6 +73,18 @@ impl DraftPolicy {
         }
     }
 
+    /// astrum P5: enable via `GRIM_ASTRUM_DRAFT_POLICY=1` (default OFF, output-neutral).
+    pub fn from_env() -> Option<Self> {
+        if std::env::var("GRIM_ASTRUM_DRAFT_POLICY").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let margin = std::env::var("GRIM_ASTRUM_DRAFT_MARGIN")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.05);
+        Some(Self::new(margin))
+    }
+
     /// Select source for a context length (bucketed). MTP is the default until
     /// data shows suffix wins by more than `margin` with hysteresis.
     pub fn select(&mut self, ctx_len: usize) -> DraftSource {

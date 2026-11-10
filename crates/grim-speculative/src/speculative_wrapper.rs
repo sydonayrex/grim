@@ -104,7 +104,7 @@ impl SpeculativeCausalLm {
                 SpeculationConfig::default(),
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
-            astrum_draft_policy: None,
+            astrum_draft_policy: crate::draft_policy::DraftPolicy::from_env().map(std::sync::Mutex::new),
             gpu_verifier: None,
         }
     }
@@ -146,7 +146,7 @@ impl SpeculativeCausalLm {
             confidence: Some(confidence),
             scheduler: Mutex::new(scheduler),
             depth_tuner: Mutex::new(depth_tuner),
-            astrum_draft_policy: None,
+            astrum_draft_policy: crate::draft_policy::DraftPolicy::from_env().map(std::sync::Mutex::new),
             gpu_verifier: None,
         }
     }
@@ -165,7 +165,7 @@ impl SpeculativeCausalLm {
                 SpeculationConfig::default(),
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
-            astrum_draft_policy: None,
+            astrum_draft_policy: crate::draft_policy::DraftPolicy::from_env().map(std::sync::Mutex::new),
             gpu_verifier: None,
         }
     }
