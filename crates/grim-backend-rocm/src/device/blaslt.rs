@@ -157,6 +157,50 @@ type MatmulFn = unsafe extern "C" fn(
     *mut c_void,
 ) -> i32;
 
+type MatmulPreferenceCreateFn = unsafe extern "C" fn(*mut *mut c_void) -> i32;
+type MatmulPreferenceDestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type MatmulPreferenceSetAttributeFn =
+    unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> i32;
+type MatmulAlgoGetHeuristicFn = unsafe extern "C" fn(
+    *mut c_void,  // handle
+    *mut c_void,  // matmulDesc
+    *mut c_void,  // Adesc
+    *mut c_void,  // Bdesc
+    *mut c_void,  // Cdesc
+    *mut c_void,  // Ddesc
+    *mut c_void,  // pref
+    i32,          // requestedAlgoCount
+    *mut HipblasLtMatmulHeuristicResult,
+    *mut i32,     // returnAlgoCount
+) -> i32;
+
+/// Raw hipblasLtMatmulAlgo_t (opaque, trivially copyable/serializable).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HipblasLtMatmulAlgo {
+    pub data: [u8; 16],
+    pub max_workspace_bytes: usize,
+}
+
+/// Raw hipblasLtMatmulHeuristicResult_t.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HipblasLtMatmulHeuristicResult {
+    pub algo: HipblasLtMatmulAlgo,
+    pub workspace_size: usize,
+    pub state: i32,
+    pub waves_count: f32,
+    pub reserved: [i32; 4],
+}
+
+/// A heuristic algo candidate returned by hipBLASLt.
+#[derive(Debug, Clone, Copy)]
+pub struct BlasLtAlgoCandidate {
+    pub algo: HipblasLtMatmulAlgo,
+    pub workspace_size: usize,
+    pub waves_count: f32,
+}
+
 struct MatmulApi {
     _library: Library,
     create: CreateFn,
@@ -167,6 +211,10 @@ struct MatmulApi {
     desc_destroy: MatmulDescDestroyFn,
     desc_set_attribute: MatmulDescSetAttributeFn,
     matmul: MatmulFn,
+    pref_create: MatmulPreferenceCreateFn,
+    pref_destroy: MatmulPreferenceDestroyFn,
+    pref_set_attribute: MatmulPreferenceSetAttributeFn,
+    algo_get_heuristic: MatmulAlgoGetHeuristicFn,
 }
 
 impl MatmulApi {
@@ -205,6 +253,18 @@ impl MatmulApi {
                         .map_err(|error| error.to_string())?,
                     matmul: *library
                         .get::<MatmulFn>(b"hipblasLtMatmul\0")
+                        .map_err(|error| error.to_string())?,
+                    pref_create: *library
+                        .get::<MatmulPreferenceCreateFn>(b"hipblasLtMatmulPreferenceCreate\0")
+                        .map_err(|error| error.to_string())?,
+                    pref_destroy: *library
+                        .get::<MatmulPreferenceDestroyFn>(b"hipblasLtMatmulPreferenceDestroy\0")
+                        .map_err(|error| error.to_string())?,
+                    pref_set_attribute: *library
+                        .get::<MatmulPreferenceSetAttributeFn>(b"hipblasLtMatmulPreferenceSetAttribute\0")
+                        .map_err(|error| error.to_string())?,
+                    algo_get_heuristic: *library
+                        .get::<MatmulAlgoGetHeuristicFn>(b"hipblasLtMatmulAlgoGetHeuristic\0")
                         .map_err(|error| error.to_string())?,
                     _library: library,
                 })
@@ -294,11 +354,29 @@ pub fn matmul_col_major_f32(
     n: usize,
     k: usize,
 ) -> Result<(), String> {
+    matmul_col_major_f32_with_algo(stream, a, b, d, m, n, k, None, std::ptr::null_mut(), 0)
+}
+
+/// Like `matmul_col_major_f32` but allows selecting a specific heuristic algo
+/// and workspace (astrum P1 tuning). `algo` is a pointer to a
+/// `hipblasLtMatmulAlgo_t` (or null for default).
+pub fn matmul_col_major_f32_with_algo(
+    stream: *mut c_void,
+    a: *const c_void,
+    b: *const c_void,
+    d: *mut c_void,
+    m: usize,
+    n: usize,
+    k: usize,
+    algo: Option<&HipblasLtMatmulAlgo>,
+    workspace: *mut c_void,
+    workspace_size: usize,
+) -> Result<(), String> {
     if stream.is_null() || a.is_null() || b.is_null() || d.is_null() {
-        return Err("matmul_row_major_f32 received a null pointer".into());
+        return Err("matmul_col_major_f32 received a null pointer".into());
     }
     if m == 0 || n == 0 || k == 0 {
-        return Err("matmul_row_major_f32 received an empty shape".into());
+        return Err("matmul_col_major_f32 received an empty shape".into());
     }
     let api = unsafe { MatmulApi::open()? };
     let mut handle: *mut c_void = std::ptr::null_mut();
@@ -347,6 +425,10 @@ pub fn matmul_col_major_f32(
                 "hipblasLtMatrixLayoutCreate failed: A={a_status} B={b_status} D={d_status}"
             ));
         }
+        let algo_ptr = match algo {
+            Some(a) => a as *const HipblasLtMatmulAlgo as *const c_void,
+            None => std::ptr::null(),
+        };
         let matmul_status = (api.matmul)(
             handle,
             desc,
@@ -360,9 +442,9 @@ pub fn matmul_col_major_f32(
             d_layout,
             d,
             d_layout,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            0,
+            algo_ptr,
+            workspace,
+            workspace_size,
             stream,
         );
         let _ = (api.layout_destroy)(a_layout);
@@ -377,6 +459,148 @@ pub fn matmul_col_major_f32(
         }
     };
     result
+}
+
+/// Query hipBLASLt heuristic algorithm candidates for a canonical column-major
+/// FP32 matmul of shape (m,n,k) (C[M,N] = A[M,K] @ B[K,N]). Returns candidates
+/// in heuristic-preferred order. `max_workspace_bytes` sets the preference
+/// (0 = no workspace). astrum P1 / Step 6.
+pub fn get_heuristic_algos_f32(
+    m: usize,
+    n: usize,
+    k: usize,
+    requested: i32,
+    max_workspace_bytes: usize,
+) -> Result<Vec<BlasLtAlgoCandidate>, String> {
+    if m == 0 || n == 0 || k == 0 || requested <= 0 {
+        return Ok(Vec::new());
+    }
+    let api = unsafe { MatmulApi::open()? };
+    unsafe {
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        let mut desc: *mut c_void = std::ptr::null_mut();
+        let mut a_layout: *mut c_void = std::ptr::null_mut();
+        let mut b_layout: *mut c_void = std::ptr::null_mut();
+        let mut c_layout: *mut c_void = std::ptr::null_mut();
+        let mut d_layout: *mut c_void = std::ptr::null_mut();
+        let mut pref: *mut c_void = std::ptr::null_mut();
+
+        let cleanup = |handle: *mut c_void,
+                       desc: *mut c_void,
+                       a_layout: *mut c_void,
+                       b_layout: *mut c_void,
+                       c_layout: *mut c_void,
+                       d_layout: *mut c_void,
+                       pref: *mut c_void,
+                       api: &MatmulApi| {
+            if !pref.is_null() {
+                let _ = (api.pref_destroy)(pref);
+            }
+            if !d_layout.is_null() {
+                let _ = (api.layout_destroy)(d_layout);
+            }
+            if !c_layout.is_null() {
+                let _ = (api.layout_destroy)(c_layout);
+            }
+            if !b_layout.is_null() {
+                let _ = (api.layout_destroy)(b_layout);
+            }
+            if !a_layout.is_null() {
+                let _ = (api.layout_destroy)(a_layout);
+            }
+            if !desc.is_null() {
+                let _ = (api.desc_destroy)(desc);
+            }
+            if !handle.is_null() {
+                let _ = (api.destroy)(handle);
+            }
+        };
+
+        let st = (api.create)(&mut handle);
+        if st != 0 || handle.is_null() {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(format!("hipblasLtCreate failed: {st}"));
+        }
+        let st = (api.desc_create)(&mut desc, 2, 0); // COMPUTE_32F, scale F32
+        if st != 0 || desc.is_null() {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(format!("hipblasLtMatmulDescCreate failed: {st}"));
+        }
+        if let Err(e) = api.set_desc_transpose(desc, 0, 111) {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(e);
+        }
+        if let Err(e) = api.set_desc_transpose(desc, 1, 111) {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(e);
+        }
+        // layouts: R_32F (0), column-major leading dims m,k,n,m
+        let st_a = (api.layout_create)(&mut a_layout, 0, m as u64, k as u64, m as i64);
+        let st_b = (api.layout_create)(&mut b_layout, 0, k as u64, n as u64, k as i64);
+        let st_c = (api.layout_create)(&mut c_layout, 0, m as u64, n as u64, m as i64);
+        let st_d = (api.layout_create)(&mut d_layout, 0, m as u64, n as u64, m as i64);
+        if st_a != 0 || st_b != 0 || st_c != 0 || st_d != 0 || a_layout.is_null() || b_layout.is_null() || c_layout.is_null() || d_layout.is_null() {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(format!("hipblasLtMatrixLayoutCreate failed: A={st_a} B={st_b} C={st_c} D={st_d}"));
+        }
+        let st = (api.pref_create)(&mut pref);
+        if st != 0 || pref.is_null() {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(format!("hipblasLtMatmulPreferenceCreate failed: {st}"));
+        }
+        // HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1
+        let ws = max_workspace_bytes as u64;
+        let st = (api.pref_set_attribute)(
+            pref,
+            1,
+            &ws as *const u64 as *const c_void,
+            std::mem::size_of::<u64>(),
+        );
+        if st != 0 {
+            cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+            return Err(format!("hipblasLtMatmulPreferenceSetAttribute(MAX_WORKSPACE) failed: {st}"));
+        }
+
+        let mut results: Vec<HipblasLtMatmulHeuristicResult> = vec![
+            HipblasLtMatmulHeuristicResult {
+                algo: HipblasLtMatmulAlgo { data: [0u8; 16], max_workspace_bytes: 0 },
+                workspace_size: 0,
+                state: 0,
+                waves_count: 0.0,
+                reserved: [0i32; 4],
+            };
+            requested as usize
+        ];
+        let mut returned: i32 = 0;
+        let st = (api.algo_get_heuristic)(
+            handle,
+            desc,
+            a_layout,
+            b_layout,
+            c_layout,
+            d_layout,
+            pref,
+            requested,
+            results.as_mut_ptr(),
+            &mut returned,
+        );
+        cleanup(handle, desc, a_layout, b_layout, c_layout, d_layout, pref, &api);
+        if st != 0 {
+            return Err(format!("hipblasLtMatmulAlgoGetHeuristic failed: {st}"));
+        }
+        let nret = (returned.max(0) as usize).min(results.len());
+        let mut out = Vec::with_capacity(nret);
+        for r in results.into_iter().take(nret) {
+            if r.state == 0 { // HIPBLAS_STATUS_SUCCESS
+                out.push(BlasLtAlgoCandidate {
+                    algo: r.algo,
+                    workspace_size: r.workspace_size,
+                    waves_count: r.waves_count,
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Return whether the explicit model-prefill experiment is enabled.
