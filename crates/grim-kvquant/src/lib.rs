@@ -111,6 +111,86 @@ pub fn apply_rotation(data: &[f32], rotation: &[f32], dim: usize, count: usize) 
     out
 }
 
+/// astrum P4: KV rotation mode (default preserves existing random-orthogonal behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvRotationMode {
+    /// Existing seeded random orthogonal matrix at head_dim (default, bit-compatible).
+    RandomOrthogonal,
+    /// Fixed orthonormal Hadamard (FWHT butterfly, x+y/x-y) at 256-dim.
+    /// Falls back to RandomOrthogonal when head_dim != 256.
+    Hadamard256,
+}
+
+fn kv_rotation_mode() -> KvRotationMode {
+    if std::env::var("KV_ROTATION").ok().as_deref() == Some("hadamard256") {
+        return KvRotationMode::Hadamard256;
+    }
+    if let Ok(q) = std::env::var("GRIM_KV_QUANT") {
+        if q.trim().eq_ignore_ascii_case("q4_hadamard") {
+            return KvRotationMode::Hadamard256;
+        }
+    }
+    KvRotationMode::RandomOrthogonal
+}
+
+/// In-place FWHT (x+y, x-y butterfly), unnormalized. `data.len()` must be a power of two.
+pub fn fwht_inplace(data: &mut [f32]) {
+    let n = data.len();
+    debug_assert!(n.is_power_of_two());
+    let mut h = 1usize;
+    while h < n {
+        let mut i = 0usize;
+        while i < n {
+            for j in i..(i + h) {
+                let x = data[j];
+                let y = data[j + h];
+                data[j] = x + y;
+                data[j + h] = x - y;
+            }
+            i += h * 2;
+        }
+        h *= 2;
+    }
+}
+
+/// Orthonormal Hadamard matrix (H/sqrt(dim)) as a dense row-major `dim*dim` matrix,
+/// suitable for `apply_rotation` (rotated = data @ H). Symmetric and self-inverse.
+pub fn hadamard_matrix(dim: usize) -> Vec<f32> {
+    debug_assert!(dim.is_power_of_two() && dim > 0);
+    let scale = 1.0f32 / (dim as f32).sqrt();
+    let mut mat = vec![0.0f32; dim * dim];
+    for r in 0..dim {
+        let mut row = vec![0.0f32; dim];
+        row[r] = 1.0;
+        fwht_inplace(&mut row);
+        for c in 0..dim {
+            mat[r * dim + c] = row[c] * scale;
+        }
+    }
+    mat
+}
+
+fn rotation_for_head(head_dim: usize, forward: bool) -> (Vec<f32>, bool) {
+    // returns (matrix_to_apply_via_apply_rotation, applied_hadamard)
+    if kv_rotation_mode() == KvRotationMode::Hadamard256 && head_dim == 256 {
+        // Orthonormal symmetric Hadamard: forward == inverse == H
+        (hadamard_matrix(head_dim), true)
+    } else {
+        let rotation = random_orthogonal_matrix(head_dim, 0x1337_C0DE_BA5E_B01D);
+        if forward {
+            (rotation, false)
+        } else {
+            let mut inv = vec![0.0f32; head_dim * head_dim];
+            for r in 0..head_dim {
+                for c in 0..head_dim {
+                    inv[c * head_dim + r] = rotation[r * head_dim + c];
+                }
+            }
+            (inv, false)
+        }
+    }
+}
+
 /// Compresses / decompresses KV block contents in place.
 pub trait KvCompressor: Send + Sync {
     fn compress(&self, keys: &Tensor, values: &Tensor) -> Result<CompressedKvBlock>;
@@ -193,6 +273,9 @@ pub fn named_profile(name: &str) -> Option<KvQuantConfig> {
         "text-shallow" | "k8v4" => (8, 4, 64),
         // KV-OMNI text (deep): K4V2, group 64.
         "text-deep" | "k4v2" => (4, 2, 64),
+        // astrum P4: Q4 KV + fixed Hadamard-256 rotation (rotation mode selected
+        // via KV_ROTATION/GRIM_KV_QUANT=q4_hadamard at compress time; head_dim==256).
+        "q4_hadamard" | "q4-hadamard" => (4, 4, 32),
         // KV-OMNI audio: K2V2, group 32 (rotation is a compressor-side policy).
         "audio" | "k2v2" => (2, 2, 32),
         // KV-OMNI visual: K8V16, group 32 (Tucker-16 core).
@@ -213,6 +296,7 @@ pub const NAMED_PROFILES: &[&str] = &[
     "k8v4",
     "text-deep",
     "k4v2",
+    "q4_hadamard",
     "audio",
     "k2v2",
     "visual",
@@ -748,10 +832,11 @@ impl KvCompressor for LloydMaxCompressor {
             None => None,
         };
 
-        // 1. Random Orthogonal Rotation pre-step for Keys (§6) — skipped when a
-        // channel allocation drives the quantizer (see above).
+        // 1. Key pre-rotation (§6) — skipped when a channel allocation drives
+        // the quantizer (see above). astrum P4: env-gated hadamard256 (head_dim==256)
+        // falls back to existing random orthogonal, preserving default behavior.
         if alloc.is_none() {
-            let rotation = random_orthogonal_matrix(head_dim, 0x1337_C0DE_BA5E_B01D);
+            let (rotation, _hadamard) = rotation_for_head(head_dim, true);
             for t in 0..num_tokens {
                 for h in 0..num_kv_heads {
                     let start_idx = (t * num_kv_heads + h) * head_dim;
@@ -959,17 +1044,10 @@ impl KvCompressor for LloydMaxCompressor {
             k_data.push(0.0);
         }
 
-        // Apply inverse Random Orthogonal Rotation for Keys (§6) — only when
-        // compress applied it (i.e. no channel allocation was attached).
+        // Apply inverse key pre-rotation (§6) — only when compress applied it
+        // (i.e. no channel allocation). astrum P4: env-gated hadamard256 path.
         if alloc.is_none() {
-            let rotation = random_orthogonal_matrix(block.head_dim, 0x1337_C0DE_BA5E_B01D);
-            // Compute transpose of orthogonal matrix for the inverse transformation
-            let mut inv_rotation = vec![0.0f32; block.head_dim * block.head_dim];
-            for r in 0..block.head_dim {
-                for c in 0..block.head_dim {
-                    inv_rotation[c * block.head_dim + r] = rotation[r * block.head_dim + c];
-                }
-            }
+            let (inv_rotation, _hadamard) = rotation_for_head(block.head_dim, false);
             for t in 0..block.num_tokens {
                 for h in 0..block.num_kv_heads {
                     let start_idx = (t * block.num_kv_heads + h) * block.head_dim;
