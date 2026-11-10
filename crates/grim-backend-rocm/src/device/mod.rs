@@ -14,6 +14,7 @@ pub mod device_recurrent;
 pub mod device_serve;
 pub mod eplb;
 pub mod gemm_tuning;
+pub mod gemm_tuning_measured;
 /// Prism/Bonsai FWHT-1024 Hadamard launcher (one launch per call).
 pub mod hadamard_launch;
 pub mod handles;

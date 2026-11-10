@@ -141,6 +141,10 @@ impl ArchFamily {
 
 /// Offline-tuned rocBLAS solution index lookup table (Item 7). [see: `(m, n, k, arith)`, `solution_index`]
 pub fn lookup_solution_index(m: usize, n: usize, k: usize, arch: &str, arith: ArithType) -> i32 {
+    // astrum P1: measured override (rocblas-library table only; safe no-op when unset).
+    if let Some(idx) = crate::device::gemm_tuning_measured::lookup_measured_rocblas_solution(m, n, k, arch, arith) {
+        return idx;
+    }
     let family = ArchFamily::from_arch_str(arch);
 
     // Only tuned for FP32, F16, and BF16; other dtypes fall back to default (0).
