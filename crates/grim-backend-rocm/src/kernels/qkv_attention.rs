@@ -3113,86 +3113,6 @@ extern "C" __global__ void grim_rope_append_whitecrow_k(
     }
 }
 
-// QSA dequant-on-gather (plans/PLAN-qsa-dequant-on-gather.md, strata
-// kv_gather_q8_step transfer): read SELECTED rows of a quantized KV arena
-// and write them dequantized into a compact fp16 scratch, so the sparse
-// attention runs the proven fp16 path over only the selected cells instead
-// of the whole arena with a mask. One thread per output element.
-extern "C" __global__ void grim_kv_gather_q81(
-    const unsigned char* __restrict__ k_arena,
-    const unsigned char* __restrict__ v_arena,
-    const int* __restrict__ row_ids,
-    int n_ids,
-    int num_kv_heads,
-    int head_dim,
-    long long arena_slot_stride,
-    __half* __restrict__ k_dst,
-    __half* __restrict__ v_dst,
-    int dst_stride                 // elements per gathered row (num_kv_heads*head_dim)
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = n_ids * num_kv_heads * head_dim;
-    if (i >= total) return;
-    const int row = i / (num_kv_heads * head_dim);
-    const int rem = i % (num_kv_heads * head_dim);
-    const int kh = rem / head_dim;
-    const int d = rem % head_dim;
-    const int arena_row = row_ids[row];
-    const int num_blocks = head_dim / 32;
-    const int blk_stride = 36;
-    const long long row_bytes = (long long)num_kv_heads * num_blocks * blk_stride;
-    const unsigned char* k_blk = k_arena + (long long)arena_row * row_bytes
-        + ((long long)kh * num_blocks + (d >> 5)) * blk_stride;
-    const unsigned char* v_blk = v_arena + (long long)arena_row * row_bytes
-        + ((long long)kh * num_blocks + (d >> 5)) * blk_stride;
-    __half kd, vd;
-    __builtin_memcpy(&kd, k_blk, sizeof(kd));
-    __builtin_memcpy(&vd, v_blk, sizeof(vd));
-    const signed char kcode = ((const signed char*)(k_blk + 4))[d & 31];
-    const signed char vcode = ((const signed char*)(v_blk + 4))[d & 31];
-    k_dst[(long long)row * dst_stride + rem] = __float2half((float)kcode * __half2float(kd));
-    v_dst[(long long)row * dst_stride + rem] = __float2half((float)vcode * __half2float(vd));
-}
-
-// QSA device indexer score (plans/PLAN-qsa-dequant-on-gather.md):
-//   score[cell] = sum_h relu( q_h . k_cell )
-// per-head rectification BEFORE the sum (upstream qwen4exp.cpp
-// build_qsa_top_k semantics). One block per cell; each warp computes the
-// per-head dot with a shuffle reduction, lane 0 accumulates the rectified
-// sum. QSA keys/q are pooled+normed+roped upstream (host or device).
-extern "C" __global__ void grim_qsa_index_score(
-    const float* __restrict__ keys,   // [n_cells, idx_dim]
-    const float* __restrict__ q,      // [n_idx_h, idx_dim]
-    float* __restrict__ scores,       // [n_cells]
-    int n_cells,
-    int idx_dim,
-    int n_idx_h
-) {
-    const int cell = blockIdx.x;
-    if (cell >= n_cells) return;
-    const int lane = threadIdx.x % 32;
-    const float* k = keys + (long long)cell * idx_dim;
-
-    float acc = 0.0f;
-    for (int h = 0; h < n_idx_h; ++h) {
-        const float* qh = q + (long long)h * idx_dim;
-        float part = 0.0f;
-        for (int d = lane; d < idx_dim; d += 32) {
-            part += qh[d] * k[d];
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            part += __shfl_xor(part, off);
-        }
-        if (lane == 0) {
-            acc += fmaxf(part, 0.0f);
-        }
-    }
-    if (lane == 0) {
-        scores[cell] = acc;
-    }
-}
-
 // SPEED-DOT4: Graph-capturable Q8_1 KV append.
 // Quantizes incoming f32 tokens into 36-byte Q8_1 blocks [d: fp16][sum: fp16][32 x int8]
 // at the ring position past_dev[slot] + step.
@@ -5847,6 +5767,87 @@ extern "C" __global__ void grim_qkv_attention_ixkv(
         }
     }
 }
+
+// QSA dequant-on-gather (plans/PLAN-qsa-dequant-on-gather.md, strata
+// kv_gather_q8_step transfer): read SELECTED rows of a quantized KV arena
+// and write them dequantized into a compact fp16 scratch, so the sparse
+// attention runs the proven fp16 path over only the selected cells instead
+// of the whole arena with a mask. One thread per output element.
+extern "C" __global__ void grim_kv_gather_q81(
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    const int* __restrict__ row_ids,
+    int n_ids,
+    int num_kv_heads,
+    int head_dim,
+    long long arena_slot_stride,
+    __half* __restrict__ k_dst,
+    __half* __restrict__ v_dst,
+    int dst_stride                 // elements per gathered row (num_kv_heads*head_dim)
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_ids * num_kv_heads * head_dim;
+    if (i >= total) return;
+    const int row = i / (num_kv_heads * head_dim);
+    const int rem = i % (num_kv_heads * head_dim);
+    const int kh = rem / head_dim;
+    const int d = rem % head_dim;
+    const int arena_row = row_ids[row];
+    const int num_blocks = head_dim / 32;
+    const int blk_stride = 36;
+    const long long row_bytes = (long long)num_kv_heads * num_blocks * blk_stride;
+    const unsigned char* k_blk = k_arena + (long long)arena_row * row_bytes
+        + ((long long)kh * num_blocks + (d >> 5)) * blk_stride;
+    const unsigned char* v_blk = v_arena + (long long)arena_row * row_bytes
+        + ((long long)kh * num_blocks + (d >> 5)) * blk_stride;
+    __half kd, vd;
+    __builtin_memcpy(&kd, k_blk, sizeof(kd));
+    __builtin_memcpy(&vd, v_blk, sizeof(vd));
+    const signed char kcode = ((const signed char*)(k_blk + 4))[d & 31];
+    const signed char vcode = ((const signed char*)(v_blk + 4))[d & 31];
+    k_dst[(long long)row * dst_stride + rem] = __float2half((float)kcode * __half2float(kd));
+    v_dst[(long long)row * dst_stride + rem] = __float2half((float)vcode * __half2float(vd));
+}
+
+// QSA device indexer score (plans/PLAN-qsa-dequant-on-gather.md):
+//   score[cell] = sum_h relu( q_h . k_cell )
+// per-head rectification BEFORE the sum (upstream qwen4exp.cpp
+// build_qsa_top_k semantics). One block per cell; each warp computes the
+// per-head dot with a shuffle reduction, lane 0 accumulates the rectified
+// sum. QSA keys/q are pooled+normed+roped upstream (host or device).
+extern "C" __global__ void grim_qsa_index_score(
+    const float* __restrict__ keys,   // [n_cells, idx_dim]
+    const float* __restrict__ q,      // [n_idx_h, idx_dim]
+    float* __restrict__ scores,       // [n_cells]
+    int n_cells,
+    int idx_dim,
+    int n_idx_h
+) {
+    const int cell = blockIdx.x;
+    if (cell >= n_cells) return;
+    const int lane = threadIdx.x % 32;
+    const float* k = keys + (long long)cell * idx_dim;
+
+    float acc = 0.0f;
+    for (int h = 0; h < n_idx_h; ++h) {
+        const float* qh = q + (long long)h * idx_dim;
+        float part = 0.0f;
+        for (int d = lane; d < idx_dim; d += 32) {
+            part += qh[d] * k[d];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            part += __shfl_xor(part, off);
+        }
+        if (lane == 0) {
+            acc += fmaxf(part, 0.0f);
+        }
+    }
+    if (lane == 0) {
+        scores[cell] = acc;
+    }
+}
+
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
