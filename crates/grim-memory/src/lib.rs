@@ -45,6 +45,9 @@ pub mod encoder_cache;
 
 pub use encoder_cache::{EncoderCache, EncoderEmbedding, EncoderKey, SharedEncoderCache};
 
+/// Conversation checkpoint cache (astrum P10).
+pub mod conversation_checkpoint;
+
 /// Heterogeneous KV layer grouping and layout metadata.
 pub mod layer_groups;
 
