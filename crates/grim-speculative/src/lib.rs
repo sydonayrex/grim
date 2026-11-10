@@ -13,6 +13,7 @@ pub mod mamba_speculative;
 pub mod markov_head;
 pub mod native_mtp;
 pub mod speculative_wrapper;
+pub mod suffix_drafter;
 
 pub mod tiny_draft_backbone;
 pub mod uniform_markov_head;
@@ -31,5 +32,6 @@ pub use mamba_speculative::{MambaSpeculativeEngine, MambaStepState};
 pub use markov_head::MarkovHead;
 pub use native_mtp::NativeMtp;
 pub use speculative_wrapper::{SpeculativeCausalLm, SpeculativeTelemetry, SpeculativeVerifier, Strategy};
+pub use suffix_drafter::SuffixDrafter;
 pub use tiny_draft_backbone::TinyDraftBackbone;
 pub use uniform_markov_head::UniformMarkovHead;
