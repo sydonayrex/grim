@@ -3248,13 +3248,15 @@ impl Qwen35Block {
         // when any qkv consumer needs q8_1 — one dual-output kernel
         // (grim_rms_norm_quant_q81_dual) replaces rms_norm + first quantize.
         // Byte-identity to the split path is pinned by
-        // rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity. Production
-        // graph path only (emit.is_none()): the task-ring IR keeps the
-        // split NORM + FALLBACK nodes, so ring replay stays consistent.
+        // rmsnorm_quant_parity::rmsnorm_quant_q81_dual_parity.
+        // Under graph capture (emit.is_some()) the dual launch is captured
+        // into the HIP graph AND the ring IR is emitted as the SPLIT NORM
+        // node (see the fused branch): the ring replays its own split norm
+        // (FALLBACK nodes are skipped there), while the captured graph runs
+        // the dual — identical results, one fewer launch in the capture.
         // m == 1 only (decode-shaped kernel); impossible when the norm was
         // already fused into the previous Residual 2 add.
         let fuse_norm_quant = self.is_full_attention
-            && emit.is_none()
             && batch == 1
             && !norm_already_fused
             && current_hadamard_plan().is_none()
@@ -3298,6 +3300,33 @@ impl Qwen35Block {
             .map_err(|e| {
                 grim_core::error::Error::Backend(format!("qwen35 fused norm+q81: {e}"))
             })?;
+            // Ring IR (M7.1): emit the SPLIT-path NORM node for the ring —
+            // the dual launch is a single launch the ring has no arm for,
+            // and the ring replays its own split norm, so its IR must keep
+            // the NORM node (FALLBACK nodes are skipped there). The
+            // captured HIP graph runs the dual instead; the two are
+            // byte-identical (rmsnorm_quant_q81_dual_parity).
+            if let Some(e) = emit.as_deref_mut() {
+                let in_rocm = dst_downcast(&buffers.layer_input[layer_idx])?;
+                e.launch(
+                    grim_backend_rocm::task_graph::op::NORM,
+                    [0, self.hidden_size as u32, batch as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[
+                        (
+                            in_rocm.device_ptr_u64().unwrap_or(0),
+                            in_rocm.bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_IN,
+                        ),
+                        (
+                            buffers.norm_buf[layer_idx]
+                                .device_ptr_u64()
+                                .unwrap_or(0),
+                            buffers.norm_buf[layer_idx].bytes() as u64,
+                            grim_backend_rocm::task_graph::arg_role::ACT_OUT,
+                        ),
+                    ],
+                );
+            }
         } else if !norm_already_fused {
             // Task 5B.5: Attention norm emission through RocmGraphEmitter
             let mut graph_emitter = RocmGraphEmitter {

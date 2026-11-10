@@ -2501,3 +2501,122 @@ fn qwen35_production_27b_route_wall_and_utilization() {
     }
     unsafe { std::env::remove_var("GRIM_SPLIT_LAYERS"); }
 }
+
+/// Task 2.6 under capture: with q8_1 consumers on q/k/v (Q5K, exact mode
+/// OFF), the attention norm must be launched as the dual
+/// `grim_rms_norm_quant_q81_dual` INSIDE capture — the fused launch is
+/// captured into the HIP graph, the ring IR keeps the split NORM node — and
+/// the replayed logits must match the eager split path step for step.
+/// Without this gate the fused-under-capture wiring is untested: the
+/// `emit.is_none()` predicate would silently keep the split path.
+#[test]
+fn qwen35_fused_norm_quant_under_capture_matches_eager() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        // q8_1 consumers on q/k/v: exact mode off restores the prequant
+        // route the fuse predicate keys on.
+        std::env::set_var("GRIM_DECODE_EXACT_GEMV", "0");
+        std::env::remove_var("GRIM_FUSE_NORM_QUANT");
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+    }
+
+    let mut provider = synth_weights();
+    // Override q/k/v with Q5K storage (fake packed bytes; both sides read
+    // the same bytes, so parity is unaffected).
+    for key in [
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+    ] {
+        if let Some(old) = provider.tensors.get(key) {
+            let shape = old.shape.clone();
+            let k = shape[1];
+            let n = shape[0];
+            let fake_bytes = vec![0u8; (n * k / 32) * 36];
+            provider.tensors.insert(
+                key.to_string(),
+                RawTensor {
+                    bytes: fake_bytes,
+                    shape,
+                    dtype: grim_tensor::DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q5K),
+                    },
+                    provenance: grim_tensor::QuantProvenance::GrimNative,
+                },
+            );
+        }
+    }
+    let ws = WeightSource::root(&provider, device.clone());
+    let model = Qwen35::load(device.clone(), &ws, tiny_cfg()).expect("load tiny qwen35");
+
+    // ── Eager side.
+    let mut session = model.new_session();
+    let mut eager_logits = Vec::new();
+    for (step, tok) in TOKENS.iter().enumerate() {
+        let ids = dev_tensor(dev.as_ref(), &device, &[*tok as f32]);
+        let pos = dev_tensor(dev.as_ref(), &device, &[step as f32]);
+        let out = CausalLm::forward(
+            &model,
+            session.as_mut(),
+            &ids,
+            &pos,
+            &[] as &[AdapterHandle],
+        )
+        .expect("eager forward")
+        .to_vec_f32()
+        .expect("eager readback");
+        eager_logits.push(out);
+    }
+
+    // ── Graph side: capture, then replay.
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .expect("graph pool alloc");
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    let _ = model.forward_capture(&mut graph, TOKENS[0]);
+    grim_backend_rocm::reset_kernel_route_counters();
+    graph.begin_capture().expect("begin capture");
+    model
+        .forward_capture(&mut graph, TOKENS[0])
+        .expect("recorded capture");
+    graph.end_capture().expect("end capture");
+    let routes = grim_backend_rocm::kernel_route_snapshot();
+    let dual_launches = routes
+        .iter()
+        .find(|(k, _)| k == "grim_rms_norm_quant_q81_dual")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    assert!(
+        dual_launches >= 1,
+        "fused-under-capture must launch the dual norm+q81 kernel per full-attention layer (tiny_cfg has 1); got {dual_launches}"
+    );
+
+    let mut graph_logits = Vec::new();
+    for tok in TOKENS {
+        dev.reset_launch_count();
+        model
+            .forward_replay(&mut graph, tok)
+            .expect("graph replay failed");
+        assert_eq!(dev.launch_count(), 0, "replay must enqueue zero eager launches");
+        graph_logits.push(graph.read_logits_f32().expect("graph logit readback"));
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+    }
+    for (step, (a, b)) in eager_logits.iter().zip(graph_logits.iter()).enumerate() {
+        let (e, at, abs) = worst_scaled(a, b);
+        assert!(
+            e <= 1e-1,
+            "step {step}: fused-under-capture replay diverges from eager: worst {e:.3e} at {at} (abs {abs:.3e})"
+        );
+    }
+
+    unsafe {
+        std::env::set_var("GRIM_KV_ARENA", "f32");
+    }
+}

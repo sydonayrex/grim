@@ -26,6 +26,13 @@ fn test_q81_launch_census_and_logits_parity_vs_dedup_disabled() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
+    // The q8_1-prequant dedup route these arms pin was superseded at decode
+    // by exact mode (44ced04e): with GRIM_DECODE_EXACT_GEMV on (the
+    // default), Q4K..Q3K take the f32 WMMA fused-dequant path and never
+    // quantize activations — exact-mode parity has its own gates. Pin exact
+    // mode OFF so this file measures what it was written to measure: one
+    // shared grim_quantize_q8_1 across q/k/v (and gate/up, KDA projections).
+    unsafe { std::env::set_var("GRIM_DECODE_EXACT_GEMV", "0") };
     let dev = RocmDevice::shared(0);
 
     let m = 1usize;
