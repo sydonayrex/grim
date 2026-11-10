@@ -64,6 +64,9 @@ pub struct SpeculativeCausalLm {
     /// PID depth controller driving the DSpark draft block length K.
     /// Fed by observed (accepted, proposed) counts each DSpark step.
     depth_tuner: Mutex<SpeculativeDepthPidController>,
+    /// astrum P5: optional E/cost draft-source policy (output-neutral observation; default OFF).
+    #[allow(dead_code)]
+    astrum_draft_policy: Option<Mutex<crate::draft_policy::DraftPolicy>>,
     /// Optional GPU rejection-sampling verifier (Task 10.6). When set and the
     /// verify logits are ROCm-resident, the ratio test runs on device — no
     /// vocab-sized D2H copy. Errors fall back to the CPU verify loop.
@@ -101,6 +104,7 @@ impl SpeculativeCausalLm {
                 SpeculationConfig::default(),
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
+            astrum_draft_policy: None,
             gpu_verifier: None,
         }
     }
@@ -142,6 +146,7 @@ impl SpeculativeCausalLm {
             confidence: Some(confidence),
             scheduler: Mutex::new(scheduler),
             depth_tuner: Mutex::new(depth_tuner),
+            astrum_draft_policy: None,
             gpu_verifier: None,
         }
     }
@@ -160,6 +165,7 @@ impl SpeculativeCausalLm {
                 SpeculationConfig::default(),
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
+            astrum_draft_policy: None,
             gpu_verifier: None,
         }
     }
