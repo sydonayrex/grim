@@ -3113,6 +3113,86 @@ extern "C" __global__ void grim_rope_append_whitecrow_k(
     }
 }
 
+// QSA dequant-on-gather (plans/PLAN-qsa-dequant-on-gather.md, strata
+// kv_gather_q8_step transfer): read SELECTED rows of a quantized KV arena
+// and write them dequantized into a compact fp16 scratch, so the sparse
+// attention runs the proven fp16 path over only the selected cells instead
+// of the whole arena with a mask. One thread per output element.
+extern "C" __global__ void grim_kv_gather_q81(
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    const int* __restrict__ row_ids,
+    int n_ids,
+    int num_kv_heads,
+    int head_dim,
+    long long arena_slot_stride,
+    __half* __restrict__ k_dst,
+    __half* __restrict__ v_dst,
+    int dst_stride                 // elements per gathered row (num_kv_heads*head_dim)
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_ids * num_kv_heads * head_dim;
+    if (i >= total) return;
+    const int row = i / (num_kv_heads * head_dim);
+    const int rem = i % (num_kv_heads * head_dim);
+    const int kh = rem / head_dim;
+    const int d = rem % head_dim;
+    const int arena_row = row_ids[row];
+    const int num_blocks = head_dim / 32;
+    const int blk_stride = 36;
+    const long long row_bytes = (long long)num_kv_heads * num_blocks * blk_stride;
+    const unsigned char* k_blk = k_arena + (long long)arena_row * row_bytes
+        + ((long long)kh * num_blocks + (d >> 5)) * blk_stride;
+    const unsigned char* v_blk = v_arena + (long long)arena_row * row_bytes
+        + ((long long)kh * num_blocks + (d >> 5)) * blk_stride;
+    __half kd, vd;
+    __builtin_memcpy(&kd, k_blk, sizeof(kd));
+    __builtin_memcpy(&vd, v_blk, sizeof(vd));
+    const signed char kcode = ((const signed char*)(k_blk + 4))[d & 31];
+    const signed char vcode = ((const signed char*)(v_blk + 4))[d & 31];
+    k_dst[(long long)row * dst_stride + rem] = __float2half((float)kcode * __half2float(kd));
+    v_dst[(long long)row * dst_stride + rem] = __float2half((float)vcode * __half2float(vd));
+}
+
+// QSA device indexer score (plans/PLAN-qsa-dequant-on-gather.md):
+//   score[cell] = sum_h relu( q_h . k_cell )
+// per-head rectification BEFORE the sum (upstream qwen4exp.cpp
+// build_qsa_top_k semantics). One block per cell; each warp computes the
+// per-head dot with a shuffle reduction, lane 0 accumulates the rectified
+// sum. QSA keys/q are pooled+normed+roped upstream (host or device).
+extern "C" __global__ void grim_qsa_index_score(
+    const float* __restrict__ keys,   // [n_cells, idx_dim]
+    const float* __restrict__ q,      // [n_idx_h, idx_dim]
+    float* __restrict__ scores,       // [n_cells]
+    int n_cells,
+    int idx_dim,
+    int n_idx_h
+) {
+    const int cell = blockIdx.x;
+    if (cell >= n_cells) return;
+    const int lane = threadIdx.x % 32;
+    const float* k = keys + (long long)cell * idx_dim;
+
+    float acc = 0.0f;
+    for (int h = 0; h < n_idx_h; ++h) {
+        const float* qh = q + (long long)h * idx_dim;
+        float part = 0.0f;
+        for (int d = lane; d < idx_dim; d += 32) {
+            part += qh[d] * k[d];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            part += __shfl_xor(part, off);
+        }
+        if (lane == 0) {
+            acc += fmaxf(part, 0.0f);
+        }
+    }
+    if (lane == 0) {
+        scores[cell] = acc;
+    }
+}
+
 // SPEED-DOT4: Graph-capturable Q8_1 KV append.
 // Quantizes incoming f32 tokens into 36-byte Q8_1 blocks [d: fp16][sum: fp16][32 x int8]
 // at the ring position past_dev[slot] + step.
@@ -7342,6 +7422,127 @@ pub fn launch_rope_append_whitecrow_k(
             arg(&mut base_f),
             arg(&mut inter_i),
             arg(&mut rotary_i),
+        ],
+    )
+}
+
+/// QSA indexer score launcher (plans/PLAN-qsa-dequant-on-gather.md):
+/// one block per cell, warp-reduced per-head dots, rectified sum.
+pub fn launch_qsa_index_score(
+    dev: &crate::RocmDevice,
+    keys: &dyn BackendStorage,
+    q: &dyn BackendStorage,
+    scores: &crate::memory::storage::RocmStorage,
+    n_cells: usize,
+    idx_dim: usize,
+    n_idx_h: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    let ks = keys
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("qsa_index_score: keys must be RocmStorage".into()))?;
+    let qs = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("qsa_index_score: q must be RocmStorage".into()))?;
+    let mut kp = ks
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("qsa_index_score: keys has no device ptr".into()))?;
+    let mut qp = qs
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("qsa_index_score: q has no device ptr".into()))?;
+    let mut sp = scores
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("qsa_index_score: scores has no device ptr".into()))?;
+    let mut nc = n_cells as i32;
+    let mut dim = idx_dim as i32;
+    let mut nh = n_idx_h as i32;
+    dev.launch_compute_kernel(
+        "grim_qsa_index_score",
+        crate::HipDim3::new(n_cells as u32, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [
+            crate::arg(&mut kp),
+            crate::arg(&mut qp),
+            crate::arg(&mut sp),
+            crate::arg(&mut nc),
+            crate::arg(&mut dim),
+            crate::arg(&mut nh),
+        ],
+    )
+}
+
+/// QSA dequant-on-gather launcher (plans/PLAN-qsa-dequant-on-gather.md):
+/// gather `row_ids` from a Q8_1 arena into fp16 scratch. The scratch is a
+/// compact f16 arena the existing fp16 attention path reads with
+/// kv_seq_len = n_ids, replacing the all-rows masked read for sparse layers.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_gather_q81(
+    dev: &crate::RocmDevice,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    row_ids: &dyn BackendStorage,
+    n_ids: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    arena_slot_stride: usize,
+    k_dst: &crate::memory::storage::RocmStorage,
+    v_dst: &crate::memory::storage::RocmStorage,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    let k_a = k_arena
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: k_arena must be RocmStorage".into()))?;
+    let v_a = v_arena
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: v_arena must be RocmStorage".into()))?;
+    let ids = row_ids
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: row_ids must be RocmStorage".into()))?;
+    let mut kp = k_a
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: k_arena has no device ptr".into()))?;
+    let mut vp = v_a
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: v_arena has no device ptr".into()))?;
+    let mut idp = ids
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: row_ids has no device ptr".into()))?;
+    let mut kd = k_dst
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: k_dst has no device ptr".into()))?;
+    let mut vd = v_dst
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_q81: v_dst has no device ptr".into()))?;
+    let mut n_i = n_ids as i32;
+    let mut nkv_i = num_kv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut slot_stride_i = i64::try_from(arena_slot_stride).map_err(|_| {
+        crate::Error::Backend("kv_gather_q81: arena_slot_stride overflow".into())
+    })?;
+    let mut dst_stride_i = (num_kv_heads * head_dim) as i32;
+    let total = n_ids * num_kv_heads * head_dim;
+    let block = crate::HipDim3::new(256, 1, 1);
+    let grid = crate::HipDim3::new((total as u32).div_ceil(256), 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_gather_q81",
+        grid,
+        block,
+        &mut [
+            crate::arg(&mut kp),
+            crate::arg(&mut vp),
+            crate::arg(&mut idp),
+            crate::arg(&mut n_i),
+            crate::arg(&mut nkv_i),
+            crate::arg(&mut hd_i),
+            crate::arg(&mut slot_stride_i),
+            crate::arg(&mut kd),
+            crate::arg(&mut vd),
+            crate::arg(&mut dst_stride_i),
         ],
     )
 }
