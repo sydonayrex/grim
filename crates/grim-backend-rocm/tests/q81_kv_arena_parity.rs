@@ -255,6 +255,66 @@ fn q81_kv_arena_matches_f32_oracle_at_27b_geometry() -> TestResult {
         eprintln!(
             "[q81-arena-parity] arena content vs host oracle: worst {worst_arena:.3e} at {worst_arena_at}"
         );
+
+        // ── strata-style three-part gate (kv_q8_parity.cpp methodology):
+        //   1. codes BITWISE equal to the host reference (same f32 rounding);
+        //   2. stored fp16 scale within fp16 rounding of the ideal d;
+        //   3. dequantized value within half a step + fp16 rounding of the
+        //      original f32 (0.63 * d, strata uses 0.624 steps).
+        let mut code_mismatch = 0usize;
+        let mut scale_worst: f32 = 0.0;
+        let mut step_worst: f32 = 0.0;
+        let mut step_worst_at = 0usize;
+        for r in 0..rows {
+            for kh in 0..nkv {
+                for blk in 0..(hd / 32) {
+                    let off = (r * stride + kh * hd + blk * 32) * 36 / 32;
+                    let d16 = {
+                        let h = u16::from_le_bytes([kb[off], kb[off + 1]]);
+                        fp16_to_f32_host(h)
+                    };
+                    let amax = (0..32)
+                        .map(|e| k_f32[r * stride + kh * hd + blk * 32 + e].abs())
+                        .fold(0.0f32, f32::max);
+                    let d_ideal = if amax / 127.0 > 1e-30 { amax / 127.0 } else { 1e-30 };
+                    // 2. scale rounding: |d16 - d_ideal| <= d_ideal * 2^-11
+                    let srel = (d16 - d_ideal).abs() / d_ideal.max(1e-30);
+                    if srel > scale_worst {
+                        scale_worst = srel;
+                    }
+                    assert!(
+                        srel <= 2.0f32.powi(-11) + 1e-6,
+                        "fp16 scale rounding too large at r={r} kh={kh} blk={blk}: rel {srel:.3e}"
+                    );
+                    for e in 0..32 {
+                        let x = k_f32[r * stride + kh * hd + blk * 32 + e];
+                        // kernel: q = roundf(x / d_ideal) (f32), clamp
+                        let q = (x / d_ideal).round().clamp(-127.0, 127.0) as i8;
+                        let code = kb[off + 4 + e] as i8;
+                        if code != q {
+                            code_mismatch += 1;
+                        }
+                        // 3. dequant within half a step + fp16 rounding
+                        let xprime = code as f32 * d16;
+                        let bound = 0.63 * d_ideal;
+                        let err = (xprime - x).abs();
+                        if err > step_worst {
+                            step_worst = err;
+                            step_worst_at = r * stride + kh * hd + blk * 32 + e;
+                        }
+                        assert!(
+                            err <= bound + 1e-7,
+                            "dequant error {err:.3e} exceeds 0.63*d ({bound:.3e}) at r={r} kh={kh} blk={blk} e={e}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[q81-arena-parity] strata gate: code mismatches {code_mismatch}/{} (bitwise),              scale rounding worst {scale_worst:.3e} (bound 2^-11),              dequant worst {step_worst:.3e} at {step_worst_at} (bound 0.63*d)",
+            rows * stride
+        );
+        assert_eq!(code_mismatch, 0, "codes must be bitwise equal to the host reference");
     }
 
     let mut worst = 0.0f32;
@@ -281,4 +341,20 @@ fn q81_kv_arena_matches_f32_oracle_at_27b_geometry() -> TestResult {
         worst / scale
     );
     Ok(())
+}
+
+/// Exact fp16 -> f32 (mirrors fp16_to_float_device; sign-correct subnormals).
+fn fp16_to_f32_host(bits: u16) -> f32 {
+    let sign = ((bits >> 15) as u32) << 31;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        // subnormal (incl. signed zero)
+        let v = (mant as f32) * 2f32.powi(-24);
+        return if sign != 0 { -v } else { v };
+    }
+    if exp == 0x1f {
+        return f32::from_bits(sign | 0x7F800000 | (mant << 13));
+    }
+    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
 }
