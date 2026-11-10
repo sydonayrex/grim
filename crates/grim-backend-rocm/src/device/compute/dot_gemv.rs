@@ -725,6 +725,27 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // astrum P2: measured dispatch table (default OFF -> Plain = existing heuristics).
+        {
+            use crate::device::compute::gemv_dispatch_table::{current_variant, GemvKey, GemvVariant};
+            let key = GemvKey::new("forest", self.gcn_arch(), m as u32, n);
+            match current_variant(&key) {
+                GemvVariant::Plain => {} // fall through to existing heuristics
+                GemvVariant::RowsR2 if m >= 2 => {
+                    return self.launch_dot4_forest_gemv_rows_named(
+                        "grim_dot4_forest_gemv_rows_r2",
+                        2,
+                        act_f32,
+                        b_storage,
+                        out_storage,
+                        m,
+                        n,
+                        k,
+                    );
+                }
+                _ => {} // unmapped variant: fall through to existing heuristics
+            }
+        }
         static V10: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let v10 = *V10.get_or_init(|| {
             !matches!(
