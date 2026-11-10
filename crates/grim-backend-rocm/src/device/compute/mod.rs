@@ -100,6 +100,7 @@ impl FusedGateUpQ4KWeights {
 pub mod autograd_ops;
 pub mod core_tensor_ops;
 pub mod dot_gemv;
+pub mod gemv_dispatch_table;
 pub mod elementwise_ops;
 pub mod fused_ops;
 pub mod fusion_ops;
