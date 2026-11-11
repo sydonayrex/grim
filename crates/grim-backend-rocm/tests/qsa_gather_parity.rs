@@ -267,3 +267,143 @@ fn qsa_index_score_matches_host() -> TestResult {
     assert!(worst < 1e-4, "score kernel diverges: {worst:.3e} at cell {at}");
     Ok(())
 }
+
+/// The wiring equivalence the model path relies on: gathering the selected
+/// rows and running DENSE attention over them equals the masked softmax over
+/// the full history (keep = 0 keeps, -inf removes; causal). Gathers on
+/// device, dense softmax on host over the gathered scratch.
+#[test]
+#[ignore = "needs a ROCm device; run with GRIM_GPU_TEST=1"]
+fn gathered_dense_attention_equals_masked_softmax() -> TestResult {
+    let dev = match gpu_device() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
+
+    let (nh, nkv, hd) = (4_usize, 2_usize, 64_usize);
+    let kv_len = 16_usize;
+    let stride = nkv * hd;
+    let mut rng = Lcg(0x6A7);
+    let mut k_hist = vec![0.0f32; kv_len * stride];
+    let mut v_hist = vec![0.0f32; kv_len * stride];
+    let mut q = vec![0.0f32; nh * hd];
+    for v in k_hist.iter_mut() {
+        *v = rng.f32();
+    }
+    for v in v_hist.iter_mut() {
+        *v = rng.f32();
+    }
+    for v in q.iter_mut() {
+        *v = rng.f32();
+    }
+    // select 5 cells (the top-K stand-in); the rest are masked out
+    let keep_rows: Vec<i32> = vec![1, 4, 7, 11, 14];
+    let mut keep = vec![f32::NEG_INFINITY; kv_len];
+    for &r in &keep_rows {
+        keep[r as usize] = 0.0;
+    }
+    let cache_offset = kv_len - 1; // single-token decode at the last position
+
+    // ── Path A: masked softmax over the full history (host reference).
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut want = vec![0.0f32; nh * hd];
+    for h in 0..nh {
+        let kvh = h * nkv / nh;
+        let mut scores = vec![f32::NEG_INFINITY; kv_len];
+        let mut mx = f32::NEG_INFINITY;
+        for t2 in 0..kv_len {
+            if keep[t2] == f32::NEG_INFINITY || t2 > cache_offset {
+                continue;
+            }
+            let mut dot = 0.0f32;
+            for d in 0..hd {
+                dot += q[h * hd + d] * k_hist[t2 * stride + kvh * hd + d];
+            }
+            scores[t2] = dot * scale + keep[t2];
+            mx = mx.max(scores[t2]);
+        }
+        let mut sum = 0.0f32;
+        for t2 in 0..kv_len {
+            if scores[t2].is_finite() {
+                sum += (scores[t2] - mx).exp();
+            }
+        }
+        for d in 0..hd {
+            let mut acc = 0.0f32;
+            for t2 in 0..kv_len {
+                if scores[t2].is_finite() {
+                    acc += (scores[t2] - mx).exp() * v_hist[t2 * stride + kvh * hd + d];
+                }
+            }
+            want[h * hd + d] = acc / sum;
+        }
+    }
+
+    // ── Path B: device gather -> dense softmax over the scratch.
+    let k_t = CoreTensorOps::from_cpu(&dev, &k_hist, &Shape::new(vec![kv_len * stride]), f32ty())?;
+    let v_t = CoreTensorOps::from_cpu(&dev, &v_hist, &Shape::new(vec![kv_len * stride]), f32ty())?;
+    let ids_bits: Vec<f32> = keep_rows.iter().map(|&v| f32::from_bits(v as u32)).collect();
+    let ids_t = CoreTensorOps::from_cpu(&dev, &ids_bits, &Shape::new(vec![keep_rows.len()]), f32ty())?;
+    let n_ids = keep_rows.len();
+    let k_g = dev.zeros(&Shape::new(vec![n_ids * stride]), f32ty())?;
+    let v_g = dev.zeros(&Shape::new(vec![n_ids * stride]), f32ty())?;
+    grim_backend_rocm::launch_kv_gather_f32(
+        &dev,
+        k_t.as_ref(),
+        v_t.as_ref(),
+        ids_t.as_ref(),
+        n_ids,
+        stride,
+        as_rocm(k_g.as_ref()).unwrap(),
+        as_rocm(v_g.as_ref()).unwrap(),
+    )?;
+    dev.synchronize();
+    let k_got = k_g.to_cpu_vec_f32()?;
+    let v_got = v_g.to_cpu_vec_f32()?;
+
+    let mut got = vec![0.0f32; nh * hd];
+    for h in 0..nh {
+        let kvh = h * nkv / nh;
+        let mut scores = vec![0.0f32; n_ids];
+        let mut mx = f32::NEG_INFINITY;
+        for (gi, _src) in keep_rows.iter().enumerate() {
+            let mut dot = 0.0f32;
+            for d in 0..hd {
+                dot += q[h * hd + d] * k_got[gi * stride + kvh * hd + d];
+            }
+            scores[gi] = dot * scale;
+            mx = mx.max(scores[gi]);
+        }
+        let mut sum = 0.0f32;
+        for gi in 0..n_ids {
+            sum += (scores[gi] - mx).exp();
+        }
+        for d in 0..hd {
+            let mut acc = 0.0f32;
+            for gi in 0..n_ids {
+                acc += (scores[gi] - mx).exp() * v_got[gi * stride + kvh * hd + d];
+            }
+            got[h * hd + d] = acc / sum;
+        }
+    }
+
+    let mut worst = 0.0f32;
+    let mut at = 0usize;
+    for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > worst {
+            worst = d;
+            at = i;
+        }
+    }
+    eprintln!(
+        "[qsa-gather] gather+dense vs masked softmax: worst {worst:.3e} at {at} (want {:.5} got {:.5})",
+        want[at], got[at]
+    );
+    assert!(
+        worst < 1e-5,
+        "gather+dense != masked softmax: worst {worst:.3e} at {at}"
+    );
+    Ok(())
+}

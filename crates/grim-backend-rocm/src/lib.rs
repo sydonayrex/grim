@@ -237,7 +237,7 @@ pub use kernels::qkv_attention::{
     BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, KvRingPolicy, f16_kv_explicitly_disabled,
     launch_bump_i32, launch_bump_i32_slots, launch_clamp_layer_total, launch_kv_append,
     launch_kv_append_batch, launch_kv_append_i4, launch_kv_append_i8, launch_kv_append_q81,
-    launch_kv_gather_q81, launch_qsa_index_score,
+    launch_kv_gather_q81, launch_kv_gather_f32, launch_qsa_index_score,
     launch_kv_append_whitecrow, launch_kv_quantize_rows_i2,
     launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8, launch_kv_quantize_rows_q81, launch_kv_quantize_rows_whitecrow,
     launch_paged_attention, launch_paged_attention_quant, launch_paged_attention_quant_split,

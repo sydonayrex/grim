@@ -5848,6 +5848,32 @@ extern "C" __global__ void grim_qsa_index_score(
     }
 }
 
+
+// QSA f32 row gather (plans/PLAN-qsa-dequant-on-gather.md): copy the
+// SELECTED rows of a window's f32 K/V into a compact scratch so the sparse
+// attention runs dense over only the selected cells. The flash_next (QSA)
+// path computes its K/V window in f32 on device; the q8_1 arena path uses
+// grim_kv_gather_q81 (dequantizing). One thread per element.
+extern "C" __global__ void grim_kv_gather_f32(
+    const float* __restrict__ k_src,
+    const float* __restrict__ v_src,
+    const int* __restrict__ row_ids,
+    int n_ids,
+    int stride,                  // elements per row (num_kv_heads * head_dim)
+    float* __restrict__ k_dst,
+    float* __restrict__ v_dst,
+    int dst_stride
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_ids * stride;
+    if (i >= total) return;
+    const int row = i / stride;
+    const int rem = i - row * stride;
+    const int src_row = row_ids[row];
+    k_dst[(long long)row * dst_stride + rem] = k_src[(long long)src_row * stride + rem];
+    v_dst[(long long)row * dst_stride + rem] = v_src[(long long)src_row * stride + rem];
+}
+
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7423,6 +7449,68 @@ pub fn launch_rope_append_whitecrow_k(
             arg(&mut base_f),
             arg(&mut inter_i),
             arg(&mut rotary_i),
+        ],
+    )
+}
+
+/// QSA f32 row-gather launcher (plans/PLAN-qsa-dequant-on-gather.md):
+/// copy the selected rows of a window's f32 K/V into a compact scratch.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_gather_f32(
+    dev: &crate::RocmDevice,
+    k_src: &dyn BackendStorage,
+    v_src: &dyn BackendStorage,
+    row_ids: &dyn BackendStorage,
+    n_ids: usize,
+    stride: usize,
+    k_dst: &crate::memory::storage::RocmStorage,
+    v_dst: &crate::memory::storage::RocmStorage,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    let ks = k_src
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: k_src must be RocmStorage".into()))?;
+    let vs = v_src
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: v_src must be RocmStorage".into()))?;
+    let ids = row_ids
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: row_ids must be RocmStorage".into()))?;
+    let mut kp = ks
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: k_src has no device ptr".into()))?;
+    let mut vp = vs
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: v_src has no device ptr".into()))?;
+    let mut idp = ids
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: row_ids has no device ptr".into()))?;
+    let mut kd = k_dst
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: k_dst has no device ptr".into()))?;
+    let mut vd = v_dst
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_gather_f32: v_dst has no device ptr".into()))?;
+    let mut n_i = n_ids as i32;
+    let mut stride_i = stride as i32;
+    let mut dst_stride_i = stride as i32;
+    let total = n_ids * stride;
+    dev.launch_compute_kernel(
+        "grim_kv_gather_f32",
+        crate::HipDim3::new((total as u32).div_ceil(256), 1, 1),
+        crate::HipDim3::new(256, 1, 1),
+        &mut [
+            crate::arg(&mut kp),
+            crate::arg(&mut vp),
+            crate::arg(&mut idp),
+            crate::arg(&mut n_i),
+            crate::arg(&mut stride_i),
+            crate::arg(&mut kd),
+            crate::arg(&mut vd),
+            crate::arg(&mut dst_stride_i),
         ],
     )
 }
