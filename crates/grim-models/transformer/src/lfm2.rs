@@ -3704,6 +3704,10 @@ impl CausalLm for Lfm2 {
         Box::new(session)
     }
 
+    fn has_recurrent_state(&self) -> bool {
+        true
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,

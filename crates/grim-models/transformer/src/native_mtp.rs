@@ -329,6 +329,10 @@ impl CausalLm for Qwen38FlashNextMtp {
         self.base.new_session()
     }
 
+    fn has_recurrent_state(&self) -> bool {
+        self.base.has_recurrent_state()
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,

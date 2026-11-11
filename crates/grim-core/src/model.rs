@@ -168,6 +168,13 @@ pub trait CausalLm: Model {
     fn hidden_size_hint(&self) -> Option<usize> {
         None
     }
+    /// True when the model carries recurrent/SSM/conv state that a paged-KV
+    /// prefix seed cannot reconstruct (hybrid GDN, short-conv, Mamba/SSM, RWKV).
+    /// Radix prefix reuse must be blocked for such models unless recurrent
+    /// checkpoints are explicitly restored.
+    fn has_recurrent_state(&self) -> bool {
+        false
+    }
     fn forward(
         &self,
         session: &mut dyn crate::session::SessionT,

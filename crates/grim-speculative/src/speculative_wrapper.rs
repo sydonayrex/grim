@@ -677,6 +677,10 @@ impl CausalLm for SpeculativeCausalLm {
         self.target.hidden_size_hint()
     }
 
+    fn has_recurrent_state(&self) -> bool {
+        self.target.has_recurrent_state()
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,

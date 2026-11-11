@@ -508,6 +508,10 @@ impl CausalLm for Mamba {
         Box::new(grim_core::session::Inner::new(self.device.clone()))
     }
 
+    fn has_recurrent_state(&self) -> bool {
+        true
+    }
+
     fn forward(
         &self,
         session: &mut dyn grim_core::session::SessionT,

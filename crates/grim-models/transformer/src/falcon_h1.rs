@@ -268,6 +268,10 @@ impl CausalLm for FalconH1Model {
         session.set_model_state(Box::new(caches));
         Box::new(session)
     }
+
+    fn has_recurrent_state(&self) -> bool {
+        true
+    }
     fn forward(
         &self,
         session: &mut dyn SessionT,

@@ -104,6 +104,10 @@ impl CausalLm for Lfm2Moe {
         self.inner.new_session()
     }
 
+    fn has_recurrent_state(&self) -> bool {
+        self.inner.has_recurrent_state()
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,

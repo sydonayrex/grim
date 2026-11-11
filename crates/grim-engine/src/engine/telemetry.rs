@@ -188,23 +188,16 @@ impl Engine {
         )
     }
 
-    /// Layer 1.5 gate: hybrid models (LFM2's ShortConv state, Mamba variants)
-    /// keep per-layer state that a paged-KV prefix seed cannot reconstruct —
-    /// prefix reuse for those requires recurrent checkpoints, which Layer 1.5
-    /// deliberately declines (no anchor state → no seed). Returns true when
-    /// the request's model must NOT receive a radix seed.
+    /// Layer 1.5 gate: models with recurrent/SSM/conv state that a paged-KV
+    /// prefix seed cannot reconstruct must NOT receive a radix seed. Prefix
+    /// reuse for those requires recurrent checkpoints (see T2/`GRIM_HYBRID_PREFIX`).
+    /// Returns true when the request's model must NOT receive a radix seed.
     pub(crate) fn model_uses_hybrid_kv(&self, id: u64) -> bool {
         self.model_for_request(id)
             .and_then(|(mid, _)| self.models.get(&mid))
-            .map(|m| {
-                m.model
-                    .target()
-                    .as_any()
-                    .downcast_ref::<grim_models_transformer::Lfm2>()
-                    .is_some()
-            })
-            // Unknown model: do not seed — skipping the shared prefix would be
-            // a correctness risk we cannot rule out.
+            .map(|m| m.model.target().has_recurrent_state())
+            // Unknown model: do not seed — fail closed (skipping the shared
+            // prefix would be a correctness risk we cannot rule out).
             .unwrap_or(true)
     }
 

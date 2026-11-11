@@ -381,6 +381,10 @@ impl CausalLm for Qwen35Moe {
         Box::new(grim_core::session::Session::new(self.device.clone()))
     }
 
+    fn has_recurrent_state(&self) -> bool {
+        true
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,
