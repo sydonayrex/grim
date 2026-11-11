@@ -80,3 +80,19 @@ the QSA layers"). This plan scopes the same architecture for grim.
 keeps Q in f32; the q8_1 kernels were fixed to do the same (13f70e91) after
 quantizing Q flipped Gate D token 3. Any new quantized-KV path (including the
 QSA gather) must keep Q/softmax in fp32/fp16 and dequantize K per element.
+
+## Status (2026-11-10)
+
+- Landed: `grim_kv_gather_q81` (arena -> fp16 scratch; bitwise gate 0/640),
+  `grim_qsa_index_score` (score parity 3.05e-5), `grim_kv_gather_f32`
+  (window rows -> compact f32 scratch), and the equivalence gate
+  `gathered_dense_attention_equals_masked_softmax` (worst 0.000e0 — the
+  gather+dense path is exactly the masked softmax over the selected rows).
+  All in `tests/qsa_gather_parity.rs`; kernels appended at the END of
+  `KERNEL_SOURCE` (mid-string insertion flips Gate D via HIPRTC codegen).
+- Remaining: the branch swap in `qwen4exp_flash_next.rs` (gather the keep
+  rows from the device K/V, dense attention over the scratch). Verifying it
+  needs a GUARDED run of the 48GB flash checkpoint: free-RAM/VRAM headroom
+  check + CPU-offload/SSD spill plan FIRST. A bare `grim-cli run` of a
+  48GB model on this box (62GB RAM, no margin) is an OOM risk — do not
+  attempt it unguarded.
