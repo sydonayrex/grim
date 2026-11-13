@@ -21,7 +21,9 @@ hex = "0.4"
 tracing = "0.1"
 
 # WASM runtime for sandboxed plugin execution
-wasmtime = { version = "47", features = ["async"], optional = true }
+# 48.0.7 fixes GHSA br_table misjump (cranelift/aarch64) + component-model
+# stream panic advisories (#30-#33).
+wasmtime = { version = "48.0.7", features = ["async"], optional = true }
 
 [dev-dependencies]
 grim-backend-cpu = { workspace = true }
