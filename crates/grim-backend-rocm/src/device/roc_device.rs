@@ -1417,6 +1417,7 @@ impl RocmDevice {
             if let Ok(guard) = self.upload_event.lock() {
                 if let Some(ev) = *guard {
                     if !ev.is_null() {
+                        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                         unsafe {
                             let _ = crate::hipStreamWaitEvent(stream, ev, 0);
                         }
@@ -1504,6 +1505,7 @@ impl RocmDevice {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .unwrap_or(std::ptr::null_mut());
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut graph: *mut c_void = std::ptr::null_mut();
         let res = unsafe { hipStreamEndCapture(stream, &mut graph) };
         if res != hipSuccess {
