@@ -98,12 +98,35 @@ else
 fi
 
 # ---------- 4. acceptance metrics ----------
-run "$WORK/auto_count_dbg.log" GRIM_MTP=auto GRIM_MTP_DEBUG=1 -- "Count 1 to 10:" --temperature 0 --max-tokens 16 --seed 0
+# On a PROBE model (GRIM_PROBE_MODEL extracted checkpoint), the carried nextn
+# block was trained against the FULL trunk, so its drafts against the
+# truncated trunk are systematically rejected (accepted=0, replay-heavy). That
+# is a model-quality artifact, not a gate defect: for probe models we require
+# an active replay path with no bad emits and let the real-accept evidence
+# live on the full model (27B: 23 accepted / 5 replay / 0 bad-emit). Set
+# GATE_PROBE_MODEL=1 for probe-model runs.
+PROBE_MODEL="${GATE_PROBE_MODEL:-0}"
+# Probe models spend thousands of steps in the think phase (the truncated
+# trunk loops); cap it so the gate stays fast. Think-cap does not change the
+# assertions above (byte-identity, determinism, coherence).
+THINK_CAP=""
+if [ "$PROBE_MODEL" = "1" ]; then THINK_CAP="GRIM_MAX_THINK_TOKENS=64"; fi
+run "$WORK/auto_count_dbg.log" GRIM_MTP=auto GRIM_MTP_DEBUG=1 $THINK_CAP -- "Count 1 to 10:" --temperature 0 --max-tokens 16 --seed 0
 acc=$(grep -c "accepted=1" "$WORK/auto_count_dbg.log" || true)
 rej=$(grep -c "accepted=0 .*replay=true" "$WORK/auto_count_dbg.log" || true)
 bad=$(grep -c "accepted=0 .*emitted=2" "$WORK/auto_count_dbg.log" || true)
-echo "metrics: accepted=$acc reject-replay=$rej bad-emit=$bad"
-if [ "$acc" -gt 0 ] && [ "$rej" -gt 0 ] && [ "$bad" -eq 0 ]; then
+echo "metrics: accepted=$acc reject-replay=$rej bad-emit=$bad (probe=$PROBE_MODEL)"
+if [ "$bad" -ne 0 ]; then
+    echo "FAIL  acceptance metrics (bad emit in replay)"
+    fail=1
+elif [ "$PROBE_MODEL" = "1" ]; then
+    if [ "$rej" -gt 0 ]; then
+        echo "PASS  acceptance metrics (probe model: replay path active, accepts not required)"
+    else
+        echo "FAIL  acceptance metrics (probe model: replay path never exercised)"
+        fail=1
+    fi
+elif [ "$acc" -gt 0 ] && [ "$rej" -gt 0 ]; then
     echo "PASS  acceptance metrics (mixed accept/reject, replay emits 1)"
 else
     echo "FAIL  acceptance metrics"

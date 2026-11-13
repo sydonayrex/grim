@@ -29,7 +29,14 @@ fn verify_window_matches_two_decode_steps() -> Result<(), Box<dyn std::error::Er
     std::fs::create_dir_all("/tmp/window_parity_a")?;
     std::fs::create_dir_all("/tmp/window_parity_b")?;
 
-    const MODEL: &str = "/drive/bigfast/grim/models/qwen38-27b/Qwen3.8-27B-Q4_K_M.gguf";
+        // Probe model: GRIM_PROBE_MODEL overrides (default = the 27B). A small
+    // extracted checkpoint (scripts/extract_probe_model.py) lets the
+    // correctness probes run entirely in VRAM on ONE GPU instead of
+    // forcing a 16 GB model onto a 16 GB card through host-backed memory.
+    let model_path = std::env::var("GRIM_PROBE_MODEL")
+        .unwrap_or_else(|_| "/drive/bigfast/grim/models/qwen38-27b/Qwen3.8-27B-Q4_K_M.gguf".to_string());
+    #[allow(non_snake_case)]
+    let MODEL: &str = &model_path;
     const VOCAB: usize = 248320;
     if !std::path::Path::new(MODEL).exists() {
         eprintln!("skipping: no model");

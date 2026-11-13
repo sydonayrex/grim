@@ -11,13 +11,24 @@
 
 use grim_tensor::{Device, Shape};
 
-const MODEL: &str = "/drive/bigfast/grim/models/qwen38-27b/Qwen3.8-27B-Q4_K_M.gguf";
 const VOCAB: usize = 248320;
+
+/// Probe model: GRIM_PROBE_MODEL overrides (default = the 27B). A small
+/// extracted checkpoint (scripts/extract_probe_model.py) lets the correctness
+/// probes run entirely in VRAM on ONE GPU instead of forcing a 16 GB model
+/// onto a 16 GB card through host-backed memory.
+fn model_path() -> String {
+    std::env::var("GRIM_PROBE_MODEL").unwrap_or_else(|_| {
+        "/drive/bigfast/grim/models/qwen38-27b/Qwen3.8-27B-Q4_K_M.gguf".to_string()
+    })
+}
 
 #[test]
 #[ignore = "needs the 27B model + ROCm device; run with GRIM_GPU_TEST=1"]
 fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !std::path::Path::new(MODEL).exists() {
+    #[allow(non_snake_case)]
+    let MODEL = model_path();
+    if !std::path::Path::new(&*MODEL).exists() {
         eprintln!("skipping: no model");
         return Ok(());
     }
@@ -29,7 +40,7 @@ fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Err
     // once with only CACHED=1 to bisect the first divergent layer.
     let only_fullseq = std::env::var("GRIM_PARITY_ONLY_FULLSEQ").is_ok();
     let only_cached = std::env::var("GRIM_PARITY_ONLY_CACHED").is_ok();
-    let model = grim_engine::model_loader::load_model_from_gguf(MODEL, device.clone())
+    let model = grim_engine::model_loader::load_model_from_gguf(&MODEL, device.clone())
         .map_err(|e| format!("load: {e}"))?;
     // The exact CLI prompt ids (grim template, "Explain how a transistor...")
     let prompt: Vec<u32> = vec![
