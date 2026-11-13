@@ -635,9 +635,18 @@ impl RocmDevice {
         // would trade real throughput for accuracy nobody is currently losing.
         // Q6_K has no such trade to protect: its 8 tensors are all in the MTP
         // block, and it was 100x outside tolerance.
+        // Q3_K joins Q5_K/Q6_K (2026-11-13): real-weight probe
+        // (grim-models-transformer/tests/real_weight_window_parity.rs) measured
+        // blk0.ffn_up (Q3K, n=17408 k=5120) M=1 lane route vs the M=2 WMMA
+        // route at max abs 0.19-0.21 (vs oracle: lane 129x off near-zero
+        // columns, WMMA 0.29 = 3-bit tolerance). Same inherent W4A4
+        // activation-requant noise class as the Q5K/Q6K opt-out above; the
+        // M>1 u4-GEMM route is unaffected and stays.
         let q5k_decode_skip = matches!(
             scheme,
-            grim_tensor::dtype::KQuantScheme::Q5K | grim_tensor::dtype::KQuantScheme::Q6K
+            grim_tensor::dtype::KQuantScheme::Q5K
+                | grim_tensor::dtype::KQuantScheme::Q6K
+                | grim_tensor::dtype::KQuantScheme::Q3K
         );
         if m != 1
             || !w4a4_decode

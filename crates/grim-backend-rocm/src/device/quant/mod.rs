@@ -832,7 +832,19 @@ impl QuantOps for RocmDevice {
                     .is_some();
                 if lane_served {
                     // out_storage is written by the lane GEMV.
-                } else if (is_rdna2 || is_rdna34)
+                // CORRECTNESS GATE (2026-11-13, real-weight probe
+                // tests/real_weight_window_parity.rs): the Q3_K dot4-q81 M=1
+                // kernel is ~129x off the faithful per-row dequant oracle on
+                // REAL checkpoint bytes (blk0.ffn_up, Q3K) while the m=2
+                // WMMA route matches to 0.29 (3-bit quantization tolerance).
+                // Default = WMMA fallback; GRIM_Q3K_DOT4=1 re-enables the
+                // fast kernel. Same defect class as the IQ4XS arm (see its
+                // gate above): exact on grim-quant synthetic bytes, wrong on
+                // llama.cpp importance-matrix quantized bytes.
+                } else if matches!(
+                    std::env::var("GRIM_Q3K_DOT4").as_deref(),
+                    Ok("1" | "true" | "on")
+                ) && (is_rdna2 || is_rdna34)
                     && m == 1
                     && !dot_disabled
                     && k % 256 == 0
@@ -1256,7 +1268,34 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || self.is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                // CORRECTNESS GATE (2026-11-13, real-weight probe
+                // tests/real_weight_window_parity.rs): the IQ4XS dot4-q81 M=1
+                // kernel mis-computes on REAL checkpoint bytes (ffn_gate/
+                // ffn_down outputs off by up to 3.2e-2 abs vs the faithful
+                // llama.cpp-reference per-row dequant; the m=2 WMMA route
+                // matches the oracle to 2.3e-4). It is exact on synthetic
+                // bytes from grim's own quant_iq4xs, so the bug is triggered
+                // by scale/nibble patterns the llama.cpp importance-matrix
+                // quantizer emits. This noise was the measured per-layer
+                // floor of the prefill-vs-decode divergence (0.276) and the
+                // MTP verify-window drift. Default = WMMA fallback (oracle-
+                // exact); GRIM_IQ4XS_DOT4=1 re-enables the fast kernel until
+                // its byte-pattern bug is fixed. NOTE: the old comment
+                // claiming RDNA3/4 correctness cited the Q4_K arch probe —
+                // IQ4XS was never probed on real weights until now. (An M=2
+                // gate lift of this arm was also tried for MTP and measured
+                // worse, 0.259 -> 0.298, plus intermittent dev1 page faults —
+                // see the m==2 rows_hv2 arm in launch_dot4_iq4xs_q81_gemv.)
+                let iq4xs_dot4 = matches!(
+                    std::env::var("GRIM_IQ4XS_DOT4").as_deref(),
+                    Ok("1" | "true" | "on")
+                );
+                if iq4xs_dot4
+                    && (is_rdna2 || self.is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
+                {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
