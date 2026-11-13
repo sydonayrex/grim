@@ -58,23 +58,33 @@ run() { # run <log> <env...> -- <args...>
 
 strip_dbg() { sed -n '/Response:/,/Done\./p' "$1" | grep -v "mtp-debug"; }
 
+# Canonical token stream: (id, logprob) pairs from --logprobs output. Console
+# text is NOT a valid identity signal — the "[grim] Reached max thinking token
+# limit" notice interleaves at different stream positions between off and MTP
+# runs (MTP emission accounting differs), changing line breaks on identical
+# token streams. This bit us as a false Count-pair identity failure on the
+# probe model while the logprob streams matched 80/80.
+token_stream() { grep -o '"token": "[^"]*", "id": [0-9]*, "logprob": -\?[0-9.]*' "$1"; }
+
 echo "== MTP semantic gate =="
 echo "model: $MODEL"
 echo "work:  $WORK"
 
 # ---------- 1. forced-reject byte-identity (bitwise bar) ----------
-run "$WORK/off_count.log" GRIM_MTP=off -- "Count 1 to 10:" --temperature 0 --max-tokens 16 --seed 0
-run "$WORK/fr_count.log" GRIM_MTP=auto GRIM_MTP_FORCE_REJECT=1 -- "Count 1 to 10:" --temperature 0 --max-tokens 16 --seed 0
-run "$WORK/off_sky.log"  GRIM_MTP=off -- "Explain why the sky is blue." --temperature 0 --max-tokens 280 --seed 0
-run "$WORK/fr_sky.log"  GRIM_MTP=auto GRIM_MTP_FORCE_REJECT=1 -- "Explain why the sky is blue." --temperature 0 --max-tokens 280 --seed 0
+run "$WORK/off_count.log" GRIM_MTP=off -- "Count 1 to 10:" --temperature 0 --max-tokens 16 --seed 0 --logprobs 1
+run "$WORK/fr_count.log" GRIM_MTP=auto GRIM_MTP_FORCE_REJECT=1 -- "Count 1 to 10:" --temperature 0 --max-tokens 16 --seed 0 --logprobs 1
+run "$WORK/off_sky.log"  GRIM_MTP=off -- "Explain why the sky is blue." --temperature 0 --max-tokens 280 --seed 0 --logprobs 1
+run "$WORK/fr_sky.log"  GRIM_MTP=auto GRIM_MTP_FORCE_REJECT=1 -- "Explain why the sky is blue." --temperature 0 --max-tokens 280 --seed 0 --logprobs 1
 
 fail=0
 for pair in "off_count.log fr_count.log" "off_sky.log fr_sky.log"; do
     set -- $pair
-    if diff -q <(strip_dbg "$WORK/$1") <(strip_dbg "$WORK/$2") >/dev/null; then
-        echo "PASS  forced-reject byte-identity: $1 vs $2"
+    if diff -q <(token_stream "$WORK/$1") <(token_stream "$WORK/$2") >/dev/null; then
+        n=$(token_stream "$WORK/$1" | wc -l)
+        echo "PASS  forced-reject token-stream identity: $1 vs $2 ($n tokens)"
     else
-        echo "FAIL  forced-reject byte-identity: $1 vs $2"
+        echo "FAIL  forced-reject token-stream identity: $1 vs $2"
+        diff <(token_stream "$WORK/$1") <(token_stream "$WORK/$2") | head -4
         fail=1
     fi
 done
