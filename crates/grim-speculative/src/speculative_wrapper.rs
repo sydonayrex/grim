@@ -590,6 +590,9 @@ impl SpeculativeCausalLm {
         let base_logits_full = self.target.forward(session, input_ids, positions, adapters)?;
         session.set_full_output_logits(prev_full_logits);
 
+        let kv_len_after_base = session.kv_mut().map(|kv| kv.len());
+        let base_hidden_state = session.get_last_hidden_state();
+
         // Snapshot after base for recurrent rollback/replay: avoids replaying base forward on
         // reject/partial-accept and restores exact post-base state (KV/recurrent/pos).
         let mut post_base_snapshot = if recurrent {
@@ -616,6 +619,15 @@ impl SpeculativeCausalLm {
         } else {
             base_vec
         };
+        if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+            let base_argmax = base_last
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            eprintln!("[mtp-debug-base] pos={} argmax={}", session.current_pos(), base_argmax);
+        }
 
         // 2. Draft from the already-run base forward (must not re-run the base input).
         let draft_block = mtp.predict_multi_after_forward(session, input_ids, positions, &base_logits_full)?;
@@ -631,6 +643,9 @@ impl SpeculativeCausalLm {
                     // Fallback only if post-base snapshot unavailable.
                     let _ = self.target.forward(session, input_ids, positions, adapters)?;
                 }
+            }
+            if let Some(h) = base_hidden_state.clone() {
+                session.set_last_hidden_state(h);
             }
             session.set_last_accepted_tokens(1);
             return Ok(grim_backend_cpu::cpu_tensor(
@@ -722,11 +737,6 @@ impl SpeculativeCausalLm {
             )));
         }
 
-        // Commit tentative KV slots. For recurrent models we restore+replay below (except full
-        // accept, where state is already base + all verified drafts in order).
-        if let Some(kv) = session.kv_mut() {
-            kv.commit(accepted_count)?;
-        }
         {
             let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
             sched.record_acceptance(accepted_count, verify_len);
@@ -746,34 +756,59 @@ impl SpeculativeCausalLm {
             );
         }
 
-        if recurrent && accepted_count < verify_len {
-            if let Some(snap) = post_base_snapshot.take() {
-                session.restore_recurrent_state(snap)?;
-                // Replay only accepted draft tokens from exact post-base state.
-                for i in 0..accepted_count {
-                    let tok = draft_block.tokens[i];
-                    let step_input = self.scalar_token_tensor(tok);
-                    let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
-                    let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
-                    let _ = self
-                        .target
-                        .forward(session, &step_input, &step_pos, adapters)?;
+        if recurrent {
+            if accepted_count < verify_len {
+                // Verify forward mutated recurrent/KV state for drafted rows. Drop tentative
+                // draft KV slots (if any), then restore to exact post-base and replay only the
+                // accepted prefix so rejected rows have zero net effect.
+                if let Some(base_kv_len) = kv_len_after_base {
+                    if let Some(kv) = session.kv_mut() {
+                        if kv.len() != base_kv_len {
+                            let _ = kv.rollback_to(base_kv_len);
+                        }
+                    }
                 }
-            } else if let Some(snap) = base_snapshot.take() {
-                session.restore_recurrent_state(snap)?;
-                // Fallback: replay base + accepted draft tokens.
-                let _ = self.target.forward(session, input_ids, positions, adapters)?;
-                for i in 0..accepted_count {
-                    let tok = draft_block.tokens[i];
-                    let step_input = self.scalar_token_tensor(tok);
-                    let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
-                    let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
-                    let _ = self
-                        .target
-                        .forward(session, &step_input, &step_pos, adapters)?;
+                if let Some(snap) = post_base_snapshot.take() {
+                    session.restore_recurrent_state(snap)?; // also rolls KV to post-base pos
+                    if accepted_count == 0 {
+                        if let Some(h) = base_hidden_state.clone() {
+                            session.set_last_hidden_state(h);
+                        }
+                    }
+                    for i in 0..accepted_count {
+                        let tok = draft_block.tokens[i];
+                        let step_input = self.scalar_token_tensor(tok);
+                        let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
+                        let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
+                        let _ = self
+                            .target
+                            .forward(session, &step_input, &step_pos, adapters)?;
+                    }
+                } else if let Some(snap) = base_snapshot.take() {
+                    session.restore_recurrent_state(snap)?; // also rolls KV to base pos
+                    let _ = self.target.forward(session, input_ids, positions, adapters)?;
+                    // base forward re-ran: sets post-base hidden state.
+                    for i in 0..accepted_count {
+                        let tok = draft_block.tokens[i];
+                        let step_input = self.scalar_token_tensor(tok);
+                        let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
+                        let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
+                        let _ = self
+                            .target
+                            .forward(session, &step_input, &step_pos, adapters)?;
+                    }
+                }
+            } else {
+                // Full accept: verify forward already applied all drafted rows in order.
+                if let Some(kv) = session.kv_mut() {
+                    kv.commit(accepted_count)?;
                 }
             }
-            // full accept: keep advanced state (base + verify_len drafts)
+        } else {
+            // Non-recurrent: KV tentative slots track drafted rows only.
+            if let Some(kv) = session.kv_mut() {
+                kv.commit(accepted_count)?;
+            }
         }
 
         session.set_last_accepted_tokens(emitted);

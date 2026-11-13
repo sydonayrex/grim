@@ -135,9 +135,9 @@ impl NativeMtp for Qwen35MtpAdapter {
         let bonus_token = input_vec.last().copied().unwrap_or(0.0) as u32;
         let bonus_pos = pos_vec.last().copied().unwrap_or(0.0) as u32;
 
-        // TODO(gpu-verify): llama.cpp's graph_mtp feeds the *post*-output_norm hidden state
-        // (`t_h_nextn`); grim saves pre-norm (see qwen35.rs forward). If acceptance stays near 0
-        // after the M3 double-forward fix, measure the post-norm variant here.
+        // Trunk seed is post-output_norm hidden (`h_nextn`-equivalent, llama.cpp qwen3next /
+        // Strata normed-seed contract); nextn applies its own enorm/hnorm in forward_step.
+        // TODO(gpu-verify): confirm acceptance/identity on clean sequential GPUs.
         let (tokens, step_logits) = qwen.predict_nextn_draft(
             bonus_token,
             &h_prev,

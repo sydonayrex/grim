@@ -400,6 +400,21 @@ pub fn move_to_device(x: &Tensor, target: &Device) -> Result<Tensor> {
     if x.device() == target {
         return Ok(x.clone());
     }
+    #[cfg(feature = "rocm-mem")]
+    if let (Device::Rocm(src_ord), Device::Rocm(dst_ord)) = (x.device(), target) {
+        // Diagnostic gate (2026-11-13): default OFF. The P2P move path was
+        // proven to break plain decode at the 39/25 split (reproducible
+        // garbage + immediate EOS; A/B with GRIM_MOVE_P2P=0 restored coherent
+        // output matching the historical baseline). Opt in with
+        // GRIM_MOVE_P2P=1 after re-validating against the current kernel
+        // state; the async-copy-vs-consumer-sync ordering is the suspect
+        // class (see the concurrent DeviceGuard edits in roc_device.rs).
+        if std::env::var("GRIM_MOVE_P2P").as_deref() == Ok("1") {
+            if let Ok(t) = try_move_rocm_p2p(x, *src_ord, *dst_ord) {
+                return Ok(t);
+            }
+        }
+    }
     let dev = pick_device_for_storage_device(target);
     let out_storage = dev.from_cpu(&x.to_vec_f32()?, x.shape(), DType::F32)?;
     Ok(Tensor::new(
@@ -408,6 +423,39 @@ pub fn move_to_device(x: &Tensor, target: &Device) -> Result<Tensor> {
         DType::F32,
         x.provenance().clone(),
         target.clone(),
+    ))
+}
+
+#[cfg(feature = "rocm-mem")]
+fn try_move_rocm_p2p(x: &Tensor, src_ord: usize, dst_ord: usize) -> Result<Tensor> {
+    let _ = grim_backend_rocm::peer_access::enable_peer_access(src_ord as i32, dst_ord as i32);
+    let src_rocm = grim_backend_rocm::as_rocm(x.storage().as_ref())?;
+    let src_ptr = src_rocm
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("try_move_rocm_p2p: null src ptr".into()))?
+        as *const std::ffi::c_void;
+    let bytes = src_rocm.bytes();
+    let dst_dev = grim_backend_rocm::RocmDevice::shared(dst_ord);
+    let dst_storage = dst_dev.zeros(x.shape(), x.dtype())?;
+    let dst_rocm = grim_backend_rocm::as_rocm(dst_storage.as_ref())?;
+    let dst_ptr = dst_rocm
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("try_move_rocm_p2p: null dst ptr".into()))?
+        as *mut std::ffi::c_void;
+    grim_backend_rocm::peer_access::p2p_memcpy_async(
+        dst_ptr,
+        dst_ord as i32,
+        src_ptr,
+        src_ord as i32,
+        bytes,
+        dst_dev.active_stream(),
+    )?;
+    Ok(Tensor::new(
+        Arc::from(dst_storage),
+        x.shape().clone(),
+        x.dtype(),
+        x.provenance().clone(),
+        Device::Rocm(dst_ord),
     ))
 }
 
@@ -4024,5 +4072,28 @@ mod mla_cache_tests {
         let b_vec = broadcasted.to_vec_f32().unwrap();
         // 1.0 * 2.0 = 2.0
         assert!((b_vec[0] - 2.0).abs() < 1e-5);
+    }
+
+    #[cfg(feature = "rocm-mem")]
+    #[test]
+    fn move_to_device_rocm_p2p_preserves_dtype_and_values() {
+        if grim_backend_rocm::RocmDevice::try_new(1).is_err() {
+            return;
+        }
+        let dev0 = pick_device_for_storage_device(&Device::Rocm(0));
+        let vals = [1.0_f32, 2.0, 3.0, 4.0];
+        let shape = Shape::new(vec![4]);
+        let storage = dev0.from_cpu(&vals, &shape, DType::F16).unwrap();
+        let t = Tensor::new(
+            Arc::from(storage),
+            shape,
+            DType::F16,
+            Default::default(),
+            Device::Rocm(0),
+        );
+        let moved = move_to_device(&t, &Device::Rocm(1)).unwrap();
+        assert_eq!(moved.device(), &Device::Rocm(1));
+        assert_eq!(moved.dtype(), DType::F16);
+        assert_eq!(moved.to_vec_f32().unwrap(), vals);
     }
 }

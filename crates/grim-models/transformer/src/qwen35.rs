@@ -1204,12 +1204,18 @@ impl Qwen35Block {
                             let mut host_bytes = vec![0u8; n_bytes];
                             unsafe {
                                 if let Some(p) = rocm.device_ptr_u64() {
-                                    grim_backend_rocm::hipMemcpy(
-                                        host_bytes.as_mut_ptr() as *mut std::ffi::c_void,
-                                        p as *const std::ffi::c_void,
-                                        n_bytes,
-                                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                                    let _dev_guard = grim_backend_rocm::device::util::DeviceGuard::set(
+                                        rocm.device_ordinal() as i32,
                                     );
+                                    grim_backend_rocm::check_hip(
+                                        "qwen35 eager-scan D2H",
+                                        grim_backend_rocm::hipMemcpy(
+                                            host_bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                                            p as *const std::ffi::c_void,
+                                            n_bytes,
+                                            grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                                        ),
+                                    )?;
                                     let k_u16: &[u16] = std::slice::from_raw_parts(
                                         host_bytes.as_ptr() as *const u16,
                                         n_bytes / 2,
@@ -1491,13 +1497,30 @@ impl Qwen35Block {
                 // single token) — post-rope Q/K, V, pre-gate and post-gate
                 // attention branch. Align with the reference's per-call
                 // Qcur-3/Kcur-3/Vcur-3/attn_gated-3/attn_output-3 dumps.
-                if seq_len == 1 {
+                if seq_len == 1 || seq_len == 2 {
                     if let Some(dir) = std::env::var_os("GRIM_ATTN_DUMP_DIR") {
                         let want: usize = std::env::var("GRIM_ATTN_DUMP_LAYER")
                             .ok()
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(3);
                         if self.layer_idx == want {
+                            // Window probe: seq_len==2 dumps every row with a
+                            // win_ tag so the rows can be diffed against the
+                            // two seq_len==1 decode-step dumps (grim_attn_*).
+                            // seq_len==1 steps are tagged dec/dec2 by call
+                            // order so step 2 does not overwrite step 1.
+                            static STEP: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let tag = if seq_len == 2 {
+                                "win_".to_string()
+                            } else {
+                                let n = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n == 0 {
+                                    "dec_".to_string()
+                                } else {
+                                    "dec2_".to_string()
+                                }
+                            };
                             let dump = |name: &str, t: &Tensor| {
                                 if let Ok(r) = grim_backend_rocm::device::util::as_rocm(
                                     t.storage().as_ref(),
@@ -1507,7 +1530,7 @@ impl Qwen35Block {
                                     }
                                     if let Ok(b) = r.copy_to_host() {
                                         let _ = std::fs::write(
-                                            format!("{}/grim_attn_{name}.bin", dir.to_string_lossy()),
+                                            format!("{}/grim_attn_{}{}.bin", dir.to_string_lossy(), tag, name),
                                             &b,
                                         );
                                     }
@@ -1517,6 +1540,13 @@ impl Qwen35Block {
                             dump("k_rope", &k_rope);
                             dump("v", &v_dev_t);
                             dump("attn_pre_gate", &attn_tensor);
+                            if seq_len == 2 {
+                                eprintln!(
+                                    "[attn-win-dump] layer {} q_rope/q/v/attn rows={}",
+                                    self.layer_idx,
+                                    q_rope.shape().dims()[0]
+                                );
+                            }
                             // EAGER-PROBE counterpart: full eager K arena for
                             // this layer, to diff against the graph replay's
                             // graph_karena_l0.bin (same GRIM_LAYERS_DUMP_DIR
@@ -1665,7 +1695,7 @@ impl Qwen35Block {
         // (first divergence hunt between D2D and host runs).
         let kda_probe_layer0 = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
             && self.layer_idx == 0
-            && seq_len == 1;
+            && seq_len <= 2;
         if kda_probe_layer0 {
             static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1891,14 +1921,23 @@ impl Qwen35Block {
         let ffn_out = self.ffn_down.forward(&act_t)?;
         // KDA-STEP-PROBE: layer-0 decode FFN stage dumps.
         if kda_probe_layer0 {
-            static FF_DUMPED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !FF_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            static FF_CALLS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let ff_call = FF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ff_tag = if seq_len == 2 {
+                "win".to_string()
+            } else if ff_call == 0 {
+                "dec".to_string()
+            } else {
+                "dec2".to_string()
+            };
+            let _dump_to = |name: &str| format!("/tmp/kda_probe_ffn_{ff_tag}_{name}.bin");
+            if ff_call < 3 {
                 let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
                 if let Device::Rocm(ord) = x.device() {
                     grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
                 }
-                let mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
+                let _mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
                     "host"
                 } else {
                     "d2d"
@@ -1924,7 +1963,7 @@ impl Qwen35Block {
                                 let bytes: Vec<u8> =
                                     vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                                 let _ = std::fs::write(
-                                    format!("/tmp/kda_probe_ffn_{mode}_{name}.bin"),
+                                    format!("/tmp/kda_probe_ffn_{}_{name}.bin", ff_tag),
                                     &bytes,
                                 );
                             }
@@ -1937,7 +1976,7 @@ impl Qwen35Block {
                 dump(&gate, "gate");
                 dump(&up, "up");
                 dump(&ffn_out, "ffn_out");
-                let mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
+                let _mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
                     "host"
                 } else {
                     "d2d"
@@ -1950,7 +1989,7 @@ impl Qwen35Block {
                         Ok(r) => match r.copy_to_host() {
                             Ok(b) => {
                                 let _ = std::fs::write(
-                                    format!("/tmp/kda_probe_ffn_{mode}_w_gate_raw.bin"),
+                                    format!("/tmp/kda_probe_ffn_{}_w_gate_raw.bin", ff_tag),
                                     &b,
                                 );
                                 eprintln!("[ffn-fp] w_gate raw ({} B) dumped", b.len());
@@ -1977,11 +2016,11 @@ impl Qwen35Block {
                     Ok(r) => match r.copy_to_host() {
                         Ok(b) => {
                             let _ = std::fs::write(
-                                format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"),
+                                format!("/tmp/kda_probe_ffn_{}_fused_w.bin", ff_tag),
                                 &b,
                             );
                             let vals: Vec<f32> =
-                                std::fs::read(format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"))
+                                std::fs::read(format!("/tmp/kda_probe_ffn_{}_fused_w.bin", ff_tag))
                                     .unwrap_or_default()
                                     .chunks_exact(4)
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -2366,15 +2405,17 @@ impl Qwen35LayerCache {
         self.ssm_state = snap.ssm_state.clone();
         self.current_pos = snap.current_pos;
 
-        // Dense/paged KV device arenas are invalidated by rollback; clear so they
-        // can be rebuilt consistently with restored host/current_pos state.
-        self.k_device = None;
-        self.v_device = None;
-        self.k_scales_device = None;
-        self.v_scales_device = None;
-        self.k_pages = None;
-        self.v_pages = None;
-        self.block_table = None;
+        // Keep the device KV state (dense arenas + quant sidecars + paged
+        // handles). There is no rebuild path for these once dropped: the host
+        // `k_cache`/`v_cache` mirrors are never populated, so clearing
+        // `k_device` here made every post-restore forward attend over
+        // UNINITIALIZED arena rows (arena alloc only copies history from a
+        // pre-existing `old_k`, qwen35.rs grow arms) while `total_kv` still
+        // counted `current_pos` rows of history. Rollback only needs the
+        // logical position: appends write in place at `arena_row(current_pos)`
+        // and every forward appends BEFORE attention reads, so stale rows above
+        // the restored pos are overwritten before they can ever be read (same
+        // ring-wrap semantics as the accept path).
         // A stashed prefill K/V belongs to the rolled-back pass; drop it so the
         // replay does not append a second copy into the shared paged store.
         self.bridge_kv = None;
@@ -3397,6 +3438,12 @@ impl CausalLm for Qwen35 {
                             } else if seq_len == 1 {
                                 let fname = format!("{dir}/grim_lres_dec_{i:02}.bin");
                                 let _ = std::fs::write(&fname, last_row);
+                            } else if seq_len == 2 {
+                                // Verify-window probe: last row of a 2-token
+                                // forward, to diff against two sequential
+                                // seq_len==1 forwards at the same positions.
+                                let fname = format!("{dir}/grim_lres_v2_{i:02}.bin");
+                                let _ = std::fs::write(&fname, last_row);
                             }
                         }
                     }
@@ -3490,6 +3537,30 @@ impl CausalLm for Qwen35 {
             )
         } else {
             let normed = self.output_norm.forward(&h)?;
+
+            // M1/MTP: expose trunk post-output_norm hidden for nextn draft paths
+            // (llama.cpp qwen3next `h_nextn` / Strata normed trunk seed semantics).
+            // Keep last-row [1, hidden] on device; nextn applies its own hnorm/enorm.
+            if normed.shape().dims().len() == 2 {
+                let hidden = self.cfg.hidden_size;
+                let rows = normed.shape().dims()[0];
+                if rows == 1 {
+                    session.set_last_hidden_state(normed.clone());
+                } else if rows > 1 {
+                    let dev = grim_nn::modules::pick_device_for_storage_device(normed.device());
+                    let last_shape = grim_tensor::Shape::new(vec![1, hidden]);
+                    let (last_row_storage, _handle) =
+                        dev.narrow_rows(normed.storage().as_ref(), rows - 1, 1, hidden, &last_shape)?;
+                    session.set_last_hidden_state(grim_tensor::Tensor::new(
+                        std::sync::Arc::from(last_row_storage),
+                        last_shape,
+                        normed.dtype().clone(),
+                        normed.provenance().clone(),
+                        normed.device().clone(),
+                    ));
+                }
+            }
+
             // result_norm analog of the reference's per-call dump: the
             // final-norm output for the LAST row, aligned with the harness's
             // ref_result_norm_<call>.bin / ref_rn_<call>.bin files.
@@ -4184,7 +4255,9 @@ fn gated_delta_net_forward_d2d(
     if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if call <= 32 {
+        // Print non-prefill calls (decode/verify geometry) plus the first
+        // prefill call, so seq_len==1 routing is visible.
+        if (seq_len != 20 || call == 1) && call <= 96 {
             eprintln!(
                 "[kda-dev] call {call} layer {} seq_len {} x_normed.device() = {}",
                 blk.layer_idx,
@@ -4415,12 +4488,29 @@ fn gated_delta_net_forward_d2d(
     // projection input, RAW step-conv output, and pre-step ring for the
     // decode-step arbitration. Unlike the composite probe below, every read
     // is preceded by a device synchronize, so the bytes are not stale.
-    if seq_len == 1 {
-        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && blk.layer_idx == kda_probe_prefill_layer()
-            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
+    if seq_len == 1 || seq_len == 2 {
+        static PROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let probe_on = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer();
+        // seq_len==1: dump both decode steps (dec_* then dec2_*) so the
+        // window rows can be diffed against each step's stage tensors.
+        // seq_len==2: dump the whole window once (win_*), full [2, ...] rows.
+        // Only consume a slot when the probe is actually on, so pre-probe
+        // derivation steps (env removed) do not eat the dec/dec2 tags.
+        let seq1_slot = if !probe_on {
+            None
+        } else if seq_len == 1 {
+            let n = PROBED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n > 1 {
+                None
+            } else {
+                Some(if n == 0 { "dec" } else { "dec2" })
+            }
+        } else {
+            Some("win")
+        };
+        if seq1_slot.is_some() {
+            let tag = seq1_slot.unwrap();
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
                     .and_then(|r| r.copy_to_host())
@@ -4436,8 +4526,7 @@ fn gated_delta_net_forward_d2d(
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
                     eprintln!(
-                        "[kda-step-probe] decode wrote {} ({} f32) -> {path}",
-                        name,
+                        "[kda-step-probe] {tag} wrote {name} ({} f32) -> {path}",
                         vals.len()
                     );
                 }
@@ -4445,10 +4534,13 @@ fn gated_delta_net_forward_d2d(
             if let Device::Rocm(ord) = x_normed.device() {
                 grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
             }
-            dump(&read(qkv.storage().as_ref()), "dec_conv_x");
-            dump(&read(conv_state.as_ref()), "dec_ring_pre");
-            dump(&read(ssm_state.as_ref()), "dec_ssm_pre");
-            dump(&read(conv_out.as_ref()), "dec_conv_raw");
+            dump(&read(qkv.storage().as_ref()), &format!("{tag}_conv_x"));
+            dump(&read(conv_state.as_ref()), &format!("{tag}_ring_pre"));
+            dump(&read(ssm_state.as_ref()), &format!("{tag}_ssm_pre"));
+            dump(&read(conv_out.as_ref()), &format!("{tag}_conv_raw"));
+            dump(&read(alpha.storage().as_ref()), &format!("{tag}_alpha"));
+            dump(&read(beta.storage().as_ref()), &format!("{tag}_beta"));
+            dump(&read(z.storage().as_ref()), &format!("{tag}_z"));
         }
     }
 
@@ -4494,6 +4586,20 @@ fn gated_delta_net_forward_d2d(
             dump(&read(z.storage().as_ref()), "prefill_z");
         }
     }
+    // Verify-window parity (prefill-vs-decode divergence, MTP gate (b)):
+    // `grim_kda_gated_delta_rule_scan_v2` computes the per-token k/q l2 norms
+    // with a block-wide tree reduction while the decode-step kernel
+    // (`grim_kda_gated_delta_rule_batched`) accumulates serially per thread —
+    // different summation order, systematic per-token drift (measured: 5-10x
+    // mean residual jump at the first KDA layer past the drift floor). For
+    // windows at or below GRIM_KDA_STEP_PARITY_MAX (default 2 — the MTP verify
+    // geometry), run the DECODE kernel once per token so the window forward is
+    // bit-identical to sequential seq_len==1 decode steps. Cost: +1 step
+    // launch per extra token (~78us) — noise against decode-step latency.
+    let step_parity_max = std::env::var("GRIM_KDA_STEP_PARITY_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2);
     let (branch, _) = if seq_len == 1 {
         dev.kda_gated_delta_rule_batched(
             conv_out.as_ref(),
@@ -4510,6 +4616,83 @@ fn gated_delta_net_forward_d2d(
             eps,
             &Shape::new(vec![1, value_dim]),
         )?
+    } else if seq_len <= step_parity_max {
+        if std::env::var_os("GRIM_TRACE_LAYERS").is_some() {
+            eprintln!("[kda-step-parity] layer {} seq_len {} -> per-token step loop", blk.layer_idx, seq_len);
+        }
+        let out_shape = Shape::new(vec![seq_len, value_dim]);
+        let out_storage = dev.alloc_storage(&out_shape, DType::F32)?;
+        // Keep every per-row storage AND launch handle alive until the copies
+        // have actually executed: `copy_slice_range` is queued on the active
+        // stream, so dropping `br`/narrow views at the end of an iteration
+        // frees device buffers the stream may still be reading — an
+        // intermittent GPU page fault on dev1 (caught by the semantic gate).
+        let mut keep_storage: Vec<Box<dyn grim_tensor::backend::BackendStorage>> = Vec::new();
+        let mut keep_handles: Vec<Box<dyn grim_tensor::backend::ComputeHandle>> = Vec::new();
+        for t in 0..seq_len {
+            let (c_t, h_c) = dev.narrow_rows(
+                conv_out.as_ref(),
+                t,
+                1,
+                conv_dim,
+                &Shape::new(vec![1, conv_dim]),
+            )?;
+            let (a_t, h_a) = dev.narrow_rows(
+                alpha.storage().as_ref(),
+                t,
+                1,
+                n_val_heads,
+                &Shape::new(vec![1, n_val_heads]),
+            )?;
+            let (b_t, h_b) = dev.narrow_rows(
+                beta.storage().as_ref(),
+                t,
+                1,
+                n_val_heads,
+                &Shape::new(vec![1, n_val_heads]),
+            )?;
+            let (z_t, h_z) = dev.narrow_rows(
+                z.storage().as_ref(),
+                t,
+                1,
+                value_dim,
+                &Shape::new(vec![1, value_dim]),
+            )?;
+            let (br, h_br) = dev.kda_gated_delta_rule_batched(
+                c_t.as_ref(),
+                a_t.as_ref(),
+                b_t.as_ref(),
+                dt_bias_d.as_ref(),
+                ssm_a_d.as_ref(),
+                ssm_norm_d.as_ref(),
+                Some(z_t.as_ref()),
+                ssm_state.as_ref(),
+                n_val_heads,
+                n_key_heads,
+                head_dim,
+                eps,
+                &Shape::new(vec![1, value_dim]),
+            )?;
+            dev.copy_slice_range(out_storage.as_ref(), t * value_dim, br.as_ref(), 0, value_dim)?;
+            keep_storage.push(br);
+            keep_storage.push(c_t);
+            keep_storage.push(a_t);
+            keep_storage.push(b_t);
+            keep_storage.push(z_t);
+            keep_handles.push(h_br);
+            keep_handles.push(h_c);
+            keep_handles.push(h_a);
+            keep_handles.push(h_b);
+            keep_handles.push(h_z);
+        }
+        // The copies are stream-ordered; make sure they completed before the
+        // retained buffers are dropped.
+        grim_backend_rocm::RocmDevice::shared(conv_out.device_ordinal() as usize).synchronize();
+        drop(keep_handles);
+        drop(keep_storage);
+        let handle = Box::new(grim_backend_rocm::RocmHandle::new(None))
+            as Box<dyn grim_tensor::backend::ComputeHandle>;
+        (out_storage, handle)
     } else {
         dev.kda_gated_delta_rule_scan(
             conv_out.as_ref(),
@@ -4530,12 +4713,26 @@ fn gated_delta_net_forward_d2d(
     };
 
     // Post-step decode dumps (device, synchronized): ssm state, ring, branch.
-    if seq_len == 1 {
-        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && blk.layer_idx == kda_probe_prefill_layer()
-            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
+    if seq_len == 1 || seq_len == 2 {
+        static PROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let probe_on = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer();
+        // Only consume a slot when the probe is actually on, so pre-probe
+        // derivation steps (env removed) do not eat the dec/dec2 tags.
+        let seq1_slot = if !probe_on {
+            None
+        } else if seq_len == 1 {
+            let n = PROBED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n > 1 {
+                None
+            } else {
+                Some(if n == 0 { "dec" } else { "dec2" })
+            }
+        } else {
+            Some("win")
+        };
+        if seq1_slot.is_some() {
+            let tag = seq1_slot.unwrap();
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
                     .and_then(|r| r.copy_to_host())
@@ -4551,8 +4748,7 @@ fn gated_delta_net_forward_d2d(
                 let path = format!("/tmp/kda_probe_d2d_{name}.bin");
                 if std::fs::write(&path, &bytes).is_ok() {
                     eprintln!(
-                        "[kda-step-probe] decode wrote {} ({} f32) -> {path}",
-                        name,
+                        "[kda-step-probe] {tag} wrote {name} ({} f32) -> {path}",
                         vals.len()
                     );
                 }
@@ -4560,9 +4756,9 @@ fn gated_delta_net_forward_d2d(
             if let Device::Rocm(ord) = x_normed.device() {
                 grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
             }
-            dump(&read(ssm_state.as_ref()), "dec_ssm_post");
-            dump(&read(conv_state.as_ref()), "dec_ring_post");
-            dump(&read(branch.as_ref()), "dec_branch");
+            dump(&read(ssm_state.as_ref()), &format!("{tag}_ssm_post"));
+            dump(&read(conv_state.as_ref()), &format!("{tag}_ring_post"));
+            dump(&read(branch.as_ref()), &format!("{tag}_branch"));
         }
     }
 
@@ -5592,12 +5788,19 @@ fn attention_layer_d2d(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
-        if blk.layer_idx == want && seq_len == 1 {
+        if blk.layer_idx == want && (seq_len == 1 || seq_len == 2) {
             // Decode-call index: the prefill call is not counted (seq_len>1),
             // so this equals the harness's decode step number (1-based).
+            // seq_len==2 (verify window) dumps with a win_ tag so its rows can
+            // be diffed against the two seq_len==1 step dumps.
             static ATTN_STEP: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
-            let step = ATTN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let tag = if seq_len == 2 {
+                "win_".to_string()
+            } else {
+                let step = ATTN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                format!("{step:02}_")
+            };
             let dump = |name: &str, t: &Tensor| {
                 if let Ok(r) =
                     grim_backend_rocm::device::util::as_rocm(t.storage().as_ref())
@@ -5607,7 +5810,7 @@ fn attention_layer_d2d(
                     }
                     if let Ok(b) = r.copy_to_host() {
                         let _ = std::fs::write(
-                            format!("{}/grim_attn_{step:02}_{name}.bin", dir.to_string_lossy()),
+                            format!("{}/grim_attn_{}{name}.bin", dir.to_string_lossy(), tag),
                             &b,
                         );
                     }
@@ -5655,7 +5858,7 @@ fn attention_layer_d2d(
                 x_normed.device().clone(),
             );
             dump("attn_gated", &gated_t);
-            eprintln!("[attn3-dump-d2d] step {} dumped (total_kv={})", step, total_kv);
+            eprintln!("[attn3-dump-d2d] {} dumped (seq_len={} total_kv={})", tag, seq_len, total_kv);
             return Ok(Some(gated_t));
         }
     }
