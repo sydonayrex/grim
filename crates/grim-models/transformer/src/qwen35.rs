@@ -2405,6 +2405,21 @@ impl Qwen35LayerCache {
         self.ssm_state = snap.ssm_state.clone();
         self.current_pos = snap.current_pos;
 
+        // The replaces below DROP the previous device storages. The verify
+        // forward that preceded this restore queued kernels writing them; if
+        // the drop wins the race the stream faults on freed VRAM
+        // (intermittent dev1 page fault, MTP reject/replay only). Sync the
+        // layer's storage device first so nothing in flight references the
+        // buffers we are about to release.
+        let dev_type = devices
+            .get(layer_idx)
+            .or_else(|| devices.last())
+            .cloned()
+            .unwrap_or(Device::Cpu);
+        if let Device::Rocm(ord) = &dev_type {
+            grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+        }
+
         // Keep the device KV state (dense arenas + quant sidecars + paged
         // handles). There is no rebuild path for these once dropped: the host
         // `k_cache`/`v_cache` mirrors are never populated, so clearing
@@ -3454,8 +3469,15 @@ impl CausalLm for Qwen35 {
             eprintln!("[qwen35-trace] all layers done, entering output norm");
         }
 
+        let trace_head = std::env::var("GRIM_TRACE_LAYERS").is_ok();
+        if trace_head {
+            eprintln!("[qwen35-trace] output-norm: h on {}", h.device());
+        }
         if h.device() != self.output_norm.weight.device() {
             h = grim_nn::modules::move_to_device(&h, self.output_norm.weight.device())?;
+        }
+        if trace_head {
+            eprintln!("[qwen35-trace] output-norm input ready on {}", h.device());
         }
 
         // M1/MTP: expose trunk final hidden before output_norm for draft paths.
@@ -3606,8 +3628,17 @@ impl CausalLm for Qwen35 {
             let head_in = crate::decode_graph::hadamard_transform_tensor(&head_in, usize::MAX, "output")
                 .unwrap_or_else(|_| head_in.clone());
             let logits = self.output.forward(&head_in)?;
+            if trace_head {
+                eprintln!("[qwen35-trace] lm-head done on {}", logits.device());
+            }
             logits
         };
+        if trace_head {
+            eprintln!(
+                "[qwen35-trace] forward returning logits on {} (skip_head={skip_head})",
+                logits.device()
+            );
+        }
         session.advance_pos(seq_len);
         Ok(logits)
     }
