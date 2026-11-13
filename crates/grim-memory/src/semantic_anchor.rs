@@ -19,8 +19,23 @@ pub struct RecurrentLayerState {
     pub shape: Vec<usize>,
 }
 
+/// Opaque session snapshot shared between a checkpoint and the engine.
+///
+/// `Mutex` makes the `Arc` `Sync` (the pool lives behind a `Mutex<KvBlockPool>`,
+/// and `Arc<dyn Any + Send>` is not `Sync`). The engine takes a read lock and
+/// passes `&dyn Any` to [`SessionT::restore_recurrent_state_ref`], so a checkpoint
+/// can be restored by any number of requests without consuming it.
+pub type SharedSessionSnapshot = Arc<std::sync::Mutex<Box<dyn std::any::Any + Send>>>;
+
 /// A full-model snapshot of all recurrent and hybrid-attention layers at a semantic boundary.
-#[derive(Debug, Clone)]
+///
+/// `session_snapshot` is the opaque [`SessionT::snapshot_recurrent_state`] payload
+/// (device GDN+conv state for Qwen35) captured at `token_offset`. It is `None` for
+/// checkpoints registered before the session snapshot was available, and for the
+/// synthetic layer-state checkpoints the pool tests build. The engine restores it
+/// via [`SessionT::restore_recurrent_state_ref`]; the pool never inspects it,
+/// which is what keeps grim-memory free of model-specific types.
+#[derive(Clone)]
 pub struct RecurrentStateCheckpoint {
     /// Unique checkpoint ID.
     pub id: CheckpointId,
@@ -32,6 +47,24 @@ pub struct RecurrentStateCheckpoint {
     pub layer_states: Vec<RecurrentLayerState>,
     /// Last access timestamp for LRU eviction.
     pub last_access: Instant,
+    /// Opaque session snapshot captured at `token_offset` (T2 hybrid prefix reuse).
+    pub session_snapshot: Option<SharedSessionSnapshot>,
+}
+
+impl std::fmt::Debug for RecurrentStateCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecurrentStateCheckpoint")
+            .field("id", &self.id)
+            .field("token_offset", &self.token_offset)
+            .field("radix_node_id", &self.radix_node_id)
+            .field("layer_states", &self.layer_states)
+            .field("last_access", &self.last_access)
+            .field(
+                "session_snapshot",
+                &self.session_snapshot.as_ref().map(|_| "<opaque>"),
+            )
+            .finish()
+    }
 }
 
 /// Registry of semantic boundary token IDs for detecting anchor points.
@@ -128,6 +161,47 @@ impl RecurrentCheckpointPool {
             radix_node_id,
             layer_states,
             last_access: Instant::now(),
+            session_snapshot: None,
+        });
+
+        self.checkpoints.insert(id, Arc::clone(&checkpoint));
+        self.node_to_checkpoint.insert(radix_node_id, id);
+        checkpoint
+    }
+
+    /// Store a checkpoint that carries an opaque session snapshot (T2).
+    ///
+    /// Same contract as [`Self::store_checkpoint`], plus the snapshot is kept
+    /// verbatim and handed back by [`Self::get_by_node`]. `layer_states` is
+    /// still accepted so a caller can record both representations; the engine
+    /// passes an empty vec and relies on `session_snapshot`.
+    pub fn store_session_checkpoint(
+        &mut self,
+        radix_node_id: usize,
+        token_offset: usize,
+        layer_states: Vec<RecurrentLayerState>,
+        session_snapshot: Option<Box<dyn std::any::Any + Send>>,
+    ) -> Arc<RecurrentStateCheckpoint> {
+        // If this node already had a checkpoint, remove it first
+        if let Some(old_id) = self.node_to_checkpoint.remove(&radix_node_id) {
+            self.checkpoints.remove(&old_id);
+        }
+
+        // Evict LRU if capacity exceeded
+        if self.checkpoints.len() >= self.max_checkpoints {
+            self.evict_coldest();
+        }
+
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+
+        let checkpoint = Arc::new(RecurrentStateCheckpoint {
+            id,
+            token_offset,
+            radix_node_id,
+            layer_states,
+            last_access: Instant::now(),
+            session_snapshot: session_snapshot.map(|s| Arc::new(std::sync::Mutex::new(s))),
         });
 
         self.checkpoints.insert(id, Arc::clone(&checkpoint));

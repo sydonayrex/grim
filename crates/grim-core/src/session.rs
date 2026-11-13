@@ -13,6 +13,32 @@ pub enum DeterminismMode {
     Strict,
 }
 
+/// Model-installed recurrent-state hooks (T2 hybrid prefix reuse).
+///
+/// The engine's session is the model-agnostic [`Inner`]; a model with
+/// recurrent state installs these hooks on first forward so the engine's
+/// `SessionT::snapshot_recurrent_state` / `restore_recurrent_state_ref` calls
+/// dispatch to model-specific logic without needing a model-specific session
+/// type. Shared as `Arc` so `Inner` can hold the hooks while mutably borrowing
+/// the model state they operate on.
+pub trait RecurrentHooks: Send + Sync {
+    /// Capture the recurrent state from the session's model-state payload at
+    /// `current_pos`. `Ok(None)` when the payload carries no recurrent state.
+    fn snapshot_recurrent(
+        &self,
+        state: &(dyn std::any::Any + Send),
+        current_pos: usize,
+    ) -> Result<Option<Box<dyn std::any::Any + Send>>>;
+
+    /// Restore a snapshot into the model-state payload. Returns the session
+    /// position the snapshot was taken at.
+    fn restore_recurrent(
+        &self,
+        state: &mut (dyn std::any::Any + Send),
+        snap: &dyn std::any::Any,
+    ) -> Result<usize>;
+}
+
 /// Object-safe session interface used by `Model` traits (`CausalLm`, `EncoderDecoderLm`).
 /// The simplest implementation is the `Inner` concrete value returned from `Session::new_storage`.
 pub trait SessionT: Send {
@@ -25,6 +51,9 @@ pub trait SessionT: Send {
     fn append_kv_layer(&mut self, _layer: usize, _k: &Tensor, _v: &Tensor) -> Result<()> {
         Ok(())
     }
+    /// Stage a radix-seeded prefix into `layer`'s paged pages without appending
+    /// a token (T2 KV bridge). See [`KvCache::hydrate_seeded_prefix`].
+    fn hydrate_seeded_prefix(&mut self, _layer: usize, _stride: usize) {}
     fn kv_cache(&self) -> Option<&(dyn KvCache + 'static)> {
         None
     }
@@ -79,6 +108,20 @@ pub trait SessionT: Send {
     }
     fn set_model_state(&mut self, _state: Box<dyn std::any::Any + Send>) {}
 
+    /// Install the model's recurrent-state hooks (T2). See [`RecurrentHooks`].
+    fn set_recurrent_hooks(&mut self, _hooks: std::sync::Arc<dyn RecurrentHooks>) {}
+    /// The installed recurrent-state hooks, if any.
+    fn recurrent_hooks(&self) -> Option<std::sync::Arc<dyn RecurrentHooks>> {
+        None
+    }
+
+    // NOTE: a trait method returning two mutable borrows cannot be called on
+    // `&mut dyn SessionT` — the `&mut (dyn KvCache + 'static)` return makes the
+    // compiler require `Self: 'static`, which `dyn SessionT + '_` does not
+    // satisfy. Models that need both (the T2 KV bridge) take the owned tensors
+    // out of the model state first, then borrow the KV. See `Qwen35::forward`'s
+    // post-loop append.
+
     /// Per-request RNG for deterministic sampling (e.g., speculative rejection).
     fn request_rng(&self) -> Option<&SimpleRng> {
         None
@@ -110,6 +153,43 @@ pub trait SessionT: Send {
         false
     }
     fn set_skip_output_projection(&mut self, _skip: bool) {}
+
+    /// Return full per-position logits for multi-token forwards (e.g. speculative verify).
+    /// Default false preserves decode/prefill slicing optimizations.
+    fn full_output_logits(&self) -> bool {
+        false
+    }
+    fn set_full_output_logits(&mut self, _full: bool) {}
+
+    /// Greedy/argmax-only sampling (temperature <= 0). Speculative verification should use
+    /// argmax-equality in greedy mode for bit-identical MTP streams.
+    fn sampling_greedy(&self) -> bool {
+        false
+    }
+    fn set_sampling_greedy(&mut self, _greedy: bool) {}
+
+    /// M2 (speculative verify): snapshot model/recurrent state for rollback.
+    /// Returns an opaque snapshot owned by the caller; `None` if no recurrent state.
+    fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        Ok(None)
+    }
+
+    /// M2 (speculative verify): restore a snapshot previously returned by
+    /// `snapshot_recurrent_state`.
+    fn restore_recurrent_state(&mut self, _snapshot: Box<dyn std::any::Any + Send>) -> Result<()> {
+        Ok(())
+    }
+
+    /// T2 (hybrid prefix reuse): restore from a snapshot the caller still owns.
+    ///
+    /// The radix checkpoint pool shares one snapshot among every request that
+    /// matches the prefix, so it cannot hand ownership to each of them. This
+    /// variant lets the session clone the concrete snapshot out of the shared
+    /// reference. The default no-op keeps existing implementors source-compatible;
+    /// a session that does not override it simply cannot be reused via T2.
+    fn restore_recurrent_state_ref(&mut self, _snapshot: &dyn std::any::Any) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -132,6 +212,13 @@ pub struct Inner {
     pub last_accepted_tokens: usize,
     /// Hint to skip output LM head projection on non-terminal prefill chunks.
     pub skip_output_projection: bool,
+    /// Return full per-position logits (e.g. speculative verify). Default false.
+    pub full_output_logits: bool,
+    /// Greedy/argmax-only sampling mode (temperature <= 0).
+    pub sampling_greedy: bool,
+    /// Model-installed recurrent-state hooks (T2 hybrid prefix reuse). `None`
+    /// means the session has no recurrent state to snapshot or restore.
+    pub recurrent_hooks: Option<std::sync::Arc<dyn RecurrentHooks>>,
 }
 
 impl Inner {
@@ -146,6 +233,9 @@ impl Inner {
             request_rng: None,
             last_accepted_tokens: 1,
             skip_output_projection: false,
+            full_output_logits: false,
+            sampling_greedy: false,
+            recurrent_hooks: None,
         }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
@@ -159,6 +249,9 @@ impl Inner {
             request_rng: None,
             last_accepted_tokens: 1,
             skip_output_projection: false,
+            full_output_logits: false,
+            sampling_greedy: false,
+            recurrent_hooks: None,
         }
     }
 }
@@ -188,6 +281,11 @@ impl SessionT for Inner {
             kv.append_kv_layer(layer, k, v)?;
         }
         Ok(())
+    }
+    fn hydrate_seeded_prefix(&mut self, layer: usize, stride: usize) {
+        if let Some(kv) = self.kv.as_deref_mut() {
+            kv.hydrate_seeded_prefix(layer, stride);
+        }
     }
     fn kv_cache(&self) -> Option<&(dyn KvCache + 'static)> {
         self.kv.as_deref()
@@ -262,6 +360,56 @@ impl SessionT for Inner {
     }
     fn set_skip_output_projection(&mut self, skip: bool) {
         self.skip_output_projection = skip;
+    }
+    fn full_output_logits(&self) -> bool {
+        self.full_output_logits
+    }
+    fn set_full_output_logits(&mut self, full: bool) {
+        self.full_output_logits = full;
+    }
+    fn sampling_greedy(&self) -> bool {
+        self.sampling_greedy
+    }
+    fn set_sampling_greedy(&mut self, greedy: bool) {
+        self.sampling_greedy = greedy;
+    }
+
+    fn set_recurrent_hooks(&mut self, hooks: std::sync::Arc<dyn RecurrentHooks>) {
+        self.recurrent_hooks = Some(hooks);
+    }
+    fn recurrent_hooks(&self) -> Option<std::sync::Arc<dyn RecurrentHooks>> {
+        self.recurrent_hooks.clone()
+    }
+
+    fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        // `Inner` is model-agnostic; the model installs [`RecurrentHooks`] on
+        // first forward. No hooks (or no model state yet) means no recurrent
+        // state to snapshot.
+        match (self.recurrent_hooks.as_ref(), self.model_state.as_deref()) {
+            (Some(hooks), Some(state)) => hooks.snapshot_recurrent(state, self.current_pos),
+            _ => Ok(None),
+        }
+    }
+
+    fn restore_recurrent_state(&mut self, snapshot: Box<dyn std::any::Any + Send>) -> Result<()> {
+        self.restore_recurrent_state_ref(&*snapshot)
+    }
+
+    fn restore_recurrent_state_ref(&mut self, snapshot: &dyn std::any::Any) -> Result<()> {
+        // Clone the Arc so the hooks are not borrowed while the model state is
+        // mutably borrowed.
+        let Some(hooks) = self.recurrent_hooks.clone() else {
+            return Ok(());
+        };
+        let Some(state) = self.model_state.as_deref_mut() else {
+            return Ok(());
+        };
+        let pos = hooks.restore_recurrent(state, snapshot)?;
+        self.current_pos = pos;
+        if let Some(kv) = self.kv.as_deref_mut() {
+            let _ = kv.rollback_to(pos);
+        }
+        Ok(())
     }
 }
 

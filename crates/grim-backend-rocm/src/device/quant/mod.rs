@@ -287,7 +287,12 @@ impl QuantOps for RocmDevice {
                     .is_some();
                 if lane_served {
                     // out_storage is written by the lane GEMV.
-                } else if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                } else if (is_rdna2 || is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
+                    && !crate::device::quant::exact_decode_gemv()
+                {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -563,7 +568,12 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_Q6K_DOT4").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if q6k_dot4_ok && (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0
+                if q6k_dot4_ok
+                    && (is_rdna2 || is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
+                    && !crate::device::quant::exact_decode_gemv()
                 {
                     if crate::device::quant::kquant_dot4_ok_for(n) {
                         // Body tensor: dot4 with Q8_1 activations (fast, Q8_1 act
@@ -692,7 +702,12 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
+                    && !crate::device::quant::exact_decode_gemv()
+                {
                     // Phase 4.5f: m==1 decode routes to the Q2_K dot4 GEMV.
                     // Activations must be pre-quantized to Q8_1; quantize on the fly otherwise.
                     let q81_bytes = (k / 32) * 36 * m;
@@ -817,7 +832,12 @@ impl QuantOps for RocmDevice {
                     .is_some();
                 if lane_served {
                     // out_storage is written by the lane GEMV.
-                } else if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                } else if (is_rdna2 || is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
+                    && !crate::device::quant::exact_decode_gemv()
+                {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());

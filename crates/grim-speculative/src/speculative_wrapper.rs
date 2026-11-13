@@ -254,8 +254,10 @@ impl SpeculativeCausalLm {
         verify_len: usize,
         uniforms: &[f32],
         rng: &mut grim_core::rng::SimpleRng,
+        greedy: bool,
     ) -> Result<usize> {
-        let gpu_ready = self.gpu_verifier.is_some()
+        let gpu_ready = !greedy
+            && self.gpu_verifier.is_some()
             && matches!(target_logits.device(), Device::Rocm(_))
             && matches!(draft_logits.device(), Device::Rocm(_))
             && uniforms.len() >= verify_len + 1;
@@ -274,19 +276,46 @@ impl SpeculativeCausalLm {
                 }
             }
         }
-        // CPU reference loop: per-row softmax + ratio test with per-request
-        // randomness (identical math to the pre-Task-10.6 loop).
         let target_probs = target_logits.to_vec_f32()?;
-        let draft_logits_cpu = draft_logits.to_vec_f32()?;
+        let draft_logits_cpu = if greedy {
+            Vec::new()
+        } else {
+            draft_logits.to_vec_f32()?
+        };
         let mut accepted_count = 0usize;
+        let base_row = context_len.saturating_sub(1);
         for i in 0..verify_len {
             let draft_tok = draft_tokens[i] as usize;
-            let row_start = (context_len + i) * vocab_size;
+            let row_start = (base_row + i) * vocab_size;
             let row_end = row_start + vocab_size;
-            let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
+            let row = &target_probs[row_start..row_end];
+
+            if greedy {
+                // Greedy/argmax path: accept only when the target's top token equals the draft.
+                let mut best_idx = 0usize;
+                let mut best_val = f32::NEG_INFINITY;
+                for (j, &v) in row.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = j;
+                    }
+                }
+                if best_idx == draft_tok {
+                    accepted_count += 1;
+                } else {
+                    break;
+                }
+                continue;
+            }
+
+            let p_target = softmax_f32_row(row)[draft_tok];
             let draft_row_start = i * vocab_size;
             let draft_row_end = draft_row_start + vocab_size;
-            let p_draft = softmax_f32_row(&draft_logits_cpu[draft_row_start..draft_row_end])[draft_tok];
+            let p_draft = if draft_row_end <= draft_logits_cpu.len() {
+                softmax_f32_row(&draft_logits_cpu[draft_row_start..draft_row_end])[draft_tok]
+            } else {
+                0.0
+            };
             let p_accept = if p_draft > 1e-10 {
                 (p_target / p_draft).min(1.0)
             } else {
@@ -411,9 +440,13 @@ impl SpeculativeCausalLm {
                 let extended_input =
                     self.extend_input_ids(input_ids, &scored.tokens[..verify_len])?;
                 let extended_positions = self.extend_positions(positions, verify_len)?;
-                let target_logits =
-                    self.target
-                        .forward(session, &extended_input, &extended_positions, adapters)?;
+                let prev_full_logits = session.full_output_logits();
+                session.set_full_output_logits(true);
+                let target_forward = self
+                    .target
+                    .forward(session, &extended_input, &extended_positions, adapters);
+                session.set_full_output_logits(prev_full_logits);
+                let target_logits = target_forward?;
                 let vocab_size = scored.base_logits.shape().dims()[1];
 
                 // CRIT-4: Use per-request RNG instead of global rand::random()
@@ -437,6 +470,7 @@ impl SpeculativeCausalLm {
                     verify_len,
                     &uniforms,
                     &mut rng,
+                    session.sampling_greedy(),
                 )?;
 
                 // CRIT-5: Properly commit/rollback KV cache based on accepted count.
@@ -530,74 +564,275 @@ impl SpeculativeCausalLm {
     ) -> Result<Tensor> {
         let mtp = self.mtp_target.as_ref().unwrap();
         let depth = mtp.mtp_depth();
-        if depth == 0 {
+        let context_len = input_ids.shape().elem_count();
+
+        // M3 correctness: native MTP is a one-token decode-step path. Prefill/multi-token inputs
+        // and projection-skipped passes must take the plain target forward.
+        if depth == 0 || context_len != 1 || session.skip_output_projection() {
+            session.set_last_accepted_tokens(1);
             return self.target.forward(session, input_ids, positions, adapters);
         }
 
-        // 1. Natively predict speculative tokens
-        let draft_block = mtp.predict_multi(session, input_ids, positions)?;
-        if draft_block.tokens.is_empty() {
-            return self.target.forward(session, input_ids, positions, adapters);
-        }
+        let recurrent = self.target.has_recurrent_state() || mtp.has_recurrent_state();
+        // `mut`: the snapshots are consumed by `restore_recurrent_state`, and
+        // `Box<dyn Any + Send>` is not `Clone`, so the reject/partial-accept
+        // paths `take()` them rather than cloning.
+        let mut base_snapshot = if recurrent {
+            session.snapshot_recurrent_state()?
+        } else {
+            None
+        };
 
+        // 1. Base forward (exactly once). This advances state by the base token and populates
+        // the session's last hidden state for the nextn draft head.
+        let prev_full_logits = session.full_output_logits();
+        session.set_full_output_logits(false);
+        let base_logits_full = self.target.forward(session, input_ids, positions, adapters)?;
+        session.set_full_output_logits(prev_full_logits);
+
+        // Snapshot after base for recurrent rollback/replay: avoids replaying base forward on
+        // reject/partial-accept and restores exact post-base state (KV/recurrent/pos).
+        let mut post_base_snapshot = if recurrent {
+            session.snapshot_recurrent_state()?
+        } else {
+            None
+        };
+
+        let base_dims = base_logits_full.shape().dims();
+        let vocab_size = *base_dims.last().unwrap_or(&0);
+        if vocab_size == 0 {
+            if let Some(snap) = base_snapshot {
+                let _ = session.restore_recurrent_state(snap);
+                // best-effort plain step after rollback
+                session.set_last_accepted_tokens(1);
+                return self.target.forward(session, input_ids, positions, adapters);
+            }
+            session.set_last_accepted_tokens(1);
+            return Ok(base_logits_full);
+        }
+        let base_vec = base_logits_full.to_vec_f32()?;
+        let base_last = if base_vec.len() >= vocab_size {
+            base_vec[base_vec.len() - vocab_size..].to_vec()
+        } else {
+            base_vec
+        };
+
+        // 2. Draft from the already-run base forward (must not re-run the base input).
+        let draft_block = mtp.predict_multi_after_forward(session, input_ids, positions, &base_logits_full)?;
         let verify_len = draft_block.tokens.len().min(depth);
 
-        // 2. Tentative append to KV Cache
+        // Helper: emit only the base row. Recurrent case must restore to post-base snapshot so
+        // state is exactly base-advanced (base forward already ran above).
+        if verify_len == 0 {
+            let had_post = post_base_snapshot.is_some();
+            if let Some(snap) = post_base_snapshot.take().or_else(|| base_snapshot.take()) {
+                session.restore_recurrent_state(snap)?;
+                if !had_post {
+                    // Fallback only if post-base snapshot unavailable.
+                    let _ = self.target.forward(session, input_ids, positions, adapters)?;
+                }
+            }
+            session.set_last_accepted_tokens(1);
+            return Ok(grim_backend_cpu::cpu_tensor(
+                base_last,
+                grim_tensor::Shape::new(vec![1, vocab_size]),
+            ));
+        }
+
+        // 3. Tentative append draft slots and verify ONLY draft tokens (never the base token).
         if let Some(kv) = session.kv_mut() {
             kv.tentative_append(verify_len)?;
         }
+        let draft_input = self.extend_input_ids_ids(&draft_block.tokens[..verify_len])?;
+        let base_last_pos = positions
+            .to_vec_f32()
+            .ok()
+            .and_then(|v| v.last().copied())
+            .unwrap_or(0.0);
+        let draft_positions_vec: Vec<f32> = (0..verify_len)
+            .map(|i| base_last_pos + 1.0 + i as f32)
+            .collect();
+        let draft_positions = grim_backend_cpu::cpu_tensor(
+            draft_positions_vec,
+            grim_tensor::Shape::new(vec![verify_len]),
+        );
 
-        // 3. Verify
-        // CRIT-3: Target must receive extended input
-        let extended_input = self.extend_input_ids(input_ids, &draft_block.tokens[..verify_len])?;
-        let extended_positions = self.extend_positions(positions, verify_len)?;
-        let target_logits =
-            self.target
-                .forward(session, &extended_input, &extended_positions, adapters)?;
+        let prev_full2 = session.full_output_logits();
+        session.set_full_output_logits(true);
+        let verify_forward = self.target.forward(session, &draft_input, &draft_positions, adapters);
+        session.set_full_output_logits(prev_full2);
+        let verify_logits = match verify_forward {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(kv) = session.kv_mut() {
+                    let _ = kv.rollback_to(kv.len().saturating_sub(verify_len));
+                }
+                let had_post = post_base_snapshot.is_some();
+                if let Some(snap) = post_base_snapshot.take().or_else(|| base_snapshot.take()) {
+                    let _ = session.restore_recurrent_state(snap);
+                    if !had_post {
+                        let _ = self.target.forward(session, input_ids, positions, adapters);
+                    }
+                }
+                return Err(e);
+            }
+        };
 
-        // 4. Rejection sampling / validation loop (§5.3) The target logits
-        // tensor has shape [S + verify_len, vocab_size] where S = len(original_input).
-        // Task 10.6: GPU rejection sampler when a verifier is attached (no
-        // vocab-sized D2H); CPU softmax loop otherwise/fallback.
-        let vocab_size = draft_block.base_logits.shape().dims()[1];
-        let context_len = input_ids.shape().elem_count();
+        // 4. Combine [L0 = base_last; verify rows] so row 0 predicts first emitted token and
+        // row 1+i predicts token after draft i (context_len=1 for verification/extraction).
+        let combined = self.prepend_base_row(&base_last, &verify_logits, vocab_size, verify_len)?;
 
         let mut rng = session
             .request_rng()
             .cloned()
             .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
         let uniforms: Vec<f32> = (0..=verify_len).map(|_| rng.next_f32()).collect();
-        let accepted_count = self.verify_accepted_count(
-            &target_logits,
+        let greedy = session.sampling_greedy();
+        let mut accepted_count = self.verify_accepted_count(
+            &combined,
             &draft_block.base_logits,
-            context_len,
+            1, // base row is index 0
             vocab_size,
             &draft_block.tokens[..verify_len],
             verify_len,
             &uniforms,
             &mut rng,
+            greedy,
         )?;
+        // Debug/measurement hooks for M2/M3 gate closure (TODO(gpu-verify): remove if undesired).
+        if std::env::var_os("GRIM_MTP_FORCE_REJECT").is_some() {
+            accepted_count = 0;
+        } else if std::env::var_os("GRIM_MTP_FORCE_ACCEPT").is_some() {
+            accepted_count = verify_len;
+        }
 
         if accepted_count > verify_len {
+            if let Some(kv) = session.kv_mut() {
+                let _ = kv.rollback_to(kv.len().saturating_sub(verify_len));
+            }
+            let had_post = post_base_snapshot.is_some();
+            if let Some(snap) = post_base_snapshot.take().or_else(|| base_snapshot.take()) {
+                let _ = session.restore_recurrent_state(snap);
+                if !had_post {
+                    let _ = self.target.forward(session, input_ids, positions, adapters);
+                }
+            }
             return Err(Error::Session(format!(
-                "speculative KV contract violation (NativeMTP): accepted_count ({accepted_count}) > \
-                 verify_len ({verify_len})"
+                "speculative KV contract violation (NativeMTP): accepted_count ({accepted_count}) > verify_len ({verify_len})"
             )));
         }
+
+        // Commit tentative KV slots. For recurrent models we restore+replay below (except full
+        // accept, where state is already base + all verified drafts in order).
         if let Some(kv) = session.kv_mut() {
             kv.commit(accepted_count)?;
         }
-
         {
             let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
             sched.record_acceptance(accepted_count, verify_len);
         }
 
-        // CRIT-7: Return logits for accepted tokens (rows S..S+accepted)
-        let accepted_logits =
-            self.extract_accepted_logits(&target_logits, accepted_count, vocab_size, context_len)?;
-        session.set_last_accepted_tokens(accepted_count);
+        let emitted = accepted_count + 1;
+        if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+            eprintln!(
+                "[mtp-debug] depth={} drafted={} accepted={} emitted={} greedy={} recurrent={} replay={}",
+                depth,
+                verify_len,
+                accepted_count,
+                emitted,
+                greedy,
+                recurrent,
+                recurrent && accepted_count < verify_len
+            );
+        }
+
+        if recurrent && accepted_count < verify_len {
+            if let Some(snap) = post_base_snapshot.take() {
+                session.restore_recurrent_state(snap)?;
+                // Replay only accepted draft tokens from exact post-base state.
+                for i in 0..accepted_count {
+                    let tok = draft_block.tokens[i];
+                    let step_input = self.scalar_token_tensor(tok);
+                    let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
+                    let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
+                    let _ = self
+                        .target
+                        .forward(session, &step_input, &step_pos, adapters)?;
+                }
+            } else if let Some(snap) = base_snapshot.take() {
+                session.restore_recurrent_state(snap)?;
+                // Fallback: replay base + accepted draft tokens.
+                let _ = self.target.forward(session, input_ids, positions, adapters)?;
+                for i in 0..accepted_count {
+                    let tok = draft_block.tokens[i];
+                    let step_input = self.scalar_token_tensor(tok);
+                    let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
+                    let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
+                    let _ = self
+                        .target
+                        .forward(session, &step_input, &step_pos, adapters)?;
+                }
+            }
+            // full accept: keep advanced state (base + verify_len drafts)
+        }
+
+        session.set_last_accepted_tokens(emitted);
+        let accepted_logits = self.extract_emitted_logits(&combined, emitted, vocab_size, 1)?;
         Ok(accepted_logits)
+    }
+
+    /// Build input tensor containing only draft token ids (M3 verify forward input).
+    fn extend_input_ids_ids(&self, draft_tokens: &[u32]) -> Result<Tensor> {
+        let ids: Vec<f32> = draft_tokens.iter().map(|&t| t as f32).collect();
+        Ok(grim_backend_cpu::cpu_tensor(
+            ids,
+            grim_tensor::Shape::new(vec![draft_tokens.len()]),
+        ))
+    }
+
+    /// Prepend the base forward's last-row logits to verify-pass logits, producing
+    /// `[1 + verify_len, vocab]` where row 0 = base (distribution for first emitted token)
+    /// and row 1+i = target logits for draft token i.
+    fn prepend_base_row(
+        &self,
+        base_last_row: &[f32],
+        verify_logits: &Tensor,
+        vocab_size: usize,
+        verify_len: usize,
+    ) -> Result<Tensor> {
+        let v = verify_logits.to_vec_f32()?;
+        let need = verify_len * vocab_size;
+        let mut out = Vec::with_capacity(vocab_size + need);
+        if base_last_row.len() >= vocab_size {
+            out.extend_from_slice(&base_last_row[base_last_row.len() - vocab_size..]);
+        } else {
+            out.extend_from_slice(base_last_row);
+            out.resize(vocab_size, 0.0);
+        }
+        if v.len() >= need {
+            out.extend_from_slice(&v[..need]);
+        } else {
+            out.extend_from_slice(&v);
+            out.resize(vocab_size + need, 0.0);
+        }
+        Ok(grim_backend_cpu::cpu_tensor(
+            out,
+            grim_tensor::Shape::new(vec![1 + verify_len, vocab_size]),
+        ))
+    }
+
+    /// Build a single-token input tensor for replay.
+    fn scalar_token_tensor(&self, token: u32) -> Tensor {
+        grim_backend_cpu::cpu_tensor(vec![token as f32], grim_tensor::Shape::new(vec![1]))
+    }
+
+    /// Build a single-token position tensor for replay at absolute position.
+    fn scalar_position_tensor(&self, base_positions: &Tensor, abs_pos: usize) -> Result<Tensor> {
+        let _ = base_positions; // absolute position preferred for replay correctness
+        Ok(grim_backend_cpu::cpu_tensor(
+            vec![abs_pos as f32],
+            grim_tensor::Shape::new(vec![1]),
+        ))
     }
 
     /// Extend input_ids tensor with draft tokens for verification
@@ -629,27 +864,36 @@ impl SpeculativeCausalLm {
         Ok(grim_backend_cpu::cpu_tensor(pos, shape))
     }
 
-    /// Extract logits for only the accepted tokens.
-    /// `context_len` is the length of the original (non-draft) input; accepted token rows start at offset.
-    fn extract_accepted_logits(
+    /// Extract logits rows for emitted tokens.
+    /// `num_rows` is typically `accepted_count + 1` (accepted drafts + bonus).
+    /// Rows start at `context_len - 1` in the extended verify logits: row for first emitted
+    /// token (or bonus when none accepted), through bonus after last accepted draft.
+    fn extract_emitted_logits(
         &self,
         target_logits: &Tensor,
-        accepted_count: usize,
+        num_rows: usize,
         vocab_size: usize,
         context_len: usize,
     ) -> Result<Tensor> {
         let all_logits = target_logits.to_vec_f32()?;
-        let start = context_len * vocab_size;
-        let end = start + accepted_count * vocab_size;
+        if num_rows == 0 {
+            return Ok(grim_backend_cpu::cpu_tensor(
+                Vec::new(),
+                grim_tensor::Shape::new(vec![0, vocab_size]),
+            ));
+        }
+        let start_row = context_len.saturating_sub(1);
+        let start = start_row * vocab_size;
+        let end = start + num_rows * vocab_size;
         if end > all_logits.len() {
             return Err(grim_core::error::Error::Config(format!(
-                "extract_accepted_logits: slice [{start}..{end}] out of bounds (logits len={})",
+                "extract_emitted_logits: slice [{start}..{end}] out of bounds (logits len={}, start_row={start_row}, num_rows={num_rows}, context_len={context_len})",
                 all_logits.len()
             )));
         }
-        let accepted_logits = all_logits[start..end].to_vec();
-        let shape = grim_tensor::Shape::new(vec![accepted_count, vocab_size]);
-        Ok(grim_backend_cpu::cpu_tensor(accepted_logits, shape))
+        let emitted_logits = all_logits[start..end].to_vec();
+        let shape = grim_tensor::Shape::new(vec![num_rows, vocab_size]);
+        Ok(grim_backend_cpu::cpu_tensor(emitted_logits, shape))
     }
 }
 
@@ -679,6 +923,10 @@ impl CausalLm for SpeculativeCausalLm {
 
     fn has_recurrent_state(&self) -> bool {
         self.target.has_recurrent_state()
+    }
+
+    fn prepare_session(&self, session: &mut dyn SessionT) {
+        self.target.prepare_session(session)
     }
 
     fn forward(

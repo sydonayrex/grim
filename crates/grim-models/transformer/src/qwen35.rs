@@ -57,6 +57,21 @@ fn attn_d2d_disabled() -> bool {
     })
 }
 
+/// T2 KV bridge: append the model's post-RoPE K/V to the session's shared paged
+/// store during prefill, and hydrate a radix-seeded prefix back into the
+/// private arena. Gated by `GRIM_HYBRID_PREFIX` (default off) — without it
+/// Qwen35's KV never enters the radix pool and hybrid prefix reuse cannot work.
+fn hybrid_kv_bridge_enabled() -> bool {
+    // Deliberately NOT cached in a `OnceLock`: tests flip this env var between
+    // cases in one process, and a cached value would make the second case
+    // observe the first one's flag. It is only reached on prefill
+    // (`seq_len > 1`), never on the decode hot path.
+    matches!(
+        std::env::var("GRIM_HYBRID_PREFIX").as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    )
+}
+
 /// Declare a D2D fallback site.
 /// When D2D is default, falling back is an exceptional event: log warning and emit fallback event.
 /// If `GRIM_FORCE_D2D=1`, halts with error rather than silently degrading.
@@ -194,6 +209,12 @@ pub struct Qwen35LayerCache {
     /// token before any arithmetic happens.
     #[doc(hidden)]
     pub ssm_state_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// T2 KV bridge: the post-RoPE K/V of the most recent prefill chunk,
+    /// stashed so `Qwen35::forward` can append it to the shared paged store
+    /// AFTER the layer loop (the session's model-state and KV borrows cannot
+    /// be held at once). `None` unless the bridge is active.
+    #[doc(hidden)]
+    pub bridge_kv: Option<(Tensor, Tensor)>,
 }
 
 // `BackendStorage` doesn't implement Debug — hand-roll one that prints the
@@ -236,6 +257,7 @@ impl Clone for Qwen35LayerCache {
             block_table: None,
             conv_state_dev: None,
             ssm_state_dev: None,
+            bridge_kv: None,
         }
     }
 }
@@ -269,6 +291,7 @@ impl Qwen35LayerCache {
             block_table: None,
             conv_state_dev: None,
             ssm_state_dev: None,
+            bridge_kv: None,
         }
     }
 }
@@ -374,8 +397,31 @@ impl Qwen35Block {
         layer_idx: usize,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        Self::load_tp_force(ws, cfg, layer_idx, tp, false)
+    }
+
+    /// Load a block, optionally forcing the full-attention weight layout.
+    /// Used for M0 nextn blocks that carry attn/ffn tensors but may not fall on
+    /// the trunk attention interval.
+    pub fn load_nextn_block(
+        ws: &WeightSource<'_>,
+        cfg: &Qwen35Config,
+        layer_idx: usize,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
+        Self::load_tp_force(ws, cfg, layer_idx, tp, true)
+    }
+
+    fn load_tp_force(
+        ws: &WeightSource<'_>,
+        cfg: &Qwen35Config,
+        layer_idx: usize,
+        tp: TensorParallelConfig,
+        force_full_attention: bool,
+    ) -> Result<Self> {
         let device = ws.device();
-        let is_full_attention = (layer_idx + 1) % cfg.full_attention_interval.max(1) == 0;
+        let is_full_attention =
+            force_full_attention || (layer_idx + 1) % cfg.full_attention_interval.max(1) == 0;
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
         // The recurrent path fused QKV is the CONV width, NOT the attention
@@ -1059,6 +1105,13 @@ impl Qwen35Block {
                 let q_rope = rope_ext(&q_dev, self.num_heads)?;
                 let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
 
+                // T2 KV bridge: stash this layer's post-RoPE K/V for
+                // `Qwen35::forward` to append after the layer loop (prefill
+                // only). See the d2d arm.
+                if seq_len > 1 && hybrid_kv_bridge_enabled() {
+                    cache.bridge_kv = Some((k_rope.clone(), v_dev_t.clone()));
+                }
+
                 // Per-step Q crosses to host for the arena attention entry
                 // point; K/V history never leaves the device.
                 let q_all = q_rope.to_vec_f32()?;
@@ -1464,6 +1517,34 @@ impl Qwen35Block {
                             dump("k_rope", &k_rope);
                             dump("v", &v_dev_t);
                             dump("attn_pre_gate", &attn_tensor);
+                            // EAGER-PROBE counterpart: full eager K arena for
+                            // this layer, to diff against the graph replay's
+                            // graph_karena_l0.bin (same GRIM_LAYERS_DUMP_DIR
+                            // style comparison, gated by GRIM_ATTN_DUMP_DIR).
+                            if let Some(kd) = cache.k_device.as_ref() {
+                                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(kd.as_ref())
+                                {
+                                    if let Device::Rocm(ord) = self.device {
+                                        grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+                                    }
+                                    if let Ok(b) = r.copy_to_host() {
+                                        let _ = std::fs::write(
+                                            format!(
+                                                "{}/eager_karena_l{}.bin",
+                                                dir.to_string_lossy(),
+                                                self.layer_idx
+                                            ),
+                                            &b,
+                                        );
+                                        eprintln!(
+                                            "[eager-karena] l={} bytes={} current_pos={}",
+                                            self.layer_idx,
+                                            b.len(),
+                                            cache.current_pos
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1968,6 +2049,245 @@ impl Qwen35Block {
     }
 }
 
+// MTP / NextN (M0: loaded separately, not executed in trunk forward)
+
+/// Loaded Qwen3.5/3.8 multi-token-prediction block and its head adapters.
+/// Kept out of the trunk forward path; behavior unchanged unless MTP is enabled.
+pub struct Qwen35Nextn {
+    /// Transformer block carrying the nextn layer's attn/ffn weights.
+    pub block: Qwen35Block,
+    /// Projects concatenated [enorm(embed(tok)); hnorm(h_prev)] (2D -> D).
+    pub eh_proj: Linear,
+    pub enorm: RmsNorm,
+    pub hnorm: RmsNorm,
+    pub shared_head_norm: RmsNorm,
+}
+
+impl Qwen35Nextn {
+    /// Load nextn block and its head adapters. M0: tensors are consumed/loaded;
+    /// Placed on the provided device (output-head device).
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &Qwen35Config,
+        layer_idx: usize,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
+        let block_ws = ws.pp("blk").pp(&layer_idx.to_string());
+        // Nextn block carries attention/ffn tensors (no ssm_*), but its layer index
+        // may not satisfy the trunk full-attention interval formula. Load as an
+        // attention-capable block by forcing full-attention structure.
+        let block = Qwen35Block::load_nextn_block(&block_ws, cfg, layer_idx, tp)?;
+        let nextn_ws = block_ws.pp("nextn");
+        let eh_proj = Linear::load(&nextn_ws.pp("eh_proj"), 2 * cfg.hidden_size, cfg.hidden_size, false)?;
+        let enorm = RmsNorm::load(&nextn_ws.pp("enorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let hnorm = RmsNorm::load(&nextn_ws.pp("hnorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let shared_head_norm = RmsNorm::load(
+            &nextn_ws.pp("shared_head_norm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        Ok(Self {
+            block,
+            eh_proj,
+            enorm,
+            hnorm,
+            shared_head_norm,
+        })
+    }
+
+    /// M1: run one nextn draft step.
+    ///
+    /// Inputs:
+    /// - `embed_tok`: embedding of the draft/bonus token, shape `[1, hidden]`.
+    /// - `h_prev`: trunk/previous hidden state before output norm, shape `[1, hidden]`.
+    /// - `position`: absolute position for this draft token.
+    /// - `cache`: nextn block's own KV/recurrent cache state.
+    ///
+    /// Returns `(block_hidden, logits)` where `block_hidden` is pre-shared-head-norm.
+    pub fn forward_step(
+        &self,
+        embed_tok: &Tensor,
+        h_prev: &Tensor,
+        position: u32,
+        cache: &mut Qwen35LayerCache,
+        output_head: &Linear,
+    ) -> Result<(Tensor, Tensor)> {
+        // M1: nextn block/head live on the output-head (last trunk) device in M0.
+        // Embed/h_prev may come from different devices in split placement; stage to
+        // h_prev's device (expected nextn device) to avoid cross-device copy errors.
+        let target_device = h_prev.device();
+        let embed_tok = if embed_tok.device() == target_device {
+            embed_tok.clone()
+        } else {
+            grim_nn::modules::move_to_device(embed_tok, target_device)?
+        };
+        let h_prev = if h_prev.device() == target_device {
+            h_prev.clone()
+        } else {
+            grim_nn::modules::move_to_device(h_prev, target_device)?
+        };
+
+        // x = eh_proj([enorm(embed(tok)); hnorm(h_prev)])
+        let e = self.enorm.forward(&embed_tok)?;
+        let h = self.hnorm.forward(&h_prev)?;
+        let e = if e.device() == target_device {
+            e
+        } else {
+            grim_nn::modules::move_to_device(&e, target_device)?
+        };
+        let h = if h.device() == target_device {
+            h
+        } else {
+            grim_nn::modules::move_to_device(&h, target_device)?
+        };
+        let x_in = grim_nn::modules::concat_2d_horizontal_on_device(&e, &h)?;
+        let x = self.eh_proj.forward(&x_in)?;
+        let positions = [position];
+        let block_out = self.block.forward(&x, &positions, cache)?;
+        let normed = self.shared_head_norm.forward(&block_out)?;
+        let logits = output_head.forward(&normed)?;
+        Ok((block_out, logits))
+    }
+}
+
+fn qwen35_mtp_mode() -> String {
+    // M0/M4: default off (plan). `auto` loads/reserves nextn when valid and present;
+    // `on` requires a loadable nextn block. `off` preserves no-load behavior.
+    std::env::var("GRIM_MTP")
+        .unwrap_or_else(|_| "off".to_string())
+        .to_ascii_lowercase()
+}
+
+/// Detect first nextn/MTP block index (>= trunk layers) from provider tensor names.
+fn qwen35_detect_nextn_idx(ws: &WeightSource<'_>, trunk_layers: usize) -> Option<usize> {
+    let names = ws.provider().tensor_names();
+    let mut idxs: Vec<usize> = names
+        .iter()
+        .filter_map(|n| n.strip_prefix("blk."))
+        .filter(|n| n.contains(".nextn."))
+        .filter_map(|n| n.split('.').next())
+        .filter_map(|i| i.parse::<usize>().ok())
+        .collect();
+    idxs.sort_unstable();
+    idxs.dedup();
+    idxs.into_iter().find(|&i| i >= trunk_layers)
+}
+
+/// All tensor names under `blk.{idx}.` in the provider.
+fn qwen35_block_tensor_names(ws: &WeightSource<'_>, idx: usize) -> Vec<String> {
+    let prefix = format!("blk.{idx}.");
+    let mut names: Vec<String> = ws
+        .provider()
+        .tensor_names()
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Expected tensor leaf names for a Qwen35 nextn block loaded in M0.
+///
+/// The block is loaded as a forced full-attention block (separate q/k/v/o and norms)
+/// plus FFN and post-attention norm, and the nextn adapters.
+fn qwen35_nextn_expected_leafs(_cfg: &Qwen35Config) -> Vec<&'static str> {
+    vec![
+        "attn_norm.weight",
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+        "attn_q_norm.weight",
+        "attn_k_norm.weight",
+        "post_attention_norm.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+        "nextn.eh_proj.weight",
+        "nextn.enorm.weight",
+        "nextn.hnorm.weight",
+        "nextn.shared_head_norm.weight",
+    ]
+}
+
+/// Validate nextn block tensors for M0: report specific missing/extra tensors.
+fn qwen35_validate_nextn_tensors(
+    ws: &WeightSource<'_>,
+    cfg: &Qwen35Config,
+    idx: usize,
+    strict: bool,
+) -> Result<()> {
+    let present = qwen35_block_tensor_names(ws, idx);
+    let present_set: std::collections::HashSet<&str> = present.iter().map(|s| s.as_str()).collect();
+    let prefix = format!("blk.{idx}.");
+    let expected_leafs = qwen35_nextn_expected_leafs(cfg);
+    let expected_full: Vec<String> = expected_leafs
+        .iter()
+        .map(|leaf| format!("{prefix}{leaf}"))
+        .collect();
+    let expected_set: std::collections::HashSet<&str> = expected_full.iter().map(|s| s.as_str()).collect();
+
+    let mut missing: Vec<String> = expected_full
+        .iter()
+        .filter(|n| !present_set.contains(n.as_str()))
+        .cloned()
+        .collect();
+    // post_attention_norm may be named ffn_norm in some checkpoints; accept either if present.
+    if missing.iter().any(|n| n.ends_with("post_attention_norm.weight")) {
+        let ffn_norm = format!("{prefix}ffn_norm.weight");
+        if present_set.contains(ffn_norm.as_str()) {
+            missing.retain(|n| !n.ends_with("post_attention_norm.weight"));
+        }
+    }
+    if !missing.is_empty() {
+        if strict {
+            return Err(grim_core::error::Error::Backend(format!(
+                "GRIM_MTP=on: nextn block blk.{idx} missing required tensor(s): {}",
+                missing.join(", ")
+            )));
+        } else {
+            return Err(grim_core::error::Error::Backend(format!(
+                "nextn block blk.{idx} missing required tensor(s): {}",
+                missing.join(", ")
+            )));
+        }
+    }
+
+    // Every tensor under blk.{idx}.* must be consumed/expected by this nextn load.
+    // Allow ffn_norm alias for post_attention_norm.
+    let unexpected: Vec<String> = present
+        .iter()
+        .filter(|n| {
+            if expected_set.contains(n.as_str()) {
+                return false;
+            }
+            // alias
+            if n.ends_with(".ffn_norm.weight")
+                && expected_full.iter().any(|e| e.ends_with(".post_attention_norm.weight"))
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    if !unexpected.is_empty() {
+        // "none left unread": any present tensor not in expected set is unread by this load.
+        return Err(grim_core::error::Error::Backend(format!(
+            "nextn block blk.{idx} has tensor(s) not consumed by M0 loader: {}",
+            unexpected.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Compute resident bytes for a nextn block (for planner accounting).
+fn qwen35_nextn_resident_bytes(ws: &WeightSource<'_>, idx: usize, convert_gsq_rco: bool) -> u64 {
+    ws.pp("blk")
+        .pp(&idx.to_string())
+        .prefix_bytes_resident(convert_gsq_rco)
+}
+
 // Full Model
 
 pub struct Qwen35 {
@@ -1981,11 +2301,420 @@ pub struct Qwen35 {
     /// PLAN-prism-hadamard-bonsai.md). `None` = no prism.hadamard metadata
     /// (every other checkpoint) => graph behavior identical to before.
     pub hadamard_plan: Option<crate::decode_graph::HadamardPlan>,
+    /// Optional native MTP/nextn block loaded from checkpoint (M0). Not used by trunk.
+    pub nextn: Option<Qwen35Nextn>,
+}
+
+/// M2: snapshot of a single Qwen35 layer cache for recurrent/speculative rollback.
+#[derive(Clone)]
+pub struct Qwen35LayerCacheSnapshot {
+    pub k_cache: Vec<f32>,
+    pub v_cache: Vec<f32>,
+    pub conv_state: Vec<f32>,
+    pub ssm_state: Vec<f32>,
+    pub current_pos: usize,
+    /// Host copies of device-resident recurrent states (if present), with shapes.
+    pub conv_state_dev: Option<(Vec<f32>, Vec<usize>)>,
+    pub ssm_state_dev: Option<(Vec<f32>, Vec<usize>)>,
+}
+
+/// M2: snapshot of all layer caches (opaque to session trait callers).
+#[derive(Clone)]
+pub struct Qwen35RecurrentSnapshot {
+    pub layers: Vec<Qwen35LayerCacheSnapshot>,
+    pub current_pos: usize,
+}
+
+impl Qwen35LayerCache {
+    /// M2: capture recurrent/KV-cache state for rollback.
+    /// Device storages are read back to host for correctness-first snapshotting.
+    /// TODO(gpu-verify): replace with D2D snapshot for performance on large contexts.
+    pub fn snapshot_for_rollback(&self) -> Result<Qwen35LayerCacheSnapshot> {
+        let conv_state_dev = if let Some(s) = self.conv_state_dev.as_ref() {
+            Some((s.to_cpu_vec_f32()?, s.shape().dims().to_vec()))
+        } else {
+            None
+        };
+        let ssm_state_dev = if let Some(s) = self.ssm_state_dev.as_ref() {
+            Some((s.to_cpu_vec_f32()?, s.shape().dims().to_vec()))
+        } else {
+            None
+        };
+        Ok(Qwen35LayerCacheSnapshot {
+            k_cache: self.k_cache.clone(),
+            v_cache: self.v_cache.clone(),
+            conv_state: self.conv_state.clone(),
+            ssm_state: self.ssm_state.clone(),
+            current_pos: self.current_pos,
+            conv_state_dev,
+            ssm_state_dev,
+        })
+    }
+
+    /// M2: restore recurrent/KV-cache state from a rollback snapshot.
+    /// Device storages (if they existed) are restored by uploading host snapshot data
+    /// to freshly allocated device buffers on the cache's target devices.
+    pub fn restore_from_snapshot(
+        &mut self,
+        snap: &Qwen35LayerCacheSnapshot,
+        devices: &[Device],
+        layer_idx: usize,
+    ) -> Result<()> {
+        self.k_cache = snap.k_cache.clone();
+        self.v_cache = snap.v_cache.clone();
+        self.conv_state = snap.conv_state.clone();
+        self.ssm_state = snap.ssm_state.clone();
+        self.current_pos = snap.current_pos;
+
+        // Dense/paged KV device arenas are invalidated by rollback; clear so they
+        // can be rebuilt consistently with restored host/current_pos state.
+        self.k_device = None;
+        self.v_device = None;
+        self.k_scales_device = None;
+        self.v_scales_device = None;
+        self.k_pages = None;
+        self.v_pages = None;
+        self.block_table = None;
+        // A stashed prefill K/V belongs to the rolled-back pass; drop it so the
+        // replay does not append a second copy into the shared paged store.
+        self.bridge_kv = None;
+
+        let dev_type = devices
+            .get(layer_idx)
+            .or_else(|| devices.last())
+            .cloned()
+            .unwrap_or(Device::Cpu);
+        let backend = pick_device_for_storage_device(&dev_type);
+
+        if let Some((data, dims)) = &snap.conv_state_dev {
+            let shape = Shape::new(dims.clone());
+            let storage = backend.from_cpu(data, &shape, DType::F32)?;
+            self.conv_state_dev = Some(storage);
+        } else {
+            self.conv_state_dev = None;
+        }
+        if let Some((data, dims)) = &snap.ssm_state_dev {
+            let shape = Shape::new(dims.clone());
+            let storage = backend.from_cpu(data, &shape, DType::F32)?;
+            self.ssm_state_dev = Some(storage);
+        } else {
+            self.ssm_state_dev = None;
+        }
+        Ok(())
+    }
+}
+
+/// T2: installs Qwen35's recurrent snapshot/restore into the session's
+/// model-agnostic [`grim_core::session::Inner`] via
+/// [`grim_core::session::RecurrentHooks`], so the engine (which builds a plain
+/// `Inner`) can snapshot and restore without a Qwen35-specific session type.
+pub struct Qwen35RecurrentHooks {
+    pub layer_devices: Vec<Device>,
+}
+
+impl grim_core::session::RecurrentHooks for Qwen35RecurrentHooks {
+    fn snapshot_recurrent(
+        &self,
+        state: &(dyn std::any::Any + Send),
+        current_pos: usize,
+    ) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        let Some(caches) = state.downcast_ref::<Vec<Qwen35LayerCache>>() else {
+            return Ok(None);
+        };
+        let snap = snapshot_qwen35_caches(caches, current_pos)?;
+        Ok(Some(Box::new(snap)))
+    }
+
+    fn restore_recurrent(
+        &self,
+        state: &mut (dyn std::any::Any + Send),
+        snap: &dyn std::any::Any,
+    ) -> Result<usize> {
+        let snap = snap.downcast_ref::<Qwen35RecurrentSnapshot>().ok_or_else(|| {
+            grim_core::error::Error::Backend(
+                "Qwen35RecurrentHooks::restore_recurrent: unexpected snapshot type".into(),
+            )
+        })?;
+        let caches = state.downcast_mut::<Vec<Qwen35LayerCache>>().ok_or_else(|| {
+            grim_core::error::Error::Backend(
+                "Qwen35RecurrentHooks::restore_recurrent: unexpected model state type".into(),
+            )
+        })?;
+        restore_qwen35_caches(caches, snap, &self.layer_devices)?;
+        Ok(snap.current_pos)
+    }
+}
+
+pub fn snapshot_qwen35_caches(
+    caches: &[Qwen35LayerCache],
+    session_pos: usize,
+) -> Result<Qwen35RecurrentSnapshot> {
+    let mut layers = Vec::with_capacity(caches.len());
+    for c in caches {
+        layers.push(c.snapshot_for_rollback()?);
+    }
+    Ok(Qwen35RecurrentSnapshot {
+        layers,
+        current_pos: session_pos,
+    })
+}
+
+pub fn restore_qwen35_caches(
+    caches: &mut [Qwen35LayerCache],
+    snap: &Qwen35RecurrentSnapshot,
+    devices: &[Device],
+) -> Result<()> {
+    if caches.len() != snap.layers.len() {
+        return Err(grim_core::error::Error::Backend(format!(
+            "restore_qwen35_caches: layer count mismatch ({} vs {})",
+            caches.len(),
+            snap.layers.len()
+        )));
+    }
+    for (i, (c, s)) in caches.iter_mut().zip(snap.layers.iter()).enumerate() {
+        c.restore_from_snapshot(s, devices, i)?;
+    }
+    Ok(())
+}
+
+/// M2: Qwen35-specific session wrapper providing recurrent snapshot/restore.
+pub struct Qwen35Session {
+    pub inner: grim_core::session::Inner,
+    /// Per-layer devices for restoring recurrent device state snapshots.
+    pub layer_devices: Vec<Device>,
+}
+
+impl Qwen35Session {
+    pub fn new(inner: grim_core::session::Inner, layer_devices: Vec<Device>) -> Self {
+        Self { inner, layer_devices }
+    }
+}
+
+impl SessionT for Qwen35Session {
+    fn device(&self) -> &Device { self.inner.device() }
+    fn current_pos(&self) -> usize { self.inner.current_pos() }
+    fn advance_pos(&mut self, by: usize) { self.inner.advance_pos(by) }
+    fn has_kv(&self) -> bool { self.inner.has_kv() }
+    fn append_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()> { self.inner.append_kv(k, v) }
+    fn append_kv_layer(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        self.inner.append_kv_layer(layer, k, v)
+    }
+    fn kv_cache(&self) -> Option<&(dyn grim_core::kv_cache::KvCache + 'static)> { self.inner.kv_cache() }
+    fn kv_mut(&mut self) -> Option<&mut (dyn grim_core::kv_cache::KvCache + 'static)> { self.inner.kv_mut() }
+    fn has_paged_kv(&self) -> bool { self.inner.has_paged_kv() }
+    fn block_table(&self) -> Option<&[u32]> { self.inner.block_table() }
+    fn paged_kv_handles(&self, layer: usize) -> Option<(Tensor, Tensor, usize)> { self.inner.paged_kv_handles(layer) }
+    fn block_table_gpu_handle(&self) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
+        self.inner.block_table_gpu_handle()
+    }
+    fn rollback_kv_to(&mut self, len: usize) -> Result<()> { self.inner.rollback_kv_to(len) }
+    fn get_hip_graph_handle(&self) -> Option<u64> { self.inner.get_hip_graph_handle() }
+    fn set_hip_graph_handle(&mut self, handle: u64) { self.inner.set_hip_graph_handle(handle) }
+    fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> { self.inner.eval_eager(op, inputs) }
+    fn get_last_hidden_state(&self) -> Option<Tensor> { self.inner.get_last_hidden_state() }
+    fn set_last_hidden_state(&mut self, hidden: Tensor) { self.inner.set_last_hidden_state(hidden) }
+    fn model_state(&self) -> Option<&(dyn std::any::Any + Send)> { self.inner.model_state() }
+    fn model_state_mut(&mut self) -> Option<&mut (dyn std::any::Any + Send)> { self.inner.model_state_mut() }
+    fn set_model_state(&mut self, state: Box<dyn std::any::Any + Send>) { self.inner.set_model_state(state) }
+    fn request_rng(&self) -> Option<&grim_core::rng::SimpleRng> { self.inner.request_rng() }
+    fn request_rng_mut(&mut self) -> Option<&mut grim_core::rng::SimpleRng> { self.inner.request_rng_mut() }
+    fn live_gpu_utilization(&self) -> f32 { self.inner.live_gpu_utilization() }
+    fn batch_pressure(&self) -> usize { self.inner.batch_pressure() }
+    fn last_accepted_tokens(&self) -> usize { self.inner.last_accepted_tokens() }
+    fn set_last_accepted_tokens(&mut self, n: usize) { self.inner.set_last_accepted_tokens(n) }
+    fn skip_output_projection(&self) -> bool { self.inner.skip_output_projection() }
+    fn set_skip_output_projection(&mut self, skip: bool) { self.inner.set_skip_output_projection(skip) }
+    fn full_output_logits(&self) -> bool { self.inner.full_output_logits() }
+    fn set_full_output_logits(&mut self, full: bool) { self.inner.set_full_output_logits(full) }
+
+    fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        let Some(state) = self.inner.model_state() else {
+            return Ok(None);
+        };
+        let Some(caches) = state.downcast_ref::<Vec<Qwen35LayerCache>>() else {
+            return Ok(None);
+        };
+        let snap = snapshot_qwen35_caches(caches, self.inner.current_pos())?;
+        Ok(Some(Box::new(snap)))
+    }
+
+    fn restore_recurrent_state(&mut self, snapshot: Box<dyn std::any::Any + Send>) -> Result<()> {
+        let snap = snapshot
+            .downcast::<Qwen35RecurrentSnapshot>()
+            .map_err(|_| {
+                grim_core::error::Error::Backend(
+                    "restore_recurrent_state: unexpected snapshot type".into(),
+                )
+            })?;
+        let pos = snap.current_pos;
+        let devices = self.layer_devices.clone();
+        let state = self.inner.model_state_mut().ok_or_else(|| {
+            grim_core::error::Error::Backend(
+                "restore_recurrent_state: missing model state".into(),
+            )
+        })?;
+        let caches = state
+            .downcast_mut::<Vec<Qwen35LayerCache>>()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "restore_recurrent_state: unexpected model state type".into(),
+                )
+            })?;
+        restore_qwen35_caches(caches, &snap, &devices)?;
+        // Restore session position (recurrent/state progression) to snapshot point.
+        self.inner.current_pos = pos;
+        // Keep paged KV length consistent with restored position when present.
+        if let Some(kv) = self.inner.kv_mut() {
+            let _ = kv.rollback_to(pos);
+        }
+        Ok(())
+    }
+
+    fn restore_recurrent_state_ref(&mut self, snapshot: &dyn std::any::Any) -> Result<()> {
+        // T2: the checkpoint pool shares one snapshot among every request that
+        // matches the prefix, so it hands us a reference rather than ownership.
+        // Clone the concrete snapshot and hand it to the owning restore path.
+        let snap = snapshot.downcast_ref::<Qwen35RecurrentSnapshot>().ok_or_else(|| {
+            grim_core::error::Error::Backend(
+                "restore_recurrent_state_ref: unexpected snapshot type".into(),
+            )
+        })?;
+        self.restore_recurrent_state(Box::new(snap.clone()))
+    }
 }
 
 impl Qwen35 {
     pub fn set_hadamard_plan(&mut self, plan: Option<crate::decode_graph::HadamardPlan>) {
         self.hadamard_plan = plan;
+    }
+
+    /// M1: whether a loadable nextn/MTP block is available.
+    pub fn has_mtp(&self) -> bool {
+        self.nextn.is_some()
+    }
+
+    /// M1: native MTP depth supported by this model instance (currently 1 nextn block).
+    pub fn mtp_depth(&self) -> usize {
+        if self.nextn.is_some() { 1 } else { 0 }
+    }
+
+    /// M1: create a fresh cache for the nextn block (own KV layer/state).
+    pub fn new_nextn_cache(&self) -> Option<Qwen35LayerCache> {
+        self.nextn.as_ref().map(|_| Qwen35LayerCache::new(&self.cfg))
+    }
+
+    /// M1: embedding lookup for a single token id, returned as `[1, hidden]` tensor.
+    pub fn embed_token(&self, token_id: u32) -> Result<Tensor> {
+        Ok(self
+            .tok_embeddings
+            .forward(&[token_id], 1, self.cfg.hidden_size)?)
+    }
+
+    /// M1: argmax of the last vocab row of logits (device-first where supported).
+    pub fn argmax_last_logits(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+        if vocab_size == 0 {
+            return Err(grim_core::error::Error::Backend(
+                "argmax over empty vocabulary".into(),
+            ));
+        }
+        let total = logits.shape().elem_count();
+        if total == 0 || total < vocab_size {
+            return Err(grim_core::error::Error::Backend(format!(
+                "argmax_last_logits: logits has {total} elements, vocab {vocab_size}"
+            )));
+        }
+        let rows = total / vocab_size;
+        let dev = grim_nn::modules::pick_device_for_storage_device(logits.device());
+        if let Ok(scratch) = dev.alloc_storage(&Shape::new(vec![1, vocab_size]), DType::F32) {
+            if dev
+                .copy_slice_range(
+                    scratch.as_ref(),
+                    0,
+                    logits.storage().as_ref(),
+                    (rows - 1) * vocab_size,
+                    vocab_size,
+                )
+                .is_ok()
+            {
+                if let Ok(idx) = dev.argmax(scratch.as_ref()) {
+                    return Ok(idx);
+                }
+            }
+        }
+        let all = logits.to_vec_f32()?;
+        let offset = all.len().saturating_sub(vocab_size);
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in all[offset..].iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        Ok(best_idx as u32)
+    }
+
+    /// M1: device draft step using the loaded nextn block.
+    ///
+    /// Runs `eh_proj([enorm(embed(tok)); hnorm(h_prev)])` → nextn block (own KV cache)
+    /// → `shared_head_norm` → shared output head → argmax.
+    ///
+    /// Returns `(draft_token, logits, block_hidden)` where `block_hidden` is the
+    /// nextn block output before shared head norm (usable as `h_prev` for depth > 1).
+    pub fn draft_nextn_one(
+        &self,
+        token_id: u32,
+        h_prev: &Tensor,
+        position: u32,
+        nextn_cache: &mut Qwen35LayerCache,
+    ) -> Result<(u32, Tensor, Tensor)> {
+        let nextn = self.nextn.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("draft_nextn_one: no nextn block loaded".into())
+        })?;
+        let embed = self.embed_token(token_id)?;
+        let (block_hidden, logits) =
+            nextn.forward_step(&embed, h_prev, position, nextn_cache, &self.output)?;
+        let tok = Self::argmax_last_logits(&logits, self.cfg.vocab_size)?;
+        Ok((tok, logits, block_hidden))
+    }
+
+    /// M1: autoregressive nextn draft for `depth` steps (capped by available mtp depth).
+    ///
+    /// `bonus_token` is the token produced by the trunk at `bonus_pos-1` whose hidden
+    /// state is `h_prev` (trunk final hidden before output_norm). Draft step 1 predicts
+    /// from `(bonus_token, h_prev)` at `bonus_pos`, step 2 feeds step 1's draft token and
+    /// block hidden at `bonus_pos+1`, etc.
+    ///
+    /// Returns `(draft_tokens, step_logits)` in draft order. `step_logits[i]` is the
+    /// logits tensor `[1, vocab]` for draft token `i`.
+    pub fn predict_nextn_draft(
+        &self,
+        bonus_token: u32,
+        h_prev: &Tensor,
+        bonus_pos: u32,
+        depth: usize,
+    ) -> Result<(Vec<u32>, Vec<Tensor>)> {
+        let depth = depth.min(self.mtp_depth());
+        if depth == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut cache = self.new_nextn_cache().ok_or_else(|| {
+            grim_core::error::Error::Backend("predict_nextn_draft: no nextn block loaded".into())
+        })?;
+        let mut tokens = Vec::with_capacity(depth);
+        let mut logits_vec = Vec::with_capacity(depth);
+        let mut curr_tok = bonus_token;
+        let mut curr_h = h_prev.clone();
+        for i in 0..depth {
+            let pos = bonus_pos.saturating_add(i as u32);
+            let (tok, logits, h_next) =
+                self.draft_nextn_one(curr_tok, &curr_h, pos, &mut cache)?;
+            tokens.push(tok);
+            logits_vec.push(logits);
+            curr_tok = tok;
+            curr_h = h_next;
+        }
+        Ok((tokens, logits_vec))
     }
 
     pub fn load(device: Device, ws: &WeightSource<'_>, cfg: Qwen35Config) -> Result<Self> {
@@ -2015,6 +2744,64 @@ impl Qwen35 {
 
         let first_device = available_devices[0].clone();
 
+        // M0: detect nextn block early so planner can reserve its bytes on the
+        // output-head device (last trunk layer device) and GRIM_MTP=on can fail
+        // fast on missing/incomplete nextn tensors.
+        let mtp_mode = qwen35_mtp_mode();
+        let nextn_idx = qwen35_detect_nextn_idx(ws, cfg.num_layers);
+        let convert_gsq_rco = !available_devices.is_empty()
+            && available_devices.iter().all(|d| match d {
+                Device::Rocm(ord) => {
+                    let shared = grim_backend_rocm::RocmDevice::shared(*ord);
+                    let target = shared.gpu_target_str();
+                    grim_backend_rocm::quantization::w4a4_ostquant_supported(
+                        grim_backend_rocm::quantization::gcn_arch(target),
+                        128,
+                    )
+                    .is_ok()
+                }
+                _ => false,
+            });
+        let nextn_reserve_bytes = match (mtp_mode.as_str(), nextn_idx) {
+            ("off", _) => 0u64,
+            ("on", None) => {
+                return Err(grim_core::error::Error::Backend(
+                    "GRIM_MTP=on but no nextn/MTP block tensors found in checkpoint".into(),
+                ));
+            }
+            ("on", Some(idx)) => {
+                qwen35_validate_nextn_tensors(ws, &cfg, idx, true)?;
+                qwen35_nextn_resident_bytes(ws, idx, convert_gsq_rco)
+            }
+            (_, Some(idx)) => {
+                // auto: load if present and valid; if invalid, skip unless on.
+                match qwen35_validate_nextn_tensors(ws, &cfg, idx, false) {
+                    Ok(()) => qwen35_nextn_resident_bytes(ws, idx, convert_gsq_rco),
+                    Err(e) => {
+                        eprintln!(
+                            "[qwen35] warning: GRIM_MTP={mtp_mode} but nextn block blk.{idx} is not loadable: {e}"
+                        );
+                        // treat as absent for planning/load in auto mode
+                        0u64
+                    }
+                }
+            }
+            (_, None) => 0u64,
+        };
+        // Only reserve/load if we have a valid nextn and mode allows.
+        let nextn_load_idx = match (mtp_mode.as_str(), nextn_idx) {
+            ("off", _) => None,
+            ("on", Some(idx)) => Some(idx),
+            (_, Some(idx)) => {
+                if qwen35_validate_nextn_tensors(ws, &cfg, idx, false).is_ok() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         // Plan BEFORE any weight is uploaded, then upload the embedding.
         //
         // `plan_layer_devices` reads live `vram_info` for each card's usable
@@ -2037,6 +2824,7 @@ impl Qwen35 {
             cfg.full_attention_interval,
             cfg.vocab_size,
             cfg.hidden_size,
+            nextn_reserve_bytes,
         )?;
 
         let tok_embeddings = Embedding::load(
@@ -2106,13 +2894,46 @@ impl Qwen35 {
         .or_else(|e| {
             fallback_on_missing(e, || {
                 Linear::load(
-                    &ws.with_device(last_device).pp("output"),
+                    &ws.with_device(last_device.clone()).pp("output"),
                     cfg.hidden_size,
                     cfg.vocab_size,
                     false,
                 )
             })
         })?;
+        // M0: load nextn/MTP block separately (not executed in trunk). Detection,
+        // validation, and planner byte accounting happened before planning.
+        let nextn = match nextn_load_idx {
+            Some(idx) => {
+                eprintln!(
+                    "[qwen35] M0: loading nextn block blk.{idx} on {} (GRIM_MTP={mtp_mode})",
+                    last_device
+                );
+                let nextn_ws = ws.with_device(last_device.clone());
+                match Qwen35Nextn::load(&nextn_ws, &cfg, idx, tp) {
+                    Ok(n) => {
+                        // Post-load consumption check: every blk.{idx}.* tensor must be
+                        // accounted for by this M0 load (none left unread/unexpected).
+                        qwen35_validate_nextn_tensors(ws, &cfg, idx, mtp_mode == "on")?;
+                        Some(n)
+                    }
+                    Err(e) => {
+                        if mtp_mode == "on" {
+                            return Err(grim_core::error::Error::Backend(format!(
+                                "GRIM_MTP=on but failed to load nextn block blk.{idx}: {e}"
+                            )));
+                        } else {
+                            eprintln!(
+                                "[qwen35] warning: GRIM_MTP={mtp_mode} but nextn block blk.{idx} failed to load: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Dump the allocation ledger when asked.
         //
         // This must run AFTER the weights exist, not during planning: a dump
@@ -2121,6 +2942,7 @@ impl Qwen35 {
         // useless. A page fault kills the process, so this file is the only
         // copy that outlives the crash and the only way to attribute the
         // faulting address afterwards.
+
         if let Ok(path) = std::env::var("GRIM_LEDGER_DUMP") {
             match grim_backend_rocm::memory::ledger::dump_to_file(&path) {
                 Ok(n) => eprintln!(
@@ -2138,6 +2960,7 @@ impl Qwen35 {
             output_norm,
             output,
             hadamard_plan: None,
+            nextn,
         })
     }
 
@@ -2191,7 +3014,29 @@ impl CausalLm for Qwen35 {
             .collect();
         let mut session = Inner::new(self.device.clone());
         session.set_model_state(Box::new(caches));
-        Box::new(session)
+        let layer_devices: Vec<Device> = self.blocks.iter().map(|b| b.device.clone()).collect();
+        // M2: return a session capable of recurrent snapshot/restore.
+        Box::new(Qwen35Session::new(session, layer_devices))
+    }
+
+    fn prepare_session(&self, session: &mut dyn SessionT) {
+        // T2: install the recurrent hooks and create the layer caches BEFORE the
+        // first forward, so the engine's radix admission can restore a
+        // checkpoint into a session that has not run yet (the hooks dispatch
+        // needs a model-state payload to write into).
+        if session.recurrent_hooks().is_none() {
+            let layer_devices: Vec<Device> =
+                self.blocks.iter().map(|b| b.device.clone()).collect();
+            session.set_recurrent_hooks(std::sync::Arc::new(Qwen35RecurrentHooks {
+                layer_devices,
+            }));
+        }
+        if session.model_state().is_none() {
+            let caches: Vec<Qwen35LayerCache> = (0..self.blocks.len())
+                .map(|_| Qwen35LayerCache::new(&self.cfg))
+                .collect();
+            session.set_model_state(Box::new(caches));
+        }
     }
 
     fn has_recurrent_state(&self) -> bool {
@@ -2261,31 +3106,37 @@ impl CausalLm for Qwen35 {
         }
 
 
-        // KDA-STEP-PROBE: embedding output at decode step 1 — against the
-        // raw file row dequant (/tmp/emb_row_11751.bin, built by /tmp/qdbg).
-        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 {
-            static EMB_DUMPED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !EMB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
-                    if let Device::Rocm(ord) = h.device() {
-                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
-                    }
-                    if let Ok(b) = r.copy_to_host() {
-                        let vals: Vec<f32> = b
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-                        let _ = std::fs::write("/tmp/kda_probe_EMB_out.bin", &bytes);
-                        eprintln!(
-                            "[kda-emb-probe] wrote embedding output ({} f32) [0:4]={:?}",
-                            vals.len(),
-                            &vals[..4]
-                        );
+        if std::env::var_os("GRIM_LAYERS_DUMP_DIR").is_some() {
+            let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+            if let Device::Rocm(ord) = h.device() {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
+            if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                if let Ok(b) = r.copy_to_host() {
+                    let row_bytes = self.cfg.hidden_size * 4;
+                    if b.len() >= row_bytes {
+                        let last_row = &b[b.len() - row_bytes..];
+                        if seq_len == 21 {
+                            let fname = format!("{dir}/grim_emb_fs.bin");
+                            let _ = std::fs::write(&fname, last_row);
+                        } else if seq_len == 1 {
+                            let fname = format!("{dir}/grim_emb_dec.bin");
+                            let _ = std::fs::write(&fname, last_row);
+                        }
                     }
                 }
             }
+        }
+
+        // T2: install the recurrent snapshot/restore hooks once, so the
+        // engine's model-agnostic `Inner` session can snapshot and restore the
+        // GDN+conv state without a Qwen35-specific session type.
+        if session.recurrent_hooks().is_none() {
+            let layer_devices: Vec<Device> =
+                self.blocks.iter().map(|b| b.device.clone()).collect();
+            session.set_recurrent_hooks(std::sync::Arc::new(Qwen35RecurrentHooks {
+                layer_devices,
+            }));
         }
 
         if session.model_state().is_none() {
@@ -2293,6 +3144,69 @@ impl CausalLm for Qwen35 {
                 .map(|_| Qwen35LayerCache::new(&self.cfg))
                 .collect();
             session.set_model_state(Box::new(fresh));
+        }
+
+        // T2 KV bridge: catch the private KV arenas up from a radix-seeded
+        // prefix. `session.current_pos()` is the seed length published by
+        // `seed_prefix` + `advance_pos`; an empty arena means this is the first
+        // forward after the seed, so the attention would otherwise read no
+        // prefix at all. The borrows are staged (immutable check → kv hydrate →
+        // gather → mutable write) because `caches` holds a mutable borrow of the
+        // same session.
+        if hybrid_kv_bridge_enabled() && session.current_pos() > 0 {
+            let prefix = session.current_pos();
+            let hydrate_layers: Vec<(usize, usize)> = session
+                .model_state()
+                .and_then(|s| s.downcast_ref::<Vec<Qwen35LayerCache>>())
+                .map(|caches| {
+                    self.blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, b)| b.is_full_attention && caches[*i].k_device.is_none())
+                        .map(|(i, b)| (i, b.num_kv_heads * b.head_dim))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !hydrate_layers.is_empty() {
+                if let Some(kv) = session.kv_mut() {
+                    for (i, stride) in &hydrate_layers {
+                        kv.hydrate_seeded_prefix(*i, *stride);
+                    }
+                }
+                let gathered: Vec<(usize, Vec<f32>, Vec<f32>)> = session
+                    .kv_cache()
+                    .map(|kv| {
+                        hydrate_layers
+                            .iter()
+                            .filter_map(|(i, _)| {
+                                kv.gather_kv_f32(*i, prefix).map(|(k, v)| (*i, k, v))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !gathered.is_empty() {
+                    let device = h.device().clone();
+                    let dev = pick_device_for_storage_device(&device);
+                    if let Some(state) = session.model_state_mut() {
+                        if let Some(caches) = state.downcast_mut::<Vec<Qwen35LayerCache>>() {
+                            for (i, k_f32, v_f32) in gathered {
+                                let blk = &self.blocks[i];
+                                hydrate_qwen35_kv_arena(
+                                    &dev,
+                                    &device,
+                                    &mut caches[i],
+                                    i,
+                                    &k_f32,
+                                    &v_f32,
+                                    prefix,
+                                    blk.num_kv_heads,
+                                    blk.head_dim,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let caches = session
@@ -2436,46 +3350,54 @@ impl CausalLm for Qwen35 {
             }
             h = block.forward(&h, &positions_vec, &mut caches[i])?;
             caches[i].current_pos += seq_len;
-            if seq_len == 1 && std::env::var_os("GRIM_LAYERS_DUMP_DIR").is_some() {
-                // Dump residuals for DECODE STEP 1 ONLY: a per-forward step
-                // counter (not per-layer) decides, so every layer file of one
-                // sweep belongs to the same decode step.
-                static LRES_STEP: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let stp = if i == 0 {
-                    LRES_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                } else {
-                    LRES_STEP.load(std::sync::atomic::Ordering::Relaxed)
-                };
-                // GRIM_LAYERS_DUMP_STEP selects WHICH decode call's per-layer
-                // residuals are dumped (default 1 = first decode step). Decode
-                // call k feeds the (k-1)th generated token — align with the
-                // reference dump call indices before comparing.
-                let want_step: String = std::env::var("GRIM_LAYERS_DUMP_STEP").unwrap_or_else(|_| "1".into());
-                let dump = if want_step == "all" {
-                    // every decode call: grim_lres_<step>_<layer>.bin
-                    let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
-                    if let Device::Rocm(ord) = h.device() {
-                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
-                    }
-                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
-                        if let Ok(b) = r.copy_to_host() {
-                            let _ =
-                                std::fs::write(format!("{dir}/grim_lres_{stp:02}_{i:02}.bin"), &b);
+            // EAGER-PROBE: dump the live device recurrent state for layer 0
+            // so it can be diffed against the graph's seeded state
+            // (graph_sc_state_l0.bin / graph_kda_state_l0.bin, same dir).
+            if seq_len == 1
+                && i == std::env::var("GRIM_EAGER_KDA_DUMP_LAYER")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+                && std::env::var_os("GRIM_EAGER_KDA_DUMP").is_some()
+            {
+                let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+                if !dir.is_empty() {
+                    for (tag, st) in [
+                        (format!("eager_conv_dev_l{i}"), caches[i].conv_state_dev.as_ref()),
+                        (format!("eager_kda_dev_l{i}"), caches[i].ssm_state_dev.as_ref()),
+                        (format!("eager_karena_l{i}"), caches[i].k_device.as_ref()),
+                        (format!("eager_varena_l{i}"), caches[i].v_device.as_ref()),
+                    ] {
+                        if let Some(st) = st {
+                            if let Ok(r) = grim_backend_rocm::device::util::as_rocm(st.as_ref()) {
+                                if let Ok(b) = r.copy_to_host() {
+                                    let _ = std::fs::write(format!("{dir}/{tag}.bin"), &b);
+                                    eprintln!("[eager-kda-dump] {tag} bytes={}", b.len());
+                                }
+                            }
                         }
                     }
-                    false
-                } else {
-                    want_step.parse::<usize>().map(|w| stp == w).unwrap_or(false)
-                };
-                if dump {
-                    let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
-                    if let Device::Rocm(ord) = h.device() {
-                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
-                    }
-                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
-                        if let Ok(b) = r.copy_to_host() {
-                            let _ = std::fs::write(format!("{dir}/grim_lres_{i:02}.bin"), &b);
+                }
+            }
+            if std::env::var_os("GRIM_LAYERS_DUMP_DIR").is_some() {
+                // Dump residuals: for seq_len == 21 (Path A full-seq), save the LAST token row as grim_lres_fs_<layer>.bin.
+                // For decode (seq_len == 1), save as grim_lres_dec_<layer>.bin.
+                let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+                if let Device::Rocm(ord) = h.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                    if let Ok(b) = r.copy_to_host() {
+                        let row_bytes = self.cfg.hidden_size * 4;
+                        if b.len() >= row_bytes {
+                            let last_row = &b[b.len() - row_bytes..];
+                            if seq_len == 21 {
+                                let fname = format!("{dir}/grim_lres_fs_{i:02}.bin");
+                                let _ = std::fs::write(&fname, last_row);
+                            } else if seq_len == 1 {
+                                let fname = format!("{dir}/grim_lres_dec_{i:02}.bin");
+                                let _ = std::fs::write(&fname, last_row);
+                            }
                         }
                     }
                 }
@@ -2489,11 +3411,64 @@ impl CausalLm for Qwen35 {
             h = grim_nn::modules::move_to_device(&h, self.output_norm.weight.device())?;
         }
 
+        // M1/MTP: expose trunk final hidden before output_norm for draft paths.
+        // Keep on device as last-row [1, hidden] to avoid host copies in hot paths.
+        if h.shape().dims().len() == 2 {
+            let hidden = self.cfg.hidden_size;
+            let rows = h.shape().dims()[0];
+            if rows == 1 {
+                session.set_last_hidden_state(h.clone());
+            } else if rows > 1 {
+                let dev = grim_nn::modules::pick_device_for_storage_device(h.device());
+                let last_shape = grim_tensor::Shape::new(vec![1, hidden]);
+                let (last_row_storage, _handle) =
+                    dev.narrow_rows(h.storage().as_ref(), rows - 1, 1, hidden, &last_shape)?;
+                let last_h = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(last_row_storage),
+                    last_shape,
+                    h.dtype().clone(),
+                    h.provenance().clone(),
+                    h.device().clone(),
+                );
+                session.set_last_hidden_state(last_h);
+            }
+        }
+
+        // T2 KV bridge: publish the stashed prefill K/V into the session's
+        // shared paged store. Done AFTER the layer loop because the session's
+        // model-state borrow (held for `caches`) and its KV borrow cannot be
+        // held at once. The stashed tensors are owned, so the model-state
+        // borrow ends before `kv_mut()` is taken.
+        if hybrid_kv_bridge_enabled() && seq_len > 1 {
+            let stashed: Vec<(usize, Tensor, Tensor)> = {
+                let caches = session
+                    .model_state_mut()
+                    .and_then(|s| s.downcast_mut::<Vec<Qwen35LayerCache>>());
+                match caches {
+                    Some(caches) => caches
+                        .iter_mut()
+                        .enumerate()
+                        .filter_map(|(i, c)| c.bridge_kv.take().map(|(k, v)| (i, k, v)))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+            if !stashed.is_empty() {
+                if let Some(kv) = session.kv_mut() {
+                    for (i, k, v) in stashed {
+                        kv.append_kv_layer(i, &k, &v)?;
+                    }
+                }
+            }
+        }
+
         // Slicing optimization: for causal generation prefill (seq_len > 1), only the
-        // last position's logits are needed unless GRIM_FULL_PREFILL_LOGITS=1 or scoring is active.
-        // Slicing normed [seq_len, hidden] to [1, hidden] before the LM head projection
-        // avoids allocating [seq_len, vocab] f32 (~993 KB per token, 2+ GB at M=2k) on dev1.
-        let full_logits = std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_some()
+        // last position's logits are needed unless full per-position logits are requested
+        // (speculative verify, GRIM_FULL_PREFILL_LOGITS=1, or scoring). Slicing normed
+        // [seq_len, hidden] to [1, hidden] before the LM head projection avoids allocating
+        // [seq_len, vocab] f32 (~993 KB per token, 2+ GB at M=2k) on dev1.
+        let full_logits = session.full_output_logits()
+            || std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_some()
             || std::env::var_os("GRIM_SCORE_FILE").is_some();
         let skip_head = session.skip_output_projection();
         // Reset skip flag on forward exit so intermediate chunk state never leaks
@@ -2688,9 +3663,15 @@ fn kda_upload_host_state_to_dev(
     let ssm_len = n_val * head_dim * d_state;
 
     if cache.conv_state.len() >= need {
-        let data = cache.conv_state[..need].to_vec();
+        let mut col_major = vec![0.0f32; need];
+        let kc = taps - 1;
+        for t in 0..kc {
+            for d in 0..conv_dim {
+                col_major[d * kc + t] = cache.conv_state[t * conv_dim + d];
+            }
+        }
         let storage = dev.from_cpu(
-            &data,
+            &col_major,
             &grim_tensor::Shape::new(vec![1, taps - 1, conv_dim]),
             grim_tensor::dtype::DType::F32,
         )?;
@@ -3326,6 +4307,35 @@ fn gated_delta_net_forward_d2d(
     // the host path reaches through `z_stride`.
     let z = gate_lin.forward(&x_normed_t)?;
 
+    // EAGER-PROBE: layer-0 KDA intermediates for the graph-vs-eager diff
+    // (gated like the state dump in the model forward loop).
+    if std::env::var_os("GRIM_EAGER_KDA_DUMP").is_some()
+        && blk.layer_idx
+            == std::env::var("GRIM_EAGER_KDA_DUMP_LAYER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+    {
+        let dir = std::env::var("GRIM_LAYERS_DUMP_DIR").unwrap_or_default();
+        if !dir.is_empty() {
+            for (tag, t) in [
+                ("eager_xnormed", x_normed),
+                ("eager_xnormed_t", &x_normed_t),
+                ("eager_qkv", &qkv),
+                ("eager_alpha", &alpha),
+                ("eager_beta", &beta),
+                ("eager_z", &z),
+            ] {
+                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
+                    if let Ok(b) = r.copy_to_host() {
+                        let _ = std::fs::write(format!("{dir}/{tag}.bin"), &b);
+                    }
+                }
+            }
+            eprintln!("[eager-kda-dump] layer {} intermediates dumped", blk.layer_idx);
+        }
+    }
+
     // Static per-head vectors pre-uploaded to device. Fallback to upload only if not pre-cached.
     let dt_bias_d = match blk.ssm_dt_bias_dev.as_ref() {
         Some(st) => st.clone(),
@@ -3448,11 +4458,9 @@ fn gated_delta_net_forward_d2d(
     // post-prefill conv ring + ssm state after it, for the host-vs-device
     // op-by-op arbitration at real distributions.
     {
-        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
             && blk.layer_idx == kda_probe_prefill_layer()
-            && seq_len > 1
-            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            && seq_len == 21
         {
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
@@ -3561,11 +4569,9 @@ fn gated_delta_net_forward_d2d(
     // Post-prefill state dumps (device): ssm state after the scan, conv ring
     // after the scan's own ring update.
     {
-        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
             && blk.layer_idx == kda_probe_prefill_layer()
-            && seq_len > 1
-            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            && seq_len == 21
         {
             let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
                 grim_backend_rocm::device::util::as_rocm(st)
@@ -4144,6 +5150,16 @@ fn attention_layer_d2d(
     };
     let q_rope = rope_ext(&q_dev, blk.num_heads)?;
     let k_rope = rope_ext(&k_dev_t, blk.num_kv_heads)?;
+
+    // T2 KV bridge: publish this layer's post-RoPE K/V into the session's
+    // shared paged store so the engine can register the prompt's blocks and a
+    // later request can seed from them. Prefill only — the decode hot path
+    // must not pay the D2H that `append_kv_layer` does.
+    if seq_len > 1 && hybrid_kv_bridge_enabled() {
+        // Stashed for `Qwen35::forward`, which appends after the layer loop:
+        // the session's model-state and KV borrows cannot be held at once.
+        cache.bridge_kv = Some((k_rope.clone(), v_dev_t.clone()));
+    }
 
     stage!("rope");
     // --- append K/V to the device arena, then attend -----------------------
@@ -4824,9 +5840,9 @@ const NUT_SUB_BLOCK_BYTES: usize = 9;
 
 /// Dense-arena representation for this model's ROCm KV path.
 /// Explicit `GRIM_KV_ARENA=int8` opts into int8 codes + f32 per-row scales
-/// (always explicit, never default); otherwise the Qwen35 f16 default
-/// applies (f16 unless `GRIM_F16_KV` explicitly disables). Other backends
-/// stay F32.
+/// (always explicit, never default); otherwise the Qwen35 Q8_1 default
+/// applies. Other backends stay F32.
+///
 /// CurDKV variants the Phase-3 eviction can select survivors by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum EvictionMode {
@@ -5827,6 +6843,83 @@ fn arena_append_kv_rows<'a>(
     }
 }
 
+/// Hydrate a Qwen35 dense KV arena from host f32 K/V rows (T2 KV bridge).
+///
+/// Writes `n_tok` token rows starting at arena row 0 through the same
+/// `arena_append_kv_rows` quantizer the cold prefill uses, so a radix-seeded
+/// prefix becomes identical to a from-scratch prefill. `cache.current_pos` is
+/// advanced to `n_tok`.
+///
+/// Mirrors the grow-site allocation in `attention_layer_d2d`: allocate
+/// `[new_rows, nkv, kv_arena_head_extent]` at `kv_arena_dtype`, install the
+/// int8 scale sidecars, upload the host rows, then append ring-aware runs.
+fn hydrate_qwen35_kv_arena(
+    dev: &Arc<dyn grim_tensor::BackendDevice>,
+    device: &Device,
+    cache: &mut Qwen35LayerCache,
+    layer_idx: usize,
+    k_f32: &[f32],
+    v_f32: &[f32],
+    n_tok: usize,
+    nkv: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if n_tok == 0 {
+        return Ok(());
+    }
+    ensure_arena_format_supported(device)?;
+    let evict = kv_eviction_policy_for_layer(device, layer_idx);
+    let need_rows = evict.live_rows(n_tok);
+    let k_cap = cache
+        .k_device
+        .as_ref()
+        .map(|s| s.shape().dims()[0])
+        .unwrap_or(0);
+    if k_cap < need_rows {
+        let new_rows = ((need_rows * 2) + 64)
+            .next_power_of_two()
+            .min(evict.cap_rows.unwrap_or(usize::MAX))
+            .max(need_rows);
+        let fmt = kv_arena_format_qwen(device);
+        let full_shape = Shape::new(vec![new_rows, nkv, kv_arena_head_extent(fmt, head_dim)]);
+        let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(device))?;
+        let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(device))?;
+        cache.k_device = Some(k_grown);
+        cache.v_device = Some(v_grown);
+        ensure_int8_scales(
+            dev,
+            device,
+            &mut cache.k_scales_device,
+            &mut cache.v_scales_device,
+            new_rows,
+            0,
+            nkv,
+        )?;
+    }
+    let stride = nkv * head_dim;
+    let k_st = dev.from_cpu(k_f32, &Shape::new(vec![n_tok * stride]), DType::F32)?;
+    let v_st = dev.from_cpu(v_f32, &Shape::new(vec![n_tok * stride]), DType::F32)?;
+    for (r, count, src_off) in ring_append_runs(|a| evict.arena_row(a), 0, n_tok) {
+        arena_append_kv_rows(
+            dev,
+            device,
+            cache.k_device.as_ref().expect("arena installed").as_ref(),
+            cache.v_device.as_ref().expect("arena installed").as_ref(),
+            r,
+            k_st.as_ref(),
+            v_st.as_ref(),
+            src_off,
+            count,
+            nkv,
+            head_dim,
+            cache.k_scales_device.as_deref(),
+            cache.v_scales_device.as_deref(),
+        )?;
+    }
+    cache.current_pos = n_tok;
+    Ok(())
+}
+
 /// Grow/allocate the scale sidecars so they cover `rows` rows, carrying
 /// the `live_rows` already-populated scales across. No-op unless int8/int4
 /// format is active (F32/F16 need no sidecar), so every call site can be
@@ -5911,7 +7004,8 @@ fn arena_append_from_f32(
 /// different representation with its own reader (eager alloc/append/attend
 /// plus seeded graph replay, all validated f16-vs-f32). Routing it through
 /// the paged path would reintroduce the reinterpretation bug the paged path
-/// is designed to avoid; use the dense f16 arenas (Qwen35 default) instead.
+/// is designed to avoid; use the dense arenas via `GRIM_KV_ARENA` instead
+/// (Qwen35's unset default is Q8_1, not f16).
 fn kv_quant_format() -> Option<grim_tensor::PagedKvQuantFormat> {
     // Least-surprise rule (2026-11-07): an EXPLICITLY set GRIM_KV_ARENA is the
     // user's dense-KV contract — it routes the eager path to the dense arena
@@ -6046,6 +7140,7 @@ fn plan_layer_devices(
     interval: usize,
     vocab: usize,
     hidden: usize,
+    nextn_reserve_bytes: u64,
 ) -> Result<Vec<Device>> {
     // Single-device or unknown layout: nothing to plan.
     if devices.len() <= 1 {
@@ -6109,25 +7204,33 @@ fn plan_layer_devices(
     };
 
     // Non-layer weights are pinned by `load_tp`: `token_embd` to the first
-    // device, `output` to the last. Reserve their loaded footprint up front, or
-    // the layer loop balances against a budget that silently over-commits the
-    // owning card. The embedding is the dangerous one: an unverified quant
-    // scheme dequantizes to f32 (715 MB packed -> 5.09 GB for the 27B vocab),
-    // while the LM head keeps its packed tensor.
-    if remaining.len() > 1 {
+    // device, `output` (and optional M0 nextn block) to the last/output-head
+    // device. Reserve their loaded footprint up front, or the layer loop
+    // balances against a budget that silently over-commits the owning card.
+    // The embedding is the dangerous one: an unverified quant scheme
+    // dequantizes to f32 (715 MB packed -> 5.09 GB for the 27B vocab), while
+    // the LM head keeps its packed tensor.
+    {
         let embed_bytes =
             non_layer_weight_bytes(ws, "token_embd", vocab.saturating_mul(hidden), true);
         let output_bytes =
             non_layer_weight_bytes(ws, "output", vocab.saturating_mul(hidden), false);
-        remaining[0] = remaining[0].saturating_sub(embed_bytes);
-        let last = remaining.len() - 1;
-        remaining[last] = remaining[last].saturating_sub(output_bytes);
-        if std::env::var_os("GRIM_PLACEMENT_TRACE").is_some() {
+        if !remaining.is_empty() {
+            remaining[0] = remaining[0].saturating_sub(embed_bytes);
+        }
+        let last = remaining.len().saturating_sub(1);
+        if !remaining.is_empty() {
+            remaining[last] = remaining[last]
+                .saturating_sub(output_bytes)
+                .saturating_sub(nextn_reserve_bytes);
+        }
+        if std::env::var_os("GRIM_PLACEMENT_TRACE").is_some() || nextn_reserve_bytes > 0 {
             eprintln!(
-                "[qwen35] placement reserve: token_embd={:.2} GB -> dev0, output={:.2} GB -> dev{}; \
+                "[qwen35] placement reserve: token_embd={:.2} GB -> dev0, output={:.2} GB + nextn={:.2} GB -> dev{}; \
                  per-device plannable remaining after reserve: {:?}",
                 embed_bytes as f64 / 1e9,
                 output_bytes as f64 / 1e9,
+                nextn_reserve_bytes as f64 / 1e9,
                 last,
                 remaining
                     .iter()
@@ -6567,20 +7670,20 @@ fn assign_by_headroom(
         // and is under its byte share, else the next device in order.
         let mut chosen: Option<usize> = None;
         for i in cur..n {
-            if used[i] + bytes <= remaining[i] && (used[i] as f64) < target[i] {
+            if bytes <= remaining[i] && (used[i] as f64) < target[i] {
                 chosen = Some(i);
                 break;
             }
         }
         // Last-resort contiguous fit: the current device may exceed its share
         // when nothing later can hold the layer.
-        if chosen.is_none() && cur < n && used[cur] + bytes <= remaining[cur] {
+        if chosen.is_none() && cur < n && bytes <= remaining[cur] {
             chosen = Some(cur);
         }
         // Fall back to any device that fits, least-loaded first.
         if chosen.is_none() {
             chosen = (0..n)
-                .filter(|&i| used[i] + bytes <= remaining[i])
+                .filter(|&i| bytes <= remaining[i])
                 .min_by_key(|&i| used[i]);
         }
         match chosen {
@@ -6902,17 +8005,19 @@ mod tests {
     }
 
     /// WS-0: the ONE intended difference between the model and backend
-    /// resolvers is the unset default (Qwen35 opts into f16; the backend
-    /// default is f32, pinned by that crate's own test). The f16 flag is
-    /// honored identically in both layers.
+    /// resolvers is the unset default (Qwen35 opts into the Q8_1 arena; the
+    /// backend default is f32, pinned by that crate's own test). The f16 flag
+    /// is honored identically in both layers.
     #[test]
     fn qwen35_arena_format_default_and_f16_flag() {
         use grim_backend_rocm::KvArenaFormat as F;
-        // Unset arena -> the Qwen35 f16 default.
+        // Unset arena -> the Qwen35 Q8_1 default. This was f16 until the Q8_1
+        // parity fix (13f70e91, 2026-11-10); `2226f520` flipped the default and
+        // this assertion was left behind.
         assert_eq!(
             resolve_kv_arena_format_qwen(None, None, None),
-            F::F16,
-            "Task 2.3 ON-FAILURE: the unset default stays f16 (int8 graph replay is broken at 27B geometry)"
+            F::Q8_1,
+            "the unset default stays Q8_1 (Q8_1 parity fixed 13f70e91)"
         );
         assert_eq!(
             resolve_kv_arena_format_qwen(None, None, Some("int8")),
@@ -6933,18 +8038,18 @@ mod tests {
                 "GRIM_F16_KV={s} should disable f16"
             );
         }
-        // The legacy flag's enabled spellings are inert under the f16 default.
+        // The legacy flag's enabled spellings are inert under the Q8_1 default.
         for s in ["1", "true", "yes"] {
             assert_eq!(
                 resolve_kv_arena_format_qwen(None, Some(s), None),
-                F::F16,
-                "GRIM_F16_KV={s} is inert under the f16 default"
+                F::Q8_1,
+                "GRIM_F16_KV={s} is inert under the Q8_1 default"
             );
         }
-        // An unrecognized explicit value uses the model's f16 default (the
+        // An unrecognized explicit value uses the model's Q8_1 default (the
         // backend warns and uses f32); the divergence is documented and only
         // reachable on a typo.
-        assert_eq!(resolve_kv_arena_format_qwen(Some("q7"), None, None), F::F16);
+        assert_eq!(resolve_kv_arena_format_qwen(Some("q7"), None, None), F::Q8_1);
     }
 
     /// Uniform capability rows: every device measures identically, so placement
@@ -7397,6 +8502,7 @@ mod tests {
             output_norm: RmsNorm::new(dummy.clone(), 1e-6),
             output: Linear::from_tensor(dummy, None),
             hadamard_plan: None,
+            nextn: None,
         };
         let reg = qwen.layer_registry();
         let kv_layers_count = (0..8)
@@ -8569,5 +9675,136 @@ mod kv_eviction_tests {
         assert_eq!(KvEvictionPolicy::disabled().effective_ctx(262_144), 262_144);
         assert_eq!(KvEvictionPolicy::disabled().live_rows(999_999), 999_999);
         assert_eq!(KvEvictionPolicy::disabled().arena_row(123_456), 123_456);
+    }
+
+    // M0: nextn tensor validation (consumed/missing named)
+
+    #[derive(Clone)]
+    struct NamedOnlyProvider {
+        names: Vec<String>,
+    }
+
+    impl grim_tensor::provider::TensorProvider for NamedOnlyProvider {
+        fn tensor_names(&self) -> Vec<String> {
+            self.names.clone()
+        }
+        fn get(&self, name: &str) -> grim_tensor::error::Result<grim_tensor::provider::RawTensor> {
+            Err(grim_tensor::error::Error::Backend(format!(
+                "unexpected get({name}) in NamedOnlyProvider"
+            )))
+        }
+        fn meta(&self, name: &str) -> grim_tensor::error::Result<grim_tensor::provider::TensorMeta> {
+            Err(grim_tensor::error::Error::Backend(format!(
+                "unexpected meta({name}) in NamedOnlyProvider"
+            )))
+        }
+    }
+
+    fn test_qwen35_cfg() -> super::Qwen35Config {
+        super::Qwen35Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            num_layers: 64,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            max_seq_len: 128,
+            full_attention_interval: 4,
+            ssm_d_state: 8,
+            ssm_d_inner: 32,
+            ssm_d_conv: 4,
+            ssm_dt_rank: 4,
+            ssm_n_group: 2,
+            rotary_dim: None,
+            devices: vec![Device::Cpu],
+        }
+    }
+
+    fn full_nextn_names(idx: usize) -> Vec<String> {
+        let p = format!("blk.{idx}");
+        vec![
+            format!("{p}.attn_norm.weight"),
+            format!("{p}.attn_q.weight"),
+            format!("{p}.attn_k.weight"),
+            format!("{p}.attn_v.weight"),
+            format!("{p}.attn_output.weight"),
+            format!("{p}.attn_q_norm.weight"),
+            format!("{p}.attn_k_norm.weight"),
+            format!("{p}.post_attention_norm.weight"),
+            format!("{p}.ffn_gate.weight"),
+            format!("{p}.ffn_up.weight"),
+            format!("{p}.ffn_down.weight"),
+            format!("{p}.nextn.eh_proj.weight"),
+            format!("{p}.nextn.enorm.weight"),
+            format!("{p}.nextn.hnorm.weight"),
+            format!("{p}.nextn.shared_head_norm.weight"),
+        ]
+    }
+
+    #[test]
+    fn mtp_nextn_validation_accepts_complete_block() {
+        let idx = 64usize;
+        let provider = NamedOnlyProvider { names: full_nextn_names(idx) };
+        let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+        let cfg = test_qwen35_cfg();
+        super::qwen35_validate_nextn_tensors(&ws, &cfg, idx, true).unwrap();
+    }
+
+    #[test]
+    fn mtp_nextn_validation_reports_missing_tensor() {
+        let idx = 64usize;
+        let mut names = full_nextn_names(idx);
+        names.retain(|n| !n.ends_with("nextn.eh_proj.weight"));
+        let provider = NamedOnlyProvider { names };
+        let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+        let cfg = test_qwen35_cfg();
+        let err = super::qwen35_validate_nextn_tensors(&ws, &cfg, idx, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing required tensor"), "{msg}");
+        assert!(msg.contains("blk.64.nextn.eh_proj.weight"), "{msg}");
+    }
+
+    #[test]
+    fn mtp_nextn_validation_reports_unread_tensor() {
+        let idx = 64usize;
+        let mut names = full_nextn_names(idx);
+        names.push(format!("blk.{idx}.nextn.unexpected.weight"));
+        let provider = NamedOnlyProvider { names };
+        let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+        let cfg = test_qwen35_cfg();
+        let err = super::qwen35_validate_nextn_tensors(&ws, &cfg, idx, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not consumed by M0 loader"), "{msg}");
+        assert!(msg.contains("blk.64.nextn.unexpected.weight"), "{msg}");
+    }
+
+    #[test]
+    fn mtp_nextn_api_depth_zero_without_nextn() {
+        use grim_backend_cpu::cpu_tensor;
+        use grim_nn::modules::{Embedding, Linear, RmsNorm};
+        use grim_tensor::{Device, Shape};
+
+        // M1: trunk-only model exposes no draft depth/cache.
+        let mut cfg = test_qwen35_cfg();
+        cfg.num_layers = 1;
+        let dummy = cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1]));
+        let model = super::Qwen35 {
+            cfg: cfg.clone(),
+            device: Device::Cpu,
+            tok_embeddings: Embedding {
+                weight: dummy.clone(),
+            },
+            blocks: vec![],
+            output_norm: RmsNorm::new(dummy.clone(), cfg.rms_norm_eps),
+            output: Linear::from_tensor(dummy, None),
+            hadamard_plan: None,
+            nextn: None,
+        };
+        assert!(!model.has_mtp());
+        assert_eq!(model.mtp_depth(), 0);
+        assert!(model.new_nextn_cache().is_none());
     }
 }

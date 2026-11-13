@@ -68,10 +68,19 @@ impl NativeMtp for LlamaMtpAdapter {
         input_ids: &Tensor,
         positions: &Tensor,
     ) -> Result<DraftBlock> {
-        // Get MTP tokens from the base provider
-        let tokens = self
-            .inner
-            .predict_mtp_tokens(session, input_ids, positions)?;
+        let base_logits = self.inner.forward(session, input_ids, positions, &[])?;
+        self.predict_multi_after_forward(session, input_ids, positions, &base_logits)
+    }
+
+    /// M3: draft from an already-run base forward. Must not re-run the base input.
+    fn predict_multi_after_forward(
+        &self,
+        session: &mut dyn SessionT,
+        _input_ids: &Tensor,
+        _positions: &Tensor,
+        base_logits: &Tensor,
+    ) -> Result<DraftBlock> {
+        let tokens = self.inner.predict_mtp_tokens_after_forward(session, base_logits)?;
 
         if tokens.is_empty() {
             return Ok(DraftBlock {
@@ -81,12 +90,24 @@ impl NativeMtp for LlamaMtpAdapter {
             });
         }
 
-        // Run base forward to get base_logits
-        let base_logits = self.inner.forward(session, input_ids, positions, &[])?;
+        // Llama MTP layers currently expose draft token ids but not per-step draft-head
+        // distributions as a DraftBlock tensor; use a sentinel block shape [1,vocab] is not
+        // required here since we provide per-draft rows only if available. Fall back to empty
+        // draft logits tensor with correct depth rows filled by caller? Instead, synthesize
+        // zero rows per draft to keep tensor shape [depth, 1] minimal; verification will rely on
+        // target logits and greedy/ratio paths as before. TODO(gpu-verify): provide true p_draft.
+        let base_row = base_logits.to_vec_f32().unwrap_or_default();
+        let vocab_size = base_logits.shape().dims().get(1).copied().unwrap_or(base_row.len()).max(1);
+        let mut flat = Vec::with_capacity(tokens.len() * vocab_size);
+        for _ in 0..tokens.len() {
+            flat.extend(std::iter::repeat_n(0.0f32, vocab_size));
+        }
+        let shape = grim_tensor::Shape::new(vec![tokens.len(), vocab_size]);
+        let draft_logits = grim_backend_cpu::cpu_tensor(flat, shape);
 
         Ok(DraftBlock {
             tokens,
-            base_logits,
+            base_logits: draft_logits,
             confidence: vec![1.0; self.mtp_depth()],
         })
     }

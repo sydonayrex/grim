@@ -57,25 +57,26 @@ fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Err
     eprintln!("[parity] prefill top5 = {:?}", &idx[..5]);
 
     // ── Path A: full-sequence forward over prompt + gen0 ──────────────────
-    if only_cached {
-        eprintln!("[parity] GRIM_PARITY_ONLY_CACHED=1: skipping path A forward");
-        return Ok(());
-    }
     let mut full = prompt.clone();
     full.push(gen0);
     let mut sess_a = model.new_session();
     let pos_a: Vec<f32> = (0..full.len()).map(|i| i as f32).collect();
     let in_a = mk(&full.iter().map(|&v| v as f32).collect::<Vec<_>>(), full.len());
     let pos_at = mk(&pos_a, pos_a.len());
-    let la = model
-        .forward(sess_a.as_mut(), &in_a, &pos_at, &[])
-        .map_err(|e| format!("full-seq: {e}"))?;
-    let fa = la.to_vec_f32().map_err(|e| format!("full-seq read: {e}"))?;
-    let ra = &fa[fa.len() - VOCAB..];
-    let mut idx_a: Vec<u32> = (0..VOCAB as u32).collect();
-    idx_a.sort_by(|&a, &b| ra[b as usize].total_cmp(&ra[a as usize]));
-    eprintln!("[parity] path A (full-seq) top1 = {} (logit {:.4})", idx_a[0], ra[idx_a[0] as usize]);
-    eprintln!("[parity] path A top5 = {:?}", &idx_a[..5]);
+    let (ra, idx_a) = if !only_cached {
+        let la = model
+            .forward(sess_a.as_mut(), &in_a, &pos_at, &[])
+            .map_err(|e| format!("full-seq: {e}"))?;
+        let fa = la.to_vec_f32().map_err(|e| format!("full-seq read: {e}"))?;
+        let r = fa[fa.len() - VOCAB..].to_vec();
+        let mut idx: Vec<u32> = (0..VOCAB as u32).collect();
+        idx.sort_by(|&a, &b| r[b as usize].total_cmp(&r[a as usize]));
+        eprintln!("[parity] path A (full-seq) top1 = {} (logit {:.4})", idx[0], r[idx[0] as usize]);
+        eprintln!("[parity] path A top5 = {:?}", &idx[..5]);
+        (r, idx)
+    } else {
+        (vec![], vec![])
+    };
 
     // ── Path B: cached incremental decode ─────────────────────────────────
     if only_fullseq {
@@ -100,6 +101,11 @@ fn cli_decode_step_matches_full_sequence() -> Result<(), Box<dyn std::error::Err
     idx_b.sort_by(|&a, &b| rb[b as usize].total_cmp(&rb[a as usize]));
     eprintln!("[parity] path B (cached) top1 = {} (logit {:.4})", idx_b[0], rb[idx_b[0] as usize]);
     eprintln!("[parity] path B top5 = {:?}", &idx_b[..5]);
+
+    if only_cached {
+        eprintln!("[parity] GRIM_PARITY_ONLY_CACHED=1: done path B");
+        return Ok(());
+    }
 
     // Logit diff
     let mut max_diff = 0.0f32;

@@ -499,6 +499,11 @@ fn try_graph_decode_step(
                             let srcs = graph_model
                                 .eager_kv_seed_sources(sess, valid_rows)
                                 .map_err(|e| format!("export: {e}"))?;
+                            let kv_seeded = srcs.iter().filter(|s| s.is_some()).count();
+                            eprintln!("[seed-summary] found {kv_seeded} kv_seeds, valid_rows={valid_rows}");
+                            if valid_rows > 0 && kv_seeded == 0 {
+                                return Err(format!("expected attention KV seed sources for valid_rows={valid_rows}, found 0"));
+                            }
                             let Device::Rocm(ordinal) = *device else {
                                 return Err("non-ROCm device".to_string());
                             };
@@ -506,6 +511,12 @@ fn try_graph_decode_step(
                             $g.buffers
                                 .seed_kv_arena_from_eager(&dev, &srcs)
                                 .map_err(|e| format!("seed: {e}"))?;
+                            if valid_rows > 0 && $g.buffers.current_pos != valid_rows {
+                                return Err(format!(
+                                    "seed_kv_arena_from_eager left current_pos={} != valid_rows={valid_rows}",
+                                    $g.buffers.current_pos
+                                ));
+                            }
                             // GDL layers: D2D copy eager recurrent state into the
                             // graph's GDL state buffer so replay doesn't start
                             // from zero after prefill.
@@ -521,6 +532,8 @@ fn try_graph_decode_step(
                             let conv_dev_seeds = graph_model
                                 .eager_conv_device_seed_sources(sess)
                                 .map_err(|e| format!("conv dev export: {e}"))?;
+                            let any_conv = conv_dev_seeds.iter().filter(|s| s.is_some()).count();
+                            eprintln!("[seed-summary] found {any_conv} conv_dev_seeds");
                             if conv_dev_seeds.iter().any(|s| s.is_some()) {
                                 $g.buffers
                                     .seed_conv_rings_from_device(&dev, &conv_dev_seeds)
@@ -538,6 +551,8 @@ fn try_graph_decode_step(
                             let kda_seeds = graph_model
                                 .eager_kda_seed_sources(sess)
                                 .map_err(|e| format!("kda export: {e}"))?;
+                            let any_kda = kda_seeds.iter().filter(|s| s.is_some()).count();
+                            eprintln!("[seed-summary] found {any_kda} kda_seeds");
                             if !kda_seeds.is_empty() {
                                 $g.buffers
                                     .seed_kda_state_from_eager(&dev, &kda_seeds)
@@ -648,6 +663,11 @@ fn try_graph_decode_step(
                     let srcs = graph_model
                         .eager_kv_seed_sources(sess, valid_rows)
                         .map_err(|e| format!("export: {e}"))?;
+                    let kv_seeded = srcs.iter().filter(|s| s.is_some()).count();
+                    eprintln!("[seed-summary-postcapture] found {kv_seeded} kv_seeds, valid_rows={valid_rows}");
+                    if valid_rows > 0 && kv_seeded == 0 {
+                        return Err(format!("expected attention KV seed sources for valid_rows={valid_rows}, found 0"));
+                    }
                     let Device::Rocm(ordinal) = *device else {
                         return Err("non-ROCm device".to_string());
                     };
@@ -655,6 +675,12 @@ fn try_graph_decode_step(
                     $g.buffers
                         .seed_kv_arena_from_eager(&dev, &srcs)
                         .map_err(|e| format!("seed: {e}"))?;
+                    if valid_rows > 0 && $g.buffers.current_pos != valid_rows {
+                        return Err(format!(
+                            "seed_kv_arena_from_eager left current_pos={} != valid_rows={valid_rows}",
+                            $g.buffers.current_pos
+                        ));
+                    }
                     $g.buffers
                         .seed_gdl_state_from_eager(&dev, &srcs)
                         .map_err(|e| format!("gdl seed: {e}"))?;
@@ -663,6 +689,8 @@ fn try_graph_decode_step(
                     let conv_dev_seeds = graph_model
                         .eager_conv_device_seed_sources(sess)
                         .map_err(|e| format!("conv dev export: {e}"))?;
+                    let any_conv = conv_dev_seeds.iter().filter(|s| s.is_some()).count();
+                    eprintln!("[seed-summary-postcapture] found {any_conv} conv_dev_seeds");
                     if conv_dev_seeds.iter().any(|s| s.is_some()) {
                         $g.buffers
                             .seed_conv_rings_from_device(&dev, &conv_dev_seeds)
@@ -680,6 +708,8 @@ fn try_graph_decode_step(
                     let kda_seeds = graph_model
                         .eager_kda_seed_sources(sess)
                         .map_err(|e| format!("kda export: {e}"))?;
+                    let any_kda = kda_seeds.iter().filter(|s| s.is_some()).count();
+                    eprintln!("[seed-summary-postcapture] found {any_kda} kda_seeds");
                     if !kda_seeds.is_empty() {
                         $g.buffers
                             .seed_kda_state_from_eager(&dev, &kda_seeds)
@@ -701,6 +731,8 @@ fn try_graph_decode_step(
             return None;
         }
         *just_captured = false;
+
+
     }
     if let Err(e) = graph_model.forward_replay(g, token_id) {
         // Replay failure drops the stale graph so the next attempt (after
@@ -829,6 +861,221 @@ fn try_graph_decode_step(
             }
         } else {
             eprintln!("[graph-toplogits] step={step} read_logits_f32 failed");
+        }
+        // Dump the first 4 floats of layer_input and layer_output for each layer
+        for l in 0..g.buffers.layer_input.len() {
+            let mut vin = [0f32; 4];
+            let mut vout = [0f32; 4];
+            let pin = _BS::device_ptr(&g.buffers.layer_input[l]).map(|q| q as *mut std::ffi::c_void);
+            let pout = _BS::device_ptr(&g.buffers.layer_output[l]).map(|q| q as *mut std::ffi::c_void);
+            if let Some(p) = pin {
+                let _ = unsafe {
+                    grim_backend_rocm::hipMemcpy(
+                        vin.as_mut_ptr() as *mut std::ffi::c_void,
+                        p,
+                        16,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    )
+                };
+            }
+            if let Some(p) = pout {
+                let _ = unsafe {
+                    grim_backend_rocm::hipMemcpy(
+                        vout.as_mut_ptr() as *mut std::ffi::c_void,
+                        p,
+                        16,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    )
+                };
+            }
+            eprintln!("[layer-probe] l={l} in={:?} out={:?}", vin, vout);
+        }
+        // EAGER-PROBE counterpart: persist the replayed graph's per-layer
+        // residual rows so they can be diffed against the eager session's
+        // `grim_lres_dec_<l>.bin` dumps (same GRIM_LAYERS_DUMP_DIR).
+        if let Ok(base) = std::env::var("GRIM_LAYERS_DUMP_DIR") {
+            if !base.is_empty() {
+                // Per-step subdir: the eager probe runs on EVERY replay, so
+                // same-step pairs (g<step> vs e<step>) can be diffed.
+                let dir = format!("{base}/g{step}");
+                let _ = std::fs::create_dir_all(&dir);
+                for l in 0..g.buffers.layer_output.len() {
+                    for (tag, buf) in [("graph_lin", &g.buffers.layer_input[l]), ("graph_lres", &g.buffers.layer_output[l])] {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(buf) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(format!("{dir}/{tag}_{l:02}.bin"), &b);
+                            }
+                        }
+                    }
+                }
+                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(&g.buffers.head_input) {
+                    if let Ok(b) = r.copy_to_host() {
+                        let _ = std::fs::write(format!("{dir}/graph_emb.bin"), &b);
+                    }
+                }
+                // Position actually used by the replay + layer-0 attention
+                // intermediates. If pos_dev != current_pos-1 the RoPE position
+                // is stale; if k_arena rows differ from the eager cache the
+                // seed is bad.
+                {
+                    let mut pv = [0f32; 4];
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(&g.buffers.pos_dev) {
+                        if let Ok(b) = r.copy_to_host() {
+                            for (i, slot) in pv.iter_mut().enumerate().take(4) {
+                                if i * 4 + 4 <= b.len() {
+                                    *slot = f32::from_le_bytes([
+                                        b[i * 4],
+                                        b[i * 4 + 1],
+                                        b[i * 4 + 2],
+                                        b[i * 4 + 3],
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[pos-probe] current_pos={} pos_dev={:?} replicas={:?}",
+                        g.buffers.current_pos, pv, g.buffers.pos_replica_ords
+                    );
+                    for (tag, buf) in [
+                        ("graph_q0", &g.buffers.q_buf[0]),
+                        ("graph_k0", &g.buffers.k_buf[0]),
+                        ("graph_v0", &g.buffers.v_buf[0]),
+                    ] {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(buf) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(format!("{dir}/{tag}.bin"), &b);
+                            }
+                        }
+                    }
+                    // K arena layer 0: dump rows [0, current_pos] (post-replay
+                    // append includes the current token's row).
+                    if !g.buffers.k_arena.is_empty() {
+                        if let Ok(r) =
+                            grim_backend_rocm::device::util::as_rocm(&g.buffers.k_arena[0])
+                        {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(format!("{dir}/graph_karena_l0.bin"), &b);
+                                eprintln!(
+                                    "[pos-probe] k_arena l0 bytes={} current_pos={}",
+                                    b.len(),
+                                    g.buffers.current_pos
+                                );
+                            }
+                        }
+                    }
+                    // Recurrent state actually seeded into the graph's KDA
+                    // buffers — diff against the eager side's
+                    // eager_conv_dev_l*.bin / eager_kda_dev_l*.bin. Layer
+                    // chosen by GRIM_PROBE_LAYER (default 0).
+                    let pl: usize = std::env::var("GRIM_PROBE_LAYER")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if pl < g.buffers.sc_state.len() {
+                        if let Ok(r) =
+                            grim_backend_rocm::device::util::as_rocm(&g.buffers.sc_state[pl])
+                        {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{dir}/graph_sc_state_l{pl}.bin"),
+                                    &b,
+                                );
+                                eprintln!("[pos-probe] sc_state l{pl} bytes={}", b.len());
+                            }
+                        }
+                    }
+                    if let Some(kda) = g.buffers.kda.get(pl).and_then(|o| o.as_ref()) {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(&kda.state) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{dir}/graph_kda_state_l{pl}.bin"),
+                                    &b,
+                                );
+                                eprintln!("[pos-probe] kda state l{pl} bytes={}", b.len());
+                            }
+                        }
+                    }
+                    // KV arena for the probe layer (attention layers): the
+                    // seeded rows [0, current_pos] the replay attends over.
+                    if let Some(ka) = g.buffers.k_arena.get(pl) {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(ka) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{dir}/graph_karena_l{pl}.bin"),
+                                    &b,
+                                );
+                                eprintln!("[pos-probe] k_arena l{pl} bytes={}", b.len());
+                            }
+                        }
+                    }
+                    if let Some(va) = g.buffers.v_arena.get(pl) {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(va) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(
+                                    format!("{dir}/graph_varena_l{pl}.bin"),
+                                    &b,
+                                );
+                                eprintln!("[pos-probe] v_arena l{pl} bytes={}", b.len());
+                            }
+                        }
+                    }
+                    // Pre-append K/V for the probe layer (post-RoPE, pre-quant)
+                    // and the attention output — to split "projection/RoPE
+                    // differs" from "append kernel differs".
+                    for (tag, buf) in [
+                        ("graph_kbuf", &g.buffers.k_buf[pl]),
+                        ("graph_vbuf", &g.buffers.v_buf[pl]),
+                        ("graph_qbuf", &g.buffers.q_buf[pl]),
+                    ] {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(buf) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ = std::fs::write(format!("{dir}/{tag}_l{pl}.bin"), &b);
+                            }
+                        }
+                    }
+                    // KDA layer intermediates: normed input, qkv, alpha, beta,
+                    // gate — diff against the eager dumps of the same names.
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(&g.buffers.norm_buf[pl]) {
+                        if let Ok(b) = r.copy_to_host() {
+                            let _ = std::fs::write(format!("{dir}/graph_xnormed_l{pl}.bin"), &b);
+                        }
+                    }
+                    // The q8_1-quantized activation the graph's GEMVs consume.
+                    if let Some(aq) = g.buffers.act_q81_buf.get(pl) {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(aq) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ =
+                                    std::fs::write(format!("{dir}/graph_actq81_l{pl}.bin"), &b);
+                                eprintln!("[pos-probe] act_q81 l{pl} bytes={}", b.len());
+                            }
+                        }
+                    }
+                    if let Some(kda) = g.buffers.kda.get(pl).and_then(|o| o.as_ref()) {
+                        for (tag, buf) in [
+                            ("graph_alpha", &kda.alpha),
+                            ("graph_beta", &kda.beta),
+                            ("graph_z", &kda.gate),
+                        ] {
+                            if let Ok(r) = grim_backend_rocm::device::util::as_rocm(buf) {
+                                if let Ok(b) = r.copy_to_host() {
+                                    let _ =
+                                        std::fs::write(format!("{dir}/{tag}_l{pl}.bin"), &b);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(fq) = g.buffers.fused_qkv_out.get(pl) {
+                        if let Ok(r) = grim_backend_rocm::device::util::as_rocm(fq) {
+                            if let Ok(b) = r.copy_to_host() {
+                                let _ =
+                                    std::fs::write(format!("{dir}/graph_fqkv_l{pl}.bin"), &b);
+                                eprintln!("[pos-probe] fused_qkv l{pl} bytes={}", b.len());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1554,6 +1801,9 @@ pub async fn cmd_run(
     // One-file speculative loading: fall back to an embedded MTP sidecar
     // when --draft-model was not given.
     let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
+    let mtp_mode = std::env::var("GRIM_MTP")
+        .unwrap_or_else(|_| "off".to_string())
+        .to_ascii_lowercase();
     let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
         let dev = model.device().clone();
         match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
@@ -1580,7 +1830,38 @@ pub async fn cmd_run(
             },
         }
     } else {
-        model
+        // M3/M4: in-model native MTP (Qwen35 nextn), not routed through --draft-model.
+        let wants_mtp = matches!(mtp_mode.as_str(), "auto" | "on");
+        let qwen_has_mtp = model
+            .as_any()
+            .downcast_ref::<grim_models_transformer::Qwen35>()
+            .map(|q| q.has_mtp())
+            .unwrap_or(false);
+        if wants_mtp && qwen_has_mtp {
+            let depth = model
+                .as_any()
+                .downcast_ref::<grim_models_transformer::Qwen35>()
+                .map(|q| q.mtp_depth())
+                .unwrap_or(0);
+            eprintln!(
+                "[grim] Native MTP: enabling Qwen35 nextn (GRIM_MTP={mtp_mode}, depth={depth})"
+            );
+            let arc_model: Arc<dyn CausalLm> = Arc::from(model);
+            let adapter = Arc::new(grim_speculative::Qwen35MtpAdapter::new(arc_model.clone()));
+            let mut wrapped = grim_speculative::SpeculativeCausalLm::with_native_mtp(
+                Box::new(grim_speculative::Qwen35MtpAdapter::new(arc_model)),
+                adapter,
+            );
+            wrapped.set_gpu_verifier(Arc::new(grim_engine::RocmSpeculativeVerifier));
+            Box::new(wrapped) as Box<dyn CausalLm>
+        } else if mtp_mode == "on" {
+            return Err(grim_core::error::Error::Config(
+                "GRIM_MTP=on but native MTP is unavailable for this model/run (no loaded nextn block)"
+                    .into(),
+            ));
+        } else {
+            model
+        }
     };
 
     // Prewarm u4 lane weights at model load time BEFORE any requests/prefill.
@@ -1657,6 +1938,7 @@ pub async fn cmd_run(
         .map_err(|e| grim_core::error::Error::Config(format!("stdout flush failed: {e}")))?;
 
     let mut session = SessionInner::new(model.device().clone());
+    session.set_sampling_greedy(temperature <= 0.0);
 
     // GRAVE Phase 0.2: teacher-forced perplexity scorer (`GRIM_SCORE_FILE`).
     // Scores a text file chunk-by-chunk with plain forward passes (no chat
@@ -2108,6 +2390,89 @@ pub async fn cmd_run(
         } else {
             None
         };
+        // GRIM_TOKEN_TRACE: which path served this step. Resolved HERE, before
+        // `graph_hit` is partially moved by the sampling match below.
+        let graph_path = match &graph_hit {
+            Some(GraphDecodeResult::Sampled(_)) => "graph-sample",
+            Some(GraphDecodeResult::Logits(_)) => "graph-logits",
+            None => "eager",
+        };
+
+        // EAGER-PROBE (GRIM_EAGER_PROBE=1 + GRIM_LAYERS_DUMP_DIR):
+        // side-by-side reference on EVERY successful replay. Runs the SAME
+        // token through the eager session at the SAME absolute position the
+        // replay just consumed; qwen35's dump branch writes
+        // `grim_lres_dec_<l>.bin`, copied here into `<dir>/e<step>/` so it can
+        // be diffed against the replay probe's `<dir>/g<step>/` same-step pair.
+        // The first diverging layer pair localizes the offending component.
+        if graph_hit.is_some() && std::env::var_os("GRIM_EAGER_PROBE").is_some() {
+            let pos = tokens.len().saturating_sub(1);
+            let tid = tokens.last().copied().unwrap_or(0);
+            // GRIM_EAGER_PROBE_FRESH=1: run the reference on a brand-new
+            // session (zero recurrent state, empty KV) instead of the live
+            // one. If the replay's layer outputs then MATCH this fresh run,
+            // the graph is effectively running with unseeded state.
+            let fresh_mode = std::env::var_os("GRIM_EAGER_PROBE_FRESH").is_some();
+            let mut fresh_session = model.new_session();
+            let live_ptr: *mut dyn grim_core::session::SessionT = &mut session;
+            let sess: &mut dyn grim_core::session::SessionT = if fresh_mode {
+                fresh_session.as_mut()
+            } else {
+                // SAFETY: `live_ptr` derives from `session`, which outlives
+                // this block; no other use of `session` overlaps it.
+                unsafe { &mut *live_ptr }
+            };
+            eprintln!(
+                "[eager-probe] reference forward tok={tid} pos={pos} fresh={fresh_mode}"
+            );
+            let shape = grim_tensor::Shape::new(vec![1]);
+            let in_t = build_tensor(&[tid as f32], &shape, &device)?;
+            let pos_t = build_tensor(&[pos as f32], &shape, &device)?;
+            let logits = CausalLm::forward(&*model, sess, &in_t, &pos_t, &[])?;
+            forward_passes += 1;
+            if let Ok(base) = std::env::var("GRIM_LAYERS_DUMP_DIR") {
+                if !base.is_empty() {
+                    let dir = format!("{base}/e{generated}");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let tag = if fresh_mode { "eager_fresh" } else { "eager" };
+                    let _ = std::fs::copy(
+                        format!("{base}/grim_emb_dec.bin"),
+                        format!("{dir}/{tag}_emb.bin"),
+                    );
+                    // Copy every dump file that exists (layer count varies by
+                    // model); missing files just don't copy.
+                    for l in 0..128usize {
+                        let _ = std::fs::copy(
+                            format!("{base}/grim_lres_dec_{l:02}.bin"),
+                            format!("{dir}/{tag}_lres_{l:02}.bin"),
+                        );
+                    }
+                    // KDA intermediates (written by qwen35.rs into the base
+                    // dir, overwritten per forward) — snapshot them per step.
+                    for f in [
+                        "eager_xnormed.bin",
+                        "eager_xnormed_t.bin",
+                        "eager_qkv.bin",
+                        "eager_alpha.bin",
+                        "eager_beta.bin",
+                        "eager_z.bin",
+                        "eager_conv_dev_l0.bin",
+                        "eager_kda_dev_l0.bin",
+                    ] {
+                        let _ = std::fs::copy(format!("{base}/{f}"), format!("{dir}/{f}"));
+                    }
+                }
+            }
+            if let Ok(flat) = logits.to_vec_f32() {
+                let mut idx: Vec<u32> = (0..flat.len() as u32).collect();
+                idx.sort_by(|&a, &b| flat[b as usize].total_cmp(&flat[a as usize]));
+                let top: Vec<String> = idx[..5]
+                    .iter()
+                    .map(|&i| format!("{i}:{:.4}", flat[i as usize]))
+                    .collect();
+                eprintln!("[eager-probe] top5=[{}] argmax={}", top.join(", "), idx[0]);
+            }
+        }
 
         // GRIM_DEBUG_STEP_TIMING=1: one line per step with which path served it.
         // The run's reported average is dominated by one-time costs (lane
@@ -2126,9 +2491,8 @@ pub async fn cmd_run(
                 }
             };
         }
-        let next_token = match graph_hit {
+        let emitted_toks: Vec<u32> = match graph_hit {
             Some(GraphDecodeResult::Sampled(tok)) => {
-                // A graph replay IS one forward pass — count it like eager.
                 forward_passes += 1;
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
@@ -2137,7 +2501,7 @@ pub async fn cmd_run(
                     phase_steps.push((step_us, "graph-sampled"));
                 }
                 step_timing!(step_us, "graph-sampled");
-                tok
+                vec![tok]
             }
             Some(GraphDecodeResult::Logits(logits)) => {
                 forward_passes += 1;
@@ -2163,18 +2527,10 @@ pub async fn cmd_run(
                     grim_tensor::dtype::QuantProvenance::default(),
                     grim_tensor::Device::Cpu,
                 );
-                sampler.sample(&last_logits_tensor, &history)?
+                vec![sampler.sample(&last_logits_tensor, &history)?]
             }
             None => {
-                // Overlap the decode-only u4-lane weight conversion with the
-                // prefill (measured 3.5 s for the 9B when it lands on the
-                // first decode step: 201 tensors, packed-weight D2H + on-disk
-                // lane read + H2D). The prewarm reads the SAME weights
-                // read-only through their packed route and writes only its own
-                // lane buffers, so the two can share the device.
                 let gm_ref = resolve_graph_model(&*model);
-                // GRIM_PREWARM=0 keeps the pre-change behaviour (conversion on
-                // the first decode step) for A/B verification.
                 let prewarm_opt_out = matches!(
                     std::env::var("GRIM_PREWARM").as_deref(),
                     Ok("0" | "false" | "off")
@@ -2185,11 +2541,6 @@ pub async fn cmd_run(
                     grim_backend_rocm::set_prefill_in_flight(true);
                     prewarm_done = true;
                 }
-                // Diagnostic (GRIM_MGPU_SYNC=1): drain every visible ROCm device
-                // before starting a step. If a cross-device page fault
-                // disappears with this on, the cause is an unsynced dependency
-                // between the previous step's last-device work and this step's
-                // first-device kernels.
                 if std::env::var_os("GRIM_MGPU_SYNC").is_some() {
                     if let Ok(devs) = grim_backend_rocm::RocmDevice::probe() {
                         for d in &devs {
@@ -2226,15 +2577,13 @@ pub async fn cmd_run(
                 {
                     let total_prompt = input_ids.len();
                     let max_chunk = compute_auto_chunk_size(tokens.len(), max_tokens);
-                    // Balanced chunking: split into equal-sized chunks so tail chunks don't fall
-                    // below the dequant/WMMA threshold (M >= 4) into decode-precision GEMVs.
                     let n_chunks = (total_prompt + max_chunk - 1) / max_chunk;
                     let mut chunk_start = 0;
-                    let mut rem_tokens = total_prompt;
+                    let mut rem_tokens_count = total_prompt;
                     let mut rem_chunks = n_chunks;
                     let mut final_out = None;
                     while chunk_start < total_prompt {
-                        let chunk_sz = (rem_tokens + rem_chunks - 1) / rem_chunks;
+                        let chunk_sz = (rem_tokens_count + rem_chunks - 1) / rem_chunks;
                         let chunk_end = (chunk_start + chunk_sz).min(total_prompt);
                         let is_last = chunk_end == total_prompt;
                         session.set_skip_output_projection(!is_last);
@@ -2257,7 +2606,7 @@ pub async fn cmd_run(
                             final_out = Some(out);
                         }
                         chunk_start = chunk_end;
-                        rem_tokens = rem_tokens.saturating_sub(chunk_sz);
+                        rem_tokens_count = rem_tokens_count.saturating_sub(chunk_sz);
                         rem_chunks = rem_chunks.saturating_sub(1);
                     }
                     final_out.expect("at least one chunk was processed")
@@ -2291,15 +2640,14 @@ pub async fn cmd_run(
                     step_timing!(step_us, "prefill");
                 }
 
-                // SPEED-ROC: on decode steps (single-row logits) sample straight from the
-                // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
-                // CPU sampling that dominated per-token overhead. Prefill (multi-row)
-                // steps fall back to the CPU sampler.
-                // `--logprobs N`: materialise this step's logits and print the
-                // top-N, shaped like Ollama's `top_logprobs` so a run diffs
-                // directly against an Ollama reference. Costs a full-vocab D2H
-                // per step, so it is a diagnostic, not a decode path.
-                if logprobs > 0 {
+                // M3/native-MTP: wrapper may return [emitted, vocab] logits and set
+                // session.last_accepted_tokens(); sample each emitted row in order.
+                let emitted = session.last_accepted_tokens().max(1);
+                let dims = logits.shape().dims();
+                let rows = if dims.len() == 2 { dims[0] } else { 1 };
+                let use_multi = !is_prefill && emitted > 1 && rows >= emitted && (logits.shape().elem_count() % vocab == 0);
+
+                if logprobs > 0 && !use_multi {
                     let logits_vec = logits.to_vec_f32()?;
                     let last_start = logits_vec.len().saturating_sub(vocab);
                     let last = &logits_vec[last_start..];
@@ -2332,150 +2680,177 @@ pub async fn cmd_run(
                     );
                 }
 
-                // B1: repeat penalty applies on-device now; a device-kernel miss
-                // degrades to CPU sampling (never errors the run).
-                let gpu_sample_ok = logits.shape().elem_count() == vocab
-                    && std::env::var("GRIM_CPU_SAMPLER").is_err()
-                    && matches!(device, Device::Rocm(_));
-
-                let device_token: Option<u32> = if gpu_sample_ok {
-                    // Sample on the LOGITS' own device, not the model's first
-                    // device. On a two-card split the LM head lives on the
-                    // last card, so `device` (rocm:0) and the logits storage
-                    // (rocm:1) disagree; launching grim_argmax_stage1 /
-                    // grim_sample_logits_stochastic on rocm:0 against rocm:1
-                    // pointers faults the queue ("Page not present"). The
-                    // graph path above already samples on the storage's
-                    // ordinal — mirror it here.
-                    let logits_device =
-                        Device::Rocm(logits.storage().as_ref().device_ordinal() as usize);
-                    sample_on_rocm(
-                        &logits_device,
-                        &logits,
-                        vocab,
-                        &sampling_params,
-                        seed,
-                        generated,
-                        &history,
-                    )
-                    .ok()
-                } else {
-                    None
-                };
-                // CPU fallback closure (device-kernel miss or prefill shape).
-                let cpu_sample = || -> Result<u32> {
+                if use_multi {
+                    // Multi-row emission (native MTP). Sample per-row on CPU to preserve
+                    // per-token history/repeat-penalty semantics.
                     let logits_vec = logits.to_vec_f32()?;
-                    let last_start = logits_vec.len().saturating_sub(vocab);
-                    let last_logits = &logits_vec[last_start..];
-                    if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
-                        if let Ok(path) = std::env::var("GRIM_DEBUG_LOGITS_PATH") {
-                            use std::io::Write as _;
-                            let mut f = std::fs::File::create(&path).ok();
-                            if let Some(f) = f.as_mut() {
-                                for v in last_logits {
-                                    let b = v.to_le_bytes();
-                                    let _ = f.write_all(&b);
+                    let mut toks = Vec::with_capacity(emitted);
+                    let mut hist = history.clone();
+                    for r in 0..emitted {
+                        let start = r * vocab;
+                        let end = start + vocab;
+                        if end > logits_vec.len() { break; }
+                        let row = &logits_vec[start..end];
+                        let row_shape = grim_tensor::Shape::new(vec![vocab]);
+                        let row_tensor = grim_tensor::Tensor::new(
+                            std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                                row,
+                                &row_shape,
+                                grim_tensor::dtype::DType::F32,
+                            )?),
+                            row_shape,
+                            grim_tensor::dtype::DType::F32,
+                            grim_tensor::dtype::QuantProvenance::default(),
+                            grim_tensor::Device::Cpu,
+                        );
+                        let tok = sampler.sample(&row_tensor, &hist)?;
+                        hist.push(tok);
+                        toks.push(tok);
+                    }
+                    if toks.is_empty() { vec![0u32] } else { toks }
+                } else {
+                    // Single-row decode/prefill sampling (existing path).
+                    let gpu_sample_ok = logits.shape().elem_count() == vocab
+                        && std::env::var("GRIM_CPU_SAMPLER").is_err()
+                        && matches!(device, Device::Rocm(_));
+
+                    let device_token: Option<u32> = if gpu_sample_ok {
+                        let logits_device =
+                            Device::Rocm(logits.storage().as_ref().device_ordinal() as usize);
+                        sample_on_rocm(
+                            &logits_device,
+                            &logits,
+                            vocab,
+                            &sampling_params,
+                            seed,
+                            generated,
+                            &history,
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
+                    let cpu_sample = || -> Result<u32> {
+                        let logits_vec = logits.to_vec_f32()?;
+                        let last_start = logits_vec.len().saturating_sub(vocab);
+                        let last_logits = &logits_vec[last_start..];
+                        if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+                            if let Ok(path) = std::env::var("GRIM_DEBUG_LOGITS_PATH") {
+                                use std::io::Write as _;
+                                let mut f = std::fs::File::create(&path).ok();
+                                if let Some(f) = f.as_mut() {
+                                    for v in last_logits {
+                                        let b = v.to_le_bytes();
+                                        let _ = f.write_all(&b);
+                                    }
                                 }
+                                eprintln!(
+                                    "[toplogits] dumped {} logits to {}",
+                                    last_logits.len(),
+                                    path
+                                );
                             }
+                            let mut idx: Vec<u32> = (0..vocab as u32).collect();
+                            idx.sort_by(|&a, &b| {
+                                last_logits[b as usize].total_cmp(&last_logits[a as usize])
+                            });
                             eprintln!(
-                                "[toplogits] dumped {} logits to {}",
-                                last_logits.len(),
-                                path
+                                "[toplogits] step={} top5: {:?}",
+                                generated,
+                                idx[..5]
+                                    .iter()
+                                    .map(|&i| (
+                                        i,
+                                        (last_logits[i as usize] * 10_000.0).round() / 10_000.0
+                                    ))
+                                    .collect::<Vec<_>>()
                             );
                         }
-                        let mut idx: Vec<u32> = (0..vocab as u32).collect();
-                        idx.sort_by(|&a, &b| {
-                            last_logits[b as usize].total_cmp(&last_logits[a as usize])
-                        });
-                        eprintln!(
-                            "[toplogits] step={} top5: {:?}",
-                            generated,
-                            idx[..5]
-                                .iter()
-                                .map(|&i| (
-                                    i,
-                                    (last_logits[i as usize] * 10_000.0).round() / 10_000.0
-                                ))
-                                .collect::<Vec<_>>()
-                        );
-                    }
-                    let last_shape = grim_tensor::Shape::new(vec![vocab]);
-                    let last_logits_tensor = grim_tensor::Tensor::new(
-                        std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
-                            last_logits,
-                            &last_shape,
+                        let last_shape = grim_tensor::Shape::new(vec![vocab]);
+                        let last_logits_tensor = grim_tensor::Tensor::new(
+                            std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                                last_logits,
+                                &last_shape,
+                                grim_tensor::dtype::DType::F32,
+                            )?),
+                            last_shape,
                             grim_tensor::dtype::DType::F32,
-                        )?),
-                        last_shape,
-                        grim_tensor::dtype::DType::F32,
-                        grim_tensor::dtype::QuantProvenance::default(),
-                        grim_tensor::Device::Cpu,
-                    );
-                    Ok(sampler.sample(&last_logits_tensor, &history)?)
-                };
-
-                match device_token {
-                    Some(tok) => tok,
-                    None => cpu_sample()?,
+                            grim_tensor::dtype::QuantProvenance::default(),
+                            grim_tensor::Device::Cpu,
+                        );
+                        Ok(sampler.sample(&last_logits_tensor, &history)?)
+                    };
+                    vec![match device_token {
+                        Some(tok) => tok,
+                        None => cpu_sample()?,
+                    }]
                 }
             }
         };
 
-        // Accumulate tokens; decode full sequence at end for correct BPE boundary handling.
-        generated_tokens.push(next_token);
+        // Accumulate and apply per-token stop/thinking rules. M3/native-MTP may emit multiple
+        // tokens in one step; process them in order and truncate the block on stop/EOS.
+        let mut stop_generation = false;
+        for next_token in emitted_toks {
+            generated_tokens.push(next_token);
+            if std::env::var_os("GRIM_TOKEN_TRACE").is_some() {
+                eprintln!("[token-trace] gen={generated} tok={next_token} path={graph_path}");
+            }
 
-        // Update state
-        tokens.push(next_token);
-        history.push(next_token);
+            tokens.push(next_token);
+            history.push(next_token);
 
-        // Check if thinking concluded or began
-        if let Some(tok) = &tokenizer {
-            let piece = tok.decode(&[next_token]);
-            if in_thinking {
-                thinking_passes += 1;
-                if piece.contains("</think>") || tok.decode(&generated_tokens).contains("</think>")
-                {
-                    in_thinking = false;
-                } else if thinking_passes >= max_thinking_passes {
-                    eprintln!(
-                        "[grim] Reached max thinking token limit ({max_thinking_passes}); ending think phase."
-                    );
-                    in_thinking = false;
+            // Check if thinking concluded or began
+            if let Some(tok) = &tokenizer {
+                let piece = tok.decode(&[next_token]);
+                if in_thinking {
+                    thinking_passes += 1;
+                    if piece.contains("</think>")
+                        || tok.decode(&generated_tokens).contains("</think>")
+                    {
+                        in_thinking = false;
+                    } else if thinking_passes >= max_thinking_passes {
+                        eprintln!(
+                            "[grim] Reached max thinking token limit ({max_thinking_passes}); ending think phase."
+                        );
+                        in_thinking = false;
+                    }
+                } else if piece.contains("<think>") {
+                    in_thinking = true;
+                    thinking_passes += 1;
+                } else {
+                    generated += 1;
                 }
-            } else if piece.contains("<think>") {
-                in_thinking = true;
-                thinking_passes += 1;
             } else {
                 generated += 1;
             }
-        } else {
-            generated += 1;
-        }
 
-        // Check for EOS or ChatML stop tokens, respecting min_tokens budget.
-        if let Some(tok) = &tokenizer {
-            let stop_tokens: Vec<u32> = vec![
-                tok.token_to_id.get("<|im_end|>").copied(),
-                tok.token_to_id.get("<|endoftext|>").copied(),
-                tok.token_to_id.get("</s>").copied(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            // Check for EOS or ChatML stop tokens, respecting min_tokens budget.
+            if let Some(tok) = &tokenizer {
+                let stop_tokens: Vec<u32> = vec![
+                    tok.token_to_id.get("<|im_end|>").copied(),
+                    tok.token_to_id.get("<|endoftext|>").copied(),
+                    tok.token_to_id.get("</s>").copied(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
 
-            if grim_core::sampler::should_stop(
-                next_token,
-                generated as u32,
-                min_tokens,
-                tok.eos_token_id,
-                &stop_tokens,
-            ) {
-                eprintln!(
-                    "[grim] EOS token {} reached, stopping generation.",
-                    next_token
-                );
-                break;
+                if grim_core::sampler::should_stop(
+                    next_token,
+                    generated as u32,
+                    min_tokens,
+                    tok.eos_token_id,
+                    &stop_tokens,
+                ) {
+                    eprintln!("[grim] EOS token {} reached, stopping generation.", next_token);
+                    stop_generation = true;
+                    break;
+                }
             }
+        }
+        if stop_generation {
+            break;
         }
     }
 
@@ -2717,7 +3092,8 @@ pub fn init_generation(
         512
     };
 
-    let session = SessionInner::new(model.device().clone());
+    let mut session = SessionInner::new(model.device().clone());
+    session.set_sampling_greedy(temperature <= 0.0);
 
     Ok(GenerationContext {
         model,
@@ -3014,6 +3390,7 @@ pub async fn cmd_run_interactive(
 
     // Session and KV cache persist across turns.
     let mut session = SessionInner::new(model.device().clone());
+    session.set_sampling_greedy(temperature <= 0.0);
     // Repeat-penalty history persists across turns.
     let mut history: Vec<u32> = Vec::new();
     // Multi-turn chat template history.
@@ -3054,6 +3431,7 @@ pub async fn cmd_run_interactive(
 
         if trimmed == "/reset" {
             session = SessionInner::new(model.device().clone());
+            session.set_sampling_greedy(temperature <= 0.0);
             messages.clear();
             if let Some(sys) = active_sys_prompt {
                 messages.push(grim_format::ChatMessage {

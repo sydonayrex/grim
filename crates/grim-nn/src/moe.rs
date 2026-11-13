@@ -4061,6 +4061,90 @@ mod tests {
     }
 
     #[test]
+    fn test_moe_aware_hybrid_astrum_default_off_matches_baseline_hybrid() {
+        let hidden = 4;
+        let inter = 8;
+        let num_experts = 4;
+        let top_k = 2;
+
+        let gate_weight = cpu_tensor(
+            vec![0.1; hidden * num_experts],
+            Shape::new(vec![num_experts, hidden]),
+        );
+        let gate_linear = Linear::from_tensor(gate_weight, None);
+        let router = MoeRouter::new(
+            gate_linear,
+            RouterKind::SoftmaxTopK,
+            top_k,
+            num_experts,
+            None,
+        );
+
+        let mut gate_layers = Vec::new();
+        let mut up_layers = Vec::new();
+        let mut down_layers = Vec::new();
+
+        for e in 0..num_experts {
+            let val = (e + 1) as f32 * 0.05;
+            gate_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])),
+                None,
+            ));
+            up_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])),
+                None,
+            ));
+            down_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; hidden * inter], Shape::new(vec![hidden, inter])),
+                None,
+            ));
+        }
+
+        let experts = ExpertBank {
+            gate: gate_layers,
+            up: up_layers,
+            down: down_layers,
+        };
+
+        let moe = MoeFfn::new(router, experts, None, 1.0);
+        let input = cpu_tensor(vec![1.0, 0.5, -0.5, 2.0], Shape::new(vec![1, hidden]));
+        let executor = grim_backend_rocm::MoeHybridExecutor::new(25_000.0, 60_000.0);
+
+        let baseline = moe
+            .forward_moe_aware_hybrid(&input, &executor, |e| e == 0)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        // astrum state default: config off (no env), no profile/trace => must be identical.
+        let mut astrum_state = grim_backend_rocm::AstrumMoeResidencyState::default();
+        let mut resident = |e: usize| e == 0;
+        let with_astrum = moe
+            .forward_moe_aware_hybrid_with_astrum(
+                &input,
+                &executor,
+                0,
+                Some(&mut astrum_state),
+                &mut resident,
+            )
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(baseline.len(), with_astrum.len());
+        for i in 0..baseline.len() {
+            assert!(
+                (baseline[i] - with_astrum[i]).abs() < 1e-7,
+                "Mismatch at {i}: baseline {}, astrum(default-off) {}",
+                baseline[i],
+                with_astrum[i]
+            );
+        }
+        assert!(astrum_state.trace.is_none(), "default-off state must not record trace");
+        assert!(astrum_state.profile.is_none(), "default-off state must not build profile");
+    }
+
+    #[test]
     fn test_expert_parallel_matches_monolithic_forward() {
         let hidden = 4;
         let inter = 8;

@@ -18,11 +18,24 @@ pub trait MtpDepthProvider: Send + Sync {
 
     /// Autoregressively predict `mtp_depth()` speculative candidate tokens
     /// using genuine MTP projection and LM head layers.
+    ///
+    /// This runs the trunk forward itself. Callers that already ran the base
+    /// forward must use [`MtpDepthProvider::predict_mtp_tokens_after_forward`]
+    /// instead, or the same input token is appended to the KV cache twice.
     fn predict_mtp_tokens(
         &self,
         session: &mut dyn SessionT,
         input_ids: &Tensor,
         positions: &Tensor,
+    ) -> Result<Vec<u32>>;
+
+    /// Same prediction as [`MtpDepthProvider::predict_mtp_tokens`], but using a base forward
+    /// that the caller already executed (`base_logits`) and the session's already-set last
+    /// hidden state. Must not run another trunk forward.
+    fn predict_mtp_tokens_after_forward(
+        &self,
+        session: &mut dyn SessionT,
+        base_logits: &Tensor,
     ) -> Result<Vec<u32>>;
 }
 
@@ -242,6 +255,14 @@ impl MtpDepthProvider for LlamaMtp {
         positions: &Tensor,
     ) -> Result<Vec<u32>> {
         let base_logits = self.base.forward(session, input_ids, positions, &[])?;
+        self.predict_mtp_tokens_after_forward(session, &base_logits)
+    }
+
+    fn predict_mtp_tokens_after_forward(
+        &self,
+        session: &mut dyn SessionT,
+        base_logits: &Tensor,
+    ) -> Result<Vec<u32>> {
         let vocab_size = self.base.cfg.vocab_size;
         let hidden_size = self.base.cfg.hidden_size;
 
@@ -251,7 +272,7 @@ impl MtpDepthProvider for LlamaMtp {
 
         // Device-side argmax over the final position's vocab row — the
         // [seq, vocab] logits tensor never crosses to host.
-        let mut curr_token = argmax_last_row_device(&base_logits, vocab_size)?;
+        let mut curr_token = argmax_last_row_device(base_logits, vocab_size)?;
 
         // Retrieve last hidden state from session or approximate from a
         // single-row embedding gather (never the whole table).
@@ -356,6 +377,14 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
         positions: &Tensor,
     ) -> Result<Vec<u32>> {
         let base_logits = self.base.forward(session, input_ids, positions, &[])?;
+        self.predict_mtp_tokens_after_forward(session, &base_logits)
+    }
+
+    fn predict_mtp_tokens_after_forward(
+        &self,
+        session: &mut dyn SessionT,
+        base_logits: &Tensor,
+    ) -> Result<Vec<u32>> {
         let vocab_size = self.base.cfg.vocab_size;
         let hidden_size = self.base.cfg.hidden_size;
 
@@ -363,7 +392,7 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
             return Ok(vec![]);
         }
 
-        let mut curr_token = argmax_last_row_device(&base_logits, vocab_size)?;
+        let mut curr_token = argmax_last_row_device(base_logits, vocab_size)?;
 
         let mut curr_h = if let Some(last_h) = session.get_last_hidden_state() {
             grim_nn::modules::slice_last_row_2d_on_device(&last_h)?

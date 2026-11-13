@@ -1134,34 +1134,18 @@ pub fn extract_laguna_gguf_hybrid(
     )
 }
 
-/// How many Qwen3.5/3.8 blocks the FORWARD pass must run, excluding MTP.
+/// Detect Qwen3.5/3.8 nextn/MTP block placement.
 ///
-/// The checkpoint ships a multi-token-prediction head as a trailing layer and
-/// `block_count` counts it, so the GGUF says 65 for a 64-layer transformer. The
-/// reference separates the two and the forward loop honours the separation:
-///
-///   * `llama-hparams.cpp:349` — `return n_layer_all - n_layer_nextn;`
-///   * `qwen35.cpp:154-155` — "MTP/NextN layers are loaded as extra decoder
-///     blocks but not executed in the main pass", then `for (il = 0; il < n_layer; ...)`
-///   * `qwen35.cpp:21` — `is_recr_impl[i] = (i < hparams.n_layer()) && ...`, so the
-///     recurrence-type array is bounded by `n_layer()` too.
-///
-/// Running that extra block corrupts the residual stream immediately before
-/// `output_norm`, which is the worst possible place for it: every weight is
-/// loaded correctly and the damage appears only at the head. On the 27B the
-/// block is `blk.64`, which carries `attn_q/k/v`, `attn_output`, `ffn_*` and the
-/// `nextn.*` heads but NO `ssm_*` weights at all — so a loader that classifies
-/// it by `(64+1) % 4 == 0` builds a *recurrent* layer with every recurrent
-/// weight `None`.
-///
-/// Detected structurally from the `nextn.*` tensors rather than hardcoded, so it
-/// follows the checkpoint instead of a magic 64. SHARED by the safetensors and
-/// GGUF paths on purpose: those two paths drifting apart is exactly the bug this
-/// function exists to prevent.
-fn qwen35_forward_layer_count<'a>(
+/// Returns `(forward_layer_count, first_nextn_block_idx)`. The trunk forward
+/// must run only `0..forward_layer_count` (excluding nextn); when present,
+/// `first_nextn_block_idx` identifies the first block carrying `nextn.*`
+/// tensors so loaders can load it separately (M0) without executing it in the
+/// trunk. Detection is structural (`blk.<i>.nextn.*`) and shared by GGUF and
+/// safetensors paths to prevent drift.
+fn qwen35_nextn_info<'a>(
     tensor_names: impl Iterator<Item = &'a str>,
     block_count: usize,
-) -> usize {
+) -> (usize, Option<usize>) {
     let first_nextn = tensor_names
         .filter_map(|n| n.strip_prefix("blk."))
         .filter(|n| n.contains(".nextn."))
@@ -1177,10 +1161,19 @@ fn qwen35_forward_layer_count<'a>(
                 block_count,
                 first_nextn
             );
-            first_nextn
+            (first_nextn, Some(first_nextn))
         }
-        _ => block_count,
+        _ => (block_count, None),
     }
+}
+
+/// How many Qwen3.5/3.8 blocks the FORWARD pass must run, excluding MTP.
+/// See [`qwen35_nextn_info`].
+fn qwen35_forward_layer_count<'a>(
+    tensor_names: impl Iterator<Item = &'a str>,
+    block_count: usize,
+) -> usize {
+    qwen35_nextn_info(tensor_names, block_count).0
 }
 
 // Gemma 4

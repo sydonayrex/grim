@@ -199,6 +199,13 @@ pub struct Scheduler {
     /// Tuned by [`SelfTuningController::chunked_prefill_size`](crate::self_tuning::KnobKind::ChunkedPrefillSize) (§5.7): how many tokens from any one prompt are drained per schedule pass.
     /// Drives prefill-vs-decode TTFT balance.
     pub chunked_prefill_size: usize,
+    /// T2 (hybrid prefix reuse): when non-zero, every prefill pass is rounded
+    /// down to a multiple of this many tokens so the pass ends on a block
+    /// boundary. The engine sets this to `grim_memory::BLOCK_SIZE` under
+    /// `GRIM_HYBRID_PREFIX=1`; 0 (the default) keeps the old unaligned chunks.
+    /// A recurrent-state checkpoint can only be paired with a block-aligned KV
+    /// seed, so an unaligned pass end would never be reusable.
+    pub prefill_block_align: usize,
     pub admission: AdmissionController,
     pub determinism_mode: DeterminismMode,
     /// Cumulative admission events since scheduler creation.
@@ -317,6 +324,7 @@ impl Scheduler {
             max_batched_tokens,
             max_num_seqs,
             chunked_prefill_size: 512,
+            prefill_block_align: 0,
             admission,
             determinism_mode: DeterminismMode::Relaxed,
             admitted_total: 0,
@@ -518,6 +526,32 @@ impl Scheduler {
                 remaining_before.min(self.chunked_prefill_size)
             } else {
                 remaining_before
+            };
+            // T2: round the pass down to a block boundary (see
+            // `prefill_block_align`). The leftover partial-block tail stays for
+            // the next pass, which is exactly what makes the pass end a depth
+            // the recurrent checkpoint can be paired with. A chunk that is
+            // already smaller than the block size is left alone — it is the
+            // final tail by construction.
+            //
+            // When the prompt length is itself a block multiple, the last pass
+            // would otherwise end at the prompt end, but the admission seed is
+            // capped at `len - 1` and rounds down — so the reusable depth is
+            // one block earlier (`len - B`). Leaving that last block for a
+            // final pass creates the boundary the checkpoint needs.
+            let chunk_size = if self.prefill_block_align > 0 {
+                let b = self.prefill_block_align;
+                if chunk_size == remaining_before
+                    && remaining_before > b
+                    && remaining_before % b == 0
+                {
+                    remaining_before - b
+                } else {
+                    let aligned = chunk_size - (chunk_size % b);
+                    if aligned > 0 { aligned } else { chunk_size }
+                }
+            } else {
+                chunk_size
             };
             if total_prefill + chunk_size > self.max_batched_tokens {
                 self.waiting.push_back(r);

@@ -1675,6 +1675,9 @@ impl DecodeGraphBuffers {
                 )));
             }
         }
+        for ord in 0..2 {
+            let _ = crate::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -1714,8 +1717,6 @@ impl DecodeGraphBuffers {
         dev: &RocmDevice,
         per_layer: &[Option<EagerKvSource<'_>>],
     ) -> Result<()> {
-        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
-        let stream = dev.active_stream();
         for (layer_idx, src) in per_layer.iter().enumerate() {
             let Some(src) = src else { continue };
             if src.prefill_len == 0 {
@@ -1727,6 +1728,14 @@ impl DecodeGraphBuffers {
                     self.k_arena.len()
                 )));
             }
+
+            let ord = self
+                .layer_devices
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(dev.ordinal);
+            let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+            let stream = crate::RocmDevice::shared(ord).active_stream();
             // Phase 3: with a fixed-capacity ring, `prefill_len` is the ABSOLUTE
             // token count while the eager arena only holds the live prefix
             // [0, min(prefill_len, cap)). Both arenas use the same ring policy,
@@ -1921,7 +1930,7 @@ impl DecodeGraphBuffers {
                 continue;
             }
             if src.src_elem_bytes == arena_elem_bytes {
-                let dst_ord = dev.ordinal as i32;
+                let dst_ord = ord as i32;
                 let src_ord = src.device_ordinal;
                 if src_ord != dst_ord {
                     // Cross-device P2P copy
@@ -2086,10 +2095,14 @@ impl DecodeGraphBuffers {
             .find_map(|s| s.as_ref().map(|e| e.prefill_len))
             .unwrap_or(0);
         self.current_pos = prefill_len;
-        // Seed the device position scalar to match; the graph's bump kernel
-        // increments it on each replay, so it must start at prefill_len.
-        self.write_pos_async(dev, prefill_len, stream)?;
-        dev.synchronize();
+        // A5b: Write position to ALL segment devices, not just primary dev!
+        self.write_pos_all_segments(prefill_len)?;
+        // D1-2a: Seed EVERY layer's KV total (layer_totals) to prefill_len!
+        // Without this, layer_totals starts at 0, so attention and append attend over 0 rows!
+        self.write_layer_totals(prefill_len)?;
+        for ord in 0..2 {
+            let _ = crate::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -2147,7 +2160,9 @@ impl DecodeGraphBuffers {
                 )));
             }
         }
-        dev.synchronize();
+        for ord in 0..2 {
+            let _ = crate::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -2199,7 +2214,9 @@ impl DecodeGraphBuffers {
                 )));
             }
         }
-        dev.synchronize();
+        for ord in 0..2 {
+            let _ = crate::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 
@@ -2244,7 +2261,9 @@ impl DecodeGraphBuffers {
                 )));
             }
         }
-        dev.synchronize();
+        for ord in 0..2 {
+            let _ = crate::RocmDevice::shared(ord).synchronize();
+        }
         Ok(())
     }
 

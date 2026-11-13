@@ -325,7 +325,7 @@ fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32
 
     // ── GEMM leg ────────────────────────────────────────────────────────────
     let ab_bytes = GEMM_DIM * GEMM_DIM * 2; // f16
-    let d_bytes = GEMM_DIM * GEMM_DIM * 4; // f32 accumulate out
+    let d_bytes = GEMM_DIM * GEMM_DIM * 2; // f16 out
     let mut d_a: *mut core::ffi::c_void = null_mut();
     let mut d_b: *mut core::ffi::c_void = null_mut();
     let mut d_d: *mut core::ffi::c_void = null_mut();
@@ -402,12 +402,12 @@ fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32
             n_dim,
             &beta as *const f32 as *const core::ffi::c_void,
             d_d,
-            rocblas_datatype::f32_r,
+            rocblas_datatype::f16_r,
             n_dim,
             d_d,
-            rocblas_datatype::f32_r,
+            rocblas_datatype::f16_r,
             n_dim,
-            rocblas_datatype::f32_r,
+            rocblas_datatype::f16_r,
             select_gemm_algo(0),
             0,
             ROCBLAS_GEMM_FLAGS_NONE,

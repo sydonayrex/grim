@@ -267,6 +267,10 @@ pub struct Engine {
     scythe_vram_waitlist: Vec<grim_scheduler::Request>,
     /// Set GRIM_RADIX=on to enable prefix-cache reuse on prefill (WP5).
     pub radix_enabled: bool,
+    /// T2: allow a hybrid (recurrent-state) model to consume a radix prefix when
+    /// a matching recurrent checkpoint exists. Default off — without it the
+    /// fail-closed gate in `model_uses_hybrid_kv` skips seeding entirely.
+    pub hybrid_prefix_enabled: bool,
     /// Layer 1.5: per-request count of leading blocks claimed from the radix
     /// tree at first prefill (`seed_prefix`). Seeded blocks are tree-claimed
     /// (+1 ref) at seed time, so they must NOT be re-registered when their

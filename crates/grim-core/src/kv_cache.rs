@@ -77,6 +77,18 @@ pub trait KvCache: Send {
     /// The default is a no-op for caches that don't support cross-sequence sharing.
     fn seed_prefix(&mut self, _blocks: &[usize]) {}
 
+    /// Stage a seeded prefix into `layer`'s pages without appending a token.
+    ///
+    /// `seed_prefix` publishes only the block table and counters; the K/V bytes
+    /// are staged lazily by [`Self::append_kv_layer`]. A model that keeps a
+    /// private KV representation (e.g. Qwen35's quantized arena) must catch that
+    /// representation up from the shared pool BEFORE its first append, or it
+    /// would attend over an empty prefix. `stride` is the model's real
+    /// `num_kv_heads * head_dim`, needed to size the layer's pages.
+    ///
+    /// The default is a no-op for caches without a paged store.
+    fn hydrate_seeded_prefix(&mut self, _layer: usize, _stride: usize) {}
+
     /// Return the physical block ids currently backing this cache, in token order.
     /// Used by the engine to register a computed prefix into the shared pool's radix tree.
     fn prefix_physical_ids(&self) -> Vec<usize> {

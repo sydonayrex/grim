@@ -3623,6 +3623,92 @@ impl RocmDevice {
                 let a_s = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
+                // EAGER-PARITY (exact mode): eager's `quantized_matmul` skips
+                // the Q8_1-activation dot4 leg for these five schemes when
+                // `exact_decode_gemv()` is on and takes the WMMA/scalar
+                // fused-dequant path instead (mod.rs arms: Q4K blk 256, the
+                // rest blk 16). The graph MUST take the same path — a Q8_1
+                // activation here is a ~1e-2 relative perturbation that
+                // compounds over 64 layers and flips greedy tokens (the Q6_K
+                // LM head is the worst case: its output IS the token). This
+                // runs BEFORE the u4-lane attempt so exact mode never picks
+                // the lossy requant route eager would not take.
+                if crate::device::quant::exact_decode_gemv()
+                    && matches!(
+                        scheme,
+                        KQuantScheme::Q4K
+                            | KQuantScheme::Q5K
+                            | KQuantScheme::Q6K
+                            | KQuantScheme::Q2K
+                            | KQuantScheme::Q3K
+                    )
+                {
+                    let wave32 = matches!(
+                        self.props.wavefront_size,
+                        crate::device::handles::WavefrontSize::W32
+                    );
+                    // Same predicate as eager's `wmma_quant_path_ok`
+                    // (`wmma_quant_tile_ok`): inlined so this file does not
+                    // need the helper's visibility widened.
+                    let wmma_ok = |blk: usize| {
+                        m > 0 && wave32 && n % 64 == 0 && k % blk == 0 && self.is_rdna34
+                    };
+                    let launched = match scheme {
+                        KQuantScheme::Q4K => {
+                            if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+                                eprintln!(
+                                    "[q4k-gemv] A={:p} W={:p} C={:p} m={m} n={n} k={k} capturing={}",
+                                    a_s.device_ptr.unwrap_or(0) as *mut c_void,
+                                    w.device_ptr.unwrap_or(0) as *mut c_void,
+                                    out.device_ptr.unwrap_or(0) as *mut c_void,
+                                    self.is_capturing(),
+                                );
+                            }
+                            if wmma_ok(256) {
+                                self.launch_wmma_fused_dequant_q4k(a_s, w, out, m, n, k)?;
+                            } else {
+                                self.launch_fused_dequant_gemm_q4k(a_s, w, out, m, n, k)?;
+                            }
+                            true
+                        }
+                        KQuantScheme::Q5K => {
+                            if wmma_ok(16) {
+                                self.launch_wmma_fused_dequant_q5k(a_s, w, out, m, n, k)?;
+                            } else {
+                                self.launch_fused_dequant_gemm_q5k(a_s, w, out, m, n, k)?;
+                            }
+                            true
+                        }
+                        KQuantScheme::Q6K => {
+                            if wmma_ok(16) {
+                                self.launch_wmma_fused_dequant_q6k(a_s, w, out, m, n, k)?;
+                            } else {
+                                self.launch_fused_dequant_gemm_q6k(a_s, w, out, m, n, k)?;
+                            }
+                            true
+                        }
+                        KQuantScheme::Q2K => {
+                            if wmma_ok(16) {
+                                self.launch_wmma_fused_dequant_q2k(a_s, w, out, m, n, k)?;
+                            } else {
+                                self.launch_fused_dequant_gemm_q2k(a_s, w, out, m, n, k)?;
+                            }
+                            true
+                        }
+                        KQuantScheme::Q3K => {
+                            if wmma_ok(16) {
+                                self.launch_wmma_fused_dequant_q3k(a_s, w, out, m, n, k)?;
+                            } else {
+                                self.launch_fused_dequant_gemm_q3k(a_s, w, out, m, n, k)?;
+                            }
+                            true
+                        }
+                        _ => false,
+                    };
+                    if launched {
+                        return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                    }
+                }
                 if !(self.is_dot4_arch && !dot_disabled && k % 256 == 0) {
                     // No dot4 GEMV on this arch (or k not 256-aligned): the
                     // WMMA fused-dequant leg is the capture-safe fallback —
@@ -4829,15 +4915,14 @@ impl RocmDevice {
             }
         }
         // Reserve: lazy kernel-module loads and activation scratch still
-        // need headroom after the last lane copy lands. 256 MiB is far above
-        // any single hsaco and small against a 17 GB card. GRIM_U4_RESERVE_MB
-        // overrides (diagnostic: a huge reserve forces every Q4K/Q5K/Q6K
-        // weight to decline and keep its dot4/WMMA route).
+        // need headroom after the last lane copy lands. 1024 MiB leaves enough
+        // working room for hsaco module loading and scratch buffers.
+        // GRIM_U4_RESERVE_MB overrides.
         let vram_reserve_bytes: usize = std::env::var("GRIM_U4_RESERVE_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(256 * 1024 * 1024);
+            .unwrap_or(1024 * 1024 * 1024);
         if budget {
             let lane_bytes = n * (k / 2) // qweight u4
                 + n * (k / 128) * 2 // scales bf16

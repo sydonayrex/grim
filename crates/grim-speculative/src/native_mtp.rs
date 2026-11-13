@@ -24,4 +24,19 @@ pub trait NativeMtp: grim_core::CausalLm {
         input_ids: &Tensor,
         positions: &Tensor,
     ) -> Result<DraftBlock>;
+
+    /// Like [`predict_multi`], but the base/trunk forward for `input_ids` has already been run by
+    /// the caller and its logits are supplied as `base_logits`. This must **not** run the base
+    /// forward again: re-appending the same input token at the same position double-counts a token
+    /// and desynchronizes the KV cache (acceptance collapses to 0 and output garbles).
+    ///
+    /// The session's last hidden state is expected to be the output of the just-run base forward.
+    /// Returns an empty block if the implementation cannot draft without a forward.
+    fn predict_multi_after_forward(
+        &self,
+        session: &mut dyn grim_core::session::SessionT,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        base_logits: &Tensor,
+    ) -> Result<DraftBlock>;
 }

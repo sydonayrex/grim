@@ -192,7 +192,20 @@ impl Engine {
         );
         let backend = grim_nn::pick_device_for_storage_device(&device);
         kv.set_device(device.clone(), backend);
-        let session = Box::new(grim_core::session::Inner::with_kv(device, Box::new(kv)));
+        let mut session = Box::new(grim_core::session::Inner::with_kv(device, Box::new(kv)));
+        // T2: let the model install its per-session hooks (recurrent
+        // snapshot/restore) before the first forward, so radix admission can
+        // restore a checkpoint into a session that has no model state yet.
+        // Resolve the model the same way `model_for_request` does: an empty or
+        // unknown id falls back to the first registered model.
+        let resolved = request
+            .model_id
+            .as_deref()
+            .and_then(|mid| self.models.get(mid))
+            .or_else(|| self.models.iter().next().map(|(_, e)| e));
+        if let Some(entry) = resolved {
+            entry.model.target().prepare_session(session.as_mut());
+        }
 
         self.sessions.insert(request.id, session);
         self.request_model_ids

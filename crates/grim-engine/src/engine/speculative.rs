@@ -89,21 +89,32 @@ impl Engine {
     }
 
     /// Register a native multi-token prediction model wrapped in `LlamaMtpAdapter`.
+    /// Backward-compatible convenience for LlamaMtp-specific call sites.
     pub fn register_native_mtp_model(
         &mut self,
         id: &str,
         model: Arc<grim_models_transformer::LlamaMtp>,
     ) {
-        let dev = grim_core::Model::device(model.as_ref()).clone();
-        let modality = grim_core::Model::config(model.as_ref()).modality();
-        // R4 — capture hyperparams before `model` moves into the adapters.
-        let arch_hyperparams = model.arch_hyperparams();
         let adapter = grim_speculative::LlamaMtpAdapter::new(model.clone());
         let mtp_arc: Arc<dyn grim_speculative::NativeMtp> = Arc::new(adapter);
-        let mut wrapped = SpeculativeCausalLm::with_native_mtp(
+        self.register_native_mtp_arc(
+            id,
             Box::new(grim_speculative::LlamaMtpAdapter::new(model)),
             mtp_arc,
         );
+    }
+
+    /// M3: register any model implementing `NativeMtp` (generic path).
+    pub fn register_native_mtp_arc(
+        &mut self,
+        id: &str,
+        target: Box<dyn CausalLm>,
+        mtp: Arc<dyn grim_speculative::NativeMtp>,
+    ) {
+        let dev = grim_core::Model::device(target.as_ref()).clone();
+        let modality = grim_core::Model::config(target.as_ref()).modality();
+        let arch_hyperparams = target.arch_hyperparams();
+        let mut wrapped = SpeculativeCausalLm::with_native_mtp(target, mtp);
         // Task 10.6: GPU rejection-sampling verifier (CPU fallback for non-ROCm).
         wrapped.set_gpu_verifier(std::sync::Arc::new(RocmSpeculativeVerifier));
         let config: Box<dyn ModelConfig> = Box::new(grim_core::config::GenericModelConfig {

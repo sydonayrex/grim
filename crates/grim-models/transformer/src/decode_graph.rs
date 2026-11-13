@@ -6282,6 +6282,18 @@ impl DecodeGraphModel for Qwen35 {
         if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
             eprintln!("[graph-trace] executing graph.replay() pos={pos}");
         }
+        // The input writes above go out on each device's default stream, but
+        // segment graphs launch on pooled streams: no implicit ordering. Fence
+        // every device so token/pos land before the graph reads them.
+        {
+            let mut pre = graph.buffers.layer_devices.clone();
+            if !pre.contains(&dev.ordinal()) {
+                pre.push(dev.ordinal());
+            }
+            for ord in pre {
+                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+            }
+        }
         let wall_start = std::time::Instant::now();
         graph
             .replay()
@@ -11113,6 +11125,7 @@ mod tests {
             output_norm: test_norm(&dev, 0, hidden_size),
             output: test_linear(&dev, 0, vocab_size, hidden_size, 999),
             hadamard_plan: None,
+            nextn: None,
         };
 
         let mut graph = qwen

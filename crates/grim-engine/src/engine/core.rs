@@ -187,6 +187,19 @@ impl Engine {
             admission,
         );
         scheduler.determinism_mode = config.determinism_mode;
+        // T2: end every prefill pass on a block boundary when hybrid prefix
+        // reuse is enabled, so the recurrent checkpoint stored at the pass end
+        // can be paired with a block-aligned KV seed on admission. Default 0
+        // keeps the historical unaligned chunks.
+        scheduler.prefill_block_align =
+            if matches!(
+                std::env::var("GRIM_HYBRID_PREFIX").as_deref(),
+                Ok("1" | "true" | "on" | "yes")
+            ) {
+                grim_memory::BLOCK_SIZE
+            } else {
+                0
+            };
         // §5.2 real KV pressure: pool occupancy feeds the scheduler's pressure signal
         // so preemption/chunked draining react to actual KV exhaustion, not just prompt-token sums.
         scheduler.set_kv_pressure(Arc::new(grim_scheduler::PoolKvPressure::new({
@@ -277,6 +290,13 @@ impl Engine {
             radix_enabled: std::env::var("GRIM_RADIX")
                 .map(|v| v != "0" && v != "false" && v != "off")
                 .unwrap_or(true),
+            // T2: opt-in. `GRIM_HYBRID_PREFIX=1` lets a recurrent-state model
+            // consume a radix prefix when a matching checkpoint exists; the
+            // default keeps the fail-closed behaviour (full prefill).
+            hybrid_prefix_enabled: matches!(
+                std::env::var("GRIM_HYBRID_PREFIX").as_deref(),
+                Ok("1" | "true" | "on" | "yes")
+            ),
             radix_seeded_blocks: HashMap::new(),
             radix_registered_blocks: HashMap::new(),
             radix_lookups: 0,

@@ -230,16 +230,51 @@ impl Engine {
             self.radix_lookups += 1;
             // Seeding is only sound when (a) the model keeps all its state in
             // the paged KV pages (hybrid models with recurrent/conv state are
-            // excluded via model_uses_hybrid_kv) and (b) at least one block
-            // remains to prefill — the first decode token's logits come from the
-            // last prefill pass. The skip is block-aligned: `matched_tokens` is
-            // a multiple of BLOCK_SIZE.
+            // excluded via model_uses_hybrid_kv, unless T2 found a matching
+            // recurrent checkpoint) and (b) at least one block remains to
+            // prefill — the first decode token's logits come from the last
+            // prefill pass. The skip is block-aligned: `matched_tokens` is a
+            // multiple of BLOCK_SIZE.
             let skip_cap = full_input.len().saturating_sub(1);
             let skip_tokens = {
                 let raw = matched_tokens.min(skip_cap);
                 raw - (raw % grim_memory::BLOCK_SIZE)
             };
-            let seed_ok = skip_tokens >= grim_memory::BLOCK_SIZE && !self.model_uses_hybrid_kv(id);
+            let hybrid = self.model_uses_hybrid_kv(id);
+
+            // T2: a hybrid model may consume the seed only when a recurrent
+            // checkpoint exists at EXACTLY the depth being seeded. The lookup
+            // is on the deepest block that would be seeded — a checkpoint on a
+            // shallower node would restore state at the wrong depth while the
+            // KV is seeded deeper, silently corrupting the recurrence.
+            let mut hybrid_snapshot: Option<grim_memory::SharedSessionSnapshot> = None;
+            if hybrid && self.hybrid_prefix_enabled && skip_tokens >= grim_memory::BLOCK_SIZE {
+                let deepest = matched_blocks
+                    .get(skip_tokens / grim_memory::BLOCK_SIZE - 1)
+                    .copied();
+                if let Some(block_id) = deepest {
+                    let checkpoint = {
+                        let mut pool =
+                            self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                        pool.checkpoint_for_block(block_id)
+                    };
+                    if let Some(cp) = checkpoint {
+                        if cp.token_offset == skip_tokens {
+                            if let Some(snap) = cp.session_snapshot.clone() {
+                                log::info!(
+                                    "[grim-engine] req {id} T2 recurrent checkpoint hit: \
+                                     block={block_id} depth={}",
+                                    cp.token_offset,
+                                );
+                                hybrid_snapshot = Some(snap);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let seed_ok = skip_tokens >= grim_memory::BLOCK_SIZE
+                && (!hybrid || hybrid_snapshot.is_some());
             if seed_ok {
                 let seed_blocks = &matched_blocks[..skip_tokens / grim_memory::BLOCK_SIZE];
                 // Claim the matched nodes for the lifetime of this request.
@@ -248,6 +283,19 @@ impl Engine {
                     pool.insert_prefix(&full_input[..skip_tokens], seed_blocks);
                 }
                 if let Some(session) = self.sessions.get_mut(&id) {
+                    // T2: restore the recurrent state BEFORE seeding the KV.
+                    // The restore sets the session position to the checkpoint
+                    // depth; `seed_prefix` then makes `committed_tokens`
+                    // agree, so no `advance_pos` is needed on this path.
+                    let had_hybrid_snapshot = hybrid_snapshot.is_some();
+                    if let Some(snap) = hybrid_snapshot {
+                        let guard = snap.lock().unwrap_or_else(|e| e.into_inner());
+                        // `guard` is `MutexGuard<Box<dyn Any + Send>>`; deref
+                        // twice so the `&dyn Any` the session receives points at
+                        // the inner snapshot, not at the `Box` (whose `Any`
+                        // impl would downcast to the box, never the snapshot).
+                        session.restore_recurrent_state_ref(&**guard)?;
+                    }
                     // `seed_prefix` refcounts the blocks and wires the block
                     // table; the pool's K/V bytes are staged lazily per layer
                     // on the session's first appends, when the model's real
@@ -257,7 +305,9 @@ impl Engine {
                     if let Some(kv) = session.kv_mut() {
                         kv.seed_prefix(seed_blocks);
                     }
-                    session.advance_pos(skip_tokens);
+                    if !had_hybrid_snapshot {
+                        session.advance_pos(skip_tokens);
+                    }
                     self.prefill_progress.insert(id, skip_tokens);
                     self.radix_seeded_blocks.insert(id, seed_blocks.len());
                     self.radix_hit_requests += 1;
@@ -352,14 +402,39 @@ impl Engine {
                             let usize_blocks: Vec<usize> =
                                 block_table.iter().map(|&b| b as usize).collect();
                             let registered_now = usize_blocks.len() - skip_blocks;
+                            // T2: snapshot the recurrent state at this pass's
+                            // completion depth so a later request matching the
+                            // prefix can restore it instead of re-prefilling.
+                            // Only a block-aligned depth is stored — the KV seed
+                            // on admission is block-aligned, so a partial-block
+                            // checkpoint could never be paired with it.
+                            let snapshot = if self.hybrid_prefix_enabled
+                                && self.model_uses_hybrid_kv(id)
+                                && target > 0
+                                && target % grim_memory::BLOCK_SIZE == 0
+                            {
+                                session.snapshot_recurrent_state().ok().flatten()
+                            } else {
+                                None
+                            };
                             let mut pool =
                                 self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                            pool.insert_prefix_with_recurrent_state_at(
-                                &full_input,
-                                &usize_blocks,
-                                Vec::new(),
-                                skip_blocks,
-                            );
+                            if snapshot.is_some() {
+                                pool.insert_prefix_with_session_snapshot_at(
+                                    &full_input,
+                                    &usize_blocks,
+                                    target,
+                                    snapshot,
+                                    skip_blocks,
+                                );
+                            } else {
+                                pool.insert_prefix_with_recurrent_state_at(
+                                    &full_input,
+                                    &usize_blocks,
+                                    Vec::new(),
+                                    skip_blocks,
+                                );
+                            }
                             self.radix_registered_blocks
                                 .insert(id, skip_blocks + registered_now);
                         }

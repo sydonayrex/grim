@@ -153,6 +153,11 @@ pub trait Model: Send + Sync {
 pub trait CausalLm: Model {
     fn new_session(&self) -> Box<dyn crate::session::SessionT>;
 
+    /// T2: let the model install per-session hooks (e.g. recurrent
+    /// snapshot/restore dispatch) right after the engine builds the session,
+    /// before the first forward. Default no-op.
+    fn prepare_session(&self, _session: &mut dyn crate::session::SessionT) {}
+
     /// Architecture hyperparameters, when the model can report them.
     /// Used by the engine's memory-sovereign admission gate (R4) to certify a request's footprint against currently-free.
     fn arch_hyperparams(&self) -> Option<ArchHyperparameters> {

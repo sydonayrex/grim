@@ -25,7 +25,7 @@ pub mod semantic_anchor;
 
 pub use semantic_anchor::{
     CheckpointId, RecurrentCheckpointPool, RecurrentLayerState, RecurrentStateCheckpoint,
-    SemanticAnchorRegistry,
+    SemanticAnchorRegistry, SharedSessionSnapshot,
 };
 
 /// Paged KV cache device-resident mirror and asynchronous tiering coordinator (F10).
@@ -277,7 +277,18 @@ impl KvBlockPool {
             ref_counts: HashMap::new(),
             prefix_tree: RadixTree::new(BLOCK_SIZE),
             ssm_states: HashMap::new(),
-            recurrent_checkpoints: RecurrentCheckpointPool::new(64),
+            // T2 hybrid prefix reuse: each checkpoint carries the full device
+            // GDN+conv state (~149 MB for the 27B's 48 recurrent layers), so the
+            // pool is bounded at 4 by default (~0.6 GB). The old default of 64
+            // would reserve ~9.5 GB of host memory for state that is only useful
+            // with `GRIM_HYBRID_PREFIX=1`. `GRIM_HYBRID_PREFIX_POOL` overrides.
+            recurrent_checkpoints: RecurrentCheckpointPool::new(
+                std::env::var("GRIM_HYBRID_PREFIX_POOL")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(4),
+            ),
             anchor_registry: SemanticAnchorRegistry::new(vec![151644, 151645, 32000, 32001]),
             block_major_layout,
             recently_zero: VecDeque::new(),
@@ -486,6 +497,65 @@ impl KvBlockPool {
                     .attach_recurrent_state(target_block_id, target_block_id);
             }
         }
+    }
+
+    /// Look up the checkpoint attached to a physical block (T2).
+    ///
+    /// The engine keys its request on the DEEPEST matched block, so this is the
+    /// lookup that matters for admission: a checkpoint on an intermediate node
+    /// must NOT be used to seed a deeper prefix, because its recurrent state is
+    /// at the intermediate depth while the KV would be seeded deeper.
+    pub fn checkpoint_for_block(
+        &mut self,
+        block_id: BlockId,
+    ) -> Option<Arc<RecurrentStateCheckpoint>> {
+        self.recurrent_checkpoints.get_by_node(block_id)
+    }
+
+    /// Register computed blocks and attach an opaque session snapshot (T2).
+    ///
+    /// `blocks[skip_blocks..]` were computed by THIS prefill pass, and `depth`
+    /// is the number of tokens that pass leaves in the session. The snapshot is
+    /// attached to the last newly-registered block — the node covering `depth`.
+    ///
+    /// A snapshot is only stored when `depth` is a multiple of [`BLOCK_SIZE`]:
+    /// the KV seed on admission is block-aligned (`seed_prefix` sets
+    /// `committed_tokens = blocks * BLOCK_SIZE`), so a checkpoint at a
+    /// partial-block depth could never be paired with a matching KV seed. The
+    /// engine rounds its prefill chunks under `GRIM_HYBRID_PREFIX=1` so the
+    /// last full-block boundary is always a chunk end.
+    pub fn insert_prefix_with_session_snapshot_at(
+        &mut self,
+        tokens: &[u32],
+        blocks: &[BlockId],
+        depth: usize,
+        session_snapshot: Option<Box<dyn std::any::Any + Send>>,
+        skip_blocks: usize,
+    ) {
+        self.prefix_tree.insert_at(tokens, blocks, skip_blocks);
+        self.prefix_tree.touch(tokens);
+
+        if depth == 0 || depth % BLOCK_SIZE != 0 {
+            return;
+        }
+        if blocks.len() <= skip_blocks {
+            return;
+        }
+        // `blocks` is the session's logical block table; the last entry covers
+        // tokens [ (len-1)*B, depth ) and ends exactly at `depth` because the
+        // depth is block-aligned.
+        let target_block_id = match blocks.get(blocks.len() - 1) {
+            Some(&b) => b,
+            None => return,
+        };
+        let _cp = self.recurrent_checkpoints.store_session_checkpoint(
+            target_block_id,
+            depth,
+            Vec::new(),
+            session_snapshot,
+        );
+        self.prefix_tree
+            .attach_recurrent_state(target_block_id, target_block_id);
     }
 
     /// Drop one sequence's reference to `blocks`, pruning unshared tree nodes (trie-leaf LRU walk-up).
@@ -1508,6 +1578,36 @@ impl PagedKvCache {
         }
     }
 
+    /// Create the per-layer page buffers up to `layer`, sized to the model's
+    /// real `stride`. `seq` is the number of tokens the current append will
+    /// write: a layer first seen after the leading layer has already counted
+    /// this chunk must start its cursor `seq` earlier so it lands on the same
+    /// first token. Factored out of `append_kv_layer` so `hydrate_seeded_prefix`
+    /// can publish a seeded prefix without appending a token.
+    fn ensure_layer_pages(&mut self, layer: usize, stride: usize, seq: usize) {
+        let page_elems = self.capacity * self.page_size * stride;
+        if self.k_pages.len() <= layer {
+            // Layers created after a radix `seed_prefix` must start their write
+            // cursor at the seeded prefix length, not at 0 — otherwise the
+            // first append would overwrite the seeded prefix. `committed_tokens`
+            // at this point counts every token the leading layer already
+            // appended in this chunk (and, via `seed_prefix`, the seeded
+            // prefix), so the seed offset for a fresh layer L is
+            // `committed_tokens` for L==0 (this chunk not yet counted for it)
+            // and `committed_tokens - seq` for L>0.
+            for l in self.k_pages.len()..=layer {
+                let init_cursor = if l == 0 {
+                    self.committed_tokens
+                } else {
+                    self.committed_tokens.saturating_sub(seq)
+                };
+                self.k_pages.push(vec![0.0f32; page_elems]);
+                self.v_pages.push(vec![0.0f32; page_elems]);
+                self.layer_committed_tokens.push(init_cursor);
+            }
+        }
+    }
+
     pub fn set_device(&mut self, device: Device, backend: Arc<dyn grim_tensor::BackendDevice>) {
         self.device = Some(device);
         self.backend = Some(backend);
@@ -1774,55 +1874,32 @@ impl KvCache for PagedKvCache {
         }
         // Grow the per-layer page buffers lazily up to `layer`, sized to the
         // actual per-token stride so the flat layout matches the kernel.
-        let page_elems = self.capacity * self.page_size * stride;
-        if self.k_pages.len() <= layer {
-            // Layers created after a radix `seed_prefix` must start their write
-            // cursor at the seeded prefix length, not at 0 — otherwise the
-            // first append would overwrite the seeded prefix. `committed_tokens`
-            // at this point counts every token layer 0 already appended in this
-            // chunk (and, via `seed_prefix`, the seeded prefix), so the seed
-            // offset for a fresh layer L is `committed_tokens` for L==0 (this
-            // chunk not yet counted for it) and `committed_tokens - seq` for
-            // L>0 (layer 0 counted the chunk already).
-            for l in self.k_pages.len()..=layer {
-                let init_cursor = if l == 0 {
-                    self.committed_tokens
-                } else {
-                    self.committed_tokens.saturating_sub(seq)
-                };
-                self.k_pages.push(vec![0.0f32; page_elems]);
-                self.v_pages.push(vec![0.0f32; page_elems]);
-                self.layer_committed_tokens.push(init_cursor);
-            }
-        }
+        self.ensure_layer_pages(layer, stride, seq);
         // WI (session-continuity P2-1, step 1): ATOMIC block reservation.
-        // Layer 0 pre-allocates every block this append will need BEFORE any
-        // write or cursor advance. A mid-loop alloc failure (pool exhausted
-        // under pinned blocks + churn) used to abort layer 0 with
-        // committed_tokens already advanced while the table stayed short;
-        // the next layer's cursor then indexed past the table (the
+        // The leading layer pre-allocates every block this append will need
+        // BEFORE any write or cursor advance. A mid-loop alloc failure (pool
+        // exhausted under pinned blocks + churn) used to abort the leading
+        // layer with committed_tokens already advanced while the table stayed
+        // short; the next layer's cursor then indexed past the table (the
         // len-2/index-2 crash). Now an alloc failure fails the whole append
         // up front, so layers can never desync.
-        if layer == 0 {
-            let req_blocks = (self.committed_tokens + seq).div_ceil(BLOCK_SIZE);
-            if self.table.len() < req_blocks {
-                let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-                while self.table.len() < req_blocks {
-                    let id = pool.alloc()?;
-                    self.table.push(id);
-                    self.block_table_u32.push(id as u32);
-                }
+        //
+        // The growth is driven by the LEADING layer, not by layer 0: hybrid
+        // models (Qwen35) have a recurrent layer 0 that never appends KV, so
+        // gating on `layer == 0` would leave the block table empty forever.
+        let req_blocks = (self.layer_committed_tokens[layer] + seq).div_ceil(BLOCK_SIZE);
+        if self.table.len() < req_blocks {
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            while self.table.len() < req_blocks {
+                let id = pool.alloc()?;
+                self.table.push(id);
+                self.block_table_u32.push(id as u32);
             }
         }
         // Layer 1.5: lazily stage seeded prefix blocks' K/V into this layer's
         // pages — the model's real stride is only known now, at first contact.
         self.hydrate_seeded_layer_from_pool(layer, stride);
         for t in 0..seq {
-            // Only layer 0 drives block-table growth (all layers see the same token sequence,
-            // so `append_slot` must fire once per token, not once per layer per token).
-            if layer == 0 {
-                self.append_slot()?;
-            }
             let pos = self.layer_committed_tokens[layer];
             let block_idx = pos / self.page_size;
             // Fail-closed: a short table here is a layer-desync bug, never a
@@ -1842,6 +1919,13 @@ impl KvCache for PagedKvCache {
             self.v_pages[layer][offset..offset + stride]
                 .copy_from_slice(&v_flat[tok_start..tok_start + stride]);
             self.layer_committed_tokens[layer] += 1;
+            // Advance the SHARED sequence counter exactly once per token. The
+            // leading layer (whichever it is) moves it; every later layer sees
+            // `layer_committed_tokens[layer] == committed_tokens` and leaves
+            // it alone. `append_slot` remains for the `KvCache` trait / tests.
+            if self.layer_committed_tokens[layer] > self.committed_tokens {
+                self.committed_tokens = self.layer_committed_tokens[layer];
+            }
 
             if let Ok(mut pool) = self.pool.lock() {
                 let within_block = (pos % self.page_size) * stride;
@@ -2163,6 +2247,20 @@ impl KvCache for PagedKvCache {
         // append (`hydrate_seeded_layer_from_pool`), when the model's real
         // per-token stride is known.
         self.seeded_blocks_pending = blocks.len();
+    }
+
+    fn hydrate_seeded_prefix(&mut self, layer: usize, stride: usize) {
+        if self.seeded_blocks_pending == 0 {
+            return;
+        }
+        // Publish the seeded prefix into this layer's pages WITHOUT appending
+        // a token: `seq = 0` makes every freshly created layer start its
+        // cursor at the seed length, and `hydrate_seeded_layer_from_pool`
+        // stages the pool bytes. Needed when a model keeps a private KV
+        // representation (Qwen35's quantized arena) and must catch it up from
+        // the shared pool before its first forward after a seed.
+        self.ensure_layer_pages(layer, stride, 0);
+        self.hydrate_seeded_layer_from_pool(layer, stride);
     }
 
     fn gather_kv_f32(&self, layer: usize, num_tokens: usize) -> Option<(Vec<f32>, Vec<f32>)> {
