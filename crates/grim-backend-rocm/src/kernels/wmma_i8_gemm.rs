@@ -164,6 +164,53 @@ extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_iu8_mtile(
         }
     }
 }
+
+typedef int grim_v8i __attribute__((ext_vector_type(8)));
+typedef int grim_v2i __attribute__((ext_vector_type(2)));
+
+// Direct RDNA4 AMDGCN iu8 WMMA (signed int8 A x unsigned uint4*16 B -> int32 C).
+// Bypasses rocwmma's SOA_INT static assert on mixed signedness and unpacks 8 4-bit
+// weights per u32 in 3 ALU instructions: lo = (w << 4) & 0xF0F0F0F0, hi = w & 0xF0F0F0F0.
+// Divide accumulator by 16 at epilogue to remove the high-nibble 16x shift factor.
+extern "C" __global__ __launch_bounds__(32) void grim_wmma_w4a8_iu8_gfx12(
+    const signed char* __restrict__ A_frag,   // pre-packed [M/16, K/16, 32 lanes, 8 i8]
+    const unsigned int* __restrict__ B_u4,    // pre-packed [N/16, K/16, 32 lanes, 1 u32 (8 nibbles)]
+    int* __restrict__ D,                      // [M, N] row-major int32 (unscaled dot, /16 applied)
+    int M, int N, int K)
+{
+    const int tile_m = blockIdx.y;
+    const int tile_n = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    if (tile_m * 16 >= M || tile_n * 16 >= N) return;
+
+    const int k_steps = K / 16;
+    grim_v8i acc = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (int ks = 0; ks < k_steps; ++ks) {
+        const int* a_ptr = (const int*)(A_frag + (((long long)tile_m * k_steps + ks) * 32 + lane) * 8);
+        grim_v2i a_reg = {a_ptr[0], a_ptr[1]};
+
+        unsigned int w = B_u4[((long long)tile_n * k_steps + ks) * 32 + lane];
+        grim_v2i b_reg;
+        b_reg[0] = (int)((w << 4) & 0xF0F0F0F0u);
+        b_reg[1] = (int)(w & 0xF0F0F0F0u);
+
+        acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+            true, a_reg, false, b_reg, acc, false);
+    }
+
+    const int col = tile_n * 16 + (lane & 15);
+    const int row_half = (lane >> 4) * 4;
+    if (col < N) {
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int row = tile_m * 16 + ((e >> 2) * 8) + row_half + (e & 3);
+            if (row < M) {
+                D[(long long)row * N + col] = acc[e] >> 4;
+            }
+        }
+    }
+}
 #endif
 "#;
 
