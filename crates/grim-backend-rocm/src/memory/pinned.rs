@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
@@ -205,5 +206,67 @@ pub fn stage_h2d_pinned<'a>(ordinal: usize, host: &'a [u8]) -> (*const u8, bool)
         let dst = slot.as_mut_slice();
         dst[..host.len()].copy_from_slice(host);
         (dst.as_ptr(), true)
+    })
+}
+
+
+// Per-ordinal "last staged H2D" event for the pinned stage ring.
+//
+// The ring (`stage_h2d_pinned`) recycles STAGE_RING_SLOTS pinned buffers
+// with NO stream ordering of its own: if more copies are in flight than
+// slots, a queued H2D reads a slot that a later call already overwrote.
+// The original contract assumed decode steps end with a blocking D2H that
+// drains the stream; the MTP wrapper violates that (it returns CPU logits,
+// so steps never drain), letting ring depth exceed 16 within one step.
+//
+// The fix is an event chain per ordinal: every staged H2D waits for the
+// previous one before overwriting a slot, then records the event. Reuse is
+// now stream-ordered regardless of the caller's drain behavior.
+thread_local! {
+    static LAST_H2D_EVENT: RefCell<std::collections::HashMap<usize, *mut c_void>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn h2d_stage_order_event(ordinal: usize, stream: *mut c_void) -> Result<*mut c_void> {
+    LAST_H2D_EVENT.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let ev = match map.get(&ordinal) {
+            Some(ev) => *ev,
+            None => {
+                let mut ev: *mut c_void = std::ptr::null_mut();
+                let st = unsafe { crate::hipEventCreate(&mut ev) };
+                if st != crate::hipSuccess {
+                    return Err(grim_tensor::error::Error::Backend(format!(
+                        "h2d_stage_order_event: hipEventCreate failed {st}"
+                    )));
+                }
+                map.insert(ordinal, ev);
+                ev
+            }
+        };
+        // This stream waits for the previous staged H2D to complete before
+        // the new one overwrites a ring slot.
+        let st = unsafe { crate::hipStreamWaitEvent(stream, ev, 0) };
+        if st != crate::hipSuccess {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "h2d_stage_order_event: hipStreamWaitEvent failed {st}"
+            )));
+        }
+        Ok(ev)
+    })
+}
+
+pub fn h2d_stage_record(ordinal: usize, stream: *mut c_void) -> Result<()> {
+    LAST_H2D_EVENT.with(|cell| {
+        let map = cell.borrow_mut();
+        if let Some(ev) = map.get(&ordinal) {
+            let st = unsafe { crate::hipEventRecord(*ev, stream) };
+            if st != crate::hipSuccess {
+                return Err(grim_tensor::error::Error::Backend(format!(
+                    "h2d_stage_record: hipEventRecord failed {st}"
+                )));
+            }
+        }
+        Ok(())
     })
 }

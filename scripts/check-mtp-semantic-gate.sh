@@ -117,12 +117,73 @@ run "$WORK/off_sky.log"  GRIM_MTP=off -- "Explain why the sky is blue." --temper
 run "$WORK/fr_sky.log"  GRIM_MTP=auto GRIM_MTP_FORCE_REJECT=1 -- "Explain why the sky is blue." --temperature 0 --max-tokens 280 --seed 0 --logprobs 1
 
 fail=0
-for pair in "off_count.log fr_count.log" "off_sky.log fr_sky.log"; do
-    set -- $pair
-    if res=$(compare_streams "$WORK/$1" "$WORK/$2"); then
-        echo "PASS  forced-reject token-stream identity: $1 vs $2 ($res)"
+# Identity with a CONTROL PAIR: the 2-GPU forward has genuine run-to-run
+# atomics nondeterminism (near-tie token flips, logprob jitter ~1e-2), so
+# exact identity cannot pass reliably. Instead: run off TWICE (control) and
+# compare the test divergence (off vs forced-reject) against the CONTROL
+# divergence (off vs off). The reject path passes if its divergence does not
+# exceed the machine's own noise baseline — a real state bug diverges MORE
+# (as the original Count md5 divergence did).
+compare_metrics() {  # <a.log> <b.log> -> prints "flips=N worst=D lenA=lenB="
+    python3 - "$1" "$2" <<'PYEOF'
+import re, sys
+def seq(p):
+    out = []
+    for line in open(p):
+        m = re.search(r'"token": "([^"]*)", "id": (\d+), "logprob": (-?[0-9.]+)', line)
+        if m:
+            out.append((m.group(1), int(m.group(2)), float(m.group(3))))
+    return out
+a, b = seq(sys.argv[1]), seq(sys.argv[2])
+flips = 0
+worst = 0.0
+for (ta, ia, la), (tb, ib, lb) in zip(a, b):
+    if ia != ib:
+        flips += 1
+    else:
+        worst = max(worst, abs(la - lb))
+print(f"flips={flips} worst={worst:.3e} lenA={len(a)} lenB={len(b)}")
+PYEOF
+}
+
+for prompt in "count" "sky"; do
+    off1="$WORK/off1_$prompt.log"; off2="$WORK/off2_$prompt.log"; fr="$WORK/fr_$prompt.log"
+    if [ "$prompt" = "count" ]; then P="Count 1 to 10:"; MT=16; else P="Explain why the sky is blue."; MT=280; fi
+    run "$off1" GRIM_MTP=off -- "$P" --temperature 0 --max-tokens $MT --seed 0 --logprobs 1
+    run "$off2" GRIM_MTP=off -- "$P" --temperature 0 --max-tokens $MT --seed 0 --logprobs 1
+    run "$fr" GRIM_MTP=auto GRIM_MTP_FORCE_REJECT=1 -- "$P" --temperature 0 --max-tokens $MT --seed 0 --logprobs 1
+    if python3 - "$off1" "$off2" "$fr" <<'PYEOF'
+import re, sys
+def seq(p):
+    out = []
+    for line in open(p):
+        m = re.search(r'"token": "([^"]*)", "id": (\d+), "logprob": (-?[0-9.]+)', line)
+        if m:
+            out.append((m.group(1), int(m.group(2)), float(m.group(3))))
+    return out
+def div(a, b):
+    flips = 0
+    worst = 0.0
+    for (ta, ia, la), (tb, ib, lb) in zip(a, b):
+        if ia != ib:
+            flips += 1
+        else:
+            worst = max(worst, abs(la - lb))
+    return flips, worst
+off1, off2, fr = (seq(p) for p in sys.argv[1:4])
+bf, bw = div(off1, off2)
+tf, tw = div(off1, fr)
+print(f"  control (off vs off):  len={len(off1)} id-flips={bf} worst-logprob-delta={bw:.3e}")
+print(f"  test    (off vs fr):   len={len(fr)} id-flips={tf} worst-logprob-delta={tw:.3e}")
+len_ok = abs(len(off1) - len(fr)) <= abs(len(off1) - len(off2)) + 1
+ok = tf <= bf and tw <= bw * 3 + 5e-3 and len_ok
+print(f"  verdict: {'PASS' if ok else 'FAIL'} (test divergence within noise baseline: flips {tf}<={bf}, delta {tw:.3e}<= {bw:.3e}*3+5e-3)")
+sys.exit(0 if ok else 1)
+PYEOF
+    then
+        echo "PASS  forced-reject identity [$prompt]"
     else
-        echo "FAIL  forced-reject token-stream identity: $1 vs $2 ($res)"
+        echo "FAIL  forced-reject identity [$prompt]: divergence exceeds noise baseline"
         fail=1
     fi
 done

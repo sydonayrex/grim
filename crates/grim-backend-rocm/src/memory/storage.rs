@@ -283,6 +283,15 @@ impl RocmStorage {
         // SAFETY: dst device mem owned by self; src is pinned stage (or the
         // original host slice for oversized/failed-stage fallback), valid for
         // the enqueue per `stage_h2d_pinned`'s safety contract.
+        //
+        // Ring-slot ordering: the stage ring recycles 16 pinned slots with no
+        // internal stream ordering, and the MTP wrapper returns CPU logits so
+        // decode steps here no longer end with a blocking D2H that would drain
+        // the stream — in-flight staged copies can exceed the slot count and
+        // read overwritten slots. This event chain serializes staged H2Ds per
+        // ordinal (each waits for the previous one before overwriting a
+        // slot). Overhead: one event wait + record per staged copy.
+        let _ev = crate::memory::pinned::h2d_stage_order_event(self.ordinal, stream)?;
         let res = unsafe {
             hipMemcpyAsync(
                 dev_ptr_void,
@@ -292,13 +301,14 @@ impl RocmStorage {
                 stream,
             )
         };
-        let _ = pinned;
         if res != hipSuccess {
             return Err(Error::Backend(format!(
                 "write_host_f32_async: hipMemcpyAsync failed {}",
                 res
             )));
         }
+        let _ = pinned;
+        crate::memory::pinned::h2d_stage_record(self.ordinal, stream)?;
         Ok(())
     }
 

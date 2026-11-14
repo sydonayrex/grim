@@ -724,6 +724,7 @@ impl SpeculativeCausalLm {
             &mut rng,
             greedy,
         )?;
+        tr_stage(&format!("accept-count done (accepted={accepted_count})"));
         // Debug/measurement hooks for M2/M3 gate closure (TODO(gpu-verify): remove if undesired).
         if std::env::var_os("GRIM_MTP_FORCE_REJECT").is_some() {
             accepted_count = 0;
@@ -779,7 +780,9 @@ impl SpeculativeCausalLm {
                     }
                 }
                 if let Some(snap) = post_base_snapshot.take() {
+                    tr_stage("reject: restore start");
                     session.restore_recurrent_state(snap)?; // also rolls KV to post-base pos
+                    tr_stage("reject: restore done");
                     if accepted_count == 0 {
                         if let Some(h) = base_hidden_state.clone() {
                             session.set_last_hidden_state(h);
@@ -822,7 +825,9 @@ impl SpeculativeCausalLm {
         }
 
         session.set_last_accepted_tokens(emitted);
+        tr_stage("emit: extract start");
         let accepted_logits = self.extract_emitted_logits(&combined, emitted, vocab_size, 1)?;
+        tr_stage("emit: extract done, returning to caller");
         Ok(accepted_logits)
     }
 
