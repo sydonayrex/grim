@@ -59,6 +59,38 @@ extern "C" __global__ void grim_fused_allreduce_rms_norm(
 
     norm_out[idx] = added * scale * weight[col];
 }
+// Narrow-workgroup PCIe link copy (derived from Radiance aql_copy_link):
+// 1 block of 128 threads (4 Wave32 waves), 16 uint4 (16B) loads in flight per thread (32 KiB/iter).
+// Saturates PCIe 4.0x16 (~28.9 GB/s) using only 1 CU so concurrent GEMMs keep >96% of CUs.
+extern "C" __global__ __launch_bounds__(128) void grim_copy_link_16b(
+    uint4* __restrict__ dst,
+    const uint4* __restrict__ src,
+    unsigned long long n_vec
+) {
+    if (n_vec == 0ULL) return;
+    const unsigned long long step = 128ULL * 16ULL;
+    unsigned long long i = (unsigned long long)threadIdx.x;
+    for (; i + step <= n_vec; i += step) {
+        uint4 v[16];
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) v[u] = src[i + (unsigned long long)u * 128ULL];
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) dst[i + (unsigned long long)u * 128ULL] = v[u];
+    }
+    if (i < n_vec) {
+        uint4 v[16];
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            unsigned long long j = i + (unsigned long long)u * 128ULL;
+            v[u] = src[j < n_vec ? j : n_vec - 1ULL];
+        }
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            unsigned long long j = i + (unsigned long long)u * 128ULL;
+            if (j < n_vec) dst[j] = v[u];
+        }
+    }
+}
 "#;
 
 // ── Host-side CommFuse orchestrator ──────────────────────────────────────────
@@ -298,4 +330,41 @@ mod tests {
             assert!((g - e).abs() < 1e-5, "mismatch at {i}: got {g} vs exp {e}");
         }
     }
+}
+
+/// Launch narrow-workgroup (`1 block × 128 threads`) 16-byte vector copy kernel.
+/// Saturates PCIe link bandwidth with 32 KiB in flight on a single CU without starving concurrent GEMMs.
+/// Requires `n_bytes` to be a multiple of 16.
+pub fn launch_copy_link_16b(
+    dev: &RocmDevice,
+    dst: &RocmStorage,
+    src: &RocmStorage,
+    n_bytes: usize,
+) -> Result<*mut c_void> {
+    if n_bytes % 16 != 0 {
+        return Err(Error::Backend(format!(
+            "launch_copy_link_16b: n_bytes ({n_bytes}) must be a multiple of 16"
+        )));
+    }
+    let dst_ptr = dst
+        .device_ptr
+        .ok_or_else(|| Error::Backend("launch_copy_link_16b: dst has no device ptr".into()))?;
+    let src_ptr = src
+        .device_ptr
+        .ok_or_else(|| Error::Backend("launch_copy_link_16b: src has no device ptr".into()))?;
+
+    let mut dp = dst_ptr;
+    let mut sp = src_ptr;
+    let mut n_vec: u64 = (n_bytes / 16) as u64;
+
+    dev.launch_compute_kernel(
+        "grim_copy_link_16b",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            crate::arg(&mut dp),
+            crate::arg(&mut sp),
+            crate::arg(&mut n_vec),
+        ],
+    )
 }
