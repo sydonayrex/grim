@@ -365,7 +365,19 @@ impl RocmDevice {
         }
         let d = dim as i32;
         let half = d / 2;
-        if half != 32 {
+        let rotary_dim = if cfg.rotary_dim > 0 { cfg.rotary_dim } else { dim } as i32;
+        let use_wide = std::env::var("GRIM_RADIANT_WIDE_QK_ROPE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || d != 64
+            || rotary_dim != d;
+        if use_wide {
+            if !matches!(d, 64 | 128 | 256) || rotary_dim <= 0 || rotary_dim > d || (rotary_dim % 2 != 0) {
+                return Err(Error::Backend(format!(
+                    "qk_rope_dev_base_into wide path requires head_dim in {{64,128,256}} and even rotary_dim <= d, got d={d}, rotary_dim={rotary_dim}"
+                )));
+            }
+        } else if half != 32 {
             return Err(Error::Backend(format!(
                 "qk_rope_dev_base_into requires head_dim 64 (half==warpSize), got {d}"
             )));
@@ -379,33 +391,58 @@ impl RocmDevice {
         let mut s_i = s;
         let mut d_i = d;
         let mut half_i = half;
+        let mut rotary_i = rotary_dim;
         let mut base_f = base;
         let mut inter_i = if cfg.interleaved { 1 } else { 0 };
         let mut heads_i = num_heads as i32;
         let mut eps_f = eps;
 
-        let total = (b * s * half) as usize;
-        let (grid, block) = linear_launch(total);
+        if use_wide {
+            let grid = HipDim3::new((b * s) as u32, 1, 1);
+            let block = HipDim3::new(d as u32, 1, 1);
+            self.launch_compute_kernel(
+                "grim_qk_rope_wide_dev_base",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut pos_ptr),
+                    arg(&mut g_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut b_i),
+                    arg(&mut s_i),
+                    arg(&mut d_i),
+                    arg(&mut rotary_i),
+                    arg(&mut base_f),
+                    arg(&mut inter_i),
+                    arg(&mut heads_i),
+                    arg(&mut eps_f),
+                ],
+            )?;
+        } else {
+            let total = (b * s * half) as usize;
+            let (grid, block) = linear_launch(total);
 
-        self.launch_compute_kernel(
-            "grim_qk_rope_dev_base",
-            grid,
-            block,
-            &mut [
-                arg(&mut x_ptr),
-                arg(&mut pos_ptr),
-                arg(&mut g_ptr),
-                arg(&mut out_ptr),
-                arg(&mut b_i),
-                arg(&mut s_i),
-                arg(&mut d_i),
-                arg(&mut half_i),
-                arg(&mut base_f),
-                arg(&mut inter_i),
-                arg(&mut heads_i),
-                arg(&mut eps_f),
-            ],
-        )?;
+            self.launch_compute_kernel(
+                "grim_qk_rope_dev_base",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut pos_ptr),
+                    arg(&mut g_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut b_i),
+                    arg(&mut s_i),
+                    arg(&mut d_i),
+                    arg(&mut half_i),
+                    arg(&mut base_f),
+                    arg(&mut inter_i),
+                    arg(&mut heads_i),
+                    arg(&mut eps_f),
+                ],
+            )?;
+        }
         Ok(())
     }
 

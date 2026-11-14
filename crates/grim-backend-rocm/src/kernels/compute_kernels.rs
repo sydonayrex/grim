@@ -772,6 +772,88 @@ extern "C" __global__ void grim_qk_rope_dev_base(const float* x, const unsigned 
     out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
 
+// Radiance-style 1-block-per-head fused QK-norm + partial RoPE for head_dim ∈ {64, 128, 256}.
+// Grid: (b * s, 1, 1), Block: (d, 1, 1) where d ∈ {64, 128, 256}.
+// Pre-loads rotary partner before the block RMS reduction so in-place out == x is safe.
+extern "C" __global__ void grim_qk_rope_wide_dev_base(
+    const float* x,
+    const unsigned int* pos_base,
+    const float* gamma,
+    float* out,
+    int b, int s, int d, int rotary_dim, float base,
+    int interleaved, int num_heads, float eps)
+{
+    __shared__ float s_red[8];
+    const int row = blockIdx.x;
+    if (row >= b * s) return;
+    const int bi = row / s;
+    const int si = row - bi * s;
+    const int tid = threadIdx.x;
+    if (tid >= d) return;
+
+    const int step_idx = (num_heads > 0) ? (si / num_heads) : si;
+    const float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
+    const int base_idx = row * d;
+
+    const int r_half = rotary_dim >> 1;
+    const bool in_rot = (tid < rotary_dim);
+    int pair_i = 0;
+    bool is_second = false;
+    int partner_tid = tid;
+    if (in_rot) {
+        if (interleaved) {
+            pair_i = tid >> 1;
+            is_second = (tid & 1) != 0;
+            partner_tid = tid ^ 1;
+        } else {
+            is_second = (tid >= r_half);
+            pair_i = is_second ? (tid - r_half) : tid;
+            partner_tid = is_second ? (tid - r_half) : (tid + r_half);
+        }
+    }
+
+    // Pre-load own element and partner element (L1-hot) before reduction.
+    const float x_self = x[base_idx + tid];
+    const float g_self = gamma[tid];
+    const float x_part = x[base_idx + partner_tid];
+    const float g_part = gamma[partner_tid];
+
+    // Warp + block reduction for sum of squares across d lanes (wave32-safe).
+    float ss = x_self * x_self;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_xor_sync(0xffffffffffffffffULL, ss, off);
+    }
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int n_waves = d >> 5;
+    if (lane == 0) s_red[wave] = ss;
+    __syncthreads();
+
+    float total_ss = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        if (w < n_waves) total_ss += s_red[w];
+    }
+    const float inv_rms = rsqrtf(total_ss / (float)d + eps);
+    const float n_self = x_self * g_self * inv_rms;
+
+    if (!in_rot) {
+        out[base_idx + tid] = n_self;
+        return;
+    }
+
+    const float n_part = x_part * g_part * inv_rms;
+    const float freq = 1.0f / powf(base, (2.0f * (float)pair_i) / (float)rotary_dim);
+    const float angle = pos * freq;
+    const float sin_v = sinf(angle);
+    const float cos_v = cosf(angle);
+
+    out[base_idx + tid] = is_second
+        ? (n_self * cos_v + n_part * sin_v)
+        : (n_self * cos_v - n_part * sin_v);
+}
+
 // SPEED-DOT-OPFUSE (Phase 4a): fused RMSNorm + RoPE for Q/K paths.
 // Normalizes x with per-channel weights + eps, then applies RoPE rotation in the same kernel.
 // Avoids materializing the intermediate normalized tensor in HBM.
