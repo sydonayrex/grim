@@ -218,3 +218,41 @@ mod probe_self_tests {
         let _: bool = probe_xnack(0);
     }
 }
+
+/// Returns `true` if a KFD `mem_banks/*/properties` text block declares
+/// `heap_type 2` (`HSA_HEAPTYPE_FRAME_BUFFER_PRIVATE`) with `size_in_bytes > 0`,
+/// which indicates non-host-visible VRAM (Resizable BAR disabled).
+pub fn parse_kfd_mem_bank_is_private_vram(props: &str) -> bool {
+    let mut heap_type: Option<u64> = None;
+    let mut size_in_bytes: u64 = 0;
+    for line in props.lines() {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("heap_type"), Some(v)) => heap_type = v.parse::<u64>().ok(),
+            (Some("size_in_bytes"), Some(v)) => size_in_bytes = v.parse::<u64>().unwrap_or(0),
+            _ => {}
+        }
+    }
+    heap_type == Some(2) && size_in_bytes > 0
+}
+
+/// Probe `/sys/class/kfd/kfd/topology/nodes/<kfd_node_id>/mem_banks/*/properties`
+/// to check if all VRAM banks are host-writable (`HSA_HEAPTYPE_FRAME_BUFFER_PUBLIC`, ReBAR enabled).
+/// Returns `false` if any non-empty bank has `heap_type == 2` (`FRAME_BUFFER_PRIVATE`).
+pub fn probe_rebar_host_writable(kfd_node_id: usize) -> bool {
+    let banks_dir = std::path::PathBuf::from(format!(
+        "/sys/class/kfd/kfd/topology/nodes/{kfd_node_id}/mem_banks"
+    ));
+    let Ok(entries) = std::fs::read_dir(banks_dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let prop_path = entry.path().join("properties");
+        if let Ok(contents) = std::fs::read_to_string(prop_path) {
+            if parse_kfd_mem_bank_is_private_vram(&contents) {
+                return false;
+            }
+        }
+    }
+    true
+}

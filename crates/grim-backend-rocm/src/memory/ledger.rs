@@ -104,8 +104,16 @@ pub fn register(ptr: u64, bytes: u64, ordinal: usize, managed: bool, owner: &str
 /// Drop a record when its allocation is released.
 pub fn deregister(ptr: u64) {
     let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
-    if t.remove(&ptr).is_some() {
+    if let Some(rec) = t.remove(&ptr) {
         TRACKED.fetch_sub(1, Ordering::Relaxed);
+        let mut ring = freed_ring().lock().unwrap_or_else(|e| e.into_inner());
+        if ring.len() >= FREED_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(FreedRecord {
+            record: rec,
+            freed_at: std::time::Instant::now(),
+        });
     }
 }
 
@@ -189,6 +197,74 @@ pub fn reset() {
     let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
     t.clear();
     TRACKED.store(0, Ordering::Relaxed);
+    let mut ring = freed_ring().lock().unwrap_or_else(|e| e.into_inner());
+    ring.clear();
+}
+
+/// Maximum number of recently freed allocations retained for use-after-free attribution.
+pub const FREED_RING_CAP: usize = 1024;
+
+/// Maximum byte distance past a live allocation's end to classify as a buffer overrun.
+pub const OVERRUN_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// A recently released device allocation retained in the freed ring.
+#[derive(Debug, Clone)]
+pub struct FreedRecord {
+    pub record: AllocRecord,
+    pub freed_at: std::time::Instant,
+}
+
+/// Secondary diagnosis when `attribute()` returns `Attribution::Unowned`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnownedDiagnosis {
+    /// Address falls inside an allocation that was recently freed.
+    UseAfterFree {
+        record: AllocRecord,
+        offset: u64,
+        age_ms: u64,
+    },
+    /// Address falls within `OVERRUN_WINDOW_BYTES` past the end of a live allocation.
+    BufferOverrun {
+        record: AllocRecord,
+        bytes_past_end: u64,
+    },
+}
+
+fn freed_ring() -> &'static Mutex<std::collections::VecDeque<FreedRecord>> {
+    static FREED: OnceLock<Mutex<std::collections::VecDeque<FreedRecord>>> = OnceLock::new();
+    FREED.get_or_init(|| Mutex::new(std::collections::VecDeque::with_capacity(FREED_RING_CAP)))
+}
+
+/// Diagnose an `Unowned` faulting address against the 1024-entry freed ring
+/// (most recently freed first) and live allocation tail windows (`<= 64 KiB` past end).
+pub fn diagnose_unowned(addr: u64) -> Option<UnownedDiagnosis> {
+    {
+        let ring = freed_ring().lock().unwrap_or_else(|e| e.into_inner());
+        for entry in ring.iter().rev() {
+            if entry.record.contains(addr) {
+                return Some(UnownedDiagnosis::UseAfterFree {
+                    record: entry.record.clone(),
+                    offset: entry.record.offset(addr),
+                    age_ms: entry.freed_at.elapsed().as_millis() as u64,
+                });
+            }
+        }
+    }
+    let t = table().lock().unwrap_or_else(|e| e.into_inner());
+    let mut best: Option<(u64, AllocRecord)> = None;
+    for rec in t.values() {
+        let end = rec.ptr.saturating_add(rec.bytes);
+        if addr >= end && addr - end <= OVERRUN_WINDOW_BYTES {
+            let delta = addr - end;
+            if best.as_ref().map_or(true, |(b_delta, _)| delta < *b_delta) {
+                best = Some((delta, rec.clone()));
+            }
+        }
+    }
+    best.map(|(bytes_past_end, record)| UnownedDiagnosis::BufferOverrun {
+        record,
+        bytes_past_end,
+    })
 }
 
 /// Shared by every module whose tests touch the global ledger. One lock, not
