@@ -70,7 +70,7 @@ impl WaveSize {
 }
 
 /// Round `n` up to the next multiple of `segment`.
-fn align_to_segment(n: u64, segment: usize) -> u64 {
+pub fn align_to_segment(n: u64, segment: usize) -> u64 {
     n.div_ceil(segment as u64) * segment as u64
 }
 
@@ -2206,4 +2206,67 @@ mod tests {
         let mut tiny = std::io::Cursor::new(vec![1u8; 8]);
         assert!(read_attachment_index(&mut tiny).unwrap().is_empty());
     }
+}
+
+/// 4 KiB (`4096 B`) movement-unit alignment required for zero-bounce Linux `O_DIRECT`
+/// NVMe reads of MoE experts and paged KV blocks (derived from Radiance `RAD_ALIGN_UNIT`).
+pub const GRIM_ALIGN_DIRECTIO_UNIT: u64 = 4096;
+
+/// 2 MiB (`2_097_152 B`) data-section pool alignment so `mmap` and pinned host pools
+/// back weights with 2 MiB Transparent Huge Pages (THP), cutting TLB misses by 512× (`RAD_ALIGN_POOL`).
+pub const GRIM_ALIGN_THP_POOL: u64 = 2 * 1024 * 1024;
+
+/// Round `offset` up to a 4 KiB (`O_DIRECT`) movement-unit boundary.
+#[inline]
+pub const fn align_to_directio_unit(offset: u64) -> u64 {
+    offset.div_ceil(GRIM_ALIGN_DIRECTIO_UNIT) * GRIM_ALIGN_DIRECTIO_UNIT
+}
+
+/// Round `offset` up to a 2 MiB (`THP`) data-pool boundary.
+#[inline]
+pub const fn align_to_thp_pool(offset: u64) -> u64 {
+    offset.div_ceil(GRIM_ALIGN_THP_POOL) * GRIM_ALIGN_THP_POOL
+}
+
+/// Calibration-derived MoE expert activation share (`(layer, expert, share)`),
+/// stored in the `"expert_priors"` `.grim` trailer attachment to warm-start `MoeResidentBudget`
+/// before token 0 is decoded (derived from Radiance `RadFileProfile`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpertPriorEntry {
+    pub layer: u32,
+    pub expert: u32,
+    pub share: f32,
+}
+
+/// Encode a slice of [`ExpertPriorEntry`] into little-endian binary (`12 bytes` per entry).
+pub fn encode_expert_priors(priors: &[ExpertPriorEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(priors.len() * 12);
+    for p in priors {
+        out.extend_from_slice(&p.layer.to_le_bytes());
+        out.extend_from_slice(&p.expert.to_le_bytes());
+        out.extend_from_slice(&p.share.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a slice of [`ExpertPriorEntry`] from little-endian binary (`12 bytes` per entry).
+pub fn decode_expert_priors(bytes: &[u8]) -> Result<Vec<ExpertPriorEntry>> {
+    if bytes.len() % 12 != 0 {
+        return Err(Error::Backend(format!(
+            "expert_priors payload length {} is not a multiple of 12",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 12);
+    for chunk in bytes.chunks_exact(12) {
+        let layer = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let expert = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let share = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+        out.push(ExpertPriorEntry {
+            layer,
+            expert,
+            share,
+        });
+    }
+    Ok(out)
 }
