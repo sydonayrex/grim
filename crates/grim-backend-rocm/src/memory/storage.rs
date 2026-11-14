@@ -11,7 +11,7 @@ use grim_tensor::error::{Error, Result};
 // Re-exports used by the type's field types. The actual type declarations
 use crate::{
     DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, RocmDevice, Shape,
-    check_hip, hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipSuccess,
+    check_hip, hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipSuccess,
 };
 
 /// BLOCKING device-to-host copies, process-wide.
@@ -292,23 +292,59 @@ impl RocmStorage {
         // ordinal (each waits for the previous one before overwriting a
         // slot). Overhead: one event wait + record per staged copy.
         let _ev = crate::memory::pinned::h2d_stage_order_event(self.ordinal, stream)?;
-        let res = unsafe {
-            hipMemcpyAsync(
-                dev_ptr_void,
-                src_ptr as *const c_void,
-                need,
-                HipMemcpyKind::HostToDevice,
-                stream,
-            )
-        };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "write_host_f32_async: hipMemcpyAsync failed {}",
-                res
-            )));
+        if pinned {
+            // Pinned stage: SYNC copy from pinned memory is fast (µs for the
+            // 4 B-64 KB staged sizes) and completes before this call returns,
+            // so the ring slot can never be recycled under an in-flight copy.
+            // History: this was hipMemcpyAsync + the event chain above, and
+            // it still faulted — the ring filled to capacity and the teardown
+            // freed slots under the last in-flight copy (host-VA 'page not
+            // present', coredump 707667 + stage traces). Synchronous pinned
+            // copies remove the entire in-flight class.
+            let res = unsafe {
+                hipMemcpy(
+                    dev_ptr_void,
+                    src_ptr as *const c_void,
+                    need,
+                    HipMemcpyKind::HostToDevice,
+                )
+            };
+            if res != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "write_host_f32_async: hipMemcpy failed {}",
+                    res
+                )));
+            }
+        } else {
+            if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+                eprintln!(
+                    "[stage-fallback] ordinal {} SYNC copy of {} bytes (oversized for stage ring)",
+                    self.ordinal,
+                    need
+                );
+            }
+            // OVERSIZED fallback (> STAGE_RING_MAX_BYTES): the source is the
+            // caller's raw host slice, frequently a TEMPORARY Vec. A pageable
+            // hipMemcpyAsync from a temporary is not safe on this driver
+            // (the copy engine can read the pages after the Vec is dropped —
+            // 'page not present' faults at heap segment boundaries, caught
+            // via coredump 707667). Use the synchronous copy: the caller's
+            // slice is alive for the whole call.
+            let res = unsafe {
+                hipMemcpy(
+                    dev_ptr_void,
+                    src_ptr as *const c_void,
+                    need,
+                    HipMemcpyKind::HostToDevice,
+                )
+            };
+            if res != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "write_host_f32_async: sync hipMemcpy failed {}",
+                    res
+                )));
+            }
         }
-        let _ = pinned;
-        crate::memory::pinned::h2d_stage_record(self.ordinal, stream)?;
         Ok(())
     }
 

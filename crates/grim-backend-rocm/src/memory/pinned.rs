@@ -202,9 +202,18 @@ pub fn stage_h2d_pinned<'a>(ordinal: usize, host: &'a [u8]) -> (*const u8, bool)
         }
         let idx = entry.next % entry.slots.len();
         entry.next = entry.next.wrapping_add(1);
+        let n_slots = entry.slots.len();
         let slot = &mut entry.slots[idx];
         let dst = slot.as_mut_slice();
         dst[..host.len()].copy_from_slice(host);
+        let dst_ptr = dst.as_ptr() as usize;
+        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            eprintln!(
+                "[stage-trace] ordinal {ordinal} slot {idx}/{n_slots} bytes {} ptr {dst_ptr:#x} thread {:?}",
+                host.len(),
+                std::thread::current().id()
+            );
+        }
         (dst.as_ptr(), true)
     })
 }
