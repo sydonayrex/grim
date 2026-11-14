@@ -20,6 +20,9 @@ pub mod radix;
 
 pub use radix::RadixTree;
 
+/// Liveness interval-coloring arena packer and step-level lending (`rad_bufplan`).
+pub mod bufplan;
+
 /// Semantic-aware state caching for recurrent/hybrid-attention models.
 pub mod semantic_anchor;
 
