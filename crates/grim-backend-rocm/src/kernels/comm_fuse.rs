@@ -91,6 +91,22 @@ extern "C" __global__ __launch_bounds__(128) void grim_copy_link_16b(
         }
     }
 }
+struct GrimWtabPatch {
+    unsigned int n;
+    unsigned int pad;
+    unsigned long long dst[24];
+    unsigned long long val[24];
+};
+
+// Stream-ordered by-value device weight-table pointer patcher (ported from Radiance wtab.hip).
+// Grid: (1, 1, 1), Block: (32, 1, 1).
+extern "C" __global__ __launch_bounds__(32)
+void grim_wtab_patch(GrimWtabPatch p) {
+    const unsigned int i = threadIdx.x;
+    if (i < p.n) {
+        *((unsigned long long*)p.dst[i]) = p.val[i];
+    }
+}
 "#;
 
 // ── Host-side CommFuse orchestrator ──────────────────────────────────────────
@@ -367,4 +383,93 @@ pub fn launch_copy_link_16b(
             crate::arg(&mut n_vec),
         ],
     )
+}
+
+/// Maximum pointer writes carried by-value in a single `grim_wtab_patch` AQL dispatch (`wtab.h:18`).
+pub const WTAB_PATCH_CAP: usize = 24;
+
+/// Stream-ordered device pointer table patch passed by value in kernel arguments so the host
+/// can queue multiple steps ahead without racing on a staging buffer (`core/runtime/wtab.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WtabPatch {
+    pub n: u32,
+    pub pad: u32,
+    pub dst: [u64; WTAB_PATCH_CAP],
+    pub val: [u64; WTAB_PATCH_CAP],
+}
+
+impl Default for WtabPatch {
+    fn default() -> Self {
+        Self {
+            n: 0,
+            pad: 0,
+            dst: [0; WTAB_PATCH_CAP],
+            val: [0; WTAB_PATCH_CAP],
+        }
+    }
+}
+
+impl WtabPatch {
+    /// Append a `(dst_device_slot_addr, new_device_ptr)` write. Returns `false` if full (`24` entries).
+    pub fn push(&mut self, dst_addr: u64, new_val: u64) -> bool {
+        let idx = self.n as usize;
+        if idx >= WTAB_PATCH_CAP {
+            return false;
+        }
+        self.dst[idx] = dst_addr;
+        self.val[idx] = new_val;
+        self.n += 1;
+        true
+    }
+
+    /// Host simulation of `grim_wtab_patch` for CPU/host-memory unit tests.
+    pub fn apply_host_sim(&self) {
+        for i in 0..(self.n as usize).min(WTAB_PATCH_CAP) {
+            let ptr = self.dst[i] as *mut u64;
+            if !ptr.is_null() {
+                unsafe {
+                    *ptr = self.val[i];
+                }
+            }
+        }
+    }
+}
+
+/// Residual-stream composition probe statistics (`arch/common/rad_arch.h:53-81`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DbgResidStat {
+    pub rms: f64,
+    pub median_abs: f64,
+    pub max_abs: f64,
+}
+
+/// Compute `rms`, `median(|x|)` (bulk magnitude immune to massive-activation outliers), and `max(|x|)`
+/// over one activation row (`rad_arch.h:58-81`).
+pub fn compute_dbg_resid_stat(row: &[f32]) -> DbgResidStat {
+    if row.is_empty() {
+        return DbgResidStat {
+            rms: -1.0,
+            median_abs: -1.0,
+            max_abs: -1.0,
+        };
+    }
+    let mut sum_sq = 0.0f64;
+    let mut max_abs = 0.0f64;
+    let mut abs_vals: Vec<f32> = Vec::with_capacity(row.len());
+    for &x in row {
+        let xf = x as f64;
+        sum_sq += xf * xf;
+        let a = x.abs();
+        if (a as f64) > max_abs {
+            max_abs = a as f64;
+        }
+        abs_vals.push(a);
+    }
+    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    DbgResidStat {
+        rms: (sum_sq / (row.len() as f64)).sqrt(),
+        median_abs: abs_vals[abs_vals.len() / 2] as f64,
+        max_abs,
+    }
 }
