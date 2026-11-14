@@ -213,7 +213,44 @@ pub struct Gemma4ProportionalRope {
 }
 
 impl Gemma4ProportionalRope {
-    /// Rotate `x` (`[steps, num_heads * head_dim]`) on the host.
+    /// Express Gemma-4's proportional RoPE (`n_pairs` rotated out of `head_dim / 2` NeoX pairs
+    /// at exponent denominator `head_dim`) as a standard full-width `RopeConfig` using Radiance's
+    /// YaRN step-ramp trick (`arch/gemma4/gemma4.cpp:33-40, 287-306`).
+    ///
+    /// - For pair `i <= low` (`i <= n_pairs - 1`), `ramp = 1.0` -> `freq = base^(-2i / head_dim)`.
+    /// - For pair `i >= high` (`i >= n_pairs`), `ramp = 0.0` -> `freq / factor ≈ 0` -> `cos = 1, sin = 0`.
+    /// - `rope_mscale` is set to `1.0 / (1.0 + 0.1 * factor.ln())` so `grim`'s YaRN mscale boost cancels to `1.0`.
+    pub fn to_yarn_rope_config(&self) -> RopeConfig {
+        let head_dim_f = self.head_dim as f32;
+        let low_idx = self.n_pairs.saturating_sub(1) as f32;
+        let high_idx = self.n_pairs as f32;
+        let original_max_pos = 4096usize;
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let beta_fast =
+            (original_max_pos as f32) / (two_pi * self.base.powf(2.0 * low_idx / head_dim_f));
+        let beta_slow =
+            (original_max_pos as f32) / (two_pi * self.base.powf(2.0 * high_idx / head_dim_f));
+        let factor = 1.0e30_f32;
+        let rope_mscale = 1.0_f32 / (1.0_f32 + 0.1_f32 * factor.ln());
+
+        RopeConfig {
+            dim: self.head_dim,
+            base: self.base,
+            rotary_dim: self.head_dim,
+            yarn: Some(grim_tensor::YaRNParams {
+                factor,
+                original_max_pos,
+                beta_fast,
+                beta_slow,
+                attention_factor: 1.0,
+                rope_mscale: Some(rope_mscale),
+            }),
+            interleaved: false,
+        }
+    }
+
+    /// Rotate `x` (`[steps, num_heads * head_dim]`).
+    /// Dispatches on-device via `rope_2d_on_device` when `GRIM_RADIANT_GEMMA4_GPU_ROPE=1` and `x` is on GPU.
     pub fn apply(&self, x: &Tensor, num_heads: usize, positions: &[u32]) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (steps, width) = (dims[0], dims[1]);
@@ -225,6 +262,12 @@ impl Gemma4ProportionalRope {
                 self.head_dim,
                 width
             )));
+        }
+        if !x.device().is_cpu()
+            && std::env::var("GRIM_RADIANT_GEMMA4_GPU_ROPE").as_deref() == Ok("1")
+        {
+            let rope = Rope::from_config(self.to_yarn_rope_config());
+            return crate::shared_attention::rope_2d_on_device(&rope, x, num_heads, positions);
         }
         let half = self.head_dim / 2;
         let mut data = x.to_vec_f32()?;

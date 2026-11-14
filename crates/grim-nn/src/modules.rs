@@ -1975,34 +1975,34 @@ impl Rope {
             let rotary_dim = self.config.rotary_dim.min(d);
             let rotary_half = rotary_dim / 2;
 
-            // Compute inv_freq with YaRN frequency ramp if specified
+            // Compute inv_freq with llama.cpp / Radiance dimension-index YaRN ramp
             let inv_freq: Vec<f32> = (0..rotary_half)
                 .map(|i| {
-                    let freq = 1.0 / self.config.base.powf((2 * i) as f32 / d as f32);
+                    let freq = 1.0 / self.config.base.powf((2 * i) as f32 / rotary_dim as f32);
                     if let Some(yarn) = &self.config.yarn {
-                        let wavelength = 2.0 * std::f32::consts::PI / freq;
-                        let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
-                        let high = (yarn.original_max_pos as f32) / yarn.beta_fast;
-                        if wavelength < high {
-                            freq
-                        } else if wavelength > low {
-                            freq / yarn.factor
-                        } else {
-                            let ramp = (yarn.original_max_pos as f32 / wavelength - yarn.beta_slow)
-                                / (yarn.beta_fast - yarn.beta_slow);
-                            (1.0 - ramp) * (freq / yarn.factor) + ramp * freq
-                        }
+                        let corr = |n_rot: f32| {
+                            (rotary_dim as f32)
+                                * ((yarn.original_max_pos as f32
+                                    / (n_rot * 2.0 * std::f32::consts::PI))
+                                    .ln())
+                                / (2.0 * self.config.base.ln())
+                        };
+                        let low = corr(yarn.beta_fast).round().max(0.0);
+                        let high = corr(yarn.beta_slow)
+                            .round()
+                            .min((rotary_dim.saturating_sub(1)) as f32);
+                        let t = (i as f32 - low) / (high - low).max(0.001);
+                        let ramp = 1.0 - t.clamp(0.0, 1.0);
+                        (freq / yarn.factor) * (1.0 - ramp) + freq * ramp
                     } else {
                         freq
                     }
                 })
                 .collect();
 
-            let mscale = self
-                .config
-                .yarn
-                .as_ref()
-                .map_or(1.0, |y| y.attention_factor);
+            let mscale = self.config.yarn.as_ref().map_or(1.0, |y| {
+                y.rope_mscale.unwrap_or(y.attention_factor) * (1.0 + 0.1 * (y.factor).ln())
+            });
 
             let mut src = x.to_vec_f32()?;
             for bi in 0..b {
