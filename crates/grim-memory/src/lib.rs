@@ -24,8 +24,8 @@ pub use radix::RadixTree;
 pub mod semantic_anchor;
 
 pub use semantic_anchor::{
-    CheckpointId, RecurrentCheckpointPool, RecurrentLayerState, RecurrentStateCheckpoint,
-    SemanticAnchorRegistry, SharedSessionSnapshot,
+    CheckpointId, DualRecurrentSlot, RecurrentCheckpointPool, RecurrentLayerState,
+    RecurrentStateCheckpoint, SemanticAnchorRegistry, SharedSessionSnapshot,
 };
 
 /// Paged KV cache device-resident mirror and asynchronous tiering coordinator (F10).

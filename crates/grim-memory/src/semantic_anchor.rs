@@ -321,3 +321,70 @@ mod tests {
         assert!(pool.get_by_node(30).is_some());
     }
 }
+
+/// Dual-copy linear/GDN recurrent state slot for speculative decoding / MTP (`RAD_KV_LINEAR` + `RAD_KV_CONV`).
+/// Holds both `committed` and `draft` state buffers plus a rolling `conv_width - 1 + n_spec` conv buffer
+/// so draft rejection (`rollback_draft`) and acceptance (`commit_draft`) require zero layer replay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DualRecurrentSlot {
+    committed: Vec<f32>,
+    draft: Vec<f32>,
+    conv_ring: Vec<f32>,
+    conv_window_len: usize,
+}
+
+impl DualRecurrentSlot {
+    /// Allocate a dual-slot recurrent state of `state_len` floats and conv rolling window `(conv_width - 1) + n_spec`.
+    pub fn new(state_len: usize, conv_width: usize, n_spec: usize) -> Self {
+        let conv_window_len = conv_width.saturating_sub(1) + n_spec;
+        Self {
+            committed: vec![0.0; state_len],
+            draft: vec![0.0; state_len],
+            conv_ring: vec![0.0; conv_window_len],
+            conv_window_len,
+        }
+    }
+
+    /// Number of rolling conv slots (`conv_width - 1 + n_spec`).
+    pub fn conv_window_len(&self) -> usize {
+        self.conv_window_len
+    }
+
+    /// Seed the committed state and synchronize the draft copy.
+    pub fn seed_committed(&mut self, data: &[f32]) {
+        assert_eq!(data.len(), self.committed.len(), "seed_committed length mismatch");
+        self.committed.copy_from_slice(data);
+        self.draft.copy_from_slice(data);
+    }
+
+    /// Immutable view of the verified/committed recurrent state.
+    pub fn committed_state(&self) -> &[f32] {
+        &self.committed
+    }
+
+    /// Immutable view of the speculative draft recurrent state.
+    pub fn draft_state(&self) -> &[f32] {
+        &self.draft
+    }
+
+    /// Mutable view of the speculative draft recurrent state.
+    pub fn draft_state_mut(&mut self) -> &mut [f32] {
+        &mut self.draft
+    }
+
+    /// Promote the verified draft state to committed and sync draft copy.
+    pub fn commit_draft(&mut self) {
+        std::mem::swap(&mut self.committed, &mut self.draft);
+        self.draft.copy_from_slice(&self.committed);
+    }
+
+    /// Discard rejected draft mutations by restoring from `committed`.
+    pub fn rollback_draft(&mut self) {
+        self.draft.copy_from_slice(&self.committed);
+    }
+
+    /// Mutable access to the rolling conv window (`conv_width - 1 + n_spec`).
+    pub fn conv_ring_mut(&mut self) -> &mut [f32] {
+        &mut self.conv_ring
+    }
+}
