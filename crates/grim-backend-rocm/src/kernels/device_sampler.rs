@@ -609,6 +609,12 @@ pub fn apply_repeat_penalty_on_device(
     let cap = guard.as_ref().map(|s| s.bytes() / 4).unwrap_or(0);
     if guard.is_none() || cap < needed {
         let grow = needed.max(64).next_power_of_two();
+        // The old buffer may still be read by the previous step's
+        // grim_repeat_penalty_apply kernel queued on this stream. Freeing
+        // device memory under an in-flight read faults the GPU — synchronize
+        // before the drop. Growth crosses a power-of-two capacity at most
+        // ~log2(ctx) times per session, so this sync is negligible.
+        device.synchronize();
         *guard = Some(RocmStorage::alloc_gpu(
             &Shape::new(vec![grow]),
             DType {
@@ -768,6 +774,12 @@ pub fn apply_repeat_penalty_on_device_stream(
     let cap = guard.as_ref().map(|s| s.bytes() / 4).unwrap_or(0);
     if guard.is_none() || cap < needed {
         let grow = needed.max(64).next_power_of_two();
+        // The old buffer may still be read by the previous step's
+        // grim_repeat_penalty_apply kernel queued on this stream. Freeing
+        // device memory under an in-flight read faults the GPU — synchronize
+        // before the drop. Growth crosses a power-of-two capacity at most
+        // ~log2(ctx) times per session, so this sync is negligible.
+        device.synchronize();
         *guard = Some(RocmStorage::alloc_gpu(
             &Shape::new(vec![grow]),
             DType {
