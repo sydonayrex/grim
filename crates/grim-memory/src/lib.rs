@@ -155,6 +155,8 @@ struct KvBlock {
     /// Current tier residency (Phase 2.3): explicit so promotion can be
     /// decided without re-querying the spill manager.
     location: CacheTier,
+    /// Whether this block's current contents are mirrored cleanly on host memory.
+    clean_on_host: bool,
 }
 
 /// Outcome of a single demote-before-drop operation.
@@ -260,6 +262,7 @@ impl KvBlockPool {
                 num_tokens: 0,
                 received: false,
                 location: CacheTier::Gpu,
+                clean_on_host: false,
             });
             free_list.push_back(i);
         }
@@ -850,6 +853,7 @@ impl KvBlockPool {
         self.blocks[id].value_data.copy_from_slice(&v);
         self.blocks[id].num_tokens = n;
         self.blocks[id].received = true;
+        self.blocks[id].clean_on_host = false;
         self.blocks[id].location = CacheTier::Gpu;
         self.spill_telemetry.promoted_blocks += 1;
         self.dirty_blocks.remove(&id);
@@ -859,7 +863,8 @@ impl KvBlockPool {
     /// Mark a block as dirty (GPU-modified and needing mirror synchronization).
     pub fn mark_dirty(&mut self, id: BlockId) {
         if id < self.blocks.len() {
-            self.dirty_blocks.insert(id);
+            self.blocks[id].clean_on_host = false;
+        self.dirty_blocks.insert(id);
         }
     }
 
@@ -1039,6 +1044,7 @@ impl KvBlockPool {
                     num_tokens: 0,
                     received: false,
                     location: CacheTier::Gpu,
+                    clean_on_host: false,
                 });
                 self.free_list.push_back(i);
             }
@@ -1075,6 +1081,7 @@ impl KvBlockPool {
         if len > 0 {
             block.received = true;
         }
+        self.blocks[id].clean_on_host = false;
         self.dirty_blocks.insert(id);
     }
 
@@ -1084,6 +1091,7 @@ impl KvBlockPool {
         let elem = self.num_heads * self.head_dim;
         let len = (n * elem).min(values.len());
         block.value_data[..len].copy_from_slice(&values[..len]);
+        self.blocks[id].clean_on_host = false;
         self.dirty_blocks.insert(id);
     }
 
@@ -1117,8 +1125,10 @@ impl KvBlockPool {
             self.blocks[id].num_tokens = num_tokens.min(BLOCK_SIZE);
             if len > 0 {
                 self.blocks[id].received = true;
+        self.blocks[id].clean_on_host = false;
             }
-            self.dirty_blocks.insert(id);
+            self.blocks[id].clean_on_host = false;
+        self.dirty_blocks.insert(id);
             return Ok(());
         }
         if self.blocks[id].layer_keys.len() <= layer {
@@ -1139,6 +1149,7 @@ impl KvBlockPool {
         }
         let len = keys.len().min(block_elem);
         self.blocks[id].layer_keys[layer][..len].copy_from_slice(&keys[..len]);
+        self.blocks[id].clean_on_host = false;
         self.dirty_blocks.insert(id);
         Ok(())
     }
@@ -1173,7 +1184,8 @@ impl KvBlockPool {
         if layer == 0 {
             let len = values.len().min(block_elem);
             self.blocks[id].value_data[..len].copy_from_slice(&values[..len]);
-            self.dirty_blocks.insert(id);
+            self.blocks[id].clean_on_host = false;
+        self.dirty_blocks.insert(id);
             return Ok(());
         }
         if self.blocks[id].layer_values.len() <= layer {
@@ -1194,6 +1206,7 @@ impl KvBlockPool {
         }
         let len = values.len().min(block_elem);
         self.blocks[id].layer_values[layer][..len].copy_from_slice(&values[..len]);
+        self.blocks[id].clean_on_host = false;
         self.dirty_blocks.insert(id);
         Ok(())
     }
@@ -1227,6 +1240,8 @@ impl KvBlockPool {
         self.blocks[id].layer_packed[layer] = Some(LayerStorage::Packed { format, bytes });
         self.blocks[id].num_tokens = num_tokens.min(BLOCK_SIZE);
         self.blocks[id].received = true;
+        self.blocks[id].clean_on_host = false;
+        self.blocks[id].clean_on_host = false;
         self.dirty_blocks.insert(id);
         Ok(())
     }
@@ -3325,3 +3340,75 @@ mod f10_mirror_tests {
     }
 }
 
+
+/// Runtime "reference + ring" sliding window (`R-SWA`, derived from Radiance `SeqWindow`).
+/// Freezes prefill/multimodal tokens `[0, ring_pos)` in reference blocks `0..ref_blocks`
+/// and recycles `ring_blocks = window.div_ceil(block_size)` blocks in place for all decode positions `>= ring_pos`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqWindow {
+    visible_lo: usize,
+    window: usize,
+    block_size: usize,
+    ring_pos: usize,
+    ring_blocks: usize,
+}
+
+impl SeqWindow {
+    /// Construct a reference-plus-ring window for a sequence whose reference prefix ends at `visible_lo`.
+    pub fn new(visible_lo: usize, window: usize, block_size: usize) -> Self {
+        assert!(block_size > 0 && window > 0, "block_size and window must be > 0");
+        let ring_pos = visible_lo.div_ceil(block_size) * block_size;
+        let ring_blocks = window.div_ceil(block_size);
+        Self {
+            visible_lo,
+            window,
+            block_size,
+            ring_pos,
+            ring_blocks,
+        }
+    }
+
+    /// Block-aligned token position where the ring begins.
+    pub fn ring_pos(&self) -> usize {
+        self.ring_pos
+    }
+
+    /// Number of blocks in the rotating decode ring.
+    pub fn ring_blocks(&self) -> usize {
+        self.ring_blocks
+    }
+
+    /// Total physical blocks required by this sequence (`ref_blocks + ring_blocks`).
+    pub fn max_blocks_needed(&self) -> usize {
+        (self.ring_pos / self.block_size) + self.ring_blocks
+    }
+
+    /// Map a monotonic token position `pos` (used for RoPE) to its logical block index.
+    pub fn logical_block_for_pos(&self, pos: usize) -> usize {
+        if pos < self.ring_pos {
+            pos / self.block_size
+        } else {
+            let ref_blocks = self.ring_pos / self.block_size;
+            let ring_offset = (pos - self.ring_pos) / self.block_size;
+            ref_blocks + (ring_offset % self.ring_blocks)
+        }
+    }
+}
+
+impl KvBlockPool {
+    /// Mark a block as having an up-to-date copy on host memory (`IdleTiers` copy-on-idle).
+    /// Any subsequent write to this block automatically clears the flag.
+    pub fn mark_block_clean_on_host(&mut self, id: BlockId) {
+        if let Some(blk) = self.blocks.get_mut(id) {
+            blk.clean_on_host = true;
+        }
+    }
+
+    /// Returns `true` if the block's current contents are already mirrored on host memory.
+    pub fn is_block_clean_on_host(&self, id: BlockId) -> bool {
+        self.blocks
+            .get(id)
+            .map(|b| b.clean_on_host)
+            .unwrap_or(false)
+    }
+}
