@@ -328,3 +328,72 @@ pub fn launch_gdn_perm(
     )?;
     Ok(())
 }
+
+/// Fused Tiled SignFlip + FWHT-1024 + Q8_0 quantization (34 bytes per 32 elements).
+/// Eliminates the intermediate f32 HBM write/read and separate quantize launch.
+pub fn launch_fwht_signed_tiled_q80(
+    dev: &RocmDevice,
+    src: &RocmStorage,
+    dst_q80: &RocmStorage,
+    signs: Option<&RocmStorage>,
+    n: u32,
+    n_blk: u32,
+    rows: usize,
+) -> Result<()> {
+    let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+    if n != 1024 || n_blk == 0 || rows == 0 {
+        return Err(Error::Backend(format!(
+            "launch_fwht_signed_tiled_q80: invalid (n={n}, n_blk={n_blk}, rows={rows})"
+        )));
+    }
+    let full_width = (n as usize) * (n_blk as usize);
+    if src.dtype != DType::F32 || src.shape.elem_count() != rows * full_width {
+        return Err(Error::Backend(
+            "launch_fwht_signed_tiled_q80: src must be f32 of rows*full_width".into(),
+        ));
+    }
+    let needed_bytes = rows * (n_blk as usize) * 32 * 34;
+    if dst_q80.shape.elem_count() < needed_bytes {
+        return Err(Error::Backend(format!(
+            "launch_fwht_signed_tiled_q80: dst_q80 needs {needed_bytes} bytes, got {}",
+            dst_q80.shape.elem_count()
+        )));
+    }
+    let mut sptr = src
+        .device_ptr
+        .ok_or_else(|| Error::Backend("fwht_q80: src has no device ptr".into()))?;
+    let mut dptr = dst_q80
+        .device_ptr
+        .ok_or_else(|| Error::Backend("fwht_q80: dst_q80 has no device ptr".into()))?;
+    let mut sptr_signs = match signs {
+        Some(sg) => {
+            if sg.dtype != DType::F32 || sg.shape.elem_count() != full_width {
+                return Err(Error::Backend(
+                    "fwht_q80: signs must be f32 matching full_width".into(),
+                ));
+            }
+            sg.device_ptr
+                .ok_or_else(|| Error::Backend("fwht_q80: signs has no device ptr".into()))?
+        }
+        None => 0u64,
+    };
+    let mut rows64 = rows as i64;
+    let mut stride64 = full_width as i64;
+    let mut scale = 1.0f32 / (n as f32).sqrt();
+    let grid_dim = HipDim3::new(n_blk, rows as u32, 1);
+    let block_dim = HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_fwht_tiled_q80_f32",
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut dptr),
+            arg(&mut rows64),
+            arg(&mut stride64),
+            arg(&mut scale),
+            arg(&mut sptr_signs),
+        ],
+    )?;
+    Ok(())
+}

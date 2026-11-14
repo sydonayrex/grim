@@ -212,6 +212,70 @@ extern "C" __global__ void grim_gdn_perm_f32(
     int new_off = i0 + i2 * perm_hd + i1 * perm_hd * perm_rep;
     dst[r * n_in + new_off] = src[r * n_in + off];
 }
+
+// Fused Tiled SignFlip + FWHT-1024 + Q8_0 (34-byte block) quantizer.
+// Grid: (n_blk, n_rows, 1), Block: (256, 1, 1).
+// Each 1024-element block b of row r is transformed in registers/LDS, then
+// threads 0..31 each quantize one 32-float slice of s_sh[0..1024] into a
+// 34-byte Q8_0 block at dst_q80 + (r * n_blk * 32 + b * 32 + tid) * 34.
+extern "C" __global__ void grim_fwht_tiled_q80_f32(
+    const float* __restrict__ src,
+    unsigned char* __restrict__ dst_q80,
+    const long long n_rows,
+    const long long row_stride,
+    const float scale,
+    const float* __restrict__ signs)
+{
+    __shared__ float s_sh[FWHT_N];
+    const int b = blockIdx.x;
+    const long long r = blockIdx.y;
+    if (r >= n_rows) return;
+
+    const int tid = threadIdx.x;
+    const long long base = r * row_stride + (long long)b * FWHT_N;
+    const float* signs_blk = signs ? signs + (long long)b * FWHT_N : 0;
+    float reg[FWHT_N / FWHT_NT];
+    #pragma unroll
+    for (int i = 0; i < FWHT_N / FWHT_NT; ++i) {
+        const int idx = i * FWHT_NT + tid;
+        float v = src[base + idx] * scale;
+        if (signs_blk) v *= signs_blk[idx];
+        reg[i] = v;
+    }
+    grim_fwht_dev_block_butterfly(reg, s_sh, tid);
+    #pragma unroll
+    for (int i = 0; i < FWHT_N / FWHT_NT; ++i) {
+        s_sh[i * FWHT_NT + tid] = reg[i];
+    }
+    __syncthreads();
+
+    // 1024 floats = 32 Q8_0 blocks of 32 floats each. Lanes 0..31 each own one block.
+    if (tid < 32) {
+        const int blk = tid;
+        const float* blk_src = s_sh + blk * 32;
+        float amax = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            amax = fmaxf(amax, fabsf(blk_src[j]));
+        }
+        const float d = (amax > 1e-9f) ? (amax / 127.0f) : 0.0f;
+        const float d_clamped = (d > 65504.0f) ? 65504.0f : d;
+        unsigned short wd = f32_to_fp16_bits_device(d_clamped);
+        const float d_round = fp16_to_float_device(wd);
+
+        const long long total_blks_per_row = (row_stride / FWHT_N) * 32;
+        unsigned char* dst = dst_q80 + (r * total_blks_per_row + (long long)b * 32 + blk) * 34;
+        dst[0] = (unsigned char)(wd & 0xFF);
+        dst[1] = (unsigned char)(wd >> 8);
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            float q_flt = (d_round > 0.0f) ? roundf(blk_src[j] / d_round) : 0.0f;
+            if (q_flt > 127.0f) q_flt = 127.0f;
+            if (q_flt < -127.0f) q_flt = -127.0f;
+            dst[2 + j] = (unsigned char)((signed char)q_flt);
+        }
+    }
+}
 "#;
 
 #[cfg(test)]
