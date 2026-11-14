@@ -933,3 +933,196 @@ mod tests {
         }
     }
 }
+
+/// Checkpoint-stated sampling configuration (`generation_config.json`, `<model>.generation.json`
+/// sidecar, or container `generation.*` metadata), ported from Radiance `core/gen_config.h`.
+///
+/// Only fields explicitly stated by the source are `Some(...)`, so multiple sources stack cleanly via [`GenSampling::onto`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GenSampling {
+    pub temp: Option<f32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub ngram_ban_n: Option<u32>,
+    pub ngram_window: Option<u32>,
+    pub suppress_tokens: Vec<u32>,
+}
+
+impl GenSampling {
+    /// Returns `true` if any sampling field was claimed by this source.
+    pub fn any(&self) -> bool {
+        self.temp.is_some()
+            || self.top_p.is_some()
+            || self.min_p.is_some()
+            || self.top_k.is_some()
+            || self.ngram_ban_n.is_some()
+            || self.ngram_window.is_some()
+            || !self.suppress_tokens.is_empty()
+    }
+
+    /// Overlay stated fields onto `base`; unstated fields preserve `base`.
+    pub fn onto(&self, mut base: SamplingParams) -> SamplingParams {
+        if let Some(t) = self.temp {
+            base.temperature = t;
+        }
+        if let Some(tp) = self.top_p {
+            base.top_p = tp;
+        }
+        if let Some(tk) = self.top_k {
+            base.top_k = tk;
+        }
+        base
+    }
+}
+
+/// Derive `<model>.generation.json` sidecar path from a container path, replacing only an extension
+/// after the last `/` (so dots in directory names are untouched).
+pub fn gen_sidecar_path(model_path: &str) -> String {
+    let last_slash = model_path.rfind('/');
+    let base_start = last_slash.map_or(0, |i| i + 1);
+    let stem = match model_path[base_start..].rfind('.') {
+        Some(dot_rel) if dot_rel > 0 => &model_path[..base_start + dot_rel],
+        _ => model_path,
+    };
+    format!("{stem}.generation.json")
+}
+
+/// Parse `generation_config.json` text into [`GenSampling`]. Out-of-range fields are dropped individually;
+/// `do_sample: false` locks `temp = Some(0.0)` and ignores stochastic fields.
+pub fn gen_sampling_parse(json_text: &str) -> Option<GenSampling> {
+    let val: serde_json::Value = serde_json::from_str(json_text).ok()?;
+    let obj = val.as_object()?;
+
+    if obj.get("do_sample").and_then(|v| v.as_bool()) == Some(false) {
+        return Some(GenSampling {
+            temp: Some(0.0),
+            ..Default::default()
+        });
+    }
+
+    let mut out = GenSampling::default();
+
+    if let Some(t) = obj.get("temperature").and_then(|v| v.as_f64()) {
+        let tf = t as f32;
+        if (0.0..=5.0).contains(&tf) {
+            out.temp = Some(tf);
+        }
+    }
+    if let Some(tp) = obj.get("top_p").and_then(|v| v.as_f64()) {
+        let tpf = tp as f32;
+        if tpf > 0.0 && tpf <= 1.0 {
+            out.top_p = Some(tpf);
+        }
+    }
+    if let Some(mp) = obj.get("min_p").and_then(|v| v.as_f64()) {
+        let mpf = mp as f32;
+        if (0.0..=1.0).contains(&mpf) {
+            out.min_p = Some(mpf);
+        }
+    }
+    if let Some(tk) = obj.get("top_k").and_then(|v| v.as_i64()) {
+        if tk == -1 {
+            out.top_k = Some(0);
+        } else if (0..=1_000_000).contains(&tk) {
+            out.top_k = Some(tk as u32);
+        }
+    }
+    let ngram_n = obj
+        .get("no_repeat_ngram_size")
+        .or_else(|| obj.get("ngram_ban_n"))
+        .and_then(|v| v.as_i64());
+    if let Some(n) = ngram_n {
+        if (0..=256).contains(&n) {
+            out.ngram_ban_n = Some(n as u32);
+        }
+    }
+    let ngram_w = obj
+        .get("no_repeat_ngram_window_size")
+        .or_else(|| obj.get("ngram_window"))
+        .and_then(|v| v.as_i64());
+    if let Some(w) = ngram_w {
+        if w < 0 {
+            out.ngram_window = Some(0);
+        } else if w <= 1_048_576 {
+            out.ngram_window = Some(w as u32);
+        }
+    }
+    if let Some(arr) = obj.get("suppress_tokens").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item.as_i64() {
+                if id >= 0 && id <= u32::MAX as i64 {
+                    out.suppress_tokens.push(id as u32);
+                }
+            }
+        }
+    }
+
+    out.any().then_some(out)
+}
+
+/// Read [`GenSampling`] from flattened container string metadata (`generation.*` keys stripped of prefix).
+pub fn gen_sampling_from_kv<'a, F>(get: F) -> Option<GenSampling>
+where
+    F: Fn(&str) -> Option<&'a str>,
+{
+    if let Some(ds) = get("do_sample") {
+        if ds == "0" || ds.eq_ignore_ascii_case("false") {
+            return Some(GenSampling {
+                temp: Some(0.0),
+                ..Default::default()
+            });
+        }
+    }
+    let mut out = GenSampling::default();
+    if let Some(t) = get("temperature").and_then(|s| s.parse::<f32>().ok()) {
+        if (0.0..=5.0).contains(&t) {
+            out.temp = Some(t);
+        }
+    }
+    if let Some(tp) = get("top_p").and_then(|s| s.parse::<f32>().ok()) {
+        if tp > 0.0 && tp <= 1.0 {
+            out.top_p = Some(tp);
+        }
+    }
+    if let Some(mp) = get("min_p").and_then(|s| s.parse::<f32>().ok()) {
+        if (0.0..=1.0).contains(&mp) {
+            out.min_p = Some(mp);
+        }
+    }
+    if let Some(tk) = get("top_k").and_then(|s| s.parse::<i64>().ok()) {
+        if tk == -1 {
+            out.top_k = Some(0);
+        } else if (0..=1_000_000).contains(&tk) {
+            out.top_k = Some(tk as u32);
+        }
+    }
+    if let Some(n) = get("no_repeat_ngram_size")
+        .or_else(|| get("ngram_ban_n"))
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        if (0..=256).contains(&n) {
+            out.ngram_ban_n = Some(n as u32);
+        }
+    }
+    if let Some(w) = get("no_repeat_ngram_window_size")
+        .or_else(|| get("ngram_window"))
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        if w < 0 {
+            out.ngram_window = Some(0);
+        } else if w <= 1_048_576 {
+            out.ngram_window = Some(w as u32);
+        }
+    }
+    if let Some(sup) = get("suppress_tokens") {
+        for tok in sup.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
+            if let Ok(id) = tok.trim().parse::<i64>() {
+                if id >= 0 && id <= u32::MAX as i64 {
+                    out.suppress_tokens.push(id as u32);
+                }
+            }
+        }
+    }
+    out.any().then_some(out)
+}
