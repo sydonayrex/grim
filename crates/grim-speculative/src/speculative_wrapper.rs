@@ -595,6 +595,13 @@ impl SpeculativeCausalLm {
 
         // Snapshot after base for recurrent rollback/replay: avoids replaying base forward on
         // reject/partial-accept and restores exact post-base state (KV/recurrent/pos).
+        let tr = std::env::var("GRIM_TRACE_LAYERS").is_ok();
+        let tr_stage = |name: &str| {
+            if tr {
+                eprintln!("[mtp-trace] {}", name);
+            }
+        };
+        tr_stage("decode_native_mtp: enter");
         let mut post_base_snapshot = if recurrent {
             session.snapshot_recurrent_state()?
         } else {
@@ -674,7 +681,9 @@ impl SpeculativeCausalLm {
 
         let prev_full2 = session.full_output_logits();
         session.set_full_output_logits(true);
+        tr_stage("verify: forward start");
         let verify_forward = self.target.forward(session, &draft_input, &draft_positions, adapters);
+        tr_stage("verify: forward done");
         session.set_full_output_logits(prev_full2);
         let verify_logits = match verify_forward {
             Ok(t) => t,
@@ -695,6 +704,7 @@ impl SpeculativeCausalLm {
 
         // 4. Combine [L0 = base_last; verify rows] so row 0 predicts first emitted token and
         // row 1+i predicts token after draft i (context_len=1 for verification/extraction).
+        tr_stage("verify: accept-count start");
         let combined = self.prepend_base_row(&base_last, &verify_logits, vocab_size, verify_len)?;
 
         let mut rng = session
