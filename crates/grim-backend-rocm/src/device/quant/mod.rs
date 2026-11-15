@@ -1286,15 +1286,16 @@ impl QuantOps for RocmDevice {
                 // gate lift of this arm was also tried for MTP and measured
                 // worse, 0.259 -> 0.298, plus intermittent dev1 page faults —
                 // see the m==2 rows_hv2 arm in launch_dot4_iq4xs_q81_gemv.)
-                let iq4xs_dot4 = matches!(
+                let iq4xs_dot4 = !matches!(
                     std::env::var("GRIM_IQ4XS_DOT4").as_deref(),
-                    Ok("1" | "true" | "on")
+                    Ok("0" | "false" | "off")
                 );
                 if iq4xs_dot4
                     && (is_rdna2 || self.is_rdna34)
-                    && m == 1
+                    && m <= 32
                     && !dot_disabled
                     && k % 256 == 0
+                    && !crate::device::quant::exact_decode_gemv()
                 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);

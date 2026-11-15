@@ -3266,7 +3266,17 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_hv2 && k % 256 == 0 {
+        if m >= 8 && rows_hv2 && k % 256 == 0 {
+            return self.launch_dot4_iq4xs_q81_gemv_rows8_for_ab(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
+        if m >= 2 && rows_hv2 && k % 256 == 0 {
             return self.launch_dot4_iq4xs_q81_gemv_rows_hv2_for_ab(
                 act_q81,
                 b_storage,
