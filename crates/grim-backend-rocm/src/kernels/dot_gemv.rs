@@ -1370,6 +1370,42 @@ extern "C" __global__ void __launch_bounds__(32) grim_fp32_gemv_v2(
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256) grim_fp32_gemv_row_per_cta(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int n = blockIdx.x;
+    const int m = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (m >= M || n >= N) return;
+
+    const float* a_row = A + (long long)m * K;
+    const float* b_row = B + (long long)n * K;
+    float sum = 0.0f;
+    for (int k = tid; k < K; k += 256) {
+        sum += a_row[k] * b_row[k];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_xor(sum, off);
+    }
+    __shared__ float s_warp[8];
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) s_warp[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < 8) ? s_warp[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            v += __shfl_xor(v, off);
+        }
+        if (lane == 0) {
+            C[(long long)m * N + n] = v;
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────── grim_fp32_mm_tile
 // 2D CTA-tiled MM / GEMV variant based on Charon/Scythe architectural lessons:
 // 1. CTA parallelism (256 threads = 8 waves on RDNA4)

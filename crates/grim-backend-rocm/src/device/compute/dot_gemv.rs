@@ -5255,6 +5255,29 @@ impl RocmDevice {
         let out_ptr = out
             .device_ptr
             .ok_or_else(|| Error::Backend("fp32_mm_tile: out has no device ptr".into()))?;
+        if m <= 32 && n <= 256 {
+            let grid_dim = HipDim3::new(n as u32, m as u32, 1);
+            let block_dim = HipDim3::new(256, 1, 1);
+            let mut aptr = a_ptr;
+            let mut wptr = w_ptr;
+            let mut optr = out_ptr;
+            let mut mm = m as i32;
+            let mut nn = n as i32;
+            let mut kk = k as i32;
+            return self.launch_compute_kernel(
+                "grim_fp32_gemv_row_per_cta",
+                grid_dim,
+                block_dim,
+                &mut [
+                    arg(&mut aptr),
+                    arg(&mut wptr),
+                    arg(&mut optr),
+                    arg(&mut mm),
+                    arg(&mut nn),
+                    arg(&mut kk),
+                ],
+            );
+        }
         let grid_x = (n as u32).div_ceil(64);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(256, 1, 1);
