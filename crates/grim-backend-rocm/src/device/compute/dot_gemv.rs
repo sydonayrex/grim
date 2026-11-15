@@ -4091,6 +4091,16 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
+        if m >= 4 && rows_r2 {
+            return self.launch_dot4_q4k_q81_gemv_rows_r4_for_ab(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         if m >= 2 && rows_r2 {
             return self.launch_dot4_q4k_q81_gemv_rows_r2_for_ab(
                 act_q81,
@@ -4726,6 +4736,50 @@ impl RocmDevice {
     }
 
     /// Q4_K dual-row weight reuse GEMV (R=2).
+    /// Quad-row A/B: Q4_K GEMV with 4-row weight reuse (`grim_dot4_q4k_q81_gemv_rows_r4`).
+    pub fn launch_dot4_q4k_q81_gemv_rows_r4_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_rows_r4: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_rows_r4: b has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q4k_q81_gemv_rows_r4: out has no device ptr".into())
+        })?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_y = (m as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv_rows_r4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub fn launch_dot4_q4k_q81_gemv_rows_r2_for_ab(
         &self,
         act_q81: &RocmStorage,

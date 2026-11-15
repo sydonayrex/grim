@@ -3146,6 +3146,17 @@ impl RocmDevice {
             return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
         }
 
+        if self.is_rdna34
+            && m <= 32
+            && a_storage.dtype.arith == ArithType::F32
+            && b_storage.dtype.arith == ArithType::F32
+            && dtype_out.arith == ArithType::F32
+            && k % 4 == 0
+        {
+            self.launch_fp32_mm_tile_for_ab(a_storage, b_storage, out_storage, m, n, k)?;
+            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+        }
+
         unsafe {
             let status = if use_gemm_ex
                 || dtype_out.arith == ArithType::F16
