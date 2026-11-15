@@ -3134,6 +3134,18 @@ impl RocmDevice {
             || self.gpu_target == "gfx90a"
             || self.gpu_target == "gfx942";
 
+        if self.is_rdna34
+            && m <= 32
+            && a_storage.dtype.arith == ArithType::F16
+            && b_storage.dtype.arith == ArithType::F16
+            && dtype_out.arith == ArithType::F32
+            && k % 16 == 0
+            && n % 16 == 0
+        {
+            self.launch_wmma_gemm_b_transposed(a_storage, b_storage, out_storage, m, n, k)?;
+            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+        }
+
         unsafe {
             let status = if use_gemm_ex
                 || dtype_out.arith == ArithType::F16

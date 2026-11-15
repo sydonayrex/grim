@@ -329,8 +329,13 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
+        let kernel = if std::env::var("GRIM_STRATA_S2_GEMV").ok().as_deref() == Some("1") {
+            "grim_dot4_q2_0_s2_fast_gemv"
+        } else {
+            "grim_dot4_q2_0_q80_gemv"
+        };
         self.launch_compute_kernel(
-            "grim_dot4_q2_0_q80_gemv",
+            kernel,
             grid_dim,
             block_dim,
             &mut [
@@ -2481,7 +2486,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_r2 {
+        if m >= 2 && rows_r2 {
             return self.launch_dot4_q2k_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -2601,7 +2606,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_r2 {
+        if m >= 2 && rows_r2 {
             return self.launch_dot4_iq4nl_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -4076,7 +4081,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_r2 {
+        if m >= 2 && rows_r2 {
             return self.launch_dot4_q4k_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -4189,7 +4194,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_r2 {
+        if m >= 2 && rows_r2 {
             return self.launch_dot4_q5k_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -4786,7 +4791,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_r2 {
+        if m >= 2 && rows_r2 {
             return self.launch_dot4_q6k_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -5395,7 +5400,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m == 2 && rows_r2 {
+        if m >= 2 && rows_r2 {
             return self.launch_dot8_w4a4_gemv_rows_r2_for_ab(
                 a_codes,
                 a_scales,

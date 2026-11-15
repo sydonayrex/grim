@@ -1867,6 +1867,7 @@ pub async fn cmd_run(
     // Prewarm u4 lane weights at model load time BEFORE any requests/prefill.
     // Eliminates memory contention and peak VRAM spikes during prefill, and gives
     // short prompts the fast ~141 ms decode rate from token one.
+    let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
     let prewarm_opt_out = matches!(
         std::env::var("GRIM_PREWARM").as_deref(),
         Ok("0" | "false" | "off")
@@ -1915,6 +1916,25 @@ pub async fn cmd_run(
                 model.device().clone(),
             );
             let _ = model.forward(warm_sess.as_mut(), &warm_ids, &warm_pos, &[]);
+        }
+        // Pre-capture DecodeGraph during model-load prewarm so first-prompt
+        // TTFT skips the 2x warmup + capture passes.
+        if let Some(gm) = resolve_graph_model(&*model) {
+            if let Ok(mut g) = gm.get_or_create_decode_graph(4096, 1) {
+                if !g.is_captured {
+                    let _ = gm.forward_capture(&mut g, 1);
+                    let _ = gm.forward_capture(&mut g, 1);
+                    if g.begin_capture().is_ok() {
+                        let ok = gm.forward_capture(&mut g, 1).is_ok();
+                        let _ = g.end_capture();
+                        if ok {
+                            decode_graph = Some(g);
+                        } else {
+                            g.is_captured = false;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2239,7 +2259,7 @@ pub async fn cmd_run(
     let mut ctx_exhausted = false;
     // One-shot: the decode-only lane-weight prewarm was completed at model load.
     let mut prewarm_done = true;
-    let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
+    // Hoisted above prewarm so pre-captured graph is reused on first decode step.
     let mut graph_just_captured = false;
     let mut graph_retry = grim_backend_rocm::graph_capture::GraphRetryPolicy::default_policy();
     let mut graph_fallback_step: Option<usize> = None;
@@ -2562,7 +2582,8 @@ pub async fn cmd_run(
             }
             None => {
                 let gm_ref = resolve_graph_model(&*model);
-                let prewarm_opt_out = matches!(
+                // Hoisted above prewarm so pre-captured graph is reused on first decode step.
+    let prewarm_opt_out = matches!(
                     std::env::var("GRIM_PREWARM").as_deref(),
                     Ok("0" | "false" | "off")
                 );

@@ -163,7 +163,7 @@ impl QuantOps for RocmDevice {
                     Ok("0" | "false" | "off")
                 );
                 if (is_rdna2 || is_rdna34)
-                    && m == 1
+                    && m <= 32
                     && !dot_disabled
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
@@ -288,7 +288,7 @@ impl QuantOps for RocmDevice {
                 if lane_served {
                     // out_storage is written by the lane GEMV.
                 } else if (is_rdna2 || is_rdna34)
-                    && m == 1
+                    && m <= 32
                     && !dot_disabled
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
@@ -703,7 +703,7 @@ impl QuantOps for RocmDevice {
                     Ok("0" | "false" | "off")
                 );
                 if (is_rdna2 || is_rdna34)
-                    && m == 1
+                    && m <= 32
                     && !dot_disabled
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
@@ -1208,7 +1208,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_IQ4NL_DOT4").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if self.is_dot4_arch && m == 1 && !dot_disabled && k % 32 == 0 {
+                if self.is_dot4_arch && m <= 32 && !dot_disabled && k % 32 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
