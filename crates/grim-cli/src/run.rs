@@ -1885,6 +1885,37 @@ pub async fn cmd_run(
                 );
             }
         }
+        // Warm up rocBLAS/hipBLASLt TensileLite heuristics during model load
+        // so first-prompt TTFT does not pay MsgPack deserialization cost.
+        let mut warm_sess = model.new_session();
+        if let (Ok(in_s), Ok(pos_s)) = (
+            grim_backend_cpu::CpuDevice::new().from_cpu(
+                &[1.0f32, 1.0f32],
+                &grim_tensor::Shape::new(vec![1, 2]),
+                grim_tensor::dtype::DType::F32,
+            ),
+            grim_backend_cpu::CpuDevice::new().from_cpu(
+                &[0.0f32, 1.0f32],
+                &grim_tensor::Shape::new(vec![1, 2]),
+                grim_tensor::dtype::DType::F32,
+            ),
+        ) {
+            let warm_ids = grim_tensor::Tensor::new(
+                std::sync::Arc::from(in_s),
+                grim_tensor::Shape::new(vec![1, 2]),
+                grim_tensor::dtype::DType::F32,
+                grim_tensor::dtype::QuantProvenance::default(),
+                model.device().clone(),
+            );
+            let warm_pos = grim_tensor::Tensor::new(
+                std::sync::Arc::from(pos_s),
+                grim_tensor::Shape::new(vec![1, 2]),
+                grim_tensor::dtype::DType::F32,
+                grim_tensor::dtype::QuantProvenance::default(),
+                model.device().clone(),
+            );
+            let _ = model.forward(warm_sess.as_mut(), &warm_ids, &warm_pos, &[]);
+        }
     }
 
     // Determine vocab size — fall back to tokenizer vocab length if model
