@@ -1538,33 +1538,31 @@ extern "C" __global__ void __launch_bounds__(256)
 grim_add_rms_norm_decode(const float* x, const float* residual,
                          const float* __restrict__ w, float* y_out, float* norm_out,
                          int row_len, float eps) {
+    __shared__ float s_warp_sums[8];
     __shared__ float s_rms;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
-    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
-    // Pass 1: All 256 threads write y_out[col] = x[col] + residual[col] except warp 0
-    // handles both y_out write and the exact stride-128 4-wide reduction matching grim_rms_norm.
-    // Wait: if all 256 threads write y_out in stride 256 first, then __syncthreads(), or warp 0
-    // computes y0..y3 in stride 128: since y_out may alias norm_out (not x or residual),
-    // all 256 threads writing y_out[col] = x[col] + residual[col] in stride 256 is completely race-free!
+    float local_ss = 0.0f;
     for (int col = tid; col < row_len; col += 256) {
-        y_out[col] = x[col] + residual[col];
+        const float y = x[col] + residual[col];
+        y_out[col] = y;
+        local_ss += y * y;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        local_ss += __shfl_xor(local_ss, off);
+    }
+    if (lane == 0) {
+        s_warp_sums[warp_id] = local_ss;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float ss = 0.0f;
-        if (lane == 0) {
-            // Sequential accumulation on lane 0, matching CPU reference and grim_rms_norm_decode order.
-            // Uses separate multiply-add (not FMA) to match host exactly.
-            for (int col = 0; col < row_len; col++) {
-                const float y = y_out[col];
-                ss += y * y;
-            }
+        float ss = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off);
         }
-        ss = __shfl_sync(shfl_mask, ss, 0);
         if (lane == 0) {
             s_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
@@ -1594,15 +1592,24 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
     const int lane = tid & 31;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
+    float local_ss = 0.0f;
+    for (int col = tid; col < row_len; col += 256) {
+        const float v = x[col];
+        local_ss += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        local_ss += __shfl_xor(local_ss, off);
+    }
+    if (lane == 0) {
+        s_lane_sums[warp_id] = local_ss;
+    }
+    __syncthreads();
+
     if (warp_id == 0) {
-        float ss = 0.0f;
-        if (lane == 0) {
-            for (int col = 0; col < row_len; col++) {
-                const float v = x[col];
-                ss += v * v;
-            }
+        float ss = (lane < 8) ? s_lane_sums[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off);
         }
-        ss = __shfl_sync(shfl_mask, ss, 0);
         if (lane == 0) {
             s_lane_sums[0] = 1.0f / sqrtf(ss / (float)row_len + eps);
         }

@@ -1590,13 +1590,14 @@ impl RocmDevice {
         let mut eps_f = eps;
         let mut has_z_i = i32::from(z_s.is_some());
 
-        // Single block of 256 threads handles all three phases cooperatively
-        let grid = crate::HipDim3::new(1, 1, 1);
+        // Launch the 3 phases as separate multi-block kernels so all CUs participate
+        // instead of bottlenecking on a single block/CU in grim_kda_fused_step.
+        let conv_total = (batch * channels) as u32;
+        let conv_grid = crate::HipDim3::new((conv_total + 255) / 256, 1, 1);
         let block = crate::HipDim3::new(256, 1, 1);
-
         self.launch_compute_kernel(
-            "grim_kda_fused_step",
-            grid,
+            "grim_short_conv1d_causal_step",
+            conv_grid,
             block,
             &mut [
                 arg(&mut ci_ptr),
@@ -1604,20 +1605,44 @@ impl RocmDevice {
                 arg(&mut cb_ptr),
                 arg(&mut cs_ptr),
                 arg(&mut co_ptr),
+                arg(&mut b_i),
+                arg(&mut ch_i),
+                arg(&mut ks_i),
+            ],
+        )?;
+
+        let kda_total = (num_value_heads * head_dim) as u32;
+        let kda_grid = crate::HipDim3::new((kda_total + 255) / 256, 1, 1);
+        self.launch_compute_kernel(
+            "grim_kda_gated_delta_rule_batched",
+            kda_grid,
+            block,
+            &mut [
+                arg(&mut co_ptr),
                 arg(&mut al_ptr),
                 arg(&mut be_ptr),
                 arg(&mut db_ptr),
                 arg(&mut sa_ptr),
-                arg(&mut nw_ptr),
-                arg(&mut z_ptr),
                 arg(&mut s_ptr),
                 arg(&mut acc_ptr),
-                arg(&mut br_ptr),
-                arg(&mut b_i),
-                arg(&mut ch_i),
-                arg(&mut ks_i),
                 arg(&mut nv_i),
                 arg(&mut nk_i),
+                arg(&mut hd_i),
+                arg(&mut eps_f),
+            ],
+        )?;
+
+        let norm_grid = crate::HipDim3::new((num_value_heads as u32 + 255) / 256, 1, 1);
+        self.launch_compute_kernel(
+            "grim_kda_head_norm_gate",
+            norm_grid,
+            block,
+            &mut [
+                arg(&mut acc_ptr),
+                arg(&mut nw_ptr),
+                arg(&mut z_ptr),
+                arg(&mut br_ptr),
+                arg(&mut nv_i),
                 arg(&mut hd_i),
                 arg(&mut eps_f),
                 arg(&mut has_z_i),

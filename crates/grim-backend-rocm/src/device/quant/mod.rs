@@ -2971,9 +2971,9 @@ pub(crate) fn decode_w4a4_enabled() -> bool {
 pub(crate) fn exact_decode_gemv() -> bool {
     static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EXACT.get_or_init(|| {
-        !matches!(
+        matches!(
             std::env::var("GRIM_DECODE_EXACT_GEMV").as_deref(),
-            Ok("0" | "false" | "off")
+            Ok("1" | "true" | "on")
         )
     })
 }

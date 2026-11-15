@@ -4368,6 +4368,211 @@ extern "C" __global__ void grim_qkv_attention_dev_q81(
     }
 }
 
+extern "C" __global__ void grim_qkv_attention_dev_q81_splitk(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int arena_slot_stride,
+    int cap_rows,
+    int split_k
+) {
+    const int split_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    if (split_idx >= split_k || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = h * head_dim;
+
+    const int lane_id = threadIdx.x % 32;
+    const int wave_id = threadIdx.x / 32;
+    const int num_waves = blockDim.x / 32;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int num_blocks = head_dim / 32;
+    float q_reg[8];
+    if (lane_id < head_dim) {
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
+        }
+    }
+
+    int live_rows = total_dev[0] + steps;
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
+    const int range_len = hi - lo;
+
+    const int total_waves = split_k * num_waves;
+    const int global_wave = split_idx * num_waves + wave_id;
+    const int base = range_len / total_waves;
+    const int rem  = range_len % total_waves;
+    int j_start = global_wave * base + (global_wave < rem ? global_wave : rem);
+    int j_end   = j_start + base + (global_wave < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int blk_stride = 36;
+    const int row_stride = num_kv_heads * num_blocks * blk_stride;
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float lane_contrib = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int idx = lane_id + c * 32;
+            if (idx < head_dim) {
+                const unsigned char* k_blk = k_tensor + (long long)j * row_stride
+                    + ((long long)kv_head * num_blocks + (idx >> 5)) * blk_stride;
+                __half khalf;
+                __builtin_memcpy(&khalf, k_blk, sizeof(khalf));
+                float kd = __half2float(khalf);
+                signed char kcode = ((const signed char*)(k_blk + 4))[idx & 31];
+                lane_contrib += q_reg[c] * ((float)kcode * kd);
+            }
+        }
+
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lane_contrib += __shfl_xor(lane_contrib, off);
+        }
+        float score = lane_contrib * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) score += alibi_slopes[h] * ((float)j - (float)abs_i);
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * 32;
+            if (d < head_dim) {
+                int blk = d / 32;
+                int e = d % 32;
+                const unsigned char* v_blk = v_tensor + (long long)j * row_stride + ((long long)kv_head * num_blocks + blk) * blk_stride;
+                __half vhalf;
+                __builtin_memcpy(&vhalf, v_blk, sizeof(vhalf));
+                float vd = __half2float(vhalf);
+                signed char code = ((const signed char*)(v_blk + 4))[e];
+                float v_val = (float)code * vd;
+
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const int p_off = (split_idx * num_heads + h) * head_dim;
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * 32;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            partial_out[p_off + d] = acc_final;
+        }
+    }
+
+    if (lane_id == 0) {
+        partial_max[split_idx * num_heads + h] = m_final;
+        partial_sum[split_idx * num_heads + h] = sum_final;
+    }
+}
+
+extern "C" __global__ void grim_qkv_attention_splitk_combine(
+    const float* __restrict__ partial_out,
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int head_dim,
+    int split_k
+) {
+    const int h = blockIdx.x;
+    const int d = threadIdx.x;
+    if (h >= num_heads || d >= head_dim) return;
+
+    float m_final = partial_max[h];
+    float sum_final = partial_sum[h];
+    for (int s = 1; s < split_k; ++s) {
+        const float ms = partial_max[s * num_heads + h];
+        const float us = partial_sum[s * num_heads + h];
+        const float m_new = fmaxf(m_final, ms);
+        sum_final = sum_final * expf(m_final - m_new) + us * expf(ms - m_new);
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+    float acc_final = 0.0f;
+    for (int s = 0; s < split_k; ++s) {
+        const float ms = partial_max[s * num_heads + h];
+        const float p_val = partial_out[(s * num_heads + h) * head_dim + d];
+        acc_final += p_val * expf(ms - m_final);
+    }
+    out[h * head_dim + d] = acc_final * inv_sum;
+
+    if (d == 0) {
+        if (out_max != nullptr) out_max[h] = m_final;
+        if (out_sum != nullptr) out_sum[h] = sum_final;
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_tensor,
@@ -8156,6 +8361,98 @@ pub fn launch_qkv_attention_dev_batch_i8(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    if seq_len == 1 && batch <= 1 && fuse_o == 0 {
+        const SPLIT_K: usize = 8;
+        static SPLITK_SCRATCH: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
+        > = std::sync::OnceLock::new();
+        let need_out_bytes =
+            SPLIT_K * (num_heads as usize) * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * (num_heads as usize) * std::mem::size_of::<f32>();
+        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
+            if rc != 0 {
+                return Err(crate::Error::Backend(format!(
+                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
+                )));
+            }
+            Ok(ptr as u64)
+        };
+        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+            let map = SPLITK_SCRATCH
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut guard = map.lock().unwrap();
+            let dev_idx = dev.ordinal();
+            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
+                if cap >= need_out_bytes {
+                    (po, pm, ps)
+                } else {
+                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                    let po_new = alloc_dev(need_out_bytes)?;
+                    let pm_new = alloc_dev(need_ms_bytes)?;
+                    let ps_new = alloc_dev(need_ms_bytes)?;
+                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                    (po_new, pm_new, ps_new)
+                }
+            } else {
+                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                let po_new = alloc_dev(need_out_bytes)?;
+                let pm_new = alloc_dev(need_ms_bytes)?;
+                let ps_new = alloc_dev(need_ms_bytes)?;
+                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                (po_new, pm_new, ps_new)
+            }
+        };
+        let mut split_k_i = SPLIT_K as i32;
+        let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, 1);
+        let split_block = crate::HipDim3::new(128, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_q81_splitk",
+            split_grid,
+            split_block,
+            &mut [
+                arg(&mut q_ptr),
+                arg(&mut k_ptr),
+                arg(&mut v_ptr),
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut tot_ptr),
+                arg(&mut steps_i),
+                arg(&mut isd),
+                arg(&mut wl),
+                arg(&mut sc),
+                arg(&mut asl),
+                arg(&mut ha),
+                arg(&mut slot_stride_i),
+                arg(&mut cap_rows_i),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        let comb_grid = crate::HipDim3::new(nh as u32, 1, 1);
+        let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_splitk_combine",
+            comb_grid,
+            comb_block,
+            &mut [
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut o_ptr),
+                arg(&mut om_ptr),
+                arg(&mut os_ptr),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        return Ok(dev.active_stream());
+    }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
@@ -8330,6 +8627,98 @@ pub fn launch_qkv_attention_dev_batch_i4(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    if seq_len == 1 && batch <= 1 && fuse_o == 0 {
+        const SPLIT_K: usize = 8;
+        static SPLITK_SCRATCH: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
+        > = std::sync::OnceLock::new();
+        let need_out_bytes =
+            SPLIT_K * (num_heads as usize) * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * (num_heads as usize) * std::mem::size_of::<f32>();
+        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
+            if rc != 0 {
+                return Err(crate::Error::Backend(format!(
+                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
+                )));
+            }
+            Ok(ptr as u64)
+        };
+        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+            let map = SPLITK_SCRATCH
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut guard = map.lock().unwrap();
+            let dev_idx = dev.ordinal();
+            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
+                if cap >= need_out_bytes {
+                    (po, pm, ps)
+                } else {
+                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                    let po_new = alloc_dev(need_out_bytes)?;
+                    let pm_new = alloc_dev(need_ms_bytes)?;
+                    let ps_new = alloc_dev(need_ms_bytes)?;
+                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                    (po_new, pm_new, ps_new)
+                }
+            } else {
+                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                let po_new = alloc_dev(need_out_bytes)?;
+                let pm_new = alloc_dev(need_ms_bytes)?;
+                let ps_new = alloc_dev(need_ms_bytes)?;
+                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                (po_new, pm_new, ps_new)
+            }
+        };
+        let mut split_k_i = SPLIT_K as i32;
+        let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, 1);
+        let split_block = crate::HipDim3::new(128, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_q81_splitk",
+            split_grid,
+            split_block,
+            &mut [
+                arg(&mut q_ptr),
+                arg(&mut k_ptr),
+                arg(&mut v_ptr),
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut tot_ptr),
+                arg(&mut steps_i),
+                arg(&mut isd),
+                arg(&mut wl),
+                arg(&mut sc),
+                arg(&mut asl),
+                arg(&mut ha),
+                arg(&mut slot_stride_i),
+                arg(&mut cap_rows_i),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        let comb_grid = crate::HipDim3::new(nh as u32, 1, 1);
+        let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_splitk_combine",
+            comb_grid,
+            comb_block,
+            &mut [
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut o_ptr),
+                arg(&mut om_ptr),
+                arg(&mut os_ptr),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        return Ok(dev.active_stream());
+    }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
@@ -8495,6 +8884,98 @@ pub fn launch_qkv_attention_dev_batch_q81(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    if seq_len == 1 && batch <= 1 && fuse_o == 0 {
+        const SPLIT_K: usize = 8;
+        static SPLITK_SCRATCH: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
+        > = std::sync::OnceLock::new();
+        let need_out_bytes =
+            SPLIT_K * (num_heads as usize) * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * (num_heads as usize) * std::mem::size_of::<f32>();
+        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
+            if rc != 0 {
+                return Err(crate::Error::Backend(format!(
+                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
+                )));
+            }
+            Ok(ptr as u64)
+        };
+        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+            let map = SPLITK_SCRATCH
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut guard = map.lock().unwrap();
+            let dev_idx = dev.ordinal();
+            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
+                if cap >= need_out_bytes {
+                    (po, pm, ps)
+                } else {
+                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                    let po_new = alloc_dev(need_out_bytes)?;
+                    let pm_new = alloc_dev(need_ms_bytes)?;
+                    let ps_new = alloc_dev(need_ms_bytes)?;
+                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                    (po_new, pm_new, ps_new)
+                }
+            } else {
+                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                let po_new = alloc_dev(need_out_bytes)?;
+                let pm_new = alloc_dev(need_ms_bytes)?;
+                let ps_new = alloc_dev(need_ms_bytes)?;
+                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                (po_new, pm_new, ps_new)
+            }
+        };
+        let mut split_k_i = SPLIT_K as i32;
+        let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, 1);
+        let split_block = crate::HipDim3::new(128, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_q81_splitk",
+            split_grid,
+            split_block,
+            &mut [
+                arg(&mut q_ptr),
+                arg(&mut k_ptr),
+                arg(&mut v_ptr),
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut tot_ptr),
+                arg(&mut steps_i),
+                arg(&mut isd),
+                arg(&mut wl),
+                arg(&mut sc),
+                arg(&mut asl),
+                arg(&mut ha),
+                arg(&mut slot_stride_i),
+                arg(&mut cap_rows_i),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        let comb_grid = crate::HipDim3::new(nh as u32, 1, 1);
+        let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_splitk_combine",
+            comb_grid,
+            comb_block,
+            &mut [
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut o_ptr),
+                arg(&mut om_ptr),
+                arg(&mut os_ptr),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        return Ok(dev.active_stream());
+    }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
@@ -8654,6 +9135,98 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    if seq_len == 1 && batch <= 1 && fuse_o == 0 {
+        const SPLIT_K: usize = 8;
+        static SPLITK_SCRATCH: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
+        > = std::sync::OnceLock::new();
+        let need_out_bytes =
+            SPLIT_K * (num_heads as usize) * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * (num_heads as usize) * std::mem::size_of::<f32>();
+        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
+            if rc != 0 {
+                return Err(crate::Error::Backend(format!(
+                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
+                )));
+            }
+            Ok(ptr as u64)
+        };
+        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+            let map = SPLITK_SCRATCH
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut guard = map.lock().unwrap();
+            let dev_idx = dev.ordinal();
+            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
+                if cap >= need_out_bytes {
+                    (po, pm, ps)
+                } else {
+                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                    let po_new = alloc_dev(need_out_bytes)?;
+                    let pm_new = alloc_dev(need_ms_bytes)?;
+                    let ps_new = alloc_dev(need_ms_bytes)?;
+                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                    (po_new, pm_new, ps_new)
+                }
+            } else {
+                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+                let po_new = alloc_dev(need_out_bytes)?;
+                let pm_new = alloc_dev(need_ms_bytes)?;
+                let ps_new = alloc_dev(need_ms_bytes)?;
+                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+                (po_new, pm_new, ps_new)
+            }
+        };
+        let mut split_k_i = SPLIT_K as i32;
+        let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, 1);
+        let split_block = crate::HipDim3::new(128, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_q81_splitk",
+            split_grid,
+            split_block,
+            &mut [
+                arg(&mut q_ptr),
+                arg(&mut k_ptr),
+                arg(&mut v_ptr),
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut tot_ptr),
+                arg(&mut steps_i),
+                arg(&mut isd),
+                arg(&mut wl),
+                arg(&mut sc),
+                arg(&mut asl),
+                arg(&mut ha),
+                arg(&mut slot_stride_i),
+                arg(&mut cap_rows_i),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        let comb_grid = crate::HipDim3::new(nh as u32, 1, 1);
+        let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_splitk_combine",
+            comb_grid,
+            comb_block,
+            &mut [
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut o_ptr),
+                arg(&mut om_ptr),
+                arg(&mut os_ptr),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        return Ok(dev.active_stream());
+    }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
