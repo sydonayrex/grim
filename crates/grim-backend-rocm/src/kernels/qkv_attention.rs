@@ -9790,16 +9790,16 @@ mod tests {
     #[test]
     fn kv_arena_resolver_is_consistent_with_f16_flag() {
         use KvArenaFormat::*;
-        // Unset arena -> driven entirely by the legacy flag.
-        assert_eq!(resolve_kv_arena_format(None, None), F32);
+        // Unset arena -> driven by the legacy flag, defaulting to Q8_1 on ROCm.
+        assert_eq!(resolve_kv_arena_format(None, None), Q8_1);
         assert_eq!(resolve_kv_arena_format(None, Some("1")), F16);
-        assert_eq!(resolve_kv_arena_format(None, Some("off")), F32);
+        assert_eq!(resolve_kv_arena_format(None, Some("off")), Q8_1);
         // Explicit arena wins over the flag, in every spelling.
         assert_eq!(resolve_kv_arena_format(Some("f32"), Some("1")), F32);
         assert_eq!(resolve_kv_arena_format(Some("int8"), Some("1")), Int8);
         assert_eq!(resolve_kv_arena_format(Some("int4"), Some("0")), Int4);
-        // Unrecognized explicit value falls back to F32 (with a warning).
-        assert_eq!(resolve_kv_arena_format(Some("q7"), None), F32);
+        // Unrecognized explicit value falls back to Q8_1 (with a warning).
+        assert_eq!(resolve_kv_arena_format(Some("q7"), None), Q8_1);
     }
 
     /// The f16 flag's disabled spellings are ONE set, not two — this is the
