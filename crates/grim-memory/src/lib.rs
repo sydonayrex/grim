@@ -13,7 +13,10 @@ use grim_tensor::{DType, Device, Shape, Tensor};
 /// MoE resident-set HBM budget (`rocm_kernel_plan.md` WI-C).
 pub mod moe_budget;
 
-pub use moe_budget::{ElasticMoEAllocation, LruResidencyTracker, MoeResidentBudget, ResidentTier};
+pub use moe_budget::{
+    ElasticMoEAllocation, ForesightSwapWindow, LruResidencyTracker, MoeResidentBudget,
+    ResidentTier, LayerQuotaExpertCache, moe_layer_quota_enabled,
+};
 
 /// Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
 pub mod radix;
@@ -213,6 +216,8 @@ pub struct KvBlockPool {
     ssm_states: HashMap<u32, Vec<f32>>,
     /// Checkpoint pool for recurrent/hybrid-attention models anchored at semantic boundaries.
     pub recurrent_checkpoints: RecurrentCheckpointPool,
+    /// Message-boundary conversation checkpoint cache (`GRIM_ASTRUM_CONVERSATION_CKPT=1`).
+    pub conversation_checkpoints: crate::conversation_checkpoint::ConversationCheckpointCache,
     /// Registry of semantic boundary token IDs (e.g. <think>, </tool_call>).
     pub anchor_registry: SemanticAnchorRegistry,
     /// Layout configuration: block-major switch tied to the rocm-aiter feature flag
@@ -229,6 +234,8 @@ pub struct KvBlockPool {
     head_dim: usize,
     /// Target hardware device ordinal assigned to this pool (default 0).
     device_ordinal: usize,
+    /// Optional Reference-Plus-Ring sliding window (R-SWA).
+    pub seq_window: Option<SeqWindow>,
     /// Optional assigned layer index range [start_layer, end_layer) for pipeline parallelism.
     layer_range: Option<(usize, usize)>,
     compressor: Option<Arc<dyn KvCompressor>>,
@@ -295,6 +302,8 @@ impl KvBlockPool {
                     .filter(|&v| v > 0)
                     .unwrap_or(4),
             ),
+            conversation_checkpoints:
+                crate::conversation_checkpoint::ConversationCheckpointCache::default(),
             anchor_registry: SemanticAnchorRegistry::new(vec![151644, 151645, 32000, 32001]),
             block_major_layout,
             recently_zero: VecDeque::new(),
@@ -303,6 +312,7 @@ impl KvBlockPool {
             num_heads,
             head_dim,
             device_ordinal,
+            seq_window: None,
             layer_range: None,
             compressor: None,
             spill: None,
@@ -3413,5 +3423,29 @@ impl KvBlockPool {
             .get(id)
             .map(|b| b.clean_on_host)
             .unwrap_or(false)
+    }
+
+    /// Save a conversation turn-boundary checkpoint (`GRIM_ASTRUM_CONVERSATION_CKPT=1`).
+    pub fn save_conversation_turn_checkpoint(
+        &mut self,
+        prefix_tokens: Vec<u32>,
+        recurrent_state_bytes: Vec<u8>,
+        kv_block_ids: Vec<BlockId>,
+    ) {
+        if crate::conversation_checkpoint::conversation_ckpt_enabled() {
+            self.conversation_checkpoints
+                .save(prefix_tokens, recurrent_state_bytes, kv_block_ids);
+        }
+    }
+
+    /// Restore the longest matching turn-boundary checkpoint if `GRIM_ASTRUM_CONVERSATION_CKPT=1`.
+    pub fn restore_conversation_turn_checkpoint(
+        &mut self,
+        tokens: &[u32],
+    ) -> Option<crate::conversation_checkpoint::RestoredState> {
+        if !crate::conversation_checkpoint::conversation_ckpt_enabled() {
+            return None;
+        }
+        self.conversation_checkpoints.restore_if_prefix_matches(tokens)
     }
 }

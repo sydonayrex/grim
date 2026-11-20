@@ -135,7 +135,15 @@ pub fn resolve(
     // against device 0's perspective only if we can - otherwise report the
     // address as unowned rather than inventing a device.
     let attribution = match ordinal {
-        Some(o) => ledger::attribute(raw.virtual_address, o),
+        Some(o) => {
+            let attr = ledger::attribute(raw.virtual_address, o);
+            if matches!(attr, Attribution::Unowned { .. }) {
+                if let Some(diag) = ledger::diagnose_unowned(raw.virtual_address) {
+                    eprintln!("[fault-diag] unowned {:#x}: {diag:?}", raw.virtual_address);
+                }
+            }
+            attr
+        }
         None => Attribution::Unowned {
             addr: raw.virtual_address,
         },

@@ -218,22 +218,44 @@ pub struct LruResidencyTracker {
     key_to_slot: std::collections::HashMap<(usize, usize), usize>,
     /// Monotonic logical clock for access recency.
     clock: u64,
+    /// Optional per-layer quota + adaptive LRU/LFU + ForesightSwap cache (`GRIM_MOE_LAYER_QUOTA=1`).
+    strata_cache: Option<LayerQuotaExpertCache>,
 }
 
 impl LruResidencyTracker {
     /// Create a new tracker with `capacity` physical slots.
     pub fn new(capacity: usize) -> Self {
+        let strata_cache = if moe_layer_quota_enabled() {
+            Some(LayerQuotaExpertCache::new(capacity, 48, 4))
+        } else {
+            None
+        };
         Self {
             capacity,
             slots: vec![None; capacity],
             key_to_slot: std::collections::HashMap::new(),
             clock: 0,
+            strata_cache,
+        }
+    }
+
+    /// Create a tracker with explicit per-layer quota (`[l*q, (l+1)*q)`) and ForesightSwap depth 4.
+    pub fn with_layer_quota(capacity: usize, num_layers: usize) -> Self {
+        Self {
+            capacity,
+            slots: vec![None; capacity],
+            key_to_slot: std::collections::HashMap::new(),
+            clock: 0,
+            strata_cache: Some(LayerQuotaExpertCache::new(capacity, num_layers, 4)),
         }
     }
 
     /// Check if `(layer_idx, expert_idx)` is currently resident in the GPU cache.
     /// If hit, refreshes recency clock and returns slot index.
     pub fn lookup(&mut self, layer: usize, expert: usize) -> Option<usize> {
+        if let Some(sc) = self.strata_cache.as_mut() {
+            return sc.lookup(layer, expert);
+        }
         let &slot = self.key_to_slot.get(&(layer, expert))?;
         self.clock = self.clock.wrapping_add(1);
         if let Some(entry) = &mut self.slots[slot] {
@@ -245,6 +267,9 @@ impl LruResidencyTracker {
     /// Allocate or evict an LRU slot to admit `(layer_idx, expert_idx)`.
     /// # Contract If free slot exists, uses it.
     pub fn admit(&mut self, layer: usize, expert: usize) -> (usize, Option<(usize, usize)>) {
+        if let Some(sc) = self.strata_cache.as_mut() {
+            return sc.admit(layer, expert, &[]);
+        }
         if let Some(slot) = self.lookup(layer, expert) {
             return (slot, None);
         }
@@ -619,6 +644,211 @@ impl OffloadMoeCache {
                 },
             )
         }
+    }
+}
+
+/// Returns `true` when `GRIM_MOE_LAYER_QUOTA=1` is set (default OFF).
+pub fn moe_layer_quota_enabled() -> bool {
+    std::env::var("GRIM_MOE_LAYER_QUOTA").ok().as_deref() == Some("1")
+}
+
+/// ForesightSwap window:
+/// Requires a 2-hit streak before promoting an off-chip expert into the hot slab,
+/// and protects experts appearing in the next `depth` lookahead steps from eviction.
+#[derive(Debug, Clone)]
+pub struct ForesightSwapWindow {
+    depth: usize,
+    last_demanded_per_layer: std::collections::HashMap<usize, usize>,
+    streak_per_layer: std::collections::HashMap<(usize, usize), u32>,
+}
+
+impl ForesightSwapWindow {
+    pub fn new(depth: usize) -> Self {
+        Self {
+            depth: depth.max(1),
+            last_demanded_per_layer: std::collections::HashMap::new(),
+            streak_per_layer: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Record demand for `(layer, expert)` and return `true` iff it achieved a >=2-hit streak.
+    pub fn record_demand_and_should_promote(&mut self, layer: usize, expert: usize) -> bool {
+        let prev = self.last_demanded_per_layer.insert(layer, expert);
+        let entry = self.streak_per_layer.entry((layer, expert)).or_insert(0);
+        if prev == Some(expert) {
+            *entry += 1;
+        } else {
+            *entry = 1;
+        }
+        *entry >= 2
+    }
+
+    pub fn is_protected(&self, candidate_expert: usize, lookahead_experts: &[usize]) -> bool {
+        lookahead_experts
+            .iter()
+            .take(self.depth)
+            .any(|&e| e == candidate_expert)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QuotaCacheSlot {
+    resident: Option<(usize, usize)>,
+    last_access: u64,
+}
+
+/// Per-Layer Quota + 64-Step Adaptive LRU/LFU + ForesightSwap MoE Cache.
+#[derive(Debug, Clone)]
+pub struct LayerQuotaExpertCache {
+    capacity: usize,
+    num_layers: usize,
+    quota_per_layer: usize,
+    slots: Vec<QuotaCacheSlot>,
+    map: std::collections::HashMap<(usize, usize), usize>,
+    freq: std::collections::HashMap<(usize, usize), u64>,
+    clock: u64,
+    use_lfu: bool,
+    window_ops: u64,
+    lru_shadow_score: u64,
+    lfu_shadow_score: u64,
+    foresight: ForesightSwapWindow,
+}
+
+impl LayerQuotaExpertCache {
+    pub fn new(capacity: usize, num_layers: usize, foresight_depth: usize) -> Self {
+        let n_layers = num_layers.max(1);
+        let cap = capacity.max(n_layers);
+        let quota = (cap / n_layers).max(1);
+        Self {
+            capacity: cap,
+            num_layers: n_layers,
+            quota_per_layer: quota,
+            slots: vec![
+                QuotaCacheSlot {
+                    resident: None,
+                    last_access: 0,
+                };
+                cap
+            ],
+            map: std::collections::HashMap::with_capacity(cap),
+            freq: std::collections::HashMap::new(),
+            clock: 0,
+            use_lfu: false,
+            window_ops: 0,
+            lru_shadow_score: 0,
+            lfu_shadow_score: 0,
+            foresight: ForesightSwapWindow::new(foresight_depth),
+        }
+    }
+
+    pub fn is_using_lfu(&self) -> bool {
+        self.use_lfu
+    }
+
+    fn layer_range(&self, layer: usize) -> (usize, usize) {
+        let l = layer.min(self.num_layers - 1);
+        let start = l * self.quota_per_layer;
+        let end = if l + 1 == self.num_layers {
+            self.capacity
+        } else {
+            ((l + 1) * self.quota_per_layer).min(self.capacity)
+        };
+        (start, end.max(start + 1))
+    }
+
+    pub fn lookup(&mut self, layer: usize, expert: usize) -> Option<usize> {
+        let key = (layer, expert);
+        if let Some(&slot) = self.map.get(&key) {
+            self.clock += 1;
+            self.slots[slot].last_access = self.clock;
+            *self.freq.entry(key).or_insert(0) += 1;
+            return Some(slot);
+        }
+        None
+    }
+
+    pub fn admit(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        lookahead_experts: &[usize],
+    ) -> (usize, Option<(usize, usize)>) {
+        let key = (layer, expert);
+        let f_now = {
+            let e = self.freq.entry(key).or_insert(0);
+            *e += 1;
+            *e
+        };
+        self.clock += 1;
+        self.window_ops += 1;
+        if f_now >= 4 {
+            self.lfu_shadow_score += 2;
+        } else {
+            self.lru_shadow_score += 1;
+        }
+        if self.window_ops >= 64 {
+            self.use_lfu = self.lfu_shadow_score > self.lru_shadow_score;
+            self.window_ops = 0;
+            self.lru_shadow_score >>= 1;
+            self.lfu_shadow_score >>= 1;
+        }
+
+        if let Some(&slot) = self.map.get(&key) {
+            self.slots[slot].last_access = self.clock;
+            return (slot, None);
+        }
+
+        let (start, end) = self.layer_range(layer);
+        for slot in start..end {
+            if self.slots[slot].resident.is_none() {
+                self.slots[slot] = QuotaCacheSlot {
+                    resident: Some(key),
+                    last_access: self.clock,
+                };
+                self.map.insert(key, slot);
+                return (slot, None);
+            }
+        }
+
+        let mut best_slot = start;
+        let mut best_score = (u64::MAX, u64::MAX);
+        for pass in 0..2 {
+            let mut found = false;
+            for slot in start..end {
+                let Some((cand_l, cand_e)) = self.slots[slot].resident else {
+                    continue;
+                };
+                if pass == 0 && self.foresight.is_protected(cand_e, lookahead_experts) {
+                    continue;
+                }
+                let f = self.freq.get(&(cand_l, cand_e)).copied().unwrap_or(1);
+                let rec = self.slots[slot].last_access;
+                let score = if self.use_lfu { (f, rec) } else { (rec, f) };
+                if !found || score < best_score {
+                    best_score = score;
+                    best_slot = slot;
+                    found = true;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        let evicted = self.slots[best_slot].resident.take();
+        if let Some(old_key) = evicted {
+            self.map.remove(&old_key);
+        }
+        self.slots[best_slot] = QuotaCacheSlot {
+            resident: Some(key),
+            last_access: self.clock,
+        };
+        self.map.insert(key, best_slot);
+        (best_slot, evicted)
     }
 }
 

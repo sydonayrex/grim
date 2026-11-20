@@ -1,5 +1,8 @@
 /// Non-prefix KV chunk stitching and attention recalibration.
 pub mod cache_blend;
+/// KVA late-layer prefill skip planner (`GRIM_ASTRUM_KVA_SPLIT`).
+pub mod kva_prefill;
+pub use kva_prefill::{KvaSplitPlan, LayerPrefillMode};
 
 /// WI-HYBRID Layer 2: max session-scoped decode-graph slots per model.
 /// Each slot owns full device arenas; the default keeps GPU memory bounded.

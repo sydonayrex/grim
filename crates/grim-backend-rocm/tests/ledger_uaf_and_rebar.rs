@@ -2,9 +2,13 @@ use grim_backend_rocm::device::probe::parse_kfd_mem_bank_is_private_vram;
 use grim_backend_rocm::memory::ledger::{
     FREED_RING_CAP, UnownedDiagnosis, attribute, deregister, diagnose_unowned, register, reset,
 };
+use std::sync::Mutex;
+
+static LEDGER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn freed_allocation_ring_identifies_use_after_free_and_buffer_overrun() {
+    let _g = LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset();
     register(0x10_0000, 4096, 0, false, "layer 7 kv_k");
     register(0x20_0000, 2048, 0, false, "layer 7 attn_q");
@@ -34,12 +38,12 @@ fn freed_allocation_ring_identifies_use_after_free_and_buffer_overrun() {
     }
 }
 
-/// Ported from Radiance `aql.cpp:760-828`:
 /// 1. `FREED_RING_CAP = 1024` FIFO eviction: freeing 1025 allocations evicts #0 while #1..=1024 resolve.
 /// 2. Re-leased address range: when a freed address is re-used and freed again, the newest owner wins.
 /// 3. Closest-preceding live allocation tie-break for buffer overruns within `OVERRUN_WINDOW_BYTES`.
 #[test]
 fn radiance_oracle_freed_ring_1024_fifo_wrap_and_closest_overrun_tiebreak() {
+    let _g = LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset();
 
     // 1. Register and free 1025 allocations (`0..=1024`); entry 0 must be evicted.

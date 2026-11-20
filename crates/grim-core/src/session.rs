@@ -168,6 +168,13 @@ pub trait SessionT: Send {
     }
     fn set_sampling_greedy(&mut self, _greedy: bool) {}
 
+    /// Last token sampled by the decode loop (greedy or non-greedy), used as the bonus token
+    /// conditioning native MTP (`nextn`) drafts.
+    fn last_sampled_token(&self) -> Option<u32> {
+        None
+    }
+    fn set_last_sampled_token(&mut self, _tok: Option<u32>) {}
+
     /// M2 (speculative verify): snapshot model/recurrent state for rollback.
     /// Returns an opaque snapshot owned by the caller; `None` if no recurrent state.
     fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
@@ -216,6 +223,8 @@ pub struct Inner {
     pub full_output_logits: bool,
     /// Greedy/argmax-only sampling mode (temperature <= 0).
     pub sampling_greedy: bool,
+    /// Last token sampled by the decode loop.
+    pub last_sampled_token: Option<u32>,
     /// Model-installed recurrent-state hooks (T2 hybrid prefix reuse). `None`
     /// means the session has no recurrent state to snapshot or restore.
     pub recurrent_hooks: Option<std::sync::Arc<dyn RecurrentHooks>>,
@@ -235,6 +244,7 @@ impl Inner {
             skip_output_projection: false,
             full_output_logits: false,
             sampling_greedy: false,
+            last_sampled_token: None,
             recurrent_hooks: None,
         }
     }
@@ -251,6 +261,7 @@ impl Inner {
             skip_output_projection: false,
             full_output_logits: false,
             sampling_greedy: false,
+            last_sampled_token: None,
             recurrent_hooks: None,
         }
     }
@@ -372,6 +383,12 @@ impl SessionT for Inner {
     }
     fn set_sampling_greedy(&mut self, greedy: bool) {
         self.sampling_greedy = greedy;
+    }
+    fn last_sampled_token(&self) -> Option<u32> {
+        self.last_sampled_token
+    }
+    fn set_last_sampled_token(&mut self, tok: Option<u32>) {
+        self.last_sampled_token = tok;
     }
 
     fn set_recurrent_hooks(&mut self, hooks: std::sync::Arc<dyn RecurrentHooks>) {

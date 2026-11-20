@@ -366,7 +366,7 @@ impl RocmDevice {
         let d = dim as i32;
         let half = d / 2;
         let rotary_dim = if cfg.rotary_dim > 0 { cfg.rotary_dim } else { dim } as i32;
-        let use_wide = std::env::var("GRIM_RADIANT_WIDE_QK_ROPE")
+        let use_wide = std::env::var("GRIM_FUSED_QK_ROPE")
             .map(|v| v == "1")
             .unwrap_or(false)
             || d != 64

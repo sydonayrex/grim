@@ -744,12 +744,31 @@ impl Lfm2 {
         // The device the step touched. The caller's first D2H is NULL-stream
         // ordered and must not race these launches (the same seam
         // `forward_replay` closes).
-        let mut ords = graph.buffers.layer_devices.clone();
-        if !ords.contains(&dev.ordinal()) {
-            ords.push(dev.ordinal());
-        }
-        for ord in ords {
-            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        if !graph.stream.is_null() {
+            let active = dev.active_stream();
+            if active != graph.stream {
+                unsafe {
+                    thread_local! {
+                        static LFM2_REPLAY_EV: std::cell::Cell<*mut std::ffi::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+                    }
+                    let ev = LFM2_REPLAY_EV.with(|c| {
+                        let mut p = c.get();
+                        if p.is_null() {
+                            let _ = grim_backend_rocm::hipEventCreate(&mut p);
+                            c.set(p);
+                        }
+                        p
+                    });
+                    if !ev.is_null() {
+                        let _ = grim_backend_rocm::hipEventRecord(ev, graph.stream);
+                        let _ = grim_backend_rocm::hipStreamWaitEvent(active, ev, 0);
+                    } else {
+                        let _ = grim_backend_rocm::hipStreamSynchronize(graph.stream);
+                    }
+                }
+            }
+        } else {
+            grim_backend_rocm::RocmDevice::shared(dev.ordinal()).synchronize();
         }
         Ok(())
     }
@@ -775,6 +794,25 @@ impl Lfm2 {
             .buffers
             .write_pos_async(&dev, pos, graph.stream)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        if (std::env::var_os("GRIM_TASK_RING").is_some() || graph.ring_context.is_some())
+            && graph.buffers.emitted_task_graph.is_some()
+        {
+            if graph.ring_context.is_none() {
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(dev.ordinal());
+                if let Some(ir) = &graph.buffers.emitted_task_graph {
+                    if let Ok(Some(ring)) =
+                        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(
+                            &rocm_dev, ir,
+                        )
+                    {
+                        graph.ring_context = Some(ring);
+                    }
+                }
+            }
+            if graph.ring_context.is_some() {
+                return self.lfm2_interpret_ir(graph, token_id);
+            }
+        }
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
@@ -783,12 +821,31 @@ impl Lfm2 {
         // ordered, so without this a logits readback can race kernels still in
         // flight. (`forward_replay_batch` still returns unsynced — its callers
         // own the ordering; do not copy this there blindly.)
-        let mut ords = graph.buffers.layer_devices.clone();
-        if !ords.contains(&dev.ordinal()) {
-            ords.push(dev.ordinal());
-        }
-        for ord in ords {
-            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        if !graph.stream.is_null() {
+            let active = dev.active_stream();
+            if active != graph.stream {
+                unsafe {
+                    thread_local! {
+                        static LFM2_REPLAY_EV: std::cell::Cell<*mut std::ffi::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+                    }
+                    let ev = LFM2_REPLAY_EV.with(|c| {
+                        let mut p = c.get();
+                        if p.is_null() {
+                            let _ = grim_backend_rocm::hipEventCreate(&mut p);
+                            c.set(p);
+                        }
+                        p
+                    });
+                    if !ev.is_null() {
+                        let _ = grim_backend_rocm::hipEventRecord(ev, graph.stream);
+                        let _ = grim_backend_rocm::hipStreamWaitEvent(active, ev, 0);
+                    } else {
+                        let _ = grim_backend_rocm::hipStreamSynchronize(graph.stream);
+                    }
+                }
+            }
+        } else {
+            grim_backend_rocm::RocmDevice::shared(dev.ordinal()).synchronize();
         }
         Ok(())
     }
@@ -819,6 +876,25 @@ impl Lfm2 {
             .buffers
             .write_pos_async(&dev, pos, graph.stream)
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        if (std::env::var_os("GRIM_TASK_RING").is_some() || graph.ring_context.is_some())
+            && graph.buffers.emitted_task_graph.is_some()
+        {
+            if graph.ring_context.is_none() {
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(dev.ordinal());
+                if let Some(ir) = &graph.buffers.emitted_task_graph {
+                    if let Ok(Some(ring)) =
+                        grim_backend_rocm::kernels::task_ring::TaskRingContext::from_graph(
+                            &rocm_dev, ir,
+                        )
+                    {
+                        graph.ring_context = Some(ring);
+                    }
+                }
+            }
+            if graph.ring_context.is_some() {
+                return self.lfm2_interpret_ir(graph, token_ids[0]);
+            }
+        }
         graph
             .replay()
             .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
@@ -834,17 +910,68 @@ impl Lfm2 {
         // (e.g. GRIM_LFM2_F32_HEAD=1 f32 table).
         let h_shape = buffers.head_input.shape().clone();
         let hidden = self.cfg.hidden_size;
+        let prequant_head = matches!(
+            std::env::var("GRIM_PREQUANT_HEAD").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        ) && dot_fused_ok(dev, hidden)
+            && is_q80(&self.output.weight)
+            && !buffers.act_q81_buf.is_empty();
+        if prequant_head {
+            let n_vocab = self.output.weight.shape().dim(0).unwrap_or(0);
+            let m = (h_shape.dims().iter().product::<usize>() / hidden.max(1)).max(1);
+            dev.rms_norm_into(
+                &buffers.head_input,
+                &**self.norm.weight.storage(),
+                self.norm.eps,
+                &buffers.head_input,
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            dev.launch_quantize_q8_1(&buffers.head_input, &buffers.act_q81_buf[0], m, hidden)
+                .map_err(|e| grim_core::error::Error::Backend(format!("head prequant: {e}")))?;
+            dev.launch_dot4_q80_q81_gemv(
+                &buffers.act_q81_buf[0],
+                rocm_storage(&self.output.weight)?,
+                &buffers.head_output,
+                m,
+                n_vocab,
+                hidden,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("head q81 dot4: {e}")))?;
+            return Ok(());
+        }
         let norm_fused_head = dot_fused_ok(dev, hidden) && is_q80(&self.output.weight);
         if norm_fused_head {
             let n_vocab = self.output.weight.shape().dim(0).unwrap_or(0);
-            let m = h_shape.dims().iter().product::<usize>() / hidden.max(1);
+            let m = (h_shape.dims().iter().product::<usize>() / hidden.max(1)).max(1);
+            let fused_head_argmax = m == 1
+                && !matches!(
+                    std::env::var("GRIM_FUSED_HEAD_ARGMAX").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+            if fused_head_argmax {
+                dev.launch_dot4_q80_norm_f32act_argmax_u64_into(
+                    &buffers.head_input,
+                    rocm_storage(&self.norm.weight)?,
+                    self.norm.eps,
+                    rocm_storage(&self.output.weight)?,
+                    &buffers.head_output,
+                    1,
+                    n_vocab,
+                    hidden,
+                )
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("fused norm head argmax: {e}"))
+                })?;
+                return Ok(());
+            }
             dev.launch_dot4_q80_norm_f32act_gemv_into(
                 &buffers.head_input,
                 rocm_storage(&self.norm.weight)?,
                 self.norm.eps,
                 rocm_storage(&self.output.weight)?,
                 &buffers.head_output,
-                m.max(1),
+                m,
                 n_vocab,
                 hidden,
             )

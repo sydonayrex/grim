@@ -2711,3 +2711,81 @@ mod k2v4_tests {
         assert!(dequantize_v4(&vc, vs).iter().all(|x| (x + 0.25).abs() < 1e-6));
     }
 }
+
+/// Deterministic `q4_0` group quantizer with positive tie-break on opposite-sign absmax ties.
+pub fn quantize_q4_0_deterministic_tiebreak(group: &[f32]) -> (Vec<u8>, f32) {
+    assert_eq!(group.len(), 32, "q4_0 group must have 32 elements");
+    let mut amax = 0.0f32;
+    let mut mval = 0.0f32;
+    for &v in group {
+        let a = v.abs();
+        if a > amax || (a == amax && v > mval) {
+            amax = a;
+            mval = v;
+        }
+    }
+    let d = mval / -8.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let mut packed = vec![0u8; 16];
+    for j in 0..16 {
+        let q0 = ((group[j] * id + 8.5).floor() as i32).clamp(0, 15) as u8;
+        let q1 = ((group[j + 16] * id + 8.5).floor() as i32).clamp(0, 15) as u8;
+        packed[j] = q0 | (q1 << 4);
+    }
+    (packed, d)
+}
+
+/// Dequantize 16 packed `q4_0` bytes with signed scale `d` into 32 `f32` values.
+pub fn dequantize_q4_0_deterministic(packed: &[u8], d: f32) -> [f32; 32] {
+    let mut out = [0.0f32; 32];
+    for j in 0..16 {
+        let lo = (packed[j] & 0x0F) as i32 - 8;
+        let hi = (packed[j] >> 4) as i32 - 8;
+        out[j] = (lo as f32) * d;
+        out[j + 16] = (hi as f32) * d;
+    }
+    out
+}
+
+/// Asymmetric `K8V4` head quantizer (`q8_0` Keys + deterministic `q4_0` Values).
+pub fn quantize_k8v4_head(k_row: &[f32], v_row: &[f32]) -> (Vec<i8>, f32, Vec<u8>, f32) {
+    let k_amax = k_row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let k_scale = if k_amax > 1e-30 { k_amax / 127.0 } else { 1.0 };
+    let k_inv = 1.0 / k_scale;
+    let k_i8: Vec<i8> = k_row
+        .iter()
+        .map(|&x| (x * k_inv).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    let (v_packed, v_scale) = quantize_q4_0_deterministic_tiebreak(v_row);
+    (k_i8, k_scale, v_packed, v_scale)
+}
+
+#[inline]
+pub fn kv_k8v4_enabled() -> bool {
+    std::env::var("GRIM_KV_K8V4")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Deterministic Q4 round-half-away-from-zero tie-break helper (`+0.5` for >= 0, `-0.5` for < 0)
+/// avoiding banker's rounding bias on `.5` boundaries.
+#[inline]
+pub fn kv_q4_tiebreak_round(x: f32) -> i32 {
+    if x >= 0.0 {
+        (x + 0.5).floor() as i32
+    } else {
+        (x - 0.5).ceil() as i32
+    }
+}
+
+/// Asymmetric K8/V4 quantization summary: K quantized to 8-bit (`[-127, 127]`), V to 4-bit (`[0, 15]`).
+pub fn quantize_k8_symmetric(k: &[f32]) -> (Vec<i8>, f32) {
+    let amax = k.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+    let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let inv = 1.0 / scale;
+    let q = k
+        .iter()
+        .map(|&v| kv_q4_tiebreak_round(v * inv).clamp(-127, 127) as i8)
+        .collect();
+    (q, scale)
+}

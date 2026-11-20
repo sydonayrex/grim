@@ -172,7 +172,7 @@ pub use crate::device::helpers::{
     check_hip, hip_stream_synchronize, hip_stream_synchronize_after_copy, jit_compile_hsaco,
     memcpy_with_xnack_fallback, upload_device_buffer,
 };
-pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
+pub use crate::device::probe::{probe_host_gpu, probe_rebar_host_writable, probe_system_rocm, probe_xnack};
 
 pub use crate::device::util::{
     DeviceGuard, ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size,

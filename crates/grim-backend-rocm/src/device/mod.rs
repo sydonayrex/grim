@@ -13,6 +13,8 @@ pub mod cubecl;
 pub mod device_recurrent;
 pub mod device_serve;
 pub mod eplb;
+/// Double-buffered PCIe next-layer expert prefetch stream (`GRIM_ASTRUM_EXPERT_PREFETCH=1`).
+pub mod expert_prefetch_stream;
 pub mod gemm_tuning;
 pub mod gemm_tuning_measured;
 /// Prism/Bonsai FWHT-1024 Hadamard launcher (one launch per call).

@@ -883,6 +883,13 @@ pub fn sample_logits_on_device_with_penalty_at_stream(
         }
     }
     if temperature <= 0.0 {
+        let multi_wg = !matches!(
+            std::env::var("GRIM_MULTI_WG_ARGMAX").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if multi_wg {
+            return Ok(Some(device.gpu_argmax_ptr_on_stream(ptr, vocab, stream)?));
+        }
         // Greedy: sampler kernel handles temp<=0 branch; pass through for
         // stream-ordered correctness (ambient argmax would run unordered).
         return Ok(Some(sample_impl(

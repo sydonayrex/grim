@@ -102,6 +102,40 @@ impl RocmStorageView {
         Self::from_offset(parent, byte_offset, bytes, shape)
     }
 
+    /// Build a borrowed view from raw pointer and metadata without owning the parent allocation.
+    ///
+    /// # Safety
+    /// The caller must guarantee `ptr` remains valid and accessible on `ordinal` for the lifetime of this view.
+    pub unsafe fn from_raw_unowned(
+        ptr: u64,
+        bytes: usize,
+        shape: Shape,
+        dtype: DType,
+        provenance: QuantProvenance,
+        ordinal: usize,
+    ) -> Self {
+        #[derive(Debug)]
+        struct DummyStorage;
+        impl BackendStorage for DummyStorage {
+            fn device_ptr(&self) -> Option<u64> { None }
+            fn shape(&self) -> &Shape { static S: std::sync::OnceLock<Shape> = std::sync::OnceLock::new(); S.get_or_init(|| Shape::new(vec![0])) }
+            fn dtype(&self) -> DType { DType { arith: crate::ArithType::F32, storage: crate::DTypeStorage::Native } }
+            fn provenance(&self) -> QuantProvenance { QuantProvenance::default() }
+            fn device_ordinal(&self) -> u32 { 0 }
+            fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> { Ok(Vec::new()) }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+        Self {
+            device_ptr: ptr,
+            bytes,
+            shape,
+            dtype,
+            provenance,
+            ordinal,
+            _parent: Arc::new(DummyStorage),
+        }
+    }
+
     /// The device pointer for the start of this view (parent base + offset).
     pub fn device_ptr_u64(&self) -> u64 {
         self.device_ptr

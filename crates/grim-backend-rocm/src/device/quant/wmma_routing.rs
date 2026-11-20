@@ -87,7 +87,7 @@ impl RocmDevice {
         let prefill_dequant_min_m: usize = std::env::var("GRIM_PREFILL_DEQUANT_MIN_M")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+            .unwrap_or(16);
         if prefill_dequant_on && m >= prefill_dequant_min_m {
             if let Some(format_tag) = format_tag_hint {
                 self.launch_iq_prefill_dequant_rocblas_f16(a, b, out, m, n, k, format_tag)?;

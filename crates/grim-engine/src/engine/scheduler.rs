@@ -376,6 +376,16 @@ impl Engine {
             let is_terminal_chunk = target >= prompt_tokens;
             if let Some(session) = self.sessions.get_mut(&id) {
                 session.set_skip_output_projection(!is_terminal_chunk);
+                if let Some(g) = self.decode_graphs.get(&model_id) {
+                    if let Some(model) = self.models.get(&model_id) {
+                        let inner_any = grim_core::Model::as_any(model.model.inner_target());
+                        if let Some(gm) = inner_any.downcast_ref::<grim_models_transformer::Qwen35>() {
+                            let _ = gm.attach_decode_graph_arenas(session.as_mut(), &g.buffers);
+                        } else if let Some(gm) = inner_any.downcast_ref::<grim_models_transformer::Lfm2>() {
+                            let _ = gm.attach_decode_graph_arenas(session.as_mut(), &g.buffers);
+                        }
+                    }
+                }
             }
             let forward_res = self.drive_forward(&model_id, id, &ids, &positions);
             if let Some(session) = self.sessions.get_mut(&id) {

@@ -735,9 +735,9 @@ impl RocmDevice {
         )
     }
 
-    /// Returns `true` when `GRIM_RADIANT_WMMA_W4A8=1` is set (default OFF).
+    /// Returns `true` when `GRIM_WMMA_W4A8=1` is set (default OFF).
     pub fn wmma_w4a8_iu8_enabled() -> bool {
-        std::env::var("GRIM_RADIANT_WMMA_W4A8").ok().as_deref() == Some("1")
+        std::env::var("GRIM_WMMA_W4A8").ok().as_deref() == Some("1")
     }
 
     /// Launch RDNA4 `iu8` WMMA 16x16x16 (`grim_wmma_w4a8_iu8_gfx12`) for `M >= 16`.
@@ -1439,7 +1439,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        if std::env::var("GRIM_STRATA_IQ_FAST").ok().as_deref() == Some("1") {
+        if std::env::var("GRIM_WMMA_IQ_FAST").ok().as_deref() == Some("1") {
             let mut aptr = a.device_ptr.ok_or_else(|| Error::Backend("iq4nl_fast: a has no device ptr".into()))?;
             let mut bptr = b.device_ptr.ok_or_else(|| Error::Backend("iq4nl_fast: b has no device ptr".into()))?;
             let mut cptr = out.device_ptr.ok_or_else(|| Error::Backend("iq4nl_fast: out has no device ptr".into()))?;
@@ -1447,7 +1447,7 @@ impl RocmDevice {
             let mut nn = n as i32;
             let mut kk = k as i32;
             return self.launch_compute_kernel(
-                "grim_wmma_iq4nl_strata_fast",
+                "grim_wmma_iq4nl_fast",
                 HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1),
                 HipDim3::new(32, 1, 1),
                 &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut cptr), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
@@ -1474,7 +1474,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        if std::env::var("GRIM_STRATA_IQ_FAST").ok().as_deref() == Some("1") {
+        if std::env::var("GRIM_WMMA_IQ_FAST").ok().as_deref() == Some("1") {
             let mut aptr = a.device_ptr.ok_or_else(|| Error::Backend("iq4xs_fast: a has no device ptr".into()))?;
             let mut bptr = b.device_ptr.ok_or_else(|| Error::Backend("iq4xs_fast: b has no device ptr".into()))?;
             let mut cptr = out.device_ptr.ok_or_else(|| Error::Backend("iq4xs_fast: out has no device ptr".into()))?;
@@ -1482,7 +1482,7 @@ impl RocmDevice {
             let mut nn = n as i32;
             let mut kk = k as i32;
             return self.launch_compute_kernel(
-                "grim_wmma_iq4xs_strata_fast",
+                "grim_wmma_iq4xs_fast",
                 HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1),
                 HipDim3::new(32, 1, 1),
                 &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut cptr), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
@@ -3249,7 +3249,7 @@ impl RocmDevice {
             .max(1);
         let n = out_dims.last().copied().unwrap_or(0);
         let k = a.shape().dims().last().copied().unwrap_or(0);
-        if m == 1 && n > 0 {
+        if m >= 1 && m <= 32 && n > 0 {
             if let (Some(a_s), Some(b_s)) = (
                 a.as_any().downcast_ref::<RocmStorage>(),
                 b.as_any().downcast_ref::<RocmStorage>(),
@@ -3259,7 +3259,11 @@ impl RocmDevice {
                 let b_is_f32 = b_s.dtype().arith == ArithType::F32
                     && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
                 if a_is_f32 && b_is_f32 && a_s.device_ptr_is_valid() && b_s.device_ptr_is_valid() {
-                    let stream = self.launch_fp32_gemv(a_s, b_s, out, m, n, k)?;
+                    let stream = if m == 1 {
+                        self.launch_fp32_gemv(a_s, b_s, out, m, n, k)?
+                    } else {
+                        self.launch_fp32_mm_tile_for_ab(a_s, b_s, out, m, n, k)?
+                    };
                     return Ok(Box::new(RocmHandle::new(Some(stream))));
                 }
             }
@@ -4025,7 +4029,11 @@ impl RocmDevice {
                             std::env::var("GRIM_Q6K_DOT4").as_deref(),
                             Ok("0" | "false" | "off")
                         ) {
-                            self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                            if crate::device::quant::kquant_dot4_ok_for(n) {
+                                self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                            } else {
+                                self.launch_dot4_q6k_f32act_gemv_for_ab(a_s, w, out, m, n, k)?
+                            }
                         } else {
                             self.launch_fused_dequant_gemm_q6k(a_s, w, out, m, n, k)?
                         }

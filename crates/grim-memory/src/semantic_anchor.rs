@@ -119,6 +119,8 @@ pub struct RecurrentCheckpointPool {
     node_to_checkpoint: HashMap<usize, CheckpointId>,
     /// Counter for generating monotonically increasing checkpoint IDs.
     next_id: usize,
+    /// Optional O(1) 2-slot committed/draft speculative rollback slot.
+    pub dual_slot: Option<DualRecurrentSlot>,
 }
 
 impl RecurrentCheckpointPool {
@@ -131,7 +133,19 @@ impl RecurrentCheckpointPool {
             checkpoints: HashMap::with_capacity(max_checkpoints),
             node_to_checkpoint: HashMap::new(),
             next_id: 1,
+            dual_slot: None,
         }
+    }
+
+    /// Initialize (or reset) the O(1) speculative dual-slot for hybrid GDN/Mamba rollback.
+    pub fn init_dual_slot(
+        &mut self,
+        state_len: usize,
+        num_layers: usize,
+        qlen: usize,
+    ) -> &mut DualRecurrentSlot {
+        self.dual_slot = Some(DualRecurrentSlot::new(state_len, num_layers, qlen));
+        self.dual_slot.as_mut().expect("just set")
     }
 
     /// Store a recurrent checkpoint anchored to `radix_node_id`.

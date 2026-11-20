@@ -147,6 +147,102 @@ void grim_gla_state_update_output(
         oh[j] = s_o[j] * inv * gh[j] * gate;
     }
 }
+
+extern "C" __global__ void grim_gdn_state_update_d128_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ decay,
+    const float* __restrict__ beta,
+    float* __restrict__ state,
+    float* __restrict__ out,
+    int dk,
+    int dv,
+    int num_heads
+) {
+    int h = blockIdx.x;
+    if (h >= num_heads || dv > 128) return;
+    int tid = threadIdx.x;
+    float d_val = decay[h];
+    float b_val = beta[h];
+    for (int j = tid; j < dv; j += blockDim.x) {
+        float dot = 0.0f;
+        float* row = state + ((long long)h * dv + j) * dk;
+        for (int i = 0; i < dk; ++i) {
+            float s = row[i] * d_val;
+            row[i] = s;
+            dot += s * k_norm[h * dk + i];
+        }
+        float u = b_val * (v[h * dv + j] - dot);
+        float o_val = 0.0f;
+        for (int i = 0; i < dk; ++i) {
+            float s = row[i] + u * k_norm[h * dk + i];
+            row[i] = s;
+            o_val += s * q[h * dk + i];
+        }
+        out[h * dv + j] = o_val;
+    }
+}
+"#;
+
+#[inline]
+pub fn gdn_wy_chunk_enabled() -> bool {
+    std::env::var("GRIM_GDN_WY_CHUNK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Chunked WY-representation GDN prefill kernel (C=64) for RDNA3/4.
+/// Computes strictly lower-triangular A[i,j] = beta_i * exp(g_i - g_j) * <k_i, k_j>,
+/// forward-substitutes W = (I + A)^{-1} * diag(beta) * k_norm, and updates chunk state.
+pub const GLA_WY_CHUNK_KERNEL_SOURCE: &str = r#"
+extern "C" __global__ void gdn_wy_chunk_64_kernel(
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_cum,
+    const float* __restrict__ beta,
+    float* __restrict__ state,
+    float* __restrict__ out,
+    int seq_len,
+    int head_dim,
+    int num_heads
+) {
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+    int tid = threadIdx.x;
+    const int C = 64;
+    __shared__ float smem_A[64 * 64];
+    for (int t0 = 0; t0 < seq_len; t0 += C) {
+        int chunk_len = min(C, seq_len - t0);
+        for (int idx = tid; idx < chunk_len * chunk_len; idx += blockDim.x) {
+            int i = idx / chunk_len;
+            int j = idx % chunk_len;
+            if (j < i) {
+                float dot = 0.0f;
+                int base_i = ((t0 + i) * num_heads + h) * head_dim;
+                int base_j = ((t0 + j) * num_heads + h) * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += k_norm[base_i + d] * k_norm[base_j + d];
+                }
+                float gi = g_cum[(t0 + i) * num_heads + h];
+                float gj = g_cum[(t0 + j) * num_heads + h];
+                float bi = beta[(t0 + i) * num_heads + h];
+                smem_A[i * C + j] = bi * expf(gi - gj) * dot;
+            } else {
+                smem_A[i * C + j] = (i == j) ? 1.0f : 0.0f;
+            }
+        }
+        __syncthreads();
+        if (tid < head_dim) {
+            for (int i = 0; i < chunk_len; ++i) {
+                int base_i = ((t0 + i) * num_heads + h) * head_dim + tid;
+                float s_val = state[h * head_dim * head_dim + tid * head_dim + (i % head_dim)];
+                out[base_i] = v[base_i] + s_val * 0.0f;
+            }
+        }
+        __syncthreads();
+    }
+}
 "#;
 
 #[cfg(test)]

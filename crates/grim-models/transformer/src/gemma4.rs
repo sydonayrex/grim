@@ -250,7 +250,7 @@ impl Gemma4ProportionalRope {
     }
 
     /// Rotate `x` (`[steps, num_heads * head_dim]`).
-    /// Dispatches on-device via `rope_2d_on_device` when `GRIM_RADIANT_GEMMA4_GPU_ROPE=1` and `x` is on GPU.
+    /// Dispatches on-device via `rope_2d_on_device` when `GRIM_GEMMA4_GPU_ROPE=1` and `x` is on GPU.
     pub fn apply(&self, x: &Tensor, num_heads: usize, positions: &[u32]) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (steps, width) = (dims[0], dims[1]);
@@ -264,7 +264,7 @@ impl Gemma4ProportionalRope {
             )));
         }
         if !x.device().is_cpu()
-            && std::env::var("GRIM_RADIANT_GEMMA4_GPU_ROPE").as_deref() == Ok("1")
+            && std::env::var("GRIM_GEMMA4_GPU_ROPE").as_deref() == Ok("1")
         {
             let rope = Rope::from_config(self.to_yarn_rope_config());
             return crate::shared_attention::rope_2d_on_device(&rope, x, num_heads, positions);

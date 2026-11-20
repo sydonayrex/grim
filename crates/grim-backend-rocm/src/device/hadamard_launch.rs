@@ -329,6 +329,11 @@ pub fn launch_gdn_perm(
     Ok(())
 }
 
+/// Returns `true` when `GRIM_FUSED_FWHT_Q80=1` is set (default OFF).
+pub fn fused_fwht_q80_enabled() -> bool {
+    std::env::var("GRIM_FUSED_FWHT_Q80").ok().as_deref() == Some("1")
+}
+
 /// Fused Tiled SignFlip + FWHT-1024 + Q8_0 quantization (34 bytes per 32 elements).
 /// Eliminates the intermediate f32 HBM write/read and separate quantize launch.
 pub fn launch_fwht_signed_tiled_q80(

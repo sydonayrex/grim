@@ -1461,7 +1461,8 @@ impl RocmDevice {
         let mut eps_f = eps;
         let mut total_i = total as i32;
         let rows = total / row_len.max(1);
-        if rows == 1
+        if rows >= 1
+            && rows <= 16
             && row_len >= 1024
             && !matches!(
                 std::env::var("GRIM_RMS_NORM_DECODE").as_deref(),
@@ -1470,7 +1471,7 @@ impl RocmDevice {
         {
             self.launch_compute_kernel(
                 "grim_add_rms_norm_decode",
-                crate::HipDim3::new(1, 1, 1),
+                crate::HipDim3::new(rows as u32, 1, 1),
                 crate::HipDim3::new(256, 1, 1),
                 &mut [
                     arg(&mut x_ptr),

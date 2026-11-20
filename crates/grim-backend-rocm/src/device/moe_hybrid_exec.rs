@@ -152,6 +152,8 @@ pub struct AstrumMoeResidencyState {
     pub profile: Option<ResidentProfileFreq>,
     /// Optional activation trace (layer, expert hit counts).
     pub trace: Option<ExpertRouteTrace>,
+    /// Optional double-buffered next-layer PCIe expert prefetcher (`GRIM_ASTRUM_EXPERT_PREFETCH=1`).
+    pub prefetch_stream: Option<crate::device::expert_prefetch_stream::ExpertPrefetchStream>,
 }
 
 impl AstrumMoeResidencyState {
@@ -162,10 +164,18 @@ impl AstrumMoeResidencyState {
         } else {
             None
         };
+        let prefetch_stream =
+            if crate::device::expert_prefetch_stream::astrum_expert_prefetch_enabled() && layers > 0
+            {
+                Some(crate::device::expert_prefetch_stream::ExpertPrefetchStream::new(layers))
+            } else {
+                None
+            };
         Self {
             config,
             profile: None,
             trace,
+            prefetch_stream,
         }
     }
 
@@ -369,8 +379,17 @@ impl MoeHybridExecutor {
             };
         }
 
-        // Apply FreeToken q* closed-form policy: q* = round(m * B_P / B_H)
-        let ratio = (self.pcie_bandwidth_mbps / self.host_bandwidth_mbps).clamp(0.0, 1.0);
+        // Apply closed-form bandwidth ratio or calibrated PCIe share (`GRIM_PCIE_BW_SHARE=1`).
+        let ratio = if calibrated_pcie_share_enabled() {
+            compute_pcie_share(
+                (self.pcie_bandwidth_mbps / 1000.0) as f32,
+                (self.host_bandwidth_mbps / 1000.0) as f32,
+            ) as f64
+        } else if self.host_bandwidth_mbps <= 0.0 {
+            1.0
+        } else {
+            (self.pcie_bandwidth_mbps / self.host_bandwidth_mbps).clamp(0.0, 1.0)
+        };
         let q_raw = (m as f64 * ratio).round() as usize;
         let q = q_raw.clamp(1, m);
 
@@ -472,6 +491,97 @@ impl MoeHybridExecutor {
         }
         Ok(())
     }
+}
+
+/// Returns `true` when `GRIM_PCIE_BW_SHARE=1` is set (default OFF).
+pub fn calibrated_pcie_share_enabled() -> bool {
+    std::env::var("GRIM_PCIE_BW_SHARE").ok().as_deref() == Some("1")
+}
+
+/// Calibrated PCIe-vs-CPU miss share rule:
+/// `k(R) = clamp(0.8 + 0.03 * (R - 10), 0.8, 1.85)`
+/// `share = clamp(L / (L + k(R) * R), 0.10, 0.95)`
+pub fn compute_pcie_share(link_gbps: f32, cpu_bw_gbps: f32) -> f32 {
+    if link_gbps <= 0.0 || cpu_bw_gbps <= 0.0 {
+        return 1.0;
+    }
+    let k = (0.8 + 0.03 * (cpu_bw_gbps - 10.0)).clamp(0.8, 1.85);
+    (link_gbps / (link_gbps + k * cpu_bw_gbps)).clamp(0.10, 0.95)
+}
+
+/// Subset latency-model miss splitter.
+#[derive(Debug, Clone, Copy)]
+pub struct PcieLatencyModel {
+    pub pcie_setup_us: f64,
+    pub pcie_bw_bytes_per_us: f64,
+    pub cpu_setup_us: f64,
+    pub cpu_bw_bytes_per_us: f64,
+}
+
+impl PcieLatencyModel {
+    /// Enumerate all `2^m` subsets (`m <= 16`) and return the bitmask of experts
+    /// assigned to GPU PCIe DMA that minimizes `max(T_gpu(S), T_cpu(U \ S))`.
+    pub fn optimal_split_mask(&self, expert_bytes: &[usize]) -> u32 {
+        let m = expert_bytes.len().min(16);
+        if m == 0 {
+            return 0;
+        }
+        let total_bytes: f64 = expert_bytes[..m].iter().map(|&b| b as f64).sum();
+        let mut best_mask = 0u32;
+        let mut best_cost = f64::INFINITY;
+        for mask in 0..(1u32 << m) {
+            let mut gpu_bytes = 0.0f64;
+            for i in 0..m {
+                if (mask & (1u32 << i)) != 0 {
+                    gpu_bytes += expert_bytes[i] as f64;
+                }
+            }
+            let cpu_bytes = total_bytes - gpu_bytes;
+            let t_gpu = if gpu_bytes > 0.0 {
+                self.pcie_setup_us + gpu_bytes / self.pcie_bw_bytes_per_us.max(1.0)
+            } else {
+                0.0
+            };
+            let t_cpu = if cpu_bytes > 0.0 {
+                self.cpu_setup_us + cpu_bytes / self.cpu_bw_bytes_per_us.max(1.0)
+            } else {
+                0.0
+            };
+            let makespan = t_gpu.max(t_cpu);
+            if makespan < best_cost {
+                best_cost = makespan;
+                best_mask = mask;
+            }
+        }
+        best_mask
+    }
+}
+
+/// RDNA4/UMA faster-mode `top-5 of 6` rule:
+/// Drops the 6th lowest-weight expert only when it is non-resident in VRAM,
+/// renormalizing the remaining 5 weights so their sum is preserved.
+pub fn select_top5_of_6_faster_experts(
+    routed: &[(usize, f32)],
+    is_resident: impl Fn(usize) -> bool,
+) -> Vec<(usize, f32)> {
+    if routed.len() != 6 {
+        return routed.to_vec();
+    }
+    let mut sorted = routed.to_vec();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if is_resident(sorted[5].0) {
+        return sorted;
+    }
+    let orig_sum: f32 = sorted.iter().map(|x| x.1).sum();
+    sorted.truncate(5);
+    let kept_sum: f32 = sorted.iter().map(|x| x.1).sum();
+    if kept_sum > 1e-12 {
+        let scale = orig_sum / kept_sum;
+        for item in &mut sorted {
+            item.1 *= scale;
+        }
+    }
+    sorted
 }
 
 #[cfg(test)]

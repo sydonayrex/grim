@@ -8,6 +8,16 @@ use grim_tensor::error::{Error, Result};
 
 use crate::{check_hip, hipFree, hipMalloc, hipMallocManaged};
 
+/// 2 MiB big-page VMM physical mapping floor on RDNA4 (`gfx1201`).
+pub const VMM_GRANULARITY_FLOOR_BYTES: usize = 2 * 1024 * 1024;
+
+/// Round `bytes` up to `driver_granularity.max(VMM_GRANULARITY_FLOOR_BYTES)`.
+#[inline]
+pub fn align_vmm_elastic_chunk(bytes: usize, driver_granularity: usize) -> usize {
+    let gran = driver_granularity.max(VMM_GRANULARITY_FLOOR_BYTES);
+    bytes.max(1).div_ceil(gran) * gran
+}
+
 /// Layout key for the scratch pool: (rounded size, alignment). [see: `hipMalloc`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PoolLayout {

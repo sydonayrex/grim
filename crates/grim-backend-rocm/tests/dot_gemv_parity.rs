@@ -3274,3 +3274,70 @@ fn dot4_q80_gemv_deterministic_across_runs() {
         std::env::set_var("GRIM_DOT_GEMV", "0");
     }
 }
+
+#[test]
+fn probe_blk3_wq_dispatch_vs_direct() {
+    let _lock = grim_backend_rocm::device::util::take_gpu_test_lock_logged();
+    let Some(dev) = gpu_device() else { return; };
+    let Ok(bytes) = std::fs::read("/tmp/real_w_blk3_wq__attention_layer_.bin") else { return; };
+    let k = 5120usize;
+    let row_bytes = (k / 256) * 176;
+    let n = bytes.len() / row_bytes;
+    let mut seed = 0x51DEu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (((seed >> 33) as u32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a_f32: Vec<f32> = (0..k).map(|_| rand()).collect();
+    let q5k_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q5K) };
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &bytes, &Shape::new(vec![bytes.len()]), q5k_dtype).unwrap();
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![1, k]), DType::F32).unwrap();
+    let col = 10244usize;
+    let w_row = grim_quant::dequant_q5k(&bytes[col * row_bytes..(col + 1) * row_bytes], k).unwrap();
+    let ref0: f32 = a_f32.iter().zip(&w_row).map(|(x, y)| x * y).sum();
+
+    // Path 1: quantized_matmul (what the real-weight test calls).
+    let (s, h) = dev
+        .quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::Q5K, &Shape::new(vec![1, n]))
+        .unwrap();
+    h.synchronize().unwrap();
+    let via_dispatch = s.to_cpu_vec_f32().unwrap()[col];
+
+    // Path 2: explicit quantize + direct dot4 kernel.
+    let out_dev = CoreTensorOps::zeros(&dev, &Shape::new(vec![1, n]), DType::F32).unwrap();
+    let q81_dev = CoreTensorOps::zeros(&dev, &Shape::new(vec![(k / 32) * 36]), DType::U8).unwrap();
+    let as_r = grim_backend_rocm::device::util::as_rocm;
+    let _ = dev.launch_quantize_q8_1(as_r(a_dev.as_ref()).unwrap(), as_r(q81_dev.as_ref()).unwrap(), 1, k).unwrap();
+    dev.synchronize();
+    dev.launch_dot4_q5k_q81_gemv_for_ab(as_r(q81_dev.as_ref()).unwrap(), as_r(b_dev.as_ref()).unwrap(), as_r(out_dev.as_ref()).unwrap(), 1, n, k).unwrap();
+    dev.synchronize();
+    let direct = out_dev.to_cpu_vec_f32().unwrap()[col];
+    eprintln!("[probe-dispatch] col={col} ref={ref0:.4e} via_dispatch={via_dispatch:.4e} direct={direct:.4e}");
+    // Host Q8_1 emulation of the activation (per 32-block: d=amax/127, q=round(x/d)).
+    let mut a_q = vec![0f32; k];
+    for b in 0..k / 32 {
+        let blk = &a_f32[b * 32..(b + 1) * 32];
+        let amax = blk.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let d = amax / 127.0;
+        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for i in 0..32 {
+            a_q[b * 32 + i] = (blk[i] * inv).round() * d;
+        }
+    }
+    let all = out_dev.to_cpu_vec_f32().unwrap();
+    let mut bad = 0usize;
+    let mut worst = (0usize, 0f32);
+    let mut first_bad = usize::MAX;
+    for c in (0..n).step_by(16) {
+        let w = grim_quant::dequant_q5k(&bytes[c * row_bytes..(c + 1) * row_bytes], k).unwrap();
+        let r: f32 = a_q.iter().zip(&w).map(|(x, y)| x * y).sum();
+        let e = (all[c] - r).abs();
+        if e > 0.05 {
+            bad += 1;
+            if first_bad == usize::MAX { first_bad = c; }
+        }
+        if e > worst.1 { worst = (c, e); }
+    }
+    let wq: f32 = a_q.iter().zip(&w_row).map(|(x, y)| x * y).sum();
+    eprintln!("[probe-dispatch] host-q81 ref at col {col} = {wq:.4e}; sampled cols bad(>0.05)={bad}/{} first_bad={first_bad} worst={worst:?}", (n + 15) / 16);
+}

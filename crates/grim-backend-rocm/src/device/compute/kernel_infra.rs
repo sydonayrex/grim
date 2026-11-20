@@ -218,6 +218,29 @@ impl RocmDevice {
         let x_ptr = x_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("gpu_argmax: x has no device ptr".into()))?;
+        self.gpu_argmax_ptr_impl(x_ptr, n, None)
+    }
+
+    /// Multi-workgroup tree reduction for argmax on an explicit stream.
+    /// Falls back to ambient if `grim_argmax_stage1`/`stage2` are not yet pre-resolved.
+    pub fn gpu_argmax_ptr_on_stream(
+        &self,
+        x_ptr: u64,
+        n: usize,
+        stream: *mut c_void,
+    ) -> Result<u32> {
+        if n == 0 {
+            return Err(Error::Backend("argmax: empty tensor".into()));
+        }
+        self.gpu_argmax_ptr_impl(x_ptr, n, Some(stream))
+    }
+
+    fn gpu_argmax_ptr_impl(
+        &self,
+        x_ptr: u64,
+        n: usize,
+        explicit_stream: Option<*mut c_void>,
+    ) -> Result<u32> {
 
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
@@ -285,35 +308,183 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("argmax out_buf is None".into()))?;
         let out_ptr = dev_ptr(out_buf)?;
 
+        if let Some(s) = explicit_stream {
+            const FUSED_BLOCKS: u32 = 128;
+            let grid_fused = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, FUSED_BLOCKS);
+            check_hip("gpu_argmax_fused_u64 memset", unsafe {
+                crate::hipMemsetAsync(out_ptr as *mut c_void, 0, 8, s)
+            })?;
+            let mut x_p = x_ptr;
+            let mut out_p = out_ptr;
+            let mut n_i = n as i32;
+            let r = self.launch_compute_kernel_on_stream(
+                "grim_argmax_fused_u64",
+                HipDim3::new(grid_fused, 1, 1),
+                HipDim3::new(BLOCK_SIZE, 1, 1),
+                &mut [arg(&mut x_p), arg(&mut out_p), arg(&mut n_i)],
+                s,
+                0,
+            );
+            if let Err(e) = r {
+                if format!("{e}").contains("not pre-resolved") {
+                    let _ = self.launch_compute_kernel(
+                        "grim_argmax_fused_u64",
+                        HipDim3::new(1, 1, 1),
+                        HipDim3::new(BLOCK_SIZE, 1, 1),
+                        &mut [arg(&mut x_p), arg(&mut out_p), arg(&mut n_i)],
+                    )?;
+                    check_hip("gpu_argmax_fused_u64 memset", unsafe {
+                        crate::hipMemsetAsync(out_ptr as *mut c_void, 0, 8, s)
+                    })?;
+                    self.launch_compute_kernel_on_stream(
+                        "grim_argmax_fused_u64",
+                        HipDim3::new(grid_fused, 1, 1),
+                        HipDim3::new(BLOCK_SIZE, 1, 1),
+                        &mut [arg(&mut x_p), arg(&mut out_p), arg(&mut n_i)],
+                        s,
+                        0,
+                    )?;
+                } else {
+                    return Err(e);
+                }
+            }
+            let mut res_u64: u64 = 0u64;
+            check_hip("gpu_argmax_fused_u64 D2H", unsafe {
+                crate::memory::storage::count_blocking_d2h();
+                hipMemcpyAsync(
+                    &mut res_u64 as *mut u64 as *mut c_void,
+                    out_p as *mut c_void,
+                    std::mem::size_of::<u64>(),
+                    HipMemcpyKind::DeviceToHost,
+                    s,
+                )
+            })?;
+            check_hip("gpu_argmax_fused_u64 sync", unsafe { hipStreamSynchronize(s) })?;
+            return Ok((res_u64 & 0xFFFF_FFFF) as u32);
+        }
+
         let mut x_p = x_ptr;
         let mut part_v_p = partial_vals_ptr;
         let mut part_i_p = partial_idxs_ptr;
         let mut n_i = n as i32;
-        let _ = self.launch_compute_kernel(
-            "grim_argmax_stage1",
-            HipDim3::new(grid_blocks, 1, 1),
-            HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut x_p),
-                arg(&mut part_v_p),
-                arg(&mut part_i_p),
-                arg(&mut n_i),
-            ],
-        )?;
+        if let Some(s) = explicit_stream {
+            let r1 = self.launch_compute_kernel_on_stream(
+                "grim_argmax_stage1",
+                HipDim3::new(grid_blocks, 1, 1),
+                HipDim3::new(BLOCK_SIZE, 1, 1),
+                &mut [
+                    arg(&mut x_p),
+                    arg(&mut part_v_p),
+                    arg(&mut part_i_p),
+                    arg(&mut n_i),
+                ],
+                s,
+                0,
+            );
+            if let Err(e) = r1 {
+                if format!("{e}").contains("not pre-resolved") {
+                    let _ = self.launch_compute_kernel(
+                        "grim_argmax_stage1",
+                        HipDim3::new(1, 1, 1),
+                        HipDim3::new(BLOCK_SIZE, 1, 1),
+                        &mut [
+                            arg(&mut x_p),
+                            arg(&mut part_v_p),
+                            arg(&mut part_i_p),
+                            arg(&mut n_i),
+                        ],
+                    )?;
+                    self.launch_compute_kernel_on_stream(
+                        "grim_argmax_stage1",
+                        HipDim3::new(grid_blocks, 1, 1),
+                        HipDim3::new(BLOCK_SIZE, 1, 1),
+                        &mut [
+                            arg(&mut x_p),
+                            arg(&mut part_v_p),
+                            arg(&mut part_i_p),
+                            arg(&mut n_i),
+                        ],
+                        s,
+                        0,
+                    )?;
+                } else {
+                    return Err(e);
+                }
+            }
+        } else {
+            let _ = self.launch_compute_kernel(
+                "grim_argmax_stage1",
+                HipDim3::new(grid_blocks, 1, 1),
+                HipDim3::new(BLOCK_SIZE, 1, 1),
+                &mut [
+                    arg(&mut x_p),
+                    arg(&mut part_v_p),
+                    arg(&mut part_i_p),
+                    arg(&mut n_i),
+                ],
+            )?;
+        }
 
         let mut out_p = out_ptr;
         let mut num_part = grid_blocks as i32;
-        let stream = self.launch_compute_kernel(
-            "grim_argmax_stage2",
-            HipDim3::new(1, 1, 1),
-            HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut part_v_p),
-                arg(&mut part_i_p),
-                arg(&mut out_p),
-                arg(&mut num_part),
-            ],
-        )?;
+        let stream = if let Some(s) = explicit_stream {
+            let r2 = self.launch_compute_kernel_on_stream(
+                "grim_argmax_stage2",
+                HipDim3::new(1, 1, 1),
+                HipDim3::new(BLOCK_SIZE, 1, 1),
+                &mut [
+                    arg(&mut part_v_p),
+                    arg(&mut part_i_p),
+                    arg(&mut out_p),
+                    arg(&mut num_part),
+                ],
+                s,
+                0,
+            );
+            if let Err(e) = r2 {
+                if format!("{e}").contains("not pre-resolved") {
+                    let _ = self.launch_compute_kernel(
+                        "grim_argmax_stage2",
+                        HipDim3::new(1, 1, 1),
+                        HipDim3::new(BLOCK_SIZE, 1, 1),
+                        &mut [
+                            arg(&mut part_v_p),
+                            arg(&mut part_i_p),
+                            arg(&mut out_p),
+                            arg(&mut num_part),
+                        ],
+                    )?;
+                    self.launch_compute_kernel_on_stream(
+                        "grim_argmax_stage2",
+                        HipDim3::new(1, 1, 1),
+                        HipDim3::new(BLOCK_SIZE, 1, 1),
+                        &mut [
+                            arg(&mut part_v_p),
+                            arg(&mut part_i_p),
+                            arg(&mut out_p),
+                            arg(&mut num_part),
+                        ],
+                        s,
+                        0,
+                    )?;
+                } else {
+                    return Err(e);
+                }
+            }
+            s
+        } else {
+            self.launch_compute_kernel(
+                "grim_argmax_stage2",
+                HipDim3::new(1, 1, 1),
+                HipDim3::new(BLOCK_SIZE, 1, 1),
+                &mut [
+                    arg(&mut part_v_p),
+                    arg(&mut part_i_p),
+                    arg(&mut out_p),
+                    arg(&mut num_part),
+                ],
+            )?
+        };
 
         let mut res: u32 = 0u32;
         check_hip("gpu_argmax D2H", unsafe {

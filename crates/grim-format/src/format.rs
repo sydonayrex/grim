@@ -1372,7 +1372,12 @@ impl GrimFile {
             .map_err(|e| Error::Backend(e.to_string()))?
             + registry_byte_size;
 
-        let mut offset = payload_region_start;
+        let directio_align = std::env::var("GRIM_DIRECTIO_ALIGN").ok().as_deref() == Some("1");
+        let mut offset = if directio_align {
+            align_to_thp_pool(payload_region_start)
+        } else {
+            payload_region_start
+        };
         let mut written_entries = Vec::with_capacity(self.tensors.len());
         for t in &self.tensors {
             let mut entry = t.clone();
@@ -1387,8 +1392,12 @@ impl GrimFile {
                 offset += entry.kv_compressed_size;
                 offset = align_to_segment(offset, self.wave.segment_bytes());
             }
-            // Align next tensor to a wave segment boundary.
-            offset = align_to_segment(offset, self.wave.segment_bytes());
+            // Align next tensor to a wave segment boundary (or 4 KiB O_DIRECT unit).
+            offset = if directio_align {
+                align_to_directio_unit(offset)
+            } else {
+                align_to_segment(offset, self.wave.segment_bytes())
+            };
             written_entries.push(entry);
         }
 
@@ -2269,4 +2278,17 @@ pub fn decode_expert_priors(bytes: &[u8]) -> Result<Vec<ExpertPriorEntry>> {
         });
     }
     Ok(out)
+}
+
+/// Read and decode the optional `"expert_priors"` trailer attachment from a `.grim` file.
+pub fn read_expert_priors_from_file<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Option<Vec<ExpertPriorEntry>>> {
+    let atts = attachment_index_from_file(&path)?;
+    let Some(att) = atts.iter().find(|a| a.kind == "expert_priors") else {
+        return Ok(None);
+    };
+    let buf = std::fs::read(path.as_ref())?;
+    let bytes = attachment_bytes_from_buf(&buf, att)?;
+    Ok(Some(decode_expert_priors(&bytes)?))
 }

@@ -235,11 +235,263 @@ pub struct GdnParams<'a> {
 /// declared geometry, which means the loader sized something from the wrong
 /// quantity — the failure mode that motivated keeping `ssm_dt_rank` and
 /// `n_v_heads` as separate config fields.
+#[inline]
+pub fn gdn_wy_chunk_enabled() -> bool {
+    std::env::var("GRIM_GDN_WY_CHUNK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Chunked WY-representation forward for GDN prefill (`C <= 64`).
+/// Computes exact `(I + A)^{-1}` forward substitution over chunk `C` and updates `state`
+/// to match sequential `gated_delta_rule_row` within `1e-5`.
+pub fn gated_delta_rule_wy_chunk_64(
+    k_chunk: &[f32],
+    v_chunk: &[f32],
+    beta_chunk: &[f32],
+    gate_chunk: &[f32],
+    state: &mut [f32],
+    d_k: usize,
+    d_v: usize,
+    out_chunk: &mut [f32],
+) {
+    let w = beta_chunk.len();
+    if w == 0 || d_k == 0 || d_v == 0 || state.len() < d_k * d_v {
+        return;
+    }
+    let mut g_cum = vec![0.0f32; w];
+    let mut acc_g = 0.0f32;
+    for t in 0..w {
+        acc_g += gate_chunk[t];
+        g_cum[t] = acc_g;
+    }
+    // Strictly lower-triangular A[t, s] = beta_t * exp(g_cum[t] - g_cum[s]) * <k_t, k_s>
+    let mut a_mat = vec![0.0f32; w * w];
+    for t in 0..w {
+        let kt = &k_chunk[t * d_k..(t + 1) * d_k];
+        for s in 0..t {
+            let ks = &k_chunk[s * d_k..(s + 1) * d_k];
+            let dot: f32 = kt.iter().zip(ks.iter()).map(|(a, b)| a * b).sum();
+            a_mat[t * w + s] = beta_chunk[t] * (g_cum[t] - g_cum[s]).exp() * dot;
+        }
+    }
+    // Forward substitution: (I + A) u_tilde = beta * (v - exp(g_cum) * (S_0 k))
+    let mut u_tilde = vec![0.0f32; w * d_v];
+    for t in 0..w {
+        let kt = &k_chunk[t * d_k..(t + 1) * d_k];
+        let vt = &v_chunk[t * d_v..(t + 1) * d_v];
+        let exp_gt = g_cum[t].exp();
+        let bt = beta_chunk[t];
+        for j in 0..d_v {
+            let s0_row = &state[j * d_k..(j + 1) * d_k];
+            let s0_dot_kt: f32 = s0_row.iter().zip(kt.iter()).map(|(s, k)| s * k).sum();
+            let mut rhs = bt * (vt[j] - exp_gt * s0_dot_kt);
+            for s in 0..t {
+                rhs -= a_mat[t * w + s] * u_tilde[s * d_v + j];
+            }
+            u_tilde[t * d_v + j] = rhs;
+        }
+    }
+    // Chunk readout at each step t (using k_t as query for single-head oracle)
+    for t in 0..w {
+        let kt = &k_chunk[t * d_k..(t + 1) * d_k];
+        let exp_gt = g_cum[t].exp();
+        for j in 0..d_v {
+            let s0_row = &state[j * d_k..(j + 1) * d_k];
+            let mut val: f32 = exp_gt * s0_row.iter().zip(kt.iter()).map(|(s, k)| s * k).sum::<f32>();
+            for s in 0..=t {
+                let ks = &k_chunk[s * d_k..(s + 1) * d_k];
+                let k_dot: f32 = ks.iter().zip(kt.iter()).map(|(a, b)| a * b).sum();
+                val += (g_cum[t] - g_cum[s]).exp() * u_tilde[s * d_v + j] * k_dot;
+            }
+            out_chunk[t * d_v + j] = val;
+        }
+    }
+    // Chunk-end state update: S <- exp(g_cum[w-1]) * S_0 + sum_s exp(g_cum[w-1] - g_cum[s]) * u_tilde[s] * k_s^T
+    let g_end = g_cum[w - 1];
+    let exp_end = g_end.exp();
+    for j in 0..d_v {
+        let row = &mut state[j * d_k..(j + 1) * d_k];
+        for i in 0..d_k {
+            row[i] *= exp_end;
+        }
+        for s in 0..w {
+            let coeff = (g_end - g_cum[s]).exp() * u_tilde[s * d_v + j];
+            let ks = &k_chunk[s * d_k..(s + 1) * d_k];
+            for i in 0..d_k {
+                row[i] += coeff * ks[i];
+            }
+        }
+    }
+}
+
+/// 16-token WY-transform `(I + A)^{-1}` chunked Gated DeltaNet forward pass.
+pub fn gated_delta_net_wy_chunk16_forward(
+    params: &GdnParams<'_>,
+    cache: &mut Qwen38GdnCache,
+    out_branch: &mut [f32],
+) -> Result<()> {
+    let GdnParams {
+        conv_mix,
+        alpha,
+        beta,
+        a,
+        dt_bias,
+        norm,
+        eps,
+        n_v_heads,
+        n_k_heads,
+        head_dim,
+        conv_dim,
+        seq_len,
+        pairing,
+    } = *params;
+
+    if n_v_heads == 0 || n_k_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+    let key_dim = n_k_heads * head_dim;
+    let value_dim = n_v_heads * head_dim;
+    let expect_conv = conv_dim.max(key_dim * 2 + value_dim);
+    if conv_mix.len() < seq_len * expect_conv {
+        return Err(Error::Shape(format!(
+            "gated_delta_net_wy_chunk16_forward: conv stream has {} elements, need {}",
+            conv_mix.len(),
+            seq_len * expect_conv
+        )));
+    }
+    let state_len = head_dim * head_dim;
+    let need_state = n_v_heads * state_len;
+    if cache.ssm_state.len() < need_state {
+        cache.ssm_state.resize(need_state, 0.0);
+    }
+    let values_per_group = (n_v_heads / n_k_heads).max(1);
+    let out_width = value_dim;
+    let read_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let n_f = head_dim as f32;
+
+    for chunk_start in (0..seq_len).step_by(16) {
+        let w = (seq_len - chunk_start).min(16);
+        for h in 0..n_v_heads {
+            let key_head = match pairing {
+                KdaHeadPairing::Interleaved => h % n_k_heads,
+                KdaHeadPairing::Grouped => h / values_per_group,
+            };
+            let mut q_chunk = vec![0.0f32; w * head_dim];
+            let mut k_chunk = vec![0.0f32; w * head_dim];
+            let mut v_chunk = vec![0.0f32; w * head_dim];
+            let mut beta_chunk = vec![0.0f32; w];
+            let mut g_cum = vec![0.0f32; w];
+            let mut acc_g = 0.0f32;
+
+            for tc in 0..w {
+                let t = chunk_start + tc;
+                let base = t * expect_conv;
+                let q_off = base + key_head * head_dim;
+                let k_off = base + key_dim + key_head * head_dim;
+                let v_off = base + 2 * key_dim + h * head_dim;
+
+                let k_n = l2_normalize(&conv_mix[k_off..k_off + head_dim], eps * n_f);
+                let q_n = l2_normalize(&conv_mix[q_off..q_off + head_dim], eps * n_f);
+                for d in 0..head_dim {
+                    q_chunk[tc * head_dim + d] = q_n[d] * read_scale;
+                    k_chunk[tc * head_dim + d] = k_n[d];
+                    v_chunk[tc * head_dim + d] = conv_mix[v_off + d];
+                }
+                let mut z = alpha.get(t * n_v_heads + h).copied().unwrap_or(0.0);
+                if let Some(&d) = dt_bias.get(h) {
+                    z += d;
+                }
+                let mut gate = softplus(z);
+                if let Some(&av) = a.get(h) {
+                    gate *= av;
+                }
+                acc_g += gate;
+                g_cum[tc] = acc_g;
+                let raw_b = beta.get(t * n_v_heads + h).copied().unwrap_or(0.0);
+                beta_chunk[tc] = 1.0 / (1.0 + (-raw_b).exp());
+            }
+
+            // Build strictly lower-triangular A[tc, sc] and solve (I + A) u_tilde = rhs
+            let mut a_mat = vec![0.0f32; w * w];
+            for tc in 0..w {
+                let kt = &k_chunk[tc * head_dim..(tc + 1) * head_dim];
+                for sc in 0..tc {
+                    let ks = &k_chunk[sc * head_dim..(sc + 1) * head_dim];
+                    let dot: f32 = kt.iter().zip(ks.iter()).map(|(x, y)| x * y).sum();
+                    a_mat[tc * w + sc] = beta_chunk[tc] * (g_cum[tc] - g_cum[sc]).exp() * dot;
+                }
+            }
+
+            let st_off = h * state_len;
+            let state_h = &mut cache.ssm_state[st_off..st_off + state_len];
+            let mut u_tilde = vec![0.0f32; w * head_dim];
+            for tc in 0..w {
+                let kt = &k_chunk[tc * head_dim..(tc + 1) * head_dim];
+                let vt = &v_chunk[tc * head_dim..(tc + 1) * head_dim];
+                let exp_gt = g_cum[tc].exp();
+                let bt = beta_chunk[tc];
+                for j in 0..head_dim {
+                    let s0_row = &state_h[j * head_dim..(j + 1) * head_dim];
+                    let s0_dot_kt: f32 = s0_row.iter().zip(kt.iter()).map(|(s, k)| s * k).sum();
+                    let mut rhs = bt * (vt[j] - exp_gt * s0_dot_kt);
+                    for sc in 0..tc {
+                        rhs -= a_mat[tc * w + sc] * u_tilde[sc * head_dim + j];
+                    }
+                    u_tilde[tc * head_dim + j] = rhs;
+                }
+            }
+
+            for tc in 0..w {
+                let t = chunk_start + tc;
+                let qt = &q_chunk[tc * head_dim..(tc + 1) * head_dim];
+                let exp_gt = g_cum[tc].exp();
+                for j in 0..head_dim {
+                    let s0_row = &state_h[j * head_dim..(j + 1) * head_dim];
+                    let mut acc: f32 =
+                        exp_gt * s0_row.iter().zip(qt.iter()).map(|(s, q)| s * q).sum::<f32>();
+                    for sc in 0..=tc {
+                        let ks = &k_chunk[sc * head_dim..(sc + 1) * head_dim];
+                        let kq: f32 = ks.iter().zip(qt.iter()).map(|(k, q)| k * q).sum();
+                        acc += (g_cum[tc] - g_cum[sc]).exp() * u_tilde[sc * head_dim + j] * kq;
+                    }
+                    let w_norm = norm.get(j).copied().unwrap_or(1.0);
+                    let idx = t * out_width + h * head_dim + j;
+                    if idx < out_branch.len() {
+                        out_branch[idx] = acc * w_norm;
+                    }
+                }
+            }
+
+            let g_end = g_cum[w - 1];
+            let exp_end = g_end.exp();
+            for j in 0..head_dim {
+                let row = &mut state_h[j * head_dim..(j + 1) * head_dim];
+                for i in 0..head_dim {
+                    row[i] *= exp_end;
+                }
+                for sc in 0..w {
+                    let coeff = (g_end - g_cum[sc]).exp() * u_tilde[sc * head_dim + j];
+                    let ks = &k_chunk[sc * head_dim..(sc + 1) * head_dim];
+                    for i in 0..head_dim {
+                        row[i] += coeff * ks[i];
+                    }
+                }
+            }
+        }
+    }
+    cache.pos += seq_len;
+    Ok(())
+}
+
 pub fn gated_delta_net_forward(
     params: &GdnParams<'_>,
     cache: &mut Qwen38GdnCache,
     out_branch: &mut [f32],
 ) -> Result<()> {
+    if gdn_wy_chunk_enabled() && params.seq_len >= 16 {
+        return gated_delta_net_wy_chunk16_forward(params, cache, out_branch);
+    }
     let GdnParams {
         conv_mix,
         alpha,

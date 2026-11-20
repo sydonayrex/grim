@@ -1126,3 +1126,41 @@ where
     }
     out.any().then_some(out)
 }
+
+/// 3-tier checkpoint sampling overlay:
+/// 1. `<model_dir>/generation_config.json`
+/// 2. `.grim` / GGUF `generation.*` metadata (`kv_get`)
+/// 3. `<model_path>.generation.json` sidecar
+pub fn load_gen_sampling_overlay<'a, F>(
+    mut dst: SamplingParams,
+    model_path: Option<&std::path::Path>,
+    kv_get: Option<F>,
+) -> SamplingParams
+where
+    F: Fn(&str) -> Option<&'a str>,
+{
+    if let Some(p) = model_path {
+        if let Some(dir) = p.parent() {
+            if let Ok(txt) = std::fs::read_to_string(dir.join("generation_config.json")) {
+                if let Some(g) = gen_sampling_parse(&txt) {
+                    dst = g.onto(dst);
+                }
+            }
+        }
+    }
+    if let Some(get) = kv_get {
+        if let Some(g) = gen_sampling_from_kv(get) {
+            dst = g.onto(dst);
+        }
+    }
+    if let Some(p) = model_path {
+        let mut sidecar = p.as_os_str().to_os_string();
+        sidecar.push(".generation.json");
+        if let Ok(txt) = std::fs::read_to_string(std::path::PathBuf::from(sidecar)) {
+            if let Some(g) = gen_sampling_parse(&txt) {
+                dst = g.onto(dst);
+            }
+        }
+    }
+    dst
+}

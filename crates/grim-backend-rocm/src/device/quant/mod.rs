@@ -162,7 +162,20 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || is_rdna34)
+                let lane_served = self
+                    .try_u4_lane_decode(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        grim_tensor::dtype::KQuantScheme::Q4K,
+                    )?
+                    .is_some();
+                if lane_served {
+                    // out_storage is written by the lane GEMV.
+                } else if (is_rdna2 || is_rdna34)
                     && m <= 32
                     && !dot_disabled
                     && k % 256 == 0
@@ -568,7 +581,20 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_Q6K_DOT4").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if q6k_dot4_ok
+                let lane_served = self
+                    .try_u4_lane_decode(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        grim_tensor::dtype::KQuantScheme::Q6K,
+                    )?
+                    .is_some();
+                if lane_served {
+                    // out_storage is written by the lane GEMV.
+                } else if q6k_dot4_ok
                     && (is_rdna2 || is_rdna34)
                     && m == 1
                     && !dot_disabled
@@ -1100,7 +1126,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_IQ3XXS_DOT4").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if self.is_dot4_arch && (m == 1 || m == 2) && !dot_disabled && k % 256 == 0 {
+                if self.is_dot4_arch && m <= 32 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());

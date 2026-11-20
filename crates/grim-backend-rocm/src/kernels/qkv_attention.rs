@@ -3578,8 +3578,10 @@ extern "C" __global__ void grim_qkv_attention_dev(
     // sinks plus the newest tokens. Clamping here is the whole read-side
     // change; no gather is needed. cap_rows <= 0 means unlimited.
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
-    // Decode: single query at the last live row (all live rows are <= it).
-    const int abs_i = kv_seq_len - 1;
+    // Decode / multi-step verify: query `i` (`0..seq_len`) is at offset
+    // `i - (seq_len - 1)` from the last live row `kv_seq_len - 1`, so causal
+    // masking bounds each query `i` to `[0, kv_seq_len - seq_len + i]`.
+    const int abs_i = kv_seq_len - seq_len + i;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
     // A window lower bound computed from the ABSOLUTE position can exceed the
     // live range once tokens have been evicted; clamp so the range is never
@@ -3792,8 +3794,10 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     // sinks plus the newest tokens. Clamping here is the whole read-side
     // change; no gather is needed. cap_rows <= 0 means unlimited.
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
-    // Decode: single query at the last live row (all live rows are <= it).
-    const int abs_i = kv_seq_len - 1;
+    // Decode / multi-step verify: query `i` (`0..seq_len`) is at offset
+    // `i - (seq_len - 1)` from the last live row `kv_seq_len - 1`, so causal
+    // masking bounds each query `i` to `[0, kv_seq_len - seq_len + i]`.
+    const int abs_i = kv_seq_len - seq_len + i;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
     // A window lower bound computed from the ABSOLUTE position can exceed the
     // live range once tokens have been evicted; clamp so the range is never
@@ -4002,8 +4006,10 @@ extern "C" __global__ void grim_qkv_attention_dev_i4(
     // sinks plus the newest tokens. Clamping here is the whole read-side
     // change; no gather is needed. cap_rows <= 0 means unlimited.
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
-    // Decode: single query at the last live row (all live rows are <= it).
-    const int abs_i = kv_seq_len - 1;
+    // Decode / multi-step verify: query `i` (`0..seq_len`) is at offset
+    // `i - (seq_len - 1)` from the last live row `kv_seq_len - 1`, so causal
+    // masking bounds each query `i` to `[0, kv_seq_len - seq_len + i]`.
+    const int abs_i = kv_seq_len - seq_len + i;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
     // A window lower bound computed from the ABSOLUTE position can exceed the
     // live range once tokens have been evicted; clamp so the range is never
@@ -4253,7 +4259,7 @@ extern "C" __global__ void grim_qkv_attention_dev_q81(
 
     int live_rows = total_dev[slot] + steps;
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
-    const int abs_i = kv_seq_len - 1;
+    const int abs_i = kv_seq_len - seq_len + i;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
     const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
     const int range_len = hi - lo;
@@ -4629,7 +4635,7 @@ extern "C" __global__ void grim_qkv_attention_dev_whitecrow(
     // the contiguous prefix [0, min(live, cap_rows)).
     int live_rows = total_dev[slot] + steps;
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
-    const int abs_i = kv_seq_len - 1;
+    const int abs_i = kv_seq_len - seq_len + i;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
     const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
     const int range_len = hi - lo;
@@ -4821,7 +4827,7 @@ extern "C" __global__ void grim_qkv_attention_dev_whitecrow_split(
     const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
     int n_live_chunks = (kv_seq_len + chunk_len - 1) / chunk_len;
     if (n_live_chunks < 1) n_live_chunks = 1;
-    const int abs_i = kv_seq_len - 1;
+    const int abs_i = kv_seq_len - seq_len + i;
 
     const long long z = (long long)slot * max_chunks + chunk;
     float* pmz = partial_m + (z * seq_len + i) * num_heads + h;

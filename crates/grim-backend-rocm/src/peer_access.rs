@@ -84,16 +84,18 @@ pub fn boundary_host_sync_count() -> u64 {
 ///     and the handoff's device-side copy cannot run over it. A6's ordered
 ///     host-staged copy is used instead.
 ///   * Both unset -> OFF (the documented default).
+/// Default ON per decode-graph contract, unless explicitly disabled (`GRIM_RING_HANDOFF=0`)
+/// or explicit host bounce requested (`GRIM_P2P_HOST_BOUNCE=1`).
 pub fn ring_handoff_enabled() -> bool {
-    let handoff = std::env::var("GRIM_RING_HANDOFF").ok().map(|v| v != "0");
+    let handoff = std::env::var("GRIM_RING_HANDOFF").ok().map(|v| !matches!(v.as_str(), "0" | "false" | "off"));
     let bounce_on = std::env::var("GRIM_P2P_HOST_BOUNCE")
         .ok()
         .map(|v| v != "0" && v != "false");
     match (handoff, bounce_on) {
         (Some(false), _) => false,
         (_, Some(true)) => false,   // explicit host bounce wins
-        (Some(true), _) => true,    // explicit handoff beats implicit bounce
-        (None, _) => false,         // documented default: OFF
+        (Some(true), _) => true,    // explicit handoff
+        (None, _) => true,          // default: ON
     }
 }
 

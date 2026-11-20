@@ -73,12 +73,17 @@ impl TokenAcceptor {
             // Threshold rule: accept iff pt >= max(threshold * pd, eps).
             // With threshold == 0 and pd > 0 the rule is "accept iff pt >=.
             let pd_safe = pd.max(f32::EPSILON);
-            let gate_pt = if self.threshold > 0.0 {
-                self.threshold * pd_safe
+            let accept = if coupled_speculative_enabled() {
+                philox_uniform_f32(0x1337_C0DE, PHILOX_DRAW_ACCEPT | (i as u64), 0) * pd_safe <= pt
             } else {
-                pd_safe
+                let gate_pt = if self.threshold > 0.0 {
+                    self.threshold * pd_safe
+                } else {
+                    pd_safe
+                };
+                pt + f32::EPSILON >= gate_pt
             };
-            if pt + f32::EPSILON >= gate_pt {
+            if accept {
                 accepted.push(i);
             } else {
                 return AcceptanceResult::Partial {
@@ -801,4 +806,129 @@ impl Drop for DualStreamSpeculativeEngine {
             }
         }
     }
+}
+
+pub const PHILOX_DRAW_DRAFT: u64 = 0;
+pub const PHILOX_DRAW_ACCEPT: u64 = 1u64 << 61;
+pub const PHILOX_DRAW_RESIDUAL: u64 = 1u64 << 62;
+pub const PHILOX_DRAW_BONUS: u64 = 1u64 << 63;
+
+/// 7-round Philox-4x32 counter-based PRNG.
+#[inline]
+pub fn philox4x32_7(mut ctr: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
+    const M0: u64 = 0xD251_1F53;
+    const M1: u64 = 0xCD9E_8D57;
+    const W0: u32 = 0x9E37_79B9;
+    const W1: u32 = 0xBB67_AE85;
+    for _ in 0..7 {
+        let p0 = (ctr[0] as u64).wrapping_mul(M0);
+        let p1 = (ctr[2] as u64).wrapping_mul(M1);
+        ctr = [
+            ((p1 >> 32) as u32) ^ ctr[1] ^ key[0],
+            p1 as u32,
+            ((p0 >> 32) as u32) ^ ctr[3] ^ key[1],
+            p0 as u32,
+        ];
+        key[0] = key[0].wrapping_add(W0);
+        key[1] = key[1].wrapping_add(W1);
+    }
+    ctr
+}
+
+#[inline]
+pub fn philox_uniform_f32(seed: u64, domain_and_pos: u64, idx: u32) -> f32 {
+    let ctr = [
+        domain_and_pos as u32,
+        (domain_and_pos >> 32) as u32,
+        idx,
+        0,
+    ];
+    let key = [seed as u32, (seed >> 32) as u32];
+    let out = philox4x32_7(ctr, key);
+    ((out[0] >> 8) as f32 + 0.5) * (1.0 / 16_777_216.0)
+}
+
+/// Counter-coupled Gumbel-max / inverse-CDF draw (`kDrawDraft = 0`) independent of `blockDim.x`.
+pub fn coupled_gumbel_max_draw(probs: &[f32], seed: u64, pos: u64) -> usize {
+    let u = philox_uniform_f32(seed, PHILOX_DRAW_DRAFT | (pos & ((1u64 << 61) - 1)), 0);
+    let mut cdf = 0.0f32;
+    let mut last_valid = 0usize;
+    for (i, &p) in probs.iter().enumerate() {
+        if p > 0.0 {
+            cdf += p;
+            last_valid = i;
+            if u <= cdf {
+                return i;
+            }
+        }
+    }
+    last_valid
+}
+
+/// Unbiased Leviathan/Chen gated rejection step with disjoint Philox counter domains.
+pub fn verify_gated_speculative_step(
+    p_target: &[f32],
+    q_draft: &[f32],
+    draft_token: usize,
+    draft_in_support: bool,
+    seed: u64,
+    pos: u64,
+) -> usize {
+    let masked_pos = pos & ((1u64 << 61) - 1);
+    if draft_in_support && draft_token < p_target.len() && draft_token < q_draft.len() {
+        let pt = p_target[draft_token];
+        let qd = q_draft[draft_token].max(1e-30);
+        let u_acc = philox_uniform_f32(seed, PHILOX_DRAW_ACCEPT | masked_pos, 0);
+        if u_acc * qd <= pt {
+            return draft_token;
+        }
+    }
+    let mut resid_sum = 0.0f32;
+    for i in 0..p_target.len() {
+        let q = if draft_in_support && i < q_draft.len() { q_draft[i] } else { 0.0 };
+        resid_sum += (p_target[i] - q).max(0.0);
+    }
+    let u_res = philox_uniform_f32(seed, PHILOX_DRAW_RESIDUAL | masked_pos, 0) * resid_sum;
+    let mut acc = 0.0f32;
+    let mut fallback = 0usize;
+    for i in 0..p_target.len() {
+        let q = if draft_in_support && i < q_draft.len() { q_draft[i] } else { 0.0 };
+        let r = (p_target[i] - q).max(0.0);
+        if r > 0.0 {
+            acc += r;
+            fallback = i;
+            if u_res <= acc {
+                return i;
+            }
+        }
+    }
+    fallback
+}
+
+#[inline]
+pub fn coupled_speculative_enabled() -> bool {
+    std::env::var("GRIM_COUPLED_SPEC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Coupled speculative verification: accepts draft tokens `i` while `u[i] <= p_target[i] / p_draft[i]`,
+/// returning `(accepted_count, bonus_or_resampled_token_needed)`.
+pub fn coupled_speculative_accept_count(
+    p_target: &[f32],
+    p_draft: &[f32],
+    u_uniform: &[f32],
+) -> (usize, bool) {
+    let k = p_target.len().min(p_draft.len()).min(u_uniform.len());
+    let mut accepted = 0usize;
+    for i in 0..k {
+        let q = p_draft[i].max(1e-12);
+        let ratio = p_target[i] / q;
+        if u_uniform[i] <= ratio {
+            accepted += 1;
+        } else {
+            return (accepted, true);
+        }
+    }
+    (accepted, false)
 }

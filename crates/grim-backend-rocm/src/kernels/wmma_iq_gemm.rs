@@ -449,6 +449,134 @@ extern "C" __global__ void grim_wmma_fused_dequant_iq4xs(
     }
 }
 
+__device__ __forceinline__ float grim_i32_to_f32_magic(int x) {
+    return __builtin_bit_cast(float, (unsigned int)(x + 0x4B400000)) - 12582912.0f;
+}
+
+extern "C" __global__ __launch_bounds__(32) void grim_wmma_iq4nl_fast(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_iq,
+    float* __restrict__ C,
+    int M, int N, int K) {
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+    if (tile_row * 16 >= M || tile_col * 16 >= N) return;
+
+    __shared__ _Float16 s_a[256];
+    __shared__ _Float16 s_b[256];
+    __shared__ float s_c[256];
+
+    fragment<matrix_a, 16, 16, 16, _Float16, row_major> frag_a;
+    fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b;
+    fragment<accumulator, 16, 16, 16, float> frag_c;
+    fill_fragment(frag_c, 0.0f);
+
+    const int lane = threadIdx.x & 31;
+    const int row_base = tile_row * 16;
+    const int col_base = tile_col * 16;
+    const int n_blocks_per_row = K / 32;
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            int idx = lane + t * 32;
+            int r = idx >> 4;
+            int c = idx & 15;
+            int row = row_base + r;
+            int kk = k0 + c;
+            s_a[idx] = (row < M && kk < K) ? (_Float16)A[(long long)row * K + kk] : (_Float16)0;
+
+            int col = col_base + r;
+            if (col < N && kk < K) {
+                const unsigned char* row_ptr = B_iq + (long long)col * n_blocks_per_row * 18;
+                s_b[idx] = (_Float16)dequant_iq4nl(row_ptr + (long long)(kk / 32) * 18, kk & 31);
+            } else {
+                s_b[idx] = (_Float16)0;
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
+        load_matrix_sync(frag_a, s_a, 16);
+        load_matrix_sync(frag_b, s_b, 16);
+        mma_sync(frag_c, frag_a, frag_b, frag_c);
+        __builtin_amdgcn_wave_barrier();
+    }
+
+    store_matrix_sync(s_c, frag_c, 16, layout_t::mem_row_major);
+    __builtin_amdgcn_wave_barrier();
+    float* c_tile_ptr = C + (long long)row_base * N + col_base;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        int idx = lane + t * 32;
+        int i = idx >> 4;
+        int j = idx & 15;
+        if (row_base + i < M && col_base + j < N) {
+            c_tile_ptr[(long long)i * N + j] = s_c[idx];
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(32) void grim_wmma_iq4xs_fast(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_iq,
+    float* __restrict__ C,
+    int M, int N, int K) {
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+    if (tile_row * 16 >= M || tile_col * 16 >= N) return;
+
+    __shared__ _Float16 s_a[256];
+    __shared__ _Float16 s_b[256];
+    __shared__ float s_c[256];
+
+    fragment<matrix_a, 16, 16, 16, _Float16, row_major> frag_a;
+    fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b;
+    fragment<accumulator, 16, 16, 16, float> frag_c;
+    fill_fragment(frag_c, 0.0f);
+
+    const int lane = threadIdx.x & 31;
+    const int row_base = tile_row * 16;
+    const int col_base = tile_col * 16;
+    const int n_blocks_per_row = K / QK_K;
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            int idx = lane + t * 32;
+            int r = idx >> 4;
+            int c = idx & 15;
+            int row = row_base + r;
+            int kk = k0 + c;
+            s_a[idx] = (row < M && kk < K) ? (_Float16)A[(long long)row * K + kk] : (_Float16)0;
+
+            int col = col_base + r;
+            if (col < N && kk < K) {
+                const unsigned char* row_ptr = B_iq + (long long)col * n_blocks_per_row * 136;
+                s_b[idx] = (_Float16)dequant_iq4xs(row_ptr + (long long)(kk / QK_K) * 136, kk % QK_K);
+            } else {
+                s_b[idx] = (_Float16)0;
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
+        load_matrix_sync(frag_a, s_a, 16);
+        load_matrix_sync(frag_b, s_b, 16);
+        mma_sync(frag_c, frag_a, frag_b, frag_c);
+        __builtin_amdgcn_wave_barrier();
+    }
+
+    store_matrix_sync(s_c, frag_c, 16, layout_t::mem_row_major);
+    __builtin_amdgcn_wave_barrier();
+    float* c_tile_ptr = C + (long long)row_base * N + col_base;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        int idx = lane + t * 32;
+        int i = idx >> 4;
+        int j = idx & 15;
+        if (row_base + i < M && col_base + j < N) {
+            c_tile_ptr[(long long)i * N + j] = s_c[idx];
+        }
+    }
+}
+
 #endif // RDNA3/RDNA4
 "#;
 

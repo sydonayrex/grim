@@ -170,6 +170,48 @@ extern "C" {
         return d * (float)sc * (float)q - dmin * (float)m;
     }
 
+    // gfx12 LDS-only barrier: waits only on ds_cnt (0x0) + workgroup barrier,
+    // avoiding gfx12 __syncthreads()'s s_wait_loadcnt 0 + global_inv scope:SCOPE_SE!
+    __device__ inline void grim_sync_lds() {
+    #if defined(__gfx1200__) || defined(__gfx1201__)
+        // __builtin_amdgcn_s_wait_dscnt(0) lowered via inline asm for HIPRTC compatibility
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        __builtin_amdgcn_s_barrier();
+    #else
+        __syncthreads();
+    #endif
+    }
+
+    // Single-instruction AMD byte permute (v_perm_b32)
+    __device__ inline unsigned int grim_perm_b32(unsigned int y, unsigned int x, unsigned int s) {
+        return __builtin_amdgcn_perm(y, x, s);
+    }
+
+    // Reduces 4 float accumulators across Wave32
+    // in 6 VALU ops instead of 20 ds_bpermute_b32 instructions, bit-identical to __shfl_xor.
+    __device__ inline void grim_tsum4_wave32(float& s0, float& s1, float& s2, float& s3) {
+        const int lane = threadIdx.x & 31;
+        s0 += __shfl_xor(s0, 16);
+        s1 += __shfl_xor(s1, 16);
+        s2 += __shfl_xor(s2, 16);
+        s3 += __shfl_xor(s3, 16);
+        float a01 = (lane & 8) ? s1 : s0;
+        float b01 = __shfl_xor((lane & 8) ? s0 : s1, 8);
+        float p01 = a01 + b01;
+        float a23 = (lane & 8) ? s3 : s2;
+        float b23 = __shfl_xor((lane & 8) ? s2 : s3, 8);
+        float p23 = a23 + b23;
+        float a = (lane & 4) ? p23 : p01;
+        float b = __shfl_xor((lane & 4) ? p01 : p23, 4);
+        float q = a + b;
+        q += __shfl_xor(q, 2);
+        q += __shfl_xor(q, 1);
+        s0 = __shfl(q, 0);
+        s1 = __shfl(q, 8);
+        s2 = __shfl(q, 4);
+        s3 = __shfl(q, 12);
+    }
+
 }
 "#;
 

@@ -648,7 +648,8 @@ impl RocmDevice {
                 | grim_tensor::dtype::KQuantScheme::Q6K
                 | grim_tensor::dtype::KQuantScheme::Q3K
         );
-        if m != 1
+        if m == 0
+            || m > 4
             || !w4a4_decode
             || q5k_decode_skip
             || k % 128 != 0

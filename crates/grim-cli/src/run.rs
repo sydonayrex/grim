@@ -290,7 +290,7 @@ pub(crate) fn emit_startup_config_banner(
     let dequant_min_m: usize = std::env::var("GRIM_PREFILL_DEQUANT_MIN_M")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(16);
     let mut dequant_map = serde_json::Map::new();
     dequant_map.insert("enabled".into(), serde_json::Value::Bool(dequant_on));
     dequant_map.insert(
@@ -346,34 +346,49 @@ pub(crate) fn emit_startup_config_banner(
     }
 }
 
-/// Compute auto chunk size from measured free VRAM capped between 1,024 and 2,048
+/// Compute auto chunk size from measured free VRAM (default 4096)
 pub(crate) fn compute_auto_chunk_size(_prompt_len: usize, _max_tokens: usize) -> usize {
     if let Ok(v) = std::env::var("GRIM_PREFILL_CHUNK_SIZE") {
         if let Ok(n) = v.parse::<usize>() {
             return n.max(16);
         }
     }
-    // Query minimum free VRAM across visible ROCm cards
-    let (free0, _) = grim_backend_rocm::device::capability_profiler::vram_info(0);
-    let (free1, _) = grim_backend_rocm::device::capability_profiler::vram_info(1);
-    let min_free_mb = (free0.min(free1) / (1024 * 1024)) as usize;
-    if min_free_mb >= 4000 { 2048 } else { 1024 }
+    // Default prefill chunk size is 4096 tokens
+    4096
 }
 
 /// Resolve a `&dyn DecodeGraphModel` from a model reference, unwrapping `SpeculativeCausalLm`
 /// when operating under single-token `Strategy::Plain`. Fails closed (`None`) if wrapped under
-/// multi-token strategies (e.g. DSpark) to prevent KV state / token offset corruption.
+/// multi-token strategies (e.g. DSpark) during decode steps to prevent KV state / token offset corruption.
 pub(crate) fn resolve_graph_model<'a>(model: &'a dyn CausalLm) -> Option<&'a dyn DecodeGraphModel> {
+    resolve_graph_model_inner(model, false)
+}
+
+/// Resolve the underlying `DecodeGraphModel` even when wrapped by `SpeculativeCausalLm` (e.g. for
+/// load-time u4 lane-weight prewarm).
+pub(crate) fn resolve_graph_model_for_prewarm<'a>(model: &'a dyn CausalLm) -> Option<&'a dyn DecodeGraphModel> {
+    resolve_graph_model_inner(model, true)
+}
+
+fn resolve_graph_model_inner<'a>(model: &'a dyn CausalLm, allow_speculative: bool) -> Option<&'a dyn DecodeGraphModel> {
     let target: &'a dyn CausalLm = if let Some(spec) = model
         .as_any()
         .downcast_ref::<grim_speculative::SpeculativeCausalLm>(
     ) {
-        if spec.strategy() != grim_speculative::Strategy::Plain {
+        if !allow_speculative && spec.strategy() != grim_speculative::Strategy::Plain {
             return None;
         }
         spec.inner_target()
     } else {
         model
+    };
+    let target: &'a dyn CausalLm = if let Some(mtp) = target
+        .as_any()
+        .downcast_ref::<grim_speculative::Qwen35MtpAdapter>()
+    {
+        mtp.inner().as_ref()
+    } else {
+        target
     };
 
     if let Some(m) = target.as_any().downcast_ref::<Lfm2>() {
@@ -538,15 +553,16 @@ fn try_graph_decode_step(
                                 $g.buffers
                                     .seed_conv_rings_from_device(&dev, &conv_dev_seeds)
                                     .map_err(|e| format!("conv dev seed: {e}"))?;
-                            } else {
-                                let conv_seeds = graph_model
-                                    .eager_conv_seed_rings(sess)
-                                    .map_err(|e| format!("conv export: {e}"))?;
-                                if !conv_seeds.is_empty() {
-                                    $g.buffers
-                                        .seed_conv_rings(&conv_seeds)
-                                        .map_err(|e| format!("conv seed: {e}"))?;
-                                }
+                            }
+                            let conv_seeds = graph_model
+                                .eager_conv_seed_rings(sess)
+                                .map_err(|e| format!("conv export: {e}"))?;
+                            let any_host_conv = conv_seeds.iter().filter(|s| s.is_some()).count();
+                            eprintln!("[seed-summary] found {any_host_conv} conv_host_seeds");
+                            if !conv_seeds.is_empty() {
+                                $g.buffers
+                                    .seed_conv_rings(&conv_seeds)
+                                    .map_err(|e| format!("conv seed: {e}"))?;
                             }
                             let kda_seeds = graph_model
                                 .eager_kda_seed_sources(sess)
@@ -695,15 +711,16 @@ fn try_graph_decode_step(
                         $g.buffers
                             .seed_conv_rings_from_device(&dev, &conv_dev_seeds)
                             .map_err(|e| format!("conv dev seed: {e}"))?;
-                    } else {
-                        let conv_seeds = graph_model
-                            .eager_conv_seed_rings(sess)
-                            .map_err(|e| format!("conv export: {e}"))?;
-                        if !conv_seeds.is_empty() {
-                            $g.buffers
-                                .seed_conv_rings(&conv_seeds)
-                                .map_err(|e| format!("conv seed: {e}"))?;
-                        }
+                    }
+                    let conv_seeds = graph_model
+                        .eager_conv_seed_rings(sess)
+                        .map_err(|e| format!("conv export: {e}"))?;
+                    let any_host_conv = conv_seeds.iter().filter(|s| s.is_some()).count();
+                    eprintln!("[seed-summary-postcapture] found {any_host_conv} conv_host_seeds");
+                    if !conv_seeds.is_empty() {
+                        $g.buffers
+                            .seed_conv_rings(&conv_seeds)
+                            .map_err(|e| format!("conv seed: {e}"))?;
                     }
                     let kda_seeds = graph_model
                         .eager_kda_seed_sources(sess)
@@ -734,6 +751,26 @@ fn try_graph_decode_step(
 
 
     }
+    let fused_head_argmax = allow_gpu_sample
+        && sampling_params.temperature <= 0.0
+        && sampling_params.repeat_penalty <= 1.0
+        && !matches!(
+            std::env::var("GRIM_FUSED_HEAD_ARGMAX").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+    if fused_head_argmax {
+        if let Some(ptr) = g.logits_device_storage().device_ptr_u64() {
+            let stream = if !g.stream.is_null() {
+                g.stream
+            } else {
+                grim_backend_rocm::RocmDevice::shared(g.logits_device_storage().device_ordinal())
+                    .active_stream()
+            };
+            unsafe {
+                let _ = grim_backend_rocm::hipMemsetAsync(ptr as *mut std::ffi::c_void, 0, 8, stream);
+            }
+        }
+    }
     if let Err(e) = graph_model.forward_replay(g, token_id) {
         // Replay failure drops the stale graph so the next attempt (after
         // the retry interval) re-seeds + re-captures from the eager caches.
@@ -746,15 +783,37 @@ fn try_graph_decode_step(
         );
         return None;
     }
-    unsafe {
-        let _ = grim_backend_rocm::hipDeviceSynchronize();
-    }
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
+    if fused_head_argmax {
+        if let Some(ptr) = g.logits_device_storage().device_ptr_u64() {
+            let stream = if !g.stream.is_null() {
+                g.stream
+            } else {
+                grim_backend_rocm::RocmDevice::shared(g.logits_device_storage().device_ordinal())
+                    .active_stream()
+            };
+            let mut res_u64: u64 = 0;
+            unsafe {
+                let _ = grim_backend_rocm::hipMemcpyAsync(
+                    &mut res_u64 as *mut u64 as *mut std::ffi::c_void,
+                    ptr as *mut std::ffi::c_void,
+                    8,
+                    grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    stream,
+                );
+                let _ = grim_backend_rocm::hip_stream_synchronize(stream);
+            }
+            return Some(GraphDecodeResult::Sampled((res_u64 & 0xFFFF_FFFF) as u32));
+        }
+    }
 
     // Diagnostic: dump the replayed graph's own logits — the Sampled path
     // below never materializes them, so a diverging replay is invisible
     // (steps 2+ print no logprobs). GRIM_DEBUG_TOPLOGITS=1 enables.
     if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+        unsafe {
+            let _ = grim_backend_rocm::hipDeviceSynchronize();
+        }
         let _guard = grim_backend_rocm::device::util::DeviceGuard::set(0);
         // Localize the first NaN: scan each layer's graph-owned input buffer
         // (post-replay, stream synced by read paths below... sync first).
@@ -1089,7 +1148,11 @@ fn try_graph_decode_step(
         if let Device::Rocm(_) = device {
             let logits_ord = g.logits_device_storage().device_ordinal();
             let dev = grim_backend_rocm::RocmDevice::shared(logits_ord);
-            let stream = dev.active_stream();
+            let stream = if !g.stream.is_null() {
+                g.stream
+            } else {
+                dev.active_stream()
+            };
             let gate = sampling_params;
             match grim_backend_rocm::sample_logits_on_device_with_penalty_at_stream(
                 &dev,
@@ -1868,12 +1931,13 @@ pub async fn cmd_run(
     // Eliminates memory contention and peak VRAM spikes during prefill, and gives
     // short prompts the fast ~141 ms decode rate from token one.
     let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
+    let mut graph_just_captured = false;
     let prewarm_opt_out = matches!(
         std::env::var("GRIM_PREWARM").as_deref(),
         Ok("0" | "false" | "off")
     );
     if !prewarm_opt_out {
-        if let Some(gm) = resolve_graph_model(&*model) {
+        if let Some(gm) = resolve_graph_model_for_prewarm(&*model) {
             let t0 = std::time::Instant::now();
             let r = gm.prewarm_lane_weights();
             if std::env::var("GRIM_PREWARM_TRACE").is_ok()
@@ -1917,6 +1981,14 @@ pub async fn cmd_run(
             );
             let _ = model.forward(warm_sess.as_mut(), &warm_ids, &warm_pos, &[]);
         }
+        // Pre-capture M=2 DecodeGraph for NativeMtp during model-load prewarm so the
+        // first speculative verify step skips warmup + capture inside the decode timer.
+        if let Some(spec) = model
+            .as_any()
+            .downcast_ref::<grim_speculative::SpeculativeCausalLm>()
+        {
+            let _ = spec.prewarm_m2_graph();
+        }
         // Pre-capture DecodeGraph during model-load prewarm so first-prompt
         // TTFT skips the 2x warmup + capture passes.
         if let Some(gm) = resolve_graph_model(&*model) {
@@ -1928,6 +2000,8 @@ pub async fn cmd_run(
                         let ok = gm.forward_capture(&mut g, 1).is_ok();
                         let _ = g.end_capture();
                         if ok {
+                            g.buffers.current_pos = 0;
+                            graph_just_captured = true;
                             decode_graph = Some(g);
                         } else {
                             g.is_captured = false;
@@ -1982,7 +2056,7 @@ pub async fn cmd_run(
         "Sampling: temp={}, top_p={}, top_k={}, max_tokens={}, seed={}",
         temperature, top_p, top_k, max_tokens, seed
     );
-    print!("\nResponse: ");
+    println!();
     use std::io::Write;
     std::io::stdout()
         .flush()
@@ -2259,8 +2333,6 @@ pub async fn cmd_run(
     let mut ctx_exhausted = false;
     // One-shot: the decode-only lane-weight prewarm was completed at model load.
     let mut prewarm_done = true;
-    // Hoisted above prewarm so pre-captured graph is reused on first decode step.
-    let mut graph_just_captured = false;
     let mut graph_retry = grim_backend_rocm::graph_capture::GraphRetryPolicy::default_policy();
     let mut graph_fallback_step: Option<usize> = None;
     // Owns the one prefill tensor pair so the borrow lives across the step.
@@ -2346,7 +2418,7 @@ pub async fn cmd_run(
             // `prefill_len + generated - 1`. Without the -1 the first decode
             // step runs at 6 after a 5-token prompt: RoPE desynchronises the
             // token from the KV slot it was written to by exactly one.
-            vec![(prefill_len + generated - 1) as f32]
+            vec![tokens.len().saturating_sub(1) as f32]
         };
         // SPEED-ROC: ROCm decode steps reuse preallocated [1]-shape tensors —
         // async in-place update, zero H2D allocs on the reuse path (old code
@@ -2677,9 +2749,10 @@ pub async fn cmd_run(
                     grim_backend_rocm::set_prefill_in_flight(false);
                 }
                 let step_us = step_start.elapsed().as_micros() as u64;
+                let emitted = session.last_accepted_tokens().max(1);
                 if !is_prefill {
                     decode_total_us += step_us;
-                    decode_count += 1;
+                    decode_count += emitted as u64;
                     if phase_trace_on {
                         phase_steps.push((step_us, "eager"));
                     }
@@ -2694,7 +2767,6 @@ pub async fn cmd_run(
 
                 // M3/native-MTP: wrapper may return [emitted, vocab] logits and set
                 // session.last_accepted_tokens(); sample each emitted row in order.
-                let emitted = session.last_accepted_tokens().max(1);
                 let dims = logits.shape().dims();
                 let rows = if dims.len() == 2 { dims[0] } else { 1 };
                 let use_multi = !is_prefill && emitted > 1 && rows >= emitted && (logits.shape().elem_count() % vocab == 0);
@@ -2851,6 +2923,7 @@ pub async fn cmd_run(
 
             tokens.push(next_token);
             history.push(next_token);
+            session.set_last_sampled_token(Some(next_token));
 
             // Check if thinking concluded or began
             if let Some(tok) = &tokenizer {
@@ -2909,7 +2982,26 @@ pub async fn cmd_run(
     // Decode all tokens together for correct BPE boundary handling.
     if let Some(tok) = &tokenizer {
         let text = tok.decode(&generated_tokens);
-        print!("{}", text);
+        if prompt_has_think {
+            if let Some((thinking, response)) = text.split_once("</think>") {
+                println!("[Thinking]\n{}\n\n[Response]\n{}", thinking.trim(), response.trim());
+            } else {
+                println!("[Thinking]\n{}\n\n[Response]\n(none — reached max thinking token limit)", text.trim());
+            }
+        } else if let Some(start) = text.find("<think>") {
+            let after_start = &text[start + "<think>".len()..];
+            if let Some((thinking, response)) = after_start.split_once("</think>") {
+                let prefix = text[..start].trim();
+                if !prefix.is_empty() {
+                    println!("{}", prefix);
+                }
+                println!("[Thinking]\n{}\n\n[Response]\n{}", thinking.trim(), response.trim());
+            } else {
+                println!("[Thinking]\n{}", after_start.trim());
+            }
+        } else {
+            println!("[Response]\n{}", text.trim());
+        }
         std::io::stdout()
             .flush()
             .map_err(|e| grim_core::error::Error::Config(format!("stdout flush failed: {e}")))?;
@@ -3032,7 +3124,12 @@ pub async fn cmd_run(
     }
     // B3: operator-visible graph status (PLAN-reduce-d2h-h2d).
     if matches!(device, Device::Rocm(_)) {
-        if decode_graph.is_some() {
+        let spec_graph_active = model
+            .as_any()
+            .downcast_ref::<grim_speculative::SpeculativeCausalLm>()
+            .map(|s| s.has_active_m2_graph())
+            .unwrap_or(false);
+        if decode_graph.is_some() || spec_graph_active {
             eprintln!("[grim] decode-graph: active (replay path served decode steps)");
         } else if let Some(s) = graph_fallback_step {
             eprintln!(
@@ -3645,6 +3742,7 @@ pub async fn cmd_run_interactive(
             generated_tokens.push(next_token);
             tokens.push(next_token);
             history.push(next_token);
+            session.set_last_sampled_token(Some(next_token));
             total_tokens += n_tokens;
             generated += 1;
 

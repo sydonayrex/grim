@@ -484,9 +484,9 @@ impl GgufTokenizer {
             "</s>",
         ]);
 
-        // For byte-level BPE tokenizers (model_type == "bpe"), use the GPT-2 byte encoder
+        // For byte-level BPE tokenizers (model_type == "bpe" or "gpt2"), use the GPT-2 byte encoder
         // to map text → byte-level unicode chars, then apply BPE merges rank-by-rank.
-        if self.model_type == "bpe" {
+        if self.model_type == "bpe" || self.model_type == "gpt2" {
             return self.encode_bpe(text, &special_tokens);
         }
 
