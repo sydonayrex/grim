@@ -3,6 +3,27 @@
 
 use std::sync::{Arc, Mutex};
 
+// Per-process env latches: re-reading these via std::env::var happened on every
+// decode step on the per-token path. Env is not mutated at runtime; read once.
+fn mtp_1pass_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("GRIM_MTP_1PASS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+fn decode_graph_m2_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 use grim_core::error::{Error, Result};
 use grim_core::model::AdapterHandle;
 use grim_core::session::SessionT;
@@ -656,10 +677,7 @@ impl SpeculativeCausalLm {
         if depth == 0 || context_len != 1 || session.skip_output_projection() {
             session.set_last_accepted_tokens(1);
             let out = self.target.forward(session, input_ids, positions, adapters)?;
-            let mtp_1pass = !matches!(
-                std::env::var("GRIM_MTP_1PASS").as_deref(),
-                Ok("0" | "false" | "off")
-            );
+            let mtp_1pass = mtp_1pass_enabled();
             if mtp_1pass
                 && depth > 0
                 && context_len > 1
@@ -682,10 +700,7 @@ impl SpeculativeCausalLm {
 
         // 1-pass batched MTP (default-on unless GRIM_MTP_1PASS=0/false/off): if we have a pending draft
         // from the previous step, batch [base_token, draft_tokens...] into a SINGLE trunk forward pass!
-        let mtp_1pass = !matches!(
-            std::env::var("GRIM_MTP_1PASS").as_deref(),
-            Ok("0" | "false" | "off")
-        );
+        let mtp_1pass = mtp_1pass_enabled();
         let pending_draft = if mtp_1pass {
             self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()).take()
         } else {
@@ -696,10 +711,7 @@ impl SpeculativeCausalLm {
             if verify_len > 0 && mtp_1pass {
                 let kv_len_before = session.kv_mut().map(|kv| kv.len());
                 let use_m2_graph = verify_len >= 1
-                    && !matches!(
-                        std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
-                        Ok("0" | "false" | "off")
-                    );
+                    && decode_graph_m2_enabled();
                 let pre_batch_snapshot = if recurrent && !use_m2_graph {
                     session.snapshot_recurrent_state()?
                 } else {

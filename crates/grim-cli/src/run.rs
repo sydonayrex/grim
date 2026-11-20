@@ -1981,6 +1981,48 @@ pub async fn cmd_run(
             );
             let _ = model.forward(warm_sess.as_mut(), &warm_ids, &warm_pos, &[]);
         }
+        // Warm a full-length prompt forward (M=64) so the first real prompt does
+        // not cold-start the prefill route: rocBLAS f16 heuristics/Tensile objects,
+        // dequant kernel module loads, F16 scratch hipMalloc, KV arena growth on
+        // every layer, and (with GRIM_MTP=on) the first eager nextn draft. The
+        // [1,2] warmup above only exercises the decode-GEMV lane and leaves all
+        // of that inside the TTFT window.
+        {
+            const WARM_PREFILL_TOKENS: usize = 64;
+            let ids: Vec<f32> = (0..WARM_PREFILL_TOKENS)
+                .map(|i| ((i % 255) + 1) as f32)
+                .collect();
+            let poss: Vec<f32> = (0..WARM_PREFILL_TOKENS).map(|i| i as f32).collect();
+            let shape = grim_tensor::Shape::new(vec![1, WARM_PREFILL_TOKENS]);
+            if let (Ok(in_s), Ok(pos_s)) = (
+                grim_backend_cpu::CpuDevice::new().from_cpu(
+                    &ids,
+                    &shape,
+                    grim_tensor::dtype::DType::F32,
+                ),
+                grim_backend_cpu::CpuDevice::new().from_cpu(
+                    &poss,
+                    &shape,
+                    grim_tensor::dtype::DType::F32,
+                ),
+            ) {
+                let warm_ids = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(in_s),
+                    shape.clone(),
+                    grim_tensor::dtype::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    model.device().clone(),
+                );
+                let warm_pos = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(pos_s),
+                    shape,
+                    grim_tensor::dtype::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    model.device().clone(),
+                );
+                let _ = model.forward(warm_sess.as_mut(), &warm_ids, &warm_pos, &[]);
+            }
+        }
         // Pre-capture M=2 DecodeGraph for NativeMtp during model-load prewarm so the
         // first speculative verify step skips warmup + capture inside the decode timer.
         if let Some(spec) = model

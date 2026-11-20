@@ -21,6 +21,28 @@ use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
 use crate::deepseek4::DeepSeek4;
 use crate::deepseek32::DeepSeek32;
+// Per-process env latches: these flags were re-read via std::env::var on every
+// decode step (several sites on the per-token path). Env is not mutated at
+// runtime by the engine, so read once.
+fn decode_graph_m2_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+fn mtp_pre_norm_h_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("GRIM_MTP_PRE_NORM_H").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 use crate::gemma2::{Gemma2, Gemma2Block};
 use crate::glm4_moe_lite::Glm4MoeLite;
 use crate::granite_moe_hybrid::GraniteMoeHybrid;
@@ -4866,10 +4888,7 @@ impl Qwen35Block {
             // On the final layer, preserve the pre-output_norm residual sum in `layer_input[layer_idx]`
             // (which is dead after this point) so MTP `nextn` can A/B test pre- vs post-output_norm.
             let sum_dst: &grim_backend_rocm::RocmStorage = if layer_idx + 1 == n_layers
-                && matches!(
-                    std::env::var("GRIM_MTP_PRE_NORM_H").as_deref(),
-                    Ok("1" | "true" | "on")
-                )
+                && mtp_pre_norm_h_enabled()
             {
                 &buffers.layer_input[layer_idx]
             } else {
@@ -6034,10 +6053,7 @@ impl Qwen35 {
         };
         let hidden = self.cfg.hidden_size;
         let need_bytes = (row + 1) * hidden * std::mem::size_of::<f32>();
-        let h_src = if matches!(
-            std::env::var("GRIM_MTP_PRE_NORM_H").as_deref(),
-            Ok("1" | "true" | "on")
-        ) && !self.blocks.is_empty()
+        let h_src = if mtp_pre_norm_h_enabled() && !self.blocks.is_empty()
         {
             &g.buffers.layer_input[self.blocks.len() - 1]
         } else {
@@ -6082,10 +6098,7 @@ impl Qwen35 {
         graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
     ) -> Result<()> {
         if graph_slot.is_some()
-            || matches!(
-                std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
-                Ok("0" | "false" | "off")
-            )
+            || !decode_graph_m2_enabled()
         {
             return Ok(());
         }
@@ -6126,10 +6139,7 @@ impl Qwen35 {
     ) -> Result<Option<grim_tensor::Tensor>> {
         let batch = tokens.len();
         if batch < 1
-            || matches!(
-                std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
-                Ok("0" | "false" | "off")
-            )
+            || !decode_graph_m2_enabled()
         {
             return Ok(None);
         }
@@ -6252,10 +6262,7 @@ impl Qwen35 {
         // Publish last row of `head_input` (or pre-output_norm `layer_input[last]` when
         // `GRIM_MTP_PRE_NORM_H=1`) into `_session` so `predict_multi_after_forward` drafts from fresh Mk state.
         let hidden = self.cfg.hidden_size;
-        let h_src = if matches!(
-            std::env::var("GRIM_MTP_PRE_NORM_H").as_deref(),
-            Ok("1" | "true" | "on")
-        ) && !self.blocks.is_empty()
+        let h_src = if mtp_pre_norm_h_enabled() && !self.blocks.is_empty()
         {
             &g.buffers.layer_input[self.blocks.len() - 1]
         } else {
@@ -7374,10 +7381,7 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn forward_capture_m2(&self, graph: &mut DecodeGraph, tokens: [u32; 2]) -> Result<()> {
-        if matches!(
-            std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
-            Ok("0" | "false" | "off")
-        ) {
+        if !decode_graph_m2_enabled() {
             return Err(grim_core::error::Error::Unimplemented(
                 "GRIM_DECODE_GRAPH_M2=0".into(),
             ));
@@ -7390,10 +7394,7 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn forward_replay_m2(&self, graph: &mut DecodeGraph, tokens: [u32; 2]) -> Result<()> {
-        if matches!(
-            std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
-            Ok("0" | "false" | "off")
-        ) {
+        if !decode_graph_m2_enabled() {
             return Err(grim_core::error::Error::Unimplemented(
                 "GRIM_DECODE_GRAPH_M2=0".into(),
             ));

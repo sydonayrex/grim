@@ -79,7 +79,13 @@ impl RocmDevice {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        // Prefill dequant + rocBLAS F16 GEMM for large M (default ON for M >= 4 unless explicitly disabled).
+        // Prefill dequant + rocBLAS F16 GEMM for large M (default ON for M >= 16
+        // unless explicitly disabled). Measured on the 27B IQ3_S (17-token prompt,
+        // dual-GPU): raising this to 64 REGRESSED TTFT 657 -> 1358 ms — between
+        // the eager dot4 GEMV cap (m <= 2) and this threshold the only route is
+        // the scalar fused-dequant GEMM, which loses to dequant+rocBLAS at every
+        // prompt M tried. The real mid-M fix is a multi-row IQ3_S prefill GEMV,
+        // not a higher threshold here.
         let prefill_dequant_on = match std::env::var("GRIM_PREFILL_DEQUANT_GEMM").as_deref() {
             Ok("0") | Ok("false") | Ok("off") => false,
             _ => true,

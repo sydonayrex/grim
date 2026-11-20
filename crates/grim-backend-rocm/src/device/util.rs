@@ -391,10 +391,20 @@ static PREFILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 pub fn set_prefill_in_flight(on: bool) {
     PREFILL_IN_FLIGHT.store(on, Ordering::SeqCst);
     if !on {
-        // Drop transient prefill scratch buffers across all probed ROCm devices
-        if let Ok(devs) = crate::RocmDevice::probe() {
-            for d in devs {
-                d.release_prefill_scratch();
+        // Drop transient prefill scratch buffers across all probed ROCm devices.
+        // Opt-out: GRIM_KEEP_PREFILL_SCRATCH=1 keeps the pooled F16 dequant
+        // scratch resident so back-to-back prefills skip the re-alloc + re-dequant
+        // module traffic. Default stays release: on near-full cards (27B dual-GPU)
+        // holding the scratch can OOM the next decode-graph capture.
+        let keep = matches!(
+            std::env::var("GRIM_KEEP_PREFILL_SCRATCH").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        );
+        if !keep {
+            if let Ok(devs) = crate::RocmDevice::probe() {
+                for d in devs {
+                    d.release_prefill_scratch();
+                }
             }
         }
     }
