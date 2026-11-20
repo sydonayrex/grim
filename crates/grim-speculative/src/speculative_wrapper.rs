@@ -28,6 +28,7 @@ use grim_core::error::{Error, Result};
 use grim_core::model::AdapterHandle;
 use grim_core::session::SessionT;
 use grim_core::{CausalLm, Model, ModelConfig};
+use grim_tensor::backend::{ElementwiseOps as _, MemoryOps as _};
 use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::confidence_head::ConfidenceHead;
@@ -341,12 +342,58 @@ impl SpeculativeCausalLm {
         if greedy && matches!(target_logits.device(), Device::Rocm(_)) {
             let mut accepted_count = 0usize;
             let base_row = context_len.saturating_sub(1);
+            // Reuse ONE device scratch row across the verify loop: the per-row
+            // path in `argmax_logits_row` allocates a fresh [1, vocab] storage
+            // per row (pool churn per iteration).
+            let (_guard, dev, scratch) = match target_logits.device() {
+                Device::Rocm(o) => {
+                    // Guard must outlive the loop below: argmax kernels launch
+                    // against the thread-current device.
+                    let guard = grim_backend_rocm::DeviceGuard::set(*o as i32);
+                    let dev = grim_backend_rocm::RocmDevice::shared(*o);
+                    let scratch = grim_tensor::backend::MemoryOps::alloc_storage(
+                        dev.as_ref(),
+                        &grim_tensor::Shape::new(vec![1, vocab_size]),
+                        grim_tensor::DType::F32,
+                    )
+                    .ok();
+                    (guard, dev, scratch)
+                }
+                _ => unreachable!("greedy rocm branch checked device above"),
+            };
             for i in 0..verify_len {
-                let best_idx = grim_models_transformer::Qwen35::argmax_logits_row(
-                    target_logits,
-                    base_row + i,
-                    vocab_size,
-                )? as usize;
+                let best_idx = match scratch.as_ref() {
+                    Some(s) => {
+                        let offset = (base_row + i) * vocab_size;
+                        let mut row_idx = None;
+                        if dev
+                            .copy_slice_range(
+                                s.as_ref(),
+                                0,
+                                target_logits.storage().as_ref(),
+                                offset,
+                                vocab_size,
+                            )
+                            .is_ok()
+                        {
+                            if let Ok(idx) = dev.argmax(s.as_ref()) {
+                                row_idx = Some(idx as usize);
+                            }
+                        }
+                        row_idx.unwrap_or(
+                            grim_models_transformer::Qwen35::argmax_logits_row(
+                                target_logits,
+                                base_row + i,
+                                vocab_size,
+                            )? as usize,
+                        )
+                    }
+                    None => grim_models_transformer::Qwen35::argmax_logits_row(
+                        target_logits,
+                        base_row + i,
+                        vocab_size,
+                    )? as usize,
+                };
                 if best_idx == draft_tokens[i] as usize {
                     accepted_count += 1;
                 } else {

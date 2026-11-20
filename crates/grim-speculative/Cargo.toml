@@ -10,6 +10,7 @@ description = "Default-on speculative decoding for Grim. DSpark-style semi-autor
 grim-tensor = { workspace = true }
 grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
+grim-backend-rocm = { workspace = true }
 grim-models-transformer = { workspace = true }
 tracing = "0.1"
 thiserror = { workspace = true }
