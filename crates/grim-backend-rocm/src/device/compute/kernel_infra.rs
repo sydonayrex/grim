@@ -268,7 +268,28 @@ impl RocmDevice {
                 .as_ref()
                 .ok_or_else(|| Error::Backend("argmax idxs_buf is None".into()))?,
         );
-        drop(idxs_guard);
+        // Fault bisect: `GRIM_ARGMAX_INTO_DEV_GUARDS=1` keeps the idxs Mutex
+        // guard held across the launches exactly like `gpu_argmax` does.
+        let hold_idxs = std::env::var_os("GRIM_ARGMAX_INTO_DEV_GUARDS").is_some();
+
+        // Fault bisect: `GRIM_ARGMAX_INTO_DEV_F32OUT=1` stages stage2's
+        // output through a 16-entry F32 scratch (identical to the impl's
+        // `reduce_out_buf`) instead of the caller's U32 buffer.
+        let mut f32_out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        let f32_out = std::env::var_os("GRIM_ARGMAX_INTO_DEV_F32OUT").is_some();
+        let stage2_out_ptr: u64 = if f32_out {
+            if f32_out_guard.is_none() {
+                *f32_out_guard = Some(RocmStorage::alloc_gpu(
+                    &Shape::new(vec![16usize]),
+                    dtype_f32(),
+                    &self.allocator,
+                    self.ordinal,
+                )?);
+            }
+            dev_ptr(f32_out_guard.as_ref().unwrap())?
+        } else {
+            out_ptr
+        };
 
         let mut x_p = x_ptr;
         let mut part_v_p = partial_vals_ptr;
@@ -280,7 +301,7 @@ impl RocmDevice {
             HipDim3::new(BLOCK_SIZE, 1, 1),
             &mut [arg(&mut x_p), arg(&mut part_v_p), arg(&mut part_i_p), arg(&mut n_i)],
         )?;
-        let mut out_p = out_ptr;
+        let mut out_p = stage2_out_ptr;
         let mut num_part = grid_blocks as i32;
         self.launch_compute_kernel(
             "grim_argmax_stage2",
@@ -293,6 +314,21 @@ impl RocmDevice {
                 arg(&mut num_part),
             ],
         )?;
+        let _ = hold_idxs;
+        if f32_out {
+            // Stream-ordered 4-byte D2D from the F32 scratch to the caller's
+            // U32 buffer (same bits for indices < 2^31).
+            unsafe {
+                let _ = crate::hipMemcpyAsync(
+                    out_ptr as *mut c_void,
+                    stage2_out_ptr as *const c_void,
+                    4,
+                    HipMemcpyKind::DeviceToDevice,
+                    self.active_stream(),
+                );
+            }
+        }
+        drop(f32_out_guard);
         Ok(())
     }
 
