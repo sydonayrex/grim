@@ -3101,6 +3101,29 @@ pub async fn cmd_run(
             eprintln!("  - {:<40}: {}", name, count);
         }
     }
+    // GRIM_KERNEL_TIMES=1: cumulative device time per kernel (HIP events).
+    // Only meaningful on the eager path — event timing breaks graph capture.
+    if std::env::var_os("GRIM_KERNEL_TIMES").is_some() {
+        let mut times = grim_backend_rocm::kernel_times_snapshot();
+        if !times.is_empty() {
+            times.sort_by(|a, b| b.2.cmp(&a.2));
+            let total_us: u64 = times.iter().map(|t| t.2).sum();
+            eprintln!(
+                "[kernel-times] total={:.1} ms across {} kernels; top 25 by device time:",
+                total_us as f64 / 1000.0,
+                times.len()
+            );
+            for (name, count, us) in times.iter().take(25) {
+                eprintln!(
+                    "  - {:<44}: {:>6} launches, {:>10.1} us total, {:>7.2} us each",
+                    name,
+                    count,
+                    *us as f64,
+                    *us as f64 / *count as f64
+                );
+            }
+        }
+    }
     // GRIM_PHASE_TRACE=1: name the constant. The reported average is
     // total/count; if the window also holds a one-time cost (the graph
     // capture's eager warmup, the prefill tail, the lane prewarm) the average
