@@ -24,6 +24,16 @@ fn decode_graph_m2_enabled() -> bool {
     })
 }
 
+fn draft_chain_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("GRIM_MTP_DRAFT_CHAIN").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 use grim_core::error::{Error, Result};
 use grim_core::model::AdapterHandle;
 use grim_core::session::SessionT;
@@ -97,6 +107,9 @@ pub struct SpeculativeCausalLm {
     /// Pending draft block from the previous NativeMtp step, batched with the
     /// next base token into a single trunk forward pass.
     pending_mtp_draft: Mutex<Option<crate::draft_backbone::DraftBlock>>,
+    /// GRIM_MTP_DRAFT_CHAIN=1: a chained draft is enqueued device-side; the
+    /// next verify consumes its token from pinned staging.
+    chained_active: std::sync::atomic::AtomicBool,
     /// Optional m=2 DecodeGraph for 1-pass batched NativeMtp.
     #[allow(dead_code)]
     graph_m2: Mutex<Option<Box<dyn std::any::Any + Send>>>,
@@ -137,6 +150,7 @@ impl SpeculativeCausalLm {
             astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             gpu_verifier: None,
             pending_mtp_draft: Mutex::new(None),
+            chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
         }
     }
@@ -182,6 +196,7 @@ impl SpeculativeCausalLm {
             astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             gpu_verifier: None,
             pending_mtp_draft: Mutex::new(None),
+            chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
         }
     }
@@ -204,6 +219,7 @@ impl SpeculativeCausalLm {
             astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             gpu_verifier: None,
             pending_mtp_draft: Mutex::new(None),
+            chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
         }
     }
@@ -469,6 +485,19 @@ impl SpeculativeCausalLm {
     }
 
     /// Pre-capture the 1-pass MTP `M=2` DecodeGraph during load-time prewarm.
+    /// Teardown safety for GRIM_MTP_DRAFT_CHAIN: wait out any in-flight
+    /// async draft. Cheap (one event wait).
+    pub fn drain_chained_draft(&self) {
+        if !draft_chain_enabled() {
+            return;
+        }
+        let Some(mtp) = self.mtp_target.as_ref() else {
+            return;
+        };
+        let mut g = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+        mtp.drain_chained_draft(&mut g);
+    }
+
     pub fn prewarm_m2_graph(&self) -> Result<()> {
         if let Some(ref mtp) = self.mtp_target {
             let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
@@ -753,6 +782,137 @@ impl SpeculativeCausalLm {
         } else {
             None
         };
+        // GRIM_MTP_DRAFT_CHAIN: device-side draft pending → chained verify.
+        let chain_pending = draft_chain_enabled()
+            && self.chained_active.load(std::sync::atomic::Ordering::Acquire)
+            && depth >= 1
+            && mtp_1pass;
+        if chain_pending {
+            self.chained_active.store(false, std::sync::atomic::Ordering::Release);
+            let verify_len = 1usize.min(depth);
+            if let Some(kv) = session.kv_mut() {
+                kv.tentative_append(verify_len)?;
+            }
+            let batched_input = self.extend_input_ids(input_ids, &[0])?;
+            let batched_positions = self.extend_positions(positions, verify_len)?;
+            let prev_full = session.full_output_logits();
+            session.set_full_output_logits(true);
+            let t_verify0 = std::time::Instant::now();
+            let base_tok = input_ids.to_vec_f32().ok().and_then(|v| v.first().copied()).unwrap_or(0.0) as u32;
+            let base_pos = session.current_pos() as u32;
+            let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+            let batched_logits = match mtp.forward_m2_graph_chained(&mut g_guard, session, base_tok, base_pos) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    drop(g_guard);
+                    if let Some(kv) = session.kv_mut() {
+                        let _ = kv.rollback_to(kv.len().saturating_sub(verify_len));
+                    }
+                    session.set_full_output_logits(prev_full);
+                    let out = self.target.forward(session, &batched_input, &batched_positions, adapters)?;
+                    session.set_last_accepted_tokens(1);
+                    return Ok(out);
+                }
+                Err(e) => {
+                    drop(g_guard);
+                    if let Some(kv) = session.kv_mut() {
+                        let _ = kv.rollback_to(kv.len().saturating_sub(verify_len));
+                    }
+                    session.set_full_output_logits(prev_full);
+                    return Err(e);
+                }
+            };
+            session.set_full_output_logits(prev_full);
+            let t_verify_ms = t_verify0.elapsed().as_secs_f64() * 1000.0;
+            let chained_tok = mtp.read_chained_draft_token(&mut g_guard);
+            drop(g_guard);
+            let draft_tokens = vec![chained_tok];
+            let vocab_size = *batched_logits.shape().dims().last().unwrap_or(&0);
+            let mut rng = session
+                .request_rng()
+                .cloned()
+                .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
+            let uniforms: Vec<f32> = (0..=verify_len).map(|_| rng.next_f32()).collect();
+            let greedy = session.sampling_greedy();
+            let row0_argmax = if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+                grim_models_transformer::Qwen35::argmax_last_logits(
+                    &batched_logits,
+                    vocab_size,
+                )
+                .unwrap_or(u32::MAX)
+            } else {
+                0
+            };
+            let accepted_count = self.verify_accepted_count(
+                &batched_logits,
+                &batched_logits,
+                1,
+                vocab_size,
+                &draft_tokens,
+                verify_len,
+                &uniforms,
+                &mut rng,
+                greedy,
+            )?;
+            if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+                let dtok = draft_tokens[0];
+                eprintln!(
+                    "[chain-debug] accept base={base_tok} draft={dtok} row0argmax={row0_argmax} accepted={accepted_count}"
+                );
+            }
+            {
+                let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                sched.record_acceptance(accepted_count, verify_len);
+            }
+            let emitted = accepted_count + 1;
+            let emitted_logits = self.extract_emitted_logits(&batched_logits, emitted, vocab_size, 1)?;
+            if accepted_count == verify_len {
+                {
+                    let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = mtp.commit_m2_graph_spec_state(&mut g_guard);
+                }
+                session.advance_pos(1 + accepted_count);
+                if let Some(kv) = session.kv_mut() {
+                    kv.commit(accepted_count)?;
+                }
+                let enqueued = mtp.enqueue_chained_draft(
+                    &mut self.graph_m2.lock().unwrap_or_else(|e| e.into_inner()),
+                    session,
+                    &batched_input,
+                    &batched_positions,
+                    &emitted_logits,
+                )
+                .unwrap_or(false);
+                self.chained_active.store(enqueued, std::sync::atomic::Ordering::Release);
+            } else {
+                // Rejected: publish the accepted row + roll back the trunk
+                // graph, then draft SERIALLY (reject-path chaining disabled).
+                {
+                    let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = mtp.publish_m2_graph_hidden_row(&mut g_guard, session, accepted_count);
+                }
+                let base_pos_rec = session.current_pos() as u32;
+                {
+                    let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = mtp.rollback_m2_graph_to_accepted(&mut g_guard, base_pos_rec, 1 + accepted_count);
+                }
+                session.advance_pos(1 + accepted_count);
+                let last_tok = if accepted_count > 0 { draft_tokens[0] } else { base_tok };
+                let last_abs_pos = (base_pos_rec as usize).saturating_add(accepted_count);
+                let step_input = self.scalar_token_tensor(last_tok);
+                let step_pos = self.scalar_position_tensor(positions, last_abs_pos)?;
+                if let Ok(next_draft) = mtp.predict_multi_after_forward(session, &step_input, &step_pos, &emitted_logits) {
+                    *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(next_draft);
+                }
+            }
+            if std::env::var_os("GRIM_MTP_TIMING").is_some() {
+                eprintln!(
+                    "[mtp-timing-chained] accepted={accepted_count} verify={t_verify_ms:.2}ms tok={chained_tok}"
+                );
+            }
+            session.set_last_accepted_tokens(emitted);
+            return Ok(emitted_logits);
+        }
         if let Some(draft_block) = pending_draft {
             let verify_len = draft_block.tokens.len().min(depth);
             if verify_len > 0 && mtp_1pass {
@@ -808,6 +968,15 @@ impl SpeculativeCausalLm {
                     .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
                 let uniforms: Vec<f32> = (0..=verify_len).map(|_| rng.next_f32()).collect();
                 let greedy = session.sampling_greedy();
+                let row0_argmax = if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+                    grim_models_transformer::Qwen35::argmax_last_logits(
+                        &batched_logits,
+                        vocab_size,
+                    )
+                    .unwrap_or(u32::MAX)
+                } else {
+                    0
+                };
                 let accepted_count = self.verify_accepted_count(
                     &batched_logits,
                     &draft_block.base_logits,
@@ -819,6 +988,13 @@ impl SpeculativeCausalLm {
                     &mut rng,
                     greedy,
                 )?;
+                if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+                    let dtok0 = draft_block.tokens.first().copied().unwrap_or(0);
+                    let btok = input_ids.to_vec_f32().ok().and_then(|v| v.first().copied()).unwrap_or(0.0) as u32;
+                    eprintln!(
+                        "[serial-debug] base={btok} draft={dtok0} row0argmax={row0_argmax} accepted={accepted_count}"
+                    );
+                }
                 {
                     let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
                     sched.record_acceptance(accepted_count, verify_len);
@@ -847,8 +1023,18 @@ impl SpeculativeCausalLm {
                         kv.commit(accepted_count)?;
                     }
                     let t_d0 = std::time::Instant::now();
-                    if let Ok(next_draft) = mtp.predict_multi_after_forward(session, &batched_input, &batched_positions, &emitted_logits) {
-                        *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(next_draft);
+                    let mut chained = false;
+                    if draft_chain_enabled() && session.sampling_greedy() {
+                        let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                        chained = mtp
+                            .enqueue_chained_draft(&mut g_guard, session, &batched_input, &batched_positions, &emitted_logits)
+                            .unwrap_or(false);
+                    }
+                    self.chained_active.store(chained, std::sync::atomic::Ordering::Release);
+                    if !chained {
+                        if let Ok(next_draft) = mtp.predict_multi_after_forward(session, &batched_input, &batched_positions, &emitted_logits) {
+                            *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(next_draft);
+                        }
                     }
                     t_draft_ms = t_d0.elapsed().as_secs_f64() * 1000.0;
                 } else if recurrent {

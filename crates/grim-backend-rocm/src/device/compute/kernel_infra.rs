@@ -213,122 +213,27 @@ impl RocmDevice {
     /// value is consumed by a later async staged copy on the same stream).
     /// Launches on the ambient stream; tie-breaking matches `gpu_argmax`.
     pub fn gpu_argmax_into_dev(&self, x_ptr: u64, n: usize, out_ptr: u64) -> Result<()> {
-        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
-            eprintln!(
-                "[argmax-into-dev] dev={} x={x_ptr:#x} n={n} out={out_ptr:#x}",
-                self.ordinal
+        // Run stage1/stage2 through the EXACT gpu_argmax_ptr_impl launch
+        // sequence (same buffer setup, same arg marshalling, same resolved
+        // kernels) but skip the blocking D2H + stream sync; then copy the
+        // 4-byte index from the impl's `reduce_out_buf` to the caller's
+        // buffer, stream-ordered.
+        self.gpu_argmax_ptr_impl(x_ptr, n, None, false)?;
+        let f32_out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        let out_buf = f32_out_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("argmax out_buf is None".into()))?;
+        let out_src = dev_ptr(out_buf)?;
+        drop(f32_out_guard);
+        unsafe {
+            let _ = crate::hipMemcpyAsync(
+                out_ptr as *mut c_void,
+                out_src as *const c_void,
+                4,
+                HipMemcpyKind::DeviceToDevice,
+                self.active_stream(),
             );
         }
-        const BLOCK_SIZE: u32 = 256;
-        const MAX_BLOCKS: u32 = 1024;
-        let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
-
-        let mut part_guard = self
-            .reduce_partials_buf
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if part_guard
-            .as_ref()
-            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
-        {
-            *part_guard = Some(RocmStorage::alloc_gpu(
-                &Shape::new(vec![MAX_BLOCKS as usize]),
-                dtype_f32(),
-                &self.allocator,
-                self.ordinal,
-            )?);
-        }
-        let partial_vals_ptr = dev_ptr(
-            part_guard
-                .as_ref()
-                .ok_or_else(|| Error::Backend("argmax partials_buf is None".into()))?,
-        )?;
-
-        let mut idxs_guard = self
-            .reduce_argmax_idxs_buf
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if idxs_guard
-            .as_ref()
-            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
-        {
-            *idxs_guard = Some(RocmStorage::alloc_gpu(
-                &Shape::new(vec![MAX_BLOCKS as usize]),
-                DType {
-                    arith: ArithType::U32,
-                    storage: DTypeStorage::Native,
-                },
-                &self.allocator,
-                self.ordinal,
-            )?);
-        }
-        let partial_idxs_ptr = dev_ptr(
-            idxs_guard
-                .as_ref()
-                .ok_or_else(|| Error::Backend("argmax idxs_buf is None".into()))?,
-        );
-        // Fault bisect: `GRIM_ARGMAX_INTO_DEV_GUARDS=1` keeps the idxs Mutex
-        // guard held across the launches exactly like `gpu_argmax` does.
-        let hold_idxs = std::env::var_os("GRIM_ARGMAX_INTO_DEV_GUARDS").is_some();
-
-        // Fault bisect: `GRIM_ARGMAX_INTO_DEV_F32OUT=1` stages stage2's
-        // output through a 16-entry F32 scratch (identical to the impl's
-        // `reduce_out_buf`) instead of the caller's U32 buffer.
-        let mut f32_out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
-        let f32_out = std::env::var_os("GRIM_ARGMAX_INTO_DEV_F32OUT").is_some();
-        let stage2_out_ptr: u64 = if f32_out {
-            if f32_out_guard.is_none() {
-                *f32_out_guard = Some(RocmStorage::alloc_gpu(
-                    &Shape::new(vec![16usize]),
-                    dtype_f32(),
-                    &self.allocator,
-                    self.ordinal,
-                )?);
-            }
-            dev_ptr(f32_out_guard.as_ref().unwrap())?
-        } else {
-            out_ptr
-        };
-
-        let mut x_p = x_ptr;
-        let mut part_v_p = partial_vals_ptr;
-        let mut part_i_p = partial_idxs_ptr;
-        let mut n_i = n as i32;
-        self.launch_compute_kernel(
-            "grim_argmax_stage1",
-            HipDim3::new(grid_blocks, 1, 1),
-            HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [arg(&mut x_p), arg(&mut part_v_p), arg(&mut part_i_p), arg(&mut n_i)],
-        )?;
-        let mut out_p = stage2_out_ptr;
-        let mut num_part = grid_blocks as i32;
-        self.launch_compute_kernel(
-            "grim_argmax_stage2",
-            HipDim3::new(1, 1, 1),
-            HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut part_v_p),
-                arg(&mut part_i_p),
-                arg(&mut out_p),
-                arg(&mut num_part),
-            ],
-        )?;
-        let _ = hold_idxs;
-        if f32_out {
-            // Stream-ordered 4-byte D2D from the F32 scratch to the caller's
-            // U32 buffer (same bits for indices < 2^31).
-            unsafe {
-                let _ = crate::hipMemcpyAsync(
-                    out_ptr as *mut c_void,
-                    stage2_out_ptr as *const c_void,
-                    4,
-                    HipMemcpyKind::DeviceToDevice,
-                    self.active_stream(),
-                );
-            }
-        }
-        drop(f32_out_guard);
         Ok(())
     }
 
@@ -342,7 +247,7 @@ impl RocmDevice {
         let x_ptr = x_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("gpu_argmax: x has no device ptr".into()))?;
-        self.gpu_argmax_ptr_impl(x_ptr, n, None)
+        self.gpu_argmax_ptr_impl(x_ptr, n, None, true)
     }
 
     /// Multi-workgroup tree reduction for argmax on an explicit stream.
@@ -356,7 +261,7 @@ impl RocmDevice {
         if n == 0 {
             return Err(Error::Backend("argmax: empty tensor".into()));
         }
-        self.gpu_argmax_ptr_impl(x_ptr, n, Some(stream))
+        self.gpu_argmax_ptr_impl(x_ptr, n, Some(stream), true)
     }
 
     fn gpu_argmax_ptr_impl(
@@ -364,6 +269,7 @@ impl RocmDevice {
         x_ptr: u64,
         n: usize,
         explicit_stream: Option<*mut c_void>,
+        d2h: bool,
     ) -> Result<u32> {
 
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
@@ -610,6 +516,14 @@ impl RocmDevice {
             )?
         };
 
+        if !d2h {
+            // Chained-MTP variant: leave the index in `out_buf` (stream-
+            // ordered for the caller's async staged copy) and skip the
+            // blocking D2H + stream sync. Everything else — buffer setup,
+            // kernel launches, arg marshalling — is byte-identical to the
+            // proven `gpu_argmax` path.
+            return Ok(0);
+        }
         let mut res: u32 = 0u32;
         check_hip("gpu_argmax D2H", unsafe {
             // BLOCKING D2H: an async copy the host then waits on is a host round-trip (see `blocking_d2h_count`).

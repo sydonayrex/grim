@@ -244,6 +244,83 @@ impl NativeMtp for Qwen35MtpAdapter {
     ) -> Result<()> {
         self.qwen()?.commit_graph_spec_state(graph_slot)
     }
+    fn enqueue_chained_draft(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        session: &mut dyn SessionT,
+        _input_ids: &Tensor,
+        positions: &Tensor,
+        emitted_logits: &Tensor,
+    ) -> Result<bool> {
+        let qwen = self.qwen()?;
+        let Some(nextn) = qwen.nextn.as_ref() else {
+            return Ok(false);
+        };
+        let debug = std::env::var_os("GRIM_MTP_DEBUG").is_some();
+        // Greedy-only: the bonus token is argmax of the last emitted row.
+        if !session.sampling_greedy() {
+            return Ok(false);
+        }
+        let vocab_size = qwen.cfg.vocab_size;
+        let bonus_tok =
+            grim_models_transformer::Qwen35::argmax_last_logits(emitted_logits, vocab_size)
+                .unwrap_or(0);
+        let Some(h_prev) = session.get_last_hidden_state() else {
+            return Ok(false);
+        };
+        // Same position contract as predict_multi_after_forward.
+        let pos_vec = positions.to_vec_f32().unwrap_or_default();
+        let bonus_pos = pos_vec.last().copied().unwrap_or(0.0) as u32;
+        let mut cache_guard = nextn.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (ref mut cache_opt, ref mut pos_log) = *cache_guard;
+        let cache = cache_opt
+            .get_or_insert_with(|| grim_models_transformer::qwen35::Qwen35LayerCache::new(&qwen.cfg));
+        let persist_kv = !matches!(
+            std::env::var("GRIM_MTP_NEXTN_KV_PERSIST").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        );
+        let bonus_pos = bonus_pos.saturating_add(1);
+        if !persist_kv || bonus_pos == 0 {
+            cache.current_pos = 0;
+            pos_log.clear();
+        } else {
+            let valid_len = pos_log.iter().take_while(|&&p| p < bonus_pos).count();
+            pos_log.truncate(valid_len);
+            cache.current_pos = valid_len;
+        }
+        let ok = qwen.draft_nextn_enqueue_chained(nextn, bonus_tok, &h_prev, bonus_pos, cache, debug)?;
+        pos_log.push(bonus_pos);
+        if debug {
+            eprintln!("[chain-debug] adapter enqueue ok={ok} bonus_tok={bonus_tok} pos={bonus_pos}");
+        }
+        Ok(ok)
+    }
+
+    fn forward_m2_graph_chained(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        session: &mut dyn SessionT,
+        base_token: u32,
+        pos: u32,
+    ) -> Result<Option<Tensor>> {
+        let qwen = self.qwen()?;
+        let Some(nextn) = qwen.nextn.as_ref() else {
+            return Ok(None);
+        };
+        qwen.run_m2_graph_step_chained(graph_slot, session, nextn, base_token, pos)
+    }
+
+    fn read_chained_draft_token(&self, _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>) -> u32 {
+        let Ok(qwen) = self.qwen() else { return 0 };
+        let Some(nextn) = qwen.nextn.as_ref() else { return 0 };
+        qwen.read_chained_draft_token(nextn)
+    }
+
+    fn drain_chained_draft(&self, _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>) {
+        let Ok(qwen) = self.qwen() else { return };
+        let Some(nextn) = qwen.nextn.as_ref() else { return };
+        qwen.drain_chained_draft(nextn)
+    }
 }
 
 fn empty_block(device: &Device) -> DraftBlock {

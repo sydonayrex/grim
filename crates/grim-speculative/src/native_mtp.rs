@@ -99,4 +99,38 @@ pub trait NativeMtp: grim_core::CausalLm {
     ) -> Result<()> {
         Ok(())
     }
+    // ── Chained draft (GRIM_MTP_DRAFT_CHAIN=1): greedy, depth-1, M=2 graph only ──
+
+    /// Enqueue the nextn draft for the NEXT iteration asynchronously. The
+    /// draft token lands in pinned staging via an event-ordered chain; the
+    /// host does not wait. Ok(false) = declined (caller drafts serially).
+    fn enqueue_chained_draft(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _session: &mut dyn grim_core::session::SessionT,
+        _input_ids: &Tensor,
+        _positions: &Tensor,
+        _emitted_logits: &Tensor,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// M=2 trunk verify with slot 1 supplied by the chained draft.
+    fn forward_m2_graph_chained(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _session: &mut dyn grim_core::session::SessionT,
+        _base_token: u32,
+        _pos: u32,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    /// Read the chained draft token (valid after the chained verify returned).
+    fn read_chained_draft_token(&self, _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>) -> u32 {
+        0
+    }
+
+    /// Block until any in-flight chained draft has executed its pinned copy.
+    fn drain_chained_draft(&self, _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>) {}
 }

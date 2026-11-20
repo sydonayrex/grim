@@ -98,6 +98,20 @@ pub trait DecodeGraphModel: Send + Sync {
             "model does not support m=2 DecodeGraph replay".into(),
         ))
     }
+    /// Replay WITHOUT the pre-launch device fence and WITHOUT the trailing
+    /// device synchronize (chained-MTP path, `GRIM_MTP_DRAFT_CHAIN=1`).
+    /// Contract: the caller has staged every input write on each device's
+    /// default stream; `forward_replay_q` event-orders those writes with the
+    /// segment launch streams BEFORE replay, and the caller must not consume
+    /// outputs until a later stream-ordered barrier (verify argmax D2H).
+    /// Replay WITHOUT the pre-launch device fence and WITHOUT the trailing
+    /// device synchronize (chained-MTP path, `GRIM_MTP_DRAFT_CHAIN=1`).
+    fn forward_replay_nosync(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        let _ = (graph, token_id);
+        Err(grim_core::error::Error::Unimplemented(
+            "model does not support nosync replay".into(),
+        ))
+    }
 
     /// M2: interpret the PUBLISHED task graph for one decode step.
     ///
@@ -5523,6 +5537,26 @@ impl Qwen35 {
     }
 }
 
+/// Nextn draft-step decode graph + chained-draft plumbing (pinned staging
+/// slot and event for the GRIM_MTP_DRAFT_CHAIN token handoff).
+struct NextnDecodeGraph {
+    dev_ord: usize,
+    buffers: DecodeGraphBuffers,
+    embed_in: RocmStorage,
+    h_prev_in: RocmStorage,
+    _eh_cat: RocmStorage,
+    _eh_q81: RocmStorage,
+    _normed_out: RocmStorage,
+    graph_key: String,
+    draft_tok_dev: RocmStorage,
+    logits_clone_dev: RocmStorage,
+    pinned_tok: SendPtr,
+    ev_tok: SendPtr,
+}
+
+/// Raw-pointer newtype so nextn chain state can live in `Box<dyn Any + Send>`.
+struct SendPtr(*mut std::ffi::c_void);
+unsafe impl Send for SendPtr {}
 impl Qwen35 {
     /// Snapshot recurrent (ShortConv + KDA) state inside `DecodeGraph` before speculative verification.
     /// When `accepted > 0`, first advances the live state by `accepted` tokens from row 0..accepted
@@ -5563,6 +5597,204 @@ impl Qwen35 {
         Ok(())
     }
 
+    /// Chained-draft enqueue (GRIM_MTP_DRAFT_CHAIN=1, greedy, depth 1): stage
+    /// the nextn draft step, replay its HIP graph, then D2D-snapshot
+    /// `head_output` into a PERSISTENT clone buffer (stream-ordered) and
+    /// argmax the clone with stage1/stage2 (async, device out), then pinned
+    /// D2H + event. The host does NOT wait for the draft token.
+    /// Ok(false) = declined (caller drafts serially this step).
+    pub fn draft_nextn_enqueue_chained(
+        &self,
+        nextn: &crate::qwen35::Qwen35Nextn,
+        token_id: u32,
+        h_prev: &grim_tensor::Tensor,
+        position: u32,
+        nextn_cache: &mut crate::qwen35::Qwen35LayerCache,
+        debug: bool,
+    ) -> Result<bool> {
+        use grim_backend_rocm::{HipMemcpyKind, RocmDevice};
+        use grim_tensor::Device;
+
+        let dev_ord = match nextn.block.device {
+            Device::Rocm(o) => o,
+            _ => return Ok(false),
+        };
+        let dev = RocmDevice::shared(dev_ord);
+        let _guard = grim_backend_rocm::DeviceGuard::set(dev_ord as i32);
+
+        let mut g_guard = nextn.graph.lock().unwrap_or_else(|e| e.into_inner());
+        if g_guard
+            .as_ref()
+            .and_then(|b| b.downcast_ref::<NextnDecodeGraph>())
+            .is_none()
+        {
+            // The serial draft path never builds this graph — capture it here.
+            // Decline this step; the next enqueue finds the captured graph.
+            drop(g_guard);
+            let _ = self.draft_nextn_one_graph(nextn, token_id, h_prev, position, nextn_cache);
+            if debug {
+                eprintln!("[chain-debug] cold graph captured, declining this step");
+            }
+            return Ok(false);
+        }
+        let ng = g_guard
+            .as_mut()
+            .and_then(|b| b.downcast_mut::<NextnDecodeGraph>())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("chained draft: nextn graph downcast".into())
+            })?;
+
+        // Stage inputs exactly like the graph-path replay entry.
+        let embed = self.embed_token(token_id)?;
+        let target_dev = Device::Rocm(ng.dev_ord);
+        let embed_on_dev = if embed.device() == &target_dev {
+            embed
+        } else {
+            grim_nn::modules::move_to_device(&embed, &target_dev)?
+        };
+        let h_prev_on_dev = if h_prev.device() == &target_dev {
+            h_prev.clone()
+        } else {
+            grim_nn::modules::move_to_device(h_prev, &target_dev)?
+        };
+
+        let stream = dev.active_stream();
+        let hidden = self.cfg.hidden_size;
+        let h_bytes = hidden * std::mem::size_of::<f32>();
+        if let (Some(dst), Some(src)) = (
+            ng.embed_in.device_ptr(),
+            embed_on_dev
+                .storage()
+                .as_any()
+                .downcast_ref::<RocmStorage>()
+                .and_then(|s| s.device_ptr()),
+        ) {
+            unsafe {
+                let _ = grim_backend_rocm::hipMemcpyAsync(
+                    dst as *mut std::ffi::c_void,
+                    src as *const std::ffi::c_void,
+                    h_bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                );
+            }
+        }
+        if let (Some(dst), Some(src)) = (
+            ng.h_prev_in.device_ptr(),
+            h_prev_on_dev
+                .storage()
+                .as_any()
+                .downcast_ref::<RocmStorage>()
+                .and_then(|s| s.device_ptr()),
+        ) {
+            unsafe {
+                let _ = grim_backend_rocm::hipMemcpyAsync(
+                    dst as *mut std::ffi::c_void,
+                    src as *const std::ffi::c_void,
+                    h_bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                );
+            }
+        }
+
+        let pos_u32 = position;
+        let tot_u32 = nextn_cache.current_pos as u32;
+        if let Some(pos_ptr) = ng.buffers.pos_dev.device_ptr() {
+            unsafe {
+                let _ = grim_backend_rocm::hipMemcpyAsync(
+                    pos_ptr as *mut std::ffi::c_void,
+                    &pos_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                    HipMemcpyKind::HostToDevice,
+                    stream,
+                );
+            }
+        }
+        if let Some(tot_ptr) = ng.buffers.layer_totals[0].device_ptr() {
+            unsafe {
+                let _ = grim_backend_rocm::hipMemcpyAsync(
+                    tot_ptr as *mut std::ffi::c_void,
+                    &tot_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                    HipMemcpyKind::HostToDevice,
+                    stream,
+                );
+            }
+        }
+
+        dev.replay_graph_force(&ng.graph_key)
+            .map_err(|e| grim_core::error::Error::Backend(format!("nextn chain replay: {e}")))?;
+        nextn_cache.current_pos += 1;
+
+        let head_output_ptr = ng
+            .buffers
+            .head_output
+            .device_ptr()
+            .ok_or_else(|| grim_core::error::Error::Backend("chained draft: head_output no ptr".into()))?;
+        let clone_ptr = ng
+            .logits_clone_dev
+            .device_ptr()
+            .ok_or_else(|| grim_core::error::Error::Backend("chained draft: clone no ptr".into()))?;
+        let draft_tok_ptr = ng
+            .draft_tok_dev
+            .device_ptr()
+            .ok_or_else(|| grim_core::error::Error::Backend("chained draft: draft_tok_dev no ptr".into()))?;
+        let pinned = ng.pinned_tok.0;
+        let ev = ng.ev_tok.0;
+        let vocab = self.cfg.vocab_size;
+        drop(g_guard);
+
+        // Snapshot the graph buffer into the persistent clone (stream-ordered
+        // after the replay), then argmax over the CLONE — all async.
+        unsafe {
+            grim_backend_rocm::hipMemcpyAsync(
+                clone_ptr as *mut std::ffi::c_void,
+                head_output_ptr as *const std::ffi::c_void,
+                vocab * 4,
+                HipMemcpyKind::DeviceToDevice,
+                dev.active_stream(),
+            );
+        }
+        dev.gpu_argmax_into_dev(clone_ptr, vocab, draft_tok_ptr)?;
+        unsafe {
+            grim_backend_rocm::hipMemcpyAsync(
+                pinned,
+                draft_tok_ptr as *const std::ffi::c_void,
+                4,
+                HipMemcpyKind::DeviceToHost,
+                dev.active_stream(),
+            );
+            grim_backend_rocm::hipEventRecord(ev, dev.active_stream());
+        }
+        if debug {
+            eprintln!("[chain-debug] enqueue done (async)");
+        }
+        Ok(true)
+    }
+
+    /// Read the chained draft token from the pinned staging slot. Valid only
+    /// after the NEXT verify has synchronized (its argmax D2H is the barrier).
+    pub fn read_chained_draft_token(&self, nextn: &crate::qwen35::Qwen35Nextn) -> u32 {
+        let g_guard = nextn.graph.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ng) = g_guard.as_ref().and_then(|b| b.downcast_ref::<NextnDecodeGraph>()) else {
+            return 0;
+        };
+        unsafe { std::ptr::read_volatile(ng.pinned_tok.0 as *const u32) }
+    }
+
+    /// Block until the last chained draft's pinned copy has executed.
+    pub fn drain_chained_draft(&self, nextn: &crate::qwen35::Qwen35Nextn) {
+        let g_guard = nextn.graph.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ng) = g_guard.as_ref().and_then(|b| b.downcast_ref::<NextnDecodeGraph>()) else {
+            return;
+        };
+        let ev = ng.ev_tok.0;
+        drop(g_guard);
+        unsafe {
+            grim_backend_rocm::hipEventSynchronize(ev);
+        }
+    }
     /// Lever 3: HIP-Graph captured `Qwen35Nextn::forward_step` on `rocm:1`.
     /// Eliminates ~55 eager kernel launches and ~20 temp allocations per draft step.
     pub fn draft_nextn_one_graph(
@@ -5575,17 +5807,6 @@ impl Qwen35 {
     ) -> Result<Option<(u32, grim_tensor::Tensor, grim_tensor::Tensor)>> {
         use grim_backend_rocm::{DecodeGraphBuffers, RocmDevice, RocmStorage};
         use grim_tensor::{DType, Device, QuantProvenance, Shape, Tensor};
-
-        struct NextnDecodeGraph {
-            dev_ord: usize,
-            buffers: DecodeGraphBuffers,
-            embed_in: RocmStorage,
-            h_prev_in: RocmStorage,
-            _eh_cat: RocmStorage,
-            _eh_q81: RocmStorage,
-            _normed_out: RocmStorage,
-            graph_key: String,
-        }
 
         let dev_ord = match nextn.block.device {
             Device::Rocm(o) => o,
@@ -5651,6 +5872,50 @@ impl Qwen35 {
             let normed_out = RocmStorage::alloc_gpu(&Shape::new(vec![1, hidden]), DType::F32, &dev.allocator_handle(), dev_ord)
                 .map_err(|e| grim_core::error::Error::Backend(format!("nextn normed_out: {e}")))?;
 
+            // Chained-draft plumbing (GRIM_MTP_DRAFT_CHAIN=1).
+            // Same size class as the known-good warm buffer: tiny 4-byte
+            // pool blocks faulted as kernel targets on this path.
+            let draft_tok_dev = RocmStorage::alloc_gpu(
+                &Shape::new(vec![1, 256]),
+                DType::F32,
+                &dev.allocator_handle(),
+                dev_ord,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("nextn draft_tok_dev: {e}")))?;
+            // Persistent CLONE of head_output: the chain argmaxes over this
+            // snapshot, never the graph buffer directly.
+            let logits_clone_dev = RocmStorage::alloc_gpu(
+                &Shape::new(vec![1, self.cfg.vocab_size]),
+                DType::F32,
+                &dev.allocator_handle(),
+                dev_ord,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("nextn logits_clone_dev: {e}")))?;
+            let mut pinned_raw: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hp = unsafe { grim_backend_rocm::hipHostMalloc(&mut pinned_raw, 4, 0) };
+            if hp != 0 {
+                return Err(grim_core::error::Error::Backend(format!("nextn pinned_tok: hipHostMalloc {hp}")));
+            }
+            let mut ev_raw: *mut std::ffi::c_void = std::ptr::null_mut();
+            let ec = unsafe { grim_backend_rocm::hipEventCreate(&mut ev_raw) };
+            if ec != 0 {
+                return Err(grim_core::error::Error::Backend(format!("nextn ev_tok: hipEventCreate {ec}")));
+            }
+            // PRE-RESOLVE the argmax kernels on this device: unresolved JIT
+            // during active stream work is the prime fault suspect.
+            {
+                let warm_n = 256usize;
+                let warm = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![1, warm_n]),
+                    DType::F32,
+                    &dev.allocator_handle(),
+                    dev_ord,
+                )?;
+                if let (Some(w), Some(t)) = (warm.device_ptr(), draft_tok_dev.device_ptr()) {
+                    let _ = dev.gpu_argmax_into_dev(w, warm_n, t);
+                    let _ = dev.synchronize();
+                }
+            }
             let tag = buffers.head_output.device_ptr().unwrap_or(0);
             let graph_key = format!("qwen35_nextn_step_{tag:x}_d{dev_ord}");
 
@@ -5772,6 +6037,10 @@ impl Qwen35 {
                 _eh_q81: eh_q81,
                 _normed_out: normed_out,
                 graph_key,
+                draft_tok_dev,
+                logits_clone_dev,
+                pinned_tok: SendPtr(pinned_raw),
+                ev_tok: SendPtr(ev_raw),
             }));
         }
 
@@ -6130,12 +6399,222 @@ impl Qwen35 {
     /// Run one M-token (`1 <= M <= max_batch`) DecodeGraph step over a shared `DecodeGraphBuffers`
     /// pool (capture on first call for each batch size `M`, replay on subsequent calls).
     /// Returns `Ok(None)` if `GRIM_DECODE_GRAPH_M2=0` or if capture is unavailable.
+    /// Replay body shared by the sync and nosync (chained) paths.
+    pub fn forward_replay_q(
+        &self,
+        graph: &mut DecodeGraph,
+        token_id: u32,
+        sync_after: bool,
+    ) -> Result<()> {
+        if !graph.is_captured {
+            return Err(grim_core::error::Error::Backend(
+                "forward_replay before capture".into(),
+            ));
+        }
+        let dev = dev_for_qwen35(self)?;
+        if sync_after {
+            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        }
+
+        let pos = graph.buffers.current_pos;
+        if !graph.kv_append_node.is_null() {
+            let _ = graph.update_kv_pos_params(std::ptr::null());
+        }
+        // A5b: every segment's pos scalar starts the replay at `pos`, each
+        // written on its own device's stream. Single-device models have no
+        // replicas, so this writes the primary exactly as before.
+        graph
+            .buffers
+            .write_pos_all_segments(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        graph
+            .buffers
+            .write_layer_totals(pos)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write layer totals: {e}")))?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] executing graph.replay() pos={pos}");
+        }
+        // The input writes above go out on each device's default stream, but
+        // segment graphs launch on pooled streams: no implicit ordering.
+        // Sync path: fence every device. Nosync (chained) path: fencing dev1
+        // would block the host on the async draft sharing its default
+        // stream, so instead event-order the writes with each segment's
+        // launch stream BEFORE graph.replay(). Events are context-bound:
+        // create under the owning device's guard.
+        if !sync_after && std::env::var_os("GRIM_CHAIN_FULLFENCE").is_some() {
+            // Bisect: full fence before nosync replay — identifies stale
+            // staged inputs as the divergence cause (kills overlap on dev1).
+            let mut pre = graph.buffers.layer_devices.clone();
+            if !pre.contains(&dev.ordinal()) {
+                pre.push(dev.ordinal());
+            }
+            for ord in pre {
+                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+            }
+        } else if !sync_after {
+            thread_local! {
+                static QWEN_NOSYNC_EV: std::cell::RefCell<[*mut std::ffi::c_void; 8]> =
+                    const { std::cell::RefCell::new([std::ptr::null_mut(); 8]) };
+            }
+            unsafe {
+                QWEN_NOSYNC_EV.with(|cell| {
+                    let mut evs = cell.borrow_mut();
+                    for &ord in &graph.buffers.layer_devices {
+                        let slot = ord.min(evs.len() - 1);
+                        if evs[slot].is_null() {
+                            let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+                            let _ = grim_backend_rocm::hipEventCreate(&mut evs[slot]);
+                        }
+                        if !evs[slot].is_null() {
+                            let d = grim_backend_rocm::RocmDevice::shared(ord);
+                            let _ = grim_backend_rocm::hipEventRecord(evs[slot], d.active_stream());
+                        }
+                    }
+                    for seg in &graph.segments {
+                        let slot = seg.device.min(evs.len() - 1);
+                        if !evs[slot].is_null() {
+                            let _ = grim_backend_rocm::hipStreamWaitEvent(seg.stream, evs[slot], 0);
+                        }
+                    }
+                });
+            }
+        } else {
+            let mut pre = graph.buffers.layer_devices.clone();
+            if !pre.contains(&dev.ordinal()) {
+                pre.push(dev.ordinal());
+            }
+            for ord in pre {
+                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+            }
+        }
+        let wall_start = std::time::Instant::now();
+        graph
+            .replay()
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] graph.replay() returned ok; syncing devices");
+        }
+        if !sync_after {
+            // Chained path: no trailing barrier; the first output
+            // consumption (verify argmax D2H) is stream-ordered after seg1.
+        } else         if graph.segments.len() <= 1 && !graph.stream.is_null() {
+            let active = dev.active_stream();
+            if active != graph.stream {
+                unsafe {
+                    thread_local! {
+                        static QWEN_REPLAY_EV: std::cell::Cell<*mut std::ffi::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+                    }
+                    let ev = QWEN_REPLAY_EV.with(|c| {
+                        let mut p = c.get();
+                        if p.is_null() {
+                            let _ = grim_backend_rocm::hipEventCreate(&mut p);
+                            c.set(p);
+                        }
+                        p
+                    });
+                    if !ev.is_null() {
+                        let _ = grim_backend_rocm::hipEventRecord(ev, graph.stream);
+                        let _ = grim_backend_rocm::hipStreamWaitEvent(active, ev, 0);
+                    } else {
+                        let _ = grim_backend_rocm::hipStreamSynchronize(graph.stream);
+                    }
+                }
+            }
+        } else {
+            let mut ords = graph.buffers.layer_devices.clone();
+            if !ords.contains(&dev.ordinal()) {
+                ords.push(dev.ordinal());
+            }
+            for ord in ords {
+                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+            }
+        }
+        let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
+            eprintln!("[graph-trace] devices synchronized");
+        }
+        if matches!(
+            std::env::var("GRIM_SEGMENT_TIMING").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            if let Some(seg_ms) = graph.read_segment_timings() {
+                let sum_seg: f64 = seg_ms.iter().map(|&ms| ms as f64).sum();
+                let handoff_est = (wall_ms - sum_seg).max(0.0);
+                let seg_strs: Vec<String> = seg_ms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ms)| format!("seg_ms[{i}]={ms:.3}"))
+                    .collect();
+                // Layer-kind and bytes statistics per segment
+                let mut seg_info = Vec::new();
+                for (s_idx, s) in graph.segments.iter().enumerate() {
+                    let mut attn_count = 0usize;
+                    let mut recur_count = 0usize;
+                    let mut placed_bytes = 0u64;
+                    for l in s.layers.clone() {
+                        if (l + 1) % self.cfg.full_attention_interval.max(1) == 0 {
+                            attn_count += 1;
+                        } else {
+                            recur_count += 1;
+                        }
+                        if let Some(b) = graph.buffers.layer_input.get(l) {
+                            placed_bytes += b.bytes() as u64;
+                        }
+                    }
+                    seg_info.push(format!("seg{s_idx}(dev{},layers={:?},attn={attn_count},recur={recur_count},bytes={placed_bytes})", s.device, s.layers));
+                }
+                eprintln!(
+                    "[segment-timing] {} wall_ms={wall_ms:.3} handoff_est={handoff_est:.3} | {}",
+                    seg_strs.join(" "),
+                    seg_info.join(" ")
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn run_m2_graph_step(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        session: &mut dyn grim_core::session::SessionT,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<Option<grim_tensor::Tensor>> {
+        self.run_m2_graph_step_ex(graph_slot, session, tokens, pos, None)
+    }
+
+    /// Chained variant (GRIM_MTP_DRAFT_CHAIN=1): slot 1 is supplied by the
+    /// chained draft via event-ordered pinned staging; replay runs without
+    /// the pre-fence and trailing sync. All other logic (capture, batch
+    /// switch, eager seeding, logits clone, hidden publish) is IDENTICAL to
+    /// [`Self::run_m2_graph_step`].
+    pub fn run_m2_graph_step_chained(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        session: &mut dyn grim_core::session::SessionT,
+        nextn: &crate::qwen35::Qwen35Nextn,
+        base_token: u32,
+        pos: u32,
+    ) -> Result<Option<grim_tensor::Tensor>> {
+        // Batch MUST stay 2: the graph is captured at batch 2 and the verify
+        // needs both logits rows (base + draft). Slot 1's id is written from
+        // pinned staging; tokens[1] here is a placeholder.
+        self.run_m2_graph_step_ex(
+            graph_slot,
+            session,
+            &[base_token, 0u32],
+            pos,
+            Some(nextn),
+        )
+    }
+
+    fn run_m2_graph_step_ex(
         &self,
         graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
         _session: &mut dyn grim_core::session::SessionT,
         tokens: &[u32],
         pos: u32,
+        chained: Option<&crate::qwen35::Qwen35Nextn>,
     ) -> Result<Option<grim_tensor::Tensor>> {
         let batch = tokens.len();
         if batch < 1
@@ -6247,9 +6726,54 @@ impl Qwen35 {
                 g.buffers.snapshot_recurrent_state(ckpt, std::ptr::null_mut())?;
             }
         }
-        crate::lfm2_graph::write_batch_embeddings(&dev_primary, &g.buffers.token_ids_dev, tokens)?;
-        g.buffers.current_pos = pos;
-        self.forward_replay(g, tokens[0])?;
+        match chained {
+            Some(nextn) => {
+                // Slot 1 from the chained draft: wait its event on THIS
+                // device's stream, then H2D 4 bytes into slot 1's id field.
+                // Slot 0 (host-known base token) written right after — both
+                // on this device's default stream.
+                let g_guard = nextn.graph.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(ng) = g_guard.as_ref().and_then(|b| b.downcast_ref::<NextnDecodeGraph>()) else {
+                    return Ok(None);
+                };
+                let (pinned, ev) = (ng.pinned_tok.0, ng.ev_tok.0);
+                drop(g_guard);
+                let stream0 = dev_primary.active_stream();
+                unsafe {
+                    grim_backend_rocm::hipStreamWaitEvent(stream0, ev, 0);
+                    let Some(dst) = g.buffers.token_ids_dev.device_ptr() else {
+                        return Ok(None);
+                    };
+                    // token_ids_dev is [batch]: ONE u32 per slot, contiguous
+                    // (see write_embeddings_to_buffer_batch). Slot stride is
+                    // 4 bytes — not hidden*4.
+                    let slot1_off = std::mem::size_of::<f32>();
+                    grim_backend_rocm::hipMemcpyAsync(
+                        (dst + slot1_off as u64) as *mut std::ffi::c_void,
+                        pinned as *const std::ffi::c_void,
+                        4,
+                        grim_backend_rocm::HipMemcpyKind::HostToDevice,
+                        stream0,
+                    );
+                }
+                crate::lfm2_graph::write_embedding_to_buffer(
+                    &dev_primary,
+                    &g.buffers.token_ids_dev,
+                    tokens[0],
+                )?;
+                g.buffers.current_pos = pos;
+                self.forward_replay_nosync(g, tokens[0])?;
+            }
+            None => {
+                crate::lfm2_graph::write_batch_embeddings(
+                    &dev_primary,
+                    &g.buffers.token_ids_dev,
+                    tokens,
+                )?;
+                g.buffers.current_pos = pos;
+                self.forward_replay(g, tokens[0])?;
+            }
+        }
         let logits_dev = g.logits_device_storage();
         let ord = logits_dev.device_ordinal();
         let vocab = self.cfg.vocab_size;
@@ -7405,125 +7929,11 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
-        if !graph.is_captured {
-            return Err(grim_core::error::Error::Backend(
-                "forward_replay before capture".into(),
-            ));
-        }
-        let dev = dev_for_qwen35(self)?;
-        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        self.forward_replay_q(graph, token_id, true)
+    }
 
-        let pos = graph.buffers.current_pos;
-        if !graph.kv_append_node.is_null() {
-            let _ = graph.update_kv_pos_params(std::ptr::null());
-        }
-        // A5b: every segment's pos scalar starts the replay at `pos`, each
-        // written on its own device's stream. Single-device models have no
-        // replicas, so this writes the primary exactly as before.
-        graph
-            .buffers
-            .write_pos_all_segments(pos)
-            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
-        graph
-            .buffers
-            .write_layer_totals(pos)
-            .map_err(|e| grim_core::error::Error::Backend(format!("write layer totals: {e}")))?;
-        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
-            eprintln!("[graph-trace] executing graph.replay() pos={pos}");
-        }
-        // The input writes above go out on each device's default stream, but
-        // segment graphs launch on pooled streams: no implicit ordering. Fence
-        // every device so token/pos land before the graph reads them.
-        {
-            let mut pre = graph.buffers.layer_devices.clone();
-            if !pre.contains(&dev.ordinal()) {
-                pre.push(dev.ordinal());
-            }
-            for ord in pre {
-                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
-            }
-        }
-        let wall_start = std::time::Instant::now();
-        graph
-            .replay()
-            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
-        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
-            eprintln!("[graph-trace] graph.replay() returned ok; syncing devices");
-        }
-        if graph.segments.len() <= 1 && !graph.stream.is_null() {
-            let active = dev.active_stream();
-            if active != graph.stream {
-                unsafe {
-                    thread_local! {
-                        static QWEN_REPLAY_EV: std::cell::Cell<*mut std::ffi::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-                    }
-                    let ev = QWEN_REPLAY_EV.with(|c| {
-                        let mut p = c.get();
-                        if p.is_null() {
-                            let _ = grim_backend_rocm::hipEventCreate(&mut p);
-                            c.set(p);
-                        }
-                        p
-                    });
-                    if !ev.is_null() {
-                        let _ = grim_backend_rocm::hipEventRecord(ev, graph.stream);
-                        let _ = grim_backend_rocm::hipStreamWaitEvent(active, ev, 0);
-                    } else {
-                        let _ = grim_backend_rocm::hipStreamSynchronize(graph.stream);
-                    }
-                }
-            }
-        } else {
-            let mut ords = graph.buffers.layer_devices.clone();
-            if !ords.contains(&dev.ordinal()) {
-                ords.push(dev.ordinal());
-            }
-            for ord in ords {
-                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
-            }
-        }
-        let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
-        if std::env::var("GRIM_GRAPH_TRACE").is_ok() {
-            eprintln!("[graph-trace] devices synchronized");
-        }
-        if matches!(
-            std::env::var("GRIM_SEGMENT_TIMING").as_deref(),
-            Ok("1" | "true" | "on")
-        ) {
-            if let Some(seg_ms) = graph.read_segment_timings() {
-                let sum_seg: f64 = seg_ms.iter().map(|&ms| ms as f64).sum();
-                let handoff_est = (wall_ms - sum_seg).max(0.0);
-                let seg_strs: Vec<String> = seg_ms
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ms)| format!("seg_ms[{i}]={ms:.3}"))
-                    .collect();
-                // Layer-kind and bytes statistics per segment
-                let mut seg_info = Vec::new();
-                for (s_idx, s) in graph.segments.iter().enumerate() {
-                    let mut attn_count = 0usize;
-                    let mut recur_count = 0usize;
-                    let mut placed_bytes = 0u64;
-                    for l in s.layers.clone() {
-                        if (l + 1) % self.cfg.full_attention_interval.max(1) == 0 {
-                            attn_count += 1;
-                        } else {
-                            recur_count += 1;
-                        }
-                        if let Some(b) = graph.buffers.layer_input.get(l) {
-                            placed_bytes += b.bytes() as u64;
-                        }
-                    }
-                    seg_info.push(format!("seg{s_idx}(dev{},layers={:?},attn={attn_count},recur={recur_count},bytes={placed_bytes})", s.device, s.layers));
-                }
-                eprintln!(
-                    "[segment-timing] {} wall_ms={wall_ms:.3} handoff_est={handoff_est:.3} | {}",
-                    seg_strs.join(" "),
-                    seg_info.join(" ")
-                );
-            }
-        }
-        Ok(())
+    fn forward_replay_nosync(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        self.forward_replay_q(graph, token_id, false)
     }
 
     fn attach_decode_graph_arenas(

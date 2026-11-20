@@ -3056,6 +3056,11 @@ pub async fn cmd_run(
             .map_err(|e| grim_core::error::Error::Config(format!("stdout flush failed: {e}")))?;
     }
 
+    // GRIM_MTP_DRAFT_CHAIN teardown safety.
+    if let Some(spec) = model.as_any().downcast_ref::<grim_speculative::SpeculativeCausalLm>() {
+        spec.drain_chained_draft();
+    }
+
     println!("\n[grim] Done. Generated {} tokens.", generated);
     if prefill_us > 0 {
         eprintln!(
