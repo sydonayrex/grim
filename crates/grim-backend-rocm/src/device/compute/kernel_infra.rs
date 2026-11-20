@@ -298,7 +298,7 @@ impl RocmDevice {
 
     /// H2: GPU tree reduction for argmax.
     /// Returns the index of the maximum element in `x_storage` without whole-buffer D2H copying.
-    pub(crate) fn gpu_argmax(&self, x_storage: &RocmStorage) -> Result<u32> {
+    pub fn gpu_argmax(&self, x_storage: &RocmStorage) -> Result<u32> {
         let n = x_storage.shape().elem_count();
         if n == 0 {
             return Err(Error::Backend("argmax: empty tensor".into()));
