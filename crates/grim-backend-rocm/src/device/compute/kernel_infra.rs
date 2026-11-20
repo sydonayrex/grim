@@ -208,6 +208,88 @@ impl RocmDevice {
         Ok(res)
     }
 
+    /// Argmax writing the index into a CALLER-OWNED device buffer (u32), with
+    /// no device-to-host copy and no synchronization (chained-MTP path: the
+    /// value is consumed by a later async staged copy on the same stream).
+    /// Launches on the ambient stream; tie-breaking matches `gpu_argmax`.
+    pub fn gpu_argmax_into_dev(&self, x_ptr: u64, n: usize, out_ptr: u64) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        const BLOCK_SIZE: u32 = 256;
+        const MAX_BLOCKS: u32 = 1024;
+        let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
+
+        let mut part_guard = self
+            .reduce_partials_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if part_guard
+            .as_ref()
+            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
+        {
+            *part_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![MAX_BLOCKS as usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let partial_vals_ptr = dev_ptr(
+            part_guard
+                .as_ref()
+                .ok_or_else(|| Error::Backend("argmax partials_buf is None".into()))?,
+        )?;
+
+        let mut idxs_guard = self
+            .reduce_argmax_idxs_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if idxs_guard
+            .as_ref()
+            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
+        {
+            *idxs_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![MAX_BLOCKS as usize]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let partial_idxs_ptr = dev_ptr(
+            idxs_guard
+                .as_ref()
+                .ok_or_else(|| Error::Backend("argmax idxs_buf is None".into()))?,
+        );
+        drop(idxs_guard);
+
+        let mut x_p = x_ptr;
+        let mut part_v_p = partial_vals_ptr;
+        let mut part_i_p = partial_idxs_ptr;
+        let mut n_i = n as i32;
+        self.launch_compute_kernel(
+            "grim_argmax_stage1",
+            HipDim3::new(grid_blocks, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [arg(&mut x_p), arg(&mut part_v_p), arg(&mut part_i_p), arg(&mut n_i)],
+        )?;
+        let mut out_p = out_ptr;
+        let mut num_part = grid_blocks as i32;
+        self.launch_compute_kernel(
+            "grim_argmax_stage2",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut part_v_p),
+                arg(&mut part_i_p),
+                arg(&mut out_p),
+                arg(&mut num_part),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// H2: GPU tree reduction for argmax.
     /// Returns the index of the maximum element in `x_storage` without whole-buffer D2H copying.
     pub(crate) fn gpu_argmax(&self, x_storage: &RocmStorage) -> Result<u32> {
