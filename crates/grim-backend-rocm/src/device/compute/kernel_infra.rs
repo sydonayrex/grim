@@ -214,6 +214,12 @@ impl RocmDevice {
     /// Launches on the ambient stream; tie-breaking matches `gpu_argmax`.
     pub fn gpu_argmax_into_dev(&self, x_ptr: u64, n: usize, out_ptr: u64) -> Result<()> {
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+            eprintln!(
+                "[argmax-into-dev] dev={} x={x_ptr:#x} n={n} out={out_ptr:#x}",
+                self.ordinal
+            );
+        }
         const BLOCK_SIZE: u32 = 256;
         const MAX_BLOCKS: u32 = 1024;
         let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
