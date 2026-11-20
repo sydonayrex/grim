@@ -65,12 +65,19 @@ pub struct SpeculativeCausalLm {
     /// Fed by observed (accepted, proposed) counts each DSpark step.
     depth_tuner: Mutex<SpeculativeDepthPidController>,
     /// astrum P5: optional E/cost draft-source policy (output-neutral observation; default OFF).
-    #[allow(dead_code)]
     astrum_draft_policy: Option<Mutex<crate::draft_policy::DraftPolicy>>,
+    /// Trigram suffix prompt-lookup drafter paired with `astrum_draft_policy`.
+    astrum_suffix_drafter: Mutex<crate::suffix_drafter::SuffixDrafter>,
     /// Optional GPU rejection-sampling verifier (Task 10.6). When set and the
     /// verify logits are ROCm-resident, the ratio test runs on device — no
     /// vocab-sized D2H copy. Errors fall back to the CPU verify loop.
     gpu_verifier: Option<Arc<dyn SpeculativeVerifier>>,
+    /// Pending draft block from the previous NativeMtp step, batched with the
+    /// next base token into a single trunk forward pass.
+    pending_mtp_draft: Mutex<Option<crate::draft_backbone::DraftBlock>>,
+    /// Optional m=2 DecodeGraph for 1-pass batched NativeMtp.
+    #[allow(dead_code)]
+    graph_m2: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 /// Backend-agnostic GPU verification hook (Task 10.6). Implemented by the
@@ -105,7 +112,10 @@ impl SpeculativeCausalLm {
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
             astrum_draft_policy: crate::draft_policy::DraftPolicy::from_env().map(std::sync::Mutex::new),
+            astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             gpu_verifier: None,
+            pending_mtp_draft: Mutex::new(None),
+            graph_m2: Mutex::new(None),
         }
     }
 
@@ -147,7 +157,10 @@ impl SpeculativeCausalLm {
             scheduler: Mutex::new(scheduler),
             depth_tuner: Mutex::new(depth_tuner),
             astrum_draft_policy: crate::draft_policy::DraftPolicy::from_env().map(std::sync::Mutex::new),
+            astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             gpu_verifier: None,
+            pending_mtp_draft: Mutex::new(None),
+            graph_m2: Mutex::new(None),
         }
     }
 
@@ -166,7 +179,10 @@ impl SpeculativeCausalLm {
             )),
             depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
             astrum_draft_policy: crate::draft_policy::DraftPolicy::from_env().map(std::sync::Mutex::new),
+            astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             gpu_verifier: None,
+            pending_mtp_draft: Mutex::new(None),
+            graph_m2: Mutex::new(None),
         }
     }
 
@@ -239,6 +255,31 @@ impl SpeculativeCausalLm {
         self.gpu_verifier = Some(verifier);
     }
 
+    /// Append committed tokens to the suffix ring and draft from `SuffixDrafter`
+    /// when `DraftPolicy::select(ctx_len)` chooses `DraftSource::Suffix`.
+    pub fn try_draft_astrum_suffix(
+        &self,
+        committed_tokens: &[u32],
+        ctx_len: usize,
+        min_match: usize,
+        max_len: usize,
+    ) -> Option<crate::draft_backbone::DraftBlock> {
+        let mut sfx = self
+            .astrum_suffix_drafter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        sfx.append(committed_tokens);
+        let policy_mtx = self.astrum_draft_policy.as_ref()?;
+        let mut pol = policy_mtx.lock().unwrap_or_else(|e| e.into_inner());
+        if pol.select(ctx_len) == crate::draft_policy::DraftSource::Suffix {
+            let blk = sfx.draft(min_match, max_len);
+            if !blk.is_empty() {
+                return Some(blk);
+            }
+        }
+        None
+    }
+
     /// Shared verify decision (Task 10.6): GPU rejection sampler when a
     /// verifier is attached and both logits tensors are ROCm-resident, CPU
     /// softmax loop otherwise (also the fallback on verifier error). The RNG
@@ -275,6 +316,23 @@ impl SpeculativeCausalLm {
                     tracing::debug!("GPU speculative verify failed, falling back to CPU: {e}");
                 }
             }
+        }
+        if greedy && matches!(target_logits.device(), Device::Rocm(_)) {
+            let mut accepted_count = 0usize;
+            let base_row = context_len.saturating_sub(1);
+            for i in 0..verify_len {
+                let best_idx = grim_models_transformer::Qwen35::argmax_logits_row(
+                    target_logits,
+                    base_row + i,
+                    vocab_size,
+                )? as usize;
+                if best_idx == draft_tokens[i] as usize {
+                    accepted_count += 1;
+                } else {
+                    break;
+                }
+            }
+            return Ok(accepted_count);
         }
         let target_probs = target_logits.to_vec_f32()?;
         let draft_logits_cpu = if greedy {
@@ -340,6 +398,23 @@ impl SpeculativeCausalLm {
 
     pub fn inner_target(&self) -> &dyn CausalLm {
         &*self.target
+    }
+
+    /// Pre-capture the 1-pass MTP `M=2` DecodeGraph during load-time prewarm.
+    pub fn prewarm_m2_graph(&self) -> Result<()> {
+        if let Some(ref mtp) = self.mtp_target {
+            let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+            mtp.prewarm_m2_graph(&mut g_guard)?;
+        }
+        Ok(())
+    }
+
+    /// True when the 1-pass MTP `DecodeGraph` slot holds an active captured graph.
+    pub fn has_active_m2_graph(&self) -> bool {
+        self.graph_m2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Query runtime speculative decoding telemetry snapshot.
@@ -517,6 +592,15 @@ impl SpeculativeCausalLm {
                     .lock()
                     .unwrap()
                     .update(accepted_count, verify_len);
+                if let Some(policy_mtx) = &self.astrum_draft_policy {
+                    let mut pol = policy_mtx.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = pol.observe_and_select(
+                        crate::draft_policy::DraftSource::Mtp,
+                        context_len,
+                        accepted_count + 1,
+                        1.0,
+                    );
+                }
 
                 // ponytail ceiling: the caller contract is one next-token
                 // distribution per decode call and nothing downstream
@@ -567,24 +651,234 @@ impl SpeculativeCausalLm {
         let context_len = input_ids.shape().elem_count();
 
         // M3 correctness: native MTP is a one-token decode-step path. Prefill/multi-token inputs
-        // and projection-skipped passes must take the plain target forward.
+        // and projection-skipped passes take the plain target forward, and prefill immediately
+        // seeds `pending_mtp_draft` from the last hidden state so decode step 0 runs on M=2 graph!
         if depth == 0 || context_len != 1 || session.skip_output_projection() {
             session.set_last_accepted_tokens(1);
-            return self.target.forward(session, input_ids, positions, adapters);
+            let out = self.target.forward(session, input_ids, positions, adapters)?;
+            let mtp_1pass = !matches!(
+                std::env::var("GRIM_MTP_1PASS").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+            if mtp_1pass
+                && depth > 0
+                && context_len > 1
+                && !session.skip_output_projection()
+                && session.get_last_hidden_state().is_some()
+            {
+                if let Ok(first_draft) =
+                    mtp.predict_multi_after_forward(session, input_ids, positions, &out)
+                {
+                    *self
+                        .pending_mtp_draft
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(first_draft);
+                }
+            }
+            return Ok(out);
         }
 
         let recurrent = self.target.has_recurrent_state() || mtp.has_recurrent_state();
-        // `mut`: the snapshots are consumed by `restore_recurrent_state`, and
-        // `Box<dyn Any + Send>` is not `Clone`, so the reject/partial-accept
-        // paths `take()` them rather than cloning.
-        let mut base_snapshot = if recurrent {
-            session.snapshot_recurrent_state()?
+
+        // 1-pass batched MTP (default-on unless GRIM_MTP_1PASS=0/false/off): if we have a pending draft
+        // from the previous step, batch [base_token, draft_tokens...] into a SINGLE trunk forward pass!
+        let mtp_1pass = !matches!(
+            std::env::var("GRIM_MTP_1PASS").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        let pending_draft = if mtp_1pass {
+            self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()).take()
         } else {
             None
         };
+        if let Some(draft_block) = pending_draft {
+            let verify_len = draft_block.tokens.len().min(depth);
+            if verify_len > 0 && mtp_1pass {
+                let kv_len_before = session.kv_mut().map(|kv| kv.len());
+                let use_m2_graph = verify_len >= 1
+                    && !matches!(
+                        std::env::var("GRIM_DECODE_GRAPH_M2").as_deref(),
+                        Ok("0" | "false" | "off")
+                    );
+                let pre_batch_snapshot = if recurrent && !use_m2_graph {
+                    session.snapshot_recurrent_state()?
+                } else {
+                    None
+                };
+                if let Some(kv) = session.kv_mut() {
+                    kv.tentative_append(verify_len)?;
+                }
+                let batched_input = self.extend_input_ids(input_ids, &draft_block.tokens[..verify_len])?;
+                let batched_positions = self.extend_positions(positions, verify_len)?;
+                let prev_full = session.full_output_logits();
+                session.set_full_output_logits(true);
+                let t_verify0 = std::time::Instant::now();
+                let batched_res = if verify_len >= 1 {
+                    let base_tok = input_ids.to_vec_f32().ok().and_then(|v| v.first().copied()).unwrap_or(0.0) as u32;
+                    let base_pos = session.current_pos() as u32;
+                    let mut batch_toks = Vec::with_capacity(1 + verify_len);
+                    batch_toks.push(base_tok);
+                    batch_toks.extend_from_slice(&draft_block.tokens[..verify_len]);
+                    let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                    match mtp.forward_m2_graph(&mut g_guard, session, &batch_toks, base_pos) {
+                        Ok(Some(t)) => Ok(t),
+                        Ok(None) => self.target.forward(session, &batched_input, &batched_positions, adapters),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    self.target.forward(session, &batched_input, &batched_positions, adapters)
+                };
+                session.set_full_output_logits(prev_full);
+                let batched_logits = match batched_res {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if let Some(kv) = session.kv_mut() {
+                            let _ = kv.rollback_to(kv.len().saturating_sub(verify_len));
+                        }
+                        if let Some(snap) = pre_batch_snapshot {
+                            let _ = session.restore_recurrent_state(snap);
+                        }
+                        return Err(e);
+                    }
+                };
+                let t_verify_ms = t_verify0.elapsed().as_secs_f64() * 1000.0;
+                let vocab_size = *batched_logits.shape().dims().last().unwrap_or(&0);
+                let mut rng = session
+                    .request_rng()
+                    .cloned()
+                    .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
+                let uniforms: Vec<f32> = (0..=verify_len).map(|_| rng.next_f32()).collect();
+                let greedy = session.sampling_greedy();
+                let accepted_count = self.verify_accepted_count(
+                    &batched_logits,
+                    &draft_block.base_logits,
+                    1,
+                    vocab_size,
+                    &draft_block.tokens[..verify_len],
+                    verify_len,
+                    &uniforms,
+                    &mut rng,
+                    greedy,
+                )?;
+                {
+                    let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                    sched.record_acceptance(accepted_count, verify_len);
+                }
+                let emitted = accepted_count + 1;
+                if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+                    eprintln!(
+                        "[mtp-debug-1pass] depth={} drafted={} accepted={} emitted={} greedy={}",
+                        depth, verify_len, accepted_count, emitted, greedy
+                    );
+                }
+                let t_step0 = std::time::Instant::now();
+                let mut t_rb_ms = 0.0f64;
+                let mut t_draft_ms = 0.0f64;
+                let emitted_logits = self.extract_emitted_logits(&batched_logits, emitted, vocab_size, 1)?;
+                let t_accept_ms = t_step0.elapsed().as_secs_f64() * 1000.0;
+                if accepted_count == verify_len {
+                    if use_m2_graph {
+                        {
+                            let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = mtp.commit_m2_graph_spec_state(&mut g_guard);
+                        }
+                        session.advance_pos(1 + accepted_count);
+                    }
+                    if let Some(kv) = session.kv_mut() {
+                        kv.commit(accepted_count)?;
+                    }
+                    let t_d0 = std::time::Instant::now();
+                    if let Ok(next_draft) = mtp.predict_multi_after_forward(session, &batched_input, &batched_positions, &emitted_logits) {
+                        *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(next_draft);
+                    }
+                    t_draft_ms = t_d0.elapsed().as_secs_f64() * 1000.0;
+                } else if recurrent {
+                    let t_r0 = std::time::Instant::now();
+                    if let Some(base_kv_len) = kv_len_before {
+                        if let Some(kv) = session.kv_mut() {
+                            if kv.len() != base_kv_len {
+                                let _ = kv.rollback_to(base_kv_len);
+                            }
+                        }
+                    }
+                    if let Some(snap) = pre_batch_snapshot {
+                        session.restore_recurrent_state(snap)?;
+                    }
+                    let base_last_pos = positions.to_vec_f32().ok().and_then(|v| v.last().copied()).unwrap_or(0.0);
+                    let base_tok_rec = input_ids.to_vec_f32().ok().and_then(|v| v.first().copied()).unwrap_or(0.0) as u32;
+                    let base_pos_rec = session.current_pos() as u32;
+                    let mut accepted_toks = Vec::with_capacity(1 + accepted_count);
+                    accepted_toks.push(base_tok_rec);
+                    accepted_toks.extend_from_slice(&draft_block.tokens[..accepted_count]);
+                    // Fast-path (~1 ms, zero GEMVs): publish row `accepted_count` of `head_input`
+                    // from the M-token verify pass and roll back only the recurrent/KV state to
+                    // `base_pos_rec + 1 + accepted_count` using the already-computed projections!
+                    let fast_recovered = if use_m2_graph {
+                        let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = mtp.publish_m2_graph_hidden_row(&mut g_guard, session, accepted_count);
+                        mtp.rollback_m2_graph_to_accepted(&mut g_guard, base_pos_rec, 1 + accepted_count)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    let (last_rec_logits, last_rec_input, last_rec_pos) = if fast_recovered {
+                        session.advance_pos(1 + accepted_count);
+                        let last_tok = *accepted_toks.last().unwrap_or(&base_tok_rec);
+                        let last_abs_pos = (base_last_pos as usize).saturating_add(accepted_count);
+                        (
+                            emitted_logits.clone(),
+                            self.scalar_token_tensor(last_tok),
+                            self.scalar_position_tensor(positions, last_abs_pos)?,
+                        )
+                    } else {
+                        let mut l_logits = self.target.forward(session, input_ids, positions, adapters)?;
+                        let mut l_input = input_ids.clone();
+                        let mut l_pos = positions.clone();
+                        for i in 0..accepted_count {
+                            let tok = draft_block.tokens[i];
+                            let step_input = self.scalar_token_tensor(tok);
+                            let abs_pos = (base_last_pos as usize).saturating_add(1 + i);
+                            let step_pos = self.scalar_position_tensor(positions, abs_pos)?;
+                            l_logits = self.target.forward(session, &step_input, &step_pos, adapters)?;
+                            l_input = step_input;
+                            l_pos = step_pos;
+                        }
+                        (l_logits, l_input, l_pos)
+                    };
+                    // Immediately re-draft from recovered state so the next step stays
+                    // in 1-pass batched verification instead of dropping to pending_draft=false.
+                    t_rb_ms = t_r0.elapsed().as_secs_f64() * 1000.0;
+                    let t_d0 = std::time::Instant::now();
+                    if let Ok(next_draft) = mtp.predict_multi_after_forward(
+                        session,
+                        &last_rec_input,
+                        &last_rec_pos,
+                        &last_rec_logits,
+                    ) {
+                        *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(next_draft);
+                    }
+                    t_draft_ms = t_d0.elapsed().as_secs_f64() * 1000.0;
+                } else if let Some(kv) = session.kv_mut() {
+                    kv.commit(accepted_count)?;
+                }
+                if std::env::var_os("GRIM_MTP_TIMING").is_some() {
+                    eprintln!(
+                        "[mtp-timing] accepted={accepted_count} verify_after_match={t_verify_ms:.2}ms extract={t_accept_ms:.2}ms rollback={t_rb_ms:.2}ms draft={t_draft_ms:.2}ms"
+                    );
+                }
+                session.set_last_accepted_tokens(emitted);
+                return Ok(emitted_logits);
+            }
+        }
+        // `mut`: the snapshots are consumed by `restore_recurrent_state`, and
+        // `Box<dyn Any + Send>` is not `Clone`, so the reject/partial-accept
+        // paths `take()` them rather than cloning.
+        let mut base_snapshot: Option<Box<dyn std::any::Any + Send>> = None;
 
         // 1. Base forward (exactly once). This advances state by the base token and populates
         // the session's last hidden state for the nextn draft head.
+        // Run step 0 eagerly so we don't pay ~1.5 s to capture a batch=1 DecodeGraph when all
+        // subsequent 1-pass verify steps run at batch=2 (and rejections roll back in-place).
         let prev_full_logits = session.full_output_logits();
         session.set_full_output_logits(false);
         let base_logits_full = self.target.forward(session, input_ids, positions, adapters)?;
@@ -602,7 +896,7 @@ impl SpeculativeCausalLm {
             }
         };
         tr_stage("decode_native_mtp: enter");
-        let mut post_base_snapshot = if recurrent {
+        let mut post_base_snapshot = if recurrent && !mtp_1pass {
             session.snapshot_recurrent_state()?
         } else {
             None
@@ -639,6 +933,14 @@ impl SpeculativeCausalLm {
         // 2. Draft from the already-run base forward (must not re-run the base input).
         let draft_block = mtp.predict_multi_after_forward(session, input_ids, positions, &base_logits_full)?;
         let verify_len = draft_block.tokens.len().min(depth);
+        if verify_len > 0 && mtp_1pass {
+            *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(draft_block);
+            session.set_last_accepted_tokens(1);
+            return Ok(grim_backend_cpu::cpu_tensor(
+                base_last,
+                grim_tensor::Shape::new(vec![1, vocab_size]),
+            ));
+        }
 
         // Helper: emit only the base row. Recurrent case must restore to post-base snapshot so
         // state is exactly base-advanced (base forward already ran above).
@@ -925,7 +1227,6 @@ impl SpeculativeCausalLm {
         vocab_size: usize,
         context_len: usize,
     ) -> Result<Tensor> {
-        let all_logits = target_logits.to_vec_f32()?;
         if num_rows == 0 {
             return Ok(grim_backend_cpu::cpu_tensor(
                 Vec::new(),
@@ -933,17 +1234,12 @@ impl SpeculativeCausalLm {
             ));
         }
         let start_row = context_len.saturating_sub(1);
-        let start = start_row * vocab_size;
-        let end = start + num_rows * vocab_size;
-        if end > all_logits.len() {
-            return Err(grim_core::error::Error::Config(format!(
-                "extract_emitted_logits: slice [{start}..{end}] out of bounds (logits len={}, start_row={start_row}, num_rows={num_rows}, context_len={context_len})",
-                all_logits.len()
-            )));
-        }
-        let emitted_logits = all_logits[start..end].to_vec();
-        let shape = grim_tensor::Shape::new(vec![num_rows, vocab_size]);
-        Ok(grim_backend_cpu::cpu_tensor(emitted_logits, shape))
+        grim_models_transformer::Qwen35::slice_logits_rows(
+            target_logits,
+            start_row,
+            num_rows,
+            vocab_size,
+        )
     }
 }
 

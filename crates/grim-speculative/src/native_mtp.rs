@@ -39,4 +39,64 @@ pub trait NativeMtp: grim_core::CausalLm {
         positions: &Tensor,
         base_logits: &Tensor,
     ) -> Result<DraftBlock>;
+
+    /// Optional m=2 DecodeGraph capture/replay hook for 1-pass batched MTP.
+    /// Returns `Ok(Some(logits))` with `[batch, vocab]` logits when handled by the
+    /// graph, or `Ok(None)` to fall back to eager `CausalLm::forward`.
+    fn forward_m2_graph(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _session: &mut dyn grim_core::session::SessionT,
+        _tokens: &[u32],
+        _pos: u32,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    /// Restore the recurrent state inside `graph_slot` to the pre-step D2D snapshot
+    /// when a speculative verification step rejects one or more draft tokens.
+    fn restore_m2_graph_recurrent(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Publish row `row` of the graph's `head_input` into `session.last_hidden_state`
+    /// so `predict_multi_after_forward` can draft from row `accepted_count` without re-running the trunk.
+    fn prewarm_m2_graph(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn publish_m2_graph_hidden_row(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _session: &mut dyn grim_core::session::SessionT,
+        _row: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Roll back the graph's recurrent + KV state from a verify pass of `1 + verify_len` tokens
+    /// at `base_pos` to `base_pos + 1 + accepted_count` using in-place causal state replay over
+    /// the already-computed projections (zero GEMVs, zero trunk graph re-run).
+    fn rollback_m2_graph_to_accepted(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _base_pos: u32,
+        _accepted_tokens: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Commit M=2 speculative KDA state (`S_spec -> S`) when all draft tokens are accepted.
+    fn commit_m2_graph_spec_state(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }

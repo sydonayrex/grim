@@ -447,6 +447,50 @@ extern "C" __global__ void grim_argmax_stage1(
     }
 }
 
+extern "C" __global__ void grim_argmax_fused_u64(
+    const float* __restrict__ x,
+    unsigned long long* __restrict__ out_u64,
+    int n
+) {
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+
+    float max_val = -1e38f;
+    int max_idx = -1;
+
+    for (int i = gid; i < n; i += stride) {
+        float val = x[i];
+        if (val >= max_val || max_idx == -1) {
+            max_val = val;
+            max_idx = i;
+        }
+    }
+
+    __shared__ float s_val[GRIM_REDUCE_BLOCK];
+    __shared__ int   s_idx[GRIM_REDUCE_BLOCK];
+    s_val[tid] = max_val;
+    s_idx[tid] = max_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid] || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] > s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0 && s_idx[0] >= 0) {
+        unsigned int bits = __float_as_uint(s_val[0]);
+        unsigned int ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        unsigned long long packed = ((unsigned long long)ordered << 32) | (unsigned int)s_idx[0];
+        atomicMax(out_u64, packed);
+    }
+}
+
 extern "C" __global__ void grim_argmax_stage2(
     const float* __restrict__ partial_vals,
     const unsigned int* __restrict__ partial_idxs,
@@ -1313,36 +1357,42 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
 extern "C" __global__ void __launch_bounds__(256)
 grim_rms_norm_decode(const float* x, const float* __restrict__ w, float* out,
                      int row_len, float eps) {
-    __shared__ float s_lane_sums[32];
+    __shared__ float s_warp_sums[8];
+    __shared__ float s_rms;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
-    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+    const long long row_off = (long long)blockIdx.x * row_len;
+    const float* x_row = x + row_off;
+    float* out_row = out + row_off;
 
-    // Warp 0 reduces in the EXACT same sequential order as CPU reference
-    // (lane 0 walks the whole row), so rms is bit-identical to host RMS norm,
-    // while all 256 threads (8 warps) cooperate on the pass-2 normalization write.
+    float local_ss = 0.0f;
+    for (int col = tid; col < row_len; col += 256) {
+        const float v = x_row[col];
+        local_ss += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        local_ss += __shfl_xor(local_ss, off);
+    }
+    if (lane == 0) {
+        s_warp_sums[warp_id] = local_ss;
+    }
+    __syncthreads();
+
     if (warp_id == 0) {
-        float ss = 0.0f;
-        if (lane == 0) {
-            // Sequential accumulation on lane 0, matching CPU reference order.
-            // Uses separate multiply-add (not FMA) to match host exactly.
-            for (int col = 0; col < row_len; col++) {
-                const float v = x[col];
-                ss += v * v;
-            }
+        float ss = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off);
         }
-        ss = __shfl_sync(shfl_mask, ss, 0);
         if (lane == 0) {
-            // Match CPU reference: `inv = 1.0 / sqrt(ss/dim + eps)` then `x * inv * w`.
-            s_lane_sums[0] = 1.0f / sqrtf(ss / (float)row_len + eps);
+            s_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
     }
     __syncthreads();
 
-    const float inv_rms = s_lane_sums[0];
+    const float inv_rms = s_rms;
     for (int col = tid; col < row_len; col += 256) {
-        out[col] = x[col] * inv_rms * w[col];
+        out_row[col] = x_row[col] * inv_rms * w[col];
     }
 }
 
@@ -1543,11 +1593,16 @@ grim_add_rms_norm_decode(const float* x, const float* residual,
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
+    const long long row_off = (long long)blockIdx.x * row_len;
+    const float* x_row = x + row_off;
+    const float* res_row = residual + row_off;
+    float* y_row = y_out + row_off;
+    float* norm_row = norm_out + row_off;
 
     float local_ss = 0.0f;
     for (int col = tid; col < row_len; col += 256) {
-        const float y = x[col] + residual[col];
-        y_out[col] = y;
+        const float y = x_row[col] + res_row[col];
+        y_row[col] = y;
         local_ss += y * y;
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -1571,7 +1626,7 @@ grim_add_rms_norm_decode(const float* x, const float* residual,
 
     const float inv_rms = s_rms;
     for (int col = tid; col < row_len; col += 256) {
-        norm_out[col] = y_out[col] * inv_rms * w[col];
+        norm_row[col] = y_row[col] * inv_rms * w[col];
     }
 }
 
@@ -1591,10 +1646,16 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+    const int n_q_blocks = (row_len + 31) / 32;
+    const long long f32_off = (long long)blockIdx.x * row_len;
+    const long long q81_off = (long long)blockIdx.x * n_q_blocks * 36;
+    const float* x_row = x + f32_off;
+    float* out_row = out + f32_off;
+    unsigned char* out_q81_row = out_q81 + q81_off;
 
     float local_ss = 0.0f;
     for (int col = tid; col < row_len; col += 256) {
-        const float v = x[col];
+        const float v = x_row[col];
         local_ss += v * v;
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -1617,12 +1678,11 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
     __syncthreads();
 
     const float inv_rms = s_lane_sums[0];
-    const int n_q_blocks = (row_len + 31) / 32;
     for (int blk = warp_id; blk < n_q_blocks; blk += 8) {
         const int col = blk * 32 + lane;
         const bool live = col < row_len;
-        const float v = live ? (x[col] * inv_rms * w[col]) : 0.0f;
-        if (live) out[col] = v;
+        const float v = live ? (x_row[col] * inv_rms * w[col]) : 0.0f;
+        if (live) out_row[col] = v;
 
         float amax = __builtin_fabsf(v);
         #pragma unroll
@@ -1640,7 +1700,7 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
         for (int mask = 16; mask > 0; mask >>= 1)
             fsum += __shfl_xor_sync(shfl_mask, fsum, mask);
 
-        unsigned char* row_dst = out_q81 + (long long)blk * 36;
+        unsigned char* row_dst = out_q81_row + (long long)blk * 36;
         if (lane == 0) {
             // Strata #606 overflow guard: clamp scale and sum to finite half range (-65504 to 65504)
             const float d_finite = (d > 65504.0f) ? 65504.0f : d;
@@ -1660,6 +1720,57 @@ grim_rms_norm_quant_q81_dual(const float* x, const float* __restrict__ w, float*
     }
 }
 
+// Fused SiLU(gate) * up -> Q8_1 quantize: avoids writing/re-reading [rows, row_len] F32 intermediate.
+extern "C" __global__ void __launch_bounds__(256)
+grim_silu_mul_quant_q81(const float* __restrict__ gate, const float* __restrict__ up,
+                        unsigned char* __restrict__ out_q81, int row_len, int rows) {
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int global_warp = blockIdx.x * 8 + warp_in_block;
+    const int n_q_blocks = row_len / 32;
+    const int total_blocks = rows * n_q_blocks;
+    if (global_warp >= total_blocks) return;
+
+    const int col_base = global_warp * 32;
+    const int idx = col_base + lane;
+    const float g = gate[idx];
+    const float v = (g / (1.0f + expf(-g))) * up[idx];
+
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+    float amax = __builtin_fabsf(v);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(shfl_mask, amax, mask));
+
+    const float d = (amax > 1e-9f) ? (amax / 127.0f) : 0.0f;
+    float q_flt = (d > 0.0f) ? __builtin_roundf(v / d) : 0.0f;
+    if (q_flt > 127.0f) q_flt = 127.0f;
+    if (q_flt < -127.0f) q_flt = -127.0f;
+    const signed char qi = (signed char)q_flt;
+
+    float fsum = (float)qi;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        fsum += __shfl_xor_sync(shfl_mask, fsum, mask);
+
+    unsigned char* dst = out_q81 + (long long)global_warp * 36;
+    if (lane == 0) {
+        const float d_finite = (d > 65504.0f) ? 65504.0f : d;
+        const float s_val = fsum * d;
+        const float s_finite = (s_val > 65504.0f) ? 65504.0f : ((s_val < -65504.0f) ? -65504.0f : s_val);
+        _Float16 hd = (_Float16)d_finite;
+        _Float16 hs = (_Float16)s_finite;
+        unsigned short wd, ws;
+        __builtin_memcpy(&wd, &hd, 2);
+        __builtin_memcpy(&ws, &hs, 2);
+        dst[0] = (unsigned char)(wd & 0xFF);
+        dst[1] = (unsigned char)(wd >> 8);
+        dst[2] = (unsigned char)(ws & 0xFF);
+        dst[3] = (unsigned char)(ws >> 8);
+    }
+    dst[4 + lane] = (unsigned char)qi;
+}
+
 // Task 2.6: fused add+RMSNorm -> q8_1 quantize epilogue (DUAL output). Pass 1
 // and the rms reduction are the EXACT grim_add_rms_norm_decode sequence (y_out
 // stride-256 pre-barrier, warp-0 stride-128 fmaf reduction), so out_f32 is
@@ -1670,26 +1781,40 @@ extern "C" __global__ void __launch_bounds__(256)
 grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
                                  const float* __restrict__ w, float* y_out, float* norm_out,
                                  unsigned char* out_q81, int row_len, float eps) {
+    __shared__ float s_warp_sums[8];
     __shared__ float s_rms;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+    const int n_q_blocks = (row_len + 31) / 32;
+    const long long f32_off = (long long)blockIdx.x * row_len;
+    const long long q81_off = (long long)blockIdx.x * n_q_blocks * 36;
+    const float* x_row = x + f32_off;
+    const float* res_row = residual + f32_off;
+    float* y_row = y_out + f32_off;
+    float* norm_row = norm_out + f32_off;
+    unsigned char* out_q81_row = out_q81 + q81_off;
 
+    float local_ss = 0.0f;
     for (int col = tid; col < row_len; col += 256) {
-        y_out[col] = x[col] + residual[col];
+        const float y = x_row[col] + res_row[col];
+        y_row[col] = y;
+        local_ss += y * y;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        local_ss += __shfl_xor(local_ss, off);
+    }
+    if (lane == 0) {
+        s_warp_sums[warp_id] = local_ss;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float ss = 0.0f;
-        if (lane == 0) {
-            for (int col = 0; col < row_len; col++) {
-                const float y = y_out[col];
-                ss += y * y;
-            }
+        float ss = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off);
         }
-        ss = __shfl_sync(shfl_mask, ss, 0);
         if (lane == 0) {
             s_rms = 1.0f / sqrtf(ss / (float)row_len + eps);
         }
@@ -1697,13 +1822,12 @@ grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
     __syncthreads();
 
     const float inv_rms = s_rms;
-    const int n_q_blocks = (row_len + 31) / 32;
     for (int blk = warp_id; blk < n_q_blocks; blk += 8) {
         const int col = blk * 32 + lane;
         const bool live = col < row_len;
-        const float y = live ? y_out[col] : 0.0f;
+        const float y = live ? y_row[col] : 0.0f;
         const float v = live ? (y * inv_rms * w[col]) : 0.0f;
-        if (live) norm_out[col] = v;
+        if (live) norm_row[col] = v;
 
         float amax = __builtin_fabsf(v);
         #pragma unroll
@@ -1721,7 +1845,7 @@ grim_add_rms_norm_quant_q81_dual(const float* x, const float* residual,
         for (int mask = 16; mask > 0; mask >>= 1)
             fsum += __shfl_xor_sync(shfl_mask, fsum, mask);
 
-        unsigned char* row_dst = out_q81 + (long long)blk * 36;
+        unsigned char* row_dst = out_q81_row + (long long)blk * 36;
         if (lane == 0) {
             // Strata #606 overflow guard: clamp scale and sum to finite half range (-65504 to 65504)
             const float d_finite = (d > 65504.0f) ? 65504.0f : d;
@@ -2346,7 +2470,8 @@ __device__ __forceinline__ void kda_delta_rule_batched_dev(
     const float* conv_out, const float* alpha, const float* beta,
     const float* dt_bias, const float* ssm_a,
     float* S, float* acc,
-    int idx, int num_v, int num_k, int head_dim, float eps
+    int idx, int num_v, int num_k, int head_dim, float eps,
+    float* S_out = nullptr
 ) {
     int h = idx / head_dim;
     int j = idx - h * head_dim;
@@ -2405,6 +2530,7 @@ __device__ __forceinline__ void kda_delta_rule_batched_dev(
     float qden = sqrtf(qss + eps);
 
     float* s_row = S + ((long long)h * head_dim + j) * head_dim;
+    float* s_row_out = (S_out ? S_out : S) + ((long long)h * head_dim + j) * head_dim;
 
     // pred = sum_k k * (decay * S)   -- decay BEFORE the dot.
     float pred = 0.0f;
@@ -2453,10 +2579,10 @@ __device__ __forceinline__ void kda_delta_rule_batched_dev(
         const float s1 = decay * s_row[i + 1] + nk1 * delta;
         const float s2 = decay * s_row[i + 2] + nk2 * delta;
         const float s3 = decay * s_row[i + 3] + nk3 * delta;
-        s_row[i] = s0;
-        s_row[i + 1] = s1;
-        s_row[i + 2] = s2;
-        s_row[i + 3] = s3;
+        s_row_out[i] = s0;
+        s_row_out[i + 1] = s1;
+        s_row_out[i + 2] = s2;
+        s_row_out[i + 3] = s3;
         a += nq0 * s0;
         a += nq1 * s1;
         a += nq2 * s2;
@@ -2466,7 +2592,7 @@ __device__ __forceinline__ void kda_delta_rule_batched_dev(
         float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
         float qq = (qden > 0.0f) ? kda_silu_dev(q_raw[i]) / qden : kda_silu_dev(q_raw[i]);
         float s = decay * s_row[i] + kk * delta;
-        s_row[i] = s;
+        s_row_out[i] = s;
         a += qq * s;
     }
     // The reference scales the head output by 1/sqrt(S_v): `const float scale =
@@ -2564,6 +2690,79 @@ extern "C" __global__ void grim_kda_head_norm_gate(
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= num_v) return;
     kda_head_norm_gate_dev(acc, norm_weight, z, out, h, num_v, head_dim, eps, has_z);
+}
+
+// Fused KDA Gated Delta Rule + parallel Head RMSNorm + SiLU(z) gate:
+// 1 block per value head (`grid.x = num_v`, `block.x = head_dim` <= 256).
+// Eliminates `grim_kda_head_norm_gate` launch and replaces its 1-thread-per-head
+// serial loop with a block-parallel warp reduction.
+extern "C" __global__ void __launch_bounds__(256) grim_kda_gated_delta_rule_norm_gate(
+    const float* conv_out, const float* alpha, const float* beta,
+    const float* dt_bias, const float* ssm_a,
+    float* S, float* S_out, float* acc,
+    const float* norm_weight, const float* z, float* out,
+    int num_v, int num_k, int head_dim, float eps, int has_z
+) {
+    __shared__ float s_warp_sums[8];
+    __shared__ float s_inv_rms;
+    const int h = blockIdx.x;
+    const int d = threadIdx.x;
+    if (h >= num_v || d >= head_dim) return;
+    const int idx = h * head_dim + d;
+
+    kda_delta_rule_batched_dev(
+        conv_out, alpha, beta, dt_bias, ssm_a, S, acc,
+        idx, num_v, num_k, head_dim, eps, S_out
+    );
+
+    const float a = acc[idx];
+    float ss = a * a;
+    const int warp_id = d >> 5;
+    const int lane = d & 31;
+    const int num_warps = (head_dim + 31) >> 5;
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_xor(ss, off);
+    }
+    if (lane == 0) {
+        s_warp_sums[warp_id] = ss;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float tot = (lane < num_warps) ? s_warp_sums[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            tot += __shfl_xor(tot, off);
+        }
+        if (lane == 0) {
+            s_inv_rms = 1.0f / sqrtf(tot / (float)head_dim + eps);
+        }
+    }
+    __syncthreads();
+
+    float g = 1.0f;
+    if (has_z) {
+        const float zv = z[idx];
+        g = zv / (1.0f + expf(-zv));
+    }
+    out[idx] = a * s_inv_rms * norm_weight[d] * g;
+}
+
+// Strided 2D split of `[rows, 2 * half_cols]` into `dst_a [rows, half_cols]` and `dst_b [rows, half_cols]`.
+extern "C" __global__ void __launch_bounds__(256) grim_split_2d_halves(
+    const float* __restrict__ src,
+    float* __restrict__ dst_a,
+    float* __restrict__ dst_b,
+    int rows,
+    int half_cols
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * half_cols;
+    if (idx >= total) return;
+    const int r = idx / half_cols;
+    const int c = idx - r * half_cols;
+    const long long src_base = (long long)r * (2 * half_cols);
+    dst_a[idx] = src[src_base + c];
+    dst_b[idx] = src[src_base + half_cols + c];
 }
 
 // SPEED-KDA-FUSE: Single cooperative launch fusing short-conv causal step,

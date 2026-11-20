@@ -129,6 +129,7 @@ extern "C" __global__ void grim_dot4_q2_0_q80_gemv(
     }
 }
 
+
 // Prism PQ2_0 (GGUF tag 142, Ternary-2): 34-byte blocks of [f16 delta][32
 // packed 2-bit codes], 128 weights per block, codebook {-1, 0, +1, +2} —
 // the SAME (q - 1) * d law as the Q2_0 arm above, at double block size.
@@ -1209,7 +1210,9 @@ extern "C" __global__ void grim_quantize_q8_1(
 
     // Sequential sum on lane 0, then broadcast. Replaces __shfl_xor tree
     // reduction which reassociates f32 adds across lanes.
-    float fsum = (tid < GRIM_Q8_1_BLOCK_SIZE) ? (float)qi : 0.0f;
+    // Lane 0 accumulates all 32 codes itself, so it must start from 0. Seeding
+    // it with its own `qi` counted code 0 twice and skewed every block sum.
+    float fsum = 0.0f;
     if (tid == 0) {
         for (int i = 0; i < GRIM_Q8_1_BLOCK_SIZE; i++) {
             float qi_f = (d > 0.0f) ? __builtin_roundf(row_src[i] / d) : 0.0f;
@@ -2044,6 +2047,103 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q80_f32act_gemv_v2(
     }
 }
 
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_q80_f32act_gemv_v2_4w(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q80,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave_id  = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int col_base = (blockIdx.x * 4 + wave_id) * 4;
+    const int row      = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* a_row = act_f32 + (long long)row * K;
+    const long long col_stride = (long long)n_q_blocks * GRIM_Q8_0_BYTES;
+    const unsigned char* b0 = B_q80 + (long long)col_base * col_stride;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        const float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        unsigned short db_v[4];
+        int b_v[4][8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < active_cols) {
+                const unsigned char* b_blk = b0 + j * col_stride + (long long)blk * GRIM_Q8_0_BYTES;
+                db_v[j] = ((const unsigned short*)b_blk)[0];
+                const grim_i32_a2* bw = (const grim_i32_a2*)(b_blk + 2);
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    b_v[j][p] = bw[p];
+                }
+            } else {
+                db_v[j] = 0u;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    b_v[j][p] = 0;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d_b = fp16_to_float_device(db_v[j]);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                iacc = grim_sdot4(a4_reg[p], b_v[j][p], iacc);
+            }
+            facc[j] += d_a * (d_b * (float)iacc);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+
 // PLAN 4 (DukeNukem) Task 3: generic norm-fused single-projection GEMV.
 // rms_norm prologue (grim_rms_norm-identical traversal + formula) + per-block
 // quantize + dot4 GEMV in one launch. Feeds shortconv in_proj, lm_head, and
@@ -2150,6 +2250,116 @@ extern "C" __global__ void grim_dot4_q80_norm_f32act_gemv(
     }
 }
 
+extern "C" __global__ void grim_dot4_q80_norm_f32act_argmax_u64(
+    const float* __restrict__ res,
+    const float* __restrict__ gamma,
+    float eps,
+    const unsigned char* __restrict__ B_q80,
+    unsigned long long* __restrict__ C_u64,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* r_row = res + (long long)row * K;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q80 + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    // Prologue: row sumsq with grim_rms_norm-identical traversal and formula.
+    float ss = 0.0f;
+    for (int col = lane; col < K; col += 32) {
+        float v = r_row[col];
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor(ss, off);
+    float rms = sqrtf(ss / (float)K + eps);
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        float nrm[GRIM_Q8_0_BLOCK_SIZE];
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            nrm[e] = r_row[(long long)blk * GRIM_Q8_0_BLOCK_SIZE + e]
+                   * gamma[(long long)blk * GRIM_Q8_0_BLOCK_SIZE + e] / rms;
+        }
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(nrm[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(nrm[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(nrm[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(nrm[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(nrm[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += d_a * (d_b * (float)iacc);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0 && active_cols > 0) {
+        float best_v = facc[0];
+        int best_i = col_base;
+        for (int j = 1; j < active_cols; j++) {
+            if (facc[j] >= best_v) {
+                best_v = facc[j];
+                best_i = col_base + j;
+            }
+        }
+        unsigned int bits = __float_as_uint(best_v);
+        unsigned int ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        unsigned long long packed = ((unsigned long long)ordered << 32) | (unsigned int)best_i;
+        atomicMax(C_u64 + row, packed);
+    }
+}
+
 
 // The Q8_0 x Q8_1 GEMV BODY, shared by the standalone kernel and the ring's
 // `OP_Q8_0_DOT4` arm (plan PM-6 / condition 4).
@@ -2229,6 +2439,7 @@ __device__ __forceinline__ void grim_dot4_q80_q81_gemv_body(
         }
     }
 }
+
 
 extern "C" __global__ void grim_dot4_q80_q81_gemv(
     const unsigned char* __restrict__ A_q81,
@@ -2316,6 +2527,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q80_q81_gemv_v2(
         }
     }
 }
+
 
 // Down-projection activation-reuse experiment: consume a prequantized Q8.1
 // activation row and add the residual in the same Wave32 dot4 launch. This
@@ -3185,6 +3397,7 @@ extern "C" __global__ void grim_dot4_fp8_gemv(
     }
 }
 
+
 // Step 2.2 (#1 + #2): FP8 E4M3 × FP8 E4M3 dot4 GEMV v2:
 //   (#1) 4-column load batching before `grim_fdot4_fp8`.
 //   (#2) De-duplicated 16 B `uint4` loads across even/odd lanes (`half = lane & 1`
@@ -3264,6 +3477,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_fp8_gemv_v2(
         }
     }
 }
+
 
 // v9 multi-row hoisted-B Raven FP8 GEMV: one wave loads 4 B columns ONCE per
 // 32-element chunk and dots them against R activation rows (`facc[R][4]`),
@@ -3493,6 +3707,7 @@ extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_fp8_gemv_v10(
         }
     }
 }
+
 
 template <int R>
 __device__ __forceinline__ void grim_dot4_fp8_gemv_rows_v10_impl(
@@ -3870,6 +4085,7 @@ extern "C" __global__ void grim_dot4_q2k_q81_gemv(
         }
     }
 }
+
 
 
 
@@ -4578,6 +4794,7 @@ extern "C" __global__ void grim_dot4_q3k_q81_gemv(
         }
     }
 }
+
 
 // ─── Q3_K dot4 GEMV: word-wide-mask magnitude plane (res8 P5) ─────────────
 // The stock Q3_K kernel above fetches each 2-bit magnitude code with its
@@ -5333,6 +5550,7 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv(
     }
 }
 
+
 // Step 2.1: Q4_K sub-block-per-lane GEMV. Maps 8 lanes to one 256-weight
 // super-block (lane>>3 = super-block slot, lane&7 = 32-weight sub-block).
 // Each lane loads 32 packed nibble bytes as two 16 B vectors (`uint4`) from
@@ -5867,6 +6085,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q4k_q81_gemv_rows_r2(
     }
 }
 
+
 extern "C" __global__ void __launch_bounds__(32) grim_dot4_q4k_q81_gemv_rows_r4(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q4k,
@@ -6139,6 +6358,7 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv_ref(
         }
     }
 }
+
 
 #define GRIM_Q5K_SUPERBLOCK_SIZE 256
 #define GRIM_Q5K_BYTES           176
@@ -7052,6 +7272,7 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv(
     }
 }
 
+
 // Step 2.1: Q6_K sub-block-per-lane GEMV (same lane map as the Q5_K `_sub`
 // kernel: lane>>3 = super-block slot, lane&7 = 32-weight sub-block). The
 // 210 B super-block stride only guarantees 2 B alignment, so ql/qh words are
@@ -7660,6 +7881,170 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_q81_gemv_rows_r2(
         }
     }
 }
+
+// Q6_K Quad-Row Weight Reuse dot4 GEMV (R=4, for M >= 3 decode/verify).
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_q81_gemv_rows_r4(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q6k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * 4;
+    if (row_base >= M || col_base >= N) return;
+
+    const int active_rows = (row_base + 4 <= M) ? 4 : (M - row_base);
+
+    const int sub      = lane & 7;
+    const int slot     = lane >> 3;
+    const int nh       = sub >> 2;
+    const int quarter  = sub & 3;
+    const int q_odd    = quarter & 1;
+    const bool hi_nib  = (quarter & 2) != 0;
+    const int ql_off   = nh * 64 + (q_odd ? 32 : 0) + (hi_nib ? 16 : 0);
+    const int qh_off   = 128 + nh * 32 + (q_odd ? 16 : 0);
+    const int qh_shift = 2 * quarter;
+    const int sc0      = nh * 8 + 2 * quarter;
+
+    const int n_sb = K / GRIM_Q6K_SUPERBLOCK_SIZE;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * GRIM_Q6K_BYTES;
+    const unsigned char* b0 = B_q6k + (long long)col_base * col_stride;
+
+    float facc[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) facc[r][j] = 0.0f;
+    }
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int a4[4][8];
+        int asum0[4] = {0, 0, 0, 0};
+        int asum1[4] = {0, 0, 0, 0};
+
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (sb_valid && r < active_rows) {
+                const unsigned char* a_blk = A_q81 + (long long)(row_base + r) * a_row_stride
+                    + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+                d_a[r] = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                __builtin_memcpy(a4[r], a_blk + 4, 32);
+                #pragma unroll
+                for (int w = 0; w < 4; w++) {
+                    asum0[r] = grim_sdot4(a4[r][w], 0x01010101, asum0[r]);
+                    asum1[r] = grim_sdot4(a4[r][w + 4], 0x01010101, asum1[r]);
+                }
+            } else {
+                #pragma unroll
+                for (int w = 0; w < 8; w++) a4[r][w] = 0;
+            }
+        }
+
+        unsigned short d_v[4];
+        unsigned short sc_v[4];
+        unsigned ql_own_v[4][4];
+        unsigned qh_own_v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * GRIM_Q6K_BYTES;
+                d_v[j]  = *(const unsigned short*)(b_sb + 208);
+                sc_v[j] = *(const unsigned short*)(b_sb + 192 + sc0);
+                const grim_u32_a2* qlw = (const grim_u32_a2*)(b_sb + ql_off);
+                const grim_u32_a2* qhw = (const grim_u32_a2*)(b_sb + qh_off);
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    ql_own_v[j][u] = qlw[u];
+                    qh_own_v[j][u] = qhw[u];
+                }
+            } else {
+                d_v[j]  = 0u;
+                sc_v[j] = 0u;
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    ql_own_v[j][u] = 0u;
+                    qh_own_v[j][u] = 0u;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d  = fp16_to_float_device(d_v[j]);
+            const float s0 = (float)(signed char)(sc_v[j] & 0xFFu);
+            const float s1 = (float)(signed char)(sc_v[j] >> 8);
+
+            unsigned ql_part[4], qh_part[4];
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                ql_part[u] = (unsigned)__shfl_xor((int)ql_own_v[j][u], 2);
+                qh_part[u] = (unsigned)__shfl_xor((int)qh_own_v[j][u], 1);
+            }
+            const unsigned* ql0 = hi_nib ? ql_part : ql_own_v[j];
+            const unsigned* ql1 = hi_nib ? ql_own_v[j] : ql_part;
+            const unsigned* qh0 = q_odd ? qh_part : qh_own_v[j];
+            const unsigned* qh1 = q_odd ? qh_own_v[j] : qh_part;
+            const unsigned ql_all[8] = {ql0[0], ql0[1], ql0[2], ql0[3], ql1[0], ql1[1], ql1[2], ql1[3]};
+            const unsigned qh_all[8] = {qh0[0], qh0[1], qh0[2], qh0[3], qh1[0], qh1[1], qh1[2], qh1[3]};
+
+            int pos0[4] = {0, 0, 0, 0};
+            int pos1[4] = {0, 0, 0, 0};
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned ql = ql_all[w];
+                const unsigned qh = qh_all[w];
+                const unsigned nib = hi_nib ? ((ql >> 4) & 0x0F0F0F0Fu) : (ql & 0x0F0F0F0Fu);
+                const unsigned hb = (qh >> qh_shift) & 0x03030303u;
+                const int q4 = (int)(nib | (hb << 4));
+                if (w < 4) {
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        if (r < active_rows) pos0[r] = grim_sdot4(a4[r][w], q4, pos0[r]);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        if (r < active_rows) pos1[r] = grim_sdot4(a4[r][w], q4, pos1[r]);
+                    }
+                }
+            }
+            if (sb_valid) {
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (r < active_rows) {
+                        facc[r][j] += d * d_a[r] * (s0 * (float)(pos0[r] - 32 * asum0[r]) + s1 * (float)(pos1[r] - 32 * asum1[r]));
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r >= active_rows) break;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+        }
+    }
+    if (lane == 0) {
+        for (int r = 0; r < active_rows; r++) {
+            for (int j = 0; j < active_cols; j++) {
+                C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+            }
+        }
+    }
+}
 // M7.2h: Q6_K dot4 GEMV with f32 activations (exact path for LM head).
 //
 // Like grim_dot4_q6k_q81_gemv but reads f32 activations directly instead of
@@ -7686,6 +8071,314 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_q81_gemv_rows_r2(
 // All 32 lanes per wave are active (lane & 7 = 8 sub-blocks per super-block,
 // lane >> 3 = 4 super-block slots). Vector float loads and wave shuffles
 // replace serial 256-weight loops.
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_f32act_gemv_r2(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q6k,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K)
+{
+    const int lane = threadIdx.x; // 0..31
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * 2;
+    if (row_base >= M || col_base >= N) return;
+    const bool r1_valid = (row_base + 1 < M);
+
+    const int sub      = lane & 7;
+    const int slot     = lane >> 3;
+    const int nh       = sub >> 2;
+    const int quarter  = sub & 3;
+    const int q_odd    = quarter & 1;
+    const bool hi_nib  = (quarter & 2) != 0;
+    const int ql_off   = nh * 64 + (q_odd ? 32 : 0) + (hi_nib ? 16 : 0);
+    const int qh_off   = 128 + nh * 32 + (q_odd ? 16 : 0);
+    const int qh_shift = 2 * quarter;
+    const int sc0      = nh * 8 + 2 * quarter;
+
+    const int n_sb = K / GRIM_Q6K_SUPERBLOCK_SIZE;
+    const float* a_row0 = act_f32 + (long long)row_base * K;
+    const float* a_row1 = act_f32 + (long long)(r1_valid ? (row_base + 1) : row_base) * K;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * GRIM_Q6K_BYTES;
+    const unsigned char* b0 = B_q6k + (long long)col_base * col_stride;
+
+    float facc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float facc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+
+        float a_sub0[32];
+        float a_sub1[32];
+        if (sb_valid) {
+            const float* a_ptr0 = a_row0 + sb * 256 + sub * 32;
+            const float* a_ptr1 = a_row1 + sb * 256 + sub * 32;
+            #pragma unroll
+            for (int e = 0; e < 32; e++) {
+                a_sub0[e] = a_ptr0[e];
+                a_sub1[e] = r1_valid ? a_ptr1[e] : 0.0f;
+            }
+        } else {
+            #pragma unroll
+            for (int e = 0; e < 32; e++) {
+                a_sub0[e] = 0.0f;
+                a_sub1[e] = 0.0f;
+            }
+        }
+
+        unsigned short d_v[4];
+        unsigned short sc_v[4];
+        unsigned ql_own_v[4][4];
+        unsigned qh_own_v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * GRIM_Q6K_BYTES;
+                d_v[j]  = *(const unsigned short*)(b_sb + 208);
+                sc_v[j] = *(const unsigned short*)(b_sb + 192 + sc0);
+                const grim_u32_a2* qlw = (const grim_u32_a2*)(b_sb + ql_off);
+                const grim_u32_a2* qhw = (const grim_u32_a2*)(b_sb + qh_off);
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    ql_own_v[j][u] = qlw[u];
+                    qh_own_v[j][u] = qhw[u];
+                }
+            } else {
+                d_v[j]  = 0u;
+                sc_v[j] = 0u;
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    ql_own_v[j][u] = 0u;
+                    qh_own_v[j][u] = 0u;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d  = fp16_to_float_device(d_v[j]);
+            const float s0 = (float)(signed char)(sc_v[j] & 0xFFu);
+            const float s1 = (float)(signed char)(sc_v[j] >> 8);
+
+            unsigned ql_part[4], qh_part[4];
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                ql_part[u] = (unsigned)__shfl_xor((int)ql_own_v[j][u], 2);
+                qh_part[u] = (unsigned)__shfl_xor((int)qh_own_v[j][u], 1);
+            }
+            const unsigned* ql0 = hi_nib ? ql_part : ql_own_v[j];
+            const unsigned* ql1 = hi_nib ? ql_own_v[j] : ql_part;
+            const unsigned* qh0 = q_odd ? qh_part : qh_own_v[j];
+            const unsigned* qh1 = q_odd ? qh_own_v[j] : qh_part;
+            const unsigned ql_all[8] = {ql0[0], ql0[1], ql0[2], ql0[3], ql1[0], ql1[1], ql1[2], ql1[3]};
+            const unsigned qh_all[8] = {qh0[0], qh0[1], qh0[2], qh0[3], qh1[0], qh1[1], qh1[2], qh1[3]};
+
+            float pos0_0 = 0.0f, pos1_0 = 0.0f;
+            float pos0_1 = 0.0f, pos1_1 = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                const unsigned ql = ql_all[w];
+                const unsigned qh = qh_all[w];
+                const unsigned nib = hi_nib ? ((ql >> 4) & 0x0F0F0F0Fu) : (ql & 0x0F0F0F0Fu);
+                const unsigned hb = (qh >> qh_shift) & 0x03030303u;
+                const int q4 = (int)(nib | (hb << 4));
+
+                const float fq0 = (float)(((q4 >> 0) & 0xFF) - 32);
+                const float fq1 = (float)(((q4 >> 8) & 0xFF) - 32);
+                const float fq2 = (float)(((q4 >> 16) & 0xFF) - 32);
+                const float fq3 = (float)(((q4 >> 24) & 0xFF) - 32);
+
+                const float dot0 = a_sub0[w * 4 + 0] * fq0
+                                 + a_sub0[w * 4 + 1] * fq1
+                                 + a_sub0[w * 4 + 2] * fq2
+                                 + a_sub0[w * 4 + 3] * fq3;
+                const float dot1 = a_sub1[w * 4 + 0] * fq0
+                                 + a_sub1[w * 4 + 1] * fq1
+                                 + a_sub1[w * 4 + 2] * fq2
+                                 + a_sub1[w * 4 + 3] * fq3;
+
+                if (w < 4) { pos0_0 += dot0; pos0_1 += dot1; }
+                else       { pos1_0 += dot0; pos1_1 += dot1; }
+            }
+            if (sb_valid) {
+                facc0[j] += d * (s0 * pos0_0 + s1 * pos1_0);
+                facc1[j] += d * (s0 * pos0_1 + s1 * pos1_1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc0[j] += __shfl_xor(facc0[j], off);
+            facc1[j] += __shfl_xor(facc1[j], off);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row_base * N + col_base + j] = facc0[j];
+            if (r1_valid) {
+                C[(long long)(row_base + 1) * N + col_base + j] = facc1[j];
+            }
+        }
+    }
+}
+
+// Q6_K Quad-Row Weight Reuse GEMV with f32 activations (R=4, for M >= 3 LM head).
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_f32act_gemv_r4(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q6k,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K)
+{
+    const int lane = threadIdx.x;
+    const int col_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * 4;
+    if (row_base >= M || col_base >= N) return;
+    const int active_rows = (row_base + 4 <= M) ? 4 : (M - row_base);
+
+    const int sub      = lane & 7;
+    const int slot     = lane >> 3;
+    const int nh       = sub >> 2;
+    const int quarter  = sub & 3;
+    const int q_odd    = quarter & 1;
+    const bool hi_nib  = (quarter & 2) != 0;
+    const int ql_off   = nh * 64 + (q_odd ? 32 : 0) + (hi_nib ? 16 : 0);
+    const int qh_off   = 128 + nh * 32 + (q_odd ? 16 : 0);
+    const int qh_shift = 2 * quarter;
+    const int sc0      = nh * 8 + 2 * quarter;
+
+    const int n_sb = K / GRIM_Q6K_SUPERBLOCK_SIZE;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * GRIM_Q6K_BYTES;
+    const unsigned char* b0 = B_q6k + (long long)col_base * col_stride;
+
+    float facc[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) facc[r][j] = 0.0f;
+    }
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+
+        unsigned short d_v[4];
+        unsigned short sc_v[4];
+        unsigned ql_own_v[4][4];
+        unsigned qh_own_v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * GRIM_Q6K_BYTES;
+                d_v[j]  = *(const unsigned short*)(b_sb + 208);
+                sc_v[j] = *(const unsigned short*)(b_sb + 192 + sc0);
+                const grim_u32_a2* qlw = (const grim_u32_a2*)(b_sb + ql_off);
+                const grim_u32_a2* qhw = (const grim_u32_a2*)(b_sb + qh_off);
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    ql_own_v[j][u] = qlw[u];
+                    qh_own_v[j][u] = qhw[u];
+                }
+            } else {
+                d_v[j]  = 0u;
+                sc_v[j] = 0u;
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    ql_own_v[j][u] = 0u;
+                    qh_own_v[j][u] = 0u;
+                }
+            }
+        }
+
+        const int a_off = sb * 256 + sub * 32;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const float d  = fp16_to_float_device(d_v[j]);
+            const float s0 = (float)(signed char)(sc_v[j] & 0xFFu);
+            const float s1 = (float)(signed char)(sc_v[j] >> 8);
+
+            unsigned ql_part[4], qh_part[4];
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                ql_part[u] = (unsigned)__shfl_xor((int)ql_own_v[j][u], 2);
+                qh_part[u] = (unsigned)__shfl_xor((int)qh_own_v[j][u], 1);
+            }
+            const unsigned* ql0 = hi_nib ? ql_part : ql_own_v[j];
+            const unsigned* ql1 = hi_nib ? ql_own_v[j] : ql_part;
+            const unsigned* qh0 = q_odd ? qh_part : qh_own_v[j];
+            const unsigned* qh1 = q_odd ? qh_own_v[j] : qh_part;
+            const unsigned ql_all[8] = {ql0[0], ql0[1], ql0[2], ql0[3], ql1[0], ql1[1], ql1[2], ql1[3]};
+            const unsigned qh_all[8] = {qh0[0], qh0[1], qh0[2], qh0[3], qh1[0], qh1[1], qh1[2], qh1[3]};
+
+            float pos0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float pos1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (sb_valid) {
+                #pragma unroll
+                for (int w = 0; w < 8; w++) {
+                    const unsigned ql = ql_all[w];
+                    const unsigned qh = qh_all[w];
+                    const unsigned nib = hi_nib ? ((ql >> 4) & 0x0F0F0F0Fu) : (ql & 0x0F0F0F0Fu);
+                    const unsigned hb = (qh >> qh_shift) & 0x03030303u;
+                    const int q4 = (int)(nib | (hb << 4));
+
+                    const float fq0 = (float)(((q4 >> 0) & 0xFF) - 32);
+                    const float fq1 = (float)(((q4 >> 8) & 0xFF) - 32);
+                    const float fq2 = (float)(((q4 >> 16) & 0xFF) - 32);
+                    const float fq3 = (float)(((q4 >> 24) & 0xFF) - 32);
+
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        if (r < active_rows) {
+                            const float* ap = act_f32 + (long long)(row_base + r) * K + a_off + w * 4;
+                            const float dot = ap[0] * fq0 + ap[1] * fq1 + ap[2] * fq2 + ap[3] * fq3;
+                            if (w < 4) pos0[r] += dot;
+                            else       pos1[r] += dot;
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (r < active_rows) {
+                        facc[r][j] += d * (s0 * pos0[r] + s1 * pos1[r]);
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r >= active_rows) break;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+        }
+    }
+
+    if (lane == 0) {
+        for (int r = 0; r < active_rows; r++) {
+            #pragma unroll
+            for (int j = 0; j < active_cols; j++) {
+                C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+            }
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_f32act_gemv(
     const float* __restrict__ act_f32,
     const unsigned char* __restrict__ B_q6k,
@@ -7835,6 +8528,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q6k_f32act_gemv(
 }
 
 
+
 // M7.2c: the RETAINED ORACLE for the grim_dot4_q6k_q81_gemv group hoist — the pre-change
 // kernel body, verbatim, so the hoist can be gated on BYTE-IDENTICAL
 // output instead of a hand oracle. Not on any dispatch path; only
@@ -7969,6 +8663,7 @@ extern "C" __global__ void grim_dot4_q6k_q81_gemv_ref(
         }
     }
 }
+
 
 // ─── Phase 4.5b: W4A4 sudot8 GEMV (dot8-insts, RDNA4 gfx1200/gfx1201) ────────
 #if defined(__gfx1200__) || defined(__gfx1201__)
@@ -8145,6 +8840,7 @@ extern "C" __global__ void grim_dot8_w4a4_gemv(
     }
 }
 
+
 extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_v5(
     const unsigned int* __restrict__ A_codes,
     const float* __restrict__ A_scales,
@@ -8255,6 +8951,7 @@ extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_v5(
         }
     }
 }
+
 
 // WhiteCrow v6: Multi-Row (R=2) sudot8 GEMV:
 // Processes 2 activation rows per blockIdx.y, loading 4 columns of B weights ONCE
@@ -8391,6 +9088,7 @@ extern "C" __global__ void __launch_bounds__(128) grim_dot8_w4a4_gemv_rows_r2(
         }
     }
 }
+
 #endif // __gfx1200__ || __gfx1201__
 
 // Harness probes for the true-cold W4A4 A/B (corvid_w4a4_true_cold_ab):
@@ -8541,6 +9239,7 @@ extern "C" __global__ void grim_dot4_forest_gemv(
     }
 }
 
+
 // Step 2.2 (#1 + #2): ForestRaven GEMV v2 with 4-column load batching +
 // 8-byte `uint2` vector loads (Bcodes is at `Bblob + 8`, which is 8-byte
 // aligned for every `K % 32 == 0`). 100% bit-identical to `grim_dot4_forest_gemv`.
@@ -8645,6 +9344,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_forest_gemv_v2(
         }
     }
 }
+
 
 // v9 multi-row hoisted-B ForestRaven GEMV: one wave loads 4 B columns ONCE per
 // 32-element block and dots them against R activation rows (`facc[R][4]`),
@@ -8915,6 +9615,7 @@ extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_forest_gemv_v10(
         }
     }
 }
+
 
 template <int R>
 __device__ __forceinline__ void grim_dot4_forest_gemv_rows_v10_impl(
@@ -9193,6 +9894,7 @@ extern "C" __global__ void __launch_bounds__(128, 2) grim_dot4_forest_gemv_v11_c
         }
     }
 }
+
 
 // ──────────────────────────────────────────────────────────────────── grim_dot4_forest_gemv_rows_r2_v10
 // ForestRaven Variant B: 2-row weight reuse for dual decode (M=2)
@@ -9478,6 +10180,7 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv_fast(
         }
     }
 }
+
 
 // ─── Phase res0-T1-4: Q4_K DMMV (num_rows batching, zolotukhin lever) ─────
 // The chunked-prefill lever from the RDNA4 DMMV work (zolotukhin 2026-04-22,
@@ -9771,6 +10474,7 @@ __device__ __forceinline__ void grim_iq4xs_dot4_body(
         }
     }
 }
+
 
 extern "C" __global__ void grim_dot4_iq4xs_q81_gemv(
     const unsigned char* __restrict__ A_q81,
@@ -11387,14 +12091,15 @@ GRIM_ROWS_KERNEL(8, _r8)
 // R is a runtime argument (hv_with). Rows past M are skipped per-row.
 // ─────────────────────────────────────────────────────────────────────────────
 #define GRIM_ROWS_HV_KERNEL(FNAME, R)                                     \
-extern "C" __global__ void __launch_bounds__(32)                          \
+extern "C" __global__ void __launch_bounds__(128)                         \
 FNAME(                                                                       \
     const unsigned char* __restrict__ A_q81,                              \
     const unsigned char* __restrict__ B_iq4xs,                            \
     float* __restrict__ C, int M, int N, int K)                           \
 {                                                                           \
-    const int lane = threadIdx.x;                                           \
-    const int col_base = blockIdx.x * 4;                                    \
+    const int wave = threadIdx.x >> 5;                                      \
+    const int lane = threadIdx.x & 31;                                      \
+    const int col_base = blockIdx.x * 16 + wave * 4;                        \
     const int row_base = blockIdx.y * R;                                    \
     if (col_base >= N) return;                                              \
     const int sub  = lane & 7;                                              \
@@ -11496,6 +12201,7 @@ FNAME(                                                                       \
 }
 
 GRIM_ROWS_HV_KERNEL(grim_dot4_iq4xs_q81_gemv_rows_hv2, 2)
+GRIM_ROWS_HV_KERNEL(grim_dot4_iq4xs_q81_gemv_rows_hv4, 4)
 GRIM_ROWS_HV_KERNEL(grim_dot4_iq4xs_q81_gemv_rows_hv8, 8)
 #undef GRIM_ROWS_HV_KERNEL
 
@@ -11609,7 +12315,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3xxs_q81_gemv(
 // ----------------------------------------------------------------------------
 // IQ3_XXS Dual-Row Weight Reuse dot4 GEMV (M=2)
 // ----------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3xxs_q81_gemv_rows_r2(
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_iq3xxs_q81_gemv_rows_r2(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_iq3xxs,
     float* __restrict__ C,
@@ -11617,13 +12323,14 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3xxs_q81_gemv_rows_
 {
     __shared__ uint32_t s_grid[256];
     #pragma unroll
-    for (int i = threadIdx.x; i < 256; i += 32) {
+    for (int i = threadIdx.x; i < 256; i += 128) {
         s_grid[i] = IQ3XXS_GRID[i];
     }
     __syncthreads();
 
-    const int lane = threadIdx.x;
-    const int col_base = blockIdx.x * 4;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
     const int row_base = blockIdx.y * 2;
     if (row_base >= M || col_base >= N) return;
 
@@ -11720,6 +12427,134 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3xxs_q81_gemv_rows_
             C[(long long)row_base * N + col_base + j] = facc0[j];
             if (r1_valid)
                 C[(long long)(row_base + 1) * N + col_base + j] = facc1[j];
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// IQ3_XXS Quad-Row Weight Reuse dot4 GEMV (M >= 3)
+// ----------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_iq3xxs_q81_gemv_rows_r4(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq3xxs,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    __shared__ uint32_t s_grid[256];
+    #pragma unroll
+    for (int i = threadIdx.x; i < 256; i += 128) {
+        s_grid[i] = IQ3XXS_GRID[i];
+    }
+    __syncthreads();
+
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row_base = blockIdx.y * 4;
+    if (row_base >= M || col_base >= N) return;
+
+    const int active_rows = (row_base + 4 <= M) ? 4 : (M - row_base);
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / 256;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 98;
+    const unsigned char* b0 = B_iq3xxs + (long long)col_base * col_stride;
+
+    float facc[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) facc[r][j] = 0.0f;
+    }
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int a4[4][8];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (sb_valid && r < active_rows) {
+                const unsigned char* a_blk = A_q81 + (long long)(row_base + r) * a_row_stride
+                    + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+                d_a[r] = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                __builtin_memcpy(a4[r], a_blk + 4, 32);
+            } else {
+                #pragma unroll
+                for (int w = 0; w < 8; w++) a4[r][w] = 0;
+            }
+        }
+
+        float db_col[4];
+        uint2 q_col[4];
+        uint32_t aux_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 98;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* ss = b_sb + 66;
+                const uint32_t aux = ((const uint32_t*)ss)[sub];
+                db_col[j] = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                aux_col[j] = aux;
+                const unsigned char* qs = b_sb + 2;
+                q_col[j] = ((const uint2*)(qs + sub * 8))[0];
+            } else {
+                db_col[j] = 0.0f;
+                aux_col[j] = 0u;
+                q_col[j] = make_uint2(0u, 0u);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* q_sub = (const uint8_t*)&q_col[j];
+            const uint32_t aux = aux_col[j];
+            int sumi[4] = {0, 0, 0, 0};
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const uint32_t g0 = s_grid[q_sub[2 * l + 0]];
+                const uint32_t g1 = s_grid[q_sub[2 * l + 1]];
+                const uint32_t s = grim_unpack_ksigns((uint8_t)(aux >> (7 * l))) & 0xFFu;
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (r < active_rows) {
+                        sumi[r] = grim_sdot4(a4[r][2 * l + 0], grid_l, sumi[r]);
+                        sumi[r] = grim_sdot4(a4[r][2 * l + 1], grid_h, sumi[r]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (r < active_rows) {
+                    facc[r][j] += db_col[j] * d_a[r] * (float)sumi[r];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r >= active_rows) break;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+        }
+    }
+    if (lane == 0) {
+        for (int r = 0; r < active_rows; r++) {
+            for (int j = 0; j < active_cols; j++) {
+                C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+            }
         }
     }
 }
@@ -11828,14 +12663,138 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3s_q81_gemv(
 // ----------------------------------------------------------------------------
 // IQ3_S Dual-Row Weight Reuse dot4 GEMV (M=2)
 // ----------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3s_q81_gemv_rows_r2(
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_iq3s_q81_gemv_rows_r4(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_iq3s,
     float* __restrict__ C,
     int M, int N, int K)
 {
-    const int lane = threadIdx.x;
-    const int col_base = blockIdx.x * 4;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
+    const int row_base = blockIdx.y * 4;
+    if (row_base >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+    const int n_sb = K / 256;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 110;
+    const unsigned char* b0 = B_iq3s + (long long)col_base * col_stride;
+
+    float facc[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) facc[r][j] = 0.0f;
+    }
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int a4[4][8];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (sb_valid && (row_base + r < M)) {
+                const unsigned char* a_blk = A_q81 + (long long)(row_base + r) * a_row_stride + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+                d_a[r] = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                __builtin_memcpy(a4[r], a_blk + 4, 32);
+            } else {
+                #pragma unroll
+                for (int w = 0; w < 8; w++) a4[r][w] = 0;
+            }
+        }
+
+        float db_col[4];
+        uint2 q_col[4];
+        uint32_t signs_col[4];
+        uint8_t qh_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 110;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* scales = b_sb + 106;
+                const uint8_t sc = scales[sub / 2];
+                const int sc_val = (sub & 1) ? (sc >> 4) : (sc & 0x0Fu);
+                db_col[j] = d * (1.0f + 2.0f * (float)sc_val);
+                const unsigned char* qs = b_sb + 2;
+                q_col[j] = ((const uint2*)(qs + sub * 8))[0];
+                const unsigned char* qh = b_sb + 66;
+                qh_col[j] = qh[sub];
+                const unsigned char* signs = b_sb + 74;
+                signs_col[j] = ((const uint32_t*)(signs + sub * 4))[0];
+            } else {
+                db_col[j] = 0.0f;
+                q_col[j] = make_uint2(0u, 0u);
+                qh_col[j] = 0;
+                signs_col[j] = 0u;
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* q_sub = (const uint8_t*)&q_col[j];
+            const uint32_t signs32 = signs_col[j];
+            const uint32_t qh = qh_col[j];
+            int sumi[4] = {0, 0, 0, 0};
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const uint32_t idx0 = (uint32_t)q_sub[2 * l + 0] | (((qh >> (2 * l)) & 1u) << 8);
+                const uint32_t idx1 = (uint32_t)q_sub[2 * l + 1] | (((qh >> (2 * l + 1)) & 1u) << 8);
+                const uint32_t g0 = IQ3S_GRID[idx0];
+                const uint32_t g1 = IQ3S_GRID[idx1];
+                const uint32_t s = (signs32 >> (8 * l)) & 0xFFu;
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (row_base + r < M) {
+                        sumi[r] = grim_sdot4(a4[r][2 * l + 0], grid_l, sumi[r]);
+                        sumi[r] = grim_sdot4(a4[r][2 * l + 1], grid_h, sumi[r]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (row_base + r < M) {
+                    facc[r][j] += db_col[j] * d_a[r] * (float)sumi[r];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (row_base + r >= M) break;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                facc[r][j] += __shfl_xor(facc[r][j], off);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int j = 0; j < active_cols; j++) {
+                C[(long long)(row_base + r) * N + col_base + j] = facc[r][j];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) grim_dot4_iq3s_q81_gemv_rows_r2(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq3s,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int col_base = blockIdx.x * 16 + wave * 4;
     const int row_base = blockIdx.y * 2;
     if (row_base >= M || col_base >= N) return;
 
@@ -11947,6 +12906,7 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq3s_q81_gemv_rows_r2
         }
     }
 }
+
 
 // ----------------------------------------------------------------------------
 // IQ3_XXS dot4 GEMV with LDS Codebook Preload (v2_lds)
@@ -12363,6 +13323,7 @@ grim_dot4_iq2xxs_q81_gemv_rows_r2(
 }
 
 
+
 // ----------------------------------------------------------------------------
 // IQ2_XS dot4 GEMV (74 bytes per 256 weights, 8 sub-blocks of 32 weights)
 // ----------------------------------------------------------------------------
@@ -12604,6 +13565,7 @@ grim_dot4_iq2xs_q81_gemv_rows_r2(
 }
 
 
+
 // ----------------------------------------------------------------------------
 // IQ2_S dot4 GEMV (82 bytes per 256 weights, 8 sub-blocks of 32 weights)
 // ----------------------------------------------------------------------------
@@ -12694,6 +13656,121 @@ grim_dot4_iq2s_q81_gemv(
             for (int l = 2; l < 4; l++) {
                 const int grid_idx = (int)qs_bytes[l] | (((int)(qh_val << (8 - 2 * l))) & 0x300);
                 const unsigned long long gv = IQ2S_GRID[grid_idx];
+                const uint32_t g0 = (uint32_t)gv;
+                const uint32_t g1 = (uint32_t)(gv >> 32);
+                const uint32_t s = (uint32_t)s_bytes[l];
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                sumi_hi = grim_sdot4(a4[2 * l + 0], grid_l, sumi_hi);
+                sumi_hi = grim_sdot4(a4[2 * l + 1], grid_h, sumi_hi);
+            }
+            facc[j] += (db0_col[j] * (float)sumi_lo + db1_col[j] * (float)sumi_hi) * d_a;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++)
+            C[(long long)row * N + col_base + j] = facc[j];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(32) grim_dot4_iq2s_q81_gemv_v2_lds(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_iq2s,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    __shared__ unsigned long long s_grid[1024];
+    const int lane = threadIdx.x;
+    for (int i = lane; i < 1024; i += 32) {
+        s_grid[i] = IQ2S_GRID[i];
+    }
+    __syncthreads();
+
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    if (row >= M || col_base >= N) return;
+
+    const int sub  = lane & 7;
+    const int slot = lane >> 3;
+
+    const int n_sb = K / 256;
+    const unsigned char* a_row = A_q81 + (long long)row * (K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const long long col_stride = (long long)n_sb * 82;
+    const unsigned char* b0 = B_iq2s + (long long)col_base * col_stride;
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int sb_base = 0; sb_base < n_sb; sb_base += 4) {
+        const int sb = sb_base + slot;
+        const bool sb_valid = (sb < n_sb);
+        float d_a = 0.0f;
+        int a4[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (sb_valid) {
+            const unsigned char* a_blk = a_row + (sb * 8 + sub) * GRIM_Q8_1_BYTES;
+            d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+            __builtin_memcpy(a4, a_blk + 4, 32);
+        }
+
+        float db0_col[4], db1_col[4];
+        uint32_t qs_col[4];
+        uint32_t signs_col[4];
+        uint32_t qh_col[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (sb_valid && j < active_cols) {
+                const unsigned char* b_sb = b0 + j * col_stride + (long long)sb * 82;
+                const float d = fp16_to_float_device(((const unsigned short*)b_sb)[0]);
+                const unsigned char* scales = b_sb + 74;
+                const uint8_t sc = scales[sub];
+                db0_col[j] = d * (0.5f + (float)(sc & 0x0Fu)) * 0.25f;
+                db1_col[j] = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+                const unsigned char* qs = b_sb + 2;
+                qs_col[j] = ((const uint32_t*)(qs + sub * 4))[0];
+                const unsigned char* signs = b_sb + 34;
+                signs_col[j] = ((const uint32_t*)(signs + sub * 4))[0];
+                const unsigned char* qh = b_sb + 66;
+                qh_col[j] = (uint32_t)qh[sub];
+            } else {
+                db0_col[j] = 0.0f;
+                db1_col[j] = 0.0f;
+                qs_col[j] = 0u;
+                signs_col[j] = 0u;
+                qh_col[j] = 0u;
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const uint8_t* qs_bytes = (const uint8_t*)&qs_col[j];
+            const uint8_t* s_bytes  = (const uint8_t*)&signs_col[j];
+            const uint32_t qh_val   = qh_col[j];
+            int sumi_lo = 0;
+            #pragma unroll
+            for (int l = 0; l < 2; l++) {
+                const int grid_idx = (int)qs_bytes[l] | (((int)(qh_val << (8 - 2 * l))) & 0x300);
+                const unsigned long long gv = s_grid[grid_idx];
+                const uint32_t g0 = (uint32_t)gv;
+                const uint32_t g1 = (uint32_t)(gv >> 32);
+                const uint32_t s = (uint32_t)s_bytes[l];
+                const int grid_l = grim_iq_negate(g0, grim_iq_sign_bytes(s));
+                const int grid_h = grim_iq_negate(g1, grim_iq_sign_bytes(s >> 4));
+                sumi_lo = grim_sdot4(a4[2 * l + 0], grid_l, sumi_lo);
+                sumi_lo = grim_sdot4(a4[2 * l + 1], grid_h, sumi_lo);
+            }
+            int sumi_hi = 0;
+            #pragma unroll
+            for (int l = 2; l < 4; l++) {
+                const int grid_idx = (int)qs_bytes[l] | (((int)(qh_val << (8 - 2 * l))) & 0x300);
+                const unsigned long long gv = s_grid[grid_idx];
                 const uint32_t g0 = (uint32_t)gv;
                 const uint32_t g1 = (uint32_t)(gv >> 32);
                 const uint32_t s = (uint32_t)s_bytes[l];

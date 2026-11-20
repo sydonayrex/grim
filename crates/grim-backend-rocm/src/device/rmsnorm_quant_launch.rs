@@ -89,7 +89,8 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("rms_norm_quant_q81_dual: out_f32 has no device ptr".into()))?;
         let q_ptr = out_q81.device_ptr
             .ok_or_else(|| Error::Backend("rms_norm_quant_q81_dual: out_q81 has no device ptr".into()))?;
-        let grid_dim = HipDim3::new(1, 1, 1);
+        let rows = (out_f32.shape.elem_count() / row_len.max(1)).max(1);
+        let grid_dim = HipDim3::new(rows as u32, 1, 1);
         let block_dim = HipDim3::new(256, 1, 1);
         let mut xptr = x_ptr;
         let mut wptr = w_ptr;
@@ -133,7 +134,8 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: norm_out has no device ptr".into()))?;
         let q_ptr = out_q81.device_ptr
             .ok_or_else(|| Error::Backend("add_rms_norm_quant_q81_dual: out_q81 has no device ptr".into()))?;
-        let grid_dim = HipDim3::new(1, 1, 1);
+        let rows = (norm_out.shape.elem_count() / row_len.max(1)).max(1);
+        let grid_dim = HipDim3::new(rows as u32, 1, 1);
         let block_dim = HipDim3::new(256, 1, 1);
         let mut xptr = x_ptr;
         let mut rptr = r_ptr;
@@ -152,6 +154,68 @@ impl RocmDevice {
                 arg(&mut yptr), arg(&mut nptr), arg(&mut qptr),
                 arg(&mut kk), arg(&mut ep),
             ],
+        )
+    }
+
+    /// Fused SiLU(gate) * up -> Q8_1 quantize directly into `out_q81`.
+    pub fn launch_silu_mul_quant_q81(
+        &self,
+        gate: &RocmStorage,
+        up: &RocmStorage,
+        out_q81: &RocmStorage,
+        row_len: usize,
+        rows: usize,
+    ) -> Result<*mut c_void> {
+        let g_ptr = gate.device_ptr
+            .ok_or_else(|| Error::Backend("silu_mul_quant_q81: gate has no device ptr".into()))?;
+        let u_ptr = up.device_ptr
+            .ok_or_else(|| Error::Backend("silu_mul_quant_q81: up has no device ptr".into()))?;
+        let q_ptr = out_q81.device_ptr
+            .ok_or_else(|| Error::Backend("silu_mul_quant_q81: out_q81 has no device ptr".into()))?;
+        let total_blocks = (rows.max(1) * (row_len / 32)) as u32;
+        let grid_dim = HipDim3::new(total_blocks.div_ceil(8).max(1), 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut gptr = g_ptr;
+        let mut uptr = u_ptr;
+        let mut qptr = q_ptr;
+        let mut rl = row_len as i32;
+        let mut nr = rows.max(1) as i32;
+        self.launch_compute_kernel(
+            "grim_silu_mul_quant_q81",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut gptr), arg(&mut uptr), arg(&mut qptr), arg(&mut rl), arg(&mut nr)],
+        )
+    }
+
+    /// Strided 2D split of `[rows, 2 * half_cols]` into `dst_a` and `dst_b` in one launch.
+    pub fn launch_split_2d_halves(
+        &self,
+        src: &RocmStorage,
+        dst_a: &RocmStorage,
+        dst_b: &RocmStorage,
+        rows: usize,
+        half_cols: usize,
+    ) -> Result<*mut c_void> {
+        let s_ptr = src.device_ptr
+            .ok_or_else(|| Error::Backend("split_2d_halves: src has no device ptr".into()))?;
+        let a_ptr = dst_a.device_ptr
+            .ok_or_else(|| Error::Backend("split_2d_halves: dst_a has no device ptr".into()))?;
+        let b_ptr = dst_b.device_ptr
+            .ok_or_else(|| Error::Backend("split_2d_halves: dst_b has no device ptr".into()))?;
+        let total = (rows.max(1) * half_cols) as u32;
+        let grid_dim = HipDim3::new(total.div_ceil(256).max(1), 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut sptr = s_ptr;
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut nr = rows.max(1) as i32;
+        let mut hc = half_cols as i32;
+        self.launch_compute_kernel(
+            "grim_split_2d_halves",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut sptr), arg(&mut aptr), arg(&mut bptr), arg(&mut nr), arg(&mut hc)],
         )
     }
 }

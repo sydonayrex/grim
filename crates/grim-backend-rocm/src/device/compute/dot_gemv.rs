@@ -329,7 +329,7 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
-        let kernel = if std::env::var("GRIM_STRATA_S2_GEMV").ok().as_deref() == Some("1") {
+        let kernel = if std::env::var("GRIM_S2_GEMV").ok().as_deref() == Some("1") {
             "grim_dot4_q2_0_s2_fast_gemv"
         } else {
             "grim_dot4_q2_0_q80_gemv"
@@ -562,9 +562,28 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv: out has no device ptr".into()))?;
-        let grid_x = (n as u32).div_ceil(4);
-        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let waves4 = v2
+            && matches!(
+                std::env::var("GRIM_DOT4_WAVES").as_deref(),
+                Ok("4")
+            );
+        let (grid_dim, block_dim, kname) = if waves4 {
+            (
+                HipDim3::new((n as u32).div_ceil(16), m as u32, 1),
+                HipDim3::new(128, 1, 1),
+                "grim_dot4_q80_f32act_gemv_v2_4w",
+            )
+        } else {
+            (
+                HipDim3::new((n as u32).div_ceil(4), m as u32, 1),
+                HipDim3::new(32, 1, 1),
+                if v2 {
+                    "grim_dot4_q80_f32act_gemv_v2"
+                } else {
+                    "grim_dot4_q80_f32act_gemv"
+                },
+            )
+        };
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
         let mut optr = out_ptr;
@@ -572,11 +591,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            if v2 {
-                "grim_dot4_q80_f32act_gemv_v2"
-            } else {
-                "grim_dot4_q80_f32act_gemv"
-            },
+            kname,
             grid_dim,
             block_dim,
             &mut [
@@ -1242,6 +1257,62 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_dot4_q80_norm_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut resptr),
+                arg(&mut gammaptr),
+                arg(&mut epsv),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dot4_q80_norm_f32act_argmax_u64_into(
+        &self,
+        res: &RocmStorage,
+        gamma: &RocmStorage,
+        eps: f32,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_q80_norm_f32act_argmax: K must be 32-aligned (k={k})"
+            )));
+        }
+        let res_ptr = res.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_norm_f32act_argmax: res has no device ptr".into())
+        })?;
+        let gamma_ptr = gamma.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_norm_f32act_argmax: gamma has no device ptr".into())
+        })?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_norm_f32act_argmax: b has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_norm_f32act_argmax: out has no device ptr".into())
+        })?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut resptr, mut gammaptr, mut epsv) = (res_ptr, gamma_ptr, eps);
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_norm_f32act_argmax_u64",
             grid_dim,
             block_dim,
             &mut [
@@ -3144,10 +3215,10 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("iq4xs hv: out has no device ptr".into()))?;
-        let grid_x = (n as u32).div_ceil(4);
+        let grid_x = (n as u32).div_ceil(16);
         let grid_y = (m as u32).div_ceil(rows_per_cta as u32);
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
         let mut optr = out_ptr;
@@ -3274,6 +3345,18 @@ impl RocmDevice {
                 m,
                 n,
                 k,
+            );
+        }
+        if m >= 3 && m < 8 && rows_hv2 && k % 256 == 0 {
+            return self.launch_dot4_iq4xs_q81_gemv_rows_hv_with(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+                4,
+                "grim_dot4_iq4xs_q81_gemv_rows_hv4",
             );
         }
         if m >= 2 && rows_hv2 && k % 256 == 0 {
@@ -3549,10 +3632,10 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_iq3xxs_q81_gemv_rows_r2: out has no device ptr".into()))?;
-        let grid_x = (n as u32).div_ceil(4);
+        let grid_x = (n as u32).div_ceil(16);
         let grid_y = (m as u32).div_ceil(2);
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
         let mut optr = out_ptr;
@@ -3561,6 +3644,50 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_dot4_iq3xxs_q81_gemv_rows_r2",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch IQ3_XXS Quad-Row Weight Reuse dot4 GEMV (`grim_dot4_iq3xxs_q81_gemv_rows_r4`).
+    pub fn launch_dot4_iq3xxs_q81_gemv_rows_r4_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_iq3xxs_q81_gemv_rows_r4: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq3xxs_q81_gemv_rows_r4: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_iq3xxs_q81_gemv_rows_r4: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(16);
+        let grid_y = (m as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_iq3xxs_q81_gemv_rows_r4",
             grid_dim,
             block_dim,
             &mut [
@@ -3583,7 +3710,9 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        if m == 2 {
+        if m >= 3 {
+            self.launch_dot4_iq3xxs_q81_gemv_rows_r4_for_ab(act_q81, b_storage, out_storage, m, n, k)
+        } else if m == 2 {
             self.launch_dot4_iq3xxs_q81_gemv_rows_r2_for_ab(act_q81, b_storage, out_storage, m, n, k)
         } else {
             self.launch_dot4_iq3xxs_q81_gemv_v2_lds_for_ab(act_q81, b_storage, out_storage, m, n, k)
@@ -3694,10 +3823,14 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_iq3s_q81_gemv_rows_r2: out has no device ptr".into()))?;
-        let grid_x = (n as u32).div_ceil(4);
-        let grid_y = (m as u32).div_ceil(2);
+        let grid_x = (n as u32).div_ceil(16);
+        let (kernel_name, grid_y) = if m >= 3 {
+            ("grim_dot4_iq3s_q81_gemv_rows_r4", (m as u32).div_ceil(4))
+        } else {
+            ("grim_dot4_iq3s_q81_gemv_rows_r2", (m as u32).div_ceil(2))
+        };
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
         let mut optr = out_ptr;
@@ -3705,7 +3838,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_iq3s_q81_gemv_rows_r2",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [
@@ -3728,10 +3861,10 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        if m == 2 {
+        if m >= 2 {
             self.launch_dot4_iq3s_q81_gemv_rows_r2_for_ab(act_q81, b_storage, out_storage, m, n, k)
         } else {
-            self.launch_dot4_iq3s_q81_gemv_for_ab(act_q81, b_storage, out_storage, m, n, k)
+            self.launch_dot4_iq3s_q81_gemv_v2_lds_for_ab(act_q81, b_storage, out_storage, m, n, k)
         }
     }
 
@@ -4226,23 +4359,6 @@ impl RocmDevice {
         }
         if m >= 2 && rows_r2 {
             return self.launch_dot4_q5k_q81_gemv_rows_r2_for_ab(
-                act_q81,
-                b_storage,
-                out_storage,
-                m,
-                n,
-                k,
-            );
-        }
-        static SUB_V3_PREFETCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let sub_v3 = *SUB_V3_PREFETCH.get_or_init(|| {
-            matches!(
-                std::env::var("GRIM_Q5K_SUB_V3_PREFETCH").as_deref(),
-                Ok("1" | "true" | "on")
-            )
-        });
-        if m == 1 && sub_v3 {
-            return self.launch_dot4_q5k_q81_gemv_sub_v3_prefetch_for_ab(
                 act_q81,
                 b_storage,
                 out_storage,
@@ -4909,7 +5025,17 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m >= 2 && rows_r2 {
+        if m >= 3 && rows_r2 {
+            return self.launch_dot4_q6k_q81_gemv_rows_r4_for_ab(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
+        if m == 2 && rows_r2 {
             return self.launch_dot4_q6k_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -4919,14 +5045,7 @@ impl RocmDevice {
                 k,
             );
         }
-        static SUB_V3_PREFETCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let sub_v3 = *SUB_V3_PREFETCH.get_or_init(|| {
-            !matches!(
-                std::env::var("GRIM_Q6K_SUB_V3_PREFETCH").as_deref(),
-                Ok("0" | "false" | "off")
-            )
-        });
-        if m == 1 && sub_v3 {
+        if m == 1 {
             return self.launch_dot4_q6k_q81_gemv_sub_v3_prefetch_for_ab(
                 act_q81,
                 b_storage,
@@ -5074,6 +5193,50 @@ impl RocmDevice {
         )
     }
 
+    /// Q6_K GEMV quad-row weight reuse (R=4, for M >= 3).
+    pub fn launch_dot4_q6k_q81_gemv_rows_r4_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_rows_r4: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_rows_r4: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_rows_r4: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_y = (m as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q6k_q81_gemv_rows_r4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     fn launch_dot4_q6k_q81_gemv_named(
         &self,
         kernel_name: &str,
@@ -5141,7 +5304,14 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q6k_f32act_gemv: out has no device ptr".into()))?;
         let grid_x = (n as u32).div_ceil(4);
-        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let (kernel_name, grid_y) = if m >= 3 {
+            ("grim_dot4_q6k_f32act_gemv_r4", (m as u32).div_ceil(4))
+        } else if m == 2 {
+            ("grim_dot4_q6k_f32act_gemv_r2", (m as u32).div_ceil(2))
+        } else {
+            ("grim_dot4_q6k_f32act_gemv", m as u32)
+        };
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
         let block_dim = HipDim3::new(32, 1, 1);
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
@@ -5150,7 +5320,7 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut kk = k as i32;
         self.launch_compute_kernel(
-            "grim_dot4_q6k_f32act_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [

@@ -627,6 +627,22 @@ impl RocmDevice {
         if std::env::var_os("GRIM_INIT_TRACE").is_some() {
             eprintln!("[init-trace] attrs done, streams...");
         }
+        if !crate::probe_rebar_host_writable(ordinal + 1) {
+            eprintln!(
+                "[grim-backend-rocm] warning: GPU {ordinal} VRAM is not host-writable (Resizable BAR disabled)"
+            );
+        }
+        if std::env::var("GRIM_STREAM_QUEUE_PRIME").ok().as_deref() == Some("1") {
+            let mut prime_stream: *mut std::ffi::c_void = std::ptr::null_mut();
+            unsafe {
+                if crate::hipStreamCreateWithFlags(&mut prime_stream, 1, 0) == crate::hipSuccess
+                    && !prime_stream.is_null()
+                {
+                    let _ = crate::hipStreamSynchronize(prime_stream);
+                    let _ = crate::hipStreamDestroy(prime_stream);
+                }
+            }
+        }
         unsafe {
             let mut val = 0;
             let status =
@@ -1429,6 +1445,41 @@ impl RocmDevice {
     }
 
     /// Block until all previously issued work on all streams of this device
+    /// Stream-ordered by-value device pointer table patch (`grim_wtab_patch`).
+    pub fn launch_wtab_patch(
+        &self,
+        patch: &crate::kernels::comm_fuse::WtabPatch,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        let mut p = *patch;
+        let ptr = &mut p as *mut crate::kernels::comm_fuse::WtabPatch as *mut std::ffi::c_void;
+        self.launch_compute_kernel_on_stream(
+            "grim_wtab_patch",
+            crate::HipDim3::new(1, 1, 1),
+            crate::HipDim3::new(32, 1, 1),
+            &mut [ptr],
+            stream,
+            0,
+        )?;
+        Ok(())
+    }
+
+    /// Composition probe for residual stream (`GRIM_RESID_PROBE=1`).
+    pub fn probe_resid_stat(
+        row: &[f32],
+        tag: &str,
+    ) -> Option<crate::kernels::comm_fuse::DbgResidStat> {
+        if std::env::var("GRIM_RESID_PROBE").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let stat = crate::kernels::comm_fuse::compute_dbg_resid_stat(row);
+        eprintln!(
+            "[resid-probe:{tag}] rms={:.4} median_abs={:.4} max_abs={:.4}",
+            stat.rms, stat.median_abs, stat.max_abs
+        );
+        Some(stat)
+    }
+
     pub fn synchronize(&self) {
         // Pin the correct device before synchronizing - hipDeviceSynchronize() synchronizes the calling thread's current device, not necessarily self.ordinal.
         // [P1-7 fix: DeviceGuard before sync.]
@@ -1442,14 +1493,18 @@ impl RocmDevice {
     }
 
     /// Begin a generic graph-capture session keyed by `key`. Until `end_graph_capture` [see: `key`, `GRIM_CAPTURE_GRAPH`]
-    pub fn begin_graph_capture(&self, _key: &str) -> Result<()> {
+    pub fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        if !self.capture_enabled {
+            return Ok(());
+        }
+        self.begin_graph_capture_force(key)
+    }
+
+    pub fn begin_graph_capture_force(&self, _key: &str) -> Result<()> {
         // Invalidate stale CUR_DEV cache so DeviceGuard actually calls
         // hipSetDevice. Prevents hipModuleLoad 209 from unguarded seam.
         crate::device::util::note_current_device(-1);
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        if !self.capture_enabled {
-            return Ok(());
-        }
         if self.capture_active.load(Ordering::SeqCst) {
             return Err(Error::Backend(
                 "begin_graph_capture: a capture session is already active".into(),
@@ -1495,6 +1550,10 @@ impl RocmDevice {
         if !self.capture_enabled {
             return Ok(());
         }
+        self.end_graph_capture_force(key)
+    }
+
+    pub fn end_graph_capture_force(&self, key: &str) -> Result<()> {
         if !self.capture_active.load(Ordering::SeqCst) {
             return Err(Error::Backend(
                 "end_graph_capture: no capture session is active".into(),
@@ -1560,20 +1619,19 @@ impl RocmDevice {
 
     /// Replay the graph previously captured under `key`. Returns `Ok(false)` when no [see: `key`, `Ok(true)`]
     pub fn replay_graph(&self, key: &str) -> Result<bool> {
-        // P1-3: raw HIP ops below bind to the calling thread's current
-        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
-        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if !self.capture_enabled {
             return Ok(false);
         }
-        // Replay on the same capture stream the graph was recorded on, so the rocblas
-        let stream = {
-            let cs = self
-                .capture_stream
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            cs.unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()))
-        };
+        self.replay_graph_force(key)
+    }
+
+    pub fn replay_graph_force(&self, key: &str) -> Result<bool> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        // Replay on the default/active stream so it is strictly ordered with
+        // preceding D2D checkpoint restores and subsequent DecodeGraph replays.
+        let stream = self.active_stream();
         let cache = self
             .captured_graphs
             .lock()

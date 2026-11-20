@@ -1450,66 +1450,83 @@ impl RocmDevice {
         };
         let s_s = as_rocm(state)?;
 
-        let mut cm_ptr = dev_ptr(cm_s)?;
-        let mut al_ptr = dev_ptr(al_s)?;
-        let mut be_ptr = dev_ptr(be_s)?;
+        let cm_base = dev_ptr(cm_s)?;
+        let al_base = dev_ptr(al_s)?;
+        let be_base = dev_ptr(be_s)?;
         let mut db_ptr = dev_ptr(db_s)?;
         let mut sa_ptr = dev_ptr(sa_s)?;
         let mut s_ptr = dev_ptr(s_s)?;
         let mut acc_ptr = dev_ptr(acc_scratch)?;
+        let mut nw_ptr = dev_ptr(nw_s)?;
+        let z_base = match z_s {
+            Some(zz) => dev_ptr(zz)?,
+            None => 0u64,
+        };
+        let out_base = dev_ptr(out)?;
         let mut nv_i = num_value_heads as i32;
         let mut nk_i = num_key_heads as i32;
         let mut hd_i = head_dim as i32;
         let mut eps_f = eps;
-
-        let (grid, block) = linear_launch(num_value_heads * head_dim);
-        self.launch_compute_kernel(
-            "grim_kda_gated_delta_rule_batched",
-            grid,
-            block,
-            &mut [
-                arg(&mut cm_ptr),
-                arg(&mut al_ptr),
-                arg(&mut be_ptr),
-                arg(&mut db_ptr),
-                arg(&mut sa_ptr),
-                arg(&mut s_ptr),
-                arg(&mut acc_ptr),
-                arg(&mut nv_i),
-                arg(&mut nk_i),
-                arg(&mut hd_i),
-                arg(&mut eps_f),
-            ],
-        )?;
-
-        let mut acc_ptr2 = dev_ptr(acc_scratch)?;
-        let mut nw_ptr = dev_ptr(nw_s)?;
-        let mut z_ptr = match z_s {
-            Some(zz) => dev_ptr(zz)?,
-            None => 0u64,
-        };
-        let mut out_ptr = dev_ptr(out)?;
-        let mut nv2_i = num_value_heads as i32;
-        let mut hd2_i = head_dim as i32;
-        let mut eps2_f = eps;
         let mut has_z_i = i32::from(z_s.is_some());
 
+        let out_dims = out.shape().dims();
+        let batch = out_dims[..out_dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1);
+        let cm_dims = cm_s.shape().dims();
+        let conv_channels = cm_dims.last().copied().unwrap_or(0);
+        let value_dim = num_value_heads * head_dim;
+
+        let (grid, block) = linear_launch(num_value_heads * head_dim);
         let (grid2, block2) = linear_launch(num_value_heads);
-        self.launch_compute_kernel(
-            "grim_kda_head_norm_gate",
-            grid2,
-            block2,
-            &mut [
-                arg(&mut acc_ptr2),
-                arg(&mut nw_ptr),
-                arg(&mut z_ptr),
-                arg(&mut out_ptr),
-                arg(&mut nv2_i),
-                arg(&mut hd2_i),
-                arg(&mut eps2_f),
-                arg(&mut has_z_i),
-            ],
-        )?;
+
+        for t in 0..batch {
+            let mut cm_ptr = cm_base + (t * conv_channels * 4) as u64;
+            let mut al_ptr = al_base + (t * num_value_heads * 4) as u64;
+            let mut be_ptr = be_base + (t * num_value_heads * 4) as u64;
+            self.launch_compute_kernel(
+                "grim_kda_gated_delta_rule_batched",
+                grid,
+                block,
+                &mut [
+                    arg(&mut cm_ptr),
+                    arg(&mut al_ptr),
+                    arg(&mut be_ptr),
+                    arg(&mut db_ptr),
+                    arg(&mut sa_ptr),
+                    arg(&mut s_ptr),
+                    arg(&mut acc_ptr),
+                    arg(&mut nv_i),
+                    arg(&mut nk_i),
+                    arg(&mut hd_i),
+                    arg(&mut eps_f),
+                ],
+            )?;
+
+            let mut acc_ptr2 = acc_ptr;
+            let mut z_ptr = if z_base != 0 {
+                z_base + (t * value_dim * 4) as u64
+            } else {
+                0u64
+            };
+            let mut out_ptr = out_base + (t * value_dim * 4) as u64;
+            self.launch_compute_kernel(
+                "grim_kda_head_norm_gate",
+                grid2,
+                block2,
+                &mut [
+                    arg(&mut acc_ptr2),
+                    arg(&mut nw_ptr),
+                    arg(&mut z_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut nv_i),
+                    arg(&mut hd_i),
+                    arg(&mut eps_f),
+                    arg(&mut has_z_i),
+                ],
+            )?;
+        }
 
         Ok(())
     }
@@ -1542,6 +1559,58 @@ impl RocmDevice {
         head_dim: usize,
         eps: f32,
     ) -> Result<()> {
+        self.kda_fused_step_into_with_ckpt(
+            conv_in,
+            conv_w,
+            conv_bias,
+            conv_state,
+            conv_out,
+            alpha,
+            beta,
+            dt_bias,
+            ssm_a,
+            norm_weight,
+            z,
+            state,
+            acc_scratch,
+            branch_out,
+            batch,
+            channels,
+            kernel_size,
+            num_value_heads,
+            num_key_heads,
+            head_dim,
+            eps,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kda_fused_step_into_with_ckpt(
+        &self,
+        conv_in: &dyn BackendStorage,
+        conv_w: &dyn BackendStorage,
+        conv_bias: Option<&dyn BackendStorage>,
+        conv_state: &dyn BackendStorage,
+        conv_out: &RocmStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        acc_scratch: &RocmStorage,
+        branch_out: &RocmStorage,
+        batch: usize,
+        channels: usize,
+        kernel_size: usize,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        post_row0_ckpt: Option<(&RocmStorage, &RocmStorage)>,
+    ) -> Result<()> {
         let ci_s = as_rocm(conv_in)?;
         let cw_s = as_rocm(conv_w)?;
         let cb_s = match conv_bias {
@@ -1560,28 +1629,27 @@ impl RocmDevice {
         };
         let s_s = as_rocm(state)?;
 
-        let mut ci_ptr = dev_ptr(ci_s)?;
+        let ci_base = dev_ptr(ci_s)?;
         let mut cw_ptr = dev_ptr(cw_s)?;
         let mut cb_ptr = match cb_s {
             Some(b) => dev_ptr(b)?,
             None => 0u64,
         };
         let mut cs_ptr = dev_ptr(cs_s)?;
-        let mut co_ptr = dev_ptr(conv_out)?;
-        let mut al_ptr = dev_ptr(al_s)?;
-        let mut be_ptr = dev_ptr(be_s)?;
+        let co_base = dev_ptr(conv_out)?;
+        let al_base = dev_ptr(al_s)?;
+        let be_base = dev_ptr(be_s)?;
         let mut db_ptr = dev_ptr(db_s)?;
         let mut sa_ptr = dev_ptr(sa_s)?;
         let mut nw_ptr = dev_ptr(nw_s)?;
-        let mut z_ptr = match z_s {
+        let z_base = match z_s {
             Some(zz) => dev_ptr(zz)?,
             None => 0u64,
         };
         let mut s_ptr = dev_ptr(s_s)?;
         let mut acc_ptr = dev_ptr(acc_scratch)?;
-        let mut br_ptr = dev_ptr(branch_out)?;
+        let br_base = dev_ptr(branch_out)?;
 
-        let mut b_i = batch as i32;
         let mut ch_i = channels as i32;
         let mut ks_i = kernel_size as i32;
         let mut nv_i = num_value_heads as i32;
@@ -1592,62 +1660,152 @@ impl RocmDevice {
 
         // Launch the 3 phases as separate multi-block kernels so all CUs participate
         // instead of bottlenecking on a single block/CU in grim_kda_fused_step.
-        let conv_total = (batch * channels) as u32;
-        let conv_grid = crate::HipDim3::new((conv_total + 255) / 256, 1, 1);
-        let block = crate::HipDim3::new(256, 1, 1);
-        self.launch_compute_kernel(
-            "grim_short_conv1d_causal_step",
-            conv_grid,
-            block,
-            &mut [
-                arg(&mut ci_ptr),
-                arg(&mut cw_ptr),
-                arg(&mut cb_ptr),
-                arg(&mut cs_ptr),
-                arg(&mut co_ptr),
-                arg(&mut b_i),
-                arg(&mut ch_i),
-                arg(&mut ks_i),
-            ],
-        )?;
+        let value_dim = num_value_heads * head_dim;
 
+        let mut b_one = 1i32;
+        let conv_total = channels as u32;
+        let conv_grid = crate::HipDim3::new((conv_total + 255) / 256, 1, 1);
         let kda_total = (num_value_heads * head_dim) as u32;
         let kda_grid = crate::HipDim3::new((kda_total + 255) / 256, 1, 1);
-        self.launch_compute_kernel(
-            "grim_kda_gated_delta_rule_batched",
-            kda_grid,
-            block,
-            &mut [
-                arg(&mut co_ptr),
-                arg(&mut al_ptr),
-                arg(&mut be_ptr),
-                arg(&mut db_ptr),
-                arg(&mut sa_ptr),
-                arg(&mut s_ptr),
-                arg(&mut acc_ptr),
-                arg(&mut nv_i),
-                arg(&mut nk_i),
-                arg(&mut hd_i),
-                arg(&mut eps_f),
-            ],
-        )?;
-
         let norm_grid = crate::HipDim3::new((num_value_heads as u32 + 255) / 256, 1, 1);
-        self.launch_compute_kernel(
-            "grim_kda_head_norm_gate",
-            norm_grid,
-            block,
-            &mut [
-                arg(&mut acc_ptr),
-                arg(&mut nw_ptr),
-                arg(&mut z_ptr),
-                arg(&mut br_ptr),
-                arg(&mut nv_i),
-                arg(&mut hd_i),
-                arg(&mut eps_f),
-                arg(&mut has_z_i),
-            ],
-        )?;
+        let block = crate::HipDim3::new(256, 1, 1);
+
+        for t in 0..batch.max(1) {
+            let mut ci_row = ci_base + (t * channels * 4) as u64;
+            let mut co_row = co_base + (t * channels * 4) as u64;
+            let mut al_row = al_base + (t * num_value_heads * 4) as u64;
+            let mut be_row = be_base + (t * num_value_heads * 4) as u64;
+            let mut z_row = if z_base != 0 {
+                z_base + (t * value_dim * 4) as u64
+            } else {
+                0u64
+            };
+            let mut br_row = br_base + (t * value_dim * 4) as u64;
+
+            self.launch_compute_kernel(
+                "grim_short_conv1d_causal_step",
+                conv_grid,
+                block,
+                &mut [
+                    arg(&mut ci_row),
+                    arg(&mut cw_ptr),
+                    arg(&mut cb_ptr),
+                    arg(&mut cs_ptr),
+                    arg(&mut co_row),
+                    arg(&mut b_one),
+                    arg(&mut ch_i),
+                    arg(&mut ks_i),
+                ],
+            )?;
+
+            let fuse_norm_gate = head_dim <= 256
+                && head_dim % 32 == 0
+                && !matches!(
+                    std::env::var("GRIM_KDA_FUSED_NORM_GATE").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+            if fuse_norm_gate {
+                // Lever 4: For M=2 (`batch == 2`), write t=1 KDA state directly to `kda_ckpt`
+                // (`S_spec`), keeping `S` untouched at `S_post_row0` with ZERO D2D copy!
+                let mut s_out_ptr = if t == 1 && batch == 2 {
+                    post_row0_ckpt
+                        .and_then(|(_, kda_ckpt)| kda_ckpt.device_ptr)
+                        .unwrap_or(s_ptr)
+                } else {
+                    s_ptr
+                };
+                self.launch_compute_kernel(
+                    "grim_kda_gated_delta_rule_norm_gate",
+                    crate::HipDim3::new(num_value_heads as u32, 1, 1),
+                    crate::HipDim3::new(head_dim as u32, 1, 1),
+                    &mut [
+                        arg(&mut co_row),
+                        arg(&mut al_row),
+                        arg(&mut be_row),
+                        arg(&mut db_ptr),
+                        arg(&mut sa_ptr),
+                        arg(&mut s_ptr),
+                        arg(&mut s_out_ptr),
+                        arg(&mut acc_ptr),
+                        arg(&mut nw_ptr),
+                        arg(&mut z_row),
+                        arg(&mut br_row),
+                        arg(&mut nv_i),
+                        arg(&mut nk_i),
+                        arg(&mut hd_i),
+                        arg(&mut eps_f),
+                        arg(&mut has_z_i),
+                    ],
+                )?;
+            } else {
+                self.launch_compute_kernel(
+                    "grim_kda_gated_delta_rule_batched",
+                    kda_grid,
+                    block,
+                    &mut [
+                        arg(&mut co_row),
+                        arg(&mut al_row),
+                        arg(&mut be_row),
+                        arg(&mut db_ptr),
+                        arg(&mut sa_ptr),
+                        arg(&mut s_ptr),
+                        arg(&mut acc_ptr),
+                        arg(&mut nv_i),
+                        arg(&mut nk_i),
+                        arg(&mut hd_i),
+                        arg(&mut eps_f),
+                    ],
+                )?;
+
+                self.launch_compute_kernel(
+                    "grim_kda_head_norm_gate",
+                    norm_grid,
+                    block,
+                    &mut [
+                        arg(&mut acc_ptr),
+                        arg(&mut nw_ptr),
+                        arg(&mut z_row),
+                        arg(&mut br_row),
+                        arg(&mut nv_i),
+                        arg(&mut hd_i),
+                        arg(&mut eps_f),
+                        arg(&mut has_z_i),
+                    ],
+                )?;
+            }
+
+            if t == 0 && batch == 2 {
+                if let Some((sc_ckpt, kda_ckpt)) = post_row0_ckpt {
+                    let stream = self.active_stream();
+                    if let (Some(dst), Some(src)) = (sc_ckpt.device_ptr, cs_s.device_ptr) {
+                        unsafe {
+                            let _ = crate::hipMemcpyAsync(
+                                dst as *mut std::ffi::c_void,
+                                src as *const std::ffi::c_void,
+                                cs_s.bytes.min(sc_ckpt.bytes),
+                                crate::HipMemcpyKind::DeviceToDevice,
+                                stream,
+                            );
+                        }
+                    }
+                    // When `fuse_norm_gate` is active, t=1 writes directly to `kda_ckpt` (`S_spec`),
+                    // leaving `S` at `S_post_row0` — no 144 MB D2D copy needed!
+                    if !fuse_norm_gate {
+                        if let (Some(dst), Some(src)) = (kda_ckpt.device_ptr, s_s.device_ptr) {
+                            unsafe {
+                                let _ = crate::hipMemcpyAsync(
+                                    dst as *mut std::ffi::c_void,
+                                    src as *const std::ffi::c_void,
+                                    s_s.bytes.min(kda_ckpt.bytes),
+                                    crate::HipMemcpyKind::DeviceToDevice,
+                                    stream,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

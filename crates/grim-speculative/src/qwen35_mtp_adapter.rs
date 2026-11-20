@@ -116,7 +116,7 @@ impl NativeMtp for Qwen35MtpAdapter {
         session: &mut dyn SessionT,
         input_ids: &Tensor,
         positions: &Tensor,
-        _base_logits: &Tensor,
+        base_logits: &Tensor,
     ) -> Result<DraftBlock> {
         let qwen = self.qwen()?;
         let depth = qwen.mtp_depth();
@@ -130,10 +130,23 @@ impl NativeMtp for Qwen35MtpAdapter {
             return Ok(empty_block(grim_core::Model::device(qwen)));
         };
 
-        let input_vec = input_ids.to_vec_f32().unwrap_or_default();
         let pos_vec = positions.to_vec_f32().unwrap_or_default();
-        let bonus_token = input_vec.last().copied().unwrap_or(0.0) as u32;
         let bonus_pos = pos_vec.last().copied().unwrap_or(0.0) as u32;
+        // nextn predicts tok_{t+2} conditioned on (embed(tok_{t+1}), h_t), where tok_{t+1}
+        // is the token sampled from `base_logits` (or argmax(base_logits) in greedy mode).
+        let vocab_size = qwen.cfg.vocab_size;
+        let bonus_token = if let Some(sampled) = session.last_sampled_token().filter(|_| !session.sampling_greedy()) {
+            sampled
+        } else if vocab_size > 0 {
+            grim_models_transformer::Qwen35::argmax_last_logits(base_logits, vocab_size)
+                .unwrap_or_else(|_| {
+                    let input_vec = input_ids.to_vec_f32().unwrap_or_default();
+                    input_vec.last().copied().unwrap_or(0.0) as u32
+                })
+        } else {
+            let input_vec = input_ids.to_vec_f32().unwrap_or_default();
+            input_vec.last().copied().unwrap_or(0.0) as u32
+        };
 
         // Trunk seed is post-output_norm hidden (`h_nextn`-equivalent, llama.cpp qwen3next /
         // Strata normed-seed contract); nextn applies its own enorm/hnorm in forward_step.
@@ -153,27 +166,83 @@ impl NativeMtp for Qwen35MtpAdapter {
             });
         }
 
-        // Stack per-step logits [1, vocab] -> [depth, vocab] on CPU for DraftBlock.
-        let vocab_size = qwen.cfg.vocab_size;
-        let mut flat: Vec<f32> = Vec::with_capacity(tokens.len() * vocab_size);
-        for l in &step_logits {
-            let v = l.to_vec_f32()?;
-            if v.len() == vocab_size {
-                flat.extend_from_slice(&v);
-            } else if v.len() > vocab_size {
-                flat.extend_from_slice(&v[v.len() - vocab_size..]);
-            } else {
-                flat.extend(std::iter::repeat_n(0.0, vocab_size));
+        // In greedy mode, verification only compares argmax against `tokens` and never
+        // reads `DraftBlock.base_logits` — skip the 1 MB/token D2H copy.
+        let base_logits = if session.sampling_greedy() {
+            empty_block(grim_core::Model::device(qwen)).base_logits
+        } else {
+            let mut flat: Vec<f32> = Vec::with_capacity(tokens.len() * vocab_size);
+            for l in &step_logits {
+                let v = l.to_vec_f32()?;
+                if v.len() == vocab_size {
+                    flat.extend_from_slice(&v);
+                } else if v.len() > vocab_size {
+                    flat.extend_from_slice(&v[v.len() - vocab_size..]);
+                } else {
+                    flat.extend(std::iter::repeat_n(0.0, vocab_size));
+                }
             }
-        }
-        let shape = Shape::new(vec![tokens.len(), vocab_size]);
-        let base_logits = grim_backend_cpu::cpu_tensor(flat, shape);
+            let shape = Shape::new(vec![tokens.len(), vocab_size]);
+            grim_backend_cpu::cpu_tensor(flat, shape)
+        };
 
         Ok(DraftBlock {
             confidence: vec![1.0; tokens.len()],
             tokens,
             base_logits,
         })
+    }
+
+    fn forward_m2_graph(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        session: &mut dyn SessionT,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<Option<Tensor>> {
+        self.qwen()?.run_m2_graph_step(graph_slot, session, tokens, pos)
+    }
+
+    fn restore_m2_graph_recurrent(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<()> {
+        self.qwen()?.restore_graph_recurrent(graph_slot)
+    }
+
+    fn prewarm_m2_graph(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<()> {
+        let qwen = self.qwen()?;
+        qwen.prewarm_m2_graph(graph_slot)
+    }
+
+    fn publish_m2_graph_hidden_row(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        session: &mut dyn SessionT,
+        row: usize,
+    ) -> Result<()> {
+        self.qwen()?.publish_graph_hidden_row(graph_slot, session, row)
+    }
+
+    fn rollback_m2_graph_to_accepted(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        base_pos: u32,
+        accepted_tokens: usize,
+    ) -> Result<bool> {
+        self.qwen()?
+            .rollback_graph_to_accepted(graph_slot, base_pos, accepted_tokens)?;
+        Ok(true)
+    }
+
+    fn commit_m2_graph_spec_state(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<()> {
+        self.qwen()?.commit_graph_spec_state(graph_slot)
     }
 }
 

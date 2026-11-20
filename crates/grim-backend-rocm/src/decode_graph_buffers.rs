@@ -297,7 +297,11 @@ pub struct DecodeGraphBuffers {
     pub num_layers: usize,
     pub max_ctx: usize,
     pub batch: usize,
+    /// Allocated maximum batch capacity of this buffer pool (`1 <= batch <= max_batch`).
+    pub max_batch: usize,
     pub layer_devices: Vec<usize>,
+    /// Lazy D2D checkpoint for on-graph speculative rejection rollback.
+    pub recurrent_ckpt: Option<RecurrentCheckpoint>,
 }
 
 /// The maximal contiguous runs of equal device ordinal in `layer_devices`,
@@ -318,6 +322,224 @@ pub fn device_segments(layer_devices: &[usize]) -> Vec<(usize, std::ops::Range<u
         }
     }
     out
+}
+
+/// Snapshot of all KDA and ShortConv recurrent state buffers for speculative rollback.
+#[derive(Debug)]
+pub struct RecurrentCheckpoint {
+    /// `(live_ptr, backup_storage, bytes, device_ordinal)`
+    pub slots: Vec<(u64, RocmStorage, usize, usize)>,
+}
+
+impl DecodeGraphBuffers {
+    /// Allocate D2D backup buffers for all KDA and ShortConv state buffers.
+    pub fn alloc_recurrent_checkpoint(&self) -> Result<RecurrentCheckpoint> {
+        let mut slots = Vec::new();
+        for sc in &self.sc_state {
+            let bytes = sc.bytes();
+            if bytes == 0 {
+                continue;
+            }
+            if let Some(ptr) = sc.device_ptr_u64() {
+                let ord = sc.device_ordinal();
+                let dev = RocmDevice::shared(ord);
+                let backup = RocmStorage::alloc_gpu(
+                    sc.shape(),
+                    sc.dtype(),
+                    &dev.allocator,
+                    ord,
+                )?;
+                slots.push((ptr, backup, bytes, ord));
+            }
+        }
+        for kda in self.kda.iter().flatten() {
+            let bytes = kda.state.bytes();
+            if bytes == 0 {
+                continue;
+            }
+            if let Some(ptr) = kda.state.device_ptr_u64() {
+                let ord = kda.state.device_ordinal();
+                let dev = RocmDevice::shared(ord);
+                let backup = RocmStorage::alloc_gpu(
+                    kda.state.shape(),
+                    kda.state.dtype(),
+                    &dev.allocator,
+                    ord,
+                )?;
+                slots.push((ptr, backup, bytes, ord));
+            }
+        }
+        Ok(RecurrentCheckpoint { slots })
+    }
+
+    /// Async D2D snapshot of all recurrent state buffers before speculative verification.
+    pub fn snapshot_recurrent_state(
+        &self,
+        ckpt: &RecurrentCheckpoint,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        for &(live_ptr, ref backup, bytes, ord) in &ckpt.slots {
+            if let Some(snap_ptr) = backup.device_ptr_u64() {
+                let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+                let st = if stream.is_null() {
+                    RocmDevice::shared(ord).active_stream()
+                } else {
+                    stream
+                };
+                crate::check_hip("snapshot_recurrent_state D2D", unsafe {
+                    crate::device::handles::hipMemcpyDtoDAsync(
+                        snap_ptr as *mut std::ffi::c_void,
+                        live_ptr as *mut std::ffi::c_void,
+                        bytes,
+                        st,
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Async D2D restore of all recurrent state buffers on speculative draft rejection.
+    pub fn restore_recurrent_state(
+        &self,
+        ckpt: &RecurrentCheckpoint,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        for &(live_ptr, ref backup, bytes, ord) in &ckpt.slots {
+            if let Some(snap_ptr) = backup.device_ptr_u64() {
+                let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+                let st = if stream.is_null() {
+                    RocmDevice::shared(ord).active_stream()
+                } else {
+                    stream
+                };
+                crate::check_hip("restore_recurrent_state D2D", unsafe {
+                    crate::device::handles::hipMemcpyDtoDAsync(
+                        live_ptr as *mut std::ffi::c_void,
+                        snap_ptr as *mut std::ffi::c_void,
+                        bytes,
+                        st,
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Async D2D restore of ONLY ShortConv state buffers (for M=2 Lever 4 where KDA `S`
+    /// is already at `S_post_row0` and `t=1` wrote to `S_spec`).
+    pub fn restore_sc_only_recurrent_state(
+        &self,
+        ckpt: &RecurrentCheckpoint,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        for &(live_ptr, ref backup, bytes, ord) in &ckpt.slots {
+            let is_sc = self
+                .sc_state
+                .iter()
+                .any(|s| s.device_ptr().unwrap_or(0) == live_ptr);
+            if !is_sc {
+                continue;
+            }
+            if let Some(snap_ptr) = backup.device_ptr_u64() {
+                let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+                let st = if stream.is_null() {
+                    RocmDevice::shared(ord).active_stream()
+                } else {
+                    stream
+                };
+                crate::check_hip("restore_sc_only_recurrent_state D2D", unsafe {
+                    crate::device::handles::hipMemcpyDtoDAsync(
+                        live_ptr as *mut std::ffi::c_void,
+                        snap_ptr as *mut std::ffi::c_void,
+                        bytes,
+                        st,
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Async D2D commit of ONLY KDA speculative state (`S_spec -> S`) on M=2 draft accept.
+    pub fn commit_kda_spec_state(
+        &self,
+        ckpt: &RecurrentCheckpoint,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        for &(live_ptr, ref backup, bytes, ord) in &ckpt.slots {
+            let is_sc = self
+                .sc_state
+                .iter()
+                .any(|s| s.device_ptr().unwrap_or(0) == live_ptr);
+            if is_sc {
+                continue;
+            }
+            if let Some(snap_ptr) = backup.device_ptr_u64() {
+                let _guard = crate::device::util::DeviceGuard::set(ord as i32);
+                let st = if stream.is_null() {
+                    RocmDevice::shared(ord).active_stream()
+                } else {
+                    stream
+                };
+                crate::check_hip("commit_kda_spec_state D2D", unsafe {
+                    crate::device::handles::hipMemcpyDtoDAsync(
+                        live_ptr as *mut std::ffi::c_void,
+                        snap_ptr as *mut std::ffi::c_void,
+                        bytes,
+                        st,
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+    /// Update the leading batch dimension (`dims[0] = batch`) on all batch-indexed
+    /// activation scratch buffers so a single `DecodeGraphBuffers` (allocated at
+    /// `max_batch`) can be captured and replayed for any `1 <= batch <= max_batch`
+    /// with zero extra VRAM and zero state copies.
+    pub fn set_active_batch(&mut self, batch: usize) {
+        let set_b = |s: &mut RocmStorage| {
+            let mut dims = s.shape.dims().to_vec();
+            if dims.len() >= 2 {
+                dims[0] = batch;
+                s.shape = Shape::new(dims);
+            } else if dims.len() == 1 && self.batch > 0 && dims[0] % self.batch == 0 {
+                let per = dims[0] / self.batch;
+                s.shape = Shape::new(vec![per * batch]);
+            }
+        };
+        for s in &mut self.layer_input { set_b(s); }
+        for s in &mut self.boundary_out { set_b(s); }
+        for s in &mut self.layer_output { set_b(s); }
+        for s in &mut self.norm_buf { set_b(s); }
+        for s in &mut self.q_buf { set_b(s); }
+        for s in &mut self.q_head_buf { set_b(s); }
+        for s in &mut self.q_gate_buf { set_b(s); }
+        for s in &mut self.k_buf { set_b(s); }
+        for s in &mut self.v_buf { set_b(s); }
+        for s in &mut self.attn_out_buf { set_b(s); }
+        for s in &mut self.gate_up_buf { set_b(s); }
+        for s in &mut self.gate_buf { set_b(s); }
+        for s in &mut self.up_buf { set_b(s); }
+        for s in &mut self.activated_buf { set_b(s); }
+        for s in &mut self.act_q81_buf { set_b(s); }
+        for s in &mut self.fused_qkv_out { set_b(s); }
+        set_b(&mut self.head_input);
+        if let Some(ho) = std::sync::Arc::get_mut(&mut self.head_output) {
+            set_b(ho);
+        }
+        set_b(&mut self.token_ids_dev);
+        for kda in self.kda.iter_mut().flatten() {
+            set_b(&mut kda.alpha);
+            set_b(&mut kda.beta);
+            set_b(&mut kda.acc_scratch);
+            set_b(&mut kda.conv_out);
+            set_b(&mut kda.branch);
+            set_b(&mut kda.gate);
+        }
+        self.batch = batch;
+    }
 }
 
 /// KDA per-layer device state + projection buffers for HIP graph capture.
@@ -456,6 +678,23 @@ pub struct ConvRingSeed<'a> {
 }
 
 impl DecodeGraphBuffers {
+    /// Compute liveness-colored arena plan and decode-level shrunk plan (`GRIM_ARENA_BUFPLAN=1`).
+    pub fn liveness_bufplan_summary(num_layers: usize, hidden: usize) -> Option<(usize, usize)> {
+        if std::env::var("GRIM_ARENA_BUFPLAN").ok().as_deref() != Some("1") {
+            return None;
+        }
+        use grim_memory::bufplan::{BufDecl, BufKind, plan_buffers, plan_level};
+        let row_bytes = (hidden * std::mem::size_of::<f32>()) as u64;
+        let decls = vec![
+            BufDecl { name: "resid".to_string(), kind: BufKind::Persist, bytes: row_bytes, first_def: 0, last_use: num_layers as i32 },
+            BufDecl { name: "attn_tmp".to_string(), kind: BufKind::Transient, bytes: row_bytes * 4, first_def: 0, last_use: num_layers as i32 },
+            BufDecl { name: "mlp_tmp".to_string(), kind: BufKind::Transient, bytes: row_bytes * 8, first_def: 1, last_use: num_layers as i32 },
+        ];
+        let full = plan_buffers(&decls, (num_layers + 1) as i32);
+        let shrunk_bytes = vec![row_bytes, row_bytes, row_bytes * 2];
+        let level = plan_level(&decls, &full, &shrunk_bytes, (num_layers + 1) as i32).ok()?;
+        Some((full.arena_bytes as usize, level.arena_bytes as usize))
+    }
     /// Allocate full pool on `dev`. Fails fast on OOM -> caller falls back eager.
     /// `batch` parameterizes all per-token slots as `[batch, dim]`. `batch=1`
     /// preserves the original single-token shape.
@@ -1176,10 +1415,12 @@ impl DecodeGraphBuffers {
             num_layers,
             max_ctx,
             batch,
+            max_batch: batch,
             layer_devices: match layer_devices {
                 Some(ds) => ds.to_vec(),
                 None => vec![dev.ordinal; num_layers],
             },
+            recurrent_ckpt: None,
             boundary_out: Self::build_boundary_out(layer_devices, batch, hid, &dt)?,
         })
     }
@@ -1947,7 +2188,7 @@ impl DecodeGraphBuffers {
                     .map_err(|e| {
                         Error::Backend(format!("seed_kv_arena: P2P copy V failed: {e}"))
                     })?;
-                } else {
+                } else if dst_k as *const c_void != src_k || dst_v as *const c_void != src_v {
                     let res: crate::HipErrorT = unsafe {
                         crate::hipMemcpyAsync(
                             dst_k,
@@ -2151,8 +2392,42 @@ impl DecodeGraphBuffers {
                 .ok_or_else(|| Error::Backend("seed_gdl_state: no dst ptr".into()))?
                 as *mut c_void;
             let src_ptr = state_ptr as *const c_void;
-            let res: crate::HipErrorT = unsafe {
-                crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+            let res: crate::HipErrorT = if std::env::var("GRIM_LINK_COPY_16B").ok().as_deref()
+                == Some("1")
+                && bytes % 16 == 0
+                && bytes > 0
+            {
+                let dev = crate::RocmDevice::shared(0);
+                let mut d_ptr = dst as u64;
+                let mut s_ptr = src_ptr as u64;
+                let mut n_u4 = (bytes / 16) as u64;
+                let grid = crate::HipDim3::new(1, 1, 1);
+                let block = crate::HipDim3::new(128, 1, 1);
+                if dev
+                    .launch_compute_kernel_on_stream(
+                        "grim_copy_link_16b",
+                        grid,
+                        block,
+                        &mut [
+                            crate::arg(&mut d_ptr),
+                            crate::arg(&mut s_ptr),
+                            crate::arg(&mut n_u4),
+                        ],
+                        stream,
+                        0,
+                    )
+                    .is_ok()
+                {
+                    crate::hipSuccess
+                } else {
+                    unsafe {
+                        crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+                    }
+                }
+            } else {
+                unsafe {
+                    crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+                }
             };
             if res != crate::hipSuccess {
                 return Err(Error::Backend(format!(
@@ -2252,8 +2527,42 @@ impl DecodeGraphBuffers {
                 .ok_or_else(|| Error::Backend("seed_kda_state: no dst ptr".into()))?
                 as *mut c_void;
             let src_ptr = state_ptr as *const c_void;
-            let res: crate::HipErrorT = unsafe {
-                crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+            let res: crate::HipErrorT = if std::env::var("GRIM_LINK_COPY_16B").ok().as_deref()
+                == Some("1")
+                && bytes % 16 == 0
+                && bytes > 0
+            {
+                let dev = crate::RocmDevice::shared(0);
+                let mut d_ptr = dst as u64;
+                let mut s_ptr = src_ptr as u64;
+                let mut n_u4 = (bytes / 16) as u64;
+                let grid = crate::HipDim3::new(1, 1, 1);
+                let block = crate::HipDim3::new(128, 1, 1);
+                if dev
+                    .launch_compute_kernel_on_stream(
+                        "grim_copy_link_16b",
+                        grid,
+                        block,
+                        &mut [
+                            crate::arg(&mut d_ptr),
+                            crate::arg(&mut s_ptr),
+                            crate::arg(&mut n_u4),
+                        ],
+                        stream,
+                        0,
+                    )
+                    .is_ok()
+                {
+                    crate::hipSuccess
+                } else {
+                    unsafe {
+                        crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+                    }
+                }
+            } else {
+                unsafe {
+                    crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+                }
             };
             if res != crate::hipSuccess {
                 return Err(Error::Backend(format!(
@@ -2485,6 +2794,8 @@ pub struct DecodeGraph {
     /// segment; `abort_capture` ends whichever segment is open;
     /// `replay()` delegates to `replay_chain()`.
     pub segments: Vec<GraphSegment>,
+    /// Per-batch cached `GraphSegment` chains sharing `self.buffers` (zero extra VRAM, zero state desync).
+    pub segments_by_batch: std::collections::HashMap<usize, Vec<GraphSegment>>,
     /// One event PER BOUNDARY (index = producing segment ordinal), each
     /// created under a DeviceGuard on the producing device. Task A4.
     pub boundary_evs: Vec<*mut std::ffi::c_void>,
@@ -2557,6 +2868,47 @@ pub fn emit_node_into(
 }
 
 impl DecodeGraph {
+    /// Save the currently active graph/segments under `batch` so another batch size can be
+    /// captured/replayed over the exact same `self.buffers`.
+    pub fn save_segments_for_batch(&mut self, batch: usize) {
+        if !self.is_captured {
+            return;
+        }
+        if !self.segments.is_empty() {
+            let segs = std::mem::take(&mut self.segments);
+            self.segments_by_batch.insert(batch, segs);
+        } else if !self.exec.is_null() {
+            let seg = GraphSegment {
+                device: self.ordinal,
+                layers: 0..self.buffers.num_layers,
+                graph: self.graph,
+                exec: self.exec,
+                stream: self.stream,
+            };
+            self.graph = std::ptr::null_mut();
+            self.exec = std::ptr::null_mut();
+            self.segments_by_batch.insert(batch, vec![seg]);
+        }
+        self.is_captured = false;
+    }
+
+    /// Restore a previously captured graph/segments chain for `batch` over `self.buffers`.
+    pub fn load_segments_for_batch(&mut self, batch: usize) -> bool {
+        if let Some(mut segs) = self.segments_by_batch.remove(&batch) {
+            if segs.len() == 1 && self.segments.is_empty() && self.exec.is_null() {
+                let s = segs.remove(0);
+                self.graph = s.graph;
+                self.exec = s.exec;
+            } else {
+                self.segments = segs;
+            }
+            self.buffers.set_active_batch(batch);
+            self.is_captured = true;
+            true
+        } else {
+            false
+        }
+    }
     pub fn new(dev: &RocmDevice, buffers: DecodeGraphBuffers, stream: *mut c_void) -> Self {
         Self {
             graph: std::ptr::null_mut(),
@@ -2567,6 +2919,7 @@ impl DecodeGraph {
             capturing: false,
             kv_append_node: std::ptr::null_mut(),
             segments: Vec::new(),
+            segments_by_batch: std::collections::HashMap::new(),
             boundary_evs: Vec::new(),
             emitter: if std::env::var("GRIM_EMIT_TASK_GRAPH").is_ok() {
                 Some(crate::task_graph::TaskGraphBuilder::new())

@@ -2100,6 +2100,11 @@ pub struct Qwen35Nextn {
     pub enorm: RmsNorm,
     pub hnorm: RmsNorm,
     pub shared_head_norm: RmsNorm,
+    /// Reusable KV cache and per-row position log so `predict_nextn_draft` persists
+    /// full-attention context across decode steps and rolls back tentative rows in-place.
+    pub cache: std::sync::Mutex<(Option<Qwen35LayerCache>, Vec<u32>)>,
+    /// Optional captured HIP graph for `forward_step` (Lever 3: eliminates eager launch overhead).
+    pub(crate) graph: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl Qwen35Nextn {
@@ -2131,6 +2136,8 @@ impl Qwen35Nextn {
             enorm,
             hnorm,
             shared_head_norm,
+            cache: std::sync::Mutex::new((None, Vec::new())),
+            graph: std::sync::Mutex::new(None),
         })
     }
 
@@ -2582,6 +2589,10 @@ impl SessionT for Qwen35Session {
     fn set_skip_output_projection(&mut self, skip: bool) { self.inner.set_skip_output_projection(skip) }
     fn full_output_logits(&self) -> bool { self.inner.full_output_logits() }
     fn set_full_output_logits(&mut self, full: bool) { self.inner.set_full_output_logits(full) }
+    fn sampling_greedy(&self) -> bool { self.inner.sampling_greedy() }
+    fn set_sampling_greedy(&mut self, greedy: bool) { self.inner.set_sampling_greedy(greedy) }
+    fn last_sampled_token(&self) -> Option<u32> { self.inner.last_sampled_token() }
+    fn set_last_sampled_token(&mut self, tok: Option<u32>) { self.inner.set_last_sampled_token(tok) }
 
     fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
         let Some(state) = self.inner.model_state() else {
@@ -2651,7 +2662,15 @@ impl Qwen35 {
 
     /// M1: native MTP depth supported by this model instance (currently 1 nextn block).
     pub fn mtp_depth(&self) -> usize {
-        if self.nextn.is_some() { 1 } else { 0 }
+        if self.nextn.is_some() {
+            std::env::var("GRIM_MTP_DEPTH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&d| d >= 1)
+                .unwrap_or(1)
+        } else {
+            0
+        }
     }
 
     /// M1: create a fresh cache for the nextn block (own KV layer/state).
@@ -2666,28 +2685,33 @@ impl Qwen35 {
             .forward(&[token_id], 1, self.cfg.hidden_size)?)
     }
 
-    /// M1: argmax of the last vocab row of logits (device-first where supported).
-    pub fn argmax_last_logits(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+    /// M1: argmax of a specific vocab row of logits (device-first where supported).
+    pub fn argmax_logits_row(logits: &Tensor, row: usize, vocab_size: usize) -> Result<u32> {
         if vocab_size == 0 {
             return Err(grim_core::error::Error::Backend(
                 "argmax over empty vocabulary".into(),
             ));
         }
         let total = logits.shape().elem_count();
-        if total == 0 || total < vocab_size {
+        let offset = row * vocab_size;
+        if offset + vocab_size > total {
             return Err(grim_core::error::Error::Backend(format!(
-                "argmax_last_logits: logits has {total} elements, vocab {vocab_size}"
+                "argmax_logits_row: row {row} out of bounds (total={total}, vocab={vocab_size})"
             )));
         }
-        let rows = total / vocab_size;
         let dev = grim_nn::modules::pick_device_for_storage_device(logits.device());
+        if offset == 0 && total == vocab_size {
+            if let Ok(idx) = dev.argmax(logits.storage().as_ref()) {
+                return Ok(idx);
+            }
+        }
         if let Ok(scratch) = dev.alloc_storage(&Shape::new(vec![1, vocab_size]), DType::F32) {
             if dev
                 .copy_slice_range(
                     scratch.as_ref(),
                     0,
                     logits.storage().as_ref(),
-                    (rows - 1) * vocab_size,
+                    offset,
                     vocab_size,
                 )
                 .is_ok()
@@ -2698,16 +2722,69 @@ impl Qwen35 {
             }
         }
         let all = logits.to_vec_f32()?;
-        let offset = all.len().saturating_sub(vocab_size);
         let mut best_idx = 0usize;
         let mut best_val = f32::NEG_INFINITY;
-        for (i, &v) in all[offset..].iter().enumerate() {
+        for (i, &v) in all[offset..offset + vocab_size].iter().enumerate() {
             if v > best_val {
                 best_val = v;
                 best_idx = i;
             }
         }
         Ok(best_idx as u32)
+    }
+
+    /// Slice `[start_row .. start_row + num_rows, vocab_size]` on-device without D2H copy.
+    pub fn slice_logits_rows(
+        logits: &Tensor,
+        start_row: usize,
+        num_rows: usize,
+        vocab_size: usize,
+    ) -> Result<Tensor> {
+        let total = logits.shape().elem_count();
+        let start = start_row * vocab_size;
+        let count = num_rows * vocab_size;
+        if start + count > total {
+            return Err(grim_core::error::Error::Config(format!(
+                "slice_logits_rows: slice [{start}..{}] out of bounds (total={total})",
+                start + count
+            )));
+        }
+        if start == 0 && count == total {
+            return Ok(logits.clone());
+        }
+        let dev = grim_nn::modules::pick_device_for_storage_device(logits.device());
+        let shape = Shape::new(vec![num_rows, vocab_size]);
+        if let Ok(dst) = dev.alloc_storage(&shape, DType::F32) {
+            if dev
+                .copy_slice_range(dst.as_ref(), 0, logits.storage().as_ref(), start, count)
+                .is_ok()
+            {
+                return Ok(Tensor::new(
+                    std::sync::Arc::from(dst),
+                    shape,
+                    DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    logits.device().clone(),
+                ));
+            }
+        }
+        let all = logits.to_vec_f32()?;
+        Ok(grim_backend_cpu::cpu_tensor(
+            all[start..start + count].to_vec(),
+            shape,
+        ))
+    }
+
+    /// M1: argmax of the last vocab row of logits (device-first where supported).
+    pub fn argmax_last_logits(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+        let total = logits.shape().elem_count();
+        if vocab_size == 0 || total < vocab_size {
+            return Err(grim_core::error::Error::Backend(format!(
+                "argmax_last_logits: logits has {total} elements, vocab {vocab_size}"
+            )));
+        }
+        let rows = total / vocab_size;
+        Self::argmax_logits_row(logits, rows - 1, vocab_size)
     }
 
     /// M1: device draft step using the loaded nextn block.
@@ -2727,6 +2804,19 @@ impl Qwen35 {
         let nextn = self.nextn.as_ref().ok_or_else(|| {
             grim_core::error::Error::Backend("draft_nextn_one: no nextn block loaded".into())
         })?;
+        {
+            let use_graph = matches!(
+                std::env::var("GRIM_MTP_NEXTN_GRAPH").as_deref(),
+                Ok("1" | "true" | "on")
+            );
+            if use_graph {
+                if let Ok(Some(res)) =
+                    self.draft_nextn_one_graph(nextn, token_id, h_prev, position, nextn_cache)
+                {
+                    return Ok(res);
+                }
+            }
+        }
         let embed = self.embed_token(token_id)?;
         let (block_hidden, logits) =
             nextn.forward_step(&embed, h_prev, position, nextn_cache, &self.output)?;
@@ -2754,17 +2844,49 @@ impl Qwen35 {
         if depth == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
-        let mut cache = self.new_nextn_cache().ok_or_else(|| {
+        let nextn = self.nextn.as_ref().ok_or_else(|| {
             grim_core::error::Error::Backend("predict_nextn_draft: no nextn block loaded".into())
         })?;
+        let mut cache_guard = nextn.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (ref mut cache_opt, ref mut pos_log) = *cache_guard;
+        let cache = cache_opt.get_or_insert_with(|| Qwen35LayerCache::new(&self.cfg));
+        let persist_kv = !matches!(
+            std::env::var("GRIM_MTP_NEXTN_KV_PERSIST").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if !persist_kv || bonus_pos == 0 {
+            cache.current_pos = 0;
+            pos_log.clear();
+        } else {
+            let valid_len = pos_log.iter().take_while(|&&p| p < bonus_pos).count();
+            pos_log.truncate(valid_len);
+            cache.current_pos = valid_len;
+        }
         let mut tokens = Vec::with_capacity(depth);
         let mut logits_vec = Vec::with_capacity(depth);
         let mut curr_tok = bonus_token;
         let mut curr_h = h_prev.clone();
+        let min_conf: f32 = std::env::var("GRIM_MTP_MIN_CONF")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
         for i in 0..depth {
             let pos = bonus_pos.saturating_add(i as u32);
             let (tok, logits, h_next) =
-                self.draft_nextn_one(curr_tok, &curr_h, pos, &mut cache)?;
+                self.draft_nextn_one(curr_tok, &curr_h, pos, cache)?;
+            pos_log.push(pos);
+            if i > 0 && min_conf > 0.0 {
+                if let Ok(v) = logits.to_vec_f32() {
+                    if !v.is_empty() {
+                        let max_v = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let sum_exp: f32 = v.iter().map(|&x| (x - max_v).exp()).sum();
+                        let p_max = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+                        if p_max < min_conf {
+                            break;
+                        }
+                    }
+                }
+            }
             tokens.push(tok);
             logits_vec.push(logits);
             curr_tok = tok;
@@ -7680,7 +7802,68 @@ fn plan_layer_devices(
         );
         return Ok(vec![devices[best].clone(); num_layers]);
     }
-    let (targets, unplaced) = assign_by_headroom(&layer_cost, &mut remaining, &caps);
+    // Bandwidth-weighted split for asymmetric multi-GPU setups (e.g. gfx1201 640 GB/s + gfx1200 320 GB/s):
+    // when both cards have ample VRAM, weight layers by memory bandwidth (within a safe ~3.5 GiB
+    // headroom floor for M=2 DecodeGraph + u4 lane prewarm) so the faster card doesn't sit idle
+    // waiting on the slower card. Opt-out via GRIM_BW_PLACEMENT=0.
+    let bw_opt_out = matches!(
+        std::env::var("GRIM_BW_PLACEMENT").as_deref(),
+        Ok("0" | "false" | "off")
+    );
+    let (targets, unplaced) = if !bw_opt_out && devices.len() == 2 {
+        let bw_for = |d: &Device| -> f64 {
+            match d {
+                Device::Rocm(ord) => {
+                    let t = grim_backend_rocm::RocmDevice::shared(*ord)
+                        .gpu_target_str()
+                        .to_ascii_lowercase();
+                    if t.contains("gfx1201") || t.contains("gfx1100") || t.contains("gfx942") {
+                        640.0
+                    } else if t.contains("gfx1200") || t.contains("gfx1101") || t.contains("gfx1102") {
+                        320.0
+                    } else {
+                        400.0
+                    }
+                }
+                _ => 400.0,
+            }
+        };
+        let bw0 = bw_for(&devices[0]);
+        let bw1 = bw_for(&devices[1]);
+        if (bw0 - bw1).abs() > 1.0 {
+            let total_bw = bw0 + bw1;
+            // Shift +4 layers toward the faster card when output+nextn sit on dev1.
+            let ideal0 = (((num_layers as f64) * (bw0 / total_bw)).round() as usize + 4)
+                .min(num_layers.saturating_sub(1));
+            // `remaining[0]` already deducted token_embd and a full max-ctx KV reserve;
+            // allow up to `ideal0` layers on dev0 as long as dev0's total weight footprint
+            // leaves >= 3.5 GiB of live free VRAM for u4 prewarm + M=2 DecodeGraph.
+            let budget0 = remaining[0].saturating_add(5_200_000_000);
+            let mut acc0 = 0u64;
+            let mut fit0 = 0usize;
+            for &c in &layer_cost {
+                if fit0 < ideal0 && acc0.saturating_add(c) <= budget0 {
+                    acc0 += c;
+                    fit0 += 1;
+                } else {
+                    break;
+                }
+            }
+            if fit0 > 0 && fit0 < num_layers {
+                let mut t = Vec::with_capacity(num_layers);
+                for i in 0..num_layers {
+                    t.push(if i < fit0 { 0 } else { 1 });
+                }
+                (t, 0usize)
+            } else {
+                assign_by_headroom(&layer_cost, &mut remaining, &caps)
+            }
+        } else {
+            assign_by_headroom(&layer_cost, &mut remaining, &caps)
+        }
+    } else {
+        assign_by_headroom(&layer_cost, &mut remaining, &caps)
+    };
     for t in targets {
         assignment.push(devices[t].clone());
     }
