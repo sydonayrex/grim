@@ -214,6 +214,7 @@ pub mod qwen35moe;
 pub mod qwen3moe;
 pub mod qwen3next;
 pub mod qwen3vl;
+pub mod qwen4exp_baseline_probe;
 pub mod qwen4exp_flash_next;
 pub mod qwen4exp_gdn;
 pub mod qwen4exp_qsa;

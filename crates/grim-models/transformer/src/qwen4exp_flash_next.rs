@@ -1,6 +1,7 @@
 //! Qwen3.8-Flash-Next architecture with Hybrid Gated DeltaNet + QSA Attention, Gated Residual streams, N-gram embeddings, and 512 Fine-Grained Routed Experts.
 //! # Architecture Details - **Hybrid Attention**: Interleaved 3:1 Gated DeltaNet (GDN) linear attention and Qwen.
 
+use crate::qwen4exp_baseline_probe::{self as probe, ProbeStage};
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::hyperparams::MetadataLookup;
@@ -697,16 +698,32 @@ impl Qwen38MoeBlock {
                     cache.clear();
                 }
                 let triple = match &self.experts {
-                    Qwen38MoeExperts::Individual(list) => Some((
-                        list[idx].gate_proj.staged_to(&target)?,
-                        list[idx].up_proj.staged_to(&target)?,
-                        list[idx].down_proj.staged_to(&target)?,
-                    )),
-                    Qwen38MoeExperts::Bank(bank) => Some((
-                        bank.gate[idx].staged_to(&target)?,
-                        bank.up[idx].staged_to(&target)?,
-                        bank.down[idx].staged_to(&target)?,
-                    )),
+                    Qwen38MoeExperts::Individual(list) => {
+                        if target != Device::Cpu {
+                            let bytes = list[idx].gate_proj.weight.dtype().expected_bytes(list[idx].gate_proj.weight.shape().elem_count())
+                                + list[idx].up_proj.weight.dtype().expected_bytes(list[idx].up_proj.weight.shape().elem_count())
+                                + list[idx].down_proj.weight.dtype().expected_bytes(list[idx].down_proj.weight.shape().elem_count());
+                            probe::record_h2d(ProbeStage::ExpertStage, bytes);
+                        }
+                        Some((
+                            list[idx].gate_proj.staged_to(&target)?,
+                            list[idx].up_proj.staged_to(&target)?,
+                            list[idx].down_proj.staged_to(&target)?,
+                        ))
+                    }
+                    Qwen38MoeExperts::Bank(bank) => {
+                        if target != Device::Cpu {
+                            let bytes = bank.gate[idx].weight.dtype().expected_bytes(bank.gate[idx].weight.shape().elem_count())
+                                + bank.up[idx].weight.dtype().expected_bytes(bank.up[idx].weight.shape().elem_count())
+                                + bank.down[idx].weight.dtype().expected_bytes(bank.down[idx].weight.shape().elem_count());
+                            probe::record_h2d(ProbeStage::ExpertStage, bytes);
+                        }
+                        Some((
+                            bank.gate[idx].staged_to(&target)?,
+                            bank.up[idx].staged_to(&target)?,
+                            bank.down[idx].staged_to(&target)?,
+                        ))
+                    }
                     Qwen38MoeExperts::Offloaded(off) => {
                         let t = off.get(idx, &target)?;
                         Some(t)
@@ -757,7 +774,6 @@ impl Qwen38MoeBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let router_logits = self.gate.forward(x)?;
         let dims = x.shape().dims();
         let hidden_dim = dims[dims.len() - 1];
         let seq_len = x.shape().elem_count() / hidden_dim;
@@ -768,99 +784,129 @@ impl Qwen38MoeBlock {
             Qwen38MoeExperts::Offloaded(_) => self.gate.weight.shape().dims()[0],
         };
 
-        let logits_vec = router_logits.to_vec_f32()?;
+        let logits_vec = probe::span(ProbeStage::Router, || -> Result<Vec<f32>> {
+            let router_logits = self.gate.forward(x)?;
+            let v = router_logits.to_vec_f32()?;
+            if !x.device().is_cpu() {
+                probe::record_d2h(ProbeStage::Router, v.len() * std::mem::size_of::<f32>());
+            }
+            Ok(v)
+        })?;
 
         if x.device() != &Device::Cpu && seq_len == 1 {
-            let row = &logits_vec[0..num_exp];
-            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let k = self.num_experts_per_tok.min(num_exp);
-            let topk = &indexed[..k];
+            let (topk_ids, weights) = probe::span(ProbeStage::Router, || {
+                let row = &logits_vec[0..num_exp];
+                let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let k = self.num_experts_per_tok.min(num_exp);
+                let topk = &indexed[..k];
 
-            let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
-            let weights: Vec<f32> = topk
-                .iter()
-                .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
-                .collect();
+                let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
+                let weights: Vec<f32> = topk
+                    .iter()
+                    .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
+                    .collect();
+                let ids: Vec<usize> = topk.iter().map(|(id, _)| *id).collect();
+                (ids, weights)
+            });
 
-            let mut acc: Option<Tensor> = if self.shared_expert.is_some() {
-                Some(self.forward_shared(x)?)
-            } else {
-                None
-            };
+            return probe::span(ProbeStage::ExpertStage, || -> Result<Tensor> {
+                let mut acc: Option<Tensor> = if self.shared_expert.is_some() {
+                    Some(self.forward_shared(x)?)
+                } else {
+                    None
+                };
 
-            for (i, (exp_idx, _)) in topk.iter().enumerate() {
-                let w = weights[i];
-                let exp_out = self.forward_expert(*exp_idx, x)?;
-                acc = Some(match acc {
-                    Some(a) => grim_nn::modules::axpy_on_device(&a, w, &exp_out)?,
-                    None => {
-                        let dev = grim_nn::modules::pick_device_for_tensor(&exp_out);
-                        let (scaled_st, _) =
-                            dev.mul_scalar(&**exp_out.storage(), w, exp_out.shape())?;
-                        Tensor::new(
-                            std::sync::Arc::from(scaled_st),
-                            exp_out.shape().clone(),
-                            exp_out.dtype(),
-                            grim_tensor::dtype::QuantProvenance::default(),
-                            exp_out.device().clone(),
-                        )
-                    }
-                });
-            }
+                for (i, exp_idx) in topk_ids.iter().enumerate() {
+                    let w = weights[i];
+                    let exp_out = self.forward_expert(*exp_idx, x)?;
+                    acc = Some(match acc {
+                        Some(a) => grim_nn::modules::axpy_on_device(&a, w, &exp_out)?,
+                        None => {
+                            let dev = grim_nn::modules::pick_device_for_tensor(&exp_out);
+                            let (scaled_st, _) =
+                                dev.mul_scalar(&**exp_out.storage(), w, exp_out.shape())?;
+                            Tensor::new(
+                                std::sync::Arc::from(scaled_st),
+                                exp_out.shape().clone(),
+                                exp_out.dtype(),
+                                grim_tensor::dtype::QuantProvenance::default(),
+                                exp_out.device().clone(),
+                            )
+                        }
+                    });
+                }
 
-            if let Some(out) = acc {
-                return Ok(out);
-            }
-            return Ok(x.clone());
+                if let Some(out) = acc {
+                    return Ok(out);
+                }
+                Ok(x.clone())
+            });
         }
 
         let x_vec = x.to_vec_f32()?;
+        if !x.device().is_cpu() {
+            probe::record_d2h(ProbeStage::ExpertStage, x_vec.len() * std::mem::size_of::<f32>());
+        }
         let mut out_vec = vec![0.0f32; x_vec.len()];
 
         for s in 0..seq_len {
-            let row = &logits_vec[s * num_exp..(s + 1) * num_exp];
-            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let k = self.num_experts_per_tok.min(num_exp);
-            let topk = &indexed[..k];
+            let (topk_ids, weights) = probe::span(ProbeStage::Router, || {
+                let row = &logits_vec[s * num_exp..(s + 1) * num_exp];
+                let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let k = self.num_experts_per_tok.min(num_exp);
+                let topk = &indexed[..k];
 
-            let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
-            let weights: Vec<f32> = topk
-                .iter()
-                .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
-                .collect();
+                let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
+                let weights: Vec<f32> = topk
+                    .iter()
+                    .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
+                    .collect();
+                let ids: Vec<usize> = topk.iter().map(|(id, _)| *id).collect();
+                (ids, weights)
+            });
 
-            // The per-token slice is staged on the host, so it has to be put
-            // back on the model's device: the expert Linears are device matmuls
-            // and reject host storage with "matmul: input b is not
-            // RocmStorage". On the CPU this is a no-op clone.
-            let token_host = cpu_tensor(
-                x_vec[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
-                Shape::new(vec![1, hidden_dim]),
-            );
-            let token_x = if x.device().is_cpu() {
-                token_host
-            } else {
-                grim_nn::modules::move_to_device(&token_host, x.device())?
-            };
+            probe::span(ProbeStage::ExpertStage, || -> Result<()> {
+                // The per-token slice is staged on the host, so it has to be put
+                // back on the model's device: the expert Linears are device matmuls
+                // and reject host storage with "matmul: input b is not
+                // RocmStorage". On the CPU this is a no-op clone.
+                let token_host = cpu_tensor(
+                    x_vec[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
+                    Shape::new(vec![1, hidden_dim]),
+                );
+                let token_x = if x.device().is_cpu() {
+                    token_host
+                } else {
+                    probe::record_h2d(ProbeStage::ExpertStage, hidden_dim * std::mem::size_of::<f32>());
+                    grim_nn::modules::move_to_device(&token_host, x.device())?
+                };
 
-            for (i, (exp_idx, _)) in topk.iter().enumerate() {
-                let w = weights[i];
-                let exp_out = self.forward_expert(*exp_idx, &token_x)?.to_vec_f32()?;
-                for d in 0..hidden_dim {
-                    out_vec[s * hidden_dim + d] += w * exp_out[d];
+                for (i, exp_idx) in topk_ids.iter().enumerate() {
+                    let w = weights[i];
+                    let exp_out = self.forward_expert(*exp_idx, &token_x)?.to_vec_f32()?;
+                    if !x.device().is_cpu() {
+                        probe::record_d2h(ProbeStage::ExpertStage, exp_out.len() * std::mem::size_of::<f32>());
+                    }
+                    for d in 0..hidden_dim {
+                        out_vec[s * hidden_dim + d] += w * exp_out[d];
+                    }
                 }
-            }
 
-            if self.shared_expert.is_some() {
-                let shared_out = self.forward_shared(&token_x)?.to_vec_f32()?;
-                for d in 0..hidden_dim {
-                    out_vec[s * hidden_dim + d] += shared_out[d];
+                if self.shared_expert.is_some() {
+                    let shared_out = self.forward_shared(&token_x)?.to_vec_f32()?;
+                    if !x.device().is_cpu() {
+                        probe::record_d2h(ProbeStage::ExpertStage, shared_out.len() * std::mem::size_of::<f32>());
+                    }
+                    for d in 0..hidden_dim {
+                        out_vec[s * hidden_dim + d] += shared_out[d];
+                    }
                 }
-            }
+                Ok(())
+            })?;
         }
 
         // The multi-token path accumulates on the host, so the result is host
@@ -870,6 +916,7 @@ impl Qwen38MoeBlock {
         if x.device().is_cpu() {
             Ok(out_host)
         } else {
+            probe::record_h2d(ProbeStage::ExpertStage, out_host.shape().elem_count() * std::mem::size_of::<f32>());
             Ok(grim_nn::modules::move_to_device(&out_host, x.device())?)
         }
     }
@@ -1282,6 +1329,7 @@ impl Qwen38FlashNextBlock {
                 let (n_v_heads, n_k_heads, head_dim, conv_dim) =
                     (*n_v_heads, *n_k_heads, *head_dim, *conv_dim);
                 let pairing = *pairing;
+                probe::span(ProbeStage::Gdn, || -> Result<Tensor> {
                 // 1. Fused qkv projection, then the depthwise causal conv over
                 //    the whole [K K V] stream. The conv history lives in the
                 //    cache so it survives across decode steps.
@@ -1317,8 +1365,12 @@ impl Qwen38FlashNextBlock {
                              expected {conv_dim} (key_dim*2 + value_dim)"
                         )));
                     }
+                    let qkv_host = qkv.to_vec_f32()?;
+                    if !qkv.device().is_cpu() {
+                        probe::record_d2h(ProbeStage::Gdn, qkv_host.len() * std::mem::size_of::<f32>());
+                    }
                     let qkv_b1 = cpu_tensor(
-                        qkv.to_vec_f32()?,
+                        qkv_host,
                         grim_tensor::Shape::new(vec![1, qkv_seq, qkv_chan]),
                     );
                     // short_conv1d is a HOST reference op: it reads its
@@ -1330,6 +1382,7 @@ impl Qwen38FlashNextBlock {
                         ssm_conv1d.weight.clone()
                     } else {
                         let w = ssm_conv1d.weight.to_vec_f32()?;
+                        probe::record_d2h(ProbeStage::Gdn, w.len() * std::mem::size_of::<f32>());
                         let shape = ssm_conv1d.weight.shape().clone();
                         cpu_tensor(w, shape)
                     };
@@ -1351,6 +1404,10 @@ impl Qwen38FlashNextBlock {
                 //    the recurrence), beta raw (sigmoid inside).
                 let alpha_raw = ssm_alpha.forward(&branch_attn)?.to_vec_f32()?;
                 let beta_raw = ssm_beta.forward(&branch_attn)?.to_vec_f32()?;
+                if !branch_attn.device().is_cpu() {
+                    probe::record_d2h(ProbeStage::Gdn, alpha_raw.len() * std::mem::size_of::<f32>());
+                    probe::record_d2h(ProbeStage::Gdn, beta_raw.len() * std::mem::size_of::<f32>());
+                }
                 let a_vec: Vec<f32> = host_f32(&ssm_a)?;
                 let dt_vec: Vec<f32> = host_f32(&ssm_dt)?;
                 // ssm_norm is an RmsNorm over the 128-wide state channel, but
@@ -1360,6 +1417,9 @@ impl Qwen38FlashNextBlock {
                 // directly rather than running the norm, which would subtract
                 // a mean the recurrence does not.
                 let ssm_norm_weight: Vec<f32> = host_f32(&ssm_norm.weight)?;
+                if !ssm_norm.weight.device().is_cpu() {
+                    probe::record_d2h(ProbeStage::Gdn, ssm_norm_weight.len() * std::mem::size_of::<f32>());
+                }
 
                 // 3. The recurrence itself, over the [seq] axis in order.
                 let value_dim = n_v_heads * head_dim;
@@ -1397,6 +1457,9 @@ impl Qwen38FlashNextBlock {
                 // back to the model's device for `ssm_out`.
                 let gate = attn_gate.forward(&branch_attn)?;
                 let gate_host = host_f32(&gate)?;
+                if !gate.device().is_cpu() {
+                    probe::record_d2h(ProbeStage::Gdn, gate_host.len() * std::mem::size_of::<f32>());
+                }
                 let gated: Vec<f32> = gdn_out
                     .iter()
                     .zip(gate_host.iter())
@@ -1405,12 +1468,14 @@ impl Qwen38FlashNextBlock {
                 let gated_t = if branch_attn.device().is_cpu() {
                     cpu_tensor(gated, grim_tensor::Shape::new(vec![seq_len, value_dim]))
                 } else {
+                    probe::record_h2d(ProbeStage::Gdn, gated.len() * std::mem::size_of::<f32>());
                     grim_nn::modules::move_to_device(
                         &cpu_tensor(gated, grim_tensor::Shape::new(vec![seq_len, value_dim])),
                         branch_attn.device(),
                     )?
                 };
-                ssm_out.forward(&gated_t)?
+                Ok(ssm_out.forward(&gated_t)?)
+                })?
             }
             Qwen38Attention::Full {
                 wq,
@@ -1429,6 +1494,7 @@ impl Qwen38FlashNextBlock {
                 head_dim,
                 wqkv_q80_fused,
             } => {
+                probe::span(ProbeStage::Qsa, || -> Result<Tensor> {
                 let (mut q, mut k, v) = match wqkv_q80_fused.as_ref() {
                     Some(fused) if seq_len == 1 => {
                         crate::shared_attention::fused_qkv_project_raw(&branch_attn, fused)?
@@ -1532,6 +1598,9 @@ impl Qwen38FlashNextBlock {
                             .expect("qsa_geometry implies an indexer")
                             .forward(&branch_attn)?
                             .to_vec_f32()?;
+                        if !branch_attn.device().is_cpu() {
+                            probe::record_d2h(ProbeStage::Qsa, k_new.len() * std::mem::size_of::<f32>());
+                        }
                         let idx_dim = qcfg.idx_dim;
                         // `qsa_keys` is this layer's flat raw-key history.
                         qsa_keys.extend_from_slice(&k_new);
@@ -1567,9 +1636,15 @@ impl Qwen38FlashNextBlock {
                             .expect("qsa_geometry implies an indexer")
                             .forward(&branch_attn)?
                             .to_vec_f32()?;
+                        if !branch_attn.device().is_cpu() {
+                            probe::record_d2h(ProbeStage::Qsa, q_idx.len() * std::mem::size_of::<f32>());
+                        }
                         let mut q_normed = q_idx.clone();
                         if let Some(n) = indexer_q_norm.as_ref() {
                             let w = n.weight.to_vec_f32()?;
+                            if !n.weight.device().is_cpu() {
+                                probe::record_d2h(ProbeStage::Qsa, w.len() * std::mem::size_of::<f32>());
+                            }
                             crate::qwen4exp_qsa::rms_norm_rows(
                                 &mut q_normed,
                                 qcfg.n_idx_h * idx_dim,
@@ -1584,6 +1659,9 @@ impl Qwen38FlashNextBlock {
                             layout.pooled(&keys, n_kv, idx_dim, qcfg.compress_ratio)?;
                         if let Some(n) = indexer_k_norm.as_ref() {
                             let w = n.weight.to_vec_f32()?;
+                            if !n.weight.device().is_cpu() {
+                                probe::record_d2h(ProbeStage::Qsa, w.len() * std::mem::size_of::<f32>());
+                            }
                             crate::qwen4exp_qsa::rms_norm_rows(
                                 &mut pooled,
                                 idx_dim,
@@ -1628,6 +1706,9 @@ impl Qwen38FlashNextBlock {
                         let sel = crate::qwen4exp_qsa::top_k_cells(&cells, qcfg.select_width(n_kv));
                         let kv_stride = (*num_kv_heads * *head_dim).max(1);
                         let k_elems = k.to_vec_f32()?.len();
+                        if !k.device().is_cpu() {
+                            probe::record_d2h(ProbeStage::Qsa, k_elems * std::mem::size_of::<f32>());
+                        }
                         let kv_len = (k_elems / kv_stride).max(1);
                         let sel = sel.into_iter().filter(|c| *c < kv_len).collect::<Vec<_>>();
                         Some(crate::qwen4exp_qsa::build_top_k_mask(kv_len, &sel, None)?)
@@ -1670,6 +1751,11 @@ impl Qwen38FlashNextBlock {
                         let q_heads = q_rope.to_vec_f32()?;
                         let k_heads = k_rope.to_vec_f32()?;
                         let v_heads = v.to_vec_f32()?;
+                        if !x.device().is_cpu() {
+                            probe::record_d2h(ProbeStage::Qsa, q_heads.len() * std::mem::size_of::<f32>());
+                            probe::record_d2h(ProbeStage::Qsa, k_heads.len() * std::mem::size_of::<f32>());
+                            probe::record_d2h(ProbeStage::Qsa, v_heads.len() * std::mem::size_of::<f32>());
+                        }
                         match qsa_keep.as_ref() {
                             // Sparse: restrict the softmax to the cells the
                             // indexer selected. Only valid when this step's K/V
@@ -1698,6 +1784,7 @@ impl Qwen38FlashNextBlock {
                                 if *x.device() == Device::Cpu {
                                     host
                                 } else {
+                                    probe::record_h2d(ProbeStage::Qsa, host.shape().elem_count() * std::mem::size_of::<f32>());
                                     grim_nn::modules::move_to_device(&host, x.device())?
                                 }
                             }
@@ -1707,21 +1794,27 @@ impl Qwen38FlashNextBlock {
                             // scores per token and masks per token, which needs
                             // the full [n_kv, n_tps] mask this path does not
                             // build.
-                            _ => crate::shared_attention::fused_or_scalar_attention(
-                                &q_heads,
-                                &k_heads,
-                                &v_heads,
-                                *num_heads,
-                                *num_kv_heads,
-                                *head_dim,
-                                seq_len,
-                                None,
-                                x.device(),
-                            )?,
+                            _ => {
+                                if *x.device() != Device::Cpu {
+                                    probe::record_h2d(ProbeStage::Qsa, out_shape.elem_count() * std::mem::size_of::<f32>());
+                                }
+                                crate::shared_attention::fused_or_scalar_attention(
+                                    &q_heads,
+                                    &k_heads,
+                                    &v_heads,
+                                    *num_heads,
+                                    *num_kv_heads,
+                                    *head_dim,
+                                    seq_len,
+                                    None,
+                                    x.device(),
+                                )?
+                            }
                         }
                     }
                 };
-                wo.forward(&attn_tensor)?
+                Ok(wo.forward(&attn_tensor)?)
+                })?
             }
         };
 
@@ -2477,7 +2570,9 @@ impl CausalLm for Qwen38FlashNext {
 
         let normed = self.norm.forward(&h)?;
         session.set_last_hidden_state(normed.clone());
-        Ok(self.output.forward(&normed)?)
+        Ok(probe::span(ProbeStage::LmHead, || {
+            self.output.forward(&normed)
+        })?)
     }
 }
 
