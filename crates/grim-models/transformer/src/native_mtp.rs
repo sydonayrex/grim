@@ -305,6 +305,18 @@ impl MtpDepthProvider for LlamaMtp {
     }
 }
 
+/// Returns `true` when `GRIM_FLASH_MTP` is truthy (`1` or `true`).
+#[inline]
+pub fn flash_mtp_enabled() -> bool {
+    std::env::var("GRIM_FLASH_MTP")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 /// Qwen3.8-Flash-Next model with genuine Multi-Token Prediction (MTP) layers.
 pub struct Qwen38FlashNextMtp {
     pub base: crate::qwen4exp_flash_next::Qwen38FlashNext,
@@ -327,6 +339,24 @@ impl Qwen38FlashNextMtp {
             .map(|_| MtpLayer::random(hidden_size, vocab_size, eps))
             .collect();
         Self { base, mtp_layers }
+    }
+
+    /// Runs a multi-token speculative verification forward (`K + 1` tokens)
+    /// while forcing `session.set_full_output_logits(true)` so Q1a
+    /// (`GRIM_FLASH_LAST_ROW_LMHEAD=1`) never slices away draft-position logits,
+    /// then restores the previous `full_output_logits` flag.
+    pub fn verify_draft_tokens(
+        &self,
+        session: &mut dyn SessionT,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        adapters: &[AdapterHandle],
+    ) -> Result<Tensor> {
+        let prev_full = session.full_output_logits();
+        session.set_full_output_logits(true);
+        let res = self.base.forward(session, input_ids, positions, adapters);
+        session.set_full_output_logits(prev_full);
+        res
     }
 }
 
