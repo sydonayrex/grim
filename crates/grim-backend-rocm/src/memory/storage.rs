@@ -65,6 +65,10 @@ pub struct RocmStorage {
     pub(crate) allocator: Arc<RocmCachingAllocator>,
     /// Managed allocations may migrate between VRAM and host RAM under HIP.
     pub(crate) managed: bool,
+    /// When true, this storage is a non-owning view of another `RocmStorage`'s
+    /// device pointer (e.g. shared per-device decode-graph scratch) and must NOT
+    /// free the pointer on `Drop`.
+    pub(crate) alias: bool,
 }
 
 /// Human-readable label for a ledger entry. Deliberately cheap: it is built
@@ -81,6 +85,22 @@ impl RocmStorage {
 
     pub fn device_ordinal(&self) -> usize {
         self.ordinal
+    }
+
+    /// Create a non-owning alias pointing to the same device memory.
+    /// Caller must ensure the owning `RocmStorage` outlives all aliases.
+    pub(crate) fn non_owning_alias(&self) -> Self {
+        Self {
+            device_ptr: self.device_ptr,
+            bytes: self.bytes,
+            shape: self.shape.clone(),
+            dtype: self.dtype.clone(),
+            provenance: self.provenance.clone(),
+            ordinal: self.ordinal,
+            allocator: Arc::clone(&self.allocator),
+            managed: self.managed,
+            alias: true,
+        }
     }
 
     pub fn device_ptr_is_valid(&self) -> bool {
@@ -157,6 +177,7 @@ impl RocmStorage {
                 ordinal,
                 allocator: Arc::clone(allocator),
                 managed: true,
+            alias: false,
             });
         }
         let dev_ptr_void = match allocator.alloc(bytes) {
@@ -191,6 +212,7 @@ impl RocmStorage {
                         ordinal,
                         allocator: Arc::clone(allocator),
                         managed: true,
+            alias: false,
                     });
                 }
                 return Err(vram_error);
@@ -212,6 +234,7 @@ impl RocmStorage {
             ordinal,
             allocator: Arc::clone(allocator),
             managed: false,
+            alias: false,
         })
     }
 
@@ -465,6 +488,7 @@ impl RocmStorage {
             ordinal,
             allocator: Arc::clone(allocator),
             managed: true,
+            alias: false,
         };
         let result = unsafe {
             hipMemcpy(
@@ -534,6 +558,7 @@ impl RocmStorage {
                 ordinal,
                 allocator: Arc::clone(allocator),
                 managed: true,
+            alias: false,
             });
         }
         let dev_ptr_void = match allocator.alloc(bytes) {
@@ -569,6 +594,7 @@ impl RocmStorage {
                             ordinal,
                             allocator: Arc::clone(allocator),
                             managed: true,
+            alias: false,
                         });
                     }
                     unsafe {
@@ -627,6 +653,7 @@ impl RocmStorage {
             ordinal,
             allocator: Arc::clone(allocator),
             managed: false,
+            alias: false,
         })
     }
 
@@ -651,6 +678,9 @@ impl RocmStorage {
 
 impl Drop for RocmStorage {
     fn drop(&mut self) {
+        if self.alias {
+            return;
+        }
         if let Some(ptr_val) = self.device_ptr {
             // GRIM_ALLOC_AUDIT=1: per-drop provenance for the duplicate-owner
             // hunt — every drop of a 16 KB-class block prints a backtrace so

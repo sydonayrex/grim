@@ -1966,7 +1966,17 @@ pub async fn cmd_run(
         std::env::var("GRIM_PREWARM").as_deref(),
         Ok("0" | "false" | "off")
     );
-    if !prewarm_opt_out {
+    let prewarm_lanes = !prewarm_opt_out
+        && !matches!(
+            std::env::var("GRIM_PREWARM_LANES").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+    let prewarm_kernels = !prewarm_opt_out
+        && !matches!(
+            std::env::var("GRIM_PREWARM_KERNELS").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+    if prewarm_lanes {
         if let Some(gm) = resolve_graph_model_for_prewarm(&*model) {
             let t0 = std::time::Instant::now();
             let r = gm.prewarm_lane_weights();
@@ -1980,6 +1990,8 @@ pub async fn cmd_run(
                 );
             }
         }
+    }
+    if prewarm_kernels {
         // Warm up rocBLAS/hipBLASLt TensileLite heuristics during model load
         // so first-prompt TTFT does not pay MsgPack deserialization cost.
         let mut warm_sess = model.new_session();

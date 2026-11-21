@@ -6373,7 +6373,12 @@ impl Qwen35 {
         }
         let batch = (1 + self.mtp_depth()).max(2);
         let max_batch = batch.max(2);
-        let mut g = self.get_or_create_decode_graph(4096, max_batch)?;
+        let kv_cap = std::env::var("GRIM_KV_CACHE_LEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 64)
+            .unwrap_or(4096);
+        let mut g = self.get_or_create_decode_graph(kv_cap, max_batch)?;
         g.buffers.set_active_batch(batch);
         // Allocate recurrent checkpoint BEFORE M=2 capture so post-row-0 D2D copies are baked into the graph.
         if g.buffers.recurrent_ckpt.is_none() {
@@ -6624,7 +6629,12 @@ impl Qwen35 {
         }
         if graph_slot.is_none() {
             let max_batch = batch.max(self.mtp_depth() + 1).max(2);
-            let mut g = self.get_or_create_decode_graph(4096, max_batch)?;
+            let kv_cap = std::env::var("GRIM_KV_CACHE_LEN")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n >= 64)
+                .unwrap_or(4096);
+            let mut g = self.get_or_create_decode_graph(kv_cap, max_batch)?;
             g.buffers.set_active_batch(batch);
             if g.buffers.recurrent_ckpt.is_none() {
                 g.buffers.recurrent_ckpt = Some(g.buffers.alloc_recurrent_checkpoint()?);
@@ -6859,6 +6869,12 @@ impl DecodeGraphModel for Qwen35 {
         use grim_backend_rocm::RocmStorage;
         use grim_nn::modules::Linear;
         use grim_tensor::Storage;
+        if matches!(
+            std::env::var("GRIM_DECODE_W4A4").as_deref(),
+            Ok("0" | "false" | "off")
+        ) {
+            return Ok(());
+        }
         let _dev = dev_for_qwen35(self)?;
         let mut linears: Vec<&Linear> = Vec::new();
         for b in &self.blocks {
@@ -6898,14 +6914,7 @@ impl DecodeGraphModel for Qwen35 {
             };
             if !matches!(
                 scheme,
-                grim_tensor::KQuantScheme::Q4K
-                    | grim_tensor::KQuantScheme::Q5K
-                    | grim_tensor::KQuantScheme::Q6K
-                    | grim_tensor::KQuantScheme::Q3K
-                    | grim_tensor::KQuantScheme::IQ3S
-                    | grim_tensor::KQuantScheme::Q2K
-                    | grim_tensor::KQuantScheme::IQ4NL
-                    | grim_tensor::KQuantScheme::GsqRco3p5
+                grim_tensor::KQuantScheme::Q4K | grim_tensor::KQuantScheme::GsqRco3p5
             ) {
                 continue;
             }

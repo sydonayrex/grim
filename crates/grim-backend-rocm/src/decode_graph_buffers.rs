@@ -864,6 +864,29 @@ impl DecodeGraphBuffers {
         let nkk = n_k.max(1);
         let nvk = n_v.max(1);
         let inter = intermediate_size.max(1);
+        // Shared per-device activation scratch (llama.cpp ggml compute-buffer
+        // pattern): sequential layers on the same device reuse one scratch
+        // allocation per role, freeing ~1.5+ GiB on large 64L models.
+        // GRIM_GRAPH_SHARED_SCRATCH=0 restores per-layer allocations for A/B.
+        let shared_scratch = !matches!(
+            std::env::var("GRIM_GRAPH_SHARED_SCRATCH").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        fn push_scratch(
+            vec: &mut Vec<RocmStorage>,
+            ord: usize,
+            shared: bool,
+            alloc: impl FnOnce() -> Result<RocmStorage>,
+        ) -> Result<bool> {
+            if shared {
+                if let Some(existing) = vec.iter().find(|s| s.ordinal == ord) {
+                    vec.push(existing.non_owning_alias());
+                    return Ok(false);
+                }
+            }
+            vec.push(alloc()?);
+            Ok(true)
+        }
         for layer_i in 0..num_layers {
             let l_dev = match layer_devices.and_then(|ds| ds.get(layer_i)) {
                 Some(&ord) if ord != dev.ordinal => crate::RocmDevice::shared(ord),
@@ -881,72 +904,94 @@ impl DecodeGraphBuffers {
                 &l_dev.allocator,
                 l_dev.ordinal,
             )?);
-            q_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, nqk]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            k_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, nkk]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            v_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, nvk]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            q_head_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, n_attn_out]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            q_gate_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, n_attn_out]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            attn_out_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, n_attn_out]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            gate_up_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, 2 * inter]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            gate_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, inter]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            up_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, inter]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            activated_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, inter]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            norm_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, hid]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
+            push_scratch(&mut q_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, nqk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut k_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, nkk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut v_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, nvk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut q_head_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, n_attn_out]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut q_gate_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, n_attn_out]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut attn_out_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, n_attn_out]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut gate_up_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, 2 * inter]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut gate_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, inter]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut up_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, inter]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut activated_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, inter]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            let norm_fresh = push_scratch(&mut norm_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, hid]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
             // ZEROED at allocation, like the recurrent state. The norm buffer
             // is a scratch slot, and the FUSED paths (the LFM2's norm-fused
             // Q8_0 projections) never write it — so without this it holds
@@ -954,7 +999,7 @@ impl DecodeGraphBuffers {
             // at different times disagree on it. A scratch slot that a fused
             // path leaves untouched must still start at a KNOWN value, or the
             // model's answer depends on the allocator's history.
-            {
+            if norm_fresh {
                 let last = norm_buf.last().expect("just pushed");
                 let ptr = last
                     .device_ptr_u64()
@@ -973,25 +1018,31 @@ impl DecodeGraphBuffers {
                     return Err(Error::Backend(format!("norm_buf memset: {res}")));
                 }
             }
-            attn_max_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch * num_heads.max(1)]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            attn_sum_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch * num_heads.max(1)]),
-                dt.clone(),
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
-            act_q81_buf.push(RocmStorage::alloc_gpu_with_bytes(
-                &Shape::new(vec![q81_bytes]),
-                q81_dt.clone(),
-                q81_bytes,
-                &l_dev.allocator,
-                l_dev.ordinal,
-            )?);
+            push_scratch(&mut attn_max_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * num_heads.max(1)]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut attn_sum_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * num_heads.max(1)]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
+            push_scratch(&mut act_q81_buf, l_dev.ordinal, shared_scratch, || {
+                RocmStorage::alloc_gpu_with_bytes(
+                    &Shape::new(vec![q81_bytes]),
+                    q81_dt.clone(),
+                    q81_bytes,
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )
+            })?;
             // Padded fp8 act scratch: max row padded to whole 16-row tiles.
             let fp8_pad_bytes = batch * 16 * q81_elems.max(intermediate_size).max(32);
             act_fp8_pad_buf.push(RocmStorage::alloc_gpu_with_bytes(

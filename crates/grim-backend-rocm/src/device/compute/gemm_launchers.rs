@@ -5018,8 +5018,9 @@ impl RocmDevice {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(1024 * 1024 * 1024);
+            .unwrap_or(2048 * 1024 * 1024);
         if budget {
+            let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             let lane_bytes = n * (k / 2) // qweight u4
                 + n * (k / 128) * 2 // scales bf16
                 + n * (k / 128) // zeros u8
