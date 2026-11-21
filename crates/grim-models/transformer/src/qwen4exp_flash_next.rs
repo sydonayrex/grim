@@ -1355,6 +1355,18 @@ impl Qwen38FlashNextBlock {
         gdn_cache: &mut crate::qwen4exp_gdn::Qwen38GdnCache,
         qsa_keys: &mut Vec<f32>,
     ) -> Result<Tensor> {
+        self.forward_with_dev_gdn(x, positions, cfg, gdn_cache, None, qsa_keys)
+    }
+
+    pub fn forward_with_dev_gdn(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        cfg: &Qwen38FlashNextConfig,
+        gdn_cache: &mut crate::qwen4exp_gdn::Qwen38GdnCache,
+        dev_gdn_cache: Option<&mut Option<crate::qwen4exp_gdn_device::Qwen38GdnDeviceCache>>,
+        qsa_keys: &mut Vec<f32>,
+    ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
 
         // 1. Attention sub-layer with HC Prepare/Inject
@@ -1386,6 +1398,65 @@ impl Qwen38FlashNextBlock {
                     (*n_v_heads, *n_k_heads, *head_dim, *conv_dim);
                 let pairing = *pairing;
                 probe::span(ProbeStage::Gdn, || -> Result<Tensor> {
+                if !branch_attn.device().is_cpu()
+                    && seq_len == 1
+                    && pairing == crate::qwen4exp_gdn::KdaHeadPairing::Interleaved
+                    && crate::qwen4exp_gdn_device::gdn_device_enabled()
+                {
+                    if let Some(slot) = dev_gdn_cache {
+                        let taps = cfg.linear_conv_kernel_dim.max(2);
+                        let init_res = if slot.is_none() {
+                            crate::qwen4exp_gdn_device::Qwen38GdnDeviceCache::from_host_cache(
+                                branch_attn.device(),
+                                gdn_cache,
+                                conv_dim,
+                                taps,
+                                n_v_heads,
+                                head_dim,
+                            )
+                            .map(|c| {
+                                *slot = Some(c);
+                            })
+                        } else {
+                            Ok(())
+                        };
+                        match init_res.and_then(|_| {
+                            let qkv = attn_qkv.forward(&branch_attn)?;
+                            let alpha = ssm_alpha.forward(&branch_attn)?;
+                            let beta = ssm_beta.forward(&branch_attn)?;
+                            let gate = attn_gate.forward(&branch_attn)?;
+                            let dev_c = slot.as_mut().expect("initialized above");
+                            crate::qwen4exp_gdn_device::gdn_decode_step_on_device(
+                                &qkv,
+                                &ssm_conv1d.weight,
+                                &alpha,
+                                &beta,
+                                ssm_dt,
+                                ssm_a,
+                                &ssm_norm.weight,
+                                &gate,
+                                cfg.rms_norm_eps,
+                                n_v_heads,
+                                n_k_heads,
+                                head_dim,
+                                dev_c,
+                            )
+                        }) {
+                            Ok(gated_t) => {
+                                gdn_cache.pos += 1;
+                                return Ok(ssm_out.forward(&gated_t)?);
+                            }
+                            Err(err) => {
+                                eprintln!("[gdn-device] fallback: {err}");
+                                *slot = None;
+                            }
+                        }
+                    }
+                } else if let Some(slot) = dev_gdn_cache {
+                    if seq_len > 1 {
+                        *slot = None;
+                    }
+                }
                 // 1. Fused qkv projection, then the depthwise causal conv over
                 //    the whole [K K V] stream. The conv history lives in the
                 //    cache so it survives across decode steps.
@@ -2190,6 +2261,7 @@ pub struct Qwen38FlashNext {
 #[derive(Debug, Clone, Default)]
 pub struct Qwen38GdnSession {
     pub caches: Vec<crate::qwen4exp_gdn::Qwen38GdnCache>,
+    pub device_caches: Vec<Option<crate::qwen4exp_gdn_device::Qwen38GdnDeviceCache>>,
     /// Raw indexer keys per full-attention layer, `[n_kv, indexer_key_length]`.
     ///
     /// Stored RAW on purpose: upstream caches `index_k_proj` output and applies
@@ -2204,6 +2276,9 @@ impl Qwen38GdnSession {
     pub fn ensure(&mut self, layers: &[Qwen38FlashNextBlock], cfg: &Qwen38FlashNextConfig) {
         if self.caches.len() < layers.len() {
             self.caches.resize(layers.len(), Default::default());
+        }
+        if self.device_caches.len() < layers.len() {
+            self.device_caches.resize(layers.len(), None);
         }
         for (i, layer) in layers.iter().enumerate() {
             if !self.caches[i].ssm_state.is_empty() {
@@ -2648,8 +2723,9 @@ impl CausalLm for Qwen38FlashNext {
                 .caches
                 .get_mut(i)
                 .expect("ensure() sized one cache per layer");
+            let dev_cache = gdn_state.device_caches.get_mut(i);
             let keys = gdn_state.qsa_keys.get_mut(i).expect("qsa_keys sized above");
-            h = layer.forward(&h, &pos_u32, &self.cfg, cache, keys)?;
+            h = layer.forward_with_dev_gdn(&h, &pos_u32, &self.cfg, cache, dev_cache, keys)?;
         }
         session.set_model_state(Box::new(gdn_state));
 

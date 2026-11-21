@@ -184,4 +184,63 @@ impl RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
+
+    /// Q3: Launches `grim_kda_gated_delta_rule_batched` writing raw pre-norm
+    /// `[num_v * head_dim]` into `acc_out` and updating `state [num_v, head_dim, head_dim]`
+    /// in place. Applies internal SiLU to `conv_out`, L2 norm with `eps`,
+    /// `softplus(alpha + dt_bias) * ssm_a`, `sigmoid(beta)`, and `rsqrt(head_dim)` scaling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kda_delta_rule_raw_into(
+        &self,
+        conv_out: &RocmStorage,
+        alpha: &RocmStorage,
+        beta: &RocmStorage,
+        dt_bias: &RocmStorage,
+        ssm_a: &RocmStorage,
+        state: &RocmStorage,
+        acc_out: &RocmStorage,
+        num_v: usize,
+        num_k: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let total = num_v * head_dim;
+        if total == 0 {
+            return Ok(());
+        }
+        let mut conv_ptr = dev_ptr(conv_out)?;
+        let mut alpha_ptr = dev_ptr(alpha)?;
+        let mut beta_ptr = dev_ptr(beta)?;
+        let mut dt_ptr = dev_ptr(dt_bias)?;
+        let mut a_ptr = dev_ptr(ssm_a)?;
+        let mut state_ptr = dev_ptr(state)?;
+        let mut acc_ptr = dev_ptr(acc_out)?;
+        let mut nv = num_v as i32;
+        let mut nk = num_k as i32;
+        let mut hd = head_dim as i32;
+        let mut eps_v = eps;
+
+        let block_x = 256u32;
+        let grid_x = ((total as u32) + block_x - 1) / block_x;
+        self.launch_compute_kernel(
+            "grim_kda_gated_delta_rule_batched",
+            HipDim3 { x: grid_x, y: 1, z: 1 },
+            HipDim3 { x: block_x, y: 1, z: 1 },
+            &mut [
+                arg(&mut conv_ptr),
+                arg(&mut alpha_ptr),
+                arg(&mut beta_ptr),
+                arg(&mut dt_ptr),
+                arg(&mut a_ptr),
+                arg(&mut state_ptr),
+                arg(&mut acc_ptr),
+                arg(&mut nv),
+                arg(&mut nk),
+                arg(&mut hd),
+                arg(&mut eps_v),
+            ],
+        )?;
+        Ok(())
+    }
 }
