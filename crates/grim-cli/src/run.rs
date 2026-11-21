@@ -290,7 +290,7 @@ pub(crate) fn emit_startup_config_banner(
     let dequant_min_m: usize = std::env::var("GRIM_PREFILL_DEQUANT_MIN_M")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(16);
+        .unwrap_or(64);
     let mut dequant_map = serde_json::Map::new();
     dequant_map.insert("enabled".into(), serde_json::Value::Bool(dequant_on));
     dequant_map.insert(
