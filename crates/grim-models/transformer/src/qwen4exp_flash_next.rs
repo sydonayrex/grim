@@ -2577,18 +2577,12 @@ impl Qwen38FlashNext {
             [cfg.vocab_size, cfg.hidden_size],
         )
         .or_else(|_| {
-            // GGUF stores this as `ne = { n_embd, n_vocab }` (llama.cpp
-            // `qwen4exp.cpp:170`), and `GgufTensorInfo::shape()` reverses `ne`
-            // into row-major order, so the row-major shape is
-            // `[n_vocab, n_embd]` — the same orientation as the safetensors
-            // arm above. The transpose arm that used to sit here
-            // (`[hidden, vocab]`) could never match a GGUF file: it fires
-            // only when `n_embd == n_vocab`, and when it did not it replaced
-            // the real error with a bogus "expected [2560, 248320]" that
-            // contradicted the bytes on disk.
+            // `Linear::load_shape(&ws, [in_dim, out_dim])` expects on-disk
+            // shape `[out_dim, in_dim]`. GGUF `token_embd.weight` is row-major
+            // `[vocab_size, hidden_size]`, so pass `[hidden_size, vocab_size]`.
             Linear::load_shape(
                 &root.scoped("token_embd"),
-                [cfg.vocab_size, cfg.hidden_size],
+                [cfg.hidden_size, cfg.vocab_size],
             )
         })?;
 
@@ -2608,73 +2602,6 @@ impl Qwen38FlashNext {
                     .meta("per_layer_token_embd.weight")
                     .map(|m| m.shape[0])
                     .unwrap_or(ngram_vocab);
-                // The checkpoint PADS the PLE table past the largest head range:
-                // `per_layer_token_embd.weight` is [160, 320001536] while
-                // max(head_offset + head_vocab_size) is 320001446. Probing the
-                // derived row count can therefore never match, so the tensor is
-                // fetched by name and its own shape is trusted.
-                let table = match root
-                    .with_device(Device::Cpu)
-                    .get([padded_rows, ngram_dim], "per_layer_token_embd.weight")
-                {
-                    Ok(t) => t,
-                    Err(_) => root
-                        .with_device(Device::Cpu)
-                        .scoped("layers")
-                        .scoped("1")
-                        .scoped("ple")
-                        .scoped("ple_embedding")
-                        .scoped("ngram_embedding")
-                        .get([ngram_vocab, ngram_dim], "shard_0")
-                        .or_else(|_| {
-                            root.with_device(Device::Cpu)
-                                .scoped("ngram_embeddings")
-                                .get([ngram_vocab, ngram_dim], "weight")
-                        })
-                        .or_else(|_| {
-                            root.with_device(Device::Cpu)
-                                .scoped("ple_ngram_embd")
-                                .get([ngram_vocab, ngram_dim], "weight")
-                        })
-                        .map_err(|e| {
-                            grim_core::Error::Config(format!(
-                                "Qwen38FlashNext: config defines ngram_vocab_size={ngram_vocab}, \
-                             ngram_dim={ngram_dim}, but no PLE table was found under any known \
-                             name (per_layer_token_embd [{ngram_dim}, {ngram_vocab}], \
-                             layers.1.ple.*, ngram_embeddings, ple_ngram_embd): {e}"
-                            ))
-                        })?,
-                };
-
-                let proj = Linear::load_shape(
-                    &root
-                        .with_device(Device::Cpu)
-                        .scoped("layers")
-                        .scoped("1")
-                        .scoped("ple")
-                        .scoped("key_proj"),
-                    [ple_gathered_dim, cfg.hidden_size],
-                )
-                .or_else(|_| {
-                    Linear::load_shape(
-                        &root.with_device(Device::Cpu).scoped("ngram_proj"),
-                        [ple_gathered_dim, cfg.hidden_size],
-                    )
-                })
-                .or_else(|_| {
-                    Linear::load_shape(
-                        &root.with_device(Device::Cpu).scoped("ple_ngram_proj"),
-                        [ple_gathered_dim, cfg.hidden_size],
-                    )
-                })
-                .map_err(|e| {
-                    grim_core::Error::Config(format!(
-                        "Qwen38FlashNext: checkpoint config specifies PLE projection, \
-                     but 'key_proj'/'ngram_proj' were not found in weights: {e}"
-                    ))
-                })?;
-
-                let addressing = cfg.ple_addressing()?;
                 let spill = std::env::var("GRIM_PLE_SPILL_F32").ok().map(|p| {
                     std::sync::Arc::new(grim_nn::SpillableEmbedding::new_spilled(
                         None,
@@ -2684,16 +2611,97 @@ impl Qwen38FlashNext {
                         ngram_dim,
                     ))
                 });
+                let eager_ple =
+                    std::env::var("GRIM_PLE_EAGER_LOAD").ok().as_deref() == Some("1");
+                let oversized_ple = padded_rows.saturating_mul(ngram_dim) > 16_000_000;
+                if oversized_ple && !eager_ple && spill.is_none() {
+                    eprintln!(
+                        "[qwen4exp] skipping eager heap load of oversized PLE table \
+                         ({padded_rows}x{ngram_dim}); set GRIM_PLE_SPILL_F32=<path> for SSD-backed PLE"
+                    );
+                    None
+                } else {
+                    // The checkpoint PADS the PLE table past the largest head range:
+                    // `per_layer_token_embd.weight` is [160, 320001536] while
+                    // max(head_offset + head_vocab_size) is 320001446. Probing the
+                    // derived row count can therefore never match, so the tensor is
+                    // fetched by name and its own shape is trusted.
+                    let table = if oversized_ple && spill.is_some() {
+                        cpu_tensor(vec![0.0f32; ngram_dim], Shape::new(vec![1, ngram_dim]))
+                    } else {
+                        match root
+                            .with_device(Device::Cpu)
+                            .get([padded_rows, ngram_dim], "per_layer_token_embd.weight")
+                        {
+                            Ok(t) => t,
+                            Err(_) => root
+                                .with_device(Device::Cpu)
+                                .scoped("layers")
+                                .scoped("1")
+                                .scoped("ple")
+                                .scoped("ple_embedding")
+                                .scoped("ngram_embedding")
+                                .get([ngram_vocab, ngram_dim], "shard_0")
+                                .or_else(|_| {
+                                    root.with_device(Device::Cpu)
+                                        .scoped("ngram_embeddings")
+                                        .get([ngram_vocab, ngram_dim], "weight")
+                                })
+                                .or_else(|_| {
+                                    root.with_device(Device::Cpu)
+                                        .scoped("ple_ngram_embd")
+                                        .get([ngram_vocab, ngram_dim], "weight")
+                                })
+                                .map_err(|e| {
+                                    grim_core::Error::Config(format!(
+                                        "Qwen38FlashNext: config defines ngram_vocab_size={ngram_vocab}, \
+                                     ngram_dim={ngram_dim}, but no PLE table was found under any known \
+                                     name (per_layer_token_embd [{ngram_dim}, {ngram_vocab}], \
+                                     layers.1.ple.*, ngram_embeddings, ple_ngram_embd): {e}"
+                                    ))
+                                })?,
+                        }
+                    };
 
-                Some(Qwen38NgramEmbedding {
-                    ngram_vocab_size: ngram_vocab,
-                    ngram_dim,
-                    hidden_size: cfg.hidden_size,
-                    table,
-                    proj,
-                    addressing,
-                    spill,
-                })
+                    let proj = Linear::load_shape(
+                        &root
+                            .with_device(Device::Cpu)
+                            .scoped("layers")
+                            .scoped("1")
+                            .scoped("ple")
+                            .scoped("key_proj"),
+                        [ple_gathered_dim, cfg.hidden_size],
+                    )
+                    .or_else(|_| {
+                        Linear::load_shape(
+                            &root.with_device(Device::Cpu).scoped("ngram_proj"),
+                            [ple_gathered_dim, cfg.hidden_size],
+                        )
+                    })
+                    .or_else(|_| {
+                        Linear::load_shape(
+                            &root.with_device(Device::Cpu).scoped("ple_ngram_proj"),
+                            [ple_gathered_dim, cfg.hidden_size],
+                        )
+                    })
+                    .map_err(|e| {
+                        grim_core::Error::Config(format!(
+                            "Qwen38FlashNext: checkpoint config specifies PLE projection, \
+                         but 'key_proj'/'ngram_proj' were not found in weights: {e}"
+                        ))
+                    })?;
+
+                    let addressing = cfg.ple_addressing()?;
+                    Some(Qwen38NgramEmbedding {
+                        ngram_vocab_size: ngram_vocab,
+                        ngram_dim,
+                        hidden_size: cfg.hidden_size,
+                        table,
+                        proj,
+                        addressing,
+                        spill,
+                    })
+                }
             } else {
                 None
             };
@@ -2713,16 +2721,35 @@ impl Qwen38FlashNext {
             layers.push(block);
         }
 
-        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps).or_else(
-            |_| {
+        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps)
+            .or_else(|_| {
+                RmsNorm::load(&root.scoped("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)
+            })
+            .or_else(|_| {
+                RmsNorm::load(
+                    &root.scoped("output_hc_norm"),
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                )
+            })
+            .or_else(|_| {
+                RmsNorm::load(
+                    &root.scoped("output_hc_norm"),
+                    cfg.hc_count * cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                )
+            })
+            .or_else(|_| {
                 RmsNorm::load(
                     &root.scoped("hyper_connection_mixer").scoped("hc_norm"),
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
                 )
-            },
-        )?;
+            })?;
         let output = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
+            .or_else(|_| {
+                Linear::load_shape(&root.scoped("output"), [cfg.hidden_size, cfg.vocab_size])
+            })
             .unwrap_or_else(|_| Linear::from_tensor(tok_embeddings.w_t.clone(), None));
 
         Ok(Self {
