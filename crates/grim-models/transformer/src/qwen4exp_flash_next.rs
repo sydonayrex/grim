@@ -862,6 +862,39 @@ impl Qwen38MoeBlock {
         if !x.device().is_cpu() {
             probe::record_d2h(ProbeStage::ExpertStage, x_vec.len() * std::mem::size_of::<f32>());
         }
+
+        if seq_len > 1 && crate::qwen4exp_moe_device::moe_expert_major_enabled() {
+            match crate::qwen4exp_moe_device::expert_major_prefill(
+                x,
+                &x_vec,
+                &logits_vec,
+                seq_len,
+                hidden_dim,
+                num_exp,
+                self.num_experts_per_tok,
+                self.routed_scaling_factor,
+                self.shared_expert.is_some(),
+                |exp_idx, batch_x| self.forward_expert(exp_idx, batch_x),
+                |all_x| self.forward_shared(all_x),
+            ) {
+                Ok(out_vec) => {
+                    let host_out = cpu_tensor(out_vec, x.shape().clone());
+                    return if x.device().is_cpu() {
+                        Ok(host_out)
+                    } else {
+                        probe::record_h2d(
+                            ProbeStage::ExpertStage,
+                            x_vec.len() * std::mem::size_of::<f32>(),
+                        );
+                        Ok(grim_nn::modules::move_to_device(&host_out, x.device())?)
+                    };
+                }
+                Err(err) => {
+                    eprintln!("[moe-expert-major] fallback: {err}");
+                }
+            }
+        }
+
         let mut out_vec = vec![0.0f32; x_vec.len()];
 
         for s in 0..seq_len {
