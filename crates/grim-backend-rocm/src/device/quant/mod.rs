@@ -175,9 +175,12 @@ impl QuantOps for RocmDevice {
                     .is_some();
                 if lane_served {
                     // out_storage is written by the lane GEMV.
+                } else if b_storage.is_released() {
+                    self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if (is_rdna2 || is_rdna34)
                     && m <= 32
                     && !dot_disabled
+                    && !b_storage.is_released()
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
                 {
@@ -300,9 +303,12 @@ impl QuantOps for RocmDevice {
                     .is_some();
                 if lane_served {
                     // out_storage is written by the lane GEMV.
+                } else if b_storage.is_released() {
+                    self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if (is_rdna2 || is_rdna34)
                     && m <= 32
                     && !dot_disabled
+                    && !b_storage.is_released()
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
                 {

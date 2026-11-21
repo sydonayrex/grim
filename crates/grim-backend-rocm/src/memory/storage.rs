@@ -51,9 +51,17 @@ pub fn reset_blocking_d2h_count() {
     BLOCKING_D2H_COUNTER.store(0, Ordering::Relaxed);
 }
 
+static NEXT_STORAGE_UID: AtomicU64 = AtomicU64::new(1);
+
+fn next_storage_uid() -> u64 {
+    NEXT_STORAGE_UID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
 #[derive(Debug)]
 pub struct RocmStorage {
+    /// Monotonic unique ID (never recycled even if `device_ptr` is freed/reused).
+    pub(crate) uid: u64,
     /// Opaque device pointer, stored as u64
     pub(crate) device_ptr: Option<u64>,
     pub(crate) bytes: usize,
@@ -69,6 +77,10 @@ pub struct RocmStorage {
     /// device pointer (e.g. shared per-device decode-graph scratch) and must NOT
     /// free the pointer on `Drop`.
     pub(crate) alias: bool,
+    /// When true, the underlying GPU buffer was explicitly released (e.g. after
+    /// in-place `u4` lane repack via `GRIM_U4_REPLACE_SOURCE=1`) and must NOT
+    /// be freed again on `Drop`.
+    pub(crate) released: std::sync::atomic::AtomicBool,
 }
 
 /// Human-readable label for a ledger entry. Deliberately cheap: it is built
@@ -91,6 +103,7 @@ impl RocmStorage {
     /// Caller must ensure the owning `RocmStorage` outlives all aliases.
     pub(crate) fn non_owning_alias(&self) -> Self {
         Self {
+            uid: self.uid,
             device_ptr: self.device_ptr,
             bytes: self.bytes,
             shape: self.shape.clone(),
@@ -100,6 +113,32 @@ impl RocmStorage {
             allocator: Arc::clone(&self.allocator),
             managed: self.managed,
             alias: true,
+            released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// Release the underlying GPU buffer immediately (e.g. after in-place `u4`
+    /// lane repack) while keeping `uid` intact for cache lookup. Safe to call
+    /// multiple times; `Drop` becomes a no-op once released.
+    pub(crate) fn release_source_vram(&self) {
+        if self.alias || self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(ptr_val) = self.device_ptr {
+            if self.managed {
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                unsafe {
+                    let _ = crate::hipFree(ptr_val as *mut c_void);
+                }
+            } else {
+                self.allocator.free(ptr_val as *mut c_void, self.bytes);
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                self.allocator.empty_cache();
+            }
         }
     }
 
@@ -169,7 +208,8 @@ impl RocmStorage {
                 &alloc_label(&dtype, shape),
             );
             return Ok(RocmStorage {
-                device_ptr: Some(ptr as u64),
+                uid: next_storage_uid(),
+            device_ptr: Some(ptr as u64),
                 bytes,
                 shape: shape.clone(),
                 dtype,
@@ -178,6 +218,7 @@ impl RocmStorage {
                 allocator: Arc::clone(allocator),
                 managed: true,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
             });
         }
         let dev_ptr_void = match allocator.alloc(bytes) {
@@ -204,7 +245,8 @@ impl RocmStorage {
                         &alloc_label(&dtype, shape),
                     );
                     return Ok(RocmStorage {
-                        device_ptr: Some(ptr as u64),
+                        uid: next_storage_uid(),
+            device_ptr: Some(ptr as u64),
                         bytes,
                         shape: shape.clone(),
                         dtype,
@@ -213,6 +255,7 @@ impl RocmStorage {
                         allocator: Arc::clone(allocator),
                         managed: true,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
                     });
                 }
                 return Err(vram_error);
@@ -226,6 +269,7 @@ impl RocmStorage {
             &alloc_label(&dtype, shape),
         );
         Ok(RocmStorage {
+            uid: next_storage_uid(),
             device_ptr: Some(dev_ptr_void as u64),
             bytes,
             shape: shape.clone(),
@@ -235,6 +279,7 @@ impl RocmStorage {
             allocator: Arc::clone(allocator),
             managed: false,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -480,6 +525,7 @@ impl RocmStorage {
             hipMallocManaged(&mut ptr, bytes, 1)
         })?;
         let storage = Self {
+            uid: next_storage_uid(),
             device_ptr: Some(ptr as u64),
             bytes,
             shape: shape.clone(),
@@ -489,6 +535,7 @@ impl RocmStorage {
             allocator: Arc::clone(allocator),
             managed: true,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
         };
         let result = unsafe {
             hipMemcpy(
@@ -550,7 +597,8 @@ impl RocmStorage {
                 )));
             }
             return Ok(RocmStorage {
-                device_ptr: Some(ptr as u64),
+                uid: next_storage_uid(),
+            device_ptr: Some(ptr as u64),
                 bytes,
                 shape: shape.clone(),
                 dtype,
@@ -559,6 +607,7 @@ impl RocmStorage {
                 allocator: Arc::clone(allocator),
                 managed: true,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
             });
         }
         let dev_ptr_void = match allocator.alloc(bytes) {
@@ -586,7 +635,8 @@ impl RocmStorage {
                     };
                     if result == hipSuccess {
                         return Ok(RocmStorage {
-                            device_ptr: Some(ptr as u64),
+                            uid: next_storage_uid(),
+            device_ptr: Some(ptr as u64),
                             bytes,
                             shape: shape.clone(),
                             dtype,
@@ -595,6 +645,7 @@ impl RocmStorage {
                             allocator: Arc::clone(allocator),
                             managed: true,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
                         });
                     }
                     unsafe {
@@ -645,6 +696,7 @@ impl RocmStorage {
         }
 
         Ok(RocmStorage {
+            uid: next_storage_uid(),
             device_ptr: Some(dev_ptr_void as u64),
             bytes,
             shape: shape.clone(),
@@ -654,6 +706,7 @@ impl RocmStorage {
             allocator: Arc::clone(allocator),
             managed: false,
             alias: false,
+            released: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -678,7 +731,7 @@ impl RocmStorage {
 
 impl Drop for RocmStorage {
     fn drop(&mut self) {
-        if self.alias {
+        if self.alias || self.released.load(Ordering::Acquire) {
             return;
         }
         if let Some(ptr_val) = self.device_ptr {

@@ -132,7 +132,7 @@ impl RocmDevice {
         // L2-served while the per-tensor slice (<= 28 MB here) stays resident.
         // `dot8_w4a4_gemv_parity_multi_row` pins that M > 1 is correct.
         let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
-        if m <= lane_gemm_max_m()
+        if (m <= lane_gemm_max_m() || b_q4k_storage.is_released())
             && w4a4_decode
             && k % 128 == 0
             && crate::quantization::w4a4_ostquant_supported(

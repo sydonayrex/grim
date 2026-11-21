@@ -4981,34 +4981,20 @@ impl RocmDevice {
         // pointer) is treated as a miss and reconverts.
         type LaneCache = std::sync::Mutex<
             std::collections::HashMap<
-                (usize, usize, [usize; 2], usize, grim_tensor::KQuantScheme),
-                (Option<u64>, Option<Arc<WhiteCrowDecodedWeights>>),
+                (u64, [usize; 2], usize, grim_tensor::KQuantScheme),
+                Option<Arc<WhiteCrowDecodedWeights>>,
             >,
         >;
         static CONVERTED: OnceLock<LaneCache> = OnceLock::new();
         let cache = CONVERTED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-        let key = (
-            w.device_ptr.map(|p| p as usize).unwrap_or(0),
-            w.bytes,
-            [n, k],
-            self.ordinal,
-            scheme,
-        );
-        let content_hash = weight_source_hash(w.device_ptr, w.bytes);
+        let key = (w.uid, [n, k], self.ordinal, scheme);
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((stored_hash, hit)) = guard.get(&key) {
-            // Verify identity: a recycled pointer serving a different tensor
-            // must not hit. `None` on either side means "hash unknown" (a
-            // weight this process did not upload, e.g. legacy path) — keep
-            // the entry; the (ptr, bytes, shape, ordinal, scheme) tuple is
-            // then the best identity available.
-            let aliased = match (stored_hash, content_hash) {
-                (Some(a), Some(b)) => *a != b,
-                _ => false,
-            };
-            if !aliased {
-                return Ok(hit.clone());
-            }
+        if let Some(hit) = guard.get(&key) {
+            return Ok(hit.clone());
+        }
+        // If source VRAM was already released, we cannot reconvert.
+        if w.is_released() {
+            return Ok(None);
         }
         // Reserve: lazy kernel-module loads and activation scratch still
         // need headroom after the last lane copy lands. 1024 MiB leaves enough
@@ -5037,7 +5023,7 @@ impl RocmDevice {
                          weight keeps its dot4/WMMA route for this process"
                     );
                 }
-                guard.insert(key, (content_hash, None));
+                guard.insert(key, None);
                 return Ok(None);
             }
         }
@@ -5051,7 +5037,18 @@ impl RocmDevice {
                 w.bytes / (1024 * 1024)
             );
         }
-        guard.insert(key, (content_hash, Some(converted.clone())));
+        guard.insert(key, Some(converted.clone()));
+        // Workstream B1 (Basalt in-place repack): when GRIM_U4_REPLACE_SOURCE=1,
+        // release the redundant packed Q4K GPU buffer once the u4 lane copy is
+        // safely cached by monotonic `w.uid`, reclaiming ~3-4 GB on dev0.
+        if matches!(scheme, grim_tensor::KQuantScheme::Q4K)
+            && matches!(
+                std::env::var("GRIM_U4_REPLACE_SOURCE").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        {
+            w.release_source_vram();
+        }
         Ok(Some(converted))
     }
 

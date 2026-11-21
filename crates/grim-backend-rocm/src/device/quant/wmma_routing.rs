@@ -94,13 +94,13 @@ impl RocmDevice {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        if prefill_dequant_on && m >= prefill_dequant_min_m {
+        if prefill_dequant_on && m >= prefill_dequant_min_m && !b.is_released() {
             if let Some(format_tag) = format_tag_hint {
                 self.launch_iq_prefill_dequant_rocblas_f16(a, b, out, m, n, k, format_tag)?;
                 return Ok(());
             }
         }
-        if allow_wmma && is_rdna34 && m <= wmma_m_max && !wmma_off {
+        if allow_wmma && is_rdna34 && m <= wmma_m_max && !wmma_off && !b.is_released() {
             wmma_method(self, a, b, out, m, n, k)?;
         } else {
             scalar_method(self, a, b, out, m, n, k)?;
@@ -252,7 +252,7 @@ impl RocmDevice {
         // K-quant formats with a lane conversion are eligible. The M bound is
         // shared with the q4k arm — one switch, one bound, so the schemes
         // cannot drift apart.
-        if m <= crate::device::quant::dequant_k_quants::lane_gemm_max_m() {
+        if m <= crate::device::quant::dequant_k_quants::lane_gemm_max_m() || b_storage.is_released() {
             let scheme = if kernel.contains("q4k") {
                 Some(grim_tensor::dtype::KQuantScheme::Q4K)
             } else if kernel.contains("q5k") {
