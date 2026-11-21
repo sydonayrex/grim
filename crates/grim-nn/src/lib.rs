@@ -18,6 +18,7 @@ pub mod moe_hybrid;
 pub mod scythe2;
 pub mod sparse_attention;
 pub mod varbuilder;
+pub mod ple_offload;
 
 pub use modules::{
     ColumnParallelLinear, Conv1d, ConvTranspose1d, Embedding, ExpertParallelConfig, KdaAttention,
@@ -34,3 +35,4 @@ pub use moe_hybrid::{HybridExecutor, PcieBench};
 pub use scythe2::{Scythe2Linear, slice_input_dim, slice_output_dim};
 pub use varbuilder::WeightSource;
 pub use expert_offload::ExpertOffloadBanks;
+pub use ple_offload::OffloadedPleTable;

@@ -15,15 +15,22 @@ use grim_tensor::{MemoryOps, Tensor};
 
 use crate::Linear;
 
+#[derive(Clone)]
+struct BankSpec {
+    name: String,
+    shape: [usize; 2],
+    stride: usize,
+    dtype: DType,
+    provenance: QuantProvenance,
+}
+
 /// Lazy per-expert source: stores only metadata + a re-opened provider handle,
 /// so expert bytes live in the mmap (page cache) and are fetched per activation.
 pub struct ExpertOffloadBanks {
     provider: SplitGgufProvider,
-    gate: (String, [usize; 2], usize),
-    up: (String, [usize; 2], usize),
-    down: (String, [usize; 2], usize),
-    dtype: DType,
-    provenance: QuantProvenance,
+    gate: BankSpec,
+    up: BankSpec,
+    down: BankSpec,
     cache: Mutex<HashMap<usize, (Linear, Linear, Linear)>>,
     /// Use-capped residency state (cap 15, MRU tie-break) behind `GRIM_MOE_USE_VICTIM=1`.
     use_stats: Mutex<(Vec<u16>, Vec<u64>, u64)>,
@@ -56,38 +63,39 @@ impl ExpertOffloadBanks {
                     "expert bank '{name}': {total} bytes not divisible by {num_experts}"
                 )));
             }
-            props.push((name.to_string(), [out, in_], total / num_experts));
+            props.push(BankSpec {
+                name: name.to_string(),
+                shape: [out, in_],
+                stride: total / num_experts,
+                dtype: meta.dtype,
+                provenance: meta.provenance,
+            });
         }
-        let meta = provider.meta(gate_name)?;
         Ok(Self {
             provider,
             gate: props[0].clone(),
             up: props[1].clone(),
             down: props[2].clone(),
-            dtype: meta.dtype,
-            provenance: meta.provenance,
             cache: Mutex::new(HashMap::new()),
             use_stats: Mutex::new((vec![0u16; num_experts], vec![0u64; num_experts], 0u64)),
         })
     }
 
-    fn staged_bank_tensor(
-        &self,
-        name: &str,
-        shape: [usize; 2],
-        stride: usize,
-        idx: usize,
-    ) -> Result<Tensor> {
+    fn staged_bank_tensor(&self, bank: &BankSpec, idx: usize) -> Result<Tensor> {
         let bytes = self
             .provider
-            .get_range(name, (idx * stride) as u64, stride as u64)?;
+            .get_range(&bank.name, (idx * bank.stride) as u64, bank.stride as u64)?;
         let dev = CpuDevice::new();
-        let storage = dev.from_cpu_bytes(&bytes[..], &Shape::new(vec![shape[0], shape[1]]), self.dtype.clone())?;
+        let storage = dev.from_cpu_bytes(
+            &bytes[..],
+            &Shape::new(vec![bank.shape[0], bank.shape[1]]),
+            bank.dtype.clone(),
+        )?;
         Ok(Tensor::new(
             Arc::from(storage),
-            Shape::new(vec![shape[0], shape[1]]),
-            self.dtype.clone(),
-            self.provenance.clone(),
+            Shape::new(vec![bank.shape[0], bank.shape[1]]),
+            bank.dtype.clone(),
+            bank.provenance.clone(),
             Device::Cpu,
         ))
     }
@@ -122,9 +130,9 @@ impl ExpertOffloadBanks {
             }
         }
         let triple = (
-            self.staged_bank_tensor(&self.gate.0, self.gate.1, self.gate.2, idx)?,
-            self.staged_bank_tensor(&self.up.0, self.up.1, self.up.2, idx)?,
-            self.staged_bank_tensor(&self.down.0, self.down.1, self.down.2, idx)?,
+            self.staged_bank_tensor(&self.gate, idx)?,
+            self.staged_bank_tensor(&self.up, idx)?,
+            self.staged_bank_tensor(&self.down, idx)?,
         );
         let lins = (
             Linear::from_tensor(triple.0, None).staged_to(target)?,

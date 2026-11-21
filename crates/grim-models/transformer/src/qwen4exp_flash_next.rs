@@ -676,7 +676,24 @@ impl Qwen38MoeBlock {
         )
         .or_else(|_| Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts]))?;
 
-        let experts = if ws.device().is_cpu() {
+        let eager_experts =
+            std::env::var("GRIM_EXPERTS_EAGER_LOAD").ok().as_deref() == Some("1");
+        let experts = if ws.has_tensor("ffn_gate_exps.weight")
+            && !eager_experts
+            && ws.provider().source_path().is_some()
+        {
+            // File-backed GGUF (both CPU and GPU): keep 512-expert banks as
+            // SSD/mmap-backed byte ranges and stage active experts only.
+            let path = ws.provider().source_path().expect("checked is_some above");
+            let stores = grim_nn::ExpertOffloadBanks::open(
+                path,
+                &ws.full_name("ffn_gate_exps.weight"),
+                &ws.full_name("ffn_up_exps.weight"),
+                &ws.full_name("ffn_down_exps.weight"),
+                cfg.num_experts,
+            )?;
+            Qwen38MoeExperts::Offloaded(stores)
+        } else if ws.device().is_cpu() {
             if ws.has_tensor("ffn_gate_exps.weight") {
                 let bank = grim_nn::moe::ExpertBank::load(
                     ws,
@@ -698,20 +715,6 @@ impl Qwen38MoeBlock {
                 }
                 Qwen38MoeExperts::Individual(exp_vec)
             }
-        } else if ws.has_tensor("ffn_gate_exps.weight") {
-            // GPU target: experts are too large to upload; keep them as mmap'd
-            // byte ranges (SSD-evictable) and stage active experts only.
-            let path = ws.provider().source_path().ok_or_else(|| {
-                grim_core::Error::Config("expert offload requires a file-backed provider".into())
-            })?;
-            let stores = grim_nn::ExpertOffloadBanks::open(
-                path,
-                &ws.full_name("ffn_gate_exps.weight"),
-                &ws.full_name("ffn_up_exps.weight"),
-                &ws.full_name("ffn_down_exps.weight"),
-                cfg.num_experts,
-            )?;
-            Qwen38MoeExperts::Offloaded(stores)
         } else {
             let expert_ws = ws.with_device(Device::Cpu);
             let mut exp_vec = Vec::with_capacity(cfg.num_experts);
@@ -2427,13 +2430,17 @@ pub struct Qwen38NgramEmbedding {
     /// Both container formats expose the table row-major, so the gather's
     /// `row * ngram_dim` indexing is correct for either.
     pub table: Tensor,
-    /// Linear projection from $d_{\text{ngram}} \to d_{\text{model}}$.
-    pub proj: Linear,
+    /// Optional linear projection from `ple_gathered_dim` to `hidden_size`.
+    /// `None` when `ple_gathered_dim == hidden_size` and checkpoint has no `key_proj`/`ngram_proj`
+    /// (matching upstream Flash-Next where `16 * 160 == 2560` is used directly).
+    pub proj: Option<Linear>,
     /// Deterministic coprime polynomial modular addressing generator.
     pub addressing: Qwen38NgramAddressing,
     /// Optional tiered lookup: resident table + NVMe spill for the huge PLE
-    /// table. When `None`, rows are gathered from `table` directly.
+    /// table. When `None`, rows are gathered from `offloaded_ple` or `table`.
     pub spill: Option<std::sync::Arc<grim_nn::SpillableEmbedding>>,
+    /// Direct SSD-backed GGUF `get_range` PLE lookup with bounded DRAM cache.
+    pub offloaded_ple: Option<std::sync::Arc<grim_nn::OffloadedPleTable>>,
 }
 
 impl Qwen38NgramEmbedding {
@@ -2448,7 +2455,7 @@ impl Qwen38NgramEmbedding {
             ));
         }
 
-        let table_vec = if self.spill.is_none() {
+        let table_vec = if self.spill.is_none() && self.offloaded_ple.is_none() {
             Some(self.table.to_vec_f32()?)
         } else {
             None
@@ -2477,6 +2484,12 @@ impl Qwen38NgramEmbedding {
                     if row_vec.len() >= self.ngram_dim {
                         gathered_ngram[dst..end].copy_from_slice(&row_vec[..self.ngram_dim]);
                     }
+                } else if let Some(ref ple) = self.offloaded_ple {
+                    let row_vec = ple.get_row_f32(row as usize)?;
+                    let end = dst + self.ngram_dim;
+                    if row_vec.len() >= self.ngram_dim {
+                        gathered_ngram[dst..end].copy_from_slice(&row_vec[..self.ngram_dim]);
+                    }
                 } else if let Some(ref tv) = table_vec {
                     if src + self.ngram_dim <= tv.len() {
                         gathered_ngram[dst..dst + self.ngram_dim]
@@ -2494,7 +2507,10 @@ impl Qwen38NgramEmbedding {
             gathered_ngram,
             grim_tensor::Shape::new(vec![seq_len, row_dim]),
         );
-        Ok(self.proj.forward(&ngram_tensor)?)
+        match &self.proj {
+            Some(p) => Ok(p.forward(&ngram_tensor)?),
+            None => Ok(ngram_tensor),
+        }
     }
 }
 
@@ -2649,7 +2665,24 @@ impl Qwen38FlashNext {
                 let eager_ple =
                     std::env::var("GRIM_PLE_EAGER_LOAD").ok().as_deref() == Some("1");
                 let oversized_ple = padded_rows.saturating_mul(ngram_dim) > 16_000_000;
-                if oversized_ple && !eager_ple && spill.is_none() {
+                let offloaded_ple = if oversized_ple && !eager_ple && spill.is_none() {
+                    root.provider().source_path().and_then(|path| {
+                        match grim_nn::OffloadedPleTable::open(
+                            path,
+                            "per_layer_token_embd.weight",
+                            ngram_dim,
+                        ) {
+                            Ok(t) => Some(std::sync::Arc::new(t)),
+                            Err(err) => {
+                                eprintln!("[qwen4exp] OffloadedPleTable open skipped: {err}");
+                                None
+                            }
+                        }
+                    })
+                } else {
+                    None
+                };
+                if oversized_ple && !eager_ple && spill.is_none() && offloaded_ple.is_none() {
                     eprintln!(
                         "[qwen4exp] skipping eager heap load of oversized PLE table \
                          ({padded_rows}x{ngram_dim}); set GRIM_PLE_SPILL_F32=<path> for SSD-backed PLE"
@@ -2661,7 +2694,7 @@ impl Qwen38FlashNext {
                     // max(head_offset + head_vocab_size) is 320001446. Probing the
                     // derived row count can therefore never match, so the tensor is
                     // fetched by name and its own shape is trusted.
-                    let table = if oversized_ple && spill.is_some() {
+                    let table = if oversized_ple && (spill.is_some() || offloaded_ple.is_some()) {
                         cpu_tensor(vec![0.0f32; ngram_dim], Shape::new(vec![1, ngram_dim]))
                     } else {
                         match root
@@ -2698,7 +2731,7 @@ impl Qwen38FlashNext {
                         }
                     };
 
-                    let proj = Linear::load_shape(
+                    let proj = match Linear::load_shape(
                         &root
                             .with_device(Device::Cpu)
                             .scoped("layers")
@@ -2718,13 +2751,16 @@ impl Qwen38FlashNext {
                             &root.with_device(Device::Cpu).scoped("ple_ngram_proj"),
                             [ple_gathered_dim, cfg.hidden_size],
                         )
-                    })
-                    .map_err(|e| {
-                        grim_core::Error::Config(format!(
-                            "Qwen38FlashNext: checkpoint config specifies PLE projection, \
-                         but 'key_proj'/'ngram_proj' were not found in weights: {e}"
-                        ))
-                    })?;
+                    }) {
+                        Ok(p) => Some(p),
+                        Err(_) if ple_gathered_dim == cfg.hidden_size => None,
+                        Err(e) => {
+                            return Err(grim_core::Error::Config(format!(
+                                "Qwen38FlashNext: checkpoint config specifies PLE projection, \
+                             but 'key_proj'/'ngram_proj' were not found in weights: {e}"
+                            )));
+                        }
+                    };
 
                     let addressing = cfg.ple_addressing()?;
                     Some(Qwen38NgramEmbedding {
@@ -2735,6 +2771,7 @@ impl Qwen38FlashNext {
                         proj,
                         addressing,
                         spill,
+                        offloaded_ple,
                     })
                 }
             } else {
@@ -2832,9 +2869,10 @@ impl Qwen38FlashNext {
                 ngram_dim,
                 hidden_size: cfg.hidden_size,
                 table,
-                proj,
+                proj: Some(proj),
                 addressing,
                 spill: None,
+                offloaded_ple: None,
             })
         } else {
             None
