@@ -1034,6 +1034,99 @@ pub struct Qwen38FlashNextBlock {
     pub gated_residual_scale: f32,
 }
 
+/// Tier-1 transfer: device-side QSA gather (Q4). Default OFF. When off, the
+/// existing host indexer/masked-softmax oracle is the only path.
+#[inline]
+pub fn qsa_device_gather_enabled() -> bool {
+    std::env::var("GRIM_QSA_DEVICE_GATHER").ok().as_deref() == Some("1")
+}
+
+/// Gathers selected K/V rows (`sel`) on ROCm via `launch_kv_gather_f32` and runs
+/// `qkv_attention` over the gathered `[n_ids, num_kv_heads * head_dim]` buffer
+/// with `cache_offset = (n_ids - 1) as u32` so all `n_ids` gathered cells are visible.
+pub fn qsa_device_gather_attention(
+    q_rope: &Tensor,
+    k_rope: &Tensor,
+    v: &Tensor,
+    sel: &[usize],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let n_ids = sel.len();
+    if n_ids == 0 {
+        return Err(grim_core::error::Error::Shape(
+            "qsa_device_gather_attention: empty selection".into(),
+        ));
+    }
+    let ordinal = q_rope.device().ordinal().ok_or_else(|| {
+        grim_core::error::Error::Backend("qsa_device_gather_attention: non-GPU device".into())
+    })?;
+    let rocm = grim_backend_rocm::RocmDevice::shared_if_alive(ordinal).ok_or_else(|| {
+        grim_core::error::Error::Backend("no live device".into())
+    })?;
+
+    let ids_f32: Vec<f32> = sel.iter().map(|&i| f32::from_bits(i as u32)).collect();
+    let ids_dev = grim_nn::modules::move_to_device(
+        &cpu_tensor(ids_f32, Shape::new(vec![n_ids])),
+        q_rope.device(),
+    )?;
+
+    let stride = (num_kv_heads * head_dim).max(1);
+    let gather_shape = Shape::new(vec![n_ids, stride]);
+    use grim_tensor::CoreTensorOps;
+    let k_g = rocm.zeros(&gather_shape, grim_tensor::DType::F32)?;
+    let v_g = rocm.zeros(&gather_shape, grim_tensor::DType::F32)?;
+
+    let k_r = k_rope
+        .storage()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("k_rope not RocmStorage".into()))?;
+    let v_r = v
+        .storage()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("v not RocmStorage".into()))?;
+    let ids_r = ids_dev
+        .storage()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("ids not RocmStorage".into()))?;
+    let k_g_r = k_g
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("k_g not RocmStorage".into()))?;
+    let v_g_r = v_g
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("v_g not RocmStorage".into()))?;
+
+    grim_backend_rocm::launch_kv_gather_f32(&rocm, k_r, v_r, ids_r, n_ids, stride, k_g_r, v_g_r)?;
+
+    let dev = grim_nn::modules::pick_device_for_tensor(q_rope);
+    let out_shape = Shape::new(vec![1, num_heads * head_dim]);
+    let (s, _h) = dev.qkv_attention(
+        q_rope.storage().as_ref(),
+        k_g.as_ref(),
+        v_g.as_ref(),
+        num_kv_heads,
+        n_ids,
+        (n_ids - 1) as u32,
+        None,
+        &out_shape,
+        None,
+        None,
+    )?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(s),
+        out_shape,
+        grim_tensor::DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        q_rope.device().clone(),
+    ))
+}
+
 impl Qwen38FlashNextBlock {
     pub fn load(
         ws: &WeightSource<'_>,
@@ -1715,7 +1808,7 @@ impl Qwen38FlashNextBlock {
                 } else {
                     None
                 };
-                let qsa_keep: Option<Vec<f32>> = match qsa_geom {
+                let qsa_keep: Option<(Vec<f32>, Vec<usize>)> = match qsa_geom {
                     Some(qcfg) => {
                         // Raw indexer keys for the NEW tokens are cached
                         // unpooled and un-normed; pooling, norm and rotation
@@ -1832,18 +1925,46 @@ impl Qwen38FlashNextBlock {
                         // and is available here, before the host materialization.
                         let sel = crate::qwen4exp_qsa::top_k_cells(&cells, qcfg.select_width(n_kv));
                         let kv_stride = (*num_kv_heads * *head_dim).max(1);
-                        let k_elems = k.to_vec_f32()?.len();
-                        if !k.device().is_cpu() {
-                            probe::record_d2h(ProbeStage::Qsa, k_elems * std::mem::size_of::<f32>());
-                        }
+                        let k_elems = k.shape().elem_count();
                         let kv_len = (k_elems / kv_stride).max(1);
                         let sel = sel.into_iter().filter(|c| *c < kv_len).collect::<Vec<_>>();
-                        Some(crate::qwen4exp_qsa::build_top_k_mask(kv_len, &sel, None)?)
+                        let mask = crate::qwen4exp_qsa::build_top_k_mask(kv_len, &sel, None)?;
+                        Some((mask, sel))
                     }
                     None => None,
                 };
 
                 let out_shape = Shape::new(vec![seq_len, *num_heads * *head_dim]);
+                let dev_qsa_out: Option<Tensor> = if seq_len == 1
+                    && !x.device().is_cpu()
+                    && qsa_device_gather_enabled()
+                {
+                    if let Some((_, sel)) = qsa_keep.as_ref() {
+                        if !sel.is_empty() {
+                            match qsa_device_gather_attention(
+                                &q_rope,
+                                &k_rope,
+                                &v,
+                                sel,
+                                *num_heads,
+                                *num_kv_heads,
+                                *head_dim,
+                            ) {
+                                Ok(t) => Some(t),
+                                Err(err) => {
+                                    eprintln!("[qsa-device-gather] fallback: {err}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // The fused device kernel takes no additive mask, so it CANNOT
                 // honour the QSA selection. Trying it first and only falling
                 // back to the masked path on Err means a device that supports
@@ -1853,42 +1974,45 @@ impl Qwen38FlashNextBlock {
                 //
                 // So: when a mask exists, the masked path is the path. The
                 // kernel is only eligible for a dense step.
-                let attn_tensor = match dev.qkv_attention(
-                    q_rope.storage().as_ref(),
-                    k_rope.storage().as_ref(),
-                    v.storage().as_ref(),
-                    *num_kv_heads,
-                    seq_len,
-                    0,
-                    None,
-                    &out_shape,
-                    None,
-                    None,
-                ) {
-                    Ok((s, _h)) if qsa_keep.is_none() => Tensor::new(
-                        std::sync::Arc::from(s),
-                        out_shape.clone(),
-                        grim_tensor::DType::F32,
-                        grim_tensor::QuantProvenance::default(),
-                        x.device().clone(),
-                    ),
-                    // Any other outcome (kernel failed, or a mask exists that the
-                    // kernel cannot honour) takes the masked/dense host path.
-                    _ => {
-                        let q_heads = q_rope.to_vec_f32()?;
-                        let k_heads = k_rope.to_vec_f32()?;
-                        let v_heads = v.to_vec_f32()?;
-                        if !x.device().is_cpu() {
-                            probe::record_d2h(ProbeStage::Qsa, q_heads.len() * std::mem::size_of::<f32>());
-                            probe::record_d2h(ProbeStage::Qsa, k_heads.len() * std::mem::size_of::<f32>());
-                            probe::record_d2h(ProbeStage::Qsa, v_heads.len() * std::mem::size_of::<f32>());
-                        }
-                        match qsa_keep.as_ref() {
-                            // Sparse: restrict the softmax to the cells the
-                            // indexer selected. Only valid when this step's K/V
-                            // history IS the cells the mask was built over,
-                            // which holds for a single-token decode.
-                            Some(keep) if seq_len == 1 => {
+                let attn_tensor = if let Some(t) = dev_qsa_out {
+                    t
+                } else {
+                    match dev.qkv_attention(
+                        q_rope.storage().as_ref(),
+                        k_rope.storage().as_ref(),
+                        v.storage().as_ref(),
+                        *num_kv_heads,
+                        seq_len,
+                        0,
+                        None,
+                        &out_shape,
+                        None,
+                        None,
+                    ) {
+                        Ok((s, _h)) if qsa_keep.is_none() => Tensor::new(
+                            std::sync::Arc::from(s),
+                            out_shape.clone(),
+                            grim_tensor::DType::F32,
+                            grim_tensor::QuantProvenance::default(),
+                            x.device().clone(),
+                        ),
+                        // Any other outcome (kernel failed, or a mask exists that the
+                        // kernel cannot honour) takes the masked/dense host path.
+                        _ => {
+                            let q_heads = q_rope.to_vec_f32()?;
+                            let k_heads = k_rope.to_vec_f32()?;
+                            let v_heads = v.to_vec_f32()?;
+                            if !x.device().is_cpu() {
+                                probe::record_d2h(ProbeStage::Qsa, q_heads.len() * std::mem::size_of::<f32>());
+                                probe::record_d2h(ProbeStage::Qsa, k_heads.len() * std::mem::size_of::<f32>());
+                                probe::record_d2h(ProbeStage::Qsa, v_heads.len() * std::mem::size_of::<f32>());
+                            }
+                            match qsa_keep.as_ref() {
+                                // Sparse: restrict the softmax to the cells the
+                                // indexer selected. Only valid when this step's K/V
+                                // history IS the cells the mask was built over,
+                                // which holds for a single-token decode.
+                                Some((keep, _)) if seq_len == 1 => {
                                 let kv_len = keep.len();
                                 let out = crate::qwen4exp_qsa::masked_gqa_attention(
                                     &q_heads,
@@ -1939,6 +2063,7 @@ impl Qwen38FlashNextBlock {
                             }
                         }
                     }
+                }
                 };
                 Ok(wo.forward(&attn_tensor)?)
                 })?

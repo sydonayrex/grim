@@ -143,3 +143,26 @@ fn indexer_keys_accumulate_across_decode_steps() {
     }
     assert_eq!(keys.len(), 10, "5 steps x idx_dim 2");
 }
+
+#[test]
+fn qsa_device_gather_env_gate_defaults_off_and_enables_on_1() {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("GRIM_QSA_DEVICE_GATHER").ok();
+    unsafe { std::env::remove_var("GRIM_QSA_DEVICE_GATHER") };
+    assert!(
+        !grim_models_transformer::qwen4exp_flash_next::qsa_device_gather_enabled(),
+        "default must be OFF"
+    );
+    unsafe { std::env::set_var("GRIM_QSA_DEVICE_GATHER", "1") };
+    assert!(
+        grim_models_transformer::qwen4exp_flash_next::qsa_device_gather_enabled(),
+        "GRIM_QSA_DEVICE_GATHER=1 must enable"
+    );
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("GRIM_QSA_DEVICE_GATHER", v),
+            None => std::env::remove_var("GRIM_QSA_DEVICE_GATHER"),
+        }
+    }
+}
