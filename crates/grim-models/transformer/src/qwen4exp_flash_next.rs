@@ -23,6 +23,81 @@ pub fn flash_last_row_lmhead_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns `true` when `GRIM_QWEN4_DEVICE_ARGMAX` is truthy (`1` or `true`),
+/// running greedy argmax on ROCm via `gpu_argmax_into_dev` with a 4-byte D2H.
+pub fn qwen4_device_argmax_enabled() -> bool {
+    std::env::var("GRIM_QWEN4_DEVICE_ARGMAX")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Runs ROCm device argmax over the last row of `logits` (`[seq_len, vocab]` or `[vocab]`)
+/// via `gpu_argmax_into_dev` and reads back only 4 bytes (`u32`).
+/// Note: `grim_argmax_stage1` breaks ties in favor of the highest index, matching
+/// Rust's `Iterator::max_by`.
+pub fn argmax_last_row_on_device(logits: &Tensor) -> Result<u32> {
+    let dims = logits.shape().dims();
+    let last_row = if dims.len() >= 2 && dims[0] > 1 {
+        grim_nn::modules::slice_last_row_2d_on_device(logits)?
+    } else {
+        logits.clone()
+    };
+    let n = last_row.shape().elem_count();
+    if n == 0 {
+        return Err(grim_core::error::Error::Shape(
+            "argmax_last_row_on_device: empty logits".into(),
+        ));
+    }
+    let ordinal = last_row.device().ordinal().ok_or_else(|| {
+        grim_core::error::Error::Backend("argmax_last_row_on_device: non-GPU tensor".into())
+    })?;
+    let rocm = grim_backend_rocm::RocmDevice::shared_if_alive(ordinal).ok_or_else(|| {
+        grim_core::error::Error::Backend(format!(
+            "argmax_last_row_on_device: no live ROCm device {ordinal}"
+        ))
+    })?;
+    let x_r = last_row
+        .storage()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| {
+            grim_core::error::Error::Backend(
+                "argmax_last_row_on_device: logits storage is not RocmStorage".into(),
+            )
+        })?;
+    let x_ptr = x_r.device_ptr_u64().ok_or_else(|| {
+        grim_core::error::Error::Backend("argmax_last_row_on_device: invalid device ptr".into())
+    })?;
+    let u32_dt = grim_tensor::DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: grim_tensor::dtype::Storage::Native,
+    };
+    use grim_tensor::CoreTensorOps;
+    let out_st = rocm.zeros(&Shape::new(vec![1]), u32_dt)?;
+    let out_r = out_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| {
+            grim_core::error::Error::Backend("argmax_last_row_on_device: out not RocmStorage".into())
+        })?;
+    let out_ptr = out_r.device_ptr_u64().ok_or_else(|| {
+        grim_core::error::Error::Backend("argmax_last_row_on_device: invalid out ptr".into())
+    })?;
+    rocm.gpu_argmax_into_dev(x_ptr, n, out_ptr)?;
+    rocm.synchronize();
+    let bytes = out_r.copy_to_host()?;
+    if bytes.len() < 4 {
+        return Err(grim_core::error::Error::Backend(
+            "argmax_last_row_on_device: short D2H read".into(),
+        ));
+    }
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 // Config
 
 /// Configuration for Qwen3.8-Flash-Next architecture (matching HuggingFace `qwen4_exp_text`).
@@ -2785,6 +2860,34 @@ impl Qwen38FlashNext {
         Ok(probe::span(ProbeStage::LmHead, || {
             self.output.forward(normed)
         })?)
+    }
+
+    /// Greedy decode helper for Flash-Next: uses `argmax_last_row_on_device`
+    /// (4-byte D2H) when `GRIM_QWEN4_DEVICE_ARGMAX=1` on ROCm, falling back
+    /// loudly to host argmax on any error or when the flag is OFF.
+    pub fn forward_greedy_token(
+        &self,
+        session: &mut dyn SessionT,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        adapters: &[AdapterHandle],
+    ) -> Result<u32> {
+        let logits = self.forward(session, input_ids, positions, adapters)?;
+        if !logits.device().is_cpu() && qwen4_device_argmax_enabled() {
+            match argmax_last_row_on_device(&logits) {
+                Ok(tok) => return Ok(tok),
+                Err(err) => eprintln!("[qwen4-device-argmax] fallback: {err}"),
+            }
+        }
+        let v = logits.to_vec_f32()?;
+        let vocab = logits.shape().dims().last().copied().unwrap_or(v.len());
+        let start = v.len().saturating_sub(vocab);
+        Ok(v[start..]
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0))
     }
 }
 
