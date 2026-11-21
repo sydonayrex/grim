@@ -2963,12 +2963,19 @@ impl Qwen35 {
                 }
                 _ => false,
             });
+        let mtp_sidecar_path = std::env::var("GRIM_MTP_SIDECAR")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let nextn_reserve_bytes = match (mtp_mode.as_str(), nextn_idx) {
             ("off", _) => 0u64,
             ("on", None) => {
-                return Err(grim_core::error::Error::Backend(
-                    "GRIM_MTP=on but no nextn/MTP block tensors found in checkpoint".into(),
-                ));
+                if let Some(ref p) = mtp_sidecar_path {
+                    std::fs::metadata(p).map(|m| m.len()).unwrap_or(1_500_000_000)
+                } else {
+                    return Err(grim_core::error::Error::Backend(
+                        "GRIM_MTP=on but no nextn/MTP block tensors found in checkpoint (set GRIM_MTP_SIDECAR=/path/to/mtp.gguf)".into(),
+                    ));
+                }
             }
             ("on", Some(idx)) => {
                 qwen35_validate_nextn_tensors(ws, &cfg, idx, true)?;
@@ -3132,7 +3139,42 @@ impl Qwen35 {
                     }
                 }
             }
-            None => None,
+            None => {
+                if mtp_mode != "off" {
+                    if let Some(ref sidecar_path) = mtp_sidecar_path {
+                        eprintln!(
+                            "[qwen35] M0: loading external MTP sidecar {} on {} (GRIM_MTP={mtp_mode})",
+                            sidecar_path, last_device
+                        );
+                        let gguf = grim_format::tprov::SplitGgufProvider::open(sidecar_path).map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "failed to open GRIM_MTP_SIDECAR {sidecar_path}: {e}"
+                            ))
+                        })?;
+                        let sidecar_ws =
+                            WeightSource::root(&gguf, last_device.clone());
+                        let idx = qwen35_detect_nextn_idx(&sidecar_ws, cfg.num_layers)
+                            .or_else(|| qwen35_detect_nextn_idx(&sidecar_ws, 0))
+                            .unwrap_or(0);
+                        match Qwen35Nextn::load(&sidecar_ws, &cfg, idx, tp) {
+                            Ok(n) => Some(n),
+                            Err(e) => {
+                                if mtp_mode == "on" {
+                                    return Err(grim_core::error::Error::Backend(format!(
+                                        "GRIM_MTP=on failed loading sidecar {sidecar_path} blk.{idx}: {e}"
+                                    )));
+                                }
+                                eprintln!("[qwen35] warning: sidecar {sidecar_path} failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
         };
 
         // Dump the allocation ledger when asked.
@@ -3510,9 +3552,26 @@ impl CausalLm for Qwen35 {
                 }
             }
         }
+        let ttft_prof = seq_len > 1 && std::env::var("GRIM_TTFT_PROFILE").as_deref() == Ok("1");
+        let ttft_t0 = if ttft_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut ttft_gdn_ms = 0.0f64;
+        let mut ttft_attn_ms = 0.0f64;
+        let mut ttft_p2p_ms = 0.0f64;
         for (i, block) in self.blocks.iter().enumerate() {
             if h.device() != &block.device {
+                let tp0 = if ttft_prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 h = grim_nn::modules::move_to_device(&h, &block.device)?;
+                if let Some(t) = tp0 {
+                    ttft_p2p_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
             }
             // KDA-STEP-PROBE: in-process h fingerprint at decode step 1,
             // per layer — h vs the block's view of x, no cross-run dumps.
@@ -3549,7 +3608,20 @@ impl CausalLm for Qwen35 {
                 };
                 eprintln!("[qwen35-trace] layer {i} ({kind}) on {}", block.device);
             }
+            let tb0 = if ttft_prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             h = block.forward(&h, &positions_vec, &mut caches[i])?;
+            if let Some(t) = tb0 {
+                let dt = t.elapsed().as_secs_f64() * 1000.0;
+                if block.is_full_attention {
+                    ttft_attn_ms += dt;
+                } else {
+                    ttft_gdn_ms += dt;
+                }
+            }
             caches[i].current_pos += seq_len;
             // EAGER-PROBE: dump the live device recurrent state for layer 0
             // so it can be diffed against the graph's seeded state
@@ -3609,6 +3681,12 @@ impl CausalLm for Qwen35 {
                     }
                 }
             }
+        }
+        if let Some(t0) = ttft_t0 {
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[ttft-profile] seq_len={seq_len} total_layers={total_ms:.2}ms gdn={ttft_gdn_ms:.2}ms attn={ttft_attn_ms:.2}ms p2p={ttft_p2p_ms:.2}ms"
+            );
         }
         if trace {
             eprintln!("[qwen35-trace] all layers done, entering output norm");
