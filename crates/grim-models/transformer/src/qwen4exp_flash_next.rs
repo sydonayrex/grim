@@ -10,6 +10,19 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
+/// Returns `true` when `GRIM_FLASH_LAST_ROW_LMHEAD` is truthy (`1` or `true`),
+/// slicing prefill `[seq_len, hidden]` to the last row before the LM head unless
+/// full logits are requested via `SessionT::full_output_logits()`.
+pub fn flash_last_row_lmhead_enabled() -> bool {
+    std::env::var("GRIM_FLASH_LAST_ROW_LMHEAD")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 // Config
 
 /// Configuration for Qwen3.8-Flash-Next architecture (matching HuggingFace `qwen4_exp_text`).
@@ -2477,6 +2490,35 @@ impl Model for Qwen38FlashNext {
     }
 }
 
+impl Qwen38FlashNext {
+    /// Projects normalized final hidden states through the LM head, slicing
+    /// `[seq_len, hidden]` to `[1, hidden]` when `GRIM_FLASH_LAST_ROW_LMHEAD=1`
+    /// and full per-position logits are not requested. Keeps full `normed`
+    /// stored in `session.set_last_hidden_state`.
+    pub fn project_lm_head(&self, session: &mut dyn SessionT, normed: &Tensor) -> Result<Tensor> {
+        session.set_last_hidden_state(normed.clone());
+        let full_logits = session.full_output_logits()
+            || std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_some()
+            || std::env::var_os("GRIM_SCORE_FILE").is_some();
+        let rows = normed.shape().dims().first().copied().unwrap_or(1);
+        if flash_last_row_lmhead_enabled() && rows > 1 && !full_logits {
+            match grim_nn::modules::slice_last_row_2d_on_device(normed) {
+                Ok(last_row) => {
+                    return Ok(probe::span(ProbeStage::LmHead, || {
+                        self.output.forward(&last_row)
+                    })?);
+                }
+                Err(err) => {
+                    eprintln!("[last-row-lmhead] fallback: {err}");
+                }
+            }
+        }
+        Ok(probe::span(ProbeStage::LmHead, || {
+            self.output.forward(normed)
+        })?)
+    }
+}
+
 impl CausalLm for Qwen38FlashNext {
     fn new_session(&self) -> Box<dyn SessionT> {
         Box::new(grim_core::session::Session::new(self.device.clone()))
@@ -2568,11 +2610,16 @@ impl CausalLm for Qwen38FlashNext {
         }
         session.set_model_state(Box::new(gdn_state));
 
+        if flash_last_row_lmhead_enabled() {
+            let skip_head = session.skip_output_projection();
+            session.set_skip_output_projection(false);
+            if skip_head {
+                return Ok(cpu_tensor(Vec::new(), Shape::new(vec![0])));
+            }
+        }
+
         let normed = self.norm.forward(&h)?;
-        session.set_last_hidden_state(normed.clone());
-        Ok(probe::span(ProbeStage::LmHead, || {
-            self.output.forward(&normed)
-        })?)
+        self.project_lm_head(session, &normed)
     }
 }
 
