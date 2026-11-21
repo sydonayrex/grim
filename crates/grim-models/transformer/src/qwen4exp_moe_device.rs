@@ -148,3 +148,96 @@ where
 
     Ok(out_vec)
 }
+
+/// Returns `true` when `GRIM_MOE_DEVICE_ROUTER` is truthy (`1` or `true`).
+#[inline]
+pub fn moe_device_router_enabled() -> bool {
+    std::env::var("GRIM_MOE_DEVICE_ROUTER")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Device top-k router for Flash-Next (`seq_len == 1`) using `moe_route_topk_on_device`
+/// with `route_mode = 0` (global softmax, lower-index tie break) and `norm_weights = false`.
+/// Reads back only `k` expert IDs (`u32`) and `k` weights (`f32`) instead of all `num_experts`
+/// logits, then applies `routed_scaling_factor`.
+pub fn route_topk_flash_next_on_device(
+    router_logits: &Tensor,
+    num_experts: usize,
+    top_k: usize,
+    routed_scaling_factor: f32,
+) -> Result<(Vec<usize>, Vec<f32>)> {
+    let ordinal = router_logits.device().ordinal().ok_or_else(|| {
+        grim_core::error::Error::Backend("route_topk_flash_next_on_device: non-GPU tensor".into())
+    })?;
+    let dev = grim_backend_rocm::RocmDevice::shared_if_alive(ordinal).ok_or_else(|| {
+        grim_core::error::Error::Backend(format!(
+            "route_topk_flash_next_on_device: no live ROCm device {ordinal}"
+        ))
+    })?;
+    let l_rocm = router_logits
+        .storage()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| {
+            grim_core::error::Error::Backend(
+                "route_topk_flash_next_on_device: logits storage is not RocmStorage".into(),
+            )
+        })?;
+
+    let k = top_k.min(num_experts);
+    let u32_dt = grim_tensor::DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: grim_tensor::dtype::Storage::Native,
+    };
+    let shape_k = Shape::new(vec![k]);
+    use grim_tensor::CoreTensorOps;
+    let tok_st = dev.zeros(&shape_k, u32_dt.clone())?;
+    let exp_st = dev.zeros(&shape_k, u32_dt)?;
+    let w_st = dev.zeros(&shape_k, grim_tensor::DType::F32)?;
+
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("tok_st not RocmStorage".into()))?;
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("exp_st not RocmStorage".into()))?;
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend("w_st not RocmStorage".into()))?;
+
+    dev.moe_route_topk_on_device(
+        l_rocm,
+        None,
+        tok_rocm,
+        exp_rocm,
+        w_rocm,
+        1,
+        num_experts,
+        k,
+        0,
+        false,
+    )?;
+    dev.synchronize();
+
+    let exp_bytes = exp_rocm.copy_to_host()?;
+    let w_bytes = w_rocm.copy_to_host()?;
+    probe::record_d2h(ProbeStage::Router, exp_bytes.len() + w_bytes.len());
+
+    let ids: Vec<usize> = exp_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .collect();
+    let weights: Vec<f32> = w_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * routed_scaling_factor)
+        .collect();
+    Ok((ids, weights))
+}

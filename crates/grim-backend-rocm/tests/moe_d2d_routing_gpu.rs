@@ -2237,3 +2237,98 @@ fn gpu_device_helper_returns_none_without_env_gate() {
         "no env gate => no device probe, never a panic"
     );
 }
+
+/// Q2: Flash-Next geometry (512 experts, top_k=10, route_mode=0 global softmax,
+/// norm_weights=false) with adjacent ties and an all-equal uniform row.
+#[test]
+#[ignore]
+fn route_topk_flash_next_512_top10_ties_and_uniform_matches_host() {
+    let _guard = gpu_lock();
+    let Some(dev) = gpu_device() else { return };
+    const E: usize = 512;
+    const K: usize = 10;
+    const S: usize = 2;
+
+    let mut logits = vec![0.0f32; S * E];
+    // Row 0: deterministic spread with deliberate adjacent equal-logit ties
+    for e in 0..E {
+        logits[e] = ((e as f32) * 0.37).sin() * 2.0 - 1.0;
+    }
+    logits[17] = 5.0;
+    logits[18] = 5.0; // adjacent tie -> lower index 17 must precede 18
+    logits[200] = 4.5;
+    logits[201] = 4.5; // adjacent tie -> lower index 200 must precede 201
+    // Row 1: all-equal uniform row -> must pick 0..10 in order with weight 1/512
+    for e in 0..E {
+        logits[E + e] = 1.25;
+    }
+
+    let num_pairs = S * K;
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![S, E]), DType::F32)
+        .unwrap();
+    let l_rocm = l_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let u32_dt = DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: Storage::Native,
+    };
+    let tok_st = dev.zeros(&Shape::new(vec![num_pairs]), u32_dt.clone()).unwrap();
+    let exp_st = dev.zeros(&Shape::new(vec![num_pairs]), u32_dt).unwrap();
+    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+
+    dev.moe_route_topk_on_device(
+        l_rocm, None, tok_rocm, exp_rocm, w_rocm, S, E, K, 0, false,
+    )
+    .unwrap();
+    dev.synchronize();
+
+    let exp_bytes = exp_rocm.copy_to_host().unwrap();
+    let w_bytes = w_rocm.copy_to_host().unwrap();
+    let dev_ids: Vec<usize> = exp_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .collect();
+    let dev_w: Vec<f32> = w_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    for row_idx in 0..S {
+        let row = &logits[row_idx * E..(row_idx + 1) * E];
+        let mut indexed: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let topk = &indexed[..K];
+        let max_l = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
+        let host_ids: Vec<usize> = topk.iter().map(|(id, _)| *id).collect();
+        let host_w: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp() / denom).collect();
+
+        let got_ids = &dev_ids[row_idx * K..(row_idx + 1) * K];
+        let got_w = &dev_w[row_idx * K..(row_idx + 1) * K];
+        assert_eq!(got_ids, host_ids.as_slice(), "row {row_idx} expert IDs mismatch");
+        for i in 0..K {
+            let diff = (got_w[i] - host_w[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "row {row_idx} slot {i} weight diff={diff} (dev={} host={})",
+                got_w[i],
+                host_w[i]
+            );
+        }
+    }
+}

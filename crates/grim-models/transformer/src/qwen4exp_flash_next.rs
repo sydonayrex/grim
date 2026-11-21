@@ -797,32 +797,34 @@ impl Qwen38MoeBlock {
             Qwen38MoeExperts::Offloaded(_) => self.gate.weight.shape().dims()[0],
         };
 
-        let logits_vec = probe::span(ProbeStage::Router, || -> Result<Vec<f32>> {
-            let router_logits = self.gate.forward(x)?;
-            let v = router_logits.to_vec_f32()?;
-            if !x.device().is_cpu() {
-                probe::record_d2h(ProbeStage::Router, v.len() * std::mem::size_of::<f32>());
-            }
-            Ok(v)
-        })?;
+        let router_logits = probe::span(ProbeStage::Router, || self.gate.forward(x))?;
 
         if x.device() != &Device::Cpu && seq_len == 1 {
-            let (topk_ids, weights) = probe::span(ProbeStage::Router, || {
-                let row = &logits_vec[0..num_exp];
-                let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let k = self.num_experts_per_tok.min(num_exp);
-                let topk = &indexed[..k];
-
-                let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
-                let weights: Vec<f32> = topk
-                    .iter()
-                    .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
-                    .collect();
-                let ids: Vec<usize> = topk.iter().map(|(id, _)| *id).collect();
-                (ids, weights)
-            });
+            let (topk_ids, weights) = probe::span(ProbeStage::Router, || -> Result<(Vec<usize>, Vec<f32>)> {
+                if crate::qwen4exp_moe_device::moe_device_router_enabled() {
+                    match crate::qwen4exp_moe_device::route_topk_flash_next_on_device(
+                        &router_logits,
+                        num_exp,
+                        self.num_experts_per_tok,
+                        self.routed_scaling_factor,
+                    ) {
+                        Ok(res) => return Ok(res),
+                        Err(err) => {
+                            eprintln!("[moe-device-router] fallback: {err}");
+                        }
+                    }
+                }
+                let logits_vec = router_logits.to_vec_f32()?;
+                probe::record_d2h(
+                    ProbeStage::Router,
+                    logits_vec.len() * std::mem::size_of::<f32>(),
+                );
+                Ok(crate::qwen4exp_moe_device::route_row_host(
+                    &logits_vec[0..num_exp],
+                    self.num_experts_per_tok,
+                    self.routed_scaling_factor,
+                ))
+            })?;
 
             return probe::span(ProbeStage::ExpertStage, || -> Result<Tensor> {
                 let mut acc: Option<Tensor> = if self.shared_expert.is_some() {
@@ -857,6 +859,14 @@ impl Qwen38MoeBlock {
                 Ok(x.clone())
             });
         }
+
+        let logits_vec = probe::span(ProbeStage::Router, || -> Result<Vec<f32>> {
+            let v = router_logits.to_vec_f32()?;
+            if !x.device().is_cpu() {
+                probe::record_d2h(ProbeStage::Router, v.len() * std::mem::size_of::<f32>());
+            }
+            Ok(v)
+        })?;
 
         let x_vec = x.to_vec_f32()?;
         if !x.device().is_cpu() {
