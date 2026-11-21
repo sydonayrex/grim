@@ -7475,6 +7475,14 @@ impl DecodeGraphModel for Qwen35 {
             .unwrap_or(500);
         let min_free_bytes: u64 = min_free_mb * 1024 * 1024;
         for &ord in &ords {
+            // Flush idle prefill blocks from the caching allocator back to HIP so
+            // `vram_info(ord)` measures real free VRAM rather than pool-held slack.
+            {
+                let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+                grim_backend_rocm::RocmDevice::shared(ord)
+                    .allocator_handle()
+                    .empty_cache();
+            }
             let (free, total) = grim_backend_rocm::vram_info(ord);
             if total > 0 && free < min_free_bytes {
                 return Err(grim_core::error::Error::Backend(format!(
