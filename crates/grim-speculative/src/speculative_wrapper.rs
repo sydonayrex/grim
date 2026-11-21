@@ -113,6 +113,8 @@ pub struct SpeculativeCausalLm {
     /// Optional m=2 DecodeGraph for 1-pass batched NativeMtp.
     #[allow(dead_code)]
     graph_m2: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    /// Optional adaptive `may_verify` gate (`GRIM_SPEC_MAY_VERIFY=1`, default OFF).
+    may_verify: Option<Mutex<crate::may_verify::MayVerifyGate>>,
 }
 
 /// Backend-agnostic GPU verification hook (Task 10.6). Implemented by the
@@ -152,6 +154,8 @@ impl SpeculativeCausalLm {
             pending_mtp_draft: Mutex::new(None),
             chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
+            may_verify: crate::may_verify::spec_may_verify_enabled()
+                .then(|| Mutex::new(crate::may_verify::MayVerifyGate::with_defaults(4))),
         }
     }
 
@@ -198,6 +202,8 @@ impl SpeculativeCausalLm {
             pending_mtp_draft: Mutex::new(None),
             chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
+            may_verify: crate::may_verify::spec_may_verify_enabled()
+                .then(|| Mutex::new(crate::may_verify::MayVerifyGate::with_defaults(4))),
         }
     }
 
@@ -221,6 +227,8 @@ impl SpeculativeCausalLm {
             pending_mtp_draft: Mutex::new(None),
             chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
+            may_verify: crate::may_verify::spec_may_verify_enabled()
+                .then(|| Mutex::new(crate::may_verify::MayVerifyGate::with_defaults(4))),
         }
     }
 
@@ -913,7 +921,12 @@ impl SpeculativeCausalLm {
             session.set_last_accepted_tokens(emitted);
             return Ok(emitted_logits);
         }
-        if let Some(draft_block) = pending_draft {
+        let allow_verify = self
+            .may_verify
+            .as_ref()
+            .map(|g| g.lock().unwrap_or_else(|e| e.into_inner()).should_verify())
+            .unwrap_or(true);
+        if let Some(draft_block) = pending_draft.filter(|_| allow_verify) {
             let verify_len = draft_block.tokens.len().min(depth);
             if verify_len > 0 && mtp_1pass {
                 let kv_len_before = session.kv_mut().map(|kv| kv.len());
@@ -988,6 +1001,12 @@ impl SpeculativeCausalLm {
                     &mut rng,
                     greedy,
                 )?;
+                if let Some(gate_mtx) = &self.may_verify {
+                    gate_mtx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .observe(accepted_count, verify_len);
+                }
                 if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
                     let dtok0 = draft_block.tokens.first().copied().unwrap_or(0);
                     let btok = input_ids.to_vec_f32().ok().and_then(|v| v.first().copied()).unwrap_or(0.0) as u32;

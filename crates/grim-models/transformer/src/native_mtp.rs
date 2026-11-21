@@ -317,10 +317,13 @@ pub fn flash_mtp_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Qwen3.8-Flash-Next model with genuine Multi-Token Prediction (MTP) layers.
+/// Qwen3.8-Flash-Next model with genuine Multi-Token Prediction (MTP) layers
+/// and optional wide-stream Hyper-Connection MTP (`grim_nn::MtpHcBlock`).
 pub struct Qwen38FlashNextMtp {
     pub base: crate::qwen4exp_flash_next::Qwen38FlashNext,
     pub mtp_layers: Vec<MtpLayer>,
+    pub mtp_hc: Option<grim_nn::MtpHcBlock>,
+    pub hc_draft_depth: usize,
 }
 
 impl Qwen38FlashNextMtp {
@@ -328,7 +331,25 @@ impl Qwen38FlashNextMtp {
         base: crate::qwen4exp_flash_next::Qwen38FlashNext,
         mtp_layers: Vec<MtpLayer>,
     ) -> Self {
-        Self { base, mtp_layers }
+        Self {
+            base,
+            mtp_layers,
+            mtp_hc: None,
+            hc_draft_depth: 0,
+        }
+    }
+
+    pub fn with_mtp_hc(
+        base: crate::qwen4exp_flash_next::Qwen38FlashNext,
+        mtp_hc: grim_nn::MtpHcBlock,
+        draft_depth: usize,
+    ) -> Self {
+        Self {
+            base,
+            mtp_layers: Vec::new(),
+            mtp_hc: Some(mtp_hc),
+            hc_draft_depth: draft_depth,
+        }
     }
 
     pub fn new_random(base: crate::qwen4exp_flash_next::Qwen38FlashNext, depth: usize) -> Self {
@@ -338,7 +359,22 @@ impl Qwen38FlashNextMtp {
         let mtp_layers = (0..depth)
             .map(|_| MtpLayer::random(hidden_size, vocab_size, eps))
             .collect();
-        Self { base, mtp_layers }
+        Self {
+            base,
+            mtp_layers,
+            mtp_hc: None,
+            hc_draft_depth: 0,
+        }
+    }
+
+    pub fn new_random_hc(base: crate::qwen4exp_flash_next::Qwen38FlashNext, depth: usize) -> Self {
+        let hc = grim_nn::MtpHcBlock::seeded(
+            base.cfg.hc_count.max(1),
+            base.cfg.hidden_size,
+            base.cfg.rms_norm_eps,
+            42,
+        );
+        Self::with_mtp_hc(base, hc, depth)
     }
 
     /// Runs a multi-token speculative verification forward (`K + 1` tokens)
@@ -397,7 +433,11 @@ impl CausalLm for Qwen38FlashNextMtp {
 
 impl MtpDepthProvider for Qwen38FlashNextMtp {
     fn mtp_depth(&self) -> usize {
-        self.mtp_layers.len()
+        if self.mtp_hc.is_some() && grim_nn::mtp_hc_enabled() {
+            self.hc_draft_depth
+        } else {
+            self.mtp_layers.len()
+        }
     }
 
     fn predict_mtp_tokens(
@@ -423,6 +463,46 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
         }
 
         let mut curr_token = argmax_last_row_device(base_logits, vocab_size)?;
+
+        if let Some(ref hc) = self.mtp_hc {
+            if grim_nn::mtp_hc_enabled() && self.hc_draft_depth > 0 {
+                if let Some(wide_h) = session.get_last_wide_hidden_state() {
+                    let wide_dim = hc.hc_count * hc.hidden_size;
+                    let wide_row = if wide_h.shape().dims().last() == Some(&wide_dim) {
+                        wide_h
+                    } else {
+                        // Tile narrow hidden across hc_count sub-streams if trunk ran narrow.
+                        let last = grim_nn::modules::slice_last_row_2d_on_device(&wide_h)?;
+                        let v = last.to_vec_f32()?;
+                        let mut tiled = Vec::with_capacity(wide_dim);
+                        for _ in 0..hc.hc_count {
+                            tiled.extend_from_slice(&v[..hc.hidden_size.min(v.len())]);
+                        }
+                        grim_nn::modules::move_to_device(
+                            &cpu_tensor(tiled, Shape::new(vec![1, wide_dim])),
+                            last.device(),
+                        )?
+                    };
+                    let mut carry = grim_nn::MtpHcCarry::new(
+                        wide_row.device(),
+                        hc.hc_count,
+                        hc.hidden_size,
+                    )?;
+                    let (toks, _) = hc.draft_k_tokens(
+                        &wide_row,
+                        curr_token,
+                        session.current_pos() as u32,
+                        self.hc_draft_depth,
+                        &self.base.tok_embeddings.weight,
+                        vocab_size,
+                        &self.base.output,
+                        &mut carry,
+                        |w, _| Ok(w.clone()),
+                    )?;
+                    return Ok(toks);
+                }
+            }
+        }
 
         let mut curr_h = if let Some(last_h) = session.get_last_hidden_state() {
             grim_nn::modules::slice_last_row_2d_on_device(&last_h)?

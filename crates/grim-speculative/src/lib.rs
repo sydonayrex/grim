@@ -13,6 +13,7 @@ pub mod qwen35_mtp_adapter;
 pub mod mamba_speculative;
 pub mod markov_head;
 pub mod may_verify;
+pub mod mtp_provider_adapter;
 pub mod native_mtp;
 pub mod draft_policy;
 pub mod speculative_wrapper;
@@ -28,6 +29,7 @@ pub use confidence_scheduler::{
 pub use depth_tuner::{SpeculativeDepthPidConfig, SpeculativeDepthPidController};
 pub use draft_policy::{draft_policy_enabled, DraftPolicy, DraftSource};
 pub use may_verify::{spec_may_verify_enabled, MayVerifyGate};
+pub use mtp_provider_adapter::MtpProviderAdapter;
 pub use distill::{compress_distill_report, train_speculative_draft};
 pub use draft_backbone::{DraftBackbone, DraftBlock};
 pub use eagle3_drafter::Eagle3Drafter;

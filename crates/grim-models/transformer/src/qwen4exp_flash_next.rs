@@ -3109,6 +3109,7 @@ impl CausalLm for Qwen38FlashNext {
             }
         }
 
+        session.set_last_wide_hidden_state(h.clone());
         let normed = self.norm.forward(&h)?;
         self.project_lm_head(session, &normed)
     }

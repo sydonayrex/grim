@@ -182,6 +182,13 @@ pub trait SessionT: Send {
     }
     fn set_device_argmax(&mut self, _tok: Option<u32>) {}
 
+    /// Wide residual stream `[seq, hc_count * hidden]` captured before final output
+    /// norm/mixer for hyper-connection MTP heads (`grim_nn::MtpHcBlock`).
+    fn get_last_wide_hidden_state(&self) -> Option<Tensor> {
+        None
+    }
+    fn set_last_wide_hidden_state(&mut self, _hidden: Tensor) {}
+
     /// M2 (speculative verify): snapshot model/recurrent state for rollback.
     /// Returns an opaque snapshot owned by the caller; `None` if no recurrent state.
     fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
@@ -234,6 +241,8 @@ pub struct Inner {
     pub last_sampled_token: Option<u32>,
     /// Precomputed device greedy argmax token (Q6).
     pub device_argmax: Option<u32>,
+    /// Pre-mixer wide residual stream `[seq, hc_count * hidden]` for HC-MTP heads.
+    pub last_wide_hidden_state: Option<Tensor>,
     /// Model-installed recurrent-state hooks (T2 hybrid prefix reuse). `None`
     /// means the session has no recurrent state to snapshot or restore.
     pub recurrent_hooks: Option<std::sync::Arc<dyn RecurrentHooks>>,
@@ -255,6 +264,7 @@ impl Inner {
             sampling_greedy: false,
             last_sampled_token: None,
             device_argmax: None,
+            last_wide_hidden_state: None,
             recurrent_hooks: None,
         }
     }
@@ -273,6 +283,7 @@ impl Inner {
             sampling_greedy: false,
             last_sampled_token: None,
             device_argmax: None,
+            last_wide_hidden_state: None,
             recurrent_hooks: None,
         }
     }
@@ -406,6 +417,12 @@ impl SessionT for Inner {
     }
     fn set_device_argmax(&mut self, tok: Option<u32>) {
         self.device_argmax = tok;
+    }
+    fn get_last_wide_hidden_state(&self) -> Option<Tensor> {
+        self.last_wide_hidden_state.clone()
+    }
+    fn set_last_wide_hidden_state(&mut self, hidden: Tensor) {
+        self.last_wide_hidden_state = Some(hidden);
     }
 
     fn set_recurrent_hooks(&mut self, hooks: std::sync::Arc<dyn RecurrentHooks>) {
