@@ -2855,6 +2855,21 @@ fn load_model_from_config(
             let m = T5::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Inkling2Loop => {
+            // Full HF config.json is required: the architecture has ~30 inkling-specific
+            // fields (loop bounds, rel bias geometry, local layer ids) that have no
+            // generic hparams counterpart.
+            let raw_json = raw_config_str
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .ok_or_else(|| {
+                    grim_core::error::Error::Backend(
+                        "inkling2_loop: config.json (with text_config) is required".into(),
+                    )
+                })?;
+            let cfg = grim_models_transformer::Inkling2LoopConfig::from_hf(&raw_json);
+            let m = grim_models_transformer::Inkling2Loop::load(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::MuseGlimmer => {
             let muse_cfg = if let Some(raw_json) =
                 raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
