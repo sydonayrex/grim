@@ -6248,6 +6248,162 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q4k_q81_gemv_rows_r4(
 // kernel body, verbatim, so the hoist can be gated on BYTE-IDENTICAL
 // output instead of a hand oracle. Not on any dispatch path; only
 // tests/dot4_kquant_grouped_parity.rs launches it.
+
+// LDS-tiled MMQ (TILE_M=16, TILE_N=64, TILE_K=256) for Q4_K x Q8_1 short-prompt prefill.
+// 128 threads (4 wave32s), 8 float accumulators per thread, ~17 KB LDS (3 WGs/CU on RDNA4).
+extern "C" __global__ void __launch_bounds__(128) grim_mmq_q4k_q81_m16n64(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q4k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int tid = threadIdx.x; // 0..127
+    const int col_base = blockIdx.x * 64;
+    const int row_base = blockIdx.y * 16;
+    if (row_base >= M || col_base >= N) return;
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const long long col_stride = (long long)n_sb * GRIM_Q4K_BYTES;
+
+    __shared__ int          A_q[16][8][8];
+    __shared__ float        A_d[16][8];
+    __shared__ float        A_s[16][8];
+    __shared__ unsigned int B_qs[64][32];
+    __shared__ float        B_dsc[64][8];
+    __shared__ float        B_dm[64][8];
+
+    // Output mapping: each thread computes 1 row (0..15) x 8 columns (col_g*8 .. col_g*8+7).
+    const int row_t = tid & 15;
+    const int col_g = tid >> 4; // 0..7
+    const int c0 = col_g * 8;
+    float facc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Cooperative load indices:
+    // A: 128 threads = 16 rows x 8 sub-blocks (1:1).
+    const int a_r   = tid >> 3; // 0..15
+    const int a_sub = tid & 7;  // 0..7
+    const bool a_valid = (row_base + a_r < M);
+
+    // B: 128 threads = 64 cols x 2 halves (each loads 16 u32 qs words + 4 sub-block scales).
+    const int b_c    = tid >> 1; // 0..63
+    const int b_half = tid & 1;  // 0..1
+    const bool b_valid = (col_base + b_c < N);
+    const unsigned char* b_col_ptr = B_q4k + (long long)(col_base + b_c) * col_stride;
+
+    for (int sb = 0; sb < n_sb; sb++) {
+        // 1. Load A_q81 tile into LDS
+        if (a_valid) {
+            const unsigned char* a_blk = A_q81 + (long long)(row_base + a_r) * a_row_stride
+                                               + (long long)(sb * 8 + a_sub) * GRIM_Q8_1_BYTES;
+            A_d[a_r][a_sub] = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+            A_s[a_r][a_sub] = fp16_to_float_device(((const unsigned short*)a_blk)[1]);
+            int tmp[8];
+            __builtin_memcpy(tmp, a_blk + 4, 32);
+            #pragma unroll
+            for (int w = 0; w < 8; w++) A_q[a_r][a_sub][w] = tmp[w];
+        } else {
+            A_d[a_r][a_sub] = 0.0f;
+            A_s[a_r][a_sub] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) A_q[a_r][a_sub][w] = 0;
+        }
+
+        // 2. Load B_q4k tile into LDS
+        if (b_valid) {
+            const unsigned char* b_sb = b_col_ptr + (long long)sb * GRIM_Q4K_BYTES;
+            const uint4 hdr = ((const uint4*)b_sb)[0];
+            const float d    = fp16_to_float_device((unsigned short)(hdr.x & 0xFFFFu));
+            const float dmin = fp16_to_float_device((unsigned short)(hdr.x >> 16));
+            const unsigned sc0 = hdr.y, sc1 = hdr.z, sc2 = hdr.w;
+            if (b_half == 0) {
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int sh = 8 * s;
+                    B_dsc[b_c][s] = d    * (float)((sc0 >> sh) & 63u);
+                    B_dm[b_c][s]  = dmin * (float)((sc1 >> sh) & 63u);
+                }
+                const uint4* qsrc = (const uint4*)(b_sb + 16);
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const uint4 qv = qsrc[v];
+                    B_qs[b_c][v * 4 + 0] = qv.x;
+                    B_qs[b_c][v * 4 + 1] = qv.y;
+                    B_qs[b_c][v * 4 + 2] = qv.z;
+                    B_qs[b_c][v * 4 + 3] = qv.w;
+                }
+            } else {
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int sh = 8 * s;
+                    const unsigned b_hi = (sc2 >> sh) & 0xFFu;
+                    const unsigned b_lo = (sc0 >> sh) & 0xFFu;
+                    const unsigned b_mi = (sc1 >> sh) & 0xFFu;
+                    const int sc = (int)((b_hi & 0x0Fu) | ((b_lo >> 6) << 4));
+                    const int m  = (int)((b_hi >> 4)    | ((b_mi >> 6) << 4));
+                    B_dsc[b_c][4 + s] = d    * (float)sc;
+                    B_dm[b_c][4 + s]  = dmin * (float)m;
+                }
+                const uint4* qsrc = (const uint4*)(b_sb + 16 + 64);
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const uint4 qv = qsrc[v];
+                    B_qs[b_c][16 + v * 4 + 0] = qv.x;
+                    B_qs[b_c][16 + v * 4 + 1] = qv.y;
+                    B_qs[b_c][16 + v * 4 + 2] = qv.z;
+                    B_qs[b_c][16 + v * 4 + 3] = qv.w;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                B_dsc[b_c][b_half * 4 + s] = 0.0f;
+                B_dm[b_c][b_half * 4 + s]  = 0.0f;
+            }
+            #pragma unroll
+            for (int w = 0; w < 16; w++) B_qs[b_c][b_half * 16 + w] = 0u;
+        }
+
+        __syncthreads();
+
+        // 3. Compute 1 row x 8 cols across all 8 sub-blocks
+        #pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const float d_a   = A_d[row_t][sub];
+            const float sum_a = A_s[row_t][sub];
+            int a4[8];
+            #pragma unroll
+            for (int w = 0; w < 8; w++) a4[w] = A_q[row_t][sub][w];
+            const int chunk_base = (sub >> 1) * 8;
+            const int hi = sub & 1;
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int col = c0 + j;
+                int pos = 0;
+                #pragma unroll
+                for (int w = 0; w < 8; w++) {
+                    const unsigned qw = B_qs[col][chunk_base + w];
+                    const unsigned nib = hi ? ((qw >> 4) & 0x0F0F0F0Fu) : (qw & 0x0F0F0F0Fu);
+                    pos = grim_sdot4(a4[w], (int)nib, pos);
+                }
+                facc[j] += B_dsc[col][sub] * ((float)pos * d_a) - B_dm[col][sub] * sum_a;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (row_base + row_t < M) {
+        const long long out_row = (long long)(row_base + row_t) * N + col_base + c0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (col_base + c0 + j < N) {
+                C[out_row + j] = facc[j];
+            }
+        }
+    }
+}
 extern "C" __global__ void grim_dot4_q4k_q81_gemv_ref(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q4k,

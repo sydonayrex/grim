@@ -7211,6 +7211,11 @@ impl DecodeGraphModel for Qwen35 {
                 };
                 for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
                     let mut dims = arena.shape().dims().to_vec();
+                    // C2: Qwen35 MTP verify is single-sequence (eff_batch = 1), so
+                    // k_arena/v_arena only need `max_ctx` rows regardless of `batch`.
+                    if let Some(first) = dims.first_mut() {
+                        *first = max_ctx;
+                    }
                     if let Some(last) = dims.last_mut() {
                         *last = ((*last as f64) * packed_factor) as usize;
                     }
