@@ -589,6 +589,7 @@ struct Qwen38MoeBlock {
     /// CPU (SSD/mmap-backed packed GGUF pages) and the active experts are
     /// staged to the compute device on demand, keyed by expert index.
     expert_stage: std::sync::Mutex<std::collections::HashMap<usize, (Linear, Linear, Linear)>>,
+    residency_policy: std::sync::Mutex<grim_memory::UseCappedResidentPolicy>,
 }
 
 impl Qwen38MoeBlock {
@@ -685,6 +686,9 @@ impl Qwen38MoeBlock {
             routed_scaling_factor: cfg.routed_scaling_factor,
             _charon_cache: crate::shared_moe::CharonCache::new(),
             expert_stage: std::sync::Mutex::new(std::collections::HashMap::new()),
+            residency_policy: std::sync::Mutex::new(grim_memory::UseCappedResidentPolicy::new(
+                512, 256,
+            )),
         })
     }
 
@@ -699,6 +703,12 @@ impl Qwen38MoeBlock {
         }
         let staged = {
             let mut cache = self.expert_stage.lock().unwrap();
+            let use_victim = grim_memory::moe_use_victim_enabled();
+            if use_victim {
+                if let Ok(mut pol) = self.residency_policy.lock() {
+                    pol.count_look(idx);
+                }
+            }
             let cached = cache
                 .get(&idx)
                 .filter(|h| h.0.weight.device() == &target)
@@ -708,7 +718,18 @@ impl Qwen38MoeBlock {
             } else {
                 cache.remove(&idx);
                 if cache.len() >= 8 {
-                    cache.clear();
+                    if use_victim {
+                        if let Ok(pol) = self.residency_policy.lock() {
+                            let cached_ids: Vec<usize> = cache.keys().copied().collect();
+                            let keep: std::collections::HashSet<usize> =
+                                pol.keep_hottest(&cached_ids).into_iter().take(7).collect();
+                            cache.retain(|k, _| keep.contains(k));
+                        } else {
+                            cache.clear();
+                        }
+                    } else {
+                        cache.clear();
+                    }
                 }
                 let triple = match &self.experts {
                     Qwen38MoeExperts::Individual(list) => {
@@ -787,6 +808,11 @@ impl Qwen38MoeBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if grim_memory::moe_use_victim_enabled() {
+            if let Ok(mut pol) = self.residency_policy.lock() {
+                pol.begin_token();
+            }
+        }
         let dims = x.shape().dims();
         let hidden_dim = dims[dims.len() - 1];
         let seq_len = x.shape().elem_count() / hidden_dim;
@@ -3324,6 +3350,9 @@ mod moe_d2d_parity_tests {
             routed_scaling_factor: 1.0,
             _charon_cache: crate::shared_moe::CharonCache::new(),
             expert_stage: std::sync::Mutex::new(std::collections::HashMap::new()),
+            residency_policy: std::sync::Mutex::new(grim_memory::UseCappedResidentPolicy::new(
+                512, 256,
+            )),
         }
     }
 

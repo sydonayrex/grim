@@ -324,6 +324,114 @@ impl LruResidencyTracker {
     }
 }
 
+/// Returns `true` when `GRIM_MOE_USE_VICTIM` is truthy (`1` or `true`).
+#[inline]
+pub fn moe_use_victim_enabled() -> bool {
+    std::env::var("GRIM_MOE_USE_VICTIM")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Use-capped residency policy (Basalt tier_policy transfer, Q5).
+/// cap = 15 looks; counts halve every `half_life` tokens; MRU tie-break:
+/// among equal counts the MOST recently used expert is kept and the LEAST
+/// recently used is the victim.
+#[derive(Debug, Clone)]
+pub struct UseCappedResidentPolicy {
+    looks: Vec<u16>,
+    last_seen: Vec<u64>,
+    clock: u64,
+    access_seq: u64,
+    half_life: u64,
+}
+
+impl UseCappedResidentPolicy {
+    pub fn new(n_experts: usize, half_life: u64) -> Self {
+        Self {
+            looks: vec![0; n_experts],
+            last_seen: vec![0; n_experts],
+            clock: 0,
+            access_seq: 0,
+            half_life: half_life.max(1),
+        }
+    }
+
+    pub fn begin_token(&mut self) {
+        self.clock += 1;
+        if self.clock % self.half_life == 0 {
+            for c in &mut self.looks {
+                *c /= 2;
+            }
+        }
+    }
+
+    pub fn count_look(&mut self, expert: usize) {
+        self.access_seq += 1;
+        if let Some(c) = self.looks.get_mut(expert) {
+            *c = c.saturating_add(1).min(15);
+        }
+        if let Some(t) = self.last_seen.get_mut(expert) {
+            *t = self.access_seq;
+        }
+    }
+
+    /// Mark an expert as touched WITHOUT incrementing its use count (MRU bookkeeping).
+    pub fn touch(&mut self, expert: usize) {
+        self.access_seq += 1;
+        if let Some(t) = self.last_seen.get_mut(expert) {
+            *t = self.access_seq;
+        }
+    }
+
+    pub fn look(&self, expert: usize) -> u16 {
+        self.looks.get(expert).copied().unwrap_or(0)
+    }
+
+    pub fn forget_use(&mut self) {
+        for c in &mut self.looks {
+            *c = 0;
+        }
+    }
+
+    pub fn victim(&self, protected: &[usize]) -> Option<usize> {
+        let mut best: Option<(u16, u64, usize)> = None; // (looks, oldest last_seen, index)
+        for (i, c) in self.looks.iter().enumerate() {
+            if protected.contains(&i) {
+                continue;
+            }
+            let key = (*c, self.last_seen[i], i);
+            let better = match best {
+                None => true,
+                Some((bc, bt, _)) => *c < bc || (*c == bc && self.last_seen[i] < bt),
+            };
+            if better {
+                best = Some(key);
+            }
+        }
+        best.map(|(_, _, i)| i)
+    }
+
+    pub fn keep_hottest(&self, keep: &[usize]) -> Vec<usize> {
+        let mut v = keep.to_vec();
+        v.sort_unstable_by(|a, b| {
+            self.look(*b)
+                .cmp(&self.look(*a))
+                .then_with(|| {
+                    self.last_seen
+                        .get(*b)
+                        .copied()
+                        .unwrap_or(0)
+                        .cmp(&self.last_seen.get(*a).copied().unwrap_or(0))
+                })
+        });
+        v
+    }
+}
+
 // --- astrum P3: frequency-ranked expert route trace/profile (CPU logic, default OFF) ---
 
 /// Per-layer expert activation frequency trace (P3). Selection-only input for

@@ -15,7 +15,8 @@ pub mod moe_budget;
 
 pub use moe_budget::{
     ElasticMoEAllocation, ForesightSwapWindow, LruResidencyTracker, MoeResidentBudget,
-    ResidentTier, LayerQuotaExpertCache, moe_layer_quota_enabled,
+    ResidentTier, LayerQuotaExpertCache, UseCappedResidentPolicy, moe_layer_quota_enabled,
+    moe_use_victim_enabled,
 };
 
 /// Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
