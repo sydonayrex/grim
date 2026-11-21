@@ -25,6 +25,8 @@ pub struct ExpertOffloadBanks {
     dtype: DType,
     provenance: QuantProvenance,
     cache: Mutex<HashMap<usize, (Linear, Linear, Linear)>>,
+    /// Use-capped residency state (cap 15, MRU tie-break) behind `GRIM_MOE_USE_VICTIM=1`.
+    use_stats: Mutex<(Vec<u16>, Vec<u64>, u64)>,
 }
 
 impl ExpertOffloadBanks {
@@ -65,6 +67,7 @@ impl ExpertOffloadBanks {
             dtype: meta.dtype,
             provenance: meta.provenance,
             cache: Mutex::new(HashMap::new()),
+            use_stats: Mutex::new((vec![0u16; num_experts], vec![0u64; num_experts], 0u64)),
         })
     }
 
@@ -91,6 +94,25 @@ impl ExpertOffloadBanks {
 
     /// Fetch expert `idx`'s gate/up/down as staged device Linears.
     pub fn get(&self, idx: usize, target: &Device) -> Result<(Linear, Linear, Linear)> {
+        let use_victim = std::env::var("GRIM_MOE_USE_VICTIM")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        if use_victim {
+            if let Ok(mut st) = self.use_stats.lock() {
+                st.2 = st.2.wrapping_add(1);
+                let seq = st.2;
+                if let Some(c) = st.0.get_mut(idx) {
+                    *c = c.saturating_add(1).min(15);
+                }
+                if let Some(t) = st.1.get_mut(idx) {
+                    *t = seq;
+                }
+            }
+        }
         {
             let cache = self.cache.lock().unwrap();
             if let Some(hit) = cache.get(&idx) {
@@ -111,7 +133,29 @@ impl ExpertOffloadBanks {
         );
         let mut cache = self.cache.lock().unwrap();
         if cache.len() >= 8 {
-            cache.clear();
+            if use_victim {
+                if let Ok(st) = self.use_stats.lock() {
+                    let mut ids: Vec<usize> = cache.keys().copied().collect();
+                    ids.sort_unstable_by(|a, b| {
+                        st.0.get(*b)
+                            .copied()
+                            .unwrap_or(0)
+                            .cmp(&st.0.get(*a).copied().unwrap_or(0))
+                            .then_with(|| {
+                                st.1.get(*b)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .cmp(&st.1.get(*a).copied().unwrap_or(0))
+                            })
+                    });
+                    let keep: std::collections::HashSet<usize> = ids.into_iter().take(7).collect();
+                    cache.retain(|k, _| keep.contains(k));
+                } else {
+                    cache.clear();
+                }
+            } else {
+                cache.clear();
+            }
         }
         cache.insert(idx, lins.clone());
         Ok(lins)

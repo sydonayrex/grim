@@ -2868,25 +2868,35 @@ impl Qwen38FlashNext {
     /// stored in `session.set_last_hidden_state`.
     pub fn project_lm_head(&self, session: &mut dyn SessionT, normed: &Tensor) -> Result<Tensor> {
         session.set_last_hidden_state(normed.clone());
+        session.set_device_argmax(None);
         let full_logits = session.full_output_logits()
             || std::env::var_os("GRIM_FULL_PREFILL_LOGITS").is_some()
             || std::env::var_os("GRIM_SCORE_FILE").is_some();
         let rows = normed.shape().dims().first().copied().unwrap_or(1);
-        if flash_last_row_lmhead_enabled() && rows > 1 && !full_logits {
+        let logits = if flash_last_row_lmhead_enabled() && rows > 1 && !full_logits {
             match grim_nn::modules::slice_last_row_2d_on_device(normed) {
-                Ok(last_row) => {
-                    return Ok(probe::span(ProbeStage::LmHead, || {
-                        self.output.forward(&last_row)
-                    })?);
-                }
+                Ok(last_row) => probe::span(ProbeStage::LmHead, || {
+                    self.output.forward(&last_row)
+                })?,
                 Err(err) => {
                     eprintln!("[last-row-lmhead] fallback: {err}");
+                    probe::span(ProbeStage::LmHead, || self.output.forward(normed))?
                 }
             }
+        } else {
+            probe::span(ProbeStage::LmHead, || self.output.forward(normed))?
+        };
+        if !logits.device().is_cpu()
+            && session.sampling_greedy()
+            && qwen4_device_argmax_enabled()
+            && !full_logits
+        {
+            match argmax_last_row_on_device(&logits) {
+                Ok(tok) => session.set_device_argmax(Some(tok)),
+                Err(err) => eprintln!("[qwen4-device-argmax] fallback: {err}"),
+            }
         }
-        Ok(probe::span(ProbeStage::LmHead, || {
-            self.output.forward(normed)
-        })?)
+        Ok(logits)
     }
 
     /// Greedy decode helper for Flash-Next: uses `argmax_last_row_on_device`

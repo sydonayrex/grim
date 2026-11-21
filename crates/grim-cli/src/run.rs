@@ -3792,6 +3792,8 @@ pub async fn cmd_run_interactive(
                     &history,
                 )
                 .ok()
+            } else if temperature <= 0.0 {
+                session.take_device_argmax()
             } else {
                 None
             };

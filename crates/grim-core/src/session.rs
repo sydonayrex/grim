@@ -175,6 +175,13 @@ pub trait SessionT: Send {
     }
     fn set_last_sampled_token(&mut self, _tok: Option<u32>) {}
 
+    /// Precomputed device greedy argmax token for the last forward step (Q6).
+    /// Returns `Some(tok)` and clears it so callers skip full-vocab D2H + CPU argmax.
+    fn take_device_argmax(&mut self) -> Option<u32> {
+        None
+    }
+    fn set_device_argmax(&mut self, _tok: Option<u32>) {}
+
     /// M2 (speculative verify): snapshot model/recurrent state for rollback.
     /// Returns an opaque snapshot owned by the caller; `None` if no recurrent state.
     fn snapshot_recurrent_state(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
@@ -225,6 +232,8 @@ pub struct Inner {
     pub sampling_greedy: bool,
     /// Last token sampled by the decode loop.
     pub last_sampled_token: Option<u32>,
+    /// Precomputed device greedy argmax token (Q6).
+    pub device_argmax: Option<u32>,
     /// Model-installed recurrent-state hooks (T2 hybrid prefix reuse). `None`
     /// means the session has no recurrent state to snapshot or restore.
     pub recurrent_hooks: Option<std::sync::Arc<dyn RecurrentHooks>>,
@@ -245,6 +254,7 @@ impl Inner {
             full_output_logits: false,
             sampling_greedy: false,
             last_sampled_token: None,
+            device_argmax: None,
             recurrent_hooks: None,
         }
     }
@@ -262,6 +272,7 @@ impl Inner {
             full_output_logits: false,
             sampling_greedy: false,
             last_sampled_token: None,
+            device_argmax: None,
             recurrent_hooks: None,
         }
     }
@@ -389,6 +400,12 @@ impl SessionT for Inner {
     }
     fn set_last_sampled_token(&mut self, tok: Option<u32>) {
         self.last_sampled_token = tok;
+    }
+    fn take_device_argmax(&mut self) -> Option<u32> {
+        self.device_argmax.take()
+    }
+    fn set_device_argmax(&mut self, tok: Option<u32>) {
+        self.device_argmax = tok;
     }
 
     fn set_recurrent_hooks(&mut self, hooks: std::sync::Arc<dyn RecurrentHooks>) {
