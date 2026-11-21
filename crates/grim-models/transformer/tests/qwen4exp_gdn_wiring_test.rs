@@ -197,6 +197,7 @@ fn gdn_session_starts_empty_and_is_clonable_for_snapshots() {
     let snapshot = Qwen38GdnSession {
         caches: vec![warm.clone()],
         device_caches: Vec::new(),
+        decode_graph: None,
         qsa_keys: Vec::new(),
     };
     let mut mutated = snapshot.clone();

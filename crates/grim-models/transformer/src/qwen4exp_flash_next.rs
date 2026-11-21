@@ -1549,7 +1549,7 @@ impl Qwen38FlashNextBlock {
         gdn_cache: &mut crate::qwen4exp_gdn::Qwen38GdnCache,
         qsa_keys: &mut Vec<f32>,
     ) -> Result<Tensor> {
-        self.forward_with_dev_gdn(x, positions, cfg, gdn_cache, None, qsa_keys)
+        self.forward_with_dev_gdn(x, positions, cfg, gdn_cache, None, None, qsa_keys)
     }
 
     pub fn forward_with_dev_gdn(
@@ -1559,6 +1559,7 @@ impl Qwen38FlashNextBlock {
         cfg: &Qwen38FlashNextConfig,
         gdn_cache: &mut crate::qwen4exp_gdn::Qwen38GdnCache,
         dev_gdn_cache: Option<&mut Option<crate::qwen4exp_gdn_device::Qwen38GdnDeviceCache>>,
+        decode_graph: Option<&mut Option<crate::qwen4exp_decode_graph::FlashDecodeGraphState>>,
         qsa_keys: &mut Vec<f32>,
     ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
@@ -1620,6 +1621,39 @@ impl Qwen38FlashNextBlock {
                             let beta = ssm_beta.forward(&branch_attn)?;
                             let gate = attn_gate.forward(&branch_attn)?;
                             let dev_c = slot.as_mut().expect("initialized above");
+                            if crate::qwen4exp_decode_graph::flash_decode_graph_enabled() {
+                                if let Some(dg_slot) = decode_graph {
+                                    if dg_slot.is_none() {
+                                        *dg_slot = Some(
+                                            crate::qwen4exp_decode_graph::FlashDecodeGraphState::new(
+                                                branch_attn.device(),
+                                                conv_dim,
+                                                n_v_heads,
+                                                n_v_heads * head_dim,
+                                            )?,
+                                        );
+                                    }
+                                    if let Some(dg) = dg_slot.as_mut() {
+                                        return crate::qwen4exp_decode_graph::capture_or_replay_gdn_step(
+                                            self.layer_index,
+                                            &qkv,
+                                            &ssm_conv1d.weight,
+                                            &alpha,
+                                            &beta,
+                                            ssm_dt,
+                                            ssm_a,
+                                            &ssm_norm.weight,
+                                            &gate,
+                                            cfg.rms_norm_eps,
+                                            n_v_heads,
+                                            n_k_heads,
+                                            head_dim,
+                                            dev_c,
+                                            dg,
+                                        );
+                                    }
+                                }
+                            }
                             crate::qwen4exp_gdn_device::gdn_decode_step_on_device(
                                 &qkv,
                                 &ssm_conv1d.weight,
@@ -2488,6 +2522,7 @@ pub struct Qwen38FlashNext {
 pub struct Qwen38GdnSession {
     pub caches: Vec<crate::qwen4exp_gdn::Qwen38GdnCache>,
     pub device_caches: Vec<Option<crate::qwen4exp_gdn_device::Qwen38GdnDeviceCache>>,
+    pub decode_graph: Option<crate::qwen4exp_decode_graph::FlashDecodeGraphState>,
     /// Raw indexer keys per full-attention layer, `[n_kv, indexer_key_length]`.
     ///
     /// Stored RAW on purpose: upstream caches `index_k_proj` output and applies
@@ -3016,7 +3051,15 @@ impl CausalLm for Qwen38FlashNext {
                 .expect("ensure() sized one cache per layer");
             let dev_cache = gdn_state.device_caches.get_mut(i);
             let keys = gdn_state.qsa_keys.get_mut(i).expect("qsa_keys sized above");
-            h = layer.forward_with_dev_gdn(&h, &pos_u32, &self.cfg, cache, dev_cache, keys)?;
+            h = layer.forward_with_dev_gdn(
+                &h,
+                &pos_u32,
+                &self.cfg,
+                cache,
+                dev_cache,
+                Some(&mut gdn_state.decode_graph),
+                keys,
+            )?;
         }
         session.set_model_state(Box::new(gdn_state));
 

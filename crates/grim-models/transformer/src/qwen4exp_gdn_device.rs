@@ -30,9 +30,9 @@ pub fn gdn_device_enabled() -> bool {
 pub struct Qwen38GdnDeviceCache {
     pub conv_state: Tensor,
     pub ssm_state: Tensor,
-    conv_out_buf: Tensor,
-    acc_buf: Tensor,
-    norm_tiled: Option<Tensor>,
+    pub(crate) conv_out_buf: Tensor,
+    pub(crate) acc_buf: Tensor,
+    pub(crate) norm_tiled: Option<Tensor>,
 }
 
 impl Qwen38GdnDeviceCache {
