@@ -2920,6 +2920,29 @@ impl Qwen35 {
             available_devices
         );
 
+        if available_devices.iter().any(|d| d.is_cpu()) {
+            let per_layer_params = (3usize * cfg.hidden_size * cfg.intermediate_size)
+                .saturating_add(4usize * cfg.hidden_size * cfg.hidden_size);
+            let emb_params = cfg.vocab_size.saturating_mul(cfg.hidden_size);
+            // Conservative ~0.5 bytes/param (Q4) host footprint estimate.
+            let est_bytes = (cfg
+                .num_layers
+                .saturating_mul(per_layer_params)
+                .saturating_add(emb_params)
+                / 2) as u64;
+            let headroom_bytes = 2u64 * 1024 * 1024 * 1024;
+            if let Err(e) = grim_core::memory_certificate::check_host_alloc_budget(
+                est_bytes,
+                headroom_bytes,
+                "qwen35 CPU load",
+            ) {
+                if std::env::var("GRIM_STRICT_HOST_BUDGET").ok().as_deref() == Some("1") {
+                    return Err(e);
+                }
+                eprintln!("[qwen35] WARNING: {e}");
+            }
+        }
+
         let first_device = available_devices[0].clone();
 
         // M0: detect nextn block early so planner can reserve its bytes on the
