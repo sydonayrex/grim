@@ -208,8 +208,19 @@ impl QuantOps for RocmDevice {
                         self.launch_dot4_q4k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
                         let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
-                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
-                        fence_act_quant(self, q_stream);
+                        let cache_on = !self.is_capturing()
+                            && !matches!(
+                                std::env::var("GRIM_EAGER_Q81_CACHE").as_deref(),
+                                Ok("0" | "false" | "off")
+                            );
+                        let mut tag = self.act_q81_tag.lock().unwrap_or_else(|e| e.into_inner());
+                        let want_tag = (a_storage.uid, m, k);
+                        if !cache_on || *tag != want_tag {
+                            let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                            fence_act_quant(self, q_stream);
+                            *tag = want_tag;
+                        }
+                        drop(tag);
                         self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
                 // 64x64x32 big-tile kernel for large-M prefill: one weight
@@ -336,8 +347,19 @@ impl QuantOps for RocmDevice {
                         self.launch_dot4_q5k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
                         let act_q81 = buf_guard.as_ref().ok_or_else(|| Error::Backend("quant buf_guard is None".into()))?;
-                        let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
-                        fence_act_quant(self, q_stream);
+                        let cache_on = !self.is_capturing()
+                            && !matches!(
+                                std::env::var("GRIM_EAGER_Q81_CACHE").as_deref(),
+                                Ok("0" | "false" | "off")
+                            );
+                        let mut tag = self.act_q81_tag.lock().unwrap_or_else(|e| e.into_inner());
+                        let want_tag = (a_storage.uid, m, k);
+                        if !cache_on || *tag != want_tag {
+                            let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                            fence_act_quant(self, q_stream);
+                            *tag = want_tag;
+                        }
+                        drop(tag);
                         self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
                 } else if is_rdna34 && m >= 64 && n % 128 == 0 && k % 256 == 0 {

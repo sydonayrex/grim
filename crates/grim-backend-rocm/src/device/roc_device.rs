@@ -339,6 +339,9 @@ pub struct RocmDevice {
     /// SPEED-ROC: Preallocated buffer for activation quant (Q8_1) in dot4 GEMV.
     /// Reused every decode GEMV, eliminating per-layer hipMalloc overhead.
     pub(crate) act_q81_buf: RwLock<Option<RocmStorage>>,
+    /// (src_uid, m, k) of the last tensor quantized into `act_q81_buf` so sibling
+    /// eager projections (q/k/v, gate/up) skip redundant `launch_quantize_q8_1`.
+    pub(crate) act_q81_tag: std::sync::Mutex<(u64, usize, usize)>,
     /// Preallocated buffer for activation quant (Q8_0, 34 B per 32 weights) in
     /// the Q2_0 x Q8_0 GEMV. Separate from `act_q81_buf` because the two
     /// formats have different block widths and are live at different times.
@@ -1059,6 +1062,7 @@ impl RocmDevice {
             sampler_out_buf: Mutex::new(None),
             penalty_hist_buf: Mutex::new(None),
             act_q81_buf: RwLock::new(None),
+            act_q81_tag: std::sync::Mutex::new((0, 0, 0)),
             act_q80_buf: RwLock::new(None),
             act_u4_codes_buf: Mutex::new(None),
             act_u4_scales_buf: Mutex::new(None),
