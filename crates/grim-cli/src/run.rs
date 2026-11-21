@@ -1900,6 +1900,11 @@ pub async fn cmd_run(
             .downcast_ref::<grim_models_transformer::Qwen35>()
             .map(|q| q.has_mtp())
             .unwrap_or(false);
+        let flash_mtp_depth = model
+            .as_any()
+            .downcast_ref::<grim_models_transformer::Qwen38FlashNextMtp>()
+            .map(|m| grim_models_transformer::MtpDepthProvider::mtp_depth(m))
+            .unwrap_or(0);
         if wants_mtp && qwen_has_mtp {
             let depth = model
                 .as_any()
@@ -1913,6 +1918,31 @@ pub async fn cmd_run(
             let adapter = Arc::new(grim_speculative::Qwen35MtpAdapter::new(arc_model.clone()));
             let mut wrapped = grim_speculative::SpeculativeCausalLm::with_native_mtp(
                 Box::new(grim_speculative::Qwen35MtpAdapter::new(arc_model)),
+                adapter,
+            );
+            wrapped.set_gpu_verifier(Arc::new(grim_engine::RocmSpeculativeVerifier));
+            Box::new(wrapped) as Box<dyn CausalLm>
+        } else if wants_mtp && flash_mtp_depth > 0 {
+            eprintln!(
+                "[grim] Native MTP: enabling Qwen38FlashNextMtp (GRIM_MTP={mtp_mode}, depth={flash_mtp_depth})"
+            );
+            let arc_flash = Arc::new(
+                *model
+                    .as_any()
+                    .downcast_ref::<grim_models_transformer::Qwen38FlashNextMtp>()
+                    .map(|_| ())
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Config("Qwen38FlashNextMtp downcast failed".into())
+                    })
+                    .map(|_| {
+                        // Safe: we verified the concrete type above via `as_any().downcast_ref`.
+                        let raw = Box::into_raw(model) as *mut grim_models_transformer::Qwen38FlashNextMtp;
+                        unsafe { Box::from_raw(raw) }
+                    })?,
+            );
+            let adapter = Arc::new(grim_speculative::MtpProviderAdapter::new(arc_flash.clone()));
+            let mut wrapped = grim_speculative::SpeculativeCausalLm::with_native_mtp(
+                Box::new(grim_speculative::MtpProviderAdapter::new(arc_flash)),
                 adapter,
             );
             wrapped.set_gpu_verifier(Arc::new(grim_engine::RocmSpeculativeVerifier));

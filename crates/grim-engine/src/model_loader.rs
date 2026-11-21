@@ -1784,7 +1784,22 @@ fn load_model_from_config(
                 "[grim] Loading Qwen3.8-Flash-Next model with config: {:?}",
                 qwen38_cfg
             );
+            let hc_count = qwen38_cfg.hc_count;
+            let hidden = qwen38_cfg.hidden_size;
+            let eps = qwen38_cfg.rms_norm_eps;
+            let n_layers = qwen38_cfg.num_layers;
             let m = Qwen38FlashNext::load_tp(device.clone(), &ws, qwen38_cfg, tp)?;
+            if grim_nn::mtp_hc_enabled() {
+                let mtp_ws = ws.scoped("mtp");
+                let blk_ws = ws.scoped("blk").scoped(&n_layers.to_string());
+                if let Ok(hc) = grim_nn::MtpHcBlock::load(&mtp_ws, hc_count, hidden, eps)
+                    .or_else(|_| grim_nn::MtpHcBlock::load(&blk_ws, hc_count, hidden, eps))
+                {
+                    return Ok(Box::new(
+                        grim_models_transformer::Qwen38FlashNextMtp::with_mtp_hc(m, hc, 2),
+                    ));
+                }
+            }
             Ok(Box::new(m))
         }
         ModelArchitecture::Mellum => {
@@ -3910,7 +3925,22 @@ fn load_model_with_providers(
                 "[grim] Loading Qwen3.8-Flash-Next model from GGUF with config: {:?}",
                 qwen38_cfg
             );
+            let hc_count = qwen38_cfg.hc_count;
+            let hidden = qwen38_cfg.hidden_size;
+            let eps = qwen38_cfg.rms_norm_eps;
+            let n_layers = qwen38_cfg.num_layers;
             let m = Qwen38FlashNext::load_tp(device.clone(), &ws, qwen38_cfg, tp)?;
+            if grim_nn::mtp_hc_enabled() {
+                let mtp_ws = ws.scoped("mtp");
+                let blk_ws = ws.scoped("blk").scoped(&n_layers.to_string());
+                if let Ok(hc) = grim_nn::MtpHcBlock::load(&mtp_ws, hc_count, hidden, eps)
+                    .or_else(|_| grim_nn::MtpHcBlock::load(&blk_ws, hc_count, hidden, eps))
+                {
+                    return Ok(Box::new(
+                        grim_models_transformer::Qwen38FlashNextMtp::with_mtp_hc(m, hc, 2),
+                    ));
+                }
+            }
             Ok(Box::new(m))
         }
         ModelArchitecture::Mellum => {

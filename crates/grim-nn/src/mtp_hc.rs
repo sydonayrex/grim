@@ -86,6 +86,59 @@ pub struct MtpHcBlock {
 }
 
 impl MtpHcBlock {
+    /// Loads a wide-stream Hyper-Connection MTP head from checkpoint weights
+    /// (supports both HuggingFace `mtp.*` and GGUF `blk.<n>.nextn.*` / `nextn.*` names).
+    pub fn load(
+        ws: &crate::WeightSource<'_>,
+        hc_count: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Self> {
+        let wide_dim = hc_count * hidden_size;
+        let pre_fc_norm_hidden =
+            RmsNorm::load(&ws.scoped("pre_fc_norm_hidden"), wide_dim, eps)
+                .or_else(|_| RmsNorm::load(&ws.scoped("nextn.hnorm"), wide_dim, eps))?;
+        let pre_fc_norm_embed =
+            RmsNorm::load(&ws.scoped("pre_fc_norm_embedding"), hidden_size, eps)
+                .or_else(|_| RmsNorm::load(&ws.scoped("nextn.enorm"), hidden_size, eps))?;
+        let fc_hidden = Linear::load_shape(&ws.scoped("fc_hidden"), [hidden_size, hidden_size])
+            .or_else(|_| {
+                Linear::load_shape(&ws.scoped("nextn.fc_hidden"), [hidden_size, hidden_size])
+            })?;
+        let fc_embedding =
+            Linear::load_shape(&ws.scoped("fc_embedding"), [hidden_size, hidden_size]).or_else(
+                |_| {
+                    Linear::load_shape(
+                        &ws.scoped("nextn.fc_embedding"),
+                        [hidden_size, hidden_size],
+                    )
+                },
+            )?;
+        let output_mixer_norm = RmsNorm::load(
+            &ws.scoped("hyper_connection_mixer").scoped("hc_norm"),
+            wide_dim,
+            eps,
+        )
+        .or_else(|_| RmsNorm::load(&ws.scoped("nextn.shared_head_norm"), wide_dim, eps))?;
+        let output_mixer_proj = Linear::load_shape(
+            &ws.scoped("hyper_connection_mixer").scoped("hc_proj"),
+            [wide_dim, hidden_size],
+        )
+        .or_else(|_| {
+            Linear::load_shape(&ws.scoped("nextn.shared_head_proj"), [wide_dim, hidden_size])
+        })?;
+        Ok(Self {
+            pre_fc_norm_hidden,
+            pre_fc_norm_embed,
+            fc_hidden,
+            fc_embedding,
+            output_mixer_norm,
+            output_mixer_proj,
+            hc_count,
+            hidden_size,
+        })
+    }
+
     /// Deterministic seeded constructor for CPU/GPU parity tests.
     pub fn seeded(hc_count: usize, hidden_size: usize, eps: f32, seed: u64) -> Self {
         let lcg = |s0: u64, n: usize| -> Vec<f32> {

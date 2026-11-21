@@ -2665,6 +2665,16 @@ impl Qwen38FlashNext {
                 let eager_ple =
                     std::env::var("GRIM_PLE_EAGER_LOAD").ok().as_deref() == Some("1");
                 let oversized_ple = padded_rows.saturating_mul(ngram_dim) > 16_000_000;
+                if oversized_ple && eager_ple {
+                    let est_bytes = (padded_rows as u64)
+                        .saturating_mul(ngram_dim as u64)
+                        .saturating_mul(std::mem::size_of::<f32>() as u64);
+                    grim_core::memory_certificate::check_host_alloc_budget(
+                        est_bytes,
+                        2 * 1024 * 1024 * 1024,
+                        "GRIM_PLE_EAGER_LOAD per_layer_token_embd",
+                    )?;
+                }
                 let offloaded_ple = if oversized_ple && !eager_ple && spill.is_none() {
                     root.provider().source_path().and_then(|path| {
                         match grim_nn::OffloadedPleTable::open(

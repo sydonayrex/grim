@@ -3750,6 +3750,17 @@ impl CausalLm for Qwen35 {
             let head_in = crate::decode_graph::hadamard_transform_tensor(&head_in, usize::MAX, "output")
                 .unwrap_or_else(|_| head_in.clone());
             let logits = self.output.forward(&head_in)?;
+            session.set_device_argmax(None);
+            if !logits.device().is_cpu()
+                && session.sampling_greedy()
+                && !full_logits
+                && std::env::var("GRIM_QWEN35_EAGER_DEVICE_ARGMAX").ok().as_deref() == Some("1")
+            {
+                let dev = grim_nn::modules::pick_device_for_storage_device(logits.device());
+                if let Ok(tok) = dev.argmax(logits.storage().as_ref()) {
+                    session.set_device_argmax(Some(tok));
+                }
+            }
             if trace_head {
                 eprintln!("[qwen35-trace] lm-head done on {}", logits.device());
             }
