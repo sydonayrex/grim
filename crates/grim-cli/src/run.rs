@@ -2030,7 +2030,7 @@ pub async fn cmd_run(
         // [1,2] warmup above only exercises the decode-GEMV lane and leaves all
         // of that inside the TTFT window.
         {
-            const WARM_PREFILL_TOKENS: usize = 64;
+            const WARM_PREFILL_TOKENS: usize = 16;
             let ids: Vec<f32> = (0..WARM_PREFILL_TOKENS)
                 .map(|i| ((i % 255) + 1) as f32)
                 .collect();

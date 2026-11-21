@@ -849,6 +849,18 @@ impl Qwen35Block {
     ) -> Result<Tensor> {
         let seq_len = positions.len();
         let device = x.device().clone();
+        let ttft_detail = seq_len == 27
+            && matches!(self.layer_idx, 0 | 1 | 3 | 40 | 43)
+            && std::env::var("GRIM_TTFT_DETAIL").as_deref() == Ok("1");
+        let sync_if = |on: bool, dev: &Device| {
+            if on {
+                if let Device::Rocm(ord) = dev {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+            }
+        };
+        sync_if(ttft_detail, &device);
+        let t_blk0 = if ttft_detail { Some(std::time::Instant::now()) } else { None };
         // GRIM_I8_PROBE_DIR: block entry probe — is the decode step reaching
         // Qwen35Block::forward at all? (2026-11-07 parity defect.)
         if seq_len == 1 && std::env::var_os("GRIM_I8_PROBE_DIR").is_some() {
@@ -1908,6 +1920,8 @@ impl Qwen35Block {
         }
 
         // 4. SwiGLU FFN
+        sync_if(ttft_detail, &device);
+        let t_mlp0 = if ttft_detail { Some(std::time::Instant::now()) } else { None };
         let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
             Some(fused) => self.fused_gate_up_q4k_decode(&h_normed_t, fused)?,
             _ => (
@@ -1919,6 +1933,19 @@ impl Qwen35Block {
         let act_t = crate::decode_graph::hadamard_transform_tensor(&act, self.layer_idx, "ffn.down")
             .unwrap_or_else(|_| act.clone());
         let ffn_out = self.ffn_down.forward(&act_t)?;
+        if ttft_detail {
+            sync_if(true, &device);
+            let branch_ms = t_blk0.unwrap().elapsed().as_secs_f64() * 1000.0
+                - t_mlp0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            let mlp_ms = t_mlp0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            let kind = if self.is_full_attention { "attn" } else { "gdn" };
+            eprintln!(
+                "[ttft-detail] layer={} ({kind} on {}) branch={branch_ms:.2}ms mlp={mlp_ms:.2}ms total={:.2}ms",
+                self.layer_idx,
+                device,
+                branch_ms + mlp_ms
+            );
+        }
         // KDA-STEP-PROBE: layer-0 decode FFN stage dumps.
         if kda_probe_layer0 {
             static FF_CALLS: std::sync::atomic::AtomicUsize =
@@ -4708,6 +4735,13 @@ fn gated_delta_net_forward_d2d(
     let conv_state = cache.conv_state_dev.as_ref().ok_or_else(|| {
         grim_core::error::Error::Backend("conv_state_dev vanished after allocation".into())
     })?;
+    let gdn_detail = seq_len == 27
+        && blk.layer_idx == 1
+        && std::env::var("GRIM_TTFT_DETAIL").as_deref() == Ok("1");
+    if gdn_detail {
+        grim_backend_rocm::RocmDevice::shared(0).synchronize();
+    }
+    let t_conv0 = if gdn_detail { Some(std::time::Instant::now()) } else { None };
     let (conv_out, _) = dev.short_conv1d_causal_step(
         qkv.storage().as_ref(),
         conv_w.storage().as_ref(),
@@ -4959,7 +4993,11 @@ fn gated_delta_net_forward_d2d(
             as Box<dyn grim_tensor::backend::ComputeHandle>;
         (out_storage, handle)
     } else {
-        dev.kda_gated_delta_rule_scan(
+        if gdn_detail {
+            grim_backend_rocm::RocmDevice::shared(0).synchronize();
+        }
+        let t_scan0 = if gdn_detail { Some(std::time::Instant::now()) } else { None };
+        let res = dev.kda_gated_delta_rule_scan(
             conv_out.as_ref(),
             alpha.storage().as_ref(),
             beta.storage().as_ref(),
@@ -4974,7 +5012,15 @@ fn gated_delta_net_forward_d2d(
             head_dim,
             eps,
             &Shape::new(vec![seq_len, value_dim]),
-        )?
+        )?;
+        if gdn_detail {
+            grim_backend_rocm::RocmDevice::shared(0).synchronize();
+            let conv_ms = t_conv0.unwrap().elapsed().as_secs_f64() * 1000.0
+                - t_scan0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            let scan_ms = t_scan0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[ttft-gdn-detail] layer=1 conv={conv_ms:.2}ms kda_scan={scan_ms:.2}ms");
+        }
+        res
     };
 
     // Post-step decode dumps (device, synchronized): ssm state, ring, branch.
