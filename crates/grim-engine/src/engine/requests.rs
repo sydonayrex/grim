@@ -122,13 +122,11 @@ impl Engine {
             if let Some(hparams) = &base_model.arch_hyperparams {
                 let target_seq_len = request.prompt_tokens.saturating_add(request.max_new_tokens);
                 if let Some(free_device) = free_device_memory(&device) {
-                    let host_allowance = std::env::var("GRIM_HOST_ALLOWANCE_GB")
+                    let override_gb = std::env::var("GRIM_HOST_ALLOWANCE_GB")
                         .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(8)
-                        * 1024
-                        * 1024
-                        * 1024;
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let (host_allowance, host_authority) =
+                        BoundaryVector::live_host_allowance(override_gb);
                     let reserve = std::env::var("GRIM_MEMORY_RESERVE_GB")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
@@ -136,8 +134,9 @@ impl Engine {
                         * 1024
                         * 1024
                         * 1024;
-                    let live_boundary =
+                    let mut live_boundary =
                         BoundaryVector::standard(host_allowance, free_device, reserve);
+                    live_boundary.host_authority = host_authority;
                     if let Err(e) = MemoryCertificate::certify(
                         hparams,
                         live_boundary,

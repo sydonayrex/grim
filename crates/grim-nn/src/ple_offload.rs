@@ -53,6 +53,10 @@ impl OffloadedPleTable {
             )));
         };
         let row_bytes = meta.dtype.expected_bytes(cols);
+        let budget = grim_core::memory_certificate::probe_host_ram_budget();
+        let row_f32_bytes = (cols.saturating_mul(std::mem::size_of::<f32>())).max(1) as u64;
+        let budget_rows = ((budget.available_bytes / 100) / row_f32_bytes) as usize;
+        let cache_cap = budget_rows.clamp(64, DEFAULT_ROW_CACHE_CAP);
         Ok(Self {
             provider,
             tensor_name: tensor_name.to_string(),
@@ -62,7 +66,7 @@ impl OffloadedPleTable {
             dtype: meta.dtype,
             provenance: meta.provenance,
             cache: Mutex::new(HashMap::new()),
-            cache_cap: DEFAULT_ROW_CACHE_CAP,
+            cache_cap,
         })
     }
 

@@ -48,6 +48,158 @@ impl BoundaryVector {
             device_authority: AuthorityGrade::PhysicalCapacity,
         }
     }
+
+    /// Resolves live host memory allowance: honors an explicit `override_gb`
+    /// (e.g. `GRIM_HOST_ALLOWANCE_GB`), otherwise probes cgroup v2 and
+    /// `/proc/meminfo` via [`probe_host_ram_budget`].
+    pub fn live_host_allowance(override_gb: Option<u64>) -> (u64, AuthorityGrade) {
+        if let Some(gb) = override_gb {
+            return (
+                gb.saturating_mul(1024 * 1024 * 1024),
+                AuthorityGrade::HardEnforced,
+            );
+        }
+        let budget = probe_host_ram_budget();
+        (budget.available_bytes, budget.authority)
+    }
+}
+
+/// Live host RAM budget probed from cgroup v2 (when enforced) or `/proc/meminfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostRamBudget {
+    pub available_bytes: u64,
+    pub cgroup_limited: bool,
+    pub authority: AuthorityGrade,
+}
+
+/// Parses cgroup v2 `memory.max`, `memory.current`, and reclaimable `file` cache
+/// bytes into remaining hard host-RAM room: `max - (current - file)`.
+/// Returns `None` when `max_str` is `"max"` (unlimited) or unparseable.
+pub fn parse_cgroup_v2_room(
+    max_str: &str,
+    current_str: &str,
+    file_cache_bytes: u64,
+) -> Option<u64> {
+    let max_trim = max_str.trim();
+    if max_trim == "max" {
+        return None;
+    }
+    let lim: u64 = max_trim.parse().ok()?;
+    let used: u64 = current_str.trim().parse().ok()?;
+    let hard = used.saturating_sub(file_cache_bytes);
+    Some(lim.saturating_sub(hard))
+}
+
+fn read_cgroup_v2_file_cache(dir: &std::path::Path) -> u64 {
+    let Ok(stat) = std::fs::read_to_string(dir.join("memory.stat")) else {
+        return 0;
+    };
+    for line in stat.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("file") {
+            if let Some(v) = parts.next().and_then(|s| s.parse::<u64>().ok()) {
+                return v;
+            }
+        }
+    }
+    0
+}
+
+fn probe_cgroup_v2_min_room() -> Option<u64> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)?;
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let mut cur = if rel == "/" || rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel.trim_start_matches('/'))
+    };
+    let mut min_room: Option<u64> = None;
+    loop {
+        if let (Ok(max_s), Ok(cur_s)) = (
+            std::fs::read_to_string(cur.join("memory.max")),
+            std::fs::read_to_string(cur.join("memory.current")),
+        ) {
+            let file_bytes = read_cgroup_v2_file_cache(&cur);
+            if let Some(room) = parse_cgroup_v2_room(&max_s, &cur_s, file_bytes) {
+                min_room = Some(min_room.map_or(room, |m| m.min(room)));
+            }
+        }
+        if cur == root {
+            break;
+        }
+        match cur.parent() {
+            Some(p) => cur = p.to_path_buf(),
+            None => break,
+        }
+    }
+    min_room
+}
+
+fn probe_meminfo_available_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// Probes live available host RAM: takes the minimum of cgroup v2 hard room
+/// (when limited) and `/proc/meminfo` `MemAvailable`, falling back to 8 GiB
+/// on non-Linux hosts.
+pub fn probe_host_ram_budget() -> HostRamBudget {
+    let meminfo = probe_meminfo_available_bytes();
+    let cgroup = probe_cgroup_v2_min_room();
+    match (cgroup, meminfo) {
+        (Some(cg), Some(mi)) => HostRamBudget {
+            available_bytes: cg.min(mi),
+            cgroup_limited: true,
+            authority: AuthorityGrade::HardEnforced,
+        },
+        (Some(cg), None) => HostRamBudget {
+            available_bytes: cg,
+            cgroup_limited: true,
+            authority: AuthorityGrade::HardEnforced,
+        },
+        (None, Some(mi)) => HostRamBudget {
+            available_bytes: mi,
+            cgroup_limited: false,
+            authority: AuthorityGrade::PhysicalCapacity,
+        },
+        (None, None) => HostRamBudget {
+            available_bytes: 8 * 1024 * 1024 * 1024,
+            cgroup_limited: false,
+            authority: AuthorityGrade::SampledAudit,
+        },
+    }
+}
+
+/// Fails closed before an oversized host allocation can trigger an OOM kill.
+pub fn check_host_alloc_budget(
+    requested_bytes: u64,
+    safety_margin_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    let budget = probe_host_ram_budget();
+    let usable = budget.available_bytes.saturating_sub(safety_margin_bytes);
+    if requested_bytes > usable {
+        return Err(Error::Config(format!(
+            "host memory budget exceeded for '{label}': requested {:.2} GiB > usable {:.2} GiB \
+             (available {:.2} GiB, margin {:.2} GiB, cgroup_limited={})",
+            requested_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            usable as f64 / (1024.0 * 1024.0 * 1024.0),
+            budget.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            safety_margin_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            budget.cgroup_limited,
+        )));
+    }
+    Ok(())
 }
 
 /// Inventory and provenance record for model weights, demand, and traffic.
@@ -236,5 +388,21 @@ mod tests {
             err.to_string()
                 .contains("exceeds combined hardware envelope")
         );
+    }
+
+    #[test]
+    fn test_parse_cgroup_v2_room_and_budget_guard() {
+        // max = 16 GiB, current = 6 GiB, reclaimable file cache = 2 GiB -> hard = 4 GiB -> room = 12 GiB
+        let gib = 1024u64 * 1024 * 1024;
+        assert_eq!(
+            parse_cgroup_v2_room(&(16 * gib).to_string(), &(6 * gib).to_string(), 2 * gib),
+            Some(12 * gib)
+        );
+        assert_eq!(parse_cgroup_v2_room("max\n", "1024", 0), None);
+        let budget = probe_host_ram_budget();
+        assert!(budget.available_bytes > 0);
+        // Requesting 1 PiB must fail closed cleanly.
+        let err = check_host_alloc_budget(1u64 << 50, 0, "oversized_test").unwrap_err();
+        assert!(err.to_string().contains("host memory budget exceeded"));
     }
 }

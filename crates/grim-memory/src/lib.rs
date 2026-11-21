@@ -18,6 +18,9 @@ pub use moe_budget::{
     ResidentTier, LayerQuotaExpertCache, UseCappedResidentPolicy, moe_layer_quota_enabled,
     moe_use_victim_enabled,
 };
+pub use grim_core::memory_certificate::{
+    check_host_alloc_budget, probe_host_ram_budget, HostRamBudget,
+};
 
 /// Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
 pub mod radix;
