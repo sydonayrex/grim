@@ -1,6 +1,6 @@
 # Avalon -> grim transfer review: TTFT + decode speed for Qwen3.8-27B / Qwen3.8-Flash-Next
 
-Review date: 2026-11-20. Reviewer: ZCode. Status: COMPLETE (three Avalon code-verification agents + three PLAN-astrum code-verification agents delivered; see Appendices B, C, D).
+Review date: 2026-11-20. Reviewer: ZCode. Status: COMPLETE (14 code-verification agents delivered: 3 Avalon, 3 PLAN-astrum, 3 Basalt, 3 llama.cpp 1.0, 2 dense-specific; see Appendices B-G).
 
 ## Scope and method
 
@@ -299,7 +299,7 @@ Paths below are workspace-relative to `/drive/bigfast/grim/old/repo/avalon/`.
 | Decode speed covered | Items 4/8 + A21/A22/A24/A31; MTP backend-sampling section |
 | Qwen3.8-27B addressed | Items 4-6, 8; 27B-specific data from grim memory (248320 vocab, 30 tok/s chain) |
 | Qwen3.8-Flash-Next addressed | Items 1-3, 7, 8; `qwen4exp` model/quant/pipeline anchors |
-| Thorough / meticulous | 500-commit Avalon history mined, 32-claim evidence appendix, 6 code-reading agents delivered (Appendices B, C, D: 3 Avalon + 3 PLAN-astrum), code anchors on both sides, PLAN-astrum audited phase-by-phase into four buckets, duplicate/closed levers explicitly reclassified, README-only claims flagged and two inert flags corrected |
+| Thorough / meticulous | 500-commit histories mined for Avalon, Basalt and llama.cpp 1.0; 32-claim evidence appendix; 14 code-reading agents delivered (Appendices B-G: 3 Avalon + 3 PLAN-astrum + 3 Basalt + 3 llama.cpp 1.0 + 2 dense-specific); PLAN-astrum audited into four buckets; Avalon/Basalt/llama1 concepts split NEW/PARTIAL/DUP/N/A; explicit dense/27B coverage (F1 llama1, G1 Avalon, G2 Basalt); duplicate/closed levers reclassified; README/commit-message-only numbers flagged; two inert flags corrected |
 | Skills used | `ai-inference-expert`, `ai-llm-inference`, `caveman-mode`, `ponytail` invoked |
 | No phantom claims | Every item has Avalon commit or code path + grim path; README-only claims marked |
 
@@ -439,3 +439,430 @@ P12 have landed code but no results entry; P4's results entry claims "no product
    Do not trust module docs here - read the implementation.
 
 Standing rule reinforced: plan checkboxes and "Phase results" are not evidence. The four-bucket code census is.
+
+## Appendix E: Basalt transfer concepts (2026-11-20)
+
+Scope: `https://github.com/jesdga95/basalt` cloned to `/drive/bigfast/grim/old/repo/basalt`, HEAD `a365240`
+(24 MB, C++/CUDA, Strata fork). Basalt targets **exactly** Qwen3.8-27B (dense, DFlash2) and Qwen3.8-Flash-Next
+(512-expert MoE, MTP/DFly2), plus DeepSeek-V4.1-Flash and Hy4-flash, on NVIDIA Blackwell sm_120. 500 commits mined;
+three code-reading agents verified the mechanisms. **Platform boundary: all CUDA kernels sm_120-specific. Only the
+architecture-neutral algorithms below are transferable to grim's Rust/HIP RDNA path.** All paths relative to
+`/drive/bigfast/grim/old/repo/basalt/`.
+
+Status legend: **NEW** = no equivalent in grim; **PARTIAL** = grim has an inert/partial analog; **DUP** = already
+covered (Avalon/strata/PLAN-astrum); **N/A** = model-specific, not applicable to grim's two targets.
+
+### E1. Worthwhile concepts, ranked
+
+1. **`DraftPolicy::may_verify` - stop drafting before a head pass no window can verify** - `both`, decode. **NEW, highest value.**
+   - Code: `include/basalt/spec/draft_policy.hpp:51-61`, `src/spec/draft_policy.cpp:195-214`, proof test
+     `tests/spec/draft_policy_test.cpp:154-205`. Rule: with chances for drafts `0..j` known, compute best
+     `E(t)/cost_ms(t)`; for unknown later drafts assume `best_rate()` (cpp:64-71); if no completion can beat the known
+     best (probe exception `kProbeChance=0.85`), return false. Engine passes `need` to `draft_end`
+     (`program/serve/session_engine.cpp:533,814`); DFly2 checks confidence BEFORE the full-vocab head
+     (`models/hy4flash/dfly.cpp:459-488`). Output unchanged by construction (only drafts not made). Defaults:
+     `margin=0.03`, `kMaxT=16`, chance bins `{0.3..0.995}`, `kChanceDecay=0.98` (hpp:35-40).
+   - grim: P5 draft policy is PARTIAL-inert (`grim-speculative/src/draft_policy.rs:1-155`, wrapper
+     `speculative_wrapper.rs:692-700` hardcodes `Mtp`/`cost=1.0`, `select()` discarded — Appendix D1). No `may_verify`
+     anywhere. Pure C++/`<algorithm>` → direct Rust port; needs per-chance EMA + per-window cost + a `need` callback
+     before the draft head.
+   - Gate: soundness test (a ruled-out draft appears in no later window) + token identity; no GPU required.
+   - Honesty: soundness is proven by the test; the standalone speed figure is qualitative in docs, not stored numerically.
+
+2. **Use-capped expert victim selection (count, halve, MRU tie-break)** - `FN`, decode hit rate. **NEW.**
+   - Code: `include/basalt/core/tier_policy.hpp:35-46` (`kLookCap=15`, `count_look`, `yields_before`,
+     `use_half_life`), hooks `src/core/expert_tier.cpp:781-789` (`begin_token` halves every `victim_half_life`,
+     `forget_use` at prompt start), `:814` count lookups incl. hits, `:893-924` `oldest_slot`, `:954-994` `claim`.
+     Hy4 defaults `kVictimHalfLife=256`, `kAdmitUses=2`, `kClaimsPerRow=128` plus per-layer slot weights
+     (`models/hy4flash/model.cpp:25-31,40-43`).
+   - grim: no use-based expert eviction — `moe_budget.rs:267` LRU slot allocation, `expert_prefetch_stream.rs`
+     CPU stub, P3 prior unwired. Pure `uint16` counters + timestamps, no CUDA.
+   - Gate: frozen-tier token identity + hit-rate A/B (do NOT trust the "10-15% fewer misses" figure — agent found it
+     only in the commit message, not in code/docs).
+
+3. **Bounded expert-tier lend with MRU hot-slot compaction + double-buffered ring** - `FN`, TTFT + next-turn decode. **NEW (concept).**
+   - Code: `expert_tier.hpp:82-84,159-165,356-368`; `expert_tier.cpp:1245-1278` segmented arena (256 MiB segments,
+     depth-interleaved slots), `:1298-1347` `keep_hottest` (MRU-first D2D into kept prefix), `:1349-1387`
+     `lend(bytes)`, `:1392-1433` `reclaim`; prompt use `models/hy4flash/session.cpp:406-433`; ring
+     `session.cpp:1210-1329` (2 buffers, 2 threads/events, `ring_ahead` starts next layer's copy early).
+   - grim: no `lend` semantics in backend/engine (grep-confirmed), no MRU expert compaction; Avalon A27 lends
+     compute buffers and KV tail but does not preserve hot experts across the loan. Concept (hot-slot compaction,
+     tail-segment truncation, device-side metadata) transfers; VMM/D2D mechanics must be reimplemented.
+   - Measured in commit `92f72a9f` (message-only): 3.5K prompt lend 6.13 GiB keeping 4045/5699 slots,
+     2528→2134 ms; next turn 480→379 ms; 32 decode tokens 928→789 ms (hits 58→69.7%). Numbers from commit text,
+     not a stored doc; treat as directional.
+
+4. **Device-side sliding-window metadata → one graph per layer** - `FN`/any SWA model, decode. **NEW, high, cheap.**
+   - Code: `models/hy4flash/kernels/ops.cu:270-284` `swa_meta_kernel` computes row spans (first/count/position)
+     on device from one pinned `pos0` word; call `session.cpp:1016-1017`, graph branch `:1878-1891`. No host meta
+     writes inside the captured region → one graph replayed for any position instead of three graph/launch boundaries.
+   - grim: graph capture ON by default (`decode_graph_buffers.rs:3847-3858`) but position/meta writes remain host-side
+     in several paths; per-M pre-capture exists (`decode_graph.rs:5923-6027`). Move window-span derivation to a device
+     kernel reading a device word; keep the same accumulation order.
+   - Gate: token identity under graph replay + `GRIM_KERNEL_TIMES=1` launch-count A/B.
+
+5. **Fused add + RMSNorm + hyper-connection post with byte-identical reduction order** - `FN`, decode/prefill. **NEW pattern, caution.**
+   - Code: `models/hy4flash/kernels/ops.cu:211-268` `add_norm_hc_post_kernel<3072>`; parity `kernels/kernels_parity.cpp:158-231`
+     (`memcmp` bitwise vs separate kernels, 1/2/8/12 rows, single-among-12). Call sites `session.cpp:1885,1905,1919`.
+   - grim: related fusion was REJECTED (`79b865a4` session memory) because combining recurrent norm+quant changed bytes
+     and greedy text diverged. Basalt succeeds precisely by preserving the exact `__shfl_xor` + fixed `red[16]` sum
+     order. Lesson: fusion is allowed only when the reduction order is reproducible; add a byte-identity gate first.
+   - Note: agent could NOT find the literal "2x41 launches fewer" / "2290→1778 us" numbers in repo; mechanism and
+     runtime-printed parity harness exist, numbers are commit-message claims only.
+
+6. **Share one cell-tile load/conversion across multiple query heads** - `FN` QSA, prefill. **NEW idea (CUDA MMA impl not portable).**
+   - Code: `models/hy4flash/kernels/mla.cu:440-444,487-493,660-699` (`mma_groups()==2` when `heads%32==0`,
+     grid `dim3(heads/32,n_tok)`, two 16-head groups share each 32-cell tile load + fp16 conversion; fixed sum order
+     keeps bits). Parity harness `kernels_parity.cpp:1053-1083`.
+   - grim: QSA production path is host-materialized K/V + host mask (`qwen4exp_flash_next.rs:1504-1710` — item 1);
+     once wire-less, this is the natural attention-side follow-up. Compile-time group param + forced fallback.
+
+7. **Quantize a normed activation row once, reuse across sibling projections** - `both` drafter, decode. **NEW (byte-identical variant).**
+   - Code: `models/hy4flash/dfly.cpp:258-272` (`mm()` quantize+MMVQ vs `mmq()` on pre-quantized rows, shared `in_q8`),
+     used at `:386-390` (q_a/kv_a/gate), `:412-414` (MLP gate/up), `:472-476` (HC gate/up). HEAD commit `a365240`
+     message: "15 launches fewer a block pass and one a head step, the same bits"; draft 1.74→1.71 / 1.76→1.68 ms
+     per 5-draft window, fixed windows 8530/8502→8504/8485 ms per 512 tokens. Number in commit message only.
+   - grim: norm+quant fusion with DIFFERENT bytes was rejected; this variant keeps the same quantizer/scale for all
+     consumers, so it passes the byte-identity precondition. Requires a shared q8_1 scratch per drafter stage and
+     kernels that accept pre-quantized rows.
+
+8. **2-bit drafter-head screen + exact-rescore; bit-plane interval variant for exact verify** - `FN`, decode. **NEW, lower priority.**
+   - Code: `include/basalt/kernels/head_proxy.cuh:19-21,38-90,103-346` (`kPer=4`, `kMaxCand=64`, `kDelta=5`,
+     half-UNSHRINK `sqrt(ww/wr)`, DP4A score, radix top-k, exact rescore in `native_mmvq` order);
+     `include/basalt/kernels/q80_screen.hpp:12-24`; `src/kernels/cuda/q80_screen.cu:176` supports ONLY `n_in==3072`;
+     116 MB copy (`docs/models/hy4-flash.md:97`). Exact verify variant `include/basalt/models/qwen4exp/kernels/q80_vhead.hpp:1-43`
+     (interval `c ± w`, `w≈1.5Σ|y|`) — 350 vs 439 µs/window (`docs/precision/qwen38-flash-next.md:188-203`).
+   - grim: no head screen, no cut-vocab; `gpu_argmax_into_dev` already gives full-vocab exact argmax. Screen only
+     accelerates DRAFT proposals (cannot change output); width hard-wired to 3072, CUDA intrinsics throughout.
+     Prototype only if draft-head cost dominates after `may_verify`.
+
+9. **Profile-ranked expert seeding + prompt-histogram seed** - `FN`, cold-start TTFT. **PARTIAL.**
+   - Code: `data/profiles/{qwen4exp-48x512,hy4flash-42x512,...}.prof`, loader `src/core/expert_tier.cpp:630-645`;
+     prompt seed `models/qwen4exp/serve/tiers.cpp:16-42` (`kSeedTokens=64`, `kSeedKeep=0.3`, top-32).
+   - grim: P3 has `ResidentProfileFreq::from_trace` but unwired (Appendix D1). Idea overlaps Avalon's shipped
+     `moe-cache-ranking.bin` (Appendix C1) — use Avalon's format if adopting; histogram seed is a small add-on.
+
+10. **Priced CPU/peer expert split + peer adapt** - `FN`, prefill + two-GPU. **PARTIAL / medium.**
+    - Code: `include/basalt/prefill/peer_share.hpp:90-145` (`peer_take` minimizes max of link/rows costs),
+      `core/peer_experts.cpp:588-663` adapt (usage≥2, gain 1.5, capped swaps), `tier_policy.hpp:123-175` DP
+      `split_by_bytes`. Algorithms neutral; `cudaMemcpyPeerAsync`/NVML transport not.
+    - grim: P12 prefetch stub + P3 unwired; two-GPU pipeline exists but no priced expert split. Medium priority,
+      feeds item 3 / item 6.
+
+### E2. N/A or DUP (recorded, not promoted)
+
+- **Engram early-row prefetch during draft** (`models/hy4flash/session.cpp:265,1575-1604`): neutral overlap pattern
+  but grim's two target models have no Engram table. N/A.
+- **NVFP4/W4A4 TMA tensor-core prefill** (`prefill/fp4_dense.cu`, `moe_fp4.cu`, `nvfp4_planes.hpp`): strongly
+  Blackwell-specific; grim's W4A4 is gfx12 `v_dot8` only and its own quant formats differ. NO.
+- **`--route-prior` / `--route-tail-skip`** (`route_flags.cpp:16-77`, `route_tail_skip.cu:14-52`, `router.cu:155-210`):
+  DUP of Avalon A24 / PLAN-astrum P3; exact semantics (selection biased via `exp(Λ)`, weights unchanged; tail drop iff
+  held by no GPU and every entry rank≥R, no renormalisation) corroborate Appendix C4. Keep grim's lossy gate plan.
+- **Cut-vocab MTP head + 8192 hot embedding rows** (`qwen4exp/decode/mtp/head.cpp:15-167`,
+  `native_head.hpp:54-77`): NEW but pack/tokenizer-dependent, needs converter support. Lower priority.
+- **KV int8 + fp16 scale/64 / fp8 power-of-two scale** (`kv_q8.hpp:1-40`): DUP of grim's kvquant stack + standing
+  "quantize storage, never attention math" convention.
+- **Kernel micro-tiling (`__dp4a`, `__funnelshift_r`, `cp.async.bulk.prefetch.L2`)**: CUDA-only; only the neutral
+  ideas (one-round tile load, aligned-word codes, compile-time width, doorbell-gated prefetch) carry over.
+
+### E3. Effect on the ranked findings
+
+- Item 4b (MTP micro-transfers): **promote `may_verify` to first sub-step** - pure Rust, output-neutral, no GPU gate
+  needed for soundness. Row-quantize-once is second.
+- Item 3 (expert ring / residency): add **use-capped victim selection** and **bounded lend with hot-slot compaction**
+  as targeted additions; both are host-side algorithms that can live in the existing unwired `expert_prefetch_stream`
+  / partial P3 scaffolding.
+- Item 7 / graph work: add **device-side window metadata** so one captured graph can replay across positions;
+  pairs with grim's graph-ON default and avoids the re-capture/per-position host writes.
+- Tier 1 item 1 (QSA): add **32-head cell-tile sharing** as the post-wiring attention optimization, byte-identity gate first.
+- No change to items 2, 5, 6, 8 from Basalt. No new top-level item outranks the existing Tier-1 list.
+
+### E4. Honesty notes
+
+- Basalt is a **different backend (CUDA/sm_120)**; numbers are its hardware's and were NOT reproduced here. All
+  transfers are algorithmic, with HIP reimplementation cost.
+- Several headline numbers are commit-message-only (`15 launches fewer`, `2x41 launches`, `2290→1778 us`,
+  `10-15% fewer misses`); the agents flagged exactly which ones are not present verbatim in code/docs. Do not quote
+  them as measured facts in grim.
+- No files were written outside the review; `old/repo/basalt` is a clean depth-1 clone.
+
+## Appendix F: llama.cpp 1.0 upstream review (2026-11-20)
+
+Scope: `https://github.com/ggml-org/llama.cpp` cloned to `/drive/bigfast/grim/old/repo/llama1`, HEAD `e46069c`,
+depth-1 (232 MB). `CMakeLists.txt:6-8` confirms `LLAMA_VERSION 1.0.0`; release `v1.0.0` published 2026-11-13. 500
+commits + release notes mined; three code-verification agents read the final tree. **The clone has ONE commit, so
+PR-by-PR diffs are not available; every claim below is from reading current code or release text, not a diff.**
+
+Structural finding: upstream 1.0 now contains **`src/models/qwen4exp.cpp` (1513 lines)** with QSA, GDN, PLE, MTP,
+MoE and HC, and an **upstream MoE cache** (`src/llama-moe-cache.cpp`, 984 lines). A chunk of what Avalon built as a
+fork is now upstream. Consequence: for grim's Tier-1 item 1 (QSA wiring), upstream 1.0 is a **second, better-maintained
+reference** than Avalon; for P3 (expert residency) upstream's ClassLRU/CRF is a stronger algorithm than grim's partial
+P3 scaffolding. Paths below are relative to `old/repo/llama1/` unless marked grim.
+
+### F1. Dense / 27B inference improvements (explicitly requested — Qwen3.8-27B is dense)
+
+Upstream's dense model is `src/models/qwen35.cpp` (27B family). Transferable items:
+
+1. **MTP target hidden state as a device buffer with event-ordered row copies** - `27B`, decode. **HIGH**.
+   - API `include/llama.h:1172-1221`: `llama_set_embeddings_nextn_dev` (`:1210`, F32 `[n_embd, n_batch+n_seq_max]`
+     on output device), `llama_get/set_embeddings_nextn_rows` (`:1213-1214`), `llama_set_ctx_state_src` (`:1218`),
+     `llama_set_nextn_layer_offset` (`:1184`); batch ext row indices `:1055-1074`.
+   - Impl `src/llama-context.cpp:1426-1442` (flag changes require scheduler reserve), `:1558-1619` (allocation on
+     `model.dev_output()` with `ev_h_nextn_written`/`ev_h_nextn_read`, host fallback on any failure), `:1638-1661`
+     (row get/set wait on the right event), `:1663-1692` (`supports_state_row` rejects cross-GPU buffers).
+   - grim: `decode_graph.rs:6152` "nextn hidden copy", `:6325-6345,6789-6807` `h_src` behind `mtp_pre_norm_h_enabled()`
+     (default OFF); adapter has vocab-sized D2H logits. Mirror the API shape: one state-source context + row indices +
+     event ordering, with reserve invalidation when the flag changes (upstream comment `:1451-1452`: changing
+     embedding flags without reserve drops acceptance to zero). **Dual-GPU caveat**: upstream rejects cross-GPU state
+     rows; grim's 47/17 split must validate before relying on the device path or it silently falls back to host.
+   - Upstream also supports chained NextN heads via `set_nextn_layer_offset` (`common/speculative.cpp:2052,2065,2172,2264`)
+     — grim tested chaining and found no win; capability is not missing, workload result stands.
+
+2. **`fit` charges skipped NextN layers to the output-layer GPU** - `27B`, two-GPU placement. **HIGH, small fix**.
+   - `common/fit.cpp:152-157` `hp_ngl_skip = load_mtp ? 0 : n_layer_nextn`; placement `:634-663` adds `hp_nsk` to
+     `n_gpu_layers` and to `tensor_split[id_last]` so the loader's `i_gpu_start` (`src/llama-model.cpp:1805-1817`)
+     matches. Without this every offload boundary shifts by the NextN count.
+   - grim: `plan_layer_devices` (`qwen35.rs:7489`, 47/17 auto split) has no analogous skipped-head accounting; add
+     before any new two-card A/B, otherwise split measurements are against a shifted layout.
+
+3. **Per-model rope params + correct KV-shift for quantized/hadamard K** - `27B` + `FN`, correctness and prefix reuse. **HIGH**.
+   - `src/llama-graph.h:1090` model member of `llm_graph_context`; `llama-graph.cpp:1777-1806` `build_rope` sources
+     `model.get_rope_params(cparams, il)` (not a graph-global), indexer variant forces NEOX `n_offs=0`.
+   - `src/llama-kv-cache.cpp:2113-2179`: fast in-place KV shift only for unquantized, non-F8 K with no k_norm; slow
+     path casts F32 -> **undo hadamard** -> undo k_norm -> rope -> reapply k_norm -> reapply hadamard -> copy back.
+     Uses `ggml_row_size(type, …)` byte strides (`:2140-2142`) so quantized K is addressed correctly.
+   - Tests `tests/test-llama-archs.cpp:1583,1670-1880` compare shifted K **and logits** against a control decode in two
+     halves, with LINEAR scaling injected to catch wrong base/scale — same shape as grim's control-pair gate.
+   - grim: hadamard golden exists (`hadamard.rs`, Gate D) but rope params are not per-model/per-layer in all paths;
+     enforce undo/reapply around rope and byte-stride state copies for q8_1 default arena.
+
+4. **Graph-result and scheduler reuse (decode-speed lever of 1.0)** - `both`, decode. **HIGH**.
+   - `src/llama-context.cpp:780-830` `sched_new()`/`sched_reserve()` reuse scheduler + graph results when
+     `sched_params.can_reuse()` (node budget less/equal, same parallel/op_offload); `:1826-1899` `process_ubatch()`
+     only calls `set_inputs()` on a hit (`n_reused++`), full rebuild otherwise. Two graph-result slots
+     (`llama-context.h:453-457`) because output-present vs output-absent batches have different graph-cache keys.
+     `llama-graph.cpp:1622-1652` `can_reuse()` checks all input objects; env `LLAMA_GRAPH_REUSE_DISABLE`.
+   - `llama-graph.cpp:1544-1584` `reset()` reuses one metadata buffer allocated at worst case and **does not zero
+     unused pages** (comment `:1570`); `set_outputs()` `:1592-1620` marks every host-read sampling chain tensor as a
+     graph output so ggml-alloc cannot alias it after a select.
+   - grim: graph capture ON by default, M=64 prewarm, separate per-M execs; no topology-keyed reuse across reserves,
+     and `grim-cli`/engine graph rebuild on config changes. Adopt two-variant cache + no-touch metadata + mark
+     host-read sampler/argmax outputs live. Pairs with the `may_verify` and `gpu_argmax_into_dev` work.
+
+5. **Cross-backend prefetch rule: only inputs computed by earlier splits** - `27B` two-card, prefill/decode. **HIGH**.
+   - `ggml/src/ggml-backend.cpp:2152-2211`: skip inputs whose base tensor is not in a COMPUTE buffer (i.e. not yet
+     produced by an earlier split) and skip tensors the current split writes; event per backend, next split waits
+     (`:2107-2112`). Avoids copy-callback racing prefetch.
+   - grim: cross-device hops in `scythe2.rs:810`, `model_loader.rs:669-671`; apply "issue boundary activation copy
+     only from a stage that has produced it, gated by that stage's event" for pipeline Stage A/B work.
+
+6. **Fixed rocBLAS workspace per handle** - `27B` + `FN` on ROCm. **MEDIUM, partly known in grim**.
+   - `ggml/src/ggml-cuda/common.cuh:1392-1400,1444-1461`: one fixed 32 MiB workspace for HIP (version-gated) set once
+     at handle creation; freed once (`ggml-cuda.cu:1005-1006`).
+   - grim handles rocBLAS status 5 by allocator drain/retry + custom-HIP fallback (`roc_device.rs:2605-2652`) and sets
+     `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES` (`blaslt.rs:466-597`); prefer a preallocated cached workspace to
+     remove the per-call allocation and the failure path.
+
+7. **Few-row MMQ (2-24 rows) and empty-tile skip** - `27B` decode/prefill. **CUDA-only kernels, neutral ideas**.
+   - `ggml/src/ggml-cuda/mmq-few.cu:19-20,872-905` (`MMQ_FEW_MAX_NCG=3`, `NCOLS=8`, up to 24 columns; Q4_K min 4,
+     IQ4_XS min 6), dispatch `ggml-cuda.cu:2579-2588,2653-2654`; HIP/MUSA stub aborts (`:935-941`).
+     `mmq.cuh:1323-1370` skips empty stream-k fixup tiles. `ggml-cpu/ops.cpp:11134-11285` fused GDN K=1 writes
+     directly, K>1 via scratch — upstream removed the non-fused GDN graph expansion entirely.
+   - grim already has rows_r2 dual-row and M=2 wins; the transferable rule is batch-size-independent fusion decisions
+     (stable graph topology) and skipping empty tiles; do NOT port the CUDA kernels. Keep `GRIM_GDN_WY_CHUNK` as an
+     oracle/reference, not a maintained fast path, now that upstream is fused-only.
+
+8. **FP8 KV caches** - `27B` only with verification; **BLOCKED for Flash-Next**. **MEDIUM**.
+   - `GGML_TYPE_F8_E4M3` in `kv_cache_types` (`common/arg.cpp:275-286`), defaults f16; per-element saturating cast
+     (`ggml-quants.c:416-419`) with optional per-layer F32 scales from GGUF (`llama-model.cpp:1856-1862`) folded as
+     `q*=s, k/=s` and `v/=s, out*=s` (`llama-graph.cpp:3439-3469`). On-the-fly dequant in FA
+     (`fattn-common.cuh:150-172,438,688-713`). **Important correction**: `ggml-cuda/fp8.cu` is an FP8 matmul, NOT KV
+     quant, and is CUDA-only. `llama-context.cpp:4487-4503` explicitly **rejects FP8 KV for LLM_ARCH_QWEN4EXP**
+     (and DFLASH, MLA/DeepSeek families); qwen35 is not in that rejection list, but verify a real checkpoint before
+     assuming support. grim's q8_1/int8/WhiteCrow stack is different; the portable idea is Q/V scale folding.
+
+### F2. Flash-Next / MoE improvements
+
+1. **Upstream MoE cache with ClassLRU + CRF and CPU share** - `FN`. **PARTIAL in grim (P3 unwired), algorithm NEW**.
+   - `src/llama-moe-cache.cpp` (984 lines): `moe_cache_lru` `:21-288` uses n_class=8, `crf_half_life=128` tokens,
+     CRF = decayed uses +1, class=floor(log2(CRF)), victim=max(age/2^class) over per-class LRU heads (`:117-176`);
+     `plan()` `:187-287` keeps hits, ranks misses by CRF, sends lowest-CRF misses to CPU when cache full, one zero
+     slot per token max. `impl` `:321-879`: max_batch 32, CPU share in 1/65536 with carry (`:388,813-818`), GPU
+     required, tensor-parallel rejected (`:412-420`), only fully host-resident layers cached (`:422-445`), bank has
+     `n_zero+1` slot for MMQ overread (`:555-559`).
+   - No CPU wait on cached experts: build_lookup `g.cb(slots,...)` (`:891-947`), `copy()` uploads async and rewrites
+     slot map (`:767-862`), `build_experts` adds GPU-cached + CPU-miss paths (`:949-963`).
+   - API/flags: `include/llama.h:409-410` `moe_cache_size`/`moe_cache_cpu_share`, `--moe-cache-mib` /
+     `--moe-cache-cpu-share` (`common/arg.cpp:2751-2771`), defaults 0/0.0 (`common/common.h:619-620`); doc
+     `docs/moe-cache.md`, tuner `scripts/moe-cache-tune.py`.
+   - grim: P3 primitives exist but `from_env()` has no caller and Flash-Next routes on device without a prior
+     (Appendix D1). Adopt ClassLRU/CRF + CPU-share fraction + zero-slot scheme; backend-agnostic, but needs the
+     scheduler/copy-callback equivalent. Pipeline parallel is disabled when the cache is on
+     (`llama-context.cpp:584-590`) — account for that in grim's two-GPU pipeline work.
+
+2. **Upstream `qwen4exp` as a QSA/GDN/MTP/PLE reference** - `FN`. **REFERENCE, not a new lever**.
+   - QSA: hparams `:64-83` (single `compress_ratio`, `kpool_row=2`, `by_order=true`, `select_tail=true`);
+     `build_inp_kpool :718-811`, `build_qsa_sel :813-950` (pooled-key lightning indexer + `ggml_top_k` +
+     `ggml_top_k_mask` at `:891`), `build_attn_qsa :951-1010`, dispatcher `:1011-1087`. Device-side fused mask via
+     `llm_graph_context::build_fused_top_k_mask` (`llama-graph.cpp:3653-3670`) with `fused_top_k_mask` default ON
+     (`llama-context.cpp:346`, probe `:744`); kernel `ggml/src/ggml-cuda/top-k-mask.cu`.
+   - GDN `:1088-1218` (conv, l2 norm, recurrent attn; sigmoid gate not silu vs Qwen3.5); PLE hash `:1298-1365`;
+     MTP `graph_mtp :582-671`; MoE + shared expert `:300-307`; HC mix/combine `:352-450`.
+   - This is the concrete template for report item 1's stage 2: replace grim's host `to_vec_f32`/host mask
+     (`qwen4exp_flash_next.rs:1504-1710`) with device top-k + fused mask + selected-cell attention. No explicit
+     tail-skip/route-prior symbol in the file — do not claim one.
+
+3. **External PLE/engram shards + lazy mmap + row prefetch** - `FN`, cold load/TTFT. **MEDIUM**.
+   - `--ple` == `--shard` (`common/arg.cpp:3039-3048`); loader `src/llama-model-loader.cpp:600-758` recognizes a
+     one-tensor `per_layer_token_embd.weight` shard (`:647-649`), skips split numbering checks, and lets it override
+     the backbone copy (`:705-706,726-734`). Lazy tensor + optional F32 scale (`qwen4exp.cpp:216-219`), all files
+     mapped when mmap OR any lazy tensor (`:1505-1536`), `llama_prefetch_rows` warms selected hash rows
+     (`qwen4exp.cpp:1362-1364`).
+   - grim's Flash-Next plan already puts the PLE table in host RAM; adopt override/mmap/prefetch mechanics if the
+     checkpoint arrives as separate shards. Hash constants come from GGUF KV (`src/llama-arch.h:377-385`).
+
+4. **Reference-counted checkpoints + parent-before-child scheduling** - `both`, multi-request TTFT. **HIGH**.
+   - `tools/server/server-slot-sched.h:13-46`: checkpoints are `shared_ptr<const common_prompt_checkpoint>`; clone
+     copies the pointer list, not MiB blobs. `server-slot-sched.cpp:13-58` `get_reuse()` newest-first with SWA-aware
+     validity (`n_swa`). `tools/server/server-context.cpp:3378-3394` `iterate()` does two passes: non-child slots
+     first, child slots second; children wait (`SLOT_STATE_WAIT_OTHER`) until parent publishes the shared prefix
+     (`:4304-4312,4727-4743`).
+   - grim: radix prefix cache default-on (`engine/core.rs:289-294`), P10 checkpoint cache partial/unwired (Appendix D1).
+     Adopt `Arc`-shared immutable blobs, newest-first + SWA validity, and parent-first two-pass scheduling.
+
+5. **Graph node budget from model structure + MoE reserve** - `FN`/`27B`, stability. **MEDIUM**.
+   - `src/llama-model.h:1054-1056` `graph_nodes_per_tensor()` (8 default, 32 for most large/MoE models, 64 for
+     selected); `llama-context.cpp:2913-2935` `graph_max_nodes()` adds `+32*n_layer_all` when `moe_cache_size>0`
+     and sampler-chain nodes; failure to reserve causes realloc churn (tracked `n_reallocs_same/diff` at `:3092-3109`).
+     Node budget moved out of `n_ubatch` into model classes (`#32648`), and a per-layer MoE reserve added (`#32636`).
+   - grim's M=64 prewarm depends on a stable graph topology; budget from static model structure + MoE terms, not from
+     the current batch.
+
+### F3. DUP / N-A / not promoted
+
+- MoE CPU-miss + LRFU idea: DUP of Avalon A30/A31, Basalt E1.2, and PLAN-astrum P3 — upstream's ClassLRU/CRF is a
+  better-specified version of the same tactic, not a new lever.
+- QSA tile lists / GPU mask: DUP of Avalon A13-A15; upstream adds a fused `TOP_K_MASK` op absent from Avalon.
+- `fp8.cu` FP8 matmul: CUDA-only, excluded on HIP (`:3`); note only.
+- Few-row MMQ, stream-k fixup, NVFP4 epilogue scale fusion, Vulkan FA / RDNA prompt FA (#31323): backend-specific
+  kernels; ideas (batch-size-independent fusion, empty-tile skip) noted, no direct port.
+- `mtmd` shared compute buffer/worst-case warmup (`tools/mtmd/README-dev.md:36-37`): neutral memory idea, low priority.
+- New upstream architectures (Kimi-K3.1-Pro, Ripple, xing4_0, drama-3): outside grim's two target models.
+
+### F4. Effect on the ranked findings and honesty notes
+
+- Item 1 (QSA): upstream 1.0 `qwen4exp` becomes the **primary** wiring reference; Avalon tile lists remain the
+  performance follow-up. Add fused `TOP_K_MASK` to stage 2 scope.
+- Item 3 (expert ring/residency): add upstream ClassLRU/CRF + CPU-share + zero slot as the concrete replacement for
+  grim's unwired P3; remember pipeline parallel was disabled upstream with MoE cache on.
+- Item 4b / MTP: `may_verify` (Basalt) + device state rows (upstream) are the two complementary pieces; device path
+  must be validated for grim's cross-GPU split because upstream rejects cross-GPU state rows.
+- Item 5 (pinned checkpoint): upstream's `Arc`-shared checkpoints + parent-first scheduling strengthen the TTFT case;
+  still need Avalon's pinned capture for the first-token copy.
+- Dense/27B: items 2 (device hidden), 4/4b (graph reuse, argmax), 6 (two-GPU placement), and new F1.3 rope/KV-shift
+  are the dense-specific additions. Do not let MoE/QSA work crowd out the 27B path — it is a dense model.
+- Honesty: llama1 is a **single-commit snapshot**; PR numbers label features but no diff was available. Release-note
+  and code claims were not benchmarked here. FP8 KV is blocked for QWEN4EXP in upstream, and `fp8.cu` is not a KV
+  quantizer. No files written outside the review; `old/repo/llama1` is a clean depth-1 clone.
+
+## Appendix G: dense-model (27B) improvements in Avalon vs Basalt (2026-11-20)
+
+User question: do Avalon or Basalt contain inference improvements for DENSE models? Two dedicated code verifiers
+checked both trees. Paths relative to their clones unless marked grim.
+
+### G1. Avalon — verdict: headline work is MoE-only; a few generic changes do reach dense
+
+- Dense target in Avalon = `LLM_ARCH_QWEN35` -> `llama_model_qwen35` (`src/llama-arch.h:47`,
+  `src/llama-model.cpp:333-334`). Dense FFN is asserted: `src/models/qwen35.cpp:481-490` checks
+  `ffn_gate_inp == nullptr` and builds SILU FFN; GDN + full attention mix at `:158-170`.
+- **MoE-ONLY, cannot help 27B**: expert cache (requires `_exps`/`_chexps` 3-D host tensors,
+  `src/llama-context.cpp:882-907`, mode forced OFF otherwise `:984-987`), hosted MoE, expert prefetch ring
+  (`moe-ring.h`), RAM arena (`moe-arena.h`), QSA tiles (`qwen4exp.cpp:1357-1397`, zero QSA calls in `qwen35.cpp`),
+  fused `hc_post`+norm (qwen35 uses `build_norm_gated` at `qwen35.cpp:257-265`, not `ggml_hc_post`).
+- **Generic / shape-gated, DOES reach dense**: backend greedy argmax with `data->logits=nullptr`
+  (`src/llama-sampler.cpp:1100-1133`, NVIDIA default per `README.md:236`); fused GDN kernels
+  (`cparams.fused_gdn_ar/ch` default true `src/llama-context.cpp:368-369`, consumed by dense qwen35 at
+  `qwen35.cpp:452` via `delta-net-base.cpp:433-439`); GDN WMMA chunked prefill (shape gate S=128/HK=16/HV=48,
+  single seq, >=128 tokens — `ggml-cuda/gdn-wmma.cu:1264+`, NOT architecture-gated, but 27B dims unverified);
+  pinned checkpoint spare buffer (>16 MiB heuristic, `common/common.cpp:2510-2538`); IQ3_KS quant (only if weights
+  stored that way); `top_k_radix_row` likely generic (gating not fully confirmed).
+- **Conclusion**: README's "other models run as in llama.cpp" is overstated in the literal sense but correct for
+  all headline optimizations. No MoE/cache/QSA/hc idea leaks into dense. For grim 27B the only clearly active
+  Avalon dense items are backend argmax (item 4) and fused GDN (item 2 / Appendix E7); GDN WMMA is the same
+  shape-gated candidate already listed in item 2. No NEW dense item from Avalon.
+
+### G2. Basalt — verdict: substantial, model-specific dense/27B work; several transferable ideas
+
+All numbers below live in commit messages or `docs/models/qwen38-27b.md` / `docs/precision/qwen38-27b.md`; none were
+re-benchmarked here. Paths under `src/dense/`, `src/models/qwen35/`, `include/basalt/dense/` unless noted.
+
+1. **`--kv-resident` two-tier KV** - **NEW to grim, idea neutral, mechanism CUDA-specific**. Flag parse
+   `src/models/qwen35/adapter.cpp:652`, default 0 (`include/basalt/program/options.hpp:58-60`), rule
+   `src/dense/model.cpp:322-323`; pinned mapped host tier `cudaHostAlloc(...Mapped|Portable)` at
+   `session.cpp:63-93`, `far_view` partition `include/basalt/kernels/gqa_attn.hpp:34-44`; decode reads far cells in
+   `gqa_decode_attn` via `forward.cpp:663`; prompt staging `forward.cpp:362-399`. Commit `5f23040a` reports a
+   250k-token prompt (4345->4171 tok/s) and hit to host bandwidth (~24 of 28.8 GB/s) — decode with the far tier was
+   MUCH slower (45.4->3.1 tok/s plain), so this is a capacity/TTFT lever, NOT a free decode win. grim has no pinned
+   KV-host tier; q8_1 changes byte math, not the design. Adopt only with explicit near/far A/B.
+
+2. **Pipelined layer split for long prompts** - **PARTIAL/dup**, concept maps to grim's 47/17 split. Planner
+   `src/dense/model.cpp:358+`, `qwen35/adapter.cpp:95+,629-644`; `Stage::read` `src/dense/stage.cpp:132`,
+   `split_read :985-1094` (main reads chunk i+1 while stage reads chunk i, residual via pinned RAM, cells returned
+   per chunk); decode hand-off `dense/internal.hpp:113-121`, `forward.cpp:609-645,725-733`, graph per card `:688`.
+   Commit `d9408db3` reports decode regression on the split (~0.37 ms/layer on a 5060 Ti) and "4K prompt = one
+   chunk, no overlap" — useful caveat for grim's own pipeline A/B.
+
+3. **16-row decode windows + automatic draft width (`--spec` 0..16, default 16)** - **NEW, neutral heuristic,
+   row count not portable as-is**. `dense/internal.hpp:23-25` (`kWindow=16`, `kBatch=16`, `kNarrow=8`),
+   `session.cpp:200-204,317-401`, auto width `wide_ = n >= max(2, block-2)` at `:744`, `:208`, flag default
+   `qwen35/adapter.cpp:690`. Commit `20e8c370` reports struct 506->605 tok/s, 10.1->12.8 tok/window. grim's GEMV
+   regime is narrow (M=1/2 with rows_r2, M=64 prewarm); 16 rows moves past the M=1/2 crossover — re-measure before
+   adopting any width heuristic.
+
+4. **DFlash2 block drafter** - **NEW algorithm, needs a drafter pack**. Pack shape `include/basalt/dense/model.hpp:63-81`,
+   `qwen35/adapter.cpp:28-53` (block 2..8, top_k<=20); pass `forward.cpp:1066-1177` (row_logprobs over all block
+   candidates, `CandidateDraw`, `dyn_conv2`, selector); offer-all + confidence window `session.cpp:222-228`; sampled
+   drafts `session.cpp:821-834` with exact `min(1,p/q)` (`kernels/cuda/sampler.cu:345`); per-slot share `session.cpp:272`.
+   grim has only native MTP (default OFF) and already implements `min(1,p_target/p_draft)` (`speculative_wrapper.rs:462`).
+   Offer-all + confidence + share are neutral; weights/kernels are not.
+
+5. **`window_gemm` fused epilogues + PDL + batched windows + GDN overlap + per-state graphs** - **PARTIAL/NEW ideas**.
+   `include/basalt/kernels/window_gemm.hpp:1-90` (<=16 rows, `Epilogue{Store,Add,AddBf16,SwiGLU}`, <=3 matrices/call);
+   call sites `forward.cpp:41,62-80,134-185`, `PdlScope` `:655,784,799,819,1104`; batch `:773-901` (graph-per-composition
+   LRU 64, `internal.hpp:148`); GDN commit deferral `session.cpp:714-766` with `Join` guard `:216-219`; per-state
+   graphs `internal.hpp:188-193,207`, captured `forward.cpp:686-710`. PDL is CUDA-only (`kernels/pdl.hpp:56-77`,
+   gated CC>=9.0/CUDA>=12.3) — do NOT port to HIP. Neutral: fused epilogues, LRU graph-per-composition, deferred
+   GDN commit, per-state graph copies. grim's M=2 GEMV makes a 16-row fused GEMM less attractive today.
+
+6. **Prompt chunks: 4096 (dup) + BF16 residual + cells-only last layer (NEW, neutral)** - `internal.hpp:28-32`
+   (`kChunk=4096`, `kAttnSplits=3`), loop `session.cpp:416-428` — grim already defaults `GRIM_PREFILL_CHUNK_SIZE=4096`.
+   BF16 residual with single rounding `forward.cpp:335,916-936`, fp32 add in epilogues `:149-160`
+   (commits `2509f5da`, `d36c2a0a`). Cells-only last layer `forward.cpp:942-972` / `:418-429` (skips one of 16 prompt
+   attentions, 94 M FP8 weights, 1 of 64 MLPs per chunk — `12516e77`). Both are architecture-neutral and fit grim's
+   prefill path; NVFP4 W4A4 planes (`forward.cpp:409-417,486-499,531-540`, `prefill/fp4_dense.cu`) are
+   Blackwell/TMA-only — N/A.
+
+7. **Batched requests + drafter context in running state** - **NEW neutral principle, currently dormant in grim**.
+   `session.cpp:340-401` (`decode_batch`), `:255-289` (`draft_batch`, per-slot share `:272`), graph `forward.cpp:848-901`;
+   checkpoint includes block drafter ring + valid-length (`session.cpp:486-539`, ~42 MB per commit `31e6819e`).
+   Principle: serialize drafter ring and valid cell count in the running state so a prefix-cache hit restores it;
+   grim's MTP is OFF so nothing to restore today, but the same pattern applies when/if MTP is enabled.
+
+### G3. Effect on the ranked findings
+
+- **Avalon adds no new dense item**; its dense-relevant pieces were already in item 2 (GDN WMMA) and item 4
+  (backend argmax). The "Avalon = Flash-Next-only" framing is safe for all transfer recommendations.
+- **Basalt adds three dense ideas worth acting on**: (a) BF16 residual + cells-only last layer in the prefill path
+  (neutral, cheap, pairs with M=64 prewarm); (b) earlier-split-only cross-card prefetch + per-chunk pipelining details
+  for the 47/17 split (already in Appendix F1.5/F2.2); (c) `--kv-resident` two-tier KV as a *conditional* capacity
+  lever with a documented decode penalty — do not present it as a speed win.
+- **Do not promote**: 16-row windows / window_gemm / PDL / DFlash2 block drafter as direct copies — they assume a
+  different GEMV crossover and a drafter pack grim does not have. Keep the neutral heuristics (offer-all, confidence,
+  per-slot share, deferred commit) as design references only.
+
+### G4. Honesty notes
+
+- No GPU execution in either verifier; all speed numbers are commit-message/doc claims. Basalt's own `--kv-resident`
+  commit documents a large decode slowdown when reading the far tier — report that, not only the prefill gain.
+- Avalon's `top_k_radix_row` genericity and 27B GDN-WMMA dimension match were not fully confirmed; flagged.
+- No files were written outside the review; both clones remain clean depth-1 checkouts.
