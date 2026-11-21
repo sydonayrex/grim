@@ -3320,7 +3320,8 @@ impl RocmDevice {
                 }
                 if matches!(scheme, KQuantScheme::Q4K) {
                     let w4a4_decode = crate::device::quant::decode_w4a4_enabled();
-                    if m == 1
+                    if m >= 1
+                        && m <= 4
                         && w4a4_decode
                         && k % 128 == 0
                         && crate::quantization::w4a4_ostquant_supported(
