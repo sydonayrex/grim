@@ -16,7 +16,7 @@ use crate::{HipErrorT, hipSuccess};
 // re-declarations drifted between ROCm releases; there is exactly one
 // declaration site now.
 use crate::device::handles::{
-    hipDeviceCanAccessPeer, hipDeviceDisablePeerAccess, hipDeviceEnablePeerAccess,
+    hipDeviceCanAccessPeer, hipDeviceEnablePeerAccess,
     hipGetDeviceCount, hipGetDeviceProperties, hipMemcpyPeerAsync,
 };
 
@@ -306,6 +306,12 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
     if src == dst {
         return Ok(true);
     }
+    static GRANTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(i32, i32), bool>>> =
+        std::sync::OnceLock::new();
+    let map = GRANTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(&ok) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&(src, dst)) {
+        return Ok(ok);
+    }
     let count = enumerate_devices()?;
     if count < 2 {
         return Ok(false);
@@ -319,11 +325,9 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
     // hipDeviceEnablePeerAccess / DisablePeerAccess operate on the CURRENT device, so we must pin the current device to `src` for the duration.
     // Without this, the grant lands on (or fails from) whatever device the caller last touched.
     let _guard = crate::device::util::DeviceGuard::set(src);
-    // Disable first (best practice - peer access persists in the process
-    // address space, so a fresh probe may collide with a stale grant).
-    let _ = unsafe { hipDeviceDisablePeerAccess(dst) };
     let res = unsafe { hipDeviceEnablePeerAccess(dst, 0) };
     if res == hipSuccess || res == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+        map.lock().unwrap_or_else(|e| e.into_inner()).insert((src, dst), true);
         Ok(true)
     } else {
         Err(Error::Backend(format!(
