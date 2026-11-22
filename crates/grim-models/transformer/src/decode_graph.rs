@@ -7140,6 +7140,17 @@ impl DecodeGraphModel for Qwen35 {
                 _ => dev.ordinal(),
             })
             .collect();
+        // When Qwen35 will immediately replace k_arena/v_arena with a non-F32
+        // dtype (Q8_1 / F16 / Int8 / Int4 / WhiteCrow) sized to `max_ctx` (not
+        // `batch * max_ctx`), pass `1` here to avoid a transient `batch * ctx`
+        // F32 VRAM spike (e.g. 48 MiB × 2 × 42 layers = 4 GiB at batch=3) that
+        // OOMs rocm:0 before the replacement loop even runs.
+        let kv_dt_pre = crate::qwen35::kv_arena_dtype(&self.device);
+        let alloc_ctx = if kv_dt_pre.arith != grim_tensor::ArithType::F32 {
+            1
+        } else {
+            ctx
+        };
         let mut buffers = DecodeGraphBuffers::allocate_with_layer_devices(
             &dev,
             Some(&layer_devices),
@@ -7150,7 +7161,7 @@ impl DecodeGraphModel for Qwen35 {
             n_k,
             n_v,
             inter,
-            ctx,
+            alloc_ctx,
             vocab,
             nh,
             batch,
@@ -7161,6 +7172,7 @@ impl DecodeGraphModel for Qwen35 {
             0,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+        buffers.max_ctx = ctx;
 
         // Qwen35 owns its KV arena representation: f16 by default (validated
         // eager + graph), int8 when `GRIM_KV_ARENA=int8`, f32 on explicit
