@@ -21,6 +21,23 @@ use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
 use crate::deepseek4::DeepSeek4;
 use crate::deepseek32::DeepSeek32;
+/// Deduplicate device ordinals preserving first-seen order, optionally appending `extra`.
+#[inline]
+fn dedup_ords(src: &[usize], extra: Option<usize>) -> Vec<usize> {
+    let mut out = Vec::new();
+    for &ord in src {
+        if !out.contains(&ord) {
+            out.push(ord);
+        }
+    }
+    if let Some(e) = extra {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
 // Per-process env latches: these flags were re-read via std::env::var on every
 // decode step (several sites on the per-token path). Env is not mutated at
 // runtime by the engine, so read once.
@@ -2636,11 +2653,7 @@ impl DecodeGraphModel for Llama {
                 }
             }
         } else {
-            let mut ords = graph.buffers.layer_devices.clone();
-            if !ords.contains(&dev.ordinal()) {
-                ords.push(dev.ordinal());
-            }
-            for ord in ords {
+            for ord in dedup_ords(&graph.buffers.layer_devices, Some(dev.ordinal())) {
                 grim_backend_rocm::RocmDevice::shared(ord).synchronize();
             }
         }
@@ -2949,11 +2962,7 @@ impl DecodeGraphModel for Llama {
                 }
             }
         } else {
-            let mut ords = graph.buffers.layer_devices.clone();
-            if !ords.contains(&dev.ordinal()) {
-                ords.push(dev.ordinal());
-            }
-            for ord in ords {
+            for ord in dedup_ords(&graph.buffers.layer_devices, Some(dev.ordinal())) {
                 grim_backend_rocm::RocmDevice::shared(ord).synchronize();
             }
         }
@@ -6450,11 +6459,7 @@ impl Qwen35 {
         if !sync_after && std::env::var_os("GRIM_CHAIN_FULLFENCE").is_some() {
             // Bisect: full fence before nosync replay — identifies stale
             // staged inputs as the divergence cause (kills overlap on dev1).
-            let mut pre = graph.buffers.layer_devices.clone();
-            if !pre.contains(&dev.ordinal()) {
-                pre.push(dev.ordinal());
-            }
-            for ord in pre {
+            for ord in dedup_ords(&graph.buffers.layer_devices, Some(dev.ordinal())) {
                 grim_backend_rocm::RocmDevice::shared(ord).synchronize();
             }
         } else if !sync_after {
@@ -6465,7 +6470,7 @@ impl Qwen35 {
             unsafe {
                 QWEN_NOSYNC_EV.with(|cell| {
                     let mut evs = cell.borrow_mut();
-                    for &ord in &graph.buffers.layer_devices {
+                    for ord in dedup_ords(&graph.buffers.layer_devices, None) {
                         let slot = ord.min(evs.len() - 1);
                         if evs[slot].is_null() {
                             let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
@@ -6485,11 +6490,7 @@ impl Qwen35 {
                 });
             }
         } else {
-            let mut pre = graph.buffers.layer_devices.clone();
-            if !pre.contains(&dev.ordinal()) {
-                pre.push(dev.ordinal());
-            }
-            for ord in pre {
+            for ord in dedup_ords(&graph.buffers.layer_devices, Some(dev.ordinal())) {
                 grim_backend_rocm::RocmDevice::shared(ord).synchronize();
             }
         }
@@ -6527,11 +6528,7 @@ impl Qwen35 {
                 }
             }
         } else {
-            let mut ords = graph.buffers.layer_devices.clone();
-            if !ords.contains(&dev.ordinal()) {
-                ords.push(dev.ordinal());
-            }
-            for ord in ords {
+            for ord in dedup_ords(&graph.buffers.layer_devices, Some(dev.ordinal())) {
                 grim_backend_rocm::RocmDevice::shared(ord).synchronize();
             }
         }
@@ -7476,7 +7473,13 @@ impl DecodeGraphModel for Qwen35 {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(500);
         let min_free_bytes: u64 = min_free_mb * 1024 * 1024;
+        let mut unique_ords: Vec<usize> = Vec::new();
         for &ord in &ords {
+            if !unique_ords.contains(&ord) {
+                unique_ords.push(ord);
+            }
+        }
+        for ord in unique_ords {
             // Flush idle prefill blocks from the caching allocator back to HIP so
             // `vram_info(ord)` measures real free VRAM rather than pool-held slack.
             {
