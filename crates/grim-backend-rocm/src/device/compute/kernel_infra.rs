@@ -1112,6 +1112,72 @@ impl RocmDevice {
     /// Results are still cached by source hash, so repeated launches of the same
     /// source compile once. The route counter is recorded under `entry` exactly
     /// as the aggregate path does, so route assertions behave the same.
+    /// Preload the cached `.hsaco` modules for `entries` into `module_cache`
+    /// on this device using the exact same `jit-hw-adaptive` / standard key
+    /// derivation as `launch_compute_kernel_with_solution`.
+    pub fn prewarm_compute_entries(&self, entries: &[&str]) {
+        crate::device::util::note_current_device(-1);
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        #[cfg(feature = "jit-hw-adaptive")]
+        let spec = self.hardware_spec();
+        for &entry in entries {
+            #[cfg(feature = "jit-hw-adaptive")]
+            let (path, lowered_name, cache_key) = {
+                // Prewarm both decode-class (grid.y == 1) and prefill-class (grid.y > 1) keys.
+                let dims = crate::kernels::tile_picker::ShapeDims::new(64, 2, 64);
+                let shape_class = crate::autotune::ShapeClass::from_m(64);
+                let kernel_source = crate::kernels::source_asm::compute_kernel_source_with_spec(
+                    &spec, entry, shape_class, dims, 0, 1, None,
+                );
+                let Ok((p, lowered)) = self.jit_compile_or_cache(&kernel_source, entry, Some(&spec)) else {
+                    continue;
+                };
+                let key = format!(
+                    "grim_{}_{}_{:016x}",
+                    entry,
+                    self.gpu_target,
+                    seahash::hash(kernel_source.as_bytes())
+                );
+                (p, lowered, key)
+            };
+            #[cfg(not(feature = "jit-hw-adaptive"))]
+            let (path, lowered_name, cache_key) = {
+                let kernel_source = crate::kernels::source_asm::compute_kernel_source();
+                let hash = seahash::hash(kernel_source.as_bytes());
+                let cache_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
+                let (p, l) = if let Some((p, l)) =
+                    self.hsaco_cache.get_cached_kernel_hashed(&cache_key, hash)
+                {
+                    (p, l)
+                } else if let Ok((code, l)) = jit_compile_hsaco(&kernel_source, entry, &self.gpu_target) {
+                    match self.hsaco_cache.cache_kernel(&cache_key, &kernel_source, &code, &l) {
+                        Ok(p) => (p, l),
+                        Err(_) => continue,
+                    }
+                } else {
+                    continue;
+                };
+                (p, l, cache_key)
+            };
+            let Ok(path_c) = std::ffi::CString::new(path.to_str().unwrap_or("")) else { continue };
+            let Ok(entry_c) = std::ffi::CString::new(lowered_name.as_str()) else { continue };
+            let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if module_cache.contains_key(&cache_key) {
+                continue;
+            }
+            let mut module: *mut c_void = std::ptr::null_mut();
+            if unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) } != hipSuccess {
+                continue;
+            }
+            let mut func: *mut c_void = std::ptr::null_mut();
+            if unsafe { hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) } != hipSuccess {
+                unsafe { let _ = hipModuleUnload(module); }
+                continue;
+            }
+            module_cache.insert(cache_key, (module, func));
+        }
+    }
+
     pub fn launch_from_source(
         &self,
         source: &str,
@@ -1367,6 +1433,16 @@ impl RocmDevice {
             }
             (m, f)
         } else {
+            if PREWARM_COMPLETE.load(std::sync::atomic::Ordering::Relaxed)
+                && std::env::var_os("GRIM_WARN_LATE_MODULE_LOAD").is_some()
+            {
+                eprintln!(
+                    "[rocm-late-module-load] dev={} entry={} path={}",
+                    self.ordinal,
+                    entry,
+                    path.display()
+                );
+            }
             let mut module: *mut c_void = std::ptr::null_mut();
             let load_res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
             if load_res != hipSuccess {
@@ -1488,6 +1564,14 @@ fn route_counters() -> &'static RouteCounters {
 /// Called from the launch path next to the existing `launch_counter` increment,
 /// so it counts *successful* launches only: a failed `hipModuleLaunchKernel`
 /// returns early via `check_hip(...)?` and never reaches here.
+static PREWARM_COMPLETE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark load-time kernel prewarm complete so late `hipModuleLoad` calls can be
+/// flagged when `GRIM_WARN_LATE_MODULE_LOAD=1`.
+pub fn mark_prewarm_complete() {
+    PREWARM_COMPLETE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn record_kernel_route(entry: &str) {
     // Fast path: the name is almost always already present, so this is a read
     // lock plus an atomic add, and no allocation.

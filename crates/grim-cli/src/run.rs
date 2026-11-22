@@ -1992,6 +1992,21 @@ pub async fn cmd_run(
         }
     }
     if prewarm_kernels {
+        #[cfg(feature = "rocm")]
+        {
+            const PREWARM_ENTRIES: &[&str] = &[
+                "grim_wmma_fused_dequant_q6k",
+                "grim_wmma_fused_dequant_q3k",
+                "grim_wmma_fused_dequant_q4k",
+                "grim_wmma_fused_dequant_q5k",
+                "grim_mmq_q4k_q81_wmma_iu8_m16n64",
+            ];
+            let n_gpus = grim_backend_rocm::enumerate_devices().unwrap_or(1).max(1);
+            for ord in 0..n_gpus {
+                let rdev = grim_backend_rocm::RocmDevice::shared(ord);
+                rdev.prewarm_compute_entries(PREWARM_ENTRIES);
+            }
+        }
         // Warm up rocBLAS/hipBLASLt TensileLite heuristics during model load
         // so first-prompt TTFT does not pay MsgPack deserialization cost.
         let mut warm_sess = model.new_session();
@@ -2065,6 +2080,8 @@ pub async fn cmd_run(
                 let _ = model.forward(warm_sess.as_mut(), &warm_ids, &warm_pos, &[]);
             }
         }
+        #[cfg(feature = "rocm")]
+        grim_backend_rocm::device::compute::kernel_infra::mark_prewarm_complete();
         // Pre-capture M=2 DecodeGraph for NativeMtp during model-load prewarm so the
         // first speculative verify step skips warmup + capture inside the decode timer.
         if let Some(spec) = model
