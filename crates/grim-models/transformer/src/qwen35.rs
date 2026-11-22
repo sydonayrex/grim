@@ -298,6 +298,32 @@ impl Qwen35LayerCache {
 
 // Block
 
+/// Peer-GPU shard of the SwiGLU FFN for asymmetric FFN-only TP=2 (`GRIM_FFN_TP_RATIO=2:1`).
+pub struct FfnPeerShard {
+    pub peer_device: Device,
+    pub ffn_gate: Linear,
+    pub ffn_up: Linear,
+    pub ffn_down: Linear,
+}
+
+/// Parse `GRIM_FFN_TP_RATIO=a:b` (e.g. `2:1`) into the `dev0` intermediate width
+/// aligned to 256 (K-quant superblock boundary).
+pub fn parse_ffn_tp_split0(intermediate_size: usize) -> Option<usize> {
+    let raw = std::env::var("GRIM_FFN_TP_RATIO").ok()?;
+    let (a_s, b_s) = raw.trim().split_once(':')?;
+    let a: usize = a_s.trim().parse().ok()?;
+    let b: usize = b_s.trim().parse().ok()?;
+    if a == 0 || b == 0 {
+        return None;
+    }
+    let split0 = ((intermediate_size * a) / (a + b)) / 256 * 256;
+    if split0 >= 256 && intermediate_size.saturating_sub(split0) >= 256 {
+        Some(split0)
+    } else {
+        None
+    }
+}
+
 pub struct Qwen35Block {
     pub device: Device,
     pub attn_norm: RmsNorm,
@@ -356,6 +382,8 @@ pub struct Qwen35Block {
     /// This uses the safe Q4_K fused-dequant/WMMA path, not the RDNA4-incompatible
     /// dot4 Q4_K kernel.
     pub w_gate_up_q4k_fused: Option<std::sync::Arc<grim_backend_rocm::FusedGateUpQ4KWeights>>,
+    /// Optional peer-GPU FFN shard when `GRIM_FFN_TP_RATIO=2:1` is active.
+    pub ffn_peer: Option<FfnPeerShard>,
 }
 
 impl Qwen35Block {
@@ -641,27 +669,56 @@ impl Qwen35Block {
             RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?
         };
 
-        let ffn_gate = Linear::load_column_parallel(
-            &ws.pp("ffn_gate"),
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            false,
-            tp,
-        )?;
-        let ffn_up = Linear::load_column_parallel(
-            &ws.pp("ffn_up"),
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            false,
-            tp,
-        )?;
-        let ffn_down = Linear::load_row_parallel(
-            &ws.pp("ffn_down"),
-            cfg.intermediate_size,
-            cfg.hidden_size,
-            false,
-            tp,
-        )?;
+        let (ffn_gate, ffn_up, ffn_down, ffn_peer) = if tp.world_size == 1
+            && matches!(device, Device::Rocm(0))
+            && parse_ffn_tp_split0(cfg.intermediate_size).is_some()
+        {
+            let split0 = parse_ffn_tp_split0(cfg.intermediate_size).unwrap();
+            let peer_dev = Device::Rocm(1);
+            let (g0, g1) = ws
+                .pp("ffn_gate")
+                .get_asymmetric_pair("weight", 0, split0, &device, &peer_dev)?;
+            let (u0, u1) = ws
+                .pp("ffn_up")
+                .get_asymmetric_pair("weight", 0, split0, &device, &peer_dev)?;
+            let (d0, d1) = ws
+                .pp("ffn_down")
+                .get_asymmetric_pair("weight", 1, split0, &device, &peer_dev)?;
+            (
+                Linear::from_tensor(g0, None),
+                Linear::from_tensor(u0, None),
+                Linear::from_tensor(d0, None),
+                Some(FfnPeerShard {
+                    peer_device: peer_dev,
+                    ffn_gate: Linear::from_tensor(g1, None),
+                    ffn_up: Linear::from_tensor(u1, None),
+                    ffn_down: Linear::from_tensor(d1, None),
+                }),
+            )
+        } else {
+            let ffn_gate = Linear::load_column_parallel(
+                &ws.pp("ffn_gate"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+                tp,
+            )?;
+            let ffn_up = Linear::load_column_parallel(
+                &ws.pp("ffn_up"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+                tp,
+            )?;
+            let ffn_down = Linear::load_row_parallel(
+                &ws.pp("ffn_down"),
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                false,
+                tp,
+            )?;
+            (ffn_gate, ffn_up, ffn_down, None)
+        };
 
         let w_gate_up_q4k_fused = if matches!(&device, Device::Rocm(_))
             && matches!(
@@ -796,6 +853,7 @@ impl Qwen35Block {
             intermediate_size: cfg.intermediate_size,
             wqkv_q80_fused,
             w_gate_up_q4k_fused,
+            ffn_peer,
         })
     }
 
@@ -1922,17 +1980,41 @@ impl Qwen35Block {
         // 4. SwiGLU FFN
         sync_if(ttft_detail, &device);
         let t_mlp0 = if ttft_detail { Some(std::time::Instant::now()) } else { None };
-        let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
-            Some(fused) => self.fused_gate_up_q4k_decode(&h_normed_t, fused)?,
-            _ => (
+        let (gate, up, ffn_out) = if let Some(peer) = self.ffn_peer.as_ref() {
+            // Asymmetric FFN-only TP=2: broadcast h_normed_t to peer GPU, run both
+            // shards concurrently on their async device streams, then reduce on dev0.
+            let h_peer = grim_nn::modules::move_to_device(&h_normed_t, &peer.peer_device)?;
+            let (gate0, up0) = (
                 self.ffn_gate.forward(&h_normed_t)?,
                 self.ffn_up.forward(&h_normed_t)?,
-            ),
+            );
+            let act0 = grim_nn::modules::silu_mul_on_device(&gate0, &up0)?;
+            let out0 = self.ffn_down.forward(&act0)?;
+
+            let (gate1, up1) = (
+                peer.ffn_gate.forward(&h_peer)?,
+                peer.ffn_up.forward(&h_peer)?,
+            );
+            let act1 = grim_nn::modules::silu_mul_on_device(&gate1, &up1)?;
+            let out1 = peer.ffn_down.forward(&act1)?;
+
+            let out1_on_dev0 = grim_nn::modules::move_to_device(&out1, &device)?;
+            let out = grim_nn::modules::add_on_device(&out0, &out1_on_dev0)?;
+            (gate0, up0, out)
+        } else {
+            let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
+                Some(fused) => self.fused_gate_up_q4k_decode(&h_normed_t, fused)?,
+                _ => (
+                    self.ffn_gate.forward(&h_normed_t)?,
+                    self.ffn_up.forward(&h_normed_t)?,
+                ),
+            };
+            let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+            let act_t = crate::decode_graph::hadamard_transform_tensor(&act, self.layer_idx, "ffn.down")
+                .unwrap_or_else(|_| act.clone());
+            let out = self.ffn_down.forward(&act_t)?;
+            (gate, up, out)
         };
-        let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
-        let act_t = crate::decode_graph::hadamard_transform_tensor(&act, self.layer_idx, "ffn.down")
-            .unwrap_or_else(|_| act.clone());
-        let ffn_out = self.ffn_down.forward(&act_t)?;
         if ttft_detail {
             sync_if(true, &device);
             let branch_ms = t_blk0.unwrap().elapsed().as_secs_f64() * 1000.0
@@ -3049,18 +3131,33 @@ impl Qwen35 {
         // is what skewed a dual-16 GiB 27B load off its natural 32/33 split and
         // starved the card that also has to host the LM head, `pos_dev` and the
         // decode graph.
-        let layer_devices = plan_layer_devices(
-            ws,
-            &available_devices,
-            cfg.num_layers,
-            cfg.max_seq_len,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            cfg.full_attention_interval,
-            cfg.vocab_size,
-            cfg.hidden_size,
-            nextn_reserve_bytes,
-        )?;
+        let layer_devices = if parse_ffn_tp_split0(cfg.intermediate_size).is_some()
+            && available_devices.len() >= 2
+            && matches!(available_devices[0], Device::Rocm(0))
+            && matches!(available_devices[1], Device::Rocm(1))
+        {
+            let split0 = parse_ffn_tp_split0(cfg.intermediate_size).unwrap();
+            eprintln!(
+                "[qwen35] GRIM_FFN_TP_RATIO active: all {} layers on rocm:0 with asymmetric FFN split {}:{} (rocm:0:rocm:1)",
+                cfg.num_layers,
+                split0,
+                cfg.intermediate_size - split0
+            );
+            vec![available_devices[0].clone(); cfg.num_layers]
+        } else {
+            plan_layer_devices(
+                ws,
+                &available_devices,
+                cfg.num_layers,
+                cfg.max_seq_len,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.full_attention_interval,
+                cfg.vocab_size,
+                cfg.hidden_size,
+                nextn_reserve_bytes,
+            )?
+        };
 
         let tok_embeddings = Embedding::load(
             &ws.with_device(first_device.clone()).pp("token_embd"),
@@ -3100,10 +3197,17 @@ impl Qwen35 {
         // the cross-device capture fault, reproduced as `Memory access fault by
         // GPU node-1` on the 9B. A6's gate asserts this invariant for the graph;
         // this makes the loader honour it.
-        let last_device = layer_devices
-            .last()
-            .cloned()
-            .unwrap_or_else(|| available_devices.last().unwrap_or(&device).clone());
+        let last_device = if parse_ffn_tp_split0(cfg.intermediate_size).is_some()
+            && available_devices.len() >= 2
+            && matches!(available_devices[1], Device::Rocm(1))
+        {
+            available_devices[1].clone()
+        } else {
+            layer_devices
+                .last()
+                .cloned()
+                .unwrap_or_else(|| available_devices.last().unwrap_or(&device).clone())
+        };
         let output_norm = RmsNorm::load(
             &ws.with_device(last_device.clone()).pp("output_norm"),
             cfg.hidden_size,
@@ -9064,6 +9168,7 @@ mod tests {
                 intermediate_size: cfg.intermediate_size,
                 wqkv_q80_fused: None,
                 w_gate_up_q4k_fused: None,
+            ffn_peer: None,
             });
         }
         let dummy = cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1]));
@@ -9224,6 +9329,7 @@ mod tests {
             intermediate_size: cfg.intermediate_size,
             wqkv_q80_fused: None,
             w_gate_up_q4k_fused: None,
+            ffn_peer: None,
         };
 
         let x = cpu_tensor(
@@ -9428,6 +9534,7 @@ mod tests {
             intermediate_size: cfg.intermediate_size,
             wqkv_q80_fused: None,
             w_gate_up_q4k_fused: None,
+            ffn_peer: None,
         };
         assert!(!blk.is_full_attention, "layer 0 is recurrent");
 
@@ -9632,6 +9739,7 @@ mod tests {
             ssm_d_conv_hint: cfg.ssm_d_conv,
             wqkv_q80_fused: None,
             w_gate_up_q4k_fused: None,
+            ffn_peer: None,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(
                     det_weights(209, cfg.hidden_size),

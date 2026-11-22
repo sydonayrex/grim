@@ -219,6 +219,86 @@ impl<'a> WeightSource<'a> {
         materialize(raw, shape, dtype, provenance, &self.device)
     }
 
+    /// Fetch a 2D tensor once and split it asymmetrically along `dim` (`0` = rows,
+    /// `1` = cols) into `[0..split0]` on `dev0` and `[split0..total]` on `dev1`.
+    /// Supports both native (F32/F16/BF16) and block-packed K-quants/Q8_0 when
+    /// `split0` and `total - split0` are multiples of the quant block size.
+    pub fn get_asymmetric_pair(
+        &self,
+        leaf: &str,
+        dim: usize,
+        split0: usize,
+        dev0: &Device,
+        dev1: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let name = self.full_name(leaf);
+        let raw = self.tensors.get_packed(&name)?;
+        if raw.shape.len() != 2 || dim > 1 {
+            return Err(Error::Backend(format!(
+                "get_asymmetric_pair({name}): expected 2D tensor and dim in 0..=1, got shape={:?} dim={dim}",
+                raw.shape
+            )));
+        }
+        let rows = raw.shape[0];
+        let cols = raw.shape[1];
+        let total = raw.shape[dim];
+        if split0 == 0 || split0 >= total {
+            return Err(Error::Backend(format!(
+                "get_asymmetric_pair({name}): invalid split0={split0} for total={total}"
+            )));
+        }
+        let split1 = total - split0;
+        let row_bytes = raw.bytes.len() / rows;
+        if row_bytes * rows != raw.bytes.len() {
+            return Err(Error::Backend(format!(
+                "get_asymmetric_pair({name}): byte len {} not divisible by rows={rows}",
+                raw.bytes.len()
+            )));
+        }
+        let (bytes0, bytes1, shape0, shape1) = if dim == 0 {
+            let cut = split0 * row_bytes;
+            (
+                raw.bytes[..cut].to_vec(),
+                raw.bytes[cut..].to_vec(),
+                vec![split0, cols],
+                vec![split1, cols],
+            )
+        } else {
+            let b0_per_row = (row_bytes * split0) / cols;
+            let b1_per_row = row_bytes - b0_per_row;
+            if b0_per_row * cols != row_bytes * split0 {
+                return Err(Error::Backend(format!(
+                    "get_asymmetric_pair({name}): split0={split0} not aligned to block bytes (row_bytes={row_bytes}, cols={cols})"
+                )));
+            }
+            let mut b0 = Vec::with_capacity(rows * b0_per_row);
+            let mut b1 = Vec::with_capacity(rows * b1_per_row);
+            for r in 0..rows {
+                let row = &raw.bytes[r * row_bytes..(r + 1) * row_bytes];
+                b0.extend_from_slice(&row[..b0_per_row]);
+                b1.extend_from_slice(&row[b0_per_row..]);
+            }
+            (b0, b1, vec![rows, split0], vec![rows, split1])
+        };
+        let dtype = raw.dtype.clone();
+        let prov = raw.provenance.clone();
+        let raw0 = grim_tensor::provider::RawTensor {
+            bytes: bytes0,
+            shape: shape0.clone(),
+            dtype: dtype.clone(),
+            provenance: prov.clone(),
+        };
+        let raw1 = grim_tensor::provider::RawTensor {
+            bytes: bytes1,
+            shape: shape1.clone(),
+            dtype: dtype.clone(),
+            provenance: prov.clone(),
+        };
+        let t0 = materialize(raw0, Shape::new(shape0), dtype.clone(), prov.clone(), dev0)?;
+        let t1 = materialize(raw1, Shape::new(shape1), dtype, prov, dev1)?;
+        Ok((t0, t1))
+    }
+
     /// Resolve a rank shard for a tensor, consulting the parallel-prefetch cache first.
     /// `prefetch_all` fetches the *full* tensor (zero-copy out of the mmap) and caches the packed bytes.
     fn cached_raw_sharded(
