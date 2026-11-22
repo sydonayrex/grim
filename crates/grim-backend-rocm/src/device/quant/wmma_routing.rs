@@ -94,7 +94,7 @@ impl RocmDevice {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        let effective_min_m = if format_tag_hint == Some("iq3_s") {
+        let effective_min_m = if format_tag_hint == Some("iq3s") {
             prefill_dequant_min_m.min(16)
         } else {
             prefill_dequant_min_m
