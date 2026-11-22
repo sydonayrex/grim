@@ -4217,6 +4217,23 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        static Q4K_WMMA_IU8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let q4k_wmma_iu8 = *Q4K_WMMA_IU8.get_or_init(|| {
+            !matches!(
+                std::env::var("GRIM_Q4K_WMMA_IU8").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        });
+        if m >= 16 && q4k_wmma_iu8 && self.gpu_target.starts_with("gfx12") {
+            return self.launch_mmq_q4k_q81_wmma_iu8_m16n64(
+                act_q81,
+                b_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         static Q4K_MMQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let q4k_mmq = *Q4K_MMQ.get_or_init(|| {
             matches!(
@@ -4869,6 +4886,49 @@ impl RocmDevice {
     }
 
     /// LDS-tiled MMQ (TILE_M=16, TILE_N=64, TILE_K=256) for Q4_K x Q8_1 prefill (`m >= 8`).
+    pub fn launch_mmq_q4k_q81_wmma_iu8_m16n64(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mmq_q4k_q81_wmma_iu8_m16n64: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mmq_q4k_q81_wmma_iu8_m16n64: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mmq_q4k_q81_wmma_iu8_m16n64: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(64);
+        let grid_y = (m as u32).div_ceil(16);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_mmq_q4k_q81_wmma_iu8_m16n64",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     pub fn launch_mmq_q4k_q81_m16n64(
         &self,
         act_q81: &RocmStorage,

@@ -2425,6 +2425,7 @@ pub async fn cmd_run(
     // Generation loop
     let mut decode_total_us: u64 = 0;
     let mut decode_count: u64 = 0;
+    let mut decode_steps: u64 = 0;
     let mut prefill_us: u64 = 0;
     grim_backend_rocm::reset_kernel_route_counters();
     let initial_launch_count = if let Device::Rocm(ord) = device {
@@ -2704,6 +2705,7 @@ pub async fn cmd_run(
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                decode_steps += 1;
                 if phase_trace_on {
                     phase_steps.push((step_us, "graph-sampled"));
                 }
@@ -2715,6 +2717,7 @@ pub async fn cmd_run(
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                decode_steps += 1;
                 if phase_trace_on {
                     phase_steps.push((step_us, "graph-logits"));
                 }
@@ -2837,6 +2840,7 @@ pub async fn cmd_run(
                 if !is_prefill {
                     decode_total_us += step_us;
                     decode_count += emitted as u64;
+                    decode_steps += 1;
                     if phase_trace_on {
                         phase_steps.push((step_us, "eager"));
                     }
@@ -3123,10 +3127,16 @@ pub async fn cmd_run(
         } else {
             String::new()
         };
+        let steps = decode_steps.max(1);
+        let tok_per_step = decode_count as f64 / steps as f64;
+        let ms_per_step = (decode_total_us as f64 / steps as f64) / 1000.0;
         eprintln!(
-            "[grim] Decode: {:.2} ms/token avg ({} tokens, {:.1} tokens/sec{})",
+            "[grim] Decode: {:.2} ms/token avg ({} tokens, {} steps, {:.2} tok/step, {:.2} ms/step, {:.1} tokens/sec{})",
             avg_us as f64 / 1000.0,
             decode_count,
+            steps,
+            tok_per_step,
+            ms_per_step,
             tps,
             bw_str
         );

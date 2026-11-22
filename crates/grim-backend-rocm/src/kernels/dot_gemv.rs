@@ -6251,6 +6251,140 @@ extern "C" __global__ void __launch_bounds__(32) grim_dot4_q4k_q81_gemv_rows_r4(
 
 // LDS-tiled MMQ (TILE_M=16, TILE_N=64, TILE_K=256) for Q4_K x Q8_1 short-prompt prefill.
 // 128 threads (4 wave32s), 8 float accumulators per thread, ~17 KB LDS (3 WGs/CU on RDNA4).
+// RDNA4 integer-WMMA Q4_K x Q8_1 MMQ kernel (16x64 tile, 4 wave32s, ZERO LDS).
+// Uses __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12 directly on unpacked 4-bit
+// Q4_K nibbles (u8 0..15) and Q8_1 int8 activations, accumulating 2x K=16 WMMAs per
+// 32-weight sub-block and applying d*sc and dmin*m*s_a once per sub-block.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+typedef int grim_iu8_v2i __attribute__((ext_vector_type(2)));
+typedef int grim_iu8_v8i __attribute__((ext_vector_type(8)));
+#endif
+
+extern "C" __global__ void __launch_bounds__(128) grim_mmq_q4k_q81_wmma_iu8_m16n64(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q4k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const int wave     = threadIdx.x >> 5;   // 0..3
+    const int lane     = threadIdx.x & 31;   // 0..31
+    const int lane16   = lane & 15;          // 0..15 (row for A, col for B)
+    const int k_half   = lane >> 4;          // 0 (k=0..7) or 1 (k=8..15)
+    const int tile_m   = blockIdx.y * 16;
+    const int tile_n   = blockIdx.x * 64 + wave * 16;
+    if (tile_m >= M || tile_n >= N) return;
+
+    const int row      = tile_m + lane16;
+    const int col      = tile_n + lane16;
+    const bool row_ok  = (row < M);
+    const bool col_ok  = (col < N);
+
+    const int n_sb = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const long long a_row_stride = (long long)(K / GRIM_Q8_1_BLOCK_SIZE) * GRIM_Q8_1_BYTES;
+    const long long b_col_stride = (long long)n_sb * GRIM_Q4K_BYTES;
+    const unsigned char* a_row_ptr = A_q81 + (long long)(row_ok ? row : tile_m) * a_row_stride;
+    const unsigned char* b_col_ptr = B_q4k + (long long)(col_ok ? col : tile_n) * b_col_stride;
+
+    float facc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const int row_half = k_half * 4;
+
+    for (int sb = 0; sb < n_sb; ++sb) {
+        const unsigned char* b_sb = b_col_ptr + (long long)sb * GRIM_Q4K_BYTES;
+        const float d_b    = fp16_to_float_device(*(const unsigned short*)(b_sb + 0));
+        const float dmin_b = fp16_to_float_device(*(const unsigned short*)(b_sb + 2));
+        const unsigned char* sc_ptr = b_sb + 4;
+        const unsigned char* qs_ptr = b_sb + 16;
+
+        #pragma unroll
+        for (int sb_idx = 0; sb_idx < 8; ++sb_idx) {
+            const int ch = sb_idx >> 1;
+            const int hi = sb_idx & 1;
+
+            int sc_i, m_i;
+            if (sb_idx < 4) {
+                sc_i = sc_ptr[sb_idx] & 63;
+                m_i  = sc_ptr[sb_idx + 4] & 63;
+            } else {
+                sc_i = (sc_ptr[sb_idx + 4] & 0x0F) | ((sc_ptr[sb_idx - 4] >> 6) << 4);
+                m_i  = (sc_ptr[sb_idx + 4] >> 4)   | ((sc_ptr[sb_idx]     >> 6) << 4);
+            }
+            const float d_sc   = d_b * (float)sc_i;
+            const float dmin_m = dmin_b * (float)m_i;
+
+            const unsigned char* a_blk = a_row_ptr + (long long)(sb * 8 + sb_idx) * GRIM_Q8_1_BYTES;
+            const float d_a = row_ok ? fp16_to_float_device(*(const unsigned short*)(a_blk + 0)) : 0.0f;
+            const float s_a = row_ok ? fp16_to_float_device(*(const unsigned short*)(a_blk + 2)) : 0.0f;
+
+            const unsigned char* a_qs = a_blk + 4;
+            const unsigned char* b_qs = qs_ptr + ch * 32;
+
+            grim_iu8_v8i acc = {0, 0, 0, 0, 0, 0, 0, 0};
+
+            // Step 0: k = 0..15
+            {
+                const int off = k_half * 8;
+                grim_iu8_v2i a_reg = {
+                    *(const int*)(a_qs + off),
+                    *(const int*)(a_qs + off + 4)
+                };
+                unsigned int w0 = *(const unsigned int*)(b_qs + off);
+                unsigned int w1 = *(const unsigned int*)(b_qs + off + 4);
+                grim_iu8_v2i b_reg;
+                if (hi == 0) {
+                    b_reg[0] = (int)(w0 & 0x0F0F0F0Fu);
+                    b_reg[1] = (int)(w1 & 0x0F0F0F0Fu);
+                } else {
+                    b_reg[0] = (int)((w0 >> 4) & 0x0F0F0F0Fu);
+                    b_reg[1] = (int)((w1 >> 4) & 0x0F0F0F0Fu);
+                }
+                acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                    true, a_reg, false, b_reg, acc, false);
+            }
+
+            // Step 1: k = 16..31
+            {
+                const int off = 16 + k_half * 8;
+                grim_iu8_v2i a_reg = {
+                    *(const int*)(a_qs + off),
+                    *(const int*)(a_qs + off + 4)
+                };
+                unsigned int w0 = *(const unsigned int*)(b_qs + off);
+                unsigned int w1 = *(const unsigned int*)(b_qs + off + 4);
+                grim_iu8_v2i b_reg;
+                if (hi == 0) {
+                    b_reg[0] = (int)(w0 & 0x0F0F0F0Fu);
+                    b_reg[1] = (int)(w1 & 0x0F0F0F0Fu);
+                } else {
+                    b_reg[0] = (int)((w0 >> 4) & 0x0F0F0F0Fu);
+                    b_reg[1] = (int)((w1 >> 4) & 0x0F0F0F0Fu);
+                }
+                acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                    true, a_reg, false, b_reg, acc, false);
+            }
+
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int out_r = k_half * 8 + e;
+                const float d_a_e = __shfl(d_a, out_r);
+                const float s_a_e = __shfl(s_a, out_r);
+                facc[e] += d_a_e * d_sc * (float)acc[e] - s_a_e * dmin_m;
+            }
+        }
+    }
+
+    if (col_ok) {
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int out_row = tile_m + k_half * 8 + e;
+            if (out_row < M) {
+                C[(long long)out_row * N + col] = facc[e];
+            }
+        }
+    }
+#endif
+}
+
 extern "C" __global__ void __launch_bounds__(128) grim_mmq_q4k_q81_m16n64(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q4k,
