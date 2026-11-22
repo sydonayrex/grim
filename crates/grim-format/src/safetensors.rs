@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use grim_tensor::dtype::{ArithType, DType, Storage};
+use grim_tensor::dtype::{ArithType, DType, FloatPackScheme, Storage};
 use grim_tensor::error::{Error, Result};
 
 /// Parsed safetensors header. Each tensor entry contains its shape, dtype
@@ -197,6 +197,11 @@ impl SafetensorInfo {
             "I8" | "U8" => Ok(DType {
                 arith: ArithType::U8,
                 storage: Storage::Native,
+            }),
+            // raw FP8 planes (e.g. ModelOpt NVFP4 per-block scale tensors)
+            "F8_E4M3" | "F8_E5M2" => Ok(DType {
+                arith: ArithType::U8,
+                storage: Storage::FloatPack(FloatPackScheme::Fp8),
             }),
             other => Err(Error::Backend(format!(
                 "Unsupported safetensors dtype: '{other}'"
