@@ -4258,7 +4258,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m >= 4 && rows_r2 {
+        if m >= 3 && rows_r2 {
             return self.launch_dot4_q4k_q81_gemv_rows_r4_for_ab(
                 act_q81,
                 b_storage,
@@ -4381,7 +4381,7 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             )
         });
-        if m >= 4 && rows_r2 {
+        if m >= 3 && rows_r2 {
             return self.launch_dot4_q5k_q81_gemv_rows_r4_for_ab(
                 act_q81,
                 b_storage,
