@@ -2971,6 +2971,18 @@ impl Qwen35 {
             pos_log.truncate(valid_len);
             cache.current_pos = valid_len;
         }
+        if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
+            let h_sum: f32 = h_prev
+                .to_vec_f32()
+                .map(|v| v.iter().take(64).map(|x| x.abs()).sum())
+                .unwrap_or(-1.0);
+            let tail: Vec<u32> = pos_log.iter().rev().take(4).copied().rev().collect();
+            eprintln!(
+                "[nextn-trace] bonus_tok={bonus_token} bonus_pos={bonus_pos} cache_pos={} pos_log_len={} tail={tail:?} h_abs64={h_sum:.4}",
+                cache.current_pos,
+                pos_log.len()
+            );
+        }
         let mut tokens = Vec::with_capacity(depth);
         let mut logits_vec = Vec::with_capacity(depth);
         let mut curr_tok = bonus_token;

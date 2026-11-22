@@ -1034,6 +1034,7 @@ impl SpeculativeCausalLm {
                     if use_m2_graph {
                         {
                             let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = mtp.publish_m2_graph_hidden_row(&mut g_guard, session, accepted_count);
                             let _ = mtp.commit_m2_graph_spec_state(&mut g_guard);
                         }
                         session.advance_pos(1 + accepted_count);

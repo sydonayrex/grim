@@ -6340,8 +6340,9 @@ impl Qwen35 {
             grim_tensor::dtype::DType::F32,
         ) {
             if h_dev
-                .copy_slice_into(
+                .copy_slice_range(
                     h_row.as_ref(),
+                    0,
                     h_src,
                     row * hidden,
                     hidden,
@@ -6812,8 +6813,9 @@ impl Qwen35 {
                 grim_tensor::dtype::DType::F32,
             ) {
                 if h_dev
-                    .copy_slice_into(
+                    .copy_slice_range(
                         h_last.as_ref(),
+                        0,
                         h_src,
                         (batch - 1) * hidden,
                         hidden,
