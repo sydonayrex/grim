@@ -5097,6 +5097,23 @@ impl RocmDevice {
             );
         }
         if m == 2 && rows_r2 {
+            static Q6K_R2_V4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let q6k_r2_v4 = *Q6K_R2_V4.get_or_init(|| {
+                !matches!(
+                    std::env::var("GRIM_Q6K_R2_V4").as_deref(),
+                    Ok("0" | "false" | "off")
+                )
+            });
+            if q6k_r2_v4 {
+                return self.launch_dot4_q6k_q81_gemv_rows_r2_v4(
+                    act_q81,
+                    b_storage,
+                    out_storage,
+                    m,
+                    n,
+                    k,
+                );
+            }
             return self.launch_dot4_q6k_q81_gemv_rows_r2_for_ab(
                 act_q81,
                 b_storage,
@@ -5266,6 +5283,50 @@ impl RocmDevice {
             m,
             n,
             k,
+        )
+    }
+
+    /// High-occupancy Q6_K M=2 GEMV v4 (64 threads = 2 wave32s x 2 cols x 2 rows).
+    pub fn launch_dot4_q6k_q81_gemv_rows_r2_v4(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_rows_r2_v4: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_rows_r2_v4: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv_rows_r2_v4: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_y = (m as u32).div_ceil(2);
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(64, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q6k_q81_gemv_rows_r2_v4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 
