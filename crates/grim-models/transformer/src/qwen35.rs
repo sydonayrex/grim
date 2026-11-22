@@ -2300,7 +2300,73 @@ impl Qwen35Nextn {
         let positions = [position];
         let block_out = self.block.forward(&x, &positions, cache)?;
         let normed = self.shared_head_norm.forward(&block_out)?;
-        let logits = output_head.forward(&normed)?;
+        let draft_vocab_n: usize = {
+            static DRAFT_VOCAB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *DRAFT_VOCAB.get_or_init(|| {
+                std::env::var("GRIM_MTP_DRAFT_VOCAB")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0)
+            })
+        };
+        let logits = 'head: {
+            if draft_vocab_n > 0 {
+                let w_dims = output_head.weight.shape().dims();
+                if w_dims.len() == 2 && draft_vocab_n < w_dims[0] && w_dims[1] % 256 == 0 {
+                    let k = w_dims[1];
+                    if let (Ok(x_r), Ok(w_r)) = (
+                        grim_backend_rocm::as_rocm(normed.storage().as_ref()),
+                        grim_backend_rocm::as_rocm(output_head.weight.storage().as_ref()),
+                    ) {
+                        if matches!(
+                            output_head.weight.dtype().storage,
+                            grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q6K)
+                        ) && x_r.device_ordinal() == w_r.device_ordinal()
+                        {
+                            let ord = w_r.device_ordinal();
+                            let dev = grim_backend_rocm::RocmDevice::shared(ord);
+                            let q8_bytes = (k / 32) * 36;
+                            if let (Ok(act_q81), Ok(out_r)) = (
+                                grim_backend_rocm::RocmStorage::alloc_gpu(
+                                    &grim_tensor::Shape::new(vec![q8_bytes]),
+                                    grim_tensor::DType::U8,
+                                    &dev.allocator_handle(),
+                                    ord,
+                                ),
+                                grim_backend_rocm::RocmStorage::alloc_gpu(
+                                    &grim_tensor::Shape::new(vec![1, draft_vocab_n]),
+                                    grim_tensor::DType::F32,
+                                    &dev.allocator_handle(),
+                                    ord,
+                                ),
+                            ) {
+                                if dev.launch_quantize_q8_1(x_r, &act_q81, 1, k).is_ok()
+                                    && dev
+                                        .launch_dot4_q6k_q81_gemv_sub_v4(
+                                            &act_q81,
+                                            w_r,
+                                            &out_r,
+                                            1,
+                                            draft_vocab_n,
+                                            k,
+                                        )
+                                        .is_ok()
+                                {
+                                    break 'head Tensor::new(
+                                        std::sync::Arc::new(out_r),
+                                        grim_tensor::Shape::new(vec![1, draft_vocab_n]),
+                                        grim_tensor::DType::F32,
+                                        normed.provenance().clone(),
+                                        output_head.weight.device().clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            output_head.forward(&normed)?
+        };
         Ok((block_out, logits))
     }
 }
@@ -2929,7 +2995,13 @@ impl Qwen35 {
         let embed = self.embed_token(token_id)?;
         let (block_hidden, logits) =
             nextn.forward_step(&embed, h_prev, position, nextn_cache, &self.output)?;
-        let tok = Self::argmax_last_logits(&logits, self.cfg.vocab_size)?;
+        let logits_vocab = logits
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(self.cfg.vocab_size);
+        let tok = Self::argmax_last_logits(&logits, logits_vocab)?;
         Ok((tok, logits, block_hidden))
     }
 
