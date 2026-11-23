@@ -297,6 +297,24 @@ impl RocmDevice {
                 let n_blocks = n_elements / 256;
                 self.launch_dequant_iq3s_f16(b_storage, w_f16, n_blocks)?;
             }
+            "q4k" | "q5k" | "q3k" => {
+                let n_blocks = n_elements / 256;
+                let kname = match format_tag {
+                    "q4k" => "grim_dequant_q4k_f16",
+                    "q5k" => "grim_dequant_q5k_f16",
+                    _ => "grim_dequant_q3k_f16",
+                };
+                let mut src_ptr = b_storage.device_ptr_checked()?;
+                let mut dst_ptr = w_f16.device_ptr_checked()?;
+                let mut nb_i = n_blocks as i32;
+                let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                self.launch_compute_kernel(
+                    kname,
+                    HipDim3::new(n_blocks as u32, 1, 1),
+                    HipDim3::new(256, 1, 1),
+                    &mut [arg(&mut src_ptr), arg(&mut dst_ptr), arg(&mut nb_i)],
+                )?;
+            }
             other => {
                 return Err(Error::Backend(format!(
                     "launch_iq_prefill_dequant_rocblas_f16 unsupported format {other}"

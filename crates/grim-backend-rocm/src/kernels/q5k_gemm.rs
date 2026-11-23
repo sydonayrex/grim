@@ -203,6 +203,18 @@ extern "C" {
         dX[row * K + k_idx] = acc;
     }
 
+    /// Coalesced Q5_K -> F16 dequant: 1 block (256 threads) = 1 super-block (176 B -> 256 F16).
+    __global__ void grim_dequant_q5k_f16(
+        const unsigned char* __restrict__ packed,
+        _Float16* __restrict__ out,
+        int n_blocks)
+    {
+        int b = blockIdx.x;
+        int w = threadIdx.x;
+        if (b >= n_blocks || w >= 256) return;
+        const unsigned char* blk = packed + (long long)b * 176;
+        out[(long long)b * 256 + w] = (_Float16)dequant_q5k_element(blk, w);
+    }
 }
 "#;
 
