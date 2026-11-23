@@ -412,5 +412,71 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q3k"));
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_q3k"));
         assert!(KERNEL_SOURCE.contains("dequant_q3k_element"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_q3k_f16"));
+    }
+
+    #[test]
+    fn q3k_dequant_f16_gpu_matches_cpu_oracle_random() {
+        // 68 super-blocks = 17,408 elements (real FFN N) with deterministic PRNG weights
+        let n_blocks = 68usize;
+        let n_elems = n_blocks * 256;
+        let mut packed = vec![0u8; n_blocks * 110];
+        let mut s: u64 = 0x517cc1b727220a95;
+        for b in 0..n_blocks {
+            let off = b * 110;
+            for i in 0..108 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                packed[off + i] = (s >> 33) as u8;
+            }
+            // Valid normal F16 scale d in [0.001, 0.05] at bytes 108..110
+            let d = half::f16::from_f32(0.01f32 * ((b % 5 + 1) as f32));
+            let db = d.to_le_bytes();
+            packed[off + 108] = db[0];
+            packed[off + 109] = db[1];
+        }
+        let cpu = grim_quant::dequant_q3k(&packed, n_elems).expect("cpu dequant_q3k");
+        let dev = crate::RocmDevice::shared(0);
+        let src = crate::RocmStorage::copy_from_host_raw_bytes(
+            &packed,
+            &grim_tensor::Shape::new(vec![packed.len()]),
+            grim_tensor::DType::U8,
+            &dev.allocator_handle(),
+            0,
+        )
+        .expect("upload q3k");
+        let dst = crate::RocmStorage::alloc_gpu(
+            &grim_tensor::Shape::new(vec![n_elems]),
+            grim_tensor::DType {
+                arith: grim_tensor::ArithType::F16,
+                storage: grim_tensor::Storage::Native,
+            },
+            &dev.allocator_handle(),
+            0,
+        )
+        .expect("alloc f16 dst");
+        let mut src_ptr = src.device_ptr_checked().unwrap();
+        let mut dst_ptr = dst.device_ptr_checked().unwrap();
+        let mut nb_i = n_blocks as i32;
+        let _g = crate::device::util::DeviceGuard::set(0);
+        dev.launch_compute_kernel(
+            "grim_dequant_q3k_f16",
+            crate::HipDim3::new(n_blocks as u32, 1, 1),
+            crate::HipDim3::new(256, 1, 1),
+            &mut [
+                &mut src_ptr as *mut u64 as *mut std::ffi::c_void,
+                &mut dst_ptr as *mut u64 as *mut std::ffi::c_void,
+                &mut nb_i as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )
+        .expect("launch grim_dequant_q3k_f16");
+        dev.synchronize();
+        let gpu_bytes = dst.copy_to_host().expect("d2h f16");
+        let mut max_err = 0.0f32;
+        for i in 0..n_elems {
+            let g = half::f16::from_le_bytes([gpu_bytes[2 * i], gpu_bytes[2 * i + 1]]).to_f32();
+            let c = half::f16::from_f32(cpu[i]).to_f32();
+            max_err = max_err.max((g - c).abs());
+        }
+        assert!(max_err <= 1e-3, "q3k_dequant_f16 max_err={max_err} > 1e-3");
     }
 }
