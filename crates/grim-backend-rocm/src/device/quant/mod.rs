@@ -231,7 +231,7 @@ impl QuantOps for RocmDevice {
                 // dequant's own intermediates — d/sc/qs bytes were all
                 // correct, the nibble was a 28-bit shift). Partial tiles are
                 // masked in-kernel.
-                } else if is_rdna34 && m >= 64 && n % 128 == 0 && k % 256 == 0 {
+                } else if is_rdna34 && m >= 33 && n % 128 == 0 && k % 256 == 0 {
                     self.launch_wmma_big64x128_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -240,7 +240,7 @@ impl QuantOps for RocmDevice {
                     {
                         eprintln!("[big-gemm] Q4K m={m} n={n} k={k} -> launch_wmma_big128_q4k");
                     }
-                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
+                } else if is_rdna34 && m >= 33 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                     if *crate::device::quant::BIG_GEMM_TRACE
                         .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
@@ -362,7 +362,7 @@ impl QuantOps for RocmDevice {
                         drop(tag);
                         self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && m >= 64 && n % 128 == 0 && k % 256 == 0 {
+                } else if is_rdna34 && m >= 33 && n % 128 == 0 && k % 256 == 0 {
                     self.launch_wmma_big64x128_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -371,7 +371,7 @@ impl QuantOps for RocmDevice {
                     {
                         eprintln!("[big-gemm] Q5K m={m} n={n} k={k} -> launch_wmma_big128_q5k");
                     }
-                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
+                } else if is_rdna34 && m >= 33 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
                     if *crate::device::quant::BIG_GEMM_TRACE
                         .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
@@ -690,7 +690,7 @@ impl QuantOps for RocmDevice {
                             k,
                         )?;
                     }
-                } else if is_rdna34 && m >= 64 && n % 128 == 0 && k % 256 == 0 {
+                } else if is_rdna34 && m >= 33 && n % 128 == 0 && k % 256 == 0 {
                     self.launch_wmma_big64x128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -699,7 +699,7 @@ impl QuantOps for RocmDevice {
                     {
                         eprintln!("[big-gemm] Q6K m={m} n={n} k={k} -> launch_wmma_big128_q6k");
                     }
-                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
+                } else if is_rdna34 && m >= 33 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
                     if *crate::device::quant::BIG_GEMM_TRACE
                         .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
