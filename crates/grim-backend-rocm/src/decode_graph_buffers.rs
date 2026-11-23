@@ -3200,6 +3200,18 @@ impl DecodeGraph {
 
     /// True when every boundary has a handoff, so `replay_chain` can use them.
     fn use_boundary_handoffs(&self) -> bool {
+        // Custom scythe spin-wait P2P handoff is opt-in: on gfx1201+gfx1200 it
+        // caused run-to-run decode-graph nondeterminism (0/3 match, diverging at
+        // 105-344 chars), whereas the HIP event + hipMemcpyPeerAsync fallback
+        // (`copy_boundary_ordered_with_staging`) is 5/5 byte-identical at equal
+        // plain-decode speed (45.62 vs 45.92 ms/step). Keep opt-in until the
+        // scythe producer/consumer fence & L2-invalidation protocol is fixed.
+        if !matches!(
+            std::env::var("GRIM_BOUNDARY_HANDOFF").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return false;
+        }
         !self.boundary_handoffs.is_empty()
             && self.boundary_handoffs.len() == self.segments.len().saturating_sub(1)
             && self.boundary_handoffs.iter().all(|h| h.is_some())
