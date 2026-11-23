@@ -2005,7 +2005,6 @@ pub async fn cmd_run(
             for ord in 0..n_gpus {
                 let rdev = grim_backend_rocm::RocmDevice::shared(ord);
                 rdev.prewarm_compute_entries(PREWARM_ENTRIES);
-                rdev.prewarm_rocblas();
             }
         }
         // Warm up rocBLAS/hipBLASLt TensileLite heuristics during model load

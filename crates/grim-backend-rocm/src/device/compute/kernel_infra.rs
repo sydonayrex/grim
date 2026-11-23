@@ -1178,52 +1178,6 @@ impl RocmDevice {
         }
     }
 
-    /// Prewarm rocBLAS/TensileLite on this device with a tiny dummy `sgemm` so
-    /// first-prompt TTFT at `M >= 33` does not pay ~3.7 s of Tensile MsgPack
-    /// lazy initialization inside the prefill window.
-    pub fn prewarm_rocblas(&self) {
-        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let Ok(handle) = self.get_rocblas_handle() else {
-            return;
-        };
-        let n = 64usize;
-        let shape = grim_tensor::Shape::new(vec![n, n]);
-        let Ok(a) = crate::RocmStorage::alloc_gpu(&shape, grim_tensor::DType::F32, &self.allocator, self.ordinal) else {
-            return;
-        };
-        let Ok(b) = crate::RocmStorage::alloc_gpu(&shape, grim_tensor::DType::F32, &self.allocator, self.ordinal) else {
-            return;
-        };
-        let Ok(c) = crate::RocmStorage::alloc_gpu(&shape, grim_tensor::DType::F32, &self.allocator, self.ordinal) else {
-            return;
-        };
-        let (Some(pa), Some(pb), Some(pc)) = (a.device_ptr, b.device_ptr, c.device_ptr) else {
-            return;
-        };
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let ni = n as crate::device::rocblas::RocblasInt;
-        unsafe {
-            let _ = crate::device::rocblas::rocblas_sgemm(
-                handle,
-                crate::device::rocblas::RocblasOperation::None,
-                crate::device::rocblas::RocblasOperation::None,
-                ni,
-                ni,
-                ni,
-                &alpha,
-                pa as *const f32,
-                ni,
-                pb as *const f32,
-                ni,
-                &beta,
-                pc as *mut f32,
-                ni,
-            );
-        }
-        self.synchronize();
-    }
-
     pub fn launch_from_source(
         &self,
         source: &str,
