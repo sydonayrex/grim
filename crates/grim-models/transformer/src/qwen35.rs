@@ -3002,6 +3002,38 @@ impl Qwen35 {
             .copied()
             .unwrap_or(self.cfg.vocab_size);
         let tok = Self::argmax_last_logits(&logits, logits_vocab)?;
+        let draft_vocab_audit = {
+            static AUDIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *AUDIT.get_or_init(|| {
+                std::env::var("GRIM_MTP_DRAFT_VOCAB_AUDIT").as_deref() == Ok("1")
+            })
+        };
+        if draft_vocab_audit && logits_vocab == self.cfg.vocab_size {
+            static TOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static H32: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static H64: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static HSPEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = TOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if tok < 32768 {
+                H32.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if tok < 65536 {
+                H64.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if tok >= 248044 {
+                HSPEC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if n % 50 == 0 {
+                let h32 = H32.load(std::sync::atomic::Ordering::Relaxed);
+                let h64 = H64.load(std::sync::atomic::Ordering::Relaxed);
+                let hs = HSPEC.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[draft-vocab-audit] total={n} hit_32k={h32} ({:.1}%) hit_64k={h64} ({:.1}%) special={hs}",
+                    100.0 * h32 as f64 / n as f64,
+                    100.0 * h64 as f64 / n as f64,
+                );
+            }
+        }
         Ok((tok, logits, block_hidden))
     }
 
