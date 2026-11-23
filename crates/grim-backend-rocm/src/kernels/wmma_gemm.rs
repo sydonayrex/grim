@@ -892,6 +892,106 @@ extern "C" __global__ void grim_fused_dequant_backward_gemm_fp8_mfma(
 }
 
 #endif // __gfx1200__
+#if defined(__gfx1200__) || defined(__gfx1201__)
+typedef _Float16 grim_half8 __attribute__((ext_vector_type(8)));
+typedef float grim_float8 __attribute__((ext_vector_type(8)));
+
+// Tiled RDNA4 F16xF16->F32 TN GEMM: C[M, N] = A[M, K] @ B[N, K]^T (row-major).
+// Bypasses ROCm 10.1 rocBLAS/hipBLASLt multi-GPU second-device scalar fallback on gfx1200.
+extern "C" __global__ void __launch_bounds__(256)
+grim_wmma_f16_tn_128x128x32(
+    const _Float16* __restrict__ A,
+    const _Float16* __restrict__ B,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    constexpr int BM = 128, BN = 128, BK = 32, PAD = 8;
+    __shared__ _Float16 sA[BM][BK + PAD];
+    __shared__ _Float16 sB[BN][BK + PAD];
+
+    const int tid = threadIdx.x;
+    const int wave_id = tid >> 5;
+    const int lane = tid & 31;
+    const int wm = (wave_id >> 2) * 64;
+    const int wn = (wave_id & 3) * 32;
+
+    const int bm = blockIdx.y * BM;
+    const int bn = blockIdx.x * BN;
+
+    grim_float8 acc[4][2];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            acc[i][j] = {0,0,0,0,0,0,0,0};
+
+    const int row0 = tid >> 2;
+    const int row1 = row0 + 64;
+    const int col  = (tid & 3) * 8;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+
+    const bool full_m = (bm + BM <= M);
+    const bool full_n = (bn + BN <= N);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (full_m && k0 + BK <= K) {
+            *reinterpret_cast<uint4*>(&sA[row0][col]) = *reinterpret_cast<const uint4*>(&A[(long long)(bm + row0) * K + k0 + col]);
+            *reinterpret_cast<uint4*>(&sA[row1][col]) = *reinterpret_cast<const uint4*>(&A[(long long)(bm + row1) * K + k0 + col]);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                sA[row0][col + t] = (bm + row0 < M && k0 + col + t < K) ? A[(long long)(bm + row0) * K + k0 + col + t] : (_Float16)0.0f;
+                sA[row1][col + t] = (bm + row1 < M && k0 + col + t < K) ? A[(long long)(bm + row1) * K + k0 + col + t] : (_Float16)0.0f;
+            }
+        }
+        if (full_n && k0 + BK <= K) {
+            *reinterpret_cast<uint4*>(&sB[row0][col]) = *reinterpret_cast<const uint4*>(&B[(long long)(bn + row0) * K + k0 + col]);
+            *reinterpret_cast<uint4*>(&sB[row1][col]) = *reinterpret_cast<const uint4*>(&B[(long long)(bn + row1) * K + k0 + col]);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                sB[row0][col + t] = (bn + row0 < N && k0 + col + t < K) ? B[(long long)(bn + row0) * K + k0 + col + t] : (_Float16)0.0f;
+                sB[row1][col + t] = (bn + row1 < N && k0 + col + t < K) ? B[(long long)(bn + row1) * K + k0 + col + t] : (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            const int koff = ks * 16 + lane_h * 8;
+            grim_half8 va[4], vb[2];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                va[i] = *reinterpret_cast<const grim_half8*>(&sA[wm + i * 16 + lane_r][koff]);
+            #pragma unroll
+            for (int j = 0; j < 2; j++)
+                vb[j] = *reinterpret_cast<const grim_half8*>(&sB[wn + j * 16 + lane_r][koff]);
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 2; j++)
+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va[i], vb[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int c = bn + wn + j * 16 + lane_r;
+            if (c < N) {
+                #pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    int row = bm + wm + i * 16 + lane_h * 8 + r;
+                    if (row < M) C[(long long)row * N + c] = acc[i][j][r];
+                }
+            }
+        }
+    }
+}
+#endif
 "#;
 
 #[cfg(test)]

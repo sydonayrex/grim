@@ -357,9 +357,47 @@ impl RocmDevice {
             None => a_storage,
         };
 
-        // 4. Dispatch mixed-precision rocBLAS GEMM (A: F16, B: F16 -> C/D: F32)
-        self.launch_rocblas_gemm_f16_f32(a_act, w_f16, out_storage, m, n, k)?;
+        // 4. Dispatch mixed-precision GEMM (A: F16, B: F16 -> C/D: F32).
+        // On gfx1200 (second GPU in a gfx1201+gfx1200 process), ROCm 10.1 rocBLAS/hipBLASLt
+        // falls back to scalar MT64x32x8 (~4.5 TFLOP/s); use our tiled RDNA4 WMMA kernel (~21-25 TFLOP/s).
+        if self.gpu_target == "gfx1200" && k % 16 == 0 && n % 16 == 0 {
+            self.launch_wmma_f16_tn_128x128x32(a_act, w_f16, out_storage, m, n, k)?;
+        } else {
+            self.launch_rocblas_gemm_f16_f32(a_act, w_f16, out_storage, m, n, k)?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn launch_wmma_f16_tn_128x128x32(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let mut aptr = a_storage.device_ptr_checked()?;
+        let mut bptr = b_storage.device_ptr_checked()?;
+        let mut optr = out_storage.device_ptr_checked()?;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let grid_dim = HipDim3::new(n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        self.launch_compute_kernel(
+            "grim_wmma_f16_tn_128x128x32",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// Enqueues the JIT-compiled WMMA matrix-core GEMM kernel (WI-G).
@@ -3133,6 +3171,18 @@ impl RocmDevice {
         let use_gemm_ex = cfg!(feature = "rocm-aiter")
             || self.gpu_target == "gfx90a"
             || self.gpu_target == "gfx942";
+
+        if self.gpu_target == "gfx1200"
+            && m > 32
+            && a_storage.dtype.arith == ArithType::F16
+            && b_storage.dtype.arith == ArithType::F16
+            && dtype_out.arith == ArithType::F32
+            && k % 16 == 0
+            && n % 16 == 0
+        {
+            self.launch_wmma_f16_tn_128x128x32(a_storage, b_storage, out_storage, m, n, k)?;
+            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+        }
 
         if self.is_rdna34
             && m <= 32
