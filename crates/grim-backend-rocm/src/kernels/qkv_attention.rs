@@ -8396,11 +8396,7 @@ pub fn launch_qkv_attention_dev_batch(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
-                    unsafe {
-                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
-                    }
+                    // Do not hipFree old pointers: a previously captured graph may still reference them.
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     Some((po_new, pm_new, ps_new))
                 }
@@ -8677,11 +8673,7 @@ pub fn launch_qkv_attention_dev_batch_i8(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
-                    unsafe {
-                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
-                    }
+                    // Do not hipFree old pointers: a previously captured graph may still reference them.
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     Some((po_new, pm_new, ps_new))
                 }
@@ -8963,11 +8955,7 @@ pub fn launch_qkv_attention_dev_batch_i4(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
-                    unsafe {
-                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
-                    }
+                    // Do not hipFree old pointers: a previously captured graph may still reference them.
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     Some((po_new, pm_new, ps_new))
                 }
@@ -9240,11 +9228,7 @@ pub fn launch_qkv_attention_dev_batch_q81(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
-                    unsafe {
-                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
-                    }
+                    // Do not hipFree old pointers: a previously captured graph may still reference them.
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     Some((po_new, pm_new, ps_new))
                 }
@@ -9511,11 +9495,7 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
-                    unsafe {
-                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
-                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
-                    }
+                    // Do not hipFree old pointers: a previously captured graph may still reference them.
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     Some((po_new, pm_new, ps_new))
                 }
@@ -11072,23 +11052,7 @@ mod kv_arena_dtype_tests {
         bits * 2.0 - 1.0
     }
     use super::{arg, launch_qkv_attention_dev_batch, KvRingPolicy};
-
-    fn q81_roundtrip_f32(src: &[f32]) -> Vec<f32> {
-        let mut out = vec![0.0f32; src.len()];
-        for (dst_blk, src_blk) in out.chunks_mut(32).zip(src.chunks(32)) {
-            let max_abs = src_blk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-            let d = half::f16::from_f32(max_abs / 127.0).to_f32();
-            if d == 0.0 {
-                continue;
-            }
-            let inv_d = 1.0 / d;
-            for (o, &x) in dst_blk.iter_mut().zip(src_blk.iter()) {
-                let q = (x * inv_d).round().clamp(-127.0, 127.0) as i8;
-                *o = (q as f32) * d;
-            }
-        }
-        out
-    }
+    use grim_tensor::MemoryOps;
 
     #[test]
     fn f16_splitk_matches_serial_and_is_bitwise_deterministic() {
@@ -11110,7 +11074,7 @@ mod kv_arena_dtype_tests {
         for &(seq_len, kv_len) in &[(1u32, 19usize), (2, 19), (3, 19), (1, 517), (2, 517), (3, 517)] {
             let q_n = (seq_len * num_heads * head_dim) as usize;
             let kv_n = kv_len * (num_kv_heads * head_dim) as usize;
-            let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
+            let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 4.0).collect();
             let k_host: Vec<f32> = (0..kv_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
             let v_host: Vec<f32> = (0..kv_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
 
@@ -11231,19 +11195,178 @@ mod kv_arena_dtype_tests {
                 .fold(0.0f32, f32::max);
             eprintln!("[splitk-parity] seq_len={seq_len} kv_len={kv_len}: max_abs_err={max_err:.3e}");
             assert!(
-                max_err <= 1e-4,
-                "split-KV vs serial max_abs_err={max_err} > 1e-4 (seq_len={seq_len}, kv_len={kv_len})"
+                max_err <= 1e-5,
+                "split-KV vs serial max_abs_err={max_err} > 1e-5 (seq_len={seq_len}, kv_len={kv_len})"
+            );
+        }
+    }
+
+    fn pack_q81_bytes(src: &[f32]) -> Vec<u8> {
+        assert!(src.len() % 32 == 0);
+        let mut out = Vec::with_capacity((src.len() / 32) * 36);
+        for blk in src.chunks(32) {
+            let max_abs = blk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let d_f16 = half::f16::from_f32(max_abs / 127.0);
+            let d = d_f16.to_f32();
+            let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
+            let mut sum = 0.0f32;
+            let mut codes = [0i8; 32];
+            for (c, &x) in codes.iter_mut().zip(blk.iter()) {
+                let q = (x * inv_d).round().clamp(-127.0, 127.0) as i8;
+                *c = q;
+                sum += (q as f32) * d;
+            }
+            out.extend_from_slice(&d_f16.to_bits().to_le_bytes());
+            out.extend_from_slice(&half::f16::from_f32(sum).to_bits().to_le_bytes());
+            for &c in &codes {
+                out.push(c as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn q81_splitk_matches_serial_and_is_bitwise_deterministic() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        use grim_tensor::dtype::{ArithType, DType, Storage};
+        use grim_tensor::Shape;
+
+        let num_heads = 24u32;
+        let num_kv_heads = 4u32;
+        let head_dim = 256u32;
+        let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+        let u8_dt = DType { arith: ArithType::U8, storage: Storage::Native };
+
+        let mut rng = 0x9876_5432_10fe_dcba_u64;
+        for &(seq_len, kv_len) in &[(1u32, 19usize), (2, 19), (3, 19), (1, 517), (2, 517), (3, 517)] {
+            let q_n = (seq_len * num_heads * head_dim) as usize;
+            let kv_n = kv_len * (num_kv_heads * head_dim) as usize;
+            let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 4.0).collect();
+            let k_host: Vec<f32> = (0..kv_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
+            let v_host: Vec<f32> = (0..kv_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
+            let k_bytes = pack_q81_bytes(&k_host);
+            let v_bytes = pack_q81_bytes(&v_host);
+
+            let q_dev = dev.from_cpu(&q_host, &Shape::new(vec![q_n]), DType::F32).unwrap();
+            let k_dev = dev.from_cpu_bytes(&k_bytes, &Shape::new(vec![k_bytes.len()]), u8_dt.clone()).unwrap();
+            let v_dev = dev.from_cpu_bytes(&v_bytes, &Shape::new(vec![v_bytes.len()]), u8_dt.clone()).unwrap();
+            let tot_dev = dev.from_cpu(&[f32::from_bits(kv_len as u32)], &Shape::new(vec![1]), DType::F32).unwrap();
+            let dummy = dev.from_cpu(&[0.0f32; 4], &Shape::new(vec![4]), DType::F32).unwrap();
+            let ms_n = (seq_len * num_heads) as usize;
+
+            let run_once = |use_splitk: bool| -> Vec<f32> {
+                let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), DType::F32).unwrap();
+                let om_dev = dev.from_cpu(&vec![0.0f32; ms_n], &Shape::new(vec![ms_n]), DType::F32).unwrap();
+                let os_dev = dev.from_cpu(&vec![0.0f32; ms_n], &Shape::new(vec![ms_n]), DType::F32).unwrap();
+                let mut q_ptr = q_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut k_ptr = k_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut v_ptr = v_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut o_ptr = out_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut om_ptr = om_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut os_ptr = os_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut tot_ptr = tot_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut dum_ptr = dummy.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut nh = num_heads as i32;
+                let mut nkv = num_kv_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut sl = seq_len as i32;
+                let mut steps_i = 0i32;
+                let mut isd = inv_sqrt_d;
+                let mut wl = 0i32;
+                let mut sc = 0.0f32;
+                let mut ha = 0i32;
+                let mut slot_stride_i = 0i32;
+                let mut cap = 0i32;
+                if use_splitk {
+                    const SPLIT_K: usize = 8;
+                    let total_h = (seq_len * num_heads) as usize;
+                    let po_dev = dev.from_cpu(&vec![0.0f32; SPLIT_K * total_h * head_dim as usize], &Shape::new(vec![SPLIT_K * total_h * head_dim as usize]), DType::F32).unwrap();
+                    let pm_dev = dev.from_cpu(&vec![0.0f32; SPLIT_K * total_h], &Shape::new(vec![SPLIT_K * total_h]), DType::F32).unwrap();
+                    let ps_dev = dev.from_cpu(&vec![0.0f32; SPLIT_K * total_h], &Shape::new(vec![SPLIT_K * total_h]), DType::F32).unwrap();
+                    let mut po_ptr = po_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                    let mut pm_ptr = pm_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                    let mut ps_ptr = ps_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                    let mut split_k_i = SPLIT_K as i32;
+                    dev.launch_compute_kernel(
+                        "grim_qkv_attention_dev_q81_splitk",
+                        crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len),
+                        crate::HipDim3::new(128, 1, 1),
+                        &mut [
+                            arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr),
+                            arg(&mut po_ptr), arg(&mut pm_ptr), arg(&mut ps_ptr),
+                            arg(&mut nh), arg(&mut nkv), arg(&mut hd),
+                            arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd),
+                            arg(&mut wl), arg(&mut sc), arg(&mut dum_ptr),
+                            arg(&mut ha), arg(&mut slot_stride_i), arg(&mut cap),
+                            arg(&mut split_k_i),
+                        ],
+                    ).unwrap();
+                    let mut total_h_i = total_h as i32;
+                    dev.launch_compute_kernel(
+                        "grim_qkv_attention_splitk_combine",
+                        crate::HipDim3::new(total_h as u32, 1, 1),
+                        crate::HipDim3::new(hd as u32, 1, 1),
+                        &mut [
+                            arg(&mut po_ptr), arg(&mut pm_ptr), arg(&mut ps_ptr),
+                            arg(&mut o_ptr), arg(&mut om_ptr), arg(&mut os_ptr),
+                            arg(&mut total_h_i), arg(&mut hd), arg(&mut split_k_i),
+                        ],
+                    ).unwrap();
+                } else {
+                    let mut od = 0i32;
+                    let mut fo = 0i32;
+                    let mut batch_i = 1i32;
+                    dev.launch_compute_kernel(
+                        "grim_qkv_attention_dev_q81",
+                        crate::HipDim3::new(sl as u32, nh as u32, 1),
+                        crate::HipDim3::new(128, 1, 1),
+                        &mut [
+                            arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr),
+                            arg(&mut o_ptr), arg(&mut om_ptr), arg(&mut os_ptr),
+                            arg(&mut nh), arg(&mut nkv), arg(&mut hd),
+                            arg(&mut sl), arg(&mut tot_ptr), arg(&mut steps_i),
+                            arg(&mut isd), arg(&mut wl), arg(&mut sc),
+                            arg(&mut dum_ptr), arg(&mut od), arg(&mut fo),
+                            arg(&mut dum_ptr), arg(&mut ha), arg(&mut batch_i),
+                            arg(&mut slot_stride_i), arg(&mut cap),
+                        ],
+                    ).unwrap();
+                }
+                dev.synchronize();
+                out_dev.to_cpu_vec_f32().unwrap()
+            };
+
+            let ref_out = run_once(false);
+            let sk_out1 = run_once(true);
+            let sk_out2 = run_once(true);
+            assert_eq!(
+                sk_out1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                sk_out2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "Q8_1 split-KV must be bitwise deterministic (seq_len={seq_len}, kv_len={kv_len})"
+            );
+            let max_err = ref_out
+                .iter()
+                .zip(sk_out1.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("[q81-splitk-parity] seq_len={seq_len} kv_len={kv_len}: max_abs_err={max_err:.3e}");
+            assert!(
+                max_err <= 1e-5,
+                "Q8_1 split-KV vs serial max_abs_err={max_err} > 1e-5 (seq_len={seq_len}, kv_len={kv_len})"
             );
         }
     }
 
     #[test]
-    fn kv_f16_vs_q81_k_and_v_variance_ablation() {
+    fn kv_f16_vs_q81_real_kernel_against_f32_ref() {
         let Some(dev) = gpu_dev() else {
             eprintln!("[SKIP] requires GPU");
             return;
         };
-        use grim_tensor::dtype::DType;
+        use grim_tensor::dtype::{ArithType, DType, Storage};
         use grim_tensor::Shape;
 
         let num_heads = 24u32;
@@ -11251,14 +11374,12 @@ mod kv_arena_dtype_tests {
         let head_dim = 256u32;
         let kv_len = 517usize;
         let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
-        let f32_dt = || DType::F32;
-        let f16_dt = || DType::F16;
+        let u8_dt = DType { arith: ArithType::U8, storage: Storage::Native };
 
         let mut rng = 0xfeed_face_cafe_babeu64;
         let q_n = (num_heads * head_dim) as usize;
         let kv_n = kv_len * (num_kv_heads * head_dim) as usize;
-        let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 1.0).collect();
-        // Inject 1% channel outliers (magnitude ~12.0) to mimic real LLM KV distributions.
+        let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 4.0).collect();
         let mut gen_kv = || -> Vec<f32> {
             (0..kv_n)
                 .map(|i| {
@@ -11267,59 +11388,111 @@ mod kv_arena_dtype_tests {
                 })
                 .collect()
         };
-        let k_f16_host = gen_kv();
-        let v_f16_host = gen_kv();
-        let k_q81_host = q81_roundtrip_f32(&k_f16_host);
-        let v_q81_host = q81_roundtrip_f32(&v_f16_host);
+        let k_f32_host = gen_kv();
+        let v_f32_host = gen_kv();
+        let k_q81_bytes = pack_q81_bytes(&k_f32_host);
+        let v_q81_bytes = pack_q81_bytes(&v_f32_host);
 
-        let q_dev = dev.from_cpu(&q_host, &Shape::new(vec![q_n]), f32_dt()).unwrap();
-        let tot_dev = dev.from_cpu(&[f32::from_bits(kv_len as u32)], &Shape::new(vec![1]), f32_dt()).unwrap();
-        let dummy = dev.from_cpu(&[0.0f32; 4], &Shape::new(vec![4]), f32_dt()).unwrap();
+        let q_dev = dev.from_cpu(&q_host, &Shape::new(vec![q_n]), DType::F32).unwrap();
+        let tot_dev = dev.from_cpu(&[f32::from_bits(kv_len as u32)], &Shape::new(vec![1]), DType::F32).unwrap();
+        let dummy = dev.from_cpu(&[0.0f32; 4], &Shape::new(vec![4]), DType::F32).unwrap();
 
-        let run_kv = |k_h: &[f32], v_h: &[f32]| -> Vec<f32> {
-            let k_dev = dev.from_cpu(k_h, &Shape::new(vec![kv_n]), f16_dt()).unwrap();
-            let v_dev = dev.from_cpu(v_h, &Shape::new(vec![kv_n]), f16_dt()).unwrap();
-            let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), f32_dt()).unwrap();
-            let om_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), f32_dt()).unwrap();
-            let os_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), f32_dt()).unwrap();
+        // 1. Reference: real F32 KV kernel (`grim_qkv_attention_dev`, f16_flag=0)
+        let ref_out = {
+            let k_dev = dev.from_cpu(&k_f32_host, &Shape::new(vec![kv_n]), DType::F32).unwrap();
+            let v_dev = dev.from_cpu(&v_f32_host, &Shape::new(vec![kv_n]), DType::F32).unwrap();
+            let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), DType::F32).unwrap();
+            let om_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), DType::F32).unwrap();
+            let os_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), DType::F32).unwrap();
             launch_qkv_attention_dev_batch(
-                &dev,
-                q_dev.as_ref(),
-                k_dev.as_ref(),
-                v_dev.as_ref(),
-                out_dev.as_ref(),
-                om_dev.as_ref(),
-                os_dev.as_ref(),
-                tot_dev.as_ref(),
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                1,
-                0,
-                inv_sqrt_d,
-                0,
-                0.0,
-                dummy.as_ref(),
-                0,
-                0,
-                dummy.as_ref(),
-                0,
-                1,
-                0,
-                KvRingPolicy::UNLIMITED,
-            )
-            .unwrap();
+                &dev, q_dev.as_ref(), k_dev.as_ref(), v_dev.as_ref(),
+                out_dev.as_ref(), om_dev.as_ref(), os_dev.as_ref(), tot_dev.as_ref(),
+                num_heads, num_kv_heads, head_dim, 1, 0, inv_sqrt_d, 0, 0.0,
+                dummy.as_ref(), 0, 0, dummy.as_ref(), 0, 1, 0, KvRingPolicy::UNLIMITED,
+            ).unwrap();
             dev.synchronize();
             out_dev.to_cpu_vec_f32().unwrap()
         };
 
-        let ref_out = run_kv(&k_f16_host, &v_f16_host);
-        for (label, kh, vh) in [
-            ("K=F16,  V=Q8_1", &k_f16_host, &v_q81_host),
-            ("K=Q8_1, V=F16 ", &k_q81_host, &v_f16_host),
-            ("K=Q8_1, V=Q8_1", &k_q81_host, &v_q81_host),
-        ] {
-            let out = run_kv(kh, vh);
+        // 2. Real F16 split-KV kernel
+        let f16_out = {
+            let k_dev = dev.from_cpu(&k_f32_host, &Shape::new(vec![kv_n]), DType::F16).unwrap();
+            let v_dev = dev.from_cpu(&v_f32_host, &Shape::new(vec![kv_n]), DType::F16).unwrap();
+            let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), DType::F32).unwrap();
+            let om_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), DType::F32).unwrap();
+            let os_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), DType::F32).unwrap();
+            launch_qkv_attention_dev_batch(
+                &dev, q_dev.as_ref(), k_dev.as_ref(), v_dev.as_ref(),
+                out_dev.as_ref(), om_dev.as_ref(), os_dev.as_ref(), tot_dev.as_ref(),
+                num_heads, num_kv_heads, head_dim, 1, 0, inv_sqrt_d, 0, 0.0,
+                dummy.as_ref(), 0, 0, dummy.as_ref(), 0, 1, 0, KvRingPolicy::UNLIMITED,
+            ).unwrap();
+            dev.synchronize();
+            out_dev.to_cpu_vec_f32().unwrap()
+        };
+
+        // 3. Real Q8_1 split-KV kernel (packed 36-byte Q8_1 blocks decoded on GPU)
+        let q81_out = {
+            const SPLIT_K: usize = 8;
+            let k_dev = dev.from_cpu_bytes(&k_q81_bytes, &Shape::new(vec![k_q81_bytes.len()]), u8_dt.clone()).unwrap();
+            let v_dev = dev.from_cpu_bytes(&v_q81_bytes, &Shape::new(vec![v_q81_bytes.len()]), u8_dt.clone()).unwrap();
+            let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), DType::F32).unwrap();
+            let om_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), DType::F32).unwrap();
+            let os_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), DType::F32).unwrap();
+            let po_dev = dev.from_cpu(&vec![0.0f32; SPLIT_K * q_n], &Shape::new(vec![SPLIT_K * q_n]), DType::F32).unwrap();
+            let pm_dev = dev.from_cpu(&vec![0.0f32; SPLIT_K * num_heads as usize], &Shape::new(vec![SPLIT_K * num_heads as usize]), DType::F32).unwrap();
+            let ps_dev = dev.from_cpu(&vec![0.0f32; SPLIT_K * num_heads as usize], &Shape::new(vec![SPLIT_K * num_heads as usize]), DType::F32).unwrap();
+            let mut q_ptr = q_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut k_ptr = k_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut v_ptr = v_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut po_ptr = po_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut pm_ptr = pm_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut ps_ptr = ps_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut o_ptr = out_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut om_ptr = om_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut os_ptr = os_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut tot_ptr = tot_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut dum_ptr = dummy.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+            let mut nh = num_heads as i32;
+            let mut nkv = num_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut steps_i = 0i32;
+            let mut isd = inv_sqrt_d;
+            let mut wl = 0i32;
+            let mut sc = 0.0f32;
+            let mut ha = 0i32;
+            let mut slot_stride_i = 0i32;
+            let mut cap = 0i32;
+            let mut split_k_i = SPLIT_K as i32;
+            dev.launch_compute_kernel(
+                "grim_qkv_attention_dev_q81_splitk",
+                crate::HipDim3::new(SPLIT_K as u32, nh as u32, 1),
+                crate::HipDim3::new(128, 1, 1),
+                &mut [
+                    arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr),
+                    arg(&mut po_ptr), arg(&mut pm_ptr), arg(&mut ps_ptr),
+                    arg(&mut nh), arg(&mut nkv), arg(&mut hd),
+                    arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd),
+                    arg(&mut wl), arg(&mut sc), arg(&mut dum_ptr),
+                    arg(&mut ha), arg(&mut slot_stride_i), arg(&mut cap),
+                    arg(&mut split_k_i),
+                ],
+            ).unwrap();
+            dev.launch_compute_kernel(
+                "grim_qkv_attention_splitk_combine",
+                crate::HipDim3::new(nh as u32, 1, 1),
+                crate::HipDim3::new(hd as u32, 1, 1),
+                &mut [
+                    arg(&mut po_ptr), arg(&mut pm_ptr), arg(&mut ps_ptr),
+                    arg(&mut o_ptr), arg(&mut om_ptr), arg(&mut os_ptr),
+                    arg(&mut nh), arg(&mut hd), arg(&mut split_k_i),
+                ],
+            ).unwrap();
+            dev.synchronize();
+            out_dev.to_cpu_vec_f32().unwrap()
+        };
+
+        let metrics = |out: &[f32]| -> (f64, f32) {
             let mut max_err = 0.0f32;
             let mut mse = 0.0f64;
             for (a, b) in ref_out.iter().zip(out.iter()) {
@@ -11327,8 +11500,14 @@ mod kv_arena_dtype_tests {
                 if d > max_err { max_err = d; }
                 mse += (d as f64) * (d as f64);
             }
-            let rmse = (mse / ref_out.len() as f64).sqrt();
-            eprintln!("[kv-variance] {label}: rmse={rmse:.6e}  max_abs_err={max_err:.6e}");
-        }
+            ((mse / ref_out.len() as f64).sqrt(), max_err)
+        };
+        let (f16_rmse, f16_max) = metrics(&f16_out);
+        let (q81_rmse, q81_max) = metrics(&q81_out);
+        eprintln!("[kv-f32-ref] F16 split-KV vs F32: rmse={f16_rmse:.6e}  max_abs_err={f16_max:.6e}");
+        eprintln!("[kv-f32-ref] Q8_1 split-KV vs F32: rmse={q81_rmse:.6e}  max_abs_err={q81_max:.6e}");
+        assert!(f16_rmse < 5e-4, "F16 KV RMSE {f16_rmse} too high vs F32");
+        assert!(q81_rmse < 5e-3, "Q8_1 KV RMSE {q81_rmse} too high vs F32");
+        assert!(f16_rmse < q81_rmse, "expected F16 RMSE ({f16_rmse}) < Q8_1 RMSE ({q81_rmse})");
     }
 }
