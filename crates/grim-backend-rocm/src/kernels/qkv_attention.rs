@@ -3625,8 +3625,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
         score *= inv_sqrt_d;
         if (thread_active) {
             if (softcap > 0.0f) {
-                float t = score / softcap;
-                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+                score = softcap * tanhf(score / softcap);
             }
             if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
             float mw = fmaxf(running_max, score);
@@ -3840,8 +3839,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
         score *= inv_sqrt_d;
         if (thread_active) {
             if (softcap > 0.0f) {
-                float t = score / softcap;
-                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+                score = softcap * tanhf(score / softcap);
             }
             if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
             float mw = fmaxf(running_max, score);
@@ -4054,8 +4052,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i4(
         score *= inv_sqrt_d;
         if (thread_active) {
             if (softcap > 0.0f) {
-                float t = score / softcap;
-                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+                score = softcap * tanhf(score / softcap);
             }
             if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
             float mw = fmaxf(running_max, score);
@@ -4654,8 +4651,7 @@ extern "C" __global__ void grim_qkv_attention_dev_f16_splitk(
     const float alibi_slope = (has_alibi && alibi_slopes != nullptr) ? alibi_slopes[h] : 0.0f;
 
     for (int j = j_start; j < j_end; ++j) {
-        const int phys_j = (cap_rows > 0) ? (j % cap_rows) : j;
-        const size_t kv_off = ((size_t)phys_j * (size_t)num_kv_heads + (size_t)kv_head) * (size_t)head_dim;
+        const size_t kv_off = ((size_t)j * (size_t)num_kv_heads + (size_t)kv_head) * (size_t)head_dim;
         const __half* k_ptr = k_tensor + kv_off;
         const __half* v_ptr = v_tensor + kv_off;
 
@@ -8358,23 +8354,23 @@ pub fn launch_qkv_attention_dev_batch(
     let block_dim = crate::HipDim3::new(128, 1, 1);
     // Phase 3 ring (cap_rows <= 0 disables eviction).
     let mut cap_rows_i = ring.cap_rows;
-    if k_f16
-        && seq_len >= 1
-        && seq_len <= 3
-        && batch <= 1
-        && fuse_o == 0
-        && !matches!(
+    static F16_ATTN_SPLITK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let f16_splitk_enabled = *F16_ATTN_SPLITK_ENABLED.get_or_init(|| {
+        !matches!(
             std::env::var("GRIM_F16_ATTN_SPLITK").as_deref(),
             Ok("0" | "false" | "off")
         )
-    {
+    });
+    if k_f16 && seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && f16_splitk_enabled {
         const SPLIT_K: usize = 8;
         static F16_SPLITK_SCRATCH: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
         > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
-        let need_out_bytes = SPLIT_K * total_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * total_h * std::mem::size_of::<f32>();
+        // Pre-allocate for max seq_len=3 so M=2/M=3 graph capture never triggers hipMalloc growth.
+        let alloc_h = 3usize * (num_heads as usize);
+        let need_out_bytes = SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
         let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
@@ -8398,6 +8394,11 @@ pub fn launch_qkv_attention_dev_batch(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
+                    unsafe {
+                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
+                    }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     (po_new, pm_new, ps_new)
                 }
@@ -8628,23 +8629,23 @@ pub fn launch_qkv_attention_dev_batch_i8(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
-    if seq_len >= 1
-        && seq_len <= 3
-        && batch <= 1
-        && fuse_o == 0
-        && !matches!(
+    static Q81_ATTN_SPLITK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q81_splitk_enabled = *Q81_ATTN_SPLITK_ENABLED.get_or_init(|| {
+        !matches!(
             std::env::var("GRIM_Q81_ATTN_SPLITK").as_deref(),
             Ok("0" | "false" | "off")
         )
-    {
+    });
+    if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
         static SPLITK_SCRATCH: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
         > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
+        let alloc_h = 3usize * (num_heads as usize);
         let need_out_bytes =
-            SPLIT_K * total_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * total_h * std::mem::size_of::<f32>();
+            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
         let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
@@ -8668,6 +8669,11 @@ pub fn launch_qkv_attention_dev_batch_i8(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
+                    unsafe {
+                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
+                    }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     (po_new, pm_new, ps_new)
                 }
@@ -8904,23 +8910,23 @@ pub fn launch_qkv_attention_dev_batch_i4(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
-    if seq_len >= 1
-        && seq_len <= 3
-        && batch <= 1
-        && fuse_o == 0
-        && !matches!(
+    static Q81_ATTN_SPLITK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q81_splitk_enabled = *Q81_ATTN_SPLITK_ENABLED.get_or_init(|| {
+        !matches!(
             std::env::var("GRIM_Q81_ATTN_SPLITK").as_deref(),
             Ok("0" | "false" | "off")
         )
-    {
+    });
+    if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
         static SPLITK_SCRATCH: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
         > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
+        let alloc_h = 3usize * (num_heads as usize);
         let need_out_bytes =
-            SPLIT_K * total_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * total_h * std::mem::size_of::<f32>();
+            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
         let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
@@ -8944,6 +8950,11 @@ pub fn launch_qkv_attention_dev_batch_i4(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
+                    unsafe {
+                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
+                    }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     (po_new, pm_new, ps_new)
                 }
@@ -9171,23 +9182,23 @@ pub fn launch_qkv_attention_dev_batch_q81(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
-    if seq_len >= 1
-        && seq_len <= 3
-        && batch <= 1
-        && fuse_o == 0
-        && !matches!(
+    static Q81_ATTN_SPLITK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q81_splitk_enabled = *Q81_ATTN_SPLITK_ENABLED.get_or_init(|| {
+        !matches!(
             std::env::var("GRIM_Q81_ATTN_SPLITK").as_deref(),
             Ok("0" | "false" | "off")
         )
-    {
+    });
+    if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
         static SPLITK_SCRATCH: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
         > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
+        let alloc_h = 3usize * (num_heads as usize);
         let need_out_bytes =
-            SPLIT_K * total_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * total_h * std::mem::size_of::<f32>();
+            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
         let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
@@ -9211,6 +9222,11 @@ pub fn launch_qkv_attention_dev_batch_q81(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
+                    unsafe {
+                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
+                    }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     (po_new, pm_new, ps_new)
                 }
@@ -9432,23 +9448,23 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
     let mut opptr = oproj_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
-    if seq_len >= 1
-        && seq_len <= 3
-        && batch <= 1
-        && fuse_o == 0
-        && !matches!(
+    static Q81_ATTN_SPLITK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q81_splitk_enabled = *Q81_ATTN_SPLITK_ENABLED.get_or_init(|| {
+        !matches!(
             std::env::var("GRIM_Q81_ATTN_SPLITK").as_deref(),
             Ok("0" | "false" | "off")
         )
-    {
+    });
+    if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
         static SPLITK_SCRATCH: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
         > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
+        let alloc_h = 3usize * (num_heads as usize);
         let need_out_bytes =
-            SPLIT_K * total_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * total_h * std::mem::size_of::<f32>();
+            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
         let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
@@ -9472,6 +9488,11 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
                     let po_new = alloc_dev(need_out_bytes)?;
                     let pm_new = alloc_dev(need_ms_bytes)?;
                     let ps_new = alloc_dev(need_ms_bytes)?;
+                    unsafe {
+                        let _ = crate::hipFree(po as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(pm as *mut std::ffi::c_void);
+                        let _ = crate::hipFree(ps as *mut std::ffi::c_void);
+                    }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
                     (po_new, pm_new, ps_new)
                 }
