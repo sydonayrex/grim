@@ -8381,14 +8381,16 @@ pub fn launch_qkv_attention_dev_batch(
             }
             Ok(ptr as u64)
         };
-        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+        let scratch_ptrs: Option<(u64, u64, u64)> = {
             let map = F16_SPLITK_SCRATCH
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = map.lock().unwrap();
             let dev_idx = dev.ordinal();
             if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
                 if cap >= need_out_bytes {
-                    (po, pm, ps)
+                    Some((po, pm, ps))
+                } else if dev.is_capturing() {
+                    None
                 } else {
                     let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                     let po_new = alloc_dev(need_out_bytes)?;
@@ -8400,17 +8402,20 @@ pub fn launch_qkv_attention_dev_batch(
                         let _ = crate::hipFree(ps as *mut std::ffi::c_void);
                     }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    (po_new, pm_new, ps_new)
+                    Some((po_new, pm_new, ps_new))
                 }
+            } else if dev.is_capturing() {
+                None
             } else {
                 let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                 let po_new = alloc_dev(need_out_bytes)?;
                 let pm_new = alloc_dev(need_ms_bytes)?;
                 let ps_new = alloc_dev(need_ms_bytes)?;
                 guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                (po_new, pm_new, ps_new)
+                Some((po_new, pm_new, ps_new))
             }
         };
+        if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
         let split_block = crate::HipDim3::new(128, 1, 1);
@@ -8459,6 +8464,7 @@ pub fn launch_qkv_attention_dev_batch(
                 arg(&mut split_k_i),
             ],
         );
+        }
     }
     dev.launch_compute_kernel(
         KERNEL,
@@ -8656,14 +8662,16 @@ pub fn launch_qkv_attention_dev_batch_i8(
             }
             Ok(ptr as u64)
         };
-        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+        let scratch_ptrs: Option<(u64, u64, u64)> = {
             let map = SPLITK_SCRATCH
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = map.lock().unwrap();
             let dev_idx = dev.ordinal();
             if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
                 if cap >= need_out_bytes {
-                    (po, pm, ps)
+                    Some((po, pm, ps))
+                } else if dev.is_capturing() {
+                    None
                 } else {
                     let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                     let po_new = alloc_dev(need_out_bytes)?;
@@ -8675,17 +8683,20 @@ pub fn launch_qkv_attention_dev_batch_i8(
                         let _ = crate::hipFree(ps as *mut std::ffi::c_void);
                     }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    (po_new, pm_new, ps_new)
+                    Some((po_new, pm_new, ps_new))
                 }
+            } else if dev.is_capturing() {
+                None
             } else {
                 let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                 let po_new = alloc_dev(need_out_bytes)?;
                 let pm_new = alloc_dev(need_ms_bytes)?;
                 let ps_new = alloc_dev(need_ms_bytes)?;
                 guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                (po_new, pm_new, ps_new)
+                Some((po_new, pm_new, ps_new))
             }
         };
+        if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
         let split_block = crate::HipDim3::new(128, 1, 1);
@@ -8718,7 +8729,7 @@ pub fn launch_qkv_attention_dev_batch_i8(
         let mut total_h_i = total_h as i32;
         let comb_grid = crate::HipDim3::new(total_h as u32, 1, 1);
         let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
-        dev.launch_compute_kernel(
+        return dev.launch_compute_kernel(
             "grim_qkv_attention_splitk_combine",
             comb_grid,
             comb_block,
@@ -8733,8 +8744,8 @@ pub fn launch_qkv_attention_dev_batch_i8(
                 arg(&mut hd),
                 arg(&mut split_k_i),
             ],
-        )?;
-        return Ok(dev.active_stream());
+        );
+        }
     }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
@@ -8937,14 +8948,16 @@ pub fn launch_qkv_attention_dev_batch_i4(
             }
             Ok(ptr as u64)
         };
-        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+        let scratch_ptrs: Option<(u64, u64, u64)> = {
             let map = SPLITK_SCRATCH
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = map.lock().unwrap();
             let dev_idx = dev.ordinal();
             if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
                 if cap >= need_out_bytes {
-                    (po, pm, ps)
+                    Some((po, pm, ps))
+                } else if dev.is_capturing() {
+                    None
                 } else {
                     let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                     let po_new = alloc_dev(need_out_bytes)?;
@@ -8956,17 +8969,20 @@ pub fn launch_qkv_attention_dev_batch_i4(
                         let _ = crate::hipFree(ps as *mut std::ffi::c_void);
                     }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    (po_new, pm_new, ps_new)
+                    Some((po_new, pm_new, ps_new))
                 }
+            } else if dev.is_capturing() {
+                None
             } else {
                 let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                 let po_new = alloc_dev(need_out_bytes)?;
                 let pm_new = alloc_dev(need_ms_bytes)?;
                 let ps_new = alloc_dev(need_ms_bytes)?;
                 guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                (po_new, pm_new, ps_new)
+                Some((po_new, pm_new, ps_new))
             }
         };
+        if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
         let split_block = crate::HipDim3::new(128, 1, 1);
@@ -8999,7 +9015,7 @@ pub fn launch_qkv_attention_dev_batch_i4(
         let mut total_h_i = total_h as i32;
         let comb_grid = crate::HipDim3::new(total_h as u32, 1, 1);
         let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
-        dev.launch_compute_kernel(
+        return dev.launch_compute_kernel(
             "grim_qkv_attention_splitk_combine",
             comb_grid,
             comb_block,
@@ -9014,8 +9030,8 @@ pub fn launch_qkv_attention_dev_batch_i4(
                 arg(&mut hd),
                 arg(&mut split_k_i),
             ],
-        )?;
-        return Ok(dev.active_stream());
+        );
+        }
     }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
@@ -9209,14 +9225,16 @@ pub fn launch_qkv_attention_dev_batch_q81(
             }
             Ok(ptr as u64)
         };
-        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+        let scratch_ptrs: Option<(u64, u64, u64)> = {
             let map = SPLITK_SCRATCH
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = map.lock().unwrap();
             let dev_idx = dev.ordinal();
             if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
                 if cap >= need_out_bytes {
-                    (po, pm, ps)
+                    Some((po, pm, ps))
+                } else if dev.is_capturing() {
+                    None
                 } else {
                     let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                     let po_new = alloc_dev(need_out_bytes)?;
@@ -9228,17 +9246,20 @@ pub fn launch_qkv_attention_dev_batch_q81(
                         let _ = crate::hipFree(ps as *mut std::ffi::c_void);
                     }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    (po_new, pm_new, ps_new)
+                    Some((po_new, pm_new, ps_new))
                 }
+            } else if dev.is_capturing() {
+                None
             } else {
                 let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                 let po_new = alloc_dev(need_out_bytes)?;
                 let pm_new = alloc_dev(need_ms_bytes)?;
                 let ps_new = alloc_dev(need_ms_bytes)?;
                 guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                (po_new, pm_new, ps_new)
+                Some((po_new, pm_new, ps_new))
             }
         };
+        if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
         let split_block = crate::HipDim3::new(128, 1, 1);
@@ -9271,7 +9292,7 @@ pub fn launch_qkv_attention_dev_batch_q81(
         let mut total_h_i = total_h as i32;
         let comb_grid = crate::HipDim3::new(total_h as u32, 1, 1);
         let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
-        dev.launch_compute_kernel(
+        return dev.launch_compute_kernel(
             "grim_qkv_attention_splitk_combine",
             comb_grid,
             comb_block,
@@ -9286,8 +9307,8 @@ pub fn launch_qkv_attention_dev_batch_q81(
                 arg(&mut hd),
                 arg(&mut split_k_i),
             ],
-        )?;
-        return Ok(dev.active_stream());
+        );
+        }
     }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
@@ -9475,14 +9496,16 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
             }
             Ok(ptr as u64)
         };
-        let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = {
+        let scratch_ptrs: Option<(u64, u64, u64)> = {
             let map = SPLITK_SCRATCH
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = map.lock().unwrap();
             let dev_idx = dev.ordinal();
             if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
                 if cap >= need_out_bytes {
-                    (po, pm, ps)
+                    Some((po, pm, ps))
+                } else if dev.is_capturing() {
+                    None
                 } else {
                     let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                     let po_new = alloc_dev(need_out_bytes)?;
@@ -9494,17 +9517,20 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
                         let _ = crate::hipFree(ps as *mut std::ffi::c_void);
                     }
                     guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    (po_new, pm_new, ps_new)
+                    Some((po_new, pm_new, ps_new))
                 }
+            } else if dev.is_capturing() {
+                None
             } else {
                 let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
                 let po_new = alloc_dev(need_out_bytes)?;
                 let pm_new = alloc_dev(need_ms_bytes)?;
                 let ps_new = alloc_dev(need_ms_bytes)?;
                 guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                (po_new, pm_new, ps_new)
+                Some((po_new, pm_new, ps_new))
             }
         };
+        if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
         let split_block = crate::HipDim3::new(128, 1, 1);
@@ -9537,7 +9563,7 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
         let mut total_h_i = total_h as i32;
         let comb_grid = crate::HipDim3::new(total_h as u32, 1, 1);
         let comb_block = crate::HipDim3::new(hd as u32, 1, 1);
-        dev.launch_compute_kernel(
+        return dev.launch_compute_kernel(
             "grim_qkv_attention_splitk_combine",
             comb_grid,
             comb_block,
@@ -9552,8 +9578,8 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
                 arg(&mut hd),
                 arg(&mut split_k_i),
             ],
-        )?;
-        return Ok(dev.active_stream());
+        );
+        }
     }
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);

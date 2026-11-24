@@ -1267,7 +1267,9 @@ impl Qwen35Block {
                             cache.v_scales_device.as_deref(),
                         )?;
                     }
-                    if cache.current_pos == 24 {
+                    if cache.current_pos == 24
+                        && std::env::var("GRIM_DEBUG_POS24_D2H").as_deref() == Ok("1")
+                    {
                         use grim_backend_rocm::device::util::as_rocm;
                         if let Ok(rocm) = as_rocm(k_dev.as_ref()) {
                             let n_bytes = rocm.bytes();
@@ -5652,8 +5654,8 @@ fn attention_layer_d2d(
     let kv_dim = blk.num_kv_heads * blk.head_dim;
     let device = x_normed.device().clone();
     let dev = pick_device_for_storage_device(&device);
-    let x_normed_t = crate::decode_graph::hadamard_transform_tensor(x_normed, blk.layer_idx, "attn_q")
-        .unwrap_or_else(|_| x_normed.clone());
+    let x_normed_t =
+        crate::decode_graph::hadamard_transform_tensor(x_normed, blk.layer_idx, "attn_q")?;
 
     // TEMP probe: this path is the default decode route and it aborts on a bad
     // transfer at the first attention layer. Print the geometry each step

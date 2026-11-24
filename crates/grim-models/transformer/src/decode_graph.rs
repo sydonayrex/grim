@@ -1502,7 +1502,7 @@ impl LlamaBlock {
             steps,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -1515,7 +1515,7 @@ impl LlamaBlock {
             steps,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -1544,7 +1544,7 @@ impl LlamaBlock {
             0,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
@@ -8421,7 +8421,7 @@ impl Gemma2Block {
             steps,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -8434,7 +8434,7 @@ impl Gemma2Block {
             steps,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -8922,7 +8922,7 @@ impl ChameleonBlock {
             steps,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
 
@@ -8935,7 +8935,7 @@ impl ChameleonBlock {
             steps,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
@@ -8964,7 +8964,7 @@ impl ChameleonBlock {
             0,
             batch,
             arena_slot_stride,
-            grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            buffers.kv_ring,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
 
