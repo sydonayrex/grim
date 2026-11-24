@@ -2847,7 +2847,9 @@ __device__ inline float kda_block_sum(float v, float* s_red) {
         if (lane == 0) s_red[0] = w;
     }
     __syncthreads();
-    return s_red[0];
+    float out = s_red[0];
+    __syncthreads();
+    return out;
 }
 
 extern "C" __global__ void grim_kda_gated_delta_rule_scan_v2(
