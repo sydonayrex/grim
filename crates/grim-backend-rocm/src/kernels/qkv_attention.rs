@@ -11065,4 +11065,270 @@ mod kv_arena_dtype_tests {
             );
         });
     }
+
+    fn lcg_f32(state: &mut u64) -> f32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let bits = ((*state >> 40) as u32) as f32 / (1u32 << 24) as f32;
+        bits * 2.0 - 1.0
+    }
+    use super::{arg, launch_qkv_attention_dev_batch, KvRingPolicy};
+
+    fn q81_roundtrip_f32(src: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; src.len()];
+        for (dst_blk, src_blk) in out.chunks_mut(32).zip(src.chunks(32)) {
+            let max_abs = src_blk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let d = half::f16::from_f32(max_abs / 127.0).to_f32();
+            if d == 0.0 {
+                continue;
+            }
+            let inv_d = 1.0 / d;
+            for (o, &x) in dst_blk.iter_mut().zip(src_blk.iter()) {
+                let q = (x * inv_d).round().clamp(-127.0, 127.0) as i8;
+                *o = (q as f32) * d;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn f16_splitk_matches_serial_and_is_bitwise_deterministic() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        use grim_tensor::dtype::DType;
+        use grim_tensor::Shape;
+
+        let num_heads = 24u32;
+        let num_kv_heads = 4u32;
+        let head_dim = 256u32;
+        let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+        let f32_dt = || DType::F32;
+        let f16_dt = || DType::F16;
+
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        for &(seq_len, kv_len) in &[(1u32, 19usize), (2, 19), (3, 19), (1, 517), (2, 517), (3, 517)] {
+            let q_n = (seq_len * num_heads * head_dim) as usize;
+            let kv_n = kv_len * (num_kv_heads * head_dim) as usize;
+            let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
+            let k_host: Vec<f32> = (0..kv_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
+            let v_host: Vec<f32> = (0..kv_n).map(|_| lcg_f32(&mut rng) * 0.5).collect();
+
+            let q_dev = dev.from_cpu(&q_host, &Shape::new(vec![q_n]), f32_dt()).unwrap();
+            let k_dev = dev.from_cpu(&k_host, &Shape::new(vec![kv_n]), f16_dt()).unwrap();
+            let v_dev = dev.from_cpu(&v_host, &Shape::new(vec![kv_n]), f16_dt()).unwrap();
+            let tot_dev = dev.from_cpu(&[f32::from_bits(kv_len as u32)], &Shape::new(vec![1]), f32_dt()).unwrap();
+            let dummy = dev.from_cpu(&[0.0f32; 4], &Shape::new(vec![4]), f32_dt()).unwrap();
+            let ms_n = (seq_len * num_heads) as usize;
+
+            let run_once = |use_splitk: bool| -> Vec<f32> {
+                let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), f32_dt()).unwrap();
+                let om_dev = dev.from_cpu(&vec![0.0f32; ms_n], &Shape::new(vec![ms_n]), f32_dt()).unwrap();
+                let os_dev = dev.from_cpu(&vec![0.0f32; ms_n], &Shape::new(vec![ms_n]), f32_dt()).unwrap();
+                let mut q_ptr = q_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut k_ptr = k_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut v_ptr = v_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut o_ptr = out_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut om_ptr = om_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut os_ptr = os_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut tot_ptr = tot_dev.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut dum_ptr = dummy.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().unwrap().device_ptr.unwrap();
+                let mut nh = num_heads as i32;
+                let mut nkv = num_kv_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut sl = seq_len as i32;
+                let mut steps_i = 0i32;
+                let mut isd = inv_sqrt_d;
+                let mut wl = 0i32;
+                let mut sc = 0.0f32;
+                let mut ha = 0i32;
+                let mut cap = 0i32;
+                if use_splitk {
+                    launch_qkv_attention_dev_batch(
+                        &dev,
+                        q_dev.as_ref(),
+                        k_dev.as_ref(),
+                        v_dev.as_ref(),
+                        out_dev.as_ref(),
+                        om_dev.as_ref(),
+                        os_dev.as_ref(),
+                        tot_dev.as_ref(),
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        seq_len,
+                        0,
+                        inv_sqrt_d,
+                        0,
+                        0.0,
+                        dummy.as_ref(),
+                        0,
+                        0,
+                        dummy.as_ref(),
+                        0,
+                        1,
+                        0,
+                        KvRingPolicy::UNLIMITED,
+                    )
+                    .unwrap();
+                } else {
+                    let mut od = 0i32;
+                    let mut fo = 0i32;
+                    let mut batch_i = 1i32;
+                    let mut slot_stride_i = 0i32;
+                    let mut f16_flag = 1i32;
+                    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, 1);
+                    let block_dim = crate::HipDim3::new(128, 1, 1);
+                    dev.launch_compute_kernel(
+                        "grim_qkv_attention_dev",
+                        grid_dim,
+                        block_dim,
+                        &mut [
+                            arg(&mut q_ptr),
+                            arg(&mut k_ptr),
+                            arg(&mut v_ptr),
+                            arg(&mut o_ptr),
+                            arg(&mut om_ptr),
+                            arg(&mut os_ptr),
+                            arg(&mut nh),
+                            arg(&mut nkv),
+                            arg(&mut hd),
+                            arg(&mut sl),
+                            arg(&mut tot_ptr),
+                            arg(&mut steps_i),
+                            arg(&mut isd),
+                            arg(&mut wl),
+                            arg(&mut sc),
+                            arg(&mut dum_ptr),
+                            arg(&mut od),
+                            arg(&mut fo),
+                            arg(&mut dum_ptr),
+                            arg(&mut ha),
+                            arg(&mut batch_i),
+                            arg(&mut slot_stride_i),
+                            arg(&mut f16_flag),
+                            arg(&mut cap),
+                        ],
+                    )
+                    .unwrap();
+                }
+                dev.synchronize();
+                out_dev.to_cpu_vec_f32().unwrap()
+            };
+
+            let ref_out = run_once(false);
+            let sk_out1 = run_once(true);
+            let sk_out2 = run_once(true);
+            assert_eq!(
+                sk_out1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                sk_out2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "split-KV must be bitwise deterministic (seq_len={seq_len}, kv_len={kv_len})"
+            );
+            let max_err = ref_out
+                .iter()
+                .zip(sk_out1.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("[splitk-parity] seq_len={seq_len} kv_len={kv_len}: max_abs_err={max_err:.3e}");
+            assert!(
+                max_err <= 1e-4,
+                "split-KV vs serial max_abs_err={max_err} > 1e-4 (seq_len={seq_len}, kv_len={kv_len})"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_f16_vs_q81_k_and_v_variance_ablation() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        use grim_tensor::dtype::DType;
+        use grim_tensor::Shape;
+
+        let num_heads = 24u32;
+        let num_kv_heads = 4u32;
+        let head_dim = 256u32;
+        let kv_len = 517usize;
+        let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+        let f32_dt = || DType::F32;
+        let f16_dt = || DType::F16;
+
+        let mut rng = 0xfeed_face_cafe_babeu64;
+        let q_n = (num_heads * head_dim) as usize;
+        let kv_n = kv_len * (num_kv_heads * head_dim) as usize;
+        let q_host: Vec<f32> = (0..q_n).map(|_| lcg_f32(&mut rng) * 1.0).collect();
+        // Inject 1% channel outliers (magnitude ~12.0) to mimic real LLM KV distributions.
+        let mut gen_kv = || -> Vec<f32> {
+            (0..kv_n)
+                .map(|i| {
+                    let v = lcg_f32(&mut rng);
+                    if i % 97 == 0 { v * 12.0 } else { v * 0.5 }
+                })
+                .collect()
+        };
+        let k_f16_host = gen_kv();
+        let v_f16_host = gen_kv();
+        let k_q81_host = q81_roundtrip_f32(&k_f16_host);
+        let v_q81_host = q81_roundtrip_f32(&v_f16_host);
+
+        let q_dev = dev.from_cpu(&q_host, &Shape::new(vec![q_n]), f32_dt()).unwrap();
+        let tot_dev = dev.from_cpu(&[f32::from_bits(kv_len as u32)], &Shape::new(vec![1]), f32_dt()).unwrap();
+        let dummy = dev.from_cpu(&[0.0f32; 4], &Shape::new(vec![4]), f32_dt()).unwrap();
+
+        let run_kv = |k_h: &[f32], v_h: &[f32]| -> Vec<f32> {
+            let k_dev = dev.from_cpu(k_h, &Shape::new(vec![kv_n]), f16_dt()).unwrap();
+            let v_dev = dev.from_cpu(v_h, &Shape::new(vec![kv_n]), f16_dt()).unwrap();
+            let out_dev = dev.from_cpu(&vec![0.0f32; q_n], &Shape::new(vec![q_n]), f32_dt()).unwrap();
+            let om_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), f32_dt()).unwrap();
+            let os_dev = dev.from_cpu(&vec![0.0f32; num_heads as usize], &Shape::new(vec![num_heads as usize]), f32_dt()).unwrap();
+            launch_qkv_attention_dev_batch(
+                &dev,
+                q_dev.as_ref(),
+                k_dev.as_ref(),
+                v_dev.as_ref(),
+                out_dev.as_ref(),
+                om_dev.as_ref(),
+                os_dev.as_ref(),
+                tot_dev.as_ref(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                0,
+                inv_sqrt_d,
+                0,
+                0.0,
+                dummy.as_ref(),
+                0,
+                0,
+                dummy.as_ref(),
+                0,
+                1,
+                0,
+                KvRingPolicy::UNLIMITED,
+            )
+            .unwrap();
+            dev.synchronize();
+            out_dev.to_cpu_vec_f32().unwrap()
+        };
+
+        let ref_out = run_kv(&k_f16_host, &v_f16_host);
+        for (label, kh, vh) in [
+            ("K=F16,  V=Q8_1", &k_f16_host, &v_q81_host),
+            ("K=Q8_1, V=F16 ", &k_q81_host, &v_f16_host),
+            ("K=Q8_1, V=Q8_1", &k_q81_host, &v_q81_host),
+        ] {
+            let out = run_kv(kh, vh);
+            let mut max_err = 0.0f32;
+            let mut mse = 0.0f64;
+            for (a, b) in ref_out.iter().zip(out.iter()) {
+                let d = (a - b).abs();
+                if d > max_err { max_err = d; }
+                mse += (d as f64) * (d as f64);
+            }
+            let rmse = (mse / ref_out.len() as f64).sqrt();
+            eprintln!("[kv-variance] {label}: rmse={rmse:.6e}  max_abs_err={max_err:.6e}");
+        }
+    }
 }
