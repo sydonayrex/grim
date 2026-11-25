@@ -751,12 +751,15 @@ fn try_graph_decode_step(
 
 
     }
+    // Opt-in only: fused head+argmax requires the captured lm_head kernel to
+    // write [u32 tok_id, f32 max_val] into logits[0..8]; Q6_K/standard heads
+    // write raw f32 logits, which would otherwise be misread as u32 token IDs.
     let fused_head_argmax = allow_gpu_sample
         && sampling_params.temperature <= 0.0
         && sampling_params.repeat_penalty <= 1.0
-        && !matches!(
+        && matches!(
             std::env::var("GRIM_FUSED_HEAD_ARGMAX").as_deref(),
-            Ok("0" | "false" | "off")
+            Ok("1" | "true" | "on")
         );
     if fused_head_argmax {
         if let Some(ptr) = g.logits_device_storage().device_ptr_u64() {
@@ -3203,6 +3206,14 @@ pub async fn cmd_run(
 
     // Decode all tokens together for correct BPE boundary handling.
     if let Some(tok) = &tokenizer {
+        if let Ok(dump_path) = std::env::var("GRIM_DUMP_GEN_TOKENS") {
+            let line = generated_tokens
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = std::fs::write(&dump_path, format!("{line}\n"));
+        }
         let text = tok.decode(&generated_tokens);
         if prompt_has_think {
             if let Some((thinking, response)) = text.split_once("</think>") {
@@ -4016,7 +4027,15 @@ pub async fn cmd_run_interactive(
         }
 
         if let Some(tok) = &tokenizer {
-            let text = tok.decode(&generated_tokens);
+            if let Ok(dump_path) = std::env::var("GRIM_DUMP_GEN_TOKENS") {
+            let line = generated_tokens
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = std::fs::write(&dump_path, format!("{line}\n"));
+        }
+        let text = tok.decode(&generated_tokens);
             print!("{}", text);
             // Record assistant response for next turn's full conversation history.
             messages.push(grim_format::ChatMessage {
