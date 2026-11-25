@@ -427,12 +427,52 @@ pub fn verify_tree_stochastic(
     }
 }
 
+/// Per-node recurrent state for a tree, keyed by parent. This is the host-side
+/// representation a true packed-tree trunk needs for KDA/short-conv branching;
+/// the model-side branch that consumes it is still a follow-up.
+#[derive(Debug, Clone)]
+pub struct TreeState<T> {
+    states: Vec<T>,
+    parents: Vec<Option<usize>>,
+}
+
+impl<T: Clone> TreeState<T> {
+    pub fn new(parents: Vec<Option<usize>>, root: T) -> Self {
+        let states = vec![root; parents.len().max(1)];
+        Self { states, parents }
+    }
+
+    pub fn parent(&self, node: usize) -> Option<usize> {
+        self.parents.get(node).copied().flatten()
+    }
+
+    pub fn set(&mut self, node: usize, state: T) {
+        if let Some(slot) = self.states.get_mut(node) {
+            *slot = state;
+        }
+    }
+
+    pub fn get(&self, node: usize) -> Option<&T> {
+        self.states.get(node)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn logits(rows: &[Vec<f32>], _vocab: usize) -> Vec<f32> {
         rows.iter().flat_map(|r| r.iter().copied()).collect()
+    }
+
+    #[test]
+    fn tree_state_tracks_parent_lineage() {
+        let mut state = TreeState::new(vec![None, Some(0), Some(0)], 0u32);
+        assert_eq!(state.parent(0), None);
+        assert_eq!(state.parent(1), Some(0));
+        state.set(1, 11);
+        state.set(2, *state.get(1).unwrap());
+        assert_eq!(state.get(2), Some(&11));
     }
 
     #[test]
