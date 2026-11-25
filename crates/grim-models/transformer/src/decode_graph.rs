@@ -5606,6 +5606,30 @@ impl Qwen35 {
         Ok(())
     }
 
+    /// Append one KDA/GDN replay record to the graph buffer cursor. Host
+    /// bookkeeping only; device-state binding is a separate increment.
+    pub fn append_graph_replay_record(
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        token: u32,
+        pos: u32,
+    ) -> Result<()> {
+        if let Some(g) = graph_slot.as_mut().and_then(|a| a.downcast_mut::<DecodeGraph>()) {
+            g.buffers.append_replay_record(token, pos);
+        }
+        Ok(())
+    }
+
+    /// Commit the accepted prefix of graph replay records.
+    pub fn commit_graph_replay_records(
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        accepted: usize,
+    ) -> Result<()> {
+        if let Some(g) = graph_slot.as_mut().and_then(|a| a.downcast_mut::<DecodeGraph>()) {
+            g.buffers.commit_replay_records(accepted);
+        }
+        Ok(())
+    }
+
     /// Chained-draft enqueue (GRIM_MTP_DRAFT_CHAIN=1, greedy, depth 1): stage
     /// the nextn draft step, replay its HIP graph, then D2D-snapshot
     /// `head_output` into a PERSISTENT clone buffer (stream-ordered) and

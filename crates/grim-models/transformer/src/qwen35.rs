@@ -6702,6 +6702,17 @@ pub struct KvEvictionPolicy {
     /// Unused by the positional ring (which keeps the newest rows by
     /// construction).
     pub residual: usize,
+    /// Tiering: newest rows kept in the higher-precision side region.
+    pub recent_rows: usize,
+    /// Tiering: number of side rows reserved for non-sink history.
+    pub side_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvTier {
+    Sink,
+    Recent,
+    Stale,
 }
 
 impl KvEvictionPolicy {
@@ -6711,6 +6722,21 @@ impl KvEvictionPolicy {
             sinks: 0,
             mode: EvictionMode::Positional,
             residual: 0,
+            recent_rows: 0,
+            side_rows: 0,
+        }
+    }
+
+    /// Classify an absolute token position for precision tiering. Sinks and
+    /// the newest `recent_rows` positions stay high precision; the bounded
+    /// side region holds a fixed number of stale rows.
+    pub fn tier(&self, abs: usize, live: usize) -> KvTier {
+        if abs < self.sinks {
+            KvTier::Sink
+        } else if self.recent_rows > 0 && abs + self.recent_rows >= live {
+            KvTier::Recent
+        } else {
+            KvTier::Stale
         }
     }
 
@@ -7192,6 +7218,8 @@ pub(crate) fn kv_eviction_policy_for_layer(device: &Device, layer_idx: usize) ->
         sinks,
         mode,
         residual,
+        recent_rows: 0,
+        side_rows: 0,
     }
 }
 
@@ -7217,6 +7245,8 @@ pub(crate) fn kv_eviction_policy(device: &Device) -> KvEvictionPolicy {
         sinks,
         mode,
         residual,
+        recent_rows: 0,
+        side_rows: 0,
     }
 }
 
@@ -10344,6 +10374,23 @@ mod kv_eviction_tests {
     }
 
     #[test]
+    fn kv_tier_classifies_sink_recent_stale() {
+        let pol = KvEvictionPolicy {
+            cap_rows: Some(64),
+            sinks: 4,
+            mode: EvictionMode::Positional,
+            residual: 0,
+            recent_rows: 8,
+            side_rows: 16,
+        };
+        assert_eq!(pol.tier(0, 64), crate::qwen35::KvTier::Sink);
+        assert_eq!(pol.tier(3, 64), crate::qwen35::KvTier::Sink);
+        assert_eq!(pol.tier(4, 64), crate::qwen35::KvTier::Stale);
+        assert_eq!(pol.tier(56, 64), crate::qwen35::KvTier::Recent);
+        assert_eq!(pol.tier(63, 64), crate::qwen35::KvTier::Recent);
+    }
+
+    #[test]
     fn kv_ring_row_host_matches_device() {
         for cap in [1usize, 2, 5, 8, 16, 64, 257] {
             for sinks in [0usize, 1, 2, 4, 8, 64] {
@@ -10353,6 +10400,8 @@ mod kv_eviction_tests {
                     sinks: eff_sinks,
                     mode: EvictionMode::Positional,
                     residual: 0,
+                    recent_rows: 0,
+                    side_rows: 0,
                 };
                 for t in 0..(cap * 3 + 17) {
                     assert_eq!(
@@ -10376,6 +10425,8 @@ mod kv_eviction_tests {
             sinks,
             mode: EvictionMode::Positional,
             residual: 0,
+            recent_rows: 0,
+            side_rows: 0,
         };
         for t in 0..sinks {
             assert_eq!(pol.arena_row(t), t, "sink token {t} was evicted");

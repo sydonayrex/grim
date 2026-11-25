@@ -1354,6 +1354,9 @@ impl SpeculativeCausalLm {
                 {
                     let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = mtp.commit_m2_graph_spec_state(&mut g_guard);
+                    if self.replay_ring.is_some() {
+                        let _ = mtp.commit_replay_records(&mut g_guard, accepted_count);
+                    }
                 }
                 session.advance_pos(1 + accepted_count);
                 if let Some(kv) = session.kv_mut() {
@@ -1431,6 +1434,13 @@ impl SpeculativeCausalLm {
                         ring.flush();
                     }
                     ring.append_draft(&draft_block.tokens[..verify_len]);
+                }
+                if use_m2_graph {
+                    let base = session.current_pos() as u32;
+                    let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
+                    for (i, &tok) in draft_block.tokens[..verify_len].iter().enumerate() {
+                        mtp.append_replay_record(&mut g_guard, tok, base + 1 + i as u32)?;
+                    }
                 }
                 let pre_batch_snapshot = if recurrent && !use_m2_graph {
                     session.snapshot_recurrent_state()?
@@ -1546,6 +1556,9 @@ impl SpeculativeCausalLm {
                             let mut g_guard = self.graph_m2.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = mtp.publish_m2_graph_hidden_row(&mut g_guard, session, accepted_count);
                             let _ = mtp.commit_m2_graph_spec_state(&mut g_guard);
+                            if self.replay_ring.is_some() {
+                                let _ = mtp.commit_replay_records(&mut g_guard, accepted_count);
+                            }
                         }
                         session.advance_pos(1 + accepted_count);
                     }

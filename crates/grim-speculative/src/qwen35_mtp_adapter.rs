@@ -244,6 +244,24 @@ impl NativeMtp for Qwen35MtpAdapter {
     ) -> Result<()> {
         self.qwen()?.commit_graph_spec_state(graph_slot)
     }
+
+    fn append_replay_record(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        token: u32,
+        pos: u32,
+    ) -> Result<()> {
+        grim_models_transformer::Qwen35::append_graph_replay_record(graph_slot, token, pos)
+    }
+
+    fn commit_replay_records(
+        &self,
+        graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        accepted: usize,
+    ) -> Result<()> {
+        grim_models_transformer::Qwen35::commit_graph_replay_records(graph_slot, accepted)
+    }
+
     fn enqueue_chained_draft(
         &self,
         _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
