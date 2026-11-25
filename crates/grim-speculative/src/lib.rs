@@ -35,7 +35,10 @@ pub use may_verify::{spec_may_verify_enabled, FallbackConfig, MayVerifyGate, Spe
 pub use mtp_provider_adapter::MtpProviderAdapter;
 pub use distill::{compress_distill_report, train_speculative_draft};
 pub use draft_backbone::{DraftBackbone, DraftBlock};
-pub use draft_tree::{DraftTree, DraftTreeNode, TreeBuildConfig, TreeVerification, verify_tree_greedy};
+pub use draft_tree::{
+    path_q, verify_tree_greedy, verify_tree_stochastic, DraftTree, DraftTreeNode, TreeBuildConfig,
+    TreeVerification,
+};
 pub use eagle3_drafter::Eagle3Drafter;
 pub use entropy_confidence_head::EntropyConfidenceHead;
 pub use llama_mtp_adapter::LlamaMtpAdapter;

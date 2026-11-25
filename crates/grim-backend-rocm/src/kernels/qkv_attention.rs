@@ -4117,6 +4117,10 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
             }
         }
     }
+    // Publish the attention log-normalizer inputs for the tiered-cache merge.
+    // Buffer layout is [batch, num_heads] (one row per decode step).
+    if (out_max != nullptr) out_max[slot * num_heads + h] = m_final;
+    if (out_sum != nullptr) out_sum[slot * num_heads + h] = sum_final;
 }
 
 // int4-KV device-total variant of `grim_qkv_attention_dev` (Phase 4):
@@ -11662,5 +11666,22 @@ mod kv_arena_dtype_tests {
         assert!(f16_rmse < 5e-4, "F16 KV RMSE {f16_rmse} too high vs F32");
         assert!(q81_rmse < 5e-3, "Q8_1 KV RMSE {q81_rmse} too high vs F32");
         assert!(f16_rmse < q81_rmse, "expected F16 RMSE ({f16_rmse}) < Q8_1 RMSE ({q81_rmse})");
+    }
+
+    #[test]
+    fn int8_device_total_publishes_lse_inputs() {
+        // Guard the tiered-cache prerequisite: the int8 device-total kernel
+        // must publish its log-normalizer inputs or an INT8 side region cannot
+        // be merged with the main cache.
+        assert!(
+            crate::kernels::qkv_attention::KERNEL_SOURCE
+                .contains("out_max[slot * num_heads + h] = m_final"),
+            "int8 attention must publish out_max for LSE merge"
+        );
+        assert!(
+            crate::kernels::qkv_attention::KERNEL_SOURCE
+                .contains("out_sum[slot * num_heads + h] = sum_final"),
+            "int8 attention must publish out_sum for LSE merge"
+        );
     }
 }

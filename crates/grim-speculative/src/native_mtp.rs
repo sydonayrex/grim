@@ -133,4 +133,43 @@ pub trait NativeMtp: grim_core::CausalLm {
 
     /// Block until any in-flight chained draft has executed its pinned copy.
     fn drain_chained_draft(&self, _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>) {}
+
+    /// Run the trunk over a packed candidate tree and return `[nodes, vocab]`
+    /// logits. `depths[i]` is the tree depth of node `i` (absolute RoPE
+    /// position is `base_pos + depths[i]`) and `parents[i]` is the parent index
+    /// (root sentinel 0). Return `Ok(None)` when the model cannot support this
+    /// shape; the wrapper then keeps the linear path. Implementations must
+    /// hard-fail rather than silently run causal attention for a tree.
+    fn forward_tree(
+        &self,
+        _session: &mut dyn grim_core::session::SessionT,
+        _tokens: &[u32],
+        _depths: &[usize],
+        _parents: &[u32],
+        _base_pos: u32,
+        _adapters: &[grim_core::model::AdapterHandle],
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    /// Append one recurrent-state replay record (token id + absolute
+    /// position) behind the committed frontier. Default no-op for models
+    /// without replayable recurrent state.
+    fn append_replay_record(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _token: u32,
+        _pos: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commit the accepted prefix of replay records (`h += accepted`).
+    fn commit_replay_records(
+        &self,
+        _graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,
+        _accepted: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 }

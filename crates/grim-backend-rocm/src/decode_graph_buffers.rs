@@ -302,6 +302,11 @@ pub struct DecodeGraphBuffers {
     pub layer_devices: Vec<usize>,
     /// Lazy D2D checkpoint for on-graph speculative rejection rollback.
     pub recurrent_ckpt: Option<RecurrentCheckpoint>,
+    /// ReplaySSM-style bookkeeping: `(token_id, absolute_position)` records
+    /// appended behind the committed frontier. Device state binding is
+    /// model-specific; this ring only owns the cursor discipline.
+    pub replay_records: Vec<(u32, u32)>,
+    pub replay_committed: usize,
 }
 
 /// The maximal contiguous runs of equal device ordinal in `layer_devices`,
@@ -494,6 +499,26 @@ impl DecodeGraphBuffers {
         }
         Ok(())
     }
+    /// Append a replay record behind the committed frontier. Records past
+    /// `replay_committed` are speculative and are overwritten on the next
+    /// append after a rejection.
+    pub fn append_replay_record(&mut self, token: u32, pos: u32) {
+        if self.replay_records.len() < self.replay_committed {
+            self.replay_records.clear();
+            self.replay_committed = 0;
+        }
+        if self.replay_records.len() > self.replay_committed {
+            self.replay_records.truncate(self.replay_committed);
+        }
+        self.replay_records.push((token, pos));
+    }
+
+    /// Commit the accepted prefix by advancing the cursor; no state copy.
+    pub fn commit_replay_records(&mut self, accepted: usize) {
+        let n = accepted.min(self.replay_records.len().saturating_sub(self.replay_committed));
+        self.replay_committed += n;
+    }
+
     /// Update the leading batch dimension (`dims[0] = batch`) on all batch-indexed
     /// activation scratch buffers so a single `DecodeGraphBuffers` (allocated at
     /// `max_batch`) can be captured and replayed for any `1 <= batch <= max_batch`
@@ -1472,6 +1497,8 @@ impl DecodeGraphBuffers {
                 None => vec![dev.ordinal; num_layers],
             },
             recurrent_ckpt: None,
+            replay_records: Vec::new(),
+            replay_committed: 0,
             boundary_out: Self::build_boundary_out(layer_devices, batch, hid, &dt)?,
         })
     }

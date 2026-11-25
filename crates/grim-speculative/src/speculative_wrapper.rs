@@ -838,7 +838,13 @@ impl SpeculativeCausalLm {
         session.set_emitted_token_ids(Vec::new());
         let result = match self.strategy {
             Strategy::Plain => self.target.forward(session, input_ids, positions, adapters),
-            Strategy::NativeMtp => self.decode_native_mtp(session, input_ids, positions, adapters),
+            Strategy::NativeMtp => Ok(
+                if let Some(out) = self.decode_tree(session, input_ids, positions, adapters)? {
+                    out
+                } else {
+                    self.decode_native_mtp(session, input_ids, positions, adapters)?
+                },
+            ),
             Strategy::DSpark => {
                 let draft = self.draft.as_ref().unwrap();
                 let markov = self.markov.as_ref().unwrap();
@@ -1021,6 +1027,141 @@ impl SpeculativeCausalLm {
             }
         }
         result
+    }
+
+    /// Optional packed-tree verification path. Returns `Ok(None)` whenever
+    /// the model cannot support tree forward (the default), leaving the linear
+    /// path untouched. Gated by `GRIM_SPEC_TREE=1`.
+    fn decode_tree(
+        &self,
+        session: &mut dyn SessionT,
+        input_ids: &Tensor,
+        _positions: &Tensor,
+        adapters: &[AdapterHandle],
+    ) -> Result<Option<Tensor>> {
+        if !spec_tree_enabled() || input_ids.shape().elem_count() != 1 {
+            return Ok(None);
+        }
+        let Some(mtp) = self.mtp_target.as_ref() else {
+            return Ok(None);
+        };
+        if session.skip_output_projection() {
+            return Ok(None);
+        }
+        let Some(block) = self
+            .pending_mtp_draft
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return Ok(None);
+        };
+        let dims = block.base_logits.shape().dims().to_vec();
+        let vocab = dims.get(1).copied().unwrap_or(0);
+        let flat = block.base_logits.to_vec_f32().unwrap_or_default();
+        if vocab == 0 || block.tokens.is_empty() || flat.len() < block.tokens.len() * vocab {
+            *self
+                .pending_mtp_draft
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(block);
+            return Ok(None);
+        }
+        let tree = crate::draft_tree::DraftTree::from_block_logits(
+            &flat[..block.tokens.len() * vocab],
+            vocab,
+            crate::draft_tree::TreeBuildConfig {
+                rank_cap: 4,
+                max_nodes: (block.tokens.len() * 8).max(8),
+                max_depth: block.tokens.len(),
+            },
+        );
+        if tree.nodes.is_empty() || !tree.is_prefix_closed() {
+            *self
+                .pending_mtp_draft
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(block);
+            return Ok(None);
+        }
+        let tokens = tree.tokens();
+        let depths: Vec<usize> = tree.nodes.iter().map(|n| n.depth).collect();
+        let parents = tree.parents_u32();
+        let base_pos = session.current_pos() as u32;
+        let Some(target_logits) =
+            mtp.forward_tree(session, &tokens, &depths, &parents, base_pos, adapters)?
+        else {
+            *self
+                .pending_mtp_draft
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(block);
+            return Ok(None);
+        };
+        let tdims = target_logits.shape().dims().to_vec();
+        let t_vocab = tdims.last().copied().unwrap_or(vocab);
+        let t_flat = target_logits.to_vec_f32()?;
+        if t_flat.len() < tree.nodes.len() * t_vocab {
+            return Err(Error::Session(format!(
+                "tree forward returned {} floats for {} nodes x {t_vocab}",
+                t_flat.len(),
+                tree.nodes.len()
+            )));
+        }
+        let base_row = &t_flat[..t_vocab];
+        let greedy = session.sampling_greedy();
+        let uniforms: Vec<f32> = (0..=tree.nodes.len())
+            .map(|_| {
+                session
+                    .request_rng()
+                    .cloned()
+                    .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15))
+                    .next_f32()
+            })
+            .collect();
+        let verification = if greedy {
+            crate::draft_tree::verify_tree_greedy(
+                &tree,
+                &t_flat[..tree.nodes.len() * t_vocab],
+                base_row,
+                t_vocab,
+            )
+        } else {
+            crate::draft_tree::verify_tree_stochastic(
+                &tree,
+                &t_flat[..tree.nodes.len() * t_vocab],
+                base_row,
+                &flat[..block.tokens.len() * vocab],
+                vocab,
+                &uniforms,
+            )
+        };
+        session.set_emitted_token_ids(verification.emitted_tokens.clone());
+        session.set_last_accepted_tokens(verification.emitted_tokens.len().max(1));
+        if let Some(kv) = session.kv_mut() {
+            kv.tentative_append(tree.nodes.len())?;
+            kv.commit(verification.emitted_tokens.len().saturating_sub(1))?;
+        }
+        if let Some(&last) = verification.emitted_tokens.last() {
+            session.set_last_sampled_token(Some(last));
+        }
+        // Each emitted row comes from the tree node that produced it.
+        let mut rows = Vec::new();
+        let mut node = verification.best_node;
+        let mut path: Vec<usize> = Vec::new();
+        while let Some(i) = node {
+            path.push(i);
+            node = tree.nodes[i].parent;
+        }
+        path.reverse();
+        for i in path {
+            let start = i * t_vocab;
+            rows.extend_from_slice(&t_flat[start..start + t_vocab]);
+        }
+        if rows.is_empty() {
+            rows.extend_from_slice(base_row);
+        }
+        Ok(Some(grim_backend_cpu::cpu_tensor(
+            rows,
+            grim_tensor::Shape::new(vec![1, t_vocab]),
+        )))
     }
 
     fn decode_native_mtp(
