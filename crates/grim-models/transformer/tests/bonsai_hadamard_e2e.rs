@@ -5,6 +5,15 @@ use std::collections::HashSet;
 use std::path::Path;
 
 const MODEL: &str = "/drive/bigfast/grim/models/Bonsai-27B/Ternary-Bonsai-2-27B-PQ2_0.gguf";
+/// Persistent copy lives under `old/` so `/tmp` wipes cannot lose the gate's
+/// oracle. The `/tmp` path is kept only as a legacy fallback.
+const REF_TOKENS: &str = "/drive/bigfast/grim/old/bonsai_ref_tokens.txt";
+const REF_TOKENS_TMP: &str = "/tmp/bonsai_ref_tokens.txt";
+
+fn read_ref_tokens() -> std::io::Result<String> {
+    std::fs::read_to_string(REF_TOKENS)
+        .or_else(|_| std::fs::read_to_string(REF_TOKENS_TMP))
+}
 
 #[test]
 fn gate_a_hadamard_plan_accepts_bonsai() {
@@ -112,7 +121,7 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
     // (argmax, top1, top2, logit-of-REF-token) per step — the ref-token logit
     // quantifies whether a divergence is a near-tie flip or a real reorder.
     let mut gaps: Vec<(u32, f32, f32, f32)> = Vec::new();
-    let ref_tokens: Vec<u32> = std::fs::read_to_string("/tmp/bonsai_ref_tokens.txt")
+    let ref_tokens: Vec<u32> = read_ref_tokens()
         .unwrap_or_default()
         .split_whitespace()
         .filter_map(|t| t.parse().ok())
@@ -141,8 +150,7 @@ fn gate_d_bonsai_first_32_token_parity() -> TestResult {
         generated.push(g.0);
         gaps.push(g);
     }
-    let ref_path = std::path::Path::new("/tmp/bonsai_ref_tokens.txt");
-    let txt = std::fs::read_to_string(ref_path).map_err(|e| format!("read ref: {e}"))?;
+    let txt = read_ref_tokens().map_err(|e| format!("read ref: {e}"))?;
     let want: Vec<u32> = txt.split_whitespace().map(|t| t.parse().expect("token id")).collect();
     if generated[..32] != want[..32] {
         // Plan rule (Task 6 Step 2): on divergence print both logit gaps and
