@@ -497,6 +497,13 @@ static REQUEST_HISTORIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Extra tokens from one speculative verify. The engine has already advanced
+/// for the whole emitted prefix; the server drains these one per call so the
+/// existing single-token SSE/non-stream loops need no restructuring.
+static PENDING_TOKENS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, std::collections::VecDeque<u32>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// WI-HYBRID Layer 2: client session tag per request (body `session` field or
 /// `x-grim-session` header), read at enqueue time by `sample_next_token`.
 static REQUEST_SESSIONS: std::sync::LazyLock<
@@ -698,6 +705,29 @@ fn sample_next_token(
     vocab_size: usize,
     model_id: Option<String>,
 ) -> std::result::Result<u32, String> {
+    if step > 0 {
+        let pending = PENDING_TOKENS
+            .lock()
+            .ok()
+            .and_then(|mut m| {
+                let empty = m.get(&request_id).map_or(true, |q| q.is_empty());
+                if empty {
+                    return None;
+                }
+                let tok = m.get_mut(&request_id)?.pop_front();
+                if m.get(&request_id).map_or(true, |q| q.is_empty()) {
+                    m.remove(&request_id);
+                }
+                tok
+            });
+        if let Some(tok) = pending {
+            if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
+                hist.entry(request_id).or_default().push(tok);
+            }
+            engine.record_generated_token(request_id, tok);
+            return Ok(tok);
+        }
+    }
     if step == 0 {
         let prompt_tokens = match prompt_tokens {
             Some(t) => t,
@@ -747,6 +777,16 @@ fn sample_next_token(
         outcome.is_some(),
         engine.loaded_models()
     );
+    let forced_ids = outcome
+        .as_ref()
+        .map(|o| {
+            if o.emitted_token_ids.len() == o.accepted_tokens {
+                o.emitted_token_ids.clone()
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default();
     let logits = outcome.and_then(|o| o.logits.as_ref().cloned());
     if step == 0 && std::env::var("GRIM_DEBUG_PROMPT").as_deref() == Ok("1") {
         if let Some(t) = &logits {
@@ -804,6 +844,19 @@ fn sample_next_token(
             }
         }
         None => 0,
+    };
+    let token = if !forced_ids.is_empty() {
+        // The first forced id is returned now; the rest are drained one per
+        // call by the pending queue above. No re-sampling of accepted drafts.
+        let first = forced_ids[0];
+        if let Ok(mut m) = PENDING_TOKENS.lock() {
+            m.entry(request_id)
+                .or_default()
+                .extend(forced_ids.into_iter().skip(1));
+        }
+        first
+    } else {
+        token
     };
     if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
         hist.entry(request_id).or_default().push(token);

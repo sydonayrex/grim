@@ -834,6 +834,7 @@ impl Engine {
             logits: Some(std::sync::Arc::new(logits_tensor)),
             accepted_tokens: accepted,
             speculative: false,
+            emitted_token_ids: Vec::new(),
         })
     }
 
@@ -954,6 +955,7 @@ impl Engine {
             logits: Some(Arc::new(logits)),
             accepted_tokens,
             speculative: was_speculative_path,
+            emitted_token_ids: session.emitted_token_ids().to_vec(),
         })
     }
 
@@ -1220,6 +1222,7 @@ impl Engine {
                 logits: Some(logits_arc),
                 accepted_tokens: accepted,
                 speculative: false,
+                emitted_token_ids: Vec::new(),
             });
         }
 
@@ -1239,6 +1242,7 @@ impl Engine {
                         logits: Some(cached),
                         accepted_tokens: accepted,
                         speculative: false,
+                        emitted_token_ids: Vec::new(),
                     });
                 }
                 // Graph present but logits evicted — fall through to re-capture.
@@ -1320,6 +1324,7 @@ impl Engine {
             logits: Some(Arc::new(logits)),
             accepted_tokens: accepted,
             speculative: false,
+            emitted_token_ids: Vec::new(),
         })
     }
 
@@ -1542,6 +1547,7 @@ impl Engine {
                     logits: Some(Arc::new(t)),
                     accepted_tokens: accepted,
                     speculative: false,
+                    emitted_token_ids: Vec::new(),
                 },
             );
         }
@@ -1795,6 +1801,7 @@ impl Engine {
                             logits: Some(Arc::new(adapted)),
                             accepted_tokens,
                             speculative: false,
+                            emitted_token_ids: Vec::new(),
                         },
                     );
                 }

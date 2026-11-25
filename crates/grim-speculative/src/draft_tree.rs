@@ -97,10 +97,10 @@ impl DraftTree {
         let mut nodes: Vec<DraftTreeNode> = Vec::with_capacity(config.max_nodes);
 
         while let Some(item) = heap.pop() {
-            let child_depth = item.depth + 1;
-            if child_depth >= max_depth as isize {
+            if item.depth >= max_depth as isize {
                 continue;
             }
+            let child_depth = item.depth + 1;
             // The virtual root has no node; every other item becomes a node
             // before its children are enqueued, keeping the tree prefix-closed.
             let parent = if item.depth < 0 {
@@ -118,6 +118,10 @@ impl DraftTree {
                 });
                 Some(idx)
             };
+            if child_depth >= max_depth as isize {
+                // Node was inserted above; it is a leaf.
+                continue;
+            }
             // Proposer row `child_depth` predicts a token at that depth.
             let row_start = child_depth as usize * vocab;
             let row = &logits[row_start..row_start + vocab];

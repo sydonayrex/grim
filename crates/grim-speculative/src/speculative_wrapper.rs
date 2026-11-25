@@ -34,6 +34,26 @@ fn draft_chain_enabled() -> bool {
     })
 }
 
+fn replay_state_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("GRIM_SPEC_REPLAY_STATE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+fn spec_tree_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("GRIM_SPEC_TREE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 use grim_core::error::{Error, Result};
 use grim_core::model::AdapterHandle;
 use grim_core::session::SessionT;
@@ -44,7 +64,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::confidence_head::ConfidenceHead;
 use crate::confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, ThroughputProfile};
 use crate::depth_tuner::SpeculativeDepthPidController;
-use crate::draft_backbone::DraftBackbone;
+use crate::draft_backbone::{DraftBackbone, DraftBlock};
 use crate::markov_head::MarkovHead;
 use crate::native_mtp::NativeMtp;
 
@@ -105,6 +125,8 @@ pub struct SpeculativeCausalLm {
     astum_last_draft_ms: Mutex<f64>,
     /// Optional cost-aware verify-width controller (`GRIM_SPEC_WIDTH=1`).
     width_controller: Option<Mutex<crate::verify_width::WidthController>>,
+    /// Pointer-commit replay window for recurrent state (`GRIM_SPEC_REPLAY_STATE=1`).
+    replay_ring: Option<Mutex<crate::replay_state::ReplayRing<u32>>>,
     /// Optional GPU rejection-sampling verifier (Task 10.6). When set and the
     /// verify logits are ROCm-resident, the ratio test runs on device — no
     /// vocab-sized D2H copy. Errors fall back to the CPU verify loop.
@@ -120,8 +142,6 @@ pub struct SpeculativeCausalLm {
     graph_m2: Mutex<Option<Box<dyn std::any::Any + Send>>>,
     /// Optional adaptive `may_verify` gate (`GRIM_SPEC_MAY_VERIFY=1`, default OFF).
     may_verify: Option<Mutex<crate::may_verify::MayVerifyGate>>,
-    /// Optional acceptance-triggered target-only fallback (`GRIM_SPEC_FALLBACK=1`).
-    fallback: Option<Mutex<crate::may_verify::SpecFallback>>,
 }
 
 /// Result of one lossless verification pass.
@@ -169,13 +189,14 @@ impl SpeculativeCausalLm {
             astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             astum_last_draft_ms: Mutex::new(0.0),
             width_controller: crate::verify_width::WidthController::from_env().map(std::sync::Mutex::new),
+            replay_ring: replay_state_enabled()
+                .then(|| Mutex::new(crate::replay_state::ReplayRing::new(16))),
             gpu_verifier: None,
             pending_mtp_draft: Mutex::new(None),
             chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
             may_verify: crate::may_verify::spec_may_verify_enabled()
                 .then(|| Mutex::new(crate::may_verify::MayVerifyGate::with_defaults(4))),
-            fallback: crate::may_verify::SpecFallback::from_env().map(std::sync::Mutex::new),
         }
     }
 
@@ -220,13 +241,14 @@ impl SpeculativeCausalLm {
             astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             astum_last_draft_ms: Mutex::new(0.0),
             width_controller: crate::verify_width::WidthController::from_env().map(std::sync::Mutex::new),
+            replay_ring: replay_state_enabled()
+                .then(|| Mutex::new(crate::replay_state::ReplayRing::new(16))),
             gpu_verifier: None,
             pending_mtp_draft: Mutex::new(None),
             chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
             may_verify: crate::may_verify::spec_may_verify_enabled()
                 .then(|| Mutex::new(crate::may_verify::MayVerifyGate::with_defaults(4))),
-            fallback: crate::may_verify::SpecFallback::from_env().map(std::sync::Mutex::new),
         }
     }
 
@@ -248,13 +270,14 @@ impl SpeculativeCausalLm {
             astrum_suffix_drafter: Mutex::new(crate::suffix_drafter::SuffixDrafter::new(8192)),
             astum_last_draft_ms: Mutex::new(0.0),
             width_controller: crate::verify_width::WidthController::from_env().map(std::sync::Mutex::new),
+            replay_ring: replay_state_enabled()
+                .then(|| Mutex::new(crate::replay_state::ReplayRing::new(16))),
             gpu_verifier: None,
             pending_mtp_draft: Mutex::new(None),
             chained_active: std::sync::atomic::AtomicBool::new(false),
             graph_m2: Mutex::new(None),
             may_verify: crate::may_verify::spec_may_verify_enabled()
                 .then(|| Mutex::new(crate::may_verify::MayVerifyGate::with_defaults(4))),
-            fallback: crate::may_verify::SpecFallback::from_env().map(std::sync::Mutex::new),
         }
     }
 
@@ -327,6 +350,72 @@ impl SpeculativeCausalLm {
         self.gpu_verifier = Some(verifier);
     }
 
+    /// Re-rank a drafted block into the highest-mass path of a CAST-style
+    /// prefix-closed tree. Greedy-only: the selected tokens are proposals from
+    /// the same per-position marginals, and verification still accepts only
+    /// target argmax matches. Returns false when no usable tree was built.
+    fn apply_tree_ranking(block: &mut DraftBlock, max_depth: usize, enabled: bool) -> bool {
+        if !enabled || block.tokens.is_empty() || max_depth == 0 {
+            return false;
+        }
+        let dims = block.base_logits.shape().dims().to_vec();
+        if dims.len() != 2 || dims[1] == 0 || dims[0] == 0 {
+            return false;
+        }
+        let vocab = dims[1];
+        let depth = max_depth.min(dims[0]).min(block.tokens.len());
+        let flat = match block.base_logits.to_vec_f32() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let tree = crate::draft_tree::DraftTree::from_block_logits(
+            &flat[..depth * vocab],
+            vocab,
+            crate::draft_tree::TreeBuildConfig {
+                rank_cap: 4,
+                max_nodes: (depth * 8).max(8),
+                max_depth: depth,
+            },
+        );
+        let Some((best, _)) = tree
+            .nodes
+            .iter()
+            .enumerate()
+            .max_by(|(ia, a), (ib, b)| {
+                a.log_mass
+                    .total_cmp(&b.log_mass)
+                    .then_with(|| ib.cmp(ia))
+            })
+        else {
+            return false;
+        };
+        let path = tree.path_to(best);
+        if path.is_empty() || path.len() > depth {
+            return false;
+        }
+        block.tokens = path;
+        block.confidence = vec![1.0; block.tokens.len()];
+        true
+    }
+
+    /// Request-scoped fallback controller, lazily installed in the session.
+    /// A new session starts with `None`, which resets the controller without
+    /// any shared per-model state or cross-request contamination.
+    fn spec_fallback(session: &mut dyn SessionT) -> Option<&mut crate::may_verify::SpecFallback> {
+        let needs_init = session
+            .spec_state()
+            .and_then(|s| s.downcast_ref::<crate::may_verify::SpecFallback>())
+            .is_none();
+        if needs_init {
+            if let Some(controller) = crate::may_verify::SpecFallback::from_env() {
+                session.set_spec_state(Box::new(controller));
+            }
+        }
+        session
+            .spec_state_mut()?
+            .downcast_mut::<crate::may_verify::SpecFallback>()
+    }
+
     /// Cost-aware width selection; identity when the env gate is off.
     fn choose_verify_width(&self, confidence: &[f32], proposed: usize, ctx_len: usize) -> usize {
         match self.width_controller.as_ref() {
@@ -342,6 +431,7 @@ impl SpeculativeCausalLm {
     /// after a native-MTP verification round.
     fn record_native_outcome(
         &self,
+        session: &mut dyn SessionT,
         accepted: usize,
         drafted: usize,
         ctx_len: usize,
@@ -352,11 +442,13 @@ impl SpeculativeCausalLm {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .update(accepted, drafted);
-        if let Some(fallback) = self.fallback.as_ref() {
-            fallback
-                .lock()
+        if let Some(fallback) = Self::spec_fallback(session) {
+            fallback.observe(accepted, drafted);
+        }
+        if let Some(ring) = self.replay_ring.as_ref() {
+            ring.lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .observe(accepted, drafted);
+                .commit(accepted);
         }
         if let Some(width) = self.width_controller.as_ref() {
             width
@@ -883,39 +975,41 @@ impl SpeculativeCausalLm {
                     );
                 }
 
-                // ponytail ceiling: the caller contract is one next-token
-                // distribution per decode call and nothing downstream
-                // consumes multi-token emissions yet, so committing accepted
-                // draft tokens here would desync the token stream. The verify
-                // pass above therefore runs for telemetry/adaptation only:
-                // KV rolls back to `accepted_count == 0` (pure target state)
-                // and the caller gets the target's exact next-token logits —
-                // greedy output is bit-identical to the plain target. Wiring
-                // multi-token emission into the engine decode loop is the
-                // speedup follow-up.
-                if let Some(kv) = session.kv_mut() {
-                    kv.commit(0)?;
-                }
+                // Emit the accepted drafts plus the target's bonus/rejection
+                // row. The KV commit above already kept exactly that prefix;
+                // rolling it back here would desync the token stream.
+                let emitted = accepted_count + 1;
+                session.set_emitted_token_ids(verification.emitted_tokens);
                 if context_len == 0 {
                     return Err(Error::Session(
                         "DSpark decode: empty input has no next-token logits row".into(),
                     ));
                 }
-                let next_token_logits = target_logits.to_vec_f32()?;
-                let row_start = (context_len - 1) * vocab_size;
-                let row_end = row_start + vocab_size;
-                if row_end > next_token_logits.len() {
-                    return Err(Error::Session(format!(
-                        "DSpark decode: next-token row [{row_start}..{row_end}] out of bounds (len {})",
-                        next_token_logits.len()
-                    )));
+                // The target's full-output logits may be padded to a wider
+                // row than the draft vocab; slice by the real row stride.
+                let row_width = target_logits
+                    .shape()
+                    .dims()
+                    .last()
+                    .copied()
+                    .unwrap_or(vocab_size)
+                    .max(vocab_size);
+                let flat = target_logits.to_vec_f32()?;
+                let mut rows = Vec::with_capacity(emitted * vocab_size);
+                for i in 0..emitted {
+                    let start = (context_len - 1 + i) * row_width;
+                    if start + vocab_size <= flat.len() {
+                        rows.extend_from_slice(&flat[start..start + vocab_size]);
+                    } else {
+                        rows.resize(rows.len() + vocab_size, 0.0);
+                    }
                 }
-                let out = grim_backend_cpu::cpu_tensor(
-                    next_token_logits[row_start..row_end].to_vec(),
-                    grim_tensor::Shape::new(vec![1, vocab_size]),
+                let emitted_logits = grim_backend_cpu::cpu_tensor(
+                    rows,
+                    grim_tensor::Shape::new(vec![emitted, vocab_size]),
                 );
-                session.set_last_accepted_tokens(accepted_count);
-                Ok(out)
+                session.set_last_accepted_tokens(emitted);
+                Ok(emitted_logits)
             }
         }
     }
@@ -935,12 +1029,20 @@ impl SpeculativeCausalLm {
                 .unwrap_or_else(|e| e.into_inner())
                 .ensure_depth(depth);
         }
-        if self
-            .fallback
-            .as_ref()
-            .map(|f| !f.lock().unwrap_or_else(|e| e.into_inner()).speculating())
-            .unwrap_or(false)
-        {
+        let (target_only, just_tripped) = Self::spec_fallback(session)
+            .map(|f| {
+                let tripped = f.take_tripped();
+                (!f.speculating(), tripped)
+            })
+            .unwrap_or((false, false));
+        if target_only {
+            if just_tripped {
+                grim_core::telemetry::emit_fallback(
+                    "grim-speculative/wrapper",
+                    grim_core::telemetry::FallbackReason::SpeculativeDraft,
+                    "acceptance below threshold; entering target-only window",
+                );
+            }
             // Target-only window: exactly the plain forward, with no stale
             // pending draft carried into the probe step.
             *self
@@ -993,6 +1095,11 @@ impl SpeculativeCausalLm {
         } else {
             None
         };
+        if session.sampling_greedy() && spec_tree_enabled() {
+            if let Some(block) = pending_draft.as_mut() {
+                Self::apply_tree_ranking(block, depth, true);
+            }
+        }
         // E/cost policy: when configured, a greedy suffix draft may replace a
         // missing MTP draft. It has no draft-head logits, so it is greedy-only.
         let mut suffix_cost_ms = 0.0f64;
@@ -1090,7 +1197,7 @@ impl SpeculativeCausalLm {
                 let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
                 sched.record_acceptance(accepted_count, verify_len);
             }
-            self.record_native_outcome(accepted_count, verify_len, context_len, false, 0.0);
+            self.record_native_outcome(session, accepted_count, verify_len, context_len, false, 0.0);
             let emitted = accepted_count + 1;
             let emitted_logits = self.extract_emitted_logits(&batched_logits, emitted, vocab_size, 1)?;
             if accepted_count == verify_len {
@@ -1153,8 +1260,28 @@ impl SpeculativeCausalLm {
             );
             if verify_len > 0 && mtp_1pass {
                 let kv_len_before = session.kv_mut().map(|kv| kv.len());
+                // ReplaySSM-style flush decision depends only on the committed
+                // cursor and draft length, so it is safe before sampling. When
+                // the ring would overflow, use the snapshot/replay path.
+                let replay_flush = self
+                    .replay_ring
+                    .as_ref()
+                    .map(|r| {
+                        r.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .needs_flush(verify_len)
+                    })
+                    .unwrap_or(false);
                 let use_m2_graph = verify_len >= 1
-                    && decode_graph_m2_enabled();
+                    && decode_graph_m2_enabled()
+                    && !replay_flush;
+                if let Some(ring) = self.replay_ring.as_ref() {
+                    let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+                    if replay_flush {
+                        ring.flush();
+                    }
+                    ring.append_draft(&draft_block.tokens[..verify_len]);
+                }
                 let pre_batch_snapshot = if recurrent && !use_m2_graph {
                     session.snapshot_recurrent_state()?
                 } else {
@@ -1244,6 +1371,7 @@ impl SpeculativeCausalLm {
                     sched.record_acceptance(accepted_count, verify_len);
                 }
                 self.record_native_outcome(
+                    session,
                     accepted_count,
                     verify_len,
                     context_len,
@@ -1429,11 +1557,15 @@ impl SpeculativeCausalLm {
 
         // 2. Draft from the already-run base forward (must not re-run the base input).
         let t_draft = std::time::Instant::now();
-        let draft_block = mtp.predict_multi_after_forward(session, input_ids, positions, &base_logits_full)?;
+        let mut draft_block =
+            mtp.predict_multi_after_forward(session, input_ids, positions, &base_logits_full)?;
         *self
             .astum_last_draft_ms
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = t_draft.elapsed().as_secs_f64() * 1000.0;
+        if session.sampling_greedy() && spec_tree_enabled() {
+            Self::apply_tree_ranking(&mut draft_block, depth, true);
+        }
         let verify_len = draft_block.tokens.len().min(depth);
         if verify_len > 0 && mtp_1pass {
             *self.pending_mtp_draft.lock().unwrap_or_else(|e| e.into_inner()) = Some(draft_block);
@@ -1558,7 +1690,7 @@ impl SpeculativeCausalLm {
             let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
             sched.record_acceptance(accepted_count, verify_len);
         }
-        self.record_native_outcome(accepted_count, verify_len, context_len, false, 0.0);
+        self.record_native_outcome(session, accepted_count, verify_len, context_len, false, 0.0);
 
         let emitted = accepted_count + 1;
         if std::env::var_os("GRIM_MTP_DEBUG").is_some() {
@@ -2349,5 +2481,28 @@ mod tests {
         assert_eq!(rejected.accepted_count, 0);
         assert_eq!(rejected.emitted_tokens.len(), 1);
         assert_eq!(rejected.emitted_tokens[0], 0);
+    }
+
+    #[test]
+    fn tree_ranking_selects_highest_mass_path() {
+        // Position 0 favours token 0, position 1 favours token 1; the
+        // best-scoring path is [0, 1], not the placeholder draft [2, 2].
+        let logits = [3.0f32, 0.0, 0.0, 0.0, 3.0, 0.0];
+        let mut block = DraftBlock {
+            tokens: vec![2, 2],
+            base_logits: grim_backend_cpu::cpu_tensor(logits.to_vec(), Shape::new(vec![2, 3])),
+            confidence: vec![],
+        };
+        assert!(SpeculativeCausalLm::apply_tree_ranking(&mut block, 2, true));
+        assert_eq!(block.tokens, vec![0, 1]);
+        assert_eq!(block.confidence.len(), 2);
+
+        let mut untouched = DraftBlock {
+            tokens: vec![2, 2],
+            base_logits: grim_backend_cpu::cpu_tensor(logits.to_vec(), Shape::new(vec![2, 3])),
+            confidence: vec![],
+        };
+        assert!(!SpeculativeCausalLm::apply_tree_ranking(&mut untouched, 2, false));
+        assert_eq!(untouched.tokens, vec![2, 2]);
     }
 }

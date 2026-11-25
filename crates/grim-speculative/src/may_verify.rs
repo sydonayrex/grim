@@ -125,6 +125,8 @@ pub struct SpecFallback {
     proposed: usize,
     cooldown: usize,
     speculating: bool,
+    /// True once on the step that tripped the fallback; consumed for telemetry.
+    tripped: bool,
 }
 
 impl SpecFallback {
@@ -135,6 +137,7 @@ impl SpecFallback {
             proposed: 0,
             cooldown: 0,
             speculating: true,
+            tripped: false,
         }
     }
 
@@ -157,6 +160,11 @@ impl SpecFallback {
         self.cooldown
     }
 
+    /// Consume the one-shot trip flag (for telemetry).
+    pub fn take_tripped(&mut self) -> bool {
+        std::mem::take(&mut self.tripped)
+    }
+
     /// Reset on a new request id.
     pub fn reset(&mut self) {
         *self = Self::new(self.config);
@@ -173,6 +181,7 @@ impl SpecFallback {
             if self.cooldown == 0 {
                 // Re-entry probe: start a fresh measurement window.
                 self.speculating = true;
+                self.tripped = false;
                 self.accepted = 0;
                 self.proposed = 0;
             }
@@ -184,6 +193,7 @@ impl SpecFallback {
             let rate = self.accepted as f32 / self.proposed as f32;
             if rate < self.config.accept_threshold {
                 self.speculating = false;
+                self.tripped = true;
                 self.cooldown = self.config.cooldown_steps;
                 self.accepted = 0;
                 self.proposed = 0;

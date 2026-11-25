@@ -157,6 +157,17 @@ pub trait SessionT: Send {
     }
     fn set_emitted_token_ids(&mut self, _ids: Vec<u32>) {}
 
+    /// Model-agnostic per-session speculative controller state (e.g. an
+    /// acceptance-triggered fallback). A fresh session starts with `None`, so
+    /// request-scoped controllers reset naturally with the session.
+    fn spec_state(&self) -> Option<&(dyn std::any::Any + Send)> {
+        None
+    }
+    fn spec_state_mut(&mut self) -> Option<&mut (dyn std::any::Any + Send)> {
+        None
+    }
+    fn set_spec_state(&mut self, _state: Box<dyn std::any::Any + Send>) {}
+
     /// Hint to skip output LM head projection (useful for intermediate prefill chunks).
     fn skip_output_projection(&self) -> bool {
         false
@@ -242,6 +253,8 @@ pub struct Inner {
     pub last_accepted_tokens: usize,
     /// Exact token ids emitted by a stochastic speculative verify (empty otherwise).
     pub emitted_token_ids: Vec<u32>,
+    /// Per-session speculative controller state (request-scoped by construction).
+    pub spec_state: Option<Box<dyn std::any::Any + Send>>,
     /// Hint to skip output LM head projection on non-terminal prefill chunks.
     pub skip_output_projection: bool,
     /// Return full per-position logits (e.g. speculative verify). Default false.
@@ -271,6 +284,7 @@ impl Inner {
             request_rng: None,
             last_accepted_tokens: 1,
             emitted_token_ids: Vec::new(),
+            spec_state: None,
             skip_output_projection: false,
             full_output_logits: false,
             sampling_greedy: false,
@@ -291,6 +305,7 @@ impl Inner {
             request_rng: None,
             last_accepted_tokens: 1,
             emitted_token_ids: Vec::new(),
+            spec_state: None,
             skip_output_projection: false,
             full_output_logits: false,
             sampling_greedy: false,
@@ -406,6 +421,15 @@ impl SessionT for Inner {
     }
     fn set_emitted_token_ids(&mut self, ids: Vec<u32>) {
         self.emitted_token_ids = ids;
+    }
+    fn spec_state(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.spec_state.as_deref()
+    }
+    fn spec_state_mut(&mut self) -> Option<&mut (dyn std::any::Any + Send)> {
+        self.spec_state.as_deref_mut()
+    }
+    fn set_spec_state(&mut self, state: Box<dyn std::any::Any + Send>) {
+        self.spec_state = Some(state);
     }
     fn skip_output_projection(&self) -> bool {
         self.skip_output_projection

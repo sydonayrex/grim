@@ -2799,6 +2799,9 @@ impl SessionT for Qwen35Session {
     fn set_last_accepted_tokens(&mut self, n: usize) { self.inner.set_last_accepted_tokens(n) }
     fn emitted_token_ids(&self) -> &[u32] { self.inner.emitted_token_ids() }
     fn set_emitted_token_ids(&mut self, ids: Vec<u32>) { self.inner.set_emitted_token_ids(ids) }
+    fn spec_state(&self) -> Option<&(dyn std::any::Any + Send)> { self.inner.spec_state() }
+    fn spec_state_mut(&mut self) -> Option<&mut (dyn std::any::Any + Send)> { self.inner.spec_state_mut() }
+    fn set_spec_state(&mut self, state: Box<dyn std::any::Any + Send>) { self.inner.set_spec_state(state) }
     fn skip_output_projection(&self) -> bool { self.inner.skip_output_projection() }
     fn set_skip_output_projection(&mut self, skip: bool) { self.inner.set_skip_output_projection(skip) }
     fn full_output_logits(&self) -> bool { self.inner.full_output_logits() }

@@ -203,6 +203,9 @@ pub struct StepOutcome {
     /// Whether this step executed through the speculative path. False
     /// when the wrapper fell back to plain autoregressive decoding.
     pub speculative: bool,
+    /// Exact token ids emitted by a stochastic speculative verify. Empty means
+    /// callers must sample the returned logits themselves.
+    pub emitted_token_ids: Vec<u32>,
 }
 
 /// The core engine. Call `tick()` to advance one iteration.
@@ -574,14 +577,23 @@ mod tests {
                 .unwrap();
             let lp = logits_plain.to_vec_f32().unwrap();
             let ld = logits_dspark.to_vec_f32().unwrap();
-            assert_eq!(lp.len(), ld.len(), "vocab mismatch at step {step}");
+            // DSpark now emits accepted drafts plus the bonus row: its logits
+            // are [emitted, vocab]. Compare the final row (the next token the
+            // caller will consume) against the plain target's single row.
+            assert_eq!(
+                ld.len() % lp.len(),
+                0,
+                "DSpark emitted rows must be vocab-aligned at step {step}"
+            );
+            // Row 0 is the distribution for the token at the current position.
+            let next_row_d = &ld[..lp.len()];
             let next_p = lp
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
                 .map(|(i, _)| i)
                 .unwrap();
-            let next_d = ld
+            let next_d = next_row_d
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
