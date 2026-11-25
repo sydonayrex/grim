@@ -2009,6 +2009,16 @@ impl AttentionOps for RocmDevice {
                 "tree_attention: an input lacks a valid device pointer".into(),
             ));
         }
+        // The tree kernel reads q/k/v as raw float pointers; accepting an
+        // int8/FP8/WhiteCrow arena would silently reinterpret packed bytes.
+        if q_s.dtype.arith != ArithType::F32
+            || k_s.dtype.arith != ArithType::F32
+            || v_s.dtype.arith != ArithType::F32
+        {
+            return Err(Error::Unimplemented(
+                "tree_attention: q/k/v must be F32 (use GRIM_KV_ARENA=f32)".into(),
+            ));
+        }
 
         let out_dims = out_shape.dims();
         let batch = out_dims[0];
@@ -2030,7 +2040,7 @@ impl AttentionOps for RocmDevice {
             num_heads as u32,
             num_kv_heads as u32,
             head_dim as u32,
-            one_plus_gamma as u32,
+            (one_plus_gamma.saturating_sub(1)) as u32,
             kv_seq_len as u32,
             cache_offset,
         )?;

@@ -836,7 +836,7 @@ impl SpeculativeCausalLm {
         // Every step starts with "sample from the returned logits"; only a
         // successful stochastic verify installs exact emitted token ids.
         session.set_emitted_token_ids(Vec::new());
-        match self.strategy {
+        let result = match self.strategy {
             Strategy::Plain => self.target.forward(session, input_ids, positions, adapters),
             Strategy::NativeMtp => self.decode_native_mtp(session, input_ids, positions, adapters),
             Strategy::DSpark => {
@@ -1011,7 +1011,16 @@ impl SpeculativeCausalLm {
                 session.set_last_accepted_tokens(emitted);
                 Ok(emitted_logits)
             }
+        };
+        // ECHO-style bonus recycling: the next draft root must condition on
+        // the token actually emitted at this position, including the residual
+        // correction, not on a freshly argmaxed logits row.
+        if result.is_ok() {
+            if let Some(&tok) = session.emitted_token_ids().last() {
+                session.set_last_sampled_token(Some(tok));
+            }
         }
+        result
     }
 
     fn decode_native_mtp(

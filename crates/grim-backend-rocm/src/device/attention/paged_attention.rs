@@ -897,6 +897,14 @@ impl RocmDevice {
                 "tree_attention: an input lacks a valid device pointer".into(),
             ));
         }
+        if q_s.dtype.arith != grim_tensor::dtype::ArithType::F32
+            || k_s.dtype.arith != grim_tensor::dtype::ArithType::F32
+            || v_s.dtype.arith != grim_tensor::dtype::ArithType::F32
+        {
+            return Err(Error::Unimplemented(
+                "tree_attention: q/k/v must be F32 (use GRIM_KV_ARENA=f32)".into(),
+            ));
+        }
 
         // ─── allocate output + launch ──────────────────────────────────
         let mut storage =

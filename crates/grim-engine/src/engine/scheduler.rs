@@ -259,6 +259,11 @@ impl Engine {
                         pool.checkpoint_for_block(block_id)
                     };
                     if let Some(cp) = checkpoint {
+                        debug_assert_eq!(
+                            cp.token_offset % grim_memory::BLOCK_SIZE,
+                            0,
+                            "hybrid recurrent checkpoint must sit on a prefill chunk boundary"
+                        );
                         if cp.token_offset == skip_tokens {
                             if let Some(snap) = cp.session_snapshot.clone() {
                                 log::info!(
@@ -276,6 +281,10 @@ impl Engine {
             let seed_ok = skip_tokens >= grim_memory::BLOCK_SIZE
                 && (!hybrid || hybrid_snapshot.is_some());
             if seed_ok {
+                debug_assert!(
+                    !hybrid || hybrid_snapshot.is_some(),
+                    "never seed hybrid KV without the matching recurrent fold"
+                );
                 let seed_blocks = &matched_blocks[..skip_tokens / grim_memory::BLOCK_SIZE];
                 // Claim the matched nodes for the lifetime of this request.
                 {

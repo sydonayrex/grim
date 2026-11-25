@@ -156,6 +156,15 @@ impl DraftTree {
         self.nodes.iter().map(|n| n.parent).collect()
     }
 
+    /// Parent array in node order for the tree-attention kernel: depth-0
+    /// candidates use 0 as their own parent (the kernel's root sentinel).
+    pub fn parents_u32(&self) -> Vec<u32> {
+        self.nodes
+            .iter()
+            .map(|n| n.parent.unwrap_or(0) as u32)
+            .collect()
+    }
+
     /// Token path from the root to `node` inclusive.
     pub fn path_to(&self, node: usize) -> Vec<u32> {
         let mut out = Vec::new();
@@ -254,6 +263,170 @@ pub fn verify_tree_greedy(
     }
 }
 
+fn softmax_vec(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    if sum.is_finite() && sum > 0.0 {
+        exps.into_iter().map(|v| v / sum).collect()
+    } else {
+        vec![1.0 / logits.len() as f32; logits.len()]
+    }
+}
+
+/// Proposal probability of one tree path, computed from the one-pass
+/// per-position draft marginals. Used by stochastic tree verification;
+/// `DraftTreeNode::log_mass` is raw-logit ranking only and must not be used
+/// as a probability.
+pub fn path_q(
+    tree: &DraftTree,
+    node: usize,
+    draft_logits: &[f32],
+    vocab: usize,
+) -> f64 {
+    let path = tree.path_to(node);
+    let mut q = 1.0f64;
+    for (depth, &tok) in path.iter().enumerate() {
+        let start = depth * vocab;
+        let Some(row) = draft_logits.get(start..start + vocab) else {
+            return 0.0;
+        };
+        let p = softmax_vec(row);
+        q *= p.get(tok as usize).copied().unwrap_or(0.0) as f64;
+    }
+    q
+}
+
+/// Lossless stochastic tree verification using per-step modified rejection.
+///
+/// `target_logits` has one row per node in BFS order; `draft_logits` has one
+/// row per tree depth. At a rejected node the residual `max(0, p - q)` is
+/// sampled and every descendant is invalidated. When the whole path survives,
+/// the bonus token is drawn from the target row of the deepest node.
+pub fn verify_tree_stochastic(
+    tree: &DraftTree,
+    target_logits: &[f32],
+    base_row: &[f32],
+    draft_logits: &[f32],
+    vocab: usize,
+    uniforms: &[f32],
+) -> TreeVerification {
+    if vocab == 0 || tree.nodes.is_empty() {
+        return TreeVerification {
+            best_node: None,
+            emitted_tokens: vec![0],
+        };
+    }
+    let mut accepted = vec![false; tree.nodes.len()];
+    let mut best: Option<usize> = None;
+    let mut rejected_at: Option<usize> = None;
+    for (i, node) in tree.nodes.iter().enumerate() {
+        let ancestor_ok = match node.parent {
+            None => true,
+            Some(p) => accepted.get(p).copied().unwrap_or(false),
+        };
+        if !ancestor_ok || rejected_at.is_some() {
+            continue;
+        }
+        let Some(target_row) = target_logits.get(i * vocab..i * vocab + vocab) else {
+            rejected_at = Some(i);
+            break;
+        };
+        let p = softmax_vec(target_row);
+        let q_row = draft_logits
+            .get(node.depth * vocab..node.depth * vocab + vocab)
+            .map(softmax_vec)
+            .unwrap_or_default();
+        let q = q_row.get(node.token as usize).copied().unwrap_or(0.0);
+        let p_tok = p.get(node.token as usize).copied().unwrap_or(0.0);
+        let accept_prob = if q > 0.0 {
+            (p_tok / q).min(1.0)
+        } else {
+            1.0
+        };
+        let u = uniforms.get(i).copied().unwrap_or(1.0);
+        if u <= accept_prob {
+            accepted[i] = true;
+            if best.map_or(true, |b| node.depth > tree.nodes[b].depth) {
+                best = Some(i);
+            }
+            continue;
+        }
+        rejected_at = Some(i);
+        break;
+    }
+
+    if let Some(i) = rejected_at {
+        let node = &tree.nodes[i];
+        let target_row = target_logits
+            .get(i * vocab..i * vocab + vocab)
+            .unwrap_or(base_row);
+        let p = softmax_vec(target_row);
+        let q = draft_logits
+            .get(node.depth * vocab..node.depth * vocab + vocab)
+            .map(softmax_vec)
+            .unwrap_or_default();
+        let residual_total: f32 = p
+            .iter()
+            .zip(q.iter())
+            .map(|(&pv, &qv)| (pv - qv).max(0.0))
+            .sum();
+        let threshold = uniforms.get(tree.nodes.len()).copied().unwrap_or(0.5)
+            * residual_total;
+        let mut cum = 0.0f32;
+        let mut sampled = 0usize;
+        for v in 0..vocab {
+            let pv = p.get(v).copied().unwrap_or(0.0);
+            let qv = q.get(v).copied().unwrap_or(0.0);
+            cum += (pv - qv).max(0.0);
+            if cum >= threshold {
+                sampled = v;
+                break;
+            }
+            sampled = v;
+        }
+        let mut emitted = match best {
+            Some(b) => tree.path_to(b),
+            None => Vec::new(),
+        };
+        emitted.push(sampled as u32);
+        return TreeVerification {
+            best_node: best,
+            emitted_tokens: emitted,
+        };
+    }
+
+    let mut emitted = match best {
+        Some(b) => tree.path_to(b),
+        None => Vec::new(),
+    };
+    let bonus_row = best
+        .and_then(|b| target_logits.get(b * vocab..b * vocab + vocab))
+        .unwrap_or(base_row);
+    let p = softmax_vec(bonus_row);
+    let threshold = uniforms
+        .get(tree.nodes.len())
+        .copied()
+        .unwrap_or(0.5);
+    let mut cum = 0.0f32;
+    let mut bonus = p.len().saturating_sub(1);
+    for (v, &pv) in p.iter().enumerate() {
+        cum += pv;
+        if cum >= threshold {
+            bonus = v;
+            break;
+        }
+    }
+    emitted.push(bonus as u32);
+    TreeVerification {
+        best_node: best,
+        emitted_tokens: emitted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +475,56 @@ mod tests {
         let r = verify_tree_greedy(&tree, &bad, &base, 4);
         assert_eq!(r.best_node, None);
         assert_eq!(r.emitted_tokens, vec![1]); // argmax of base row
+    }
+
+    #[test]
+    fn parents_u32_uses_root_sentinel() {
+        let tree = DraftTree {
+            nodes: vec![
+                DraftTreeNode { token: 1, parent: None, depth: 0, log_mass: 0.0 },
+                DraftTreeNode { token: 2, parent: Some(0), depth: 1, log_mass: 0.0 },
+            ],
+        };
+        assert_eq!(tree.parents_u32(), vec![0, 0]);
+    }
+
+    #[test]
+    fn path_q_uses_normalised_draft_marginals() {
+        let tree = DraftTree {
+            nodes: vec![DraftTreeNode {
+                token: 1, parent: None, depth: 0, log_mass: 999.0,
+            }],
+        };
+        let draft = logits(&[vec![0.0, 2.0, 0.0, 0.0]], 4);
+        let q = path_q(&tree, 0, &draft, 4);
+        let expected = 2.0f64.exp() / (1.0 + 2.0f64.exp() + 1.0 + 1.0);
+        assert!((q - expected).abs() < 1e-6, "q={q}, expected={expected}");
+    }
+
+    #[test]
+    fn stochastic_tree_residual_and_bonus() {
+        let tree = DraftTree {
+            nodes: vec![
+                DraftTreeNode { token: 1, parent: None, depth: 0, log_mass: 0.0 },
+                DraftTreeNode { token: 2, parent: Some(0), depth: 1, log_mass: 0.0 },
+            ],
+        };
+        let base = [0.0f32, 9.0, 0.0, 0.0];
+        // Draft marginals: depth 0 mostly token 1, depth 1 mostly token 2.
+        let draft = logits(&[vec![0.0, 4.0, 0.0, 0.0], vec![0.0, 0.0, 4.0, 0.0]], 4);
+        // Target rows strongly favour both drafted tokens; u=0 accepts both.
+        let target = logits(&[vec![0.0, 9.0, 0.0, 0.0], vec![0.0, 0.0, 9.0, 0.0]], 4);
+        let r = verify_tree_stochastic(&tree, &target, &base, &draft, 4, &[0.0, 0.0, 0.0]);
+        assert_eq!(r.best_node, Some(1));
+        assert_eq!(r.emitted_tokens.len(), 3);
+        // A target row favouring another token at node 0 rejects; residual
+        // draw picks from max(0, p - q).
+        let reject_target =
+            logits(&[vec![9.0, 0.0, 0.0, 0.0], vec![0.0, 0.0, 9.0, 0.0]], 4);
+        let r = verify_tree_stochastic(
+            &tree, &reject_target, &base, &draft, 4, &[0.999, 0.0, 0.0],
+        );
+        assert_eq!(r.best_node, None);
+        assert_eq!(r.emitted_tokens.len(), 1);
     }
 }

@@ -552,6 +552,10 @@ impl KvBlockPool {
         session_snapshot: Option<Box<dyn std::any::Any + Send>>,
         skip_blocks: usize,
     ) {
+        debug_assert!(
+            session_snapshot.is_none() || depth % BLOCK_SIZE == 0,
+            "a recurrent snapshot must only be stored at a chunk-aligned depth"
+        );
         self.prefix_tree.insert_at(tokens, blocks, skip_blocks);
         self.prefix_tree.touch(tokens);
 

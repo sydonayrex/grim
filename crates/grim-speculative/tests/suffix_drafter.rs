@@ -55,3 +55,16 @@ fn longest_suffix_wins() {
     // continuation must not overlap the current suffix
     assert!(out.tokens.len() >= 2);
 }
+
+#[test]
+fn trie_discriminates_branching_suffixes() {
+    let mut d = SuffixDrafter::new(1024);
+    // "1,2,3" appears twice before the current tail: followed by 4,5 and
+    // (more recently) by 9,9. The trie must return a continuation of the
+    // matching suffix, preferring the newest occurrence.
+    d.append(&[1, 2, 3, 4, 5, 1, 2, 3, 9, 9, 1, 2, 3]);
+    let out = d.draft(3, 8);
+    assert!(!out.is_empty());
+    assert_eq!(out.tokens[0], 9);
+    assert_eq!(out.tokens[1], 9);
+}
