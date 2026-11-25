@@ -8363,54 +8363,8 @@ pub fn launch_qkv_attention_dev_batch(
     });
     if k_f16 && seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && f16_splitk_enabled {
         const SPLIT_K: usize = 8;
-        static F16_SPLITK_SCRATCH: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
-        > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
-        // Pre-allocate for max seq_len=3 so M=2/M=3 graph capture never triggers hipMalloc growth.
-        let alloc_h = 3usize * (num_heads as usize);
-        let need_out_bytes = SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
-        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
-            if rc != 0 {
-                return Err(crate::Error::Backend(format!(
-                    "grim_qkv_attention_dev_f16_splitk: hipMalloc({bytes}) failed: {rc}"
-                )));
-            }
-            Ok(ptr as u64)
-        };
-        let scratch_ptrs: Option<(u64, u64, u64)> = {
-            let map = F16_SPLITK_SCRATCH
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-            let mut guard = map.lock().unwrap();
-            let dev_idx = dev.ordinal();
-            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
-                if cap >= need_out_bytes {
-                    Some((po, pm, ps))
-                } else if dev.is_capturing() {
-                    None
-                } else {
-                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                    let po_new = alloc_dev(need_out_bytes)?;
-                    let pm_new = alloc_dev(need_ms_bytes)?;
-                    let ps_new = alloc_dev(need_ms_bytes)?;
-                    // Do not hipFree old pointers: a previously captured graph may still reference them.
-                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    Some((po_new, pm_new, ps_new))
-                }
-            } else if dev.is_capturing() {
-                None
-            } else {
-                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                let po_new = alloc_dev(need_out_bytes)?;
-                let pm_new = alloc_dev(need_ms_bytes)?;
-                let ps_new = alloc_dev(need_ms_bytes)?;
-                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                Some((po_new, pm_new, ps_new))
-            }
-        };
+        let scratch_ptrs = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?;
         if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
@@ -8640,54 +8594,8 @@ pub fn launch_qkv_attention_dev_batch_i8(
     });
     if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
-        static SPLITK_SCRATCH: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
-        > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
-        let alloc_h = 3usize * (num_heads as usize);
-        let need_out_bytes =
-            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
-        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
-            if rc != 0 {
-                return Err(crate::Error::Backend(format!(
-                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
-                )));
-            }
-            Ok(ptr as u64)
-        };
-        let scratch_ptrs: Option<(u64, u64, u64)> = {
-            let map = SPLITK_SCRATCH
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-            let mut guard = map.lock().unwrap();
-            let dev_idx = dev.ordinal();
-            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
-                if cap >= need_out_bytes {
-                    Some((po, pm, ps))
-                } else if dev.is_capturing() {
-                    None
-                } else {
-                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                    let po_new = alloc_dev(need_out_bytes)?;
-                    let pm_new = alloc_dev(need_ms_bytes)?;
-                    let ps_new = alloc_dev(need_ms_bytes)?;
-                    // Do not hipFree old pointers: a previously captured graph may still reference them.
-                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    Some((po_new, pm_new, ps_new))
-                }
-            } else if dev.is_capturing() {
-                None
-            } else {
-                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                let po_new = alloc_dev(need_out_bytes)?;
-                let pm_new = alloc_dev(need_ms_bytes)?;
-                let ps_new = alloc_dev(need_ms_bytes)?;
-                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                Some((po_new, pm_new, ps_new))
-            }
-        };
+        let scratch_ptrs = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?;
         if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
@@ -8922,54 +8830,8 @@ pub fn launch_qkv_attention_dev_batch_i4(
     });
     if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
-        static SPLITK_SCRATCH: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
-        > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
-        let alloc_h = 3usize * (num_heads as usize);
-        let need_out_bytes =
-            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
-        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
-            if rc != 0 {
-                return Err(crate::Error::Backend(format!(
-                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
-                )));
-            }
-            Ok(ptr as u64)
-        };
-        let scratch_ptrs: Option<(u64, u64, u64)> = {
-            let map = SPLITK_SCRATCH
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-            let mut guard = map.lock().unwrap();
-            let dev_idx = dev.ordinal();
-            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
-                if cap >= need_out_bytes {
-                    Some((po, pm, ps))
-                } else if dev.is_capturing() {
-                    None
-                } else {
-                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                    let po_new = alloc_dev(need_out_bytes)?;
-                    let pm_new = alloc_dev(need_ms_bytes)?;
-                    let ps_new = alloc_dev(need_ms_bytes)?;
-                    // Do not hipFree old pointers: a previously captured graph may still reference them.
-                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    Some((po_new, pm_new, ps_new))
-                }
-            } else if dev.is_capturing() {
-                None
-            } else {
-                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                let po_new = alloc_dev(need_out_bytes)?;
-                let pm_new = alloc_dev(need_ms_bytes)?;
-                let ps_new = alloc_dev(need_ms_bytes)?;
-                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                Some((po_new, pm_new, ps_new))
-            }
-        };
+        let scratch_ptrs = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?;
         if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
@@ -9195,54 +9057,8 @@ pub fn launch_qkv_attention_dev_batch_q81(
     });
     if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
-        static SPLITK_SCRATCH: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
-        > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
-        let alloc_h = 3usize * (num_heads as usize);
-        let need_out_bytes =
-            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
-        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
-            if rc != 0 {
-                return Err(crate::Error::Backend(format!(
-                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
-                )));
-            }
-            Ok(ptr as u64)
-        };
-        let scratch_ptrs: Option<(u64, u64, u64)> = {
-            let map = SPLITK_SCRATCH
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-            let mut guard = map.lock().unwrap();
-            let dev_idx = dev.ordinal();
-            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
-                if cap >= need_out_bytes {
-                    Some((po, pm, ps))
-                } else if dev.is_capturing() {
-                    None
-                } else {
-                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                    let po_new = alloc_dev(need_out_bytes)?;
-                    let pm_new = alloc_dev(need_ms_bytes)?;
-                    let ps_new = alloc_dev(need_ms_bytes)?;
-                    // Do not hipFree old pointers: a previously captured graph may still reference them.
-                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    Some((po_new, pm_new, ps_new))
-                }
-            } else if dev.is_capturing() {
-                None
-            } else {
-                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                let po_new = alloc_dev(need_out_bytes)?;
-                let pm_new = alloc_dev(need_ms_bytes)?;
-                let ps_new = alloc_dev(need_ms_bytes)?;
-                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                Some((po_new, pm_new, ps_new))
-            }
-        };
+        let scratch_ptrs = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?;
         if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
@@ -9462,54 +9278,8 @@ pub fn launch_qkv_attention_dev_batch_whitecrow(
     });
     if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
         const SPLIT_K: usize = 8;
-        static SPLITK_SCRATCH: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
-        > = std::sync::OnceLock::new();
         let total_h = (seq_len as usize) * (num_heads as usize);
-        let alloc_h = 3usize * (num_heads as usize);
-        let need_out_bytes =
-            SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
-        let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
-        let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
-            if rc != 0 {
-                return Err(crate::Error::Backend(format!(
-                    "grim_qkv_attention_dev_q81_splitk: hipMalloc({bytes}) failed: {rc}"
-                )));
-            }
-            Ok(ptr as u64)
-        };
-        let scratch_ptrs: Option<(u64, u64, u64)> = {
-            let map = SPLITK_SCRATCH
-                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-            let mut guard = map.lock().unwrap();
-            let dev_idx = dev.ordinal();
-            if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
-                if cap >= need_out_bytes {
-                    Some((po, pm, ps))
-                } else if dev.is_capturing() {
-                    None
-                } else {
-                    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                    let po_new = alloc_dev(need_out_bytes)?;
-                    let pm_new = alloc_dev(need_ms_bytes)?;
-                    let ps_new = alloc_dev(need_ms_bytes)?;
-                    // Do not hipFree old pointers: a previously captured graph may still reference them.
-                    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                    Some((po_new, pm_new, ps_new))
-                }
-            } else if dev.is_capturing() {
-                None
-            } else {
-                let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
-                let po_new = alloc_dev(need_out_bytes)?;
-                let pm_new = alloc_dev(need_ms_bytes)?;
-                let ps_new = alloc_dev(need_ms_bytes)?;
-                guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
-                Some((po_new, pm_new, ps_new))
-            }
-        };
+        let scratch_ptrs = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?;
         if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
         let mut split_k_i = SPLIT_K as i32;
         let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
@@ -10976,6 +10746,95 @@ mod kv_kernel_source_structure_tests {
             }
         }
     }
+}
+
+static SPLITK_SCRATCH_POOL: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64, usize)>>,
+> = std::sync::OnceLock::new();
+static SPLITK_CAPTURE_SKIP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn get_or_alloc_splitk_scratch(
+    dev: &crate::RocmDevice,
+    num_heads: u32,
+    head_dim: u32,
+) -> Result<Option<(u64, u64, u64)>, crate::Error> {
+    const SPLIT_K: usize = 8;
+    let alloc_h = 3usize * (num_heads as usize);
+    let need_out_bytes = SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+    let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
+    let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
+        if rc != 0 {
+            return Err(crate::Error::Backend(format!(
+                "splitk_scratch: hipMalloc({bytes}) failed: {rc}"
+            )));
+        }
+        Ok(ptr as u64)
+    };
+    let map = SPLITK_SCRATCH_POOL
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    let dev_idx = dev.ordinal();
+    if let Some(&(po, pm, ps, cap)) = guard.get(&dev_idx) {
+        if cap >= need_out_bytes {
+            return Ok(Some((po, pm, ps)));
+        }
+    }
+    if dev.is_capturing() {
+        if !SPLITK_CAPTURE_SKIP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[grim] WARNING: split-KV skipped during stream capture on dev{dev_idx} (scratch not pre-warmed)"
+            );
+        }
+        return Ok(None);
+    }
+    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+    let po_new = alloc_dev(need_out_bytes)?;
+    let pm_new = alloc_dev(need_ms_bytes)?;
+    let ps_new = alloc_dev(need_ms_bytes)?;
+    // Do not hipFree old pointers: a previously captured graph may still reference them.
+    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+    Ok(Some((po_new, pm_new, ps_new)))
+}
+
+/// Pre-allocate per-device split-KV scratch (`SPLIT_K=8`, `max_seq=3`) before
+/// HIP stream capture so `grim_qkv_attention_dev_{f16,q81}_splitk` never falls
+/// back to serial inside a captured decode graph.
+pub fn prewarm_splitk_scratch_ordinal(
+    dev_idx: usize,
+    num_heads: u32,
+    head_dim: u32,
+) -> Result<(), crate::Error> {
+    const SPLIT_K: usize = 8;
+    let alloc_h = 3usize * (num_heads as usize);
+    let need_out_bytes = SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
+    let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
+    let map = SPLITK_SCRATCH_POOL
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    if let Some(&(_, _, _, cap)) = guard.get(&dev_idx) {
+        if cap >= need_out_bytes {
+            return Ok(());
+        }
+    }
+    let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+    let alloc_dev = |bytes: usize| -> Result<u64, crate::Error> {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { crate::hipMalloc(&mut ptr, bytes) };
+        if rc != 0 {
+            return Err(crate::Error::Backend(format!(
+                "splitk_scratch: hipMalloc({bytes}) failed: {rc}"
+            )));
+        }
+        Ok(ptr as u64)
+    };
+    let po_new = alloc_dev(need_out_bytes)?;
+    let pm_new = alloc_dev(need_ms_bytes)?;
+    let ps_new = alloc_dev(need_ms_bytes)?;
+    guard.insert(dev_idx, (po_new, pm_new, ps_new, need_out_bytes));
+    Ok(())
 }
 
 #[cfg(test)]

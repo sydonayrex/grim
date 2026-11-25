@@ -3403,6 +3403,11 @@ impl DecodeGraph {
         if self.is_captured {
             return Err(Error::Backend("begin_capture: already captured".into()));
         }
+        // Pre-allocate split-KV scratch on every device in the split before
+        // stream capture begins so split-KV never falls back to serial.
+        for &dev_idx in &self.buffers.layer_devices {
+            let _ = crate::kernels::qkv_attention::prewarm_splitk_scratch_ordinal(dev_idx, 32, 256);
+        }
         // Split path: publish the fp8 pad, then open segment 0's bracket. The
         // interior boundaries are advanced by the model's forward_capture;
         // end_capture closes the last open segment.
