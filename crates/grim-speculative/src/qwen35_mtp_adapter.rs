@@ -245,6 +245,10 @@ impl NativeMtp for Qwen35MtpAdapter {
         self.qwen()?.commit_graph_spec_state(graph_slot)
     }
 
+    fn supports_replay_binding(&self) -> bool {
+        true
+    }
+
     fn forward_tree(
         &self,
         session: &mut dyn SessionT,

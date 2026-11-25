@@ -1173,6 +1173,12 @@ impl SpeculativeCausalLm {
         adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         let mtp = self.mtp_target.as_ref().unwrap();
+        if replay_state_enabled() && !mtp.supports_replay_binding() {
+            return Err(Error::Unimplemented(
+                "GRIM_SPEC_REPLAY_STATE=1 requires a model with device replay binding (GDL unsupported)"
+                    .into(),
+            ));
+        }
         let depth = mtp.mtp_depth();
         let context_len = input_ids.shape().elem_count();
         if let Some(gate) = self.may_verify.as_ref() {

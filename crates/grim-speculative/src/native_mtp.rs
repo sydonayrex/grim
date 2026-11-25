@@ -152,6 +152,12 @@ pub trait NativeMtp: grim_core::CausalLm {
         Ok(None)
     }
 
+    /// Whether this model supports device-side replay binding. Default false;
+    /// the wrapper fails loudly when replay is requested on an unsupported model.
+    fn supports_replay_binding(&self) -> bool {
+        false
+    }
+
     /// Append one recurrent-state replay record (token id + absolute
     /// position) behind the committed frontier. Default no-op for models
     /// without replayable recurrent state.
