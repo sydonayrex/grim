@@ -2277,6 +2277,27 @@ pub async fn cmd_run(
                 let mut last_logits =
                     CausalLm::forward(&*model, &mut sess, &in_pref, &pos_pref, &[])?;
 
+                let score_use_graph = std::env::var("GRIM_SCORE_USE_GRAPH").as_deref() == Ok("1");
+                let mut tf_graph_seeded = false;
+                if score_use_graph {
+                    if let (Some(gm), Some(ref mut g)) = (resolve_graph_model(&*model), decode_graph.as_mut()) {
+                        let dev = grim_backend_rocm::RocmDevice::shared(0);
+                        let srcs = gm.eager_kv_seed_sources(&sess, prefill_len as u32)?;
+                        g.buffers.seed_kv_arena_from_eager(&dev, &srcs)?;
+                        let conv_dev = gm.eager_conv_device_seed_sources(&sess)?;
+                        if conv_dev.iter().any(|s| s.is_some()) {
+                            g.buffers.seed_conv_rings_from_device(&dev, &conv_dev)?;
+                        }
+                        let kda_seeds = gm.eager_kda_seed_sources(&sess)?;
+                        if !kda_seeds.is_empty() {
+                            g.buffers.seed_kda_state_from_eager(&dev, &kda_seeds)?;
+                        }
+                        g.buffers.current_pos = prefill_len as u32;
+                        tf_graph_seeded = true;
+                        eprintln!("[score-graph] seeded DecodeGraph at pos={prefill_len}");
+                    }
+                }
+
                 // KV4-RL (arXiv:2610.14448 Appendix B.5): 8 evenly spaced positions
                 // round(j * (L - 1) / 7) for j = 0..7 across the forced continuation.
                 let cont_len = (chunk_end - chunk_start).saturating_sub(prefill_len);
@@ -2379,6 +2400,27 @@ pub async fn cmd_run(
 
                     // Step 1 token through M=1 decode
                     let next_token_val = full[global_pos];
+                    if tf_graph_seeded {
+                        if let (Some(gm), Some(ref mut g)) = (resolve_graph_model(&*model), decode_graph.as_mut()) {
+                            gm.forward_replay(g, next_token_val)?;
+                            g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
+                            let logits_vec = grim_tensor::BackendStorage::to_cpu_vec_f32(
+                                g.logits_device_storage(),
+                            )?;
+                            last_logits = grim_tensor::Tensor::new(
+                                std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
+                                    &logits_vec,
+                                    &grim_tensor::Shape::new(vec![1, vocab]),
+                                    grim_tensor::dtype::DType::F32,
+                                )?),
+                                grim_tensor::Shape::new(vec![1, vocab]),
+                                grim_tensor::dtype::DType::F32,
+                                grim_tensor::dtype::QuantProvenance::default(),
+                                grim_tensor::Device::Cpu,
+                            );
+                            continue;
+                        }
+                    }
                     let in_tok = grim_tensor::Tensor::new(
                         std::sync::Arc::from(grim_backend_cpu::CpuDevice::new().from_cpu(
                             &[next_token_val as f32],
