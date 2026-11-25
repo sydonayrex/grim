@@ -6861,6 +6861,23 @@ impl KvEvictionPolicy {
         }
     }
 
+    /// Side-arena row for a stale token, or `None` when the row stays in the
+    /// main arena (sinks and recent tokens). The index is bounded by the
+    /// configured side budget; older rows evicted from the side region return
+    /// `None`, which the caller must treat as "not addressable".
+    pub fn side_row(&self, abs: usize, live: usize) -> Option<usize> {
+        if self.side_rows == 0 || !matches!(self.tier(abs, live), KvTier::Stale) {
+            return None;
+        }
+        let first_stale = self.sinks;
+        let last_stale = live.saturating_sub(self.recent_rows);
+        if abs < first_stale || abs >= last_stale {
+            return None;
+        }
+        let age = last_stale - 1 - abs;
+        (age < self.side_rows).then_some(age)
+    }
+
     /// Kernel-facing policy. `UNLIMITED` makes every ring kernel an identity.
     pub fn ring(&self) -> grim_backend_rocm::KvRingPolicy {
         match self.cap_rows {
@@ -10509,6 +10526,12 @@ mod kv_eviction_tests {
         assert_eq!(pol.tier(4, 64), crate::qwen35::KvTier::Stale);
         assert_eq!(pol.tier(56, 64), crate::qwen35::KvTier::Recent);
         assert_eq!(pol.tier(63, 64), crate::qwen35::KvTier::Recent);
+        // Only stale rows inside the bounded side budget are addressable.
+        assert_eq!(pol.side_row(0, 64), None); // sink
+        assert_eq!(pol.side_row(56, 64), None); // recent
+        assert_eq!(pol.side_row(55, 64), Some(0)); // newest stale
+        assert_eq!(pol.side_row(40, 64), Some(15)); // oldest still kept
+        assert_eq!(pol.side_row(39, 64), None); // beyond side budget
     }
 
     #[test]
