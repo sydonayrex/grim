@@ -2712,4 +2712,38 @@ mod gemma4_tokenizer_tests {
             "a newline must not glue the words together, got {ids:?}"
         );
     }
+
+    #[test]
+    fn qwen2_pretokenize_matches_llama_cpp_rules() {
+        // Hyphenated names attach '-' to the following letter run (allows '-Y' BPE merge).
+        assert_eq!(
+            split_on_qwen2_pretokenize("Sung-Yub Kim"),
+            vec!["Sung", "-Yub", " Kim"]
+        );
+        // Single-digit \p{N} splitting.
+        assert_eq!(
+            split_on_qwen2_pretokenize("2026-11-24"),
+            vec!["2", "0", "2", "6", "-", "1", "1", "-", "2", "4"]
+        );
+        // En/em dashes, double dashes, math symbols, CJK.
+        assert_eq!(
+            split_on_qwen2_pretokenize("-- foo–bar—baz α+β"),
+            vec!["--", " foo", "–bar", "—baz", " α", "+β"]
+        );
+        // Case-insensitive contractions.
+        assert_eq!(
+            split_on_qwen2_pretokenize("Don't DON'T"),
+            vec!["Don", "'t", " DON", "'T"]
+        );
+        // Multi-space before word (\s+(?!\S)) and trailing whitespace at EOF (\s+).
+        assert_eq!(
+            split_on_qwen2_pretokenize("a   b   "),
+            vec!["a", "  ", " b", "   "]
+        );
+        // Spaces before newline (\s*[\r\n]+).
+        assert_eq!(
+            split_on_qwen2_pretokenize("a  \nb"),
+            vec!["a", "  \n", "b"]
+        );
+    }
 }
