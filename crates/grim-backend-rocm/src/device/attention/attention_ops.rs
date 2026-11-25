@@ -668,6 +668,47 @@ impl AttentionOps for RocmDevice {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
         let kv_are_f16 = kv_is_f16;
+        let wmma_f16_enabled = !matches!(
+            std::env::var("GRIM_ATTN_WMMA_F16").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if wmma_f16_enabled
+            && matches!(self.gpu_target.as_str(), "gfx1200" | "gfx1201")
+            && kv_are_f16
+            && seq_len >= 64
+            && window.is_none()
+            && out_max.is_none()
+            && out_sum.is_none()
+            && softcap <= 0.0
+            && config.head_dim > 0
+            && config.head_dim <= 256
+            && config.head_dim % 16 == 0
+            && config.num_kv_heads > 0
+            && config.num_heads % config.num_kv_heads == 0
+        {
+            let wmma_grid =
+                crate::HipDim3::new(seq_len.div_ceil(64) as u32, config.num_heads as u32, 1);
+            let wmma_block = crate::HipDim3::new(128, 1, 1);
+            let stream = self.launch_compute_kernel(
+                "grim_qkv_attention_wmma_f16",
+                wmma_grid,
+                wmma_block,
+                &mut [
+                    arg(&mut qptr),
+                    arg(&mut kptr),
+                    arg(&mut vptr),
+                    arg(&mut optr),
+                    arg(&mut nh),
+                    arg(&mut nkv),
+                    arg(&mut hd),
+                    arg(&mut sl),
+                    arg(&mut ksl),
+                    arg(&mut co),
+                    arg(&mut isd),
+                ],
+            )?;
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
         if tiled_qt > 1
             && kv_are_f16
             && seq_len >= 64
