@@ -10837,6 +10837,115 @@ pub fn prewarm_splitk_scratch_ordinal(
     Ok(())
 }
 
+/// Eager `F16` split-KV launcher for `seq_len = 1..=3` (used by `nextn` draft
+/// steps and eager `M=1` decode). Reuses the tested `grim_qkv_attention_dev_f16_splitk`
+/// + `grim_qkv_attention_splitk_combine` kernels with a per-device 4-byte `total_dev` slot.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_eager_f16_splitk(
+    dev: &crate::RocmDevice,
+    q_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    o_ptr: u64,
+    om_ptr: u64,
+    os_ptr: u64,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    seq_len: i32,
+    kv_seq_len: i32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    alibi_ptr: u64,
+    has_alibi: i32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    const SPLIT_K: usize = 8;
+    let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) =
+        get_or_alloc_splitk_scratch(dev, num_heads as u32, head_dim as u32)?
+    else {
+        return Err(crate::Error::Backend("eager splitk skipped during capture".into()));
+    };
+    static TOT_DEV_POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, u64>>,
+    > = std::sync::OnceLock::new();
+    let mut tot_ptr = {
+        let map = TOT_DEV_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut guard = map.lock().unwrap();
+        let dev_idx = dev.ordinal();
+        if let Some(&p) = guard.get(&dev_idx) {
+            p
+        } else {
+            let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { crate::hipMalloc(&mut ptr, 4) };
+            if rc != 0 {
+                return Err(crate::Error::Backend(format!("eager splitk tot hipMalloc failed: {rc}")));
+            }
+            let p = ptr as u64;
+            guard.insert(dev_idx, p);
+            p
+        }
+    };
+    let tot_val: i32 = kv_seq_len;
+    let _g = crate::device::util::DeviceGuard::set(dev.ordinal() as i32);
+    let rc = unsafe {
+        crate::hipMemcpyAsync(
+            tot_ptr as *mut std::ffi::c_void,
+            &tot_val as *const i32 as *const std::ffi::c_void,
+            4,
+            crate::HipMemcpyKind::HostToDevice,
+            dev.active_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(crate::Error::Backend(format!("eager splitk tot H2D failed: {rc}")));
+    }
+    let mut q_p = q_ptr;
+    let mut k_p = k_ptr;
+    let mut v_p = v_ptr;
+    let mut o_p = o_ptr;
+    let mut om_p = om_ptr;
+    let mut os_p = os_ptr;
+    let mut nh = num_heads;
+    let mut nkv = num_kv_heads;
+    let mut hd = head_dim;
+    let mut sl = seq_len;
+    let mut steps_i = 0i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut asl = alibi_ptr;
+    let mut ha = has_alibi;
+    let mut cap_rows_i = 0i32;
+    let mut split_k_i = SPLIT_K as i32;
+    let total_h = (seq_len as usize) * (num_heads as usize);
+    let mut total_h_i = total_h as i32;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_dev_f16_splitk",
+        crate::HipDim3::new(SPLIT_K as u32, nh as u32, sl as u32),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut q_p), arg(&mut k_p), arg(&mut v_p),
+            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+            arg(&mut nh), arg(&mut nkv), arg(&mut hd), arg(&mut sl),
+            arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd),
+            arg(&mut wl), arg(&mut sc), arg(&mut asl), arg(&mut ha),
+            arg(&mut cap_rows_i), arg(&mut split_k_i),
+        ],
+    )?;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_splitk_combine",
+        crate::HipDim3::new(total_h as u32, 1, 1),
+        crate::HipDim3::new(hd as u32, 1, 1),
+        &mut [
+            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+            arg(&mut o_p), arg(&mut om_p), arg(&mut os_p),
+            arg(&mut total_h_i), arg(&mut hd), arg(&mut split_k_i),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod kv_arena_dtype_tests {
     use super::kv_arena_f16;

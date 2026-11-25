@@ -706,6 +706,37 @@ impl AttentionOps for RocmDevice {
             return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
         }
 
+        if kv_is_f16
+            && seq_len >= 1
+            && seq_len <= 3
+            && kv_seq_len >= 64
+            && !matches!(
+                std::env::var("GRIM_F16_ATTN_SPLITK").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+        {
+            let stream = crate::kernels::qkv_attention::launch_qkv_attention_eager_f16_splitk(
+                self,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                max_ptr,
+                sum_ptr,
+                num_heads_i,
+                num_kv_heads_i,
+                head_dim_i,
+                seq_len_i,
+                kv_seq_len_i,
+                inv_sqrt_d,
+                window_lo_i,
+                softcap,
+                alibi_ptr,
+                has_alibi,
+            )?;
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
+
         // f16 KV arenas (GRIM_F16_KV) take the f16kv scalar variant: identical
         // math and signature, K/V rows read as fp16. f32 keeps the original.
         // (Tiled above already split on the same condition; flash_decode is
