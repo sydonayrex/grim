@@ -178,6 +178,12 @@ pub struct DecodeGraphBuffers {
     /// a codes arena without its sidecar is a loud failure, not a reinterpret.
     pub k_scale_arena: Vec<RocmStorage>,
     pub v_scale_arena: Vec<RocmStorage>,
+    /// Tiered-cache side arenas (`GRIM_KV_TIER=1`): higher-precision codes for
+    /// sink/recent rows. Empty unless tiering is enabled.
+    pub k_side_arena: Vec<RocmStorage>,
+    pub v_side_arena: Vec<RocmStorage>,
+    pub k_side_scale_arena: Vec<RocmStorage>,
+    pub v_side_scale_arena: Vec<RocmStorage>,
     /// Phase-3 eviction ring. `cap_rows <= 0` (the default) means the arena
     /// grows with the context and every ring kernel is an identity; otherwise
     /// the arena is a fixed capacity with `sink_rows` pinned attention sinks
@@ -334,6 +340,30 @@ pub fn device_segments(layer_devices: &[usize]) -> Vec<(usize, std::ops::Range<u
 pub struct RecurrentCheckpoint {
     /// `(live_ptr, backup_storage, bytes, device_ordinal)`
     pub slots: Vec<(u64, RocmStorage, usize, usize)>,
+}
+
+fn replay_pair(live: u64, spare: u64, h: usize) -> (u64, u64) {
+    if h % 2 == 0 {
+        (live, spare)
+    } else {
+        (spare, live)
+    }
+}
+
+impl RecurrentCheckpoint {
+    /// Two-slot replay pointers for cursor `h`: even `h` reads the live state
+    /// and writes the backup (`S_spec`); odd `h` swaps them. This is the host
+    /// side of a pointer commit — the device launcher/H2D pointer table that
+    /// consumes it is a separate step.
+    pub fn replay_ptrs(&self, h: usize) -> Vec<(u64, u64)> {
+        self.slots
+            .iter()
+            .map(|(live, backup, _, _)| {
+                let spare = backup.device_ptr_u64().unwrap_or(*live);
+                replay_pair(*live, spare, h)
+            })
+            .collect()
+    }
 }
 
 impl DecodeGraphBuffers {
@@ -870,6 +900,16 @@ impl DecodeGraphBuffers {
         let mut fused_qkv_out = Vec::with_capacity(num_layers);
         let mut k_arena = Vec::with_capacity(num_layers);
         let mut v_arena = Vec::with_capacity(num_layers);
+        let tiering = std::env::var("GRIM_KV_TIER").ok().as_deref() == Some("1");
+        let side_cap = std::env::var("GRIM_KV_SIDE_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(128)
+            .min(max_ctx);
+        let mut k_side_arena = Vec::with_capacity(if tiering { num_layers } else { 0 });
+        let mut v_side_arena = Vec::with_capacity(if tiering { num_layers } else { 0 });
+        let mut k_side_scale_arena = Vec::new();
+        let mut v_side_scale_arena = Vec::new();
         // Filled on demand by `set_int8_kv_scales` (an empty vec means the
         // arenas are f32/f16 and no sidecar exists).
         let k_scale_arena: Vec<RocmStorage> = Vec::new();
@@ -1134,6 +1174,54 @@ impl DecodeGraphBuffers {
                 if res != crate::hipSuccess {
                     return Err(Error::Backend(format!("zero kv arena: {res}")));
                 }
+            }
+            // Tiered side arenas are allocated up front when `GRIM_KV_TIER=1`
+            // so graph capture never allocates. They are unused until the
+            // tiered graph dispatch is wired, but their geometry is fixed.
+            if tiering && side_cap > 0 {
+                let ks = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * side_cap, nkk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )?;
+                let vs = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * side_cap, nvk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )?;
+                let kss = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * side_cap, nkk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )?;
+                let vss = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * side_cap, nvk]),
+                    dt.clone(),
+                    &l_dev.allocator,
+                    l_dev.ordinal,
+                )?;
+                for arena in [&ks, &vs, &kss, &vss] {
+                    let _zg = crate::device::util::DeviceGuard::set(arena.device_ordinal() as i32);
+                    if let Some(zp) = arena.device_ptr {
+                        let res: crate::HipErrorT = unsafe {
+                            crate::device::handles::hipMemset(
+                                zp as *mut std::ffi::c_void,
+                                0,
+                                arena.bytes,
+                            )
+                        };
+                        if res != crate::hipSuccess {
+                            return Err(Error::Backend(format!("zero kv side arena: {res}")));
+                        }
+                    }
+                }
+                k_side_arena.push(ks);
+                v_side_arena.push(vs);
+                k_side_scale_arena.push(kss);
+                v_side_scale_arena.push(vss);
             }
             if latent_kv_dim > 0 {
                 latent_kv_arena.push(RocmStorage::alloc_gpu(
@@ -1451,6 +1539,10 @@ impl DecodeGraphBuffers {
             v_arena,
             k_scale_arena,
             v_scale_arena,
+            k_side_arena: Vec::new(),
+            v_side_arena: Vec::new(),
+            k_side_scale_arena: Vec::new(),
+            v_side_scale_arena: Vec::new(),
             kv_ring: KvRingPolicy::UNLIMITED,
             kv_arena_bits: None,
             latent_kv_arena,
@@ -4089,6 +4181,13 @@ pub fn check_layer_topology(buffers: &DecodeGraphBuffers, layer_idx: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_ptrs_alternate_between_the_two_slots() {
+        assert_eq!(replay_pair(0x100, 0x200, 0), (0x100, 0x200));
+        assert_eq!(replay_pair(0x100, 0x200, 1), (0x200, 0x100));
+        assert_eq!(replay_pair(0x100, 0x200, 2), (0x100, 0x200));
+    }
 
     #[test]
     fn device_segments_are_maximal_contiguous_runs() {
