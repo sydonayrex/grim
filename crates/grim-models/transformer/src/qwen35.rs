@@ -4047,13 +4047,13 @@ impl CausalLm for Qwen35 {
                                 }
                             }
                         }
-                        let pos_shift = &positions_vec[0..n_shift];
+                        let pos_shift = &positions_vec[1..rows];
                         let mut cache_guard =
                             nextn.cache.lock().unwrap_or_else(|e| e.into_inner());
                         let (ref mut cache_opt, ref mut pos_log) = *cache_guard;
                         let cache =
                             cache_opt.get_or_insert_with(|| Qwen35LayerCache::new(&self.cfg));
-                        if pos_shift.first().copied() == Some(0) {
+                        if positions_vec.first().copied() == Some(0) {
                             cache.current_pos = 0;
                             pos_log.clear();
                         }
