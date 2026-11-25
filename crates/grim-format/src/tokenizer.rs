@@ -876,7 +876,16 @@ impl GgufTokenizer {
 
         // Pretokenize the ORIGINAL text per the GPT-2 regex (words, digits, punctuation runs, whitespace - newlines split correctly), then byte-encode each piece.
         // Byte-encoding the entire text first and splitting on Ġ glued newline-adjacent words together and produced.
-        let pieces = split_on_gpt2_pretokenize(text);
+        let use_qwen2_pre = self
+            .architecture
+            .as_deref()
+            .map(|a| a.starts_with("qwen"))
+            .unwrap_or(false);
+        let pieces = if use_qwen2_pre {
+            split_on_qwen2_pretokenize(text)
+        } else {
+            split_on_gpt2_pretokenize(text)
+        };
 
         for piece in pieces {
             if piece.is_empty() {
@@ -1735,6 +1744,128 @@ fn chunk_bounds(text: &str, target: usize) -> Vec<(usize, usize)> {
         start = end;
     }
     bounds
+}
+
+/// Qwen2 / Qwen3.5 BPE pre-tokenizer (`llama.cpp` `LLAMA_VOCAB_PRE_TYPE_QWEN2`):
+/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+fn split_on_qwen2_pretokenize(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let is_letter = |c: char| c.is_alphabetic();
+    let is_num = |c: char| c.is_numeric();
+    let is_ws = |c: char| c.is_whitespace();
+    let is_crlf = |c: char| c == '\r' || c == '\n';
+
+    let contraction = |i: usize| -> Option<usize> {
+        if chars[i] != '\'' {
+            return None;
+        }
+        for cand in ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"] {
+            let cl: Vec<char> = cand.chars().collect();
+            if i + cl.len() <= n
+                && chars[i..i + cl.len()]
+                    .iter()
+                    .zip(cl.iter())
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+            {
+                return Some(i + cl.len());
+            }
+        }
+        None
+    };
+
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = chars[i];
+
+        // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if let Some(j) = contraction(i) {
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+        if is_letter(c) {
+            let mut j = i + 1;
+            while j < n && is_letter(chars[j]) {
+                j += 1;
+            }
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        if !is_crlf(c) && !is_num(c) && i + 1 < n && is_letter(chars[i + 1]) {
+            let mut j = i + 2;
+            while j < n && is_letter(chars[j]) {
+                j += 1;
+            }
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        // 3. \p{N} (single digit)
+        if is_num(c) {
+            words.push(c.to_string());
+            i += 1;
+            continue;
+        }
+
+        // 4. ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        if (c == ' ' && i + 1 < n && !is_ws(chars[i + 1]) && !is_letter(chars[i + 1]) && !is_num(chars[i + 1]))
+            || (!is_ws(c) && !is_letter(c) && !is_num(c))
+        {
+            let mut j = if c == ' ' { i + 1 } else { i };
+            while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) {
+                j += 1;
+            }
+            while j < n && is_crlf(chars[j]) {
+                j += 1;
+            }
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        // 5. \s*[\r\n]+
+        if is_ws(c) {
+            let mut j = i;
+            let mut last_crlf = None;
+            while j < n && is_ws(chars[j]) {
+                if is_crlf(chars[j]) {
+                    last_crlf = Some(j + 1);
+                } else if last_crlf.is_some() {
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = last_crlf {
+                words.push(chars[i..end].iter().collect());
+                i = end;
+                continue;
+            }
+            // 6. \s+(?!\S) | \s+
+            let mut k = i;
+            while k < n && is_ws(chars[k]) {
+                k += 1;
+            }
+            if k < n && k > i + 1 {
+                // Leave the last whitespace char for the next token
+                words.push(chars[i..k - 1].iter().collect());
+                i = k - 1;
+            } else {
+                words.push(chars[i..k].iter().collect());
+                i = k;
+            }
+            continue;
+        }
+
+        words.push(c.to_string());
+        i += 1;
+    }
+    words
 }
 
 fn split_on_gpt2_pretokenize(s: &str) -> Vec<String> {
