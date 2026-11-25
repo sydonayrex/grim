@@ -346,14 +346,45 @@ pub(crate) fn emit_startup_config_banner(
     }
 }
 
-/// Compute auto chunk size from measured free VRAM (default 4096)
-pub(crate) fn compute_auto_chunk_size(_prompt_len: usize, _max_tokens: usize) -> usize {
+/// Compute auto chunk size from measured free VRAM (default 4096, clamped when
+/// free VRAM on any active ROCm device is tight so long prompts do not OOM on
+/// prefill intermediates, e.g. 3.9k at 40,24 with ~1.3-1.8 GiB free on dev0).
+pub(crate) fn compute_auto_chunk_size(prompt_len: usize, _max_tokens: usize) -> usize {
     if let Ok(v) = std::env::var("GRIM_PREFILL_CHUNK_SIZE") {
         if let Ok(n) = v.parse::<usize>() {
             return n.max(16);
         }
     }
-    // Default prefill chunk size is 4096 tokens
+    #[cfg(feature = "rocm")]
+    {
+        let mut min_free_mb: Option<u64> = None;
+        for ord in 0..8usize {
+            let (free_raw, _q, total_raw) =
+                grim_backend_rocm::device::capability_profiler::vram_info_detailed(ord);
+            if total_raw == 0 {
+                break;
+            }
+            let mb = free_raw / (1024 * 1024);
+            min_free_mb = Some(min_free_mb.map_or(mb, |cur| cur.min(mb)));
+        }
+        if let Some(mb) = min_free_mb {
+            let chunk = if mb >= 2560 {
+                4096
+            } else if mb >= 1200 {
+                2048
+            } else if mb >= 640 {
+                1024
+            } else {
+                512
+            };
+            if chunk < 4096 && prompt_len > chunk {
+                eprintln!(
+                    "[prefill-chunk] clamped chunk_size 4096 -> {chunk} (min_free_vram={mb} MiB, prompt_len={prompt_len})"
+                );
+            }
+            return chunk;
+        }
+    }
     4096
 }
 
