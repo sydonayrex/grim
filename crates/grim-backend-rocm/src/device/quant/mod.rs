@@ -231,13 +231,18 @@ impl QuantOps for RocmDevice {
                 // dequant's own intermediates — d/sc/qs bytes were all
                 // correct, the nibble was a 28-bit shift). Partial tiles are
                 // masked in-kernel.
-                } else if self.gpu_target == "gfx1201"
+                } else if matches!(self.gpu_target.as_str(), "gfx1201" | "gfx1200")
                     && m >= 64
                     && k % 256 == 0
                     && !matches!(
                         std::env::var("GRIM_KQUANT_DEQUANT_PREFILL").as_deref(),
                         Ok("0" | "false" | "off")
                     )
+                    && (self.gpu_target != "gfx1200"
+                        || !matches!(
+                            std::env::var("GRIM_KQUANT_DEQUANT_PREFILL_GFX1200").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ))
                 {
                     self.launch_iq_prefill_dequant_rocblas_f16(
                         a_storage,
@@ -379,13 +384,18 @@ impl QuantOps for RocmDevice {
                         drop(tag);
                         self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if self.gpu_target == "gfx1201"
+                } else if matches!(self.gpu_target.as_str(), "gfx1201" | "gfx1200")
                     && m >= 64
                     && k % 256 == 0
                     && !matches!(
                         std::env::var("GRIM_KQUANT_DEQUANT_PREFILL").as_deref(),
                         Ok("0" | "false" | "off")
                     )
+                    && (self.gpu_target != "gfx1200"
+                        || !matches!(
+                            std::env::var("GRIM_KQUANT_DEQUANT_PREFILL_GFX1200").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ))
                 {
                     self.launch_iq_prefill_dequant_rocblas_f16(
                         a_storage,
@@ -986,13 +996,18 @@ impl QuantOps for RocmDevice {
                         n,
                         k,
                     )?;
-                } else if self.gpu_target == "gfx1201"
+                } else if matches!(self.gpu_target.as_str(), "gfx1201" | "gfx1200")
                     && m >= 64
                     && k % 256 == 0
                     && !matches!(
                         std::env::var("GRIM_KQUANT_DEQUANT_PREFILL").as_deref(),
                         Ok("0" | "false" | "off")
                     )
+                    && (self.gpu_target != "gfx1200"
+                        || !matches!(
+                            std::env::var("GRIM_KQUANT_DEQUANT_PREFILL_GFX1200").as_deref(),
+                            Ok("0" | "false" | "off")
+                        ))
                 {
                     self.launch_iq_prefill_dequant_rocblas_f16(
                         a_storage,
