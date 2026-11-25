@@ -240,51 +240,55 @@ __global__ void grim_speculative_tree_verify(
     int max_path_len,
     int vocab_size
 ) {
-    __shared__ int s_best_len;
-    __shared__ int s_best_idx;
+    // Single-block reduction: every path lives in one block so the shared
+    // reduction is fully initialised and ties resolve deterministically to the
+    // lowest path id. The previous multi-block version read uninitialised
+    // shared memory on blocks other than block 0 and resolved ties via
+    // atomicExch from arbitrary threads.
+    __shared__ int s_len[256];
+    __shared__ int s_idx[256];
 
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        s_best_len = 0;
-        s_best_idx = 0;
-    }
-    __syncthreads();
-
-    const int path_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (path_id >= num_paths) return;
-
-    const int cur_path_len = path_lens[path_id];
+    const int tid = threadIdx.x;
+    const int path_id = tid;
     int accepted_len = 0;
-
-    for (int step = 0; step < cur_path_len && step < max_path_len; ++step) {
-        const int draft_tok = candidate_paths[path_id * max_path_len + step];
-        
-        // Find argmax token of target model at this step
-        float max_logit = -1e30f;
-        int target_argmax = 0;
-        const float* step_logits = &target_logits[step * vocab_size];
-
-        for (int v = 0; v < vocab_size; ++v) {
-            if (step_logits[v] > max_logit) {
-                max_logit = step_logits[v];
-                target_argmax = v;
+    if (blockIdx.x == 0 && path_id < num_paths) {
+        const int cur_path_len = path_lens[path_id];
+        for (int step = 0; step < cur_path_len && step < max_path_len; ++step) {
+            const int draft_tok = candidate_paths[path_id * max_path_len + step];
+            float max_logit = -1e30f;
+            int target_argmax = 0;
+            const float* step_logits = &target_logits[step * vocab_size];
+            for (int v = 0; v < vocab_size; ++v) {
+                if (step_logits[v] > max_logit) {
+                    max_logit = step_logits[v];
+                    target_argmax = v;
+                }
+            }
+            if (draft_tok == target_argmax) {
+                accepted_len++;
+            } else {
+                break;
             }
         }
-
-        if (draft_tok == target_argmax) {
-            accepted_len++;
-        } else {
-            // First mismatch rejects remainder of this tree path
-            break;
-        }
     }
-
-    // Atomic reduction to find maximum accepted path length
-    atomicMax(&s_best_len, accepted_len);
+    s_len[tid] = accepted_len;
+    s_idx[tid] = (blockIdx.x == 0 && path_id < num_paths) ? path_id : 0x7fffffff;
     __syncthreads();
 
-    if (accepted_len == s_best_len && threadIdx.x == 0) {
-        atomicExch(best_accepted_len, s_best_len);
-        atomicExch(best_path_idx, path_id);
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            bool better = (s_len[tid + stride] > s_len[tid])
+                || (s_len[tid + stride] == s_len[tid] && s_idx[tid + stride] < s_idx[tid]);
+            if (better) {
+                s_len[tid] = s_len[tid + stride];
+                s_idx[tid] = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (blockIdx.x == 0 && tid == 0) {
+        atomicExch(best_accepted_len, s_len[0]);
+        atomicExch(best_path_idx, s_idx[0] == 0x7fffffff ? 0 : s_idx[0]);
     }
 }
 

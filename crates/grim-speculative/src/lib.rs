@@ -16,11 +16,14 @@ pub mod may_verify;
 pub mod mtp_provider_adapter;
 pub mod native_mtp;
 pub mod draft_policy;
+pub mod replay_state;
+pub mod draft_tree;
 pub mod speculative_wrapper;
 pub mod suffix_drafter;
 
 pub mod tiny_draft_backbone;
 pub mod uniform_markov_head;
+pub mod verify_width;
 
 pub use confidence_head::ConfidenceHead;
 pub use confidence_scheduler::{
@@ -28,10 +31,11 @@ pub use confidence_scheduler::{
 };
 pub use depth_tuner::{SpeculativeDepthPidConfig, SpeculativeDepthPidController};
 pub use draft_policy::{draft_policy_enabled, DraftPolicy, DraftSource};
-pub use may_verify::{spec_may_verify_enabled, MayVerifyGate};
+pub use may_verify::{spec_may_verify_enabled, FallbackConfig, MayVerifyGate, SpecFallback};
 pub use mtp_provider_adapter::MtpProviderAdapter;
 pub use distill::{compress_distill_report, train_speculative_draft};
 pub use draft_backbone::{DraftBackbone, DraftBlock};
+pub use draft_tree::{DraftTree, DraftTreeNode, TreeBuildConfig, TreeVerification, verify_tree_greedy};
 pub use eagle3_drafter::Eagle3Drafter;
 pub use entropy_confidence_head::EntropyConfidenceHead;
 pub use llama_mtp_adapter::LlamaMtpAdapter;
@@ -43,3 +47,5 @@ pub use speculative_wrapper::{SpeculativeCausalLm, SpeculativeTelemetry, Specula
 pub use suffix_drafter::SuffixDrafter;
 pub use tiny_draft_backbone::TinyDraftBackbone;
 pub use uniform_markov_head::UniformMarkovHead;
+pub use verify_width::{WidthConfig, WidthController};
+pub use replay_state::ReplayRing;

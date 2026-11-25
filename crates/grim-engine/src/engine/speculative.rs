@@ -207,11 +207,11 @@ impl grim_speculative::speculative_wrapper::SpeculativeVerifier for RocmSpeculat
         &self,
         target_logits: &grim_tensor::Tensor,
         draft_logits: &grim_tensor::Tensor,
-        context_len: usize,
+        target_row_offset: usize,
         vocab_size: usize,
         draft_tokens: &[u32],
         uniform_rands: &[f32],
-    ) -> Result<usize> {
+    ) -> Result<grim_speculative::speculative_wrapper::VerificationOutcome> {
         use grim_tensor::backend::{CoreTensorOps, ElementwiseOps, MemoryOps};
         use grim_tensor::{DType, Shape};
 
@@ -226,16 +226,17 @@ impl grim_speculative::speculative_wrapper::SpeculativeVerifier for RocmSpeculat
         let dev = grim_backend_rocm::device::roc_device::RocmDevice::try_new(ordinal)?;
         let k = draft_tokens.len();
         if k == 0 {
-            return Ok(0);
+            return Ok(Default::default());
         }
 
-        // Kernel ABI: target_probs [K+1, vocab] (row K = bonus row, unused by
-        // the accepted-count contract — left zero), draft_probs [K, vocab],
-        // draft_tokens int32 bytes, uniforms [K+1], accepted out [K+1]/[1].
+        // Kernel ABI: target_probs [K+1, vocab] (row K = bonus row), draft_probs
+        // [K, vocab], draft_tokens int32 bytes, uniforms [K+1], accepted out
+        // [K+1]/[1]. `target_row_offset` is the first target row corresponding
+        // to a draft token (base row + 1), so the bonus row is offset + k.
         let t_rows = dev
             .narrow_rows(
                 target_logits.storage().as_ref(),
-                context_len,
+                target_row_offset,
                 k,
                 vocab_size,
                 &Shape::new(vec![k, vocab_size]),
@@ -247,6 +248,20 @@ impl grim_speculative::speculative_wrapper::SpeculativeVerifier for RocmSpeculat
             DType::F32,
         )?;
         dev.write_rows(t_buf.as_mut(), 0, t_probs.as_ref(), k, vocab_size)?;
+        // Row k must be a real target distribution: the kernel samples the
+        // bonus token from it when every draft is accepted. Allocating the
+        // buffer does not zero it.
+        let bonus_row = dev
+            .narrow_rows(
+                target_logits.storage().as_ref(),
+                target_row_offset + k,
+                1,
+                vocab_size,
+                &Shape::new(vec![1, vocab_size]),
+            )?
+            .0;
+        let bonus_probs = dev.softmax(bonus_row.as_ref(), &Shape::new(vec![1, vocab_size]))?.0;
+        dev.write_rows(t_buf.as_mut(), k, bonus_probs.as_ref(), 1, vocab_size)?;
 
         let d_rows = dev
             .narrow_rows(
@@ -295,12 +310,27 @@ impl grim_speculative::speculative_wrapper::SpeculativeVerifier for RocmSpeculat
         // accepted_lens holds the kernel's count: all-accepted = K drafts +
         // bonus (K+1); rejected at j = j drafts + 1 residual (j+1). The
         // wrapper's contract counts DRAFT acceptances only, so subtract the
-        // trailing sampled token.
+        // trailing sampled token. `at` contains the exact emitted ids,
+        // including the residual/bonus token that used to be discarded.
         let lens = al.to_cpu_vec_f32()?;
         let accepted_len = lens
             .first()
             .map(|v| v.to_bits() as usize)
-            .unwrap_or(0);
-        Ok(accepted_len.saturating_sub(1).min(k))
+            .unwrap_or(0)
+            .min(k + 1);
+        let accepted_count = accepted_len.saturating_sub(1).min(k);
+        let emitted_tokens = if accepted_len == 0 {
+            Vec::new()
+        } else {
+            at.to_cpu_vec_f32()?
+                .into_iter()
+                .take(accepted_len)
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        Ok(grim_speculative::speculative_wrapper::VerificationOutcome {
+            accepted_count,
+            emitted_tokens,
+        })
     }
 }

@@ -194,33 +194,39 @@ __global__ void grim_speculative_tree_verify(
     int max_path_len,
     int vocab_size
 ) {
-    __shared__ int s_best_len;
-    __shared__ int s_best_idx;
-    if (threadIdx.x == 0 && blockIdx.x == 0) { s_best_len = 0; s_best_idx = 0; }
-    __syncthreads();
-
-    const int path_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (path_id >= num_paths) return;
-
-    const int plen = path_lens[path_id];
+    // Single-block deterministic reduction (see the ROCm twin).
+    __shared__ int s_len[256];
+    __shared__ int s_idx[256];
+    const int tid = threadIdx.x;
+    const int path_id = tid;
     int accepted = 0;
-
-    for (int step = 0; step < plen && step < max_path_len; ++step) {
-        int draft_tok = candidate_paths[path_id * max_path_len + step];
-        const float* step_logits = target_logits + step * vocab_size;
-        float mval = -1e30f; int marg = 0;
-        for (int v = 0; v < vocab_size; ++v) {
-            if (step_logits[v] > mval) { mval = step_logits[v]; marg = v; }
+    if (blockIdx.x == 0 && path_id < num_paths) {
+        const int plen = path_lens[path_id];
+        for (int step = 0; step < plen && step < max_path_len; ++step) {
+            int draft_tok = candidate_paths[path_id * max_path_len + step];
+            const float* step_logits = target_logits + step * vocab_size;
+            float mval = -1e30f; int marg = 0;
+            for (int v = 0; v < vocab_size; ++v) {
+                if (step_logits[v] > mval) { mval = step_logits[v]; marg = v; }
+            }
+            if (draft_tok == marg) accepted++;
+            else break;
         }
-        if (draft_tok == marg) accepted++;
-        else break;
     }
-
-    atomicMax(&s_best_len, accepted);
+    s_len[tid] = accepted;
+    s_idx[tid] = (blockIdx.x == 0 && path_id < num_paths) ? path_id : 0x7fffffff;
     __syncthreads();
-    if (accepted == s_best_len && threadIdx.x == 0) {
-        atomicExch(best_accepted_len, s_best_len);
-        atomicExch(best_path_idx, path_id);
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            bool better = (s_len[tid + stride] > s_len[tid])
+                || (s_len[tid + stride] == s_len[tid] && s_idx[tid + stride] < s_idx[tid]);
+            if (better) { s_len[tid] = s_len[tid + stride]; s_idx[tid] = s_idx[tid + stride]; }
+        }
+        __syncthreads();
+    }
+    if (blockIdx.x == 0 && tid == 0) {
+        atomicExch(best_accepted_len, s_len[0]);
+        atomicExch(best_path_idx, s_idx[0] == 0x7fffffff ? 0 : s_idx[0]);
     }
 }
 

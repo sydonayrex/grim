@@ -148,6 +148,15 @@ pub trait SessionT: Send {
     }
     fn set_last_accepted_tokens(&mut self, _n: usize) {}
 
+    /// Exact token ids emitted by the most recent speculative verify, when the
+    /// verifier performed rejection/residual sampling. Empty means "sample from
+    /// the returned logits as usual" (the default for greedy and non-speculative
+    /// paths). Length, when non-empty, equals `last_accepted_tokens()`.
+    fn emitted_token_ids(&self) -> &[u32] {
+        &[]
+    }
+    fn set_emitted_token_ids(&mut self, _ids: Vec<u32>) {}
+
     /// Hint to skip output LM head projection (useful for intermediate prefill chunks).
     fn skip_output_projection(&self) -> bool {
         false
@@ -231,6 +240,8 @@ pub struct Inner {
     pub request_rng: Option<SimpleRng>,
     /// Last speculative accept count from decode_one.
     pub last_accepted_tokens: usize,
+    /// Exact token ids emitted by a stochastic speculative verify (empty otherwise).
+    pub emitted_token_ids: Vec<u32>,
     /// Hint to skip output LM head projection on non-terminal prefill chunks.
     pub skip_output_projection: bool,
     /// Return full per-position logits (e.g. speculative verify). Default false.
@@ -259,6 +270,7 @@ impl Inner {
             model_state: None,
             request_rng: None,
             last_accepted_tokens: 1,
+            emitted_token_ids: Vec::new(),
             skip_output_projection: false,
             full_output_logits: false,
             sampling_greedy: false,
@@ -278,6 +290,7 @@ impl Inner {
             model_state: None,
             request_rng: None,
             last_accepted_tokens: 1,
+            emitted_token_ids: Vec::new(),
             skip_output_projection: false,
             full_output_logits: false,
             sampling_greedy: false,
@@ -387,6 +400,12 @@ impl SessionT for Inner {
     }
     fn set_last_accepted_tokens(&mut self, n: usize) {
         self.last_accepted_tokens = n;
+    }
+    fn emitted_token_ids(&self) -> &[u32] {
+        &self.emitted_token_ids
+    }
+    fn set_emitted_token_ids(&mut self, ids: Vec<u32>) {
+        self.emitted_token_ids = ids;
     }
     fn skip_output_projection(&self) -> bool {
         self.skip_output_projection

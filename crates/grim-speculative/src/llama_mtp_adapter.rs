@@ -80,6 +80,17 @@ impl NativeMtp for LlamaMtpAdapter {
         _positions: &Tensor,
         base_logits: &Tensor,
     ) -> Result<DraftBlock> {
+        // The Llama MTP layers expose token ids but not per-step draft-head
+        // distributions. Without real q there is no lossless rejection sampler,
+        // so decline to draft in stochastic mode (the wrapper then runs the
+        // plain target forward). Greedy verification does not need q.
+        if !session.sampling_greedy() {
+            return Ok(DraftBlock {
+                tokens: vec![],
+                base_logits: empty_logits(),
+                confidence: vec![],
+            });
+        }
         let tokens = self.inner.predict_mtp_tokens_after_forward(session, base_logits)?;
 
         if tokens.is_empty() {

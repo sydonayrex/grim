@@ -232,7 +232,10 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("tree_verify: best_accepted_len has no device ptr".into()))?;
 
-        let grid_dim = crate::HipDim3::new((num_paths as u32).div_ceil(256), 1, 1);
+        // One block owns the whole reduction; paths beyond 256 are handled by
+        // the caller in multiple launches (the kernel's shared arrays are 256
+        // entries). This keeps the reduction deterministic and fully initialised.
+        let grid_dim = crate::HipDim3::new(1, 1, 1);
         let block_dim = crate::HipDim3::new(256, 1, 1);
 
         let mut cpptr = cp_ptr;

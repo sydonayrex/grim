@@ -36,12 +36,12 @@ fn cpu_verify(
         };
         let p_target = softmax_at(t_row);
         let p_draft = softmax_at(d_row);
-        let p_accept = if p_draft > 1e-10 {
+        let p_accept = if p_draft > 0.0 {
             (p_target / p_draft).min(1.0)
         } else {
-            0.0
+            1.0
         };
-        if uniforms[i] < p_accept {
+        if uniforms[i] <= p_accept {
             accepted += 1;
         } else {
             break;
@@ -63,7 +63,7 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
     let context_len = 1usize;
 
     // Deterministic logits: target rows ctx..ctx+K, draft rows 0..K.
-    let mut target = Vec::with_capacity((context_len + k) * vocab);
+    let mut target = Vec::with_capacity((context_len + k + 1) * vocab);
     let mut state = 0x243F6A8885A308D3u64;
     let mut rand = move || {
         state ^= state << 13;
@@ -71,7 +71,7 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
         state ^= state << 17;
         (state >> 11) as f32 / (1u64 << 53) as f32
     };
-    for _ in 0..(context_len + k) * vocab {
+    for _ in 0..(context_len + k + 1) * vocab {
         target.push(rand() * 10.0 - 5.0);
     }
     let mut draft = Vec::with_capacity(k * vocab);
@@ -119,7 +119,7 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
     let target_dev = CoreTensorOps::from_cpu(
         &dev,
         &target,
-        &Shape::new(vec![context_len + k, vocab]),
+        &Shape::new(vec![context_len + k + 1, vocab]),
         DType::F32,
     )?;
     let draft_dev = CoreTensorOps::from_cpu(
@@ -130,7 +130,7 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
     )?;
     let target_t = Tensor::new(
         std::sync::Arc::from(target_dev),
-        Shape::new(vec![context_len + k, vocab]),
+        Shape::new(vec![context_len + k + 1, vocab]),
         DType::F32,
         grim_tensor::dtype::QuantProvenance::default(),
         grim_tensor::Device::Rocm(0),
@@ -144,7 +144,7 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
     );
 
     let verifier = RocmSpeculativeVerifier;
-    let accepted = verifier.verify(
+    let outcome = verifier.verify(
         &target_t,
         &draft_t,
         context_len,
@@ -152,6 +152,7 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
         &draft_tokens,
         &uniforms,
     )?;
+    let accepted = outcome.accepted_count;
     assert_eq!(
         accepted, expected,
         "GPU verify accepted-count diverges from CPU loop (uniforms identical)"
@@ -166,17 +167,19 @@ fn gpu_speculative_verify_matches_cpu() -> TestResult {
         let case_dev = CoreTensorOps::from_cpu(
             &dev,
             &logits,
-            &Shape::new(vec![context_len + k, vocab]),
+            &Shape::new(vec![context_len + k + 1, vocab]),
             DType::F32,
         )?;
         let case_t = Tensor::new(
             std::sync::Arc::from(case_dev),
-            Shape::new(vec![context_len + k, vocab]),
+            Shape::new(vec![context_len + k + 1, vocab]),
             DType::F32,
             grim_tensor::dtype::QuantProvenance::default(),
             grim_tensor::Device::Rocm(0),
         );
-        let got = verifier.verify(&case_t, &draft_t, context_len, vocab, &draft_tokens, &uniforms)?;
+        let got = verifier
+            .verify(&case_t, &draft_t, context_len, vocab, &draft_tokens, &uniforms)?
+            .accepted_count;
         assert_eq!(
             got, expected_c,
             "GPU verify diverges from CPU on case {name}: got={got}, cpu={expected_c}"

@@ -86,6 +86,16 @@ impl<M: CausalLm + MtpDepthProvider + 'static> NativeMtp for MtpProviderAdapter<
         _positions: &Tensor,
         base_logits: &Tensor,
     ) -> Result<DraftBlock> {
+        // MtpDepthProvider exposes ids but not per-step draft distributions.
+        // Stochastic speculation without real q cannot be lossless; decline
+        // and let the wrapper use the plain target forward instead.
+        if !session.sampling_greedy() {
+            return Ok(DraftBlock {
+                tokens: Vec::new(),
+                base_logits: empty_logits(),
+                confidence: Vec::new(),
+            });
+        }
         let tokens = self
             .inner
             .predict_mtp_tokens_after_forward(session, base_logits)?;
