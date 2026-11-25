@@ -3539,6 +3539,127 @@ impl Model for Qwen35 {
     }
 }
 
+impl Qwen35 {
+    /// Speculative tree verification with correct per-path replay.
+    ///
+    /// This returns one target distribution per tree node (`[nodes, vocab]`)
+    /// by replaying each root-to-leaf prefix through the existing causal
+    /// forward and restoring session/recurrent state between paths. It is
+    /// correct for the interleaved KDA layers (which have a single evolving
+    /// state), but costs O(paths) forwards; a true packed single-pass trunk is
+    /// a separate, larger increment.
+    pub fn forward_tree(
+        &self,
+        session: &mut dyn SessionT,
+        tokens: &[u32],
+        depths: &[usize],
+        _parents: &[u32],
+        base_pos: u32,
+        adapters: &[AdapterHandle],
+    ) -> Result<Option<Tensor>> {
+        if tokens.is_empty() || tokens.len() != depths.len() {
+            return Ok(None);
+        }
+        if self.device().is_cpu() {
+            return Ok(None); // no CPU tree-attention implementation
+        }
+        if kv_quant_format().is_some() {
+            return Err(grim_core::error::Error::Unimplemented(
+                "Qwen35::forward_tree: paged quantized KV is unsupported; rerun with GRIM_KV_QUANT=off and GRIM_KV_ARENA=f32".into(),
+            ));
+        }
+        let arena = kv_arena_format_qwen(&self.device);
+        if arena != grim_backend_rocm::KvArenaFormat::F32 {
+            return Err(grim_core::error::Error::Unimplemented(format!(
+                "Qwen35::forward_tree: KV arena {arena:?} is unsupported; tree verification requires F32 (GRIM_KV_ARENA=f32)"
+            )));
+        }
+        if self.blocks.iter().any(|b| b.head_dim > 256) {
+            return Err(grim_core::error::Error::Unimplemented(
+                "Qwen35::forward_tree: head_dim > 256 is unsupported by tree attention".into(),
+            ));
+        }
+        let vocab = self.cfg.vocab_size;
+        let hidden = session.get_last_hidden_state().ok_or_else(|| {
+            grim_core::error::Error::Session(
+                "Qwen35::forward_tree: missing post-base hidden state".into(),
+            )
+        })?;
+        let normed = self.output_norm.forward(&hidden)?;
+        let normed = crate::decode_graph::hadamard_transform_tensor(&normed, usize::MAX, "output")
+            .unwrap_or(normed);
+        let base_logits = self.output.forward(&normed)?;
+        let base_flat = base_logits.to_vec_f32()?;
+        if base_flat.len() < vocab {
+            return Err(grim_core::error::Error::Backend(
+                "Qwen35::forward_tree: base head produced too few logits".into(),
+            ));
+        }
+        let base_row = base_flat[base_flat.len() - vocab..].to_vec();
+        let n = tokens.len();
+        let mut rows: Vec<Vec<f32>> = vec![vec![0.0f32; vocab]; n];
+        for i in 0..n {
+            // Reconstruct the root-to-node path from BFS depths: the parent
+            // of a node at depth d is the nearest earlier node at depth d-1.
+            let mut path = vec![i];
+            let mut cur = i;
+            while depths[cur] > 0 {
+                let want = depths[cur] - 1;
+                let Some(parent) = (0..cur).rev().find(|&j| depths[j] == want) else {
+                    return Err(grim_core::error::Error::Config(format!(
+                        "Qwen35::forward_tree: no parent at depth {want} for node {cur}"
+                    )));
+                };
+                path.push(parent);
+                cur = parent;
+            }
+            path.reverse();
+            if depths[i] == 0 {
+                rows[i] = base_row.clone();
+                continue;
+            }
+            let saved_hidden = session.get_last_hidden_state();
+            let saved_full = session.full_output_logits();
+            let saved_skip = session.skip_output_projection();
+            let saved_argmax = session.take_device_argmax();
+            let saved_token = session.last_sampled_token();
+            let snap = session.snapshot_recurrent_state()?;
+            let prefix = &path[..path.len() - 1];
+            let ids: Vec<f32> = prefix.iter().map(|&j| tokens[j] as f32).collect();
+            let pos: Vec<f32> = prefix
+                .iter()
+                .map(|&j| (base_pos + depths[j] as u32) as f32)
+                .collect();
+            let input = grim_backend_cpu::cpu_tensor(ids, grim_tensor::Shape::new(vec![prefix.len()]));
+            let positions = grim_backend_cpu::cpu_tensor(pos, grim_tensor::Shape::new(vec![prefix.len()]));
+            let result = self.forward(session, &input, &positions, adapters);
+            if let Some(snap) = snap {
+                session.restore_recurrent_state(snap)?;
+            }
+            if let Some(h) = saved_hidden {
+                session.set_last_hidden_state(h);
+            }
+            session.set_full_output_logits(saved_full);
+            session.set_skip_output_projection(saved_skip);
+            session.set_device_argmax(saved_argmax);
+            session.set_last_sampled_token(saved_token);
+            let logits = result?;
+            let flat = logits.to_vec_f32()?;
+            if flat.len() < vocab {
+                return Err(grim_core::error::Error::Backend(
+                    "Qwen35::forward_tree: replay produced too few logits".into(),
+                ));
+            }
+            rows[i] = flat[flat.len() - vocab..].to_vec();
+        }
+        let flat: Vec<f32> = rows.into_iter().flatten().collect();
+        Ok(Some(grim_backend_cpu::cpu_tensor(
+            flat,
+            grim_tensor::Shape::new(vec![n, vocab]),
+        )))
+    }
+}
+
 impl CausalLm for Qwen35 {
     fn new_session(&self) -> Box<dyn SessionT> {
         let caches: Vec<Qwen35LayerCache> = (0..self.blocks.len())

@@ -245,6 +245,19 @@ impl NativeMtp for Qwen35MtpAdapter {
         self.qwen()?.commit_graph_spec_state(graph_slot)
     }
 
+    fn forward_tree(
+        &self,
+        session: &mut dyn SessionT,
+        tokens: &[u32],
+        depths: &[usize],
+        parents: &[u32],
+        base_pos: u32,
+        adapters: &[grim_core::model::AdapterHandle],
+    ) -> Result<Option<Tensor>> {
+        self.qwen()?
+            .forward_tree(session, tokens, depths, parents, base_pos, adapters)
+    }
+
     fn append_replay_record(
         &self,
         graph_slot: &mut Option<Box<dyn std::any::Any + Send>>,

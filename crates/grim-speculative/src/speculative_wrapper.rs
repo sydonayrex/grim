@@ -1139,6 +1139,7 @@ impl SpeculativeCausalLm {
             kv.tentative_append(tree.nodes.len())?;
             kv.commit(verification.emitted_tokens.len().saturating_sub(1))?;
         }
+        session.advance_pos(verification.emitted_tokens.len().max(1));
         if let Some(&last) = verification.emitted_tokens.last() {
             session.set_last_sampled_token(Some(last));
         }
