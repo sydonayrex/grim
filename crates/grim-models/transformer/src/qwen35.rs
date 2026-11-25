@@ -2371,6 +2371,41 @@ impl Qwen35Nextn {
         };
         Ok((block_out, logits))
     }
+
+    /// Batched prompt-prefill KV backfill for the nextn block (`blk.64`).
+    /// Runs `eh_proj([enorm(embed_shifted); hnorm(h_shifted)])` through `self.block`
+    /// at `positions` (`0..N-1`) so `nextn.cache` holds full prompt KV history before
+    /// the first decode draft step.
+    pub fn backfill_prefill(
+        &self,
+        embed_shifted: &Tensor,
+        h_shifted: &Tensor,
+        positions: &[u32],
+        cache: &mut Qwen35LayerCache,
+    ) -> Result<()> {
+        let target_device = h_shifted.device();
+        let embed_shifted = if embed_shifted.device() == target_device {
+            embed_shifted.clone()
+        } else {
+            grim_nn::modules::move_to_device(embed_shifted, target_device)?
+        };
+        let e = self.enorm.forward(&embed_shifted)?;
+        let h = self.hnorm.forward(h_shifted)?;
+        let e = if e.device() == target_device {
+            e
+        } else {
+            grim_nn::modules::move_to_device(&e, target_device)?
+        };
+        let h = if h.device() == target_device {
+            h
+        } else {
+            grim_nn::modules::move_to_device(&h, target_device)?
+        };
+        let x_in = grim_nn::modules::concat_2d_horizontal_on_device(&e, &h)?;
+        let x = self.eh_proj.forward(&x_in)?;
+        let _ = self.block.forward(&x, positions, cache)?;
+        Ok(())
+    }
 }
 
 fn qwen35_mtp_mode() -> String {
@@ -2762,6 +2797,8 @@ impl SessionT for Qwen35Session {
     fn batch_pressure(&self) -> usize { self.inner.batch_pressure() }
     fn last_accepted_tokens(&self) -> usize { self.inner.last_accepted_tokens() }
     fn set_last_accepted_tokens(&mut self, n: usize) { self.inner.set_last_accepted_tokens(n) }
+    fn emitted_token_ids(&self) -> &[u32] { self.inner.emitted_token_ids() }
+    fn set_emitted_token_ids(&mut self, ids: Vec<u32>) { self.inner.set_emitted_token_ids(ids) }
     fn skip_output_projection(&self) -> bool { self.inner.skip_output_projection() }
     fn set_skip_output_projection(&mut self, skip: bool) { self.inner.set_skip_output_projection(skip) }
     fn full_output_logits(&self) -> bool { self.inner.full_output_logits() }
@@ -3972,6 +4009,55 @@ impl CausalLm for Qwen35 {
                     h.device().clone(),
                 );
                 session.set_last_hidden_state(last_h);
+
+                // Backfill nextn KV cache with all prompt positions 0..rows-1
+                // using (embed(tok[1..rows]), h[0..rows-1]) so nextn attends over
+                // the full prompt history on the first decode draft step.
+                if let Some(nextn) = self.nextn.as_ref() {
+                    let backfill_on = !matches!(
+                        std::env::var("GRIM_MTP_NEXTN_BACKFILL").as_deref(),
+                        Ok("0" | "false" | "off")
+                    );
+                    if backfill_on && ids.len() == rows && positions_vec.len() == rows {
+                        let n_shift = rows - 1;
+                        let shift_shape = grim_tensor::Shape::new(vec![n_shift, hidden]);
+                        let (h_shift_storage, _h_handle) =
+                            dev.narrow_rows(h.storage().as_ref(), 0, n_shift, hidden, &shift_shape)?;
+                        let h_shift = grim_tensor::Tensor::new(
+                            std::sync::Arc::from(h_shift_storage),
+                            shift_shape,
+                            h.dtype().clone(),
+                            h.provenance().clone(),
+                            h.device().clone(),
+                        );
+                        let mut embed_shift =
+                            self.tok_embeddings.forward(&ids[1..rows], n_shift, hidden)?;
+                        if std::env::var_os("GRIM_EAGER_INVERSE").as_deref()
+                            != Some(std::ffi::OsStr::new("0"))
+                        {
+                            if let Some(plan) = &self.hadamard_plan {
+                                if plan.inverse.contains("token_embd.weight") {
+                                    embed_shift = crate::decode_graph::hadamard_inverse_token_embd(
+                                        &embed_shift,
+                                        hidden,
+                                    )?;
+                                }
+                            }
+                        }
+                        let pos_shift = &positions_vec[0..n_shift];
+                        let mut cache_guard =
+                            nextn.cache.lock().unwrap_or_else(|e| e.into_inner());
+                        let (ref mut cache_opt, ref mut pos_log) = *cache_guard;
+                        let cache =
+                            cache_opt.get_or_insert_with(|| Qwen35LayerCache::new(&self.cfg));
+                        if pos_shift.first().copied() == Some(0) {
+                            cache.current_pos = 0;
+                            pos_log.clear();
+                        }
+                        nextn.backfill_prefill(&embed_shift, &h_shift, pos_shift, cache)?;
+                        pos_log.extend_from_slice(pos_shift);
+                    }
+                }
             }
         }
 

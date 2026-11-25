@@ -1905,7 +1905,7 @@ pub async fn cmd_run(
             .downcast_ref::<grim_models_transformer::Qwen38FlashNextMtp>()
             .map(|m| grim_models_transformer::MtpDepthProvider::mtp_depth(m))
             .unwrap_or(0);
-        if wants_mtp && qwen_has_mtp {
+        if wants_mtp && qwen_has_mtp && std::env::var("GRIM_SCORE_MTP_EVAL").as_deref() != Ok("1") {
             let depth = model
                 .as_any()
                 .downcast_ref::<grim_models_transformer::Qwen35>()
@@ -1947,7 +1947,9 @@ pub async fn cmd_run(
             );
             wrapped.set_gpu_verifier(Arc::new(grim_engine::RocmSpeculativeVerifier));
             Box::new(wrapped) as Box<dyn CausalLm>
-        } else if mtp_mode == "on" {
+        } else if mtp_mode == "on"
+            && std::env::var("GRIM_SCORE_MTP_EVAL").as_deref() != Ok("1")
+        {
             return Err(grim_core::error::Error::Config(
                 "GRIM_MTP=on but native MTP is unavailable for this model/run (no loaded nextn block)"
                     .into(),
@@ -2205,6 +2207,20 @@ pub async fn cmd_run(
         let score_start = std::time::Instant::now();
 
         let dump_nll_path = std::env::var("GRIM_DUMP_NLL_FILE").ok();
+        let score_mtp_eval = std::env::var("GRIM_SCORE_MTP_EVAL").as_deref() == Ok("1");
+        let mut mtp_steps = 0usize;
+        let mut mtp_cum_hits = [0usize; 4];
+        let mut mtp_pos_hits = [0usize; 4];
+        let mut mtp_base_top1_hits = 0usize;
+        let dump_logits_path = std::env::var("GRIM_DUMP_LOGITS_FILE").ok();
+        let mut dump_logits_file = match &dump_logits_path {
+            Some(p) => Some(
+                std::fs::File::create(p).map_err(|e| {
+                    grim_core::error::Error::Backend(format!("dump logits create: {e}"))
+                })?,
+            ),
+            None => None,
+        };
         let mut per_pos_nll: Vec<(usize, f64, u32)> = Vec::new();
 
         if decode_mode {
@@ -2258,12 +2274,42 @@ pub async fn cmd_run(
                 let mut last_logits =
                     CausalLm::forward(&*model, &mut sess, &in_pref, &pos_pref, &[])?;
 
+                // KV4-RL (arXiv:2610.14448 Appendix B.5): 8 evenly spaced positions
+                // round(j * (L - 1) / 7) for j = 0..7 across the forced continuation.
+                let cont_len = (chunk_end - chunk_start).saturating_sub(prefill_len);
+                let mut dump_positions: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                if dump_logits_file.is_some() && cont_len > 0 {
+                    for j in 0..8usize {
+                        let rel = if cont_len == 1 {
+                            0
+                        } else {
+                            ((j as f64) * ((cont_len - 1) as f64) / 7.0).round() as usize
+                        };
+                        dump_positions.insert(prefill_len + rel);
+                    }
+                }
+
                 for local_pos in prefill_len..(chunk_end - chunk_start) {
                     let global_pos = chunk_start + local_pos;
                     let tgt = full[global_pos] as usize;
                     let lv = last_logits.to_vec_f32()?;
                     let last_start = lv.len().saturating_sub(vocab);
                     let row = &lv[last_start..];
+                    if let Some(ref mut f) = dump_logits_file {
+                        if dump_positions.contains(&local_pos) {
+                            use std::io::Write;
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    row.as_ptr() as *const u8,
+                                    row.len() * std::mem::size_of::<f32>(),
+                                )
+                            };
+                            f.write_all(bytes).map_err(|e| {
+                                grim_core::error::Error::Backend(format!("dump logits write: {e}"))
+                            })?;
+                        }
+                    }
                     let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let logsumexp: f32 = row
                         .iter()
@@ -2285,6 +2331,47 @@ pub async fn cmd_run(
                             }
                         }
                         per_pos_nll.push((global_pos, tok_nll, best_tok));
+                    }
+
+                    if score_mtp_eval {
+                        if let Some(qwen) = model.as_any().downcast_ref::<grim_models_transformer::Qwen35>() {
+                            let eval_depth = qwen.mtp_depth().min(4);
+                            if eval_depth > 0 && global_pos + eval_depth < full.len() {
+                                // Base trunk top-1 agreement with Ollama's actual next token
+                                let mut best_tok = 0u32;
+                                let mut best_val = f32::NEG_INFINITY;
+                                for (idx, &val) in row.iter().enumerate() {
+                                    if val > best_val {
+                                        best_val = val;
+                                        best_tok = idx as u32;
+                                    }
+                                }
+                                if best_tok == full[global_pos] {
+                                    mtp_base_top1_hits += 1;
+                                }
+                                if let Some(h_prev) = sess.get_last_hidden_state() {
+                                    if let Ok((drafts, _)) = qwen.predict_nextn_draft(
+                                        full[global_pos],
+                                        &h_prev,
+                                        (local_pos - 1) as u32,
+                                        eval_depth,
+                                    ) {
+                                        mtp_steps += 1;
+                                        let mut all_ok = true;
+                                        for k in 0..drafts.len().min(4) {
+                                            let hit = drafts[k] == full[global_pos + 1 + k];
+                                            if hit {
+                                                mtp_pos_hits[k] += 1;
+                                            }
+                                            all_ok = all_ok && hit;
+                                            if all_ok {
+                                                mtp_cum_hits[k] += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Step 1 token through M=1 decode
@@ -2315,6 +2402,23 @@ pub async fn cmd_run(
                 }
                 chunks += 1;
                 chunk_start += chunk_end - chunk_start;
+            }
+            if score_mtp_eval && mtp_steps > 0 {
+                let b_rate = mtp_base_top1_hits as f64 / mtp_steps as f64;
+                let cum_str: Vec<String> = mtp_cum_hits
+                    .iter()
+                    .map(|&h| format!("{:.3}", h as f64 / mtp_steps as f64))
+                    .collect();
+                let pos_str: Vec<String> = mtp_pos_hits
+                    .iter()
+                    .map(|&h| format!("{:.3}", h as f64 / mtp_steps as f64))
+                    .collect();
+                let mean_len = 1.0 + mtp_cum_hits.iter().sum::<usize>() as f64 / mtp_steps as f64;
+                eprintln!(
+                    "[mtp-tf-eval] steps={mtp_steps} base_top1={mtp_base_top1_hits}/{mtp_steps} ({b_rate:.3}) | cum_acc=({}) | pos_acc=({}) | mean_len={mean_len:.2}",
+                    cum_str.join(", "),
+                    pos_str.join(", ")
+                );
             }
         } else {
             while start + chunk_len + 1 <= full.len() {
@@ -2910,6 +3014,18 @@ pub async fn cmd_run(
                 }
 
                 if use_multi {
+                    // A stochastic speculative verify already performed rejection
+                    // sampling: its emitted ids (accepted drafts + residual/bonus)
+                    // are the only lossless tokens to output. Re-sampling these
+                    // rows would re-roll accepted drafts and lose the correction.
+                    let forced = session.emitted_token_ids().to_vec();
+                    if forced.len() == emitted {
+                        let mut hist = history.clone();
+                        for &tok in &forced {
+                            hist.push(tok);
+                        }
+                        forced
+                    } else {
                     // Multi-row emission (native MTP). Sample per-row on CPU to preserve
                     // per-token history/repeat-penalty semantics.
                     let logits_vec = logits.to_vec_f32()?;
@@ -2937,6 +3053,7 @@ pub async fn cmd_run(
                         toks.push(tok);
                     }
                     if toks.is_empty() { vec![0u32] } else { toks }
+                    }
                 } else {
                     // Single-row decode/prefill sampling (existing path).
                     let gpu_sample_ok = logits.shape().elem_count() == vocab
