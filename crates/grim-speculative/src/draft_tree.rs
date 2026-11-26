@@ -457,6 +457,170 @@ impl<T: Clone> TreeState<T> {
     }
 }
 
+impl DraftTree {
+    /// Phase 3B: Validate tree topology by strictly increasing depths
+    /// (`depth[0] == 0`, `parent < node`, `depth[node] == depth[parent] + 1`).
+    /// Eliminates ambiguity in `parents_u32` root sentinels.
+    pub fn validate_depths(&self) -> Result<(), String> {
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+        for (i, n) in self.nodes.iter().enumerate() {
+            match n.parent {
+                None => {
+                    if i != 0 || n.depth != 0 {
+                        return Err(format!("non-root node {i} has parent=None or depth={}", n.depth));
+                    }
+                }
+                Some(p) => {
+                    if p >= i {
+                        return Err(format!("node {i} has non-topological parent {p}"));
+                    }
+                    let pd = self.nodes[p].depth;
+                    if n.depth != pd + 1 {
+                        return Err(format!("node {i} depth {} != parent {p} depth {} + 1", n.depth, pd));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 3B: Return BFS row indices from root to `leaf` (inclusive) so
+    /// accepted-path KV compaction can pack non-contiguous BFS rows into
+    /// contiguous `[base_pos .. base_pos + accepted_len]`.
+    pub fn accepted_path_indices(&self, leaf: usize) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut cur = Some(leaf);
+        while let Some(idx) = cur {
+            if idx >= self.nodes.len() {
+                break;
+            }
+            path.push(idx);
+            cur = self.nodes[idx].parent;
+        }
+        path.reverse();
+        path
+    }
+}
+
+/// Phase 3B: Bounded-memory WY pseudo-value tree scan (`O(1)` recurrent state
+/// planes; never mutates `s0` during verification). For every node `u` in a
+/// topological BFS tree, computes the exact GDN output `o[u] = S_u @ q[u]`
+/// without cloning the `[D, D]` recurrent state per tree node.
+pub fn tree_wy_scan_cpu(
+    parents: &[Option<usize>],
+    s0: &[f32],   // [D, D] row-major initial state (read-only!)
+    q: &[Vec<f32>],
+    k: &[Vec<f32>],
+    v: &[Vec<f32>],
+    beta: &[f32],
+    g: &[f32],    // log-decay <= 0
+    d: usize,
+) -> Vec<Vec<f32>> {
+    let n = parents.len();
+    // Precompute cumulative log-decay G[u] from root and ancestor chains.
+    let mut g_cum = vec![0.0f32; n];
+    let mut ancestors: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for u in 0..n {
+        if let Some(p) = parents[u] {
+            g_cum[u] = g_cum[p] + g[u];
+            let mut chain = ancestors[p].clone();
+            chain.push(u);
+            ancestors.push(chain);
+        } else {
+            g_cum[u] = g[u];
+            ancestors.push(vec![u]);
+        }
+    }
+
+    // Solve WY pseudo-vectors w[u], u_vec[u] along each node's ancestor path,
+    // then delta[u] = u_vec[u] - S_0 @ w[u] using read-only S_0.
+    let mut w_all = vec![vec![0.0f32; d]; n];
+    let mut u_all = vec![vec![0.0f32; d]; n];
+    let mut delta_all = vec![vec![0.0f32; d]; n];
+    let mut out = vec![vec![0.0f32; d]; n];
+
+    for node in 0..n {
+        let chain = &ancestors[node];
+        let mut wt = vec![0.0f32; d];
+        let mut ut = vec![0.0f32; d];
+        let exp_g = g_cum[node].exp();
+        for i in 0..d {
+            wt[i] = beta[node] * exp_g * k[node][i];
+            ut[i] = beta[node] * v[node][i];
+        }
+        // Subtract strictly preceding ancestors in the path
+        for &anc in &chain[..chain.len() - 1] {
+            let dot_kk: f32 = (0..d).map(|i| k[node][i] * k[anc][i]).sum();
+            let l_na = beta[node] * (g_cum[node] - g_cum[anc]).exp() * dot_kk;
+            for i in 0..d {
+                wt[i] -= l_na * w_all[anc][i];
+                ut[i] -= l_na * u_all[anc][i];
+            }
+        }
+        // delta[node] = ut - S_0 @ wt
+        let mut dt = vec![0.0f32; d];
+        for r in 0..d {
+            let mut sw = 0.0f32;
+            let row = &s0[r * d..(r + 1) * d];
+            for c in 0..d {
+                sw += row[c] * wt[c];
+            }
+            dt[r] = ut[r] - sw;
+        }
+        w_all[node] = wt;
+        u_all[node] = ut;
+        delta_all[node] = dt;
+
+        // Output o[node] = exp(G[node]) * (S_0 @ q[node]) + sum_{anc in chain} exp(G[node] - G[anc]) * (q[node] . k[anc]) * delta[anc]
+        let mut o = vec![0.0f32; d];
+        for r in 0..d {
+            let row = &s0[r * d..(r + 1) * d];
+            let mut sq = 0.0f32;
+            for c in 0..d {
+                sq += row[c] * q[node][c];
+            }
+            o[r] = exp_g * sq;
+        }
+        for &anc in chain {
+            let dot_qk: f32 = (0..d).map(|i| q[node][i] * k[anc][i]).sum();
+            let coeff = (g_cum[node] - g_cum[anc]).exp() * dot_qk;
+            for r in 0..d {
+                o[r] += coeff * delta_all[anc][r];
+            }
+        }
+        out[node] = o;
+    }
+    out
+}
+
+/// Phase 3C: HybridSpec Dinkelbach optimal speculative depth rule.
+/// Maximizes expected tokens/ms: `E[accepted(k)] / (t_verify(k) + k * t_draft)`
+/// where `E[accepted(k)] = (1 - p^(k+1)) / (1 - p)` (or `k + 1` when `p >= 1`).
+pub fn dinkelbach_optimal_depth(
+    p_accept: f64,
+    t_draft_ms: f64,
+    t_verify_ms_by_k: &[f64], // index k = speculative depth (0..max_k)
+) -> (usize, f64) {
+    let mut best_k = 0usize;
+    let mut best_tps = 0.0f64;
+    for (k, &t_ver) in t_verify_ms_by_k.iter().enumerate() {
+        let e_acc = if (1.0 - p_accept).abs() < 1e-9 {
+            (k + 1) as f64
+        } else {
+            (1.0 - p_accept.powi((k + 1) as i32)) / (1.0 - p_accept)
+        };
+        let t_total = t_ver + (k as f64) * t_draft_ms;
+        let tps = if t_total > 0.0 { e_acc * 1000.0 / t_total } else { 0.0 };
+        if tps > best_tps {
+            best_tps = tps;
+            best_k = k;
+        }
+    }
+    (best_k, best_tps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +730,75 @@ mod tests {
         );
         assert_eq!(r.best_node, None);
         assert_eq!(r.emitted_tokens.len(), 1);
+    }
+
+    #[test]
+    fn tree_wy_scan_matches_path_replay_to_1e6() {
+        // 7-node branching tree: 0 -> {1, 2}, 1 -> {3, 4}, 2 -> {5, 6}
+        let parents = vec![None, Some(0), Some(0), Some(1), Some(1), Some(2), Some(2)];
+        let d = 16usize;
+        let mut rng = 0x1357_2468_ace0_bdf1u64;
+        let mut next_f = || -> f32 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 40) as f32 / (1u64 << 24) as f32) * 0.6 - 0.3
+        };
+        let s0: Vec<f32> = (0..d * d).map(|_| next_f()).collect();
+        let n = parents.len();
+        let q: Vec<Vec<f32>> = (0..n).map(|_| (0..d).map(|_| next_f()).collect()).collect();
+        let k: Vec<Vec<f32>> = (0..n).map(|_| (0..d).map(|_| next_f()).collect()).collect();
+        let v: Vec<Vec<f32>> = (0..n).map(|_| (0..d).map(|_| next_f()).collect()).collect();
+        let beta: Vec<f32> = (0..n).map(|_| 0.2 + next_f().abs()).collect();
+        let g: Vec<f32> = (0..n).map(|_| -0.05 - next_f().abs() * 0.2).collect();
+
+        let wy_out = tree_wy_scan_cpu(&parents, &s0, &q, &k, &v, &beta, &g, d);
+
+        // Oracle: independent sequential GDN replay from s0 along each node's root->node path
+        let mut max_abs = 0.0f32;
+        for target_node in 0..n {
+            let mut chain = Vec::new();
+            let mut cur = Some(target_node);
+            while let Some(c) = cur {
+                chain.push(c);
+                cur = parents[c];
+            }
+            chain.reverse();
+
+            let mut s = s0.clone();
+            let mut o_ref = vec![0.0f32; d];
+            for &u in &chain {
+                let decay = g[u].exp();
+                for r in 0..d {
+                    let row = &mut s[r * d..(r + 1) * d];
+                    let mut pred = 0.0f32;
+                    for c in 0..d {
+                        row[c] *= decay;
+                        pred += row[c] * k[u][c];
+                    }
+                    let delta = beta[u] * (v[u][r] - pred);
+                    let mut acc = 0.0f32;
+                    for c in 0..d {
+                        row[c] += delta * k[u][c];
+                        acc += row[c] * q[u][c];
+                    }
+                    o_ref[r] = acc;
+                }
+            }
+            for r in 0..d {
+                max_abs = max_abs.max((wy_out[target_node][r] - o_ref[r]).abs());
+            }
+        }
+        assert!(max_abs < 1e-6, "TreeWY vs path replay mismatch: max_abs={max_abs}");
+    }
+
+    #[test]
+    fn dinkelbach_selects_optimal_depth_on_28k_timings() {
+        // Measured Qwen3.8-27B 28k timings: M=1 60.49 ms, M=2 75.68 ms (p=0.885),
+        // hypothetical M=3 91 ms, M=4 107 ms; draft ~2.5 ms/step.
+        let (best_k, best_tps) = dinkelbach_optimal_depth(0.885, 2.5, &[60.49, 75.68, 91.0, 107.0]);
+        assert!(best_k >= 1, "Dinkelbach should enable speculation at p=0.885");
+        assert!(best_tps > 23.0, "expected >23 tok/s, got {best_tps:.2}");
+        // At low acceptance p=0.10, Dinkelbach must select k=0 (no speculation).
+        let (low_k, _) = dinkelbach_optimal_depth(0.10, 2.5, &[60.49, 75.68, 91.0]);
+        assert_eq!(low_k, 0);
     }
 }
