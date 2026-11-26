@@ -2936,6 +2936,97 @@ extern "C" __global__ void grim_kda_gated_delta_rule_scan_v2(
     }
 }
 
+// Register-resident variant of grim_kda_gated_delta_rule_scan_v2 for head_dim == 128.
+// Loads each thread's 128-element state row s_row[0..128] into VGPRs once before the
+// token loop and writes it back once after, eliminating 3 * 128 * 4 B/thread/token of
+// global memory traffic while preserving bit-exact F32 arithmetic order.
+extern "C" __global__ void grim_kda_gated_delta_rule_scan_v3_reg128(
+    const float* __restrict__ conv_out_seq,
+    const float* __restrict__ alpha_seq,
+    const float* __restrict__ beta_seq,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ norm_weight,
+    const float* __restrict__ z_seq,
+    float* __restrict__ S,
+    float* __restrict__ out_seq,
+    int seq_len, int num_v, int num_k, int head_dim, float eps, int has_z)
+{
+    const int h = blockIdx.x;
+    const int j = threadIdx.x;
+
+    __shared__ float s_nk[128];
+    __shared__ float s_nq[128];
+    __shared__ float s_red[32];
+
+    const int key_dim = num_k * 128;
+    const int value_dim = num_v * 128;
+    const int conv_dim = 2 * key_dim + value_dim;
+    float* s_row = S + ((long long)h * 128 + j) * 128;
+    const float rstd_d = rsqrtf(128.0f);
+    const float dt_b = dt_bias[h];
+    const float a_h = ssm_a[h];
+    const float nw_j = norm_weight[j];
+    const int kh_off = (h % num_k) * 128;
+
+    float s_reg[128];
+    #pragma unroll 4
+    for (int i = 0; i < 128; ++i) {
+        s_reg[i] = s_row[i];
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        const float* conv_tok = conv_out_seq + (long long)t * conv_dim;
+        const float qq = kda_silu_dev(conv_tok[kh_off + j]);
+        const float kk = kda_silu_dev(conv_tok[key_dim + kh_off + j]);
+        const float vv = kda_silu_dev(conv_tok[2 * key_dim + h * 128 + j]);
+
+        const float alpha_t = alpha_seq[(long long)t * num_v + h];
+        const float beta_t = beta_seq[(long long)t * num_v + h];
+        const float gate = kda_softplus_dev(alpha_t + dt_b) * a_h;
+        const float beta_val = 1.0f / (1.0f + expf(-beta_t));
+        const float decay = expf(gate);
+
+        const float kden = sqrtf(kda_block_sum(kk * kk, s_red) + eps);
+        const float qden = sqrtf(kda_block_sum(qq * qq, s_red) + eps);
+
+        s_nk[j] = (kden > 0.0f) ? (kk / kden) : kk;
+        s_nq[j] = (qden > 0.0f) ? (qq / qden) : qq;
+        __syncthreads();
+
+        float pred = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; ++i) {
+            pred += s_nk[i] * (decay * s_reg[i]);
+        }
+        const float delta = beta_val * (vv - pred);
+
+        float a = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; ++i) {
+            const float s2 = decay * s_reg[i] + s_nk[i] * delta;
+            s_reg[i] = s2;
+            a += s_nq[i] * s2;
+        }
+        const float a_scaled = a * rstd_d;
+
+        const float ss = kda_block_sum(a_scaled * a_scaled, s_red);
+        const float inv_rms = 1.0f / sqrtf(ss * rstd_d * rstd_d + eps);
+        float g = 1.0f;
+        if (has_z && z_seq) {
+            const float zv = z_seq[(long long)t * value_dim + h * 128 + j];
+            g = zv / (1.0f + expf(-zv));
+        }
+        out_seq[(long long)t * value_dim + h * 128 + j] = a_scaled * inv_rms * nw_j * g;
+        __syncthreads();
+    }
+
+    #pragma unroll 4
+    for (int i = 0; i < 128; ++i) {
+        s_row[i] = s_reg[i];
+    }
+}
+
 extern "C" __global__ void grim_kda_gated_delta_rule_scan(
     const float* conv_out_seq,  // [seq_len, conv_dim]
     const float* alpha_seq,     // [seq_len, num_v]

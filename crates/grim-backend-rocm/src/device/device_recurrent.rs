@@ -584,7 +584,19 @@ impl RecurrentOps for RocmDevice {
         // serial 32-thread tail pass. Measured 681.8 -> see
         // tests/kda_scan_bench.rs. head_dim > 1024 cannot use v2 (shared
         // arrays are 1024) and falls back to v1.
-        let (grid, block, kernel) = if head_dim <= 1024 {
+        let use_reg128 = head_dim == 128
+            && seq_len >= 16
+            && !matches!(
+                std::env::var("GRIM_KDA_SCAN_REG").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+        let (grid, block, kernel) = if use_reg128 {
+            (
+                num_value_heads as u32,
+                128u32,
+                "grim_kda_gated_delta_rule_scan_v3_reg128",
+            )
+        } else if head_dim <= 1024 {
             (
                 num_value_heads as u32,
                 head_dim as u32,
