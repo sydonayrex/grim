@@ -3365,6 +3365,331 @@ extern "C" __global__ void grim_xing_q_absorb(
     for (int d = 0; d < nope; ++d) acc += q[d] * w[d];
     q_abs[idx] = acc;
 }
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+typedef _Float16 gdn_half8 __attribute__((ext_vector_type(8)));
+typedef float gdn_float8 __attribute__((ext_vector_type(8)));
+
+// Phase 1B: Chunked GDN prefill scan (C=32 WY recurrence + RDNA4 WMMA).
+// Keeps persistent state S[128][128] in F32 VGPRs across chunks (zero F32 drift),
+// and executes S_0 @ W^T, S_0 @ Q_scaled^T, and S += delta_scaled @ K via WMMA.
+extern "C" __global__ void grim_kda_gated_delta_rule_scan_v4_wy32(
+    const float* __restrict__ conv_out_seq,
+    const float* __restrict__ alpha_seq,
+    const float* __restrict__ beta_seq,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ norm_weight,
+    const float* __restrict__ z_seq,
+    float* __restrict__ S,
+    float* __restrict__ out_seq,
+    int seq_len, int num_v, int num_k, int head_dim, float eps, int has_z)
+{
+    constexpr int C = 32;
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x; // 0..127 (4 waves)
+    const int wave = tid >> 5;   // 0..3
+    const int lane = tid & 31;   // 0..31
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+
+    const int key_dim = num_k * 128;
+    const int value_dim = num_v * 128;
+    const int conv_dim = 2 * key_dim + value_dim;
+    const int kh_off = (h % num_k) * 128;
+    const float rstd_d = rsqrtf(128.0f);
+    const float dt_b = dt_bias[h];
+    const float a_h = ssm_a[h];
+    const float nw_tid = norm_weight[tid];
+
+    // LDS: 60.4 KB total (<= 64 KB)
+    __shared__ _Float16 s_S[128][128];     // 32 KB: F16 view of S_0 for WMMA
+    __shared__ _Float16 s_K[C][128];       // 8 KB: normalized K[t][i]
+    __shared__ _Float16 s_Q[C][128];       // 8 KB: Q_scaled[t][i] (reused as delta_scaled[j][t] / K_t)
+    __shared__ _Float16 s_W[C][128];       // 8 KB: WY W[t][i] (reused as K_t[i][t] for state update)
+    __shared__ float s_L[C][C];            // 4 KB: lower-tri WY L[t][s] and QK[t][s]
+    __shared__ float s_G[C];               // cumulative log-decay
+    __shared__ float s_beta[C];
+    __shared__ float s_red[32];
+
+    // Load persistent F32 state S[h][128][128] into VGPRs in WMMA C-fragment layout:
+    // wave owns rows j in [wave*32 .. wave*32 + 31], split into 2 m_tiles of 16 rows x 8 n_tiles of 16 cols.
+    gdn_float8 s_acc[2][8];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int row_base = wave * 32 + mt * 16 + lane_h * 8;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int col = nt * 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                s_acc[mt][nt][r] = S[((long long)h * 128 + (row_base + r)) * 128 + col];
+            }
+        }
+    }
+
+    for (int t0 = 0; t0 < seq_len; t0 += C) {
+        const int c_len = (t0 + C <= seq_len) ? C : (seq_len - t0);
+
+        // 1. Load & normalize K, Q, V, beta, G for all c_len tokens in chunk.
+        //    Also keep v_col[t] and raw k_col[t]/q_col[t] in registers for thread `tid`.
+        float v_col[C];
+        float k_col[C];
+        float q_col[C];
+        float g_acc = 0.0f;
+        for (int t = 0; t < c_len; ++t) {
+            const int gt = t0 + t;
+            const float* conv_tok = conv_out_seq + (long long)gt * conv_dim;
+            const float qq = kda_silu_dev(conv_tok[kh_off + tid]);
+            const float kk = kda_silu_dev(conv_tok[key_dim + kh_off + tid]);
+            const float vv = kda_silu_dev(conv_tok[2 * key_dim + h * 128 + tid]);
+
+            const float kden = sqrtf(kda_block_sum(kk * kk, s_red) + eps);
+            const float qden = sqrtf(kda_block_sum(qq * qq, s_red) + eps);
+            const float nk = (kden > 0.0f) ? (kk / kden) : kk;
+            const float nq = (qden > 0.0f) ? (qq / qden) : qq;
+
+            k_col[t] = nk;
+            q_col[t] = nq;
+            v_col[t] = vv;
+            s_K[t][tid] = (_Float16)nk;
+
+            if (tid == 0) {
+                const float alpha_t = alpha_seq[(long long)gt * num_v + h];
+                const float beta_t = beta_seq[(long long)gt * num_v + h];
+                const float gate = kda_softplus_dev(alpha_t + dt_b) * a_h;
+                g_acc += gate;
+                s_G[t] = g_acc;
+                s_beta[t] = 1.0f / (1.0f + expf(-beta_t));
+            }
+            __syncthreads();
+        }
+        // Zero-pad unused rows of s_K if partial tail chunk
+        for (int t = c_len; t < C; ++t) {
+            s_K[t][tid] = (_Float16)0.0f;
+            if (tid == 0) { s_G[t] = g_acc; s_beta[t] = 0.0f; }
+        }
+        __syncthreads();
+
+        // Write Q_scaled[t][tid] = exp(G[t]) * q_col[t] into s_Q
+        for (int t = 0; t < c_len; ++t) {
+            s_Q[t][tid] = (_Float16)(expf(s_G[t]) * q_col[t]);
+        }
+        for (int t = c_len; t < C; ++t) {
+            s_Q[t][tid] = (_Float16)0.0f;
+        }
+
+        // 2. Compute strictly lower-triangular WY matrix L[t][s] = beta[t] * exp(G[t] - G[s]) * (k_t . k_s)
+        //    using WMMA: K @ K^T (32x128 @ 128x32 -> 4 16x16 tiles, 1 tile per wave!).
+        __syncthreads();
+        {
+            const int mt = wave >> 1; // 0 or 1
+            const int nt = wave & 1;  // 0 or 1
+            gdn_float8 kk_acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt) {
+                gdn_half8 va = *reinterpret_cast<const gdn_half8*>(&s_K[mt * 16 + lane_r][kt * 16 + lane_h * 8]);
+                gdn_half8 vb = *reinterpret_cast<const gdn_half8*>(&s_K[nt * 16 + lane_r][kt * 16 + lane_h * 8]);
+                kk_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, vb, kk_acc);
+            }
+            const int col = nt * 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int row = mt * 16 + lane_h * 8 + r;
+                if (row < c_len && col < row) {
+                    s_L[row][col] = s_beta[row] * expf(s_G[row] - s_G[col]) * kk_acc[r];
+                } else {
+                    s_L[row][col] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+        // 3. Forward substitution for W[t][tid] and U[t][tid] in registers (ZERO barriers!)
+        float u_col[C];
+        for (int t = 0; t < c_len; ++t) {
+            float wt = s_beta[t] * expf(s_G[t]) * k_col[t];
+            float ut = s_beta[t] * v_col[t];
+            for (int s = 0; s < t; ++s) {
+                const float lts = s_L[t][s];
+                wt -= lts * (float)s_W[s][tid];
+                ut -= lts * u_col[s];
+            }
+            s_W[t][tid] = (_Float16)wt;
+            u_col[t] = ut;
+        }
+        for (int t = c_len; t < C; ++t) {
+            s_W[t][tid] = (_Float16)0.0f;
+            u_col[t] = 0.0f;
+        }
+
+        // Write F32 s_acc -> F16 s_S[128][128] once per chunk
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int row_base = wave * 32 + mt * 16 + lane_h * 8;
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const int col = nt * 16 + lane_r;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    s_S[row_base + r][col] = (_Float16)s_acc[mt][nt][r];
+                }
+            }
+        }
+        __syncthreads();
+
+        // 4. Inter-chunk WMMA:
+        //    SW = S_0 @ W^T ([128, 128] @ [128, 32] -> [128, 32])
+        //    SQ = S_0 @ Q_scaled^T ([128, 128] @ [128, 32] -> [128, 32])
+        gdn_float8 sw_acc[2][2];
+        gdn_float8 sq_acc[2][2];
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                sw_acc[mt][nt] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                sq_acc[mt][nt] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            }
+        }
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt) {
+            gdn_half8 vw0 = *reinterpret_cast<const gdn_half8*>(&s_W[lane_r][kt * 16 + lane_h * 8]);
+            gdn_half8 vw1 = *reinterpret_cast<const gdn_half8*>(&s_W[16 + lane_r][kt * 16 + lane_h * 8]);
+            gdn_half8 vq0 = *reinterpret_cast<const gdn_half8*>(&s_Q[lane_r][kt * 16 + lane_h * 8]);
+            gdn_half8 vq1 = *reinterpret_cast<const gdn_half8*>(&s_Q[16 + lane_r][kt * 16 + lane_h * 8]);
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                gdn_half8 vs = *reinterpret_cast<const gdn_half8*>(&s_S[wave * 32 + mt * 16 + lane_r][kt * 16 + lane_h * 8]);
+                sw_acc[mt][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vs, vw0, sw_acc[mt][0]);
+                sw_acc[mt][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vs, vw1, sw_acc[mt][1]);
+                sq_acc[mt][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vs, vq0, sq_acc[mt][0]);
+                sq_acc[mt][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vs, vq1, sq_acc[mt][1]);
+            }
+        }
+        __syncthreads();
+
+        // Store SW into s_W[t][j] and SQ into s_Q[t][j] so thread `tid` can read row `tid` across t=0..c_len-1
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int row_base = wave * 32 + mt * 16 + lane_h * 8;
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int t_col = nt * 16 + lane_r;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    s_W[t_col][row_base + r] = (_Float16)sw_acc[mt][nt][r];
+                    s_Q[t_col][row_base + r] = (_Float16)sq_acc[mt][nt][r];
+                }
+            }
+        }
+        // Compute causal QK^T into s_L[t][s] = exp(G[t] - G[s]) * (q_t . k_s) for s <= t.
+        // First store unscaled q_col into s_S[t][tid] (rows 0..31 of s_S are free now!).
+        for (int t = 0; t < c_len; ++t) {
+            s_S[t][tid] = (_Float16)q_col[t];
+        }
+        for (int t = c_len; t < C; ++t) {
+            s_S[t][tid] = (_Float16)0.0f;
+        }
+        __syncthreads();
+        {
+            const int mt = wave >> 1;
+            const int nt = wave & 1;
+            gdn_float8 qk_acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt) {
+                gdn_half8 va = *reinterpret_cast<const gdn_half8*>(&s_S[mt * 16 + lane_r][kt * 16 + lane_h * 8]);
+                gdn_half8 vb = *reinterpret_cast<const gdn_half8*>(&s_K[nt * 16 + lane_r][kt * 16 + lane_h * 8]);
+                qk_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, vb, qk_acc);
+            }
+            const int col = nt * 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int row = mt * 16 + lane_h * 8 + r;
+                if (row < c_len && col <= row) {
+                    s_L[row][col] = expf(s_G[row] - s_G[col]) * qk_acc[r];
+                } else {
+                    s_L[row][col] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+        // 5. Compute delta[t][tid] = u_col[t] - SW[t][tid], O = SQ + delta @ QK^T, RMSNorm + SiLU(z) -> out_seq
+        float delta_col[C];
+        for (int t = 0; t < c_len; ++t) {
+            delta_col[t] = u_col[t] - (float)s_W[t][tid];
+        }
+        for (int t = 0; t < c_len; ++t) {
+            float o_val = (float)s_Q[t][tid];
+            for (int s = 0; s <= t; ++s) {
+                o_val += delta_col[s] * s_L[t][s];
+            }
+            const float a_scaled = o_val * rstd_d;
+            const float ss = kda_block_sum(a_scaled * a_scaled, s_red);
+            const float inv_rms = 1.0f / sqrtf(ss * rstd_d * rstd_d + eps);
+            float g = 1.0f;
+            if (has_z && z_seq) {
+                const float zv = z_seq[(long long)(t0 + t) * value_dim + h * 128 + tid];
+                g = zv / (1.0f + expf(-zv));
+            }
+            out_seq[(long long)(t0 + t) * value_dim + h * 128 + tid] = a_scaled * inv_rms * nw_tid * g;
+            __syncthreads();
+        }
+
+        // 6. Update persistent F32 state S:
+        //    S_new = exp(G[c_len - 1]) * S_0 + delta_scaled @ K
+        //    Pack delta_scaled[j][t] into s_S[j][t] (cols 0..31) and K_t[i][t] into s_S[i][32+t] (cols 32..63)!
+        const float g_last = s_G[c_len - 1];
+        const float chunk_decay = expf(g_last);
+        for (int t = 0; t < c_len; ++t) {
+            s_S[tid][t] = (_Float16)(expf(g_last - s_G[t]) * delta_col[t]);
+            s_S[tid][32 + t] = (_Float16)k_col[t];
+        }
+        for (int t = c_len; t < C; ++t) {
+            s_S[tid][t] = (_Float16)0.0f;
+            s_S[tid][32 + t] = (_Float16)0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    s_acc[mt][nt][r] *= chunk_decay;
+                }
+            }
+        }
+        #pragma unroll
+        for (int kt = 0; kt < 2; ++kt) {
+            gdn_half8 vd0 = *reinterpret_cast<const gdn_half8*>(&s_S[wave * 32 + lane_r][kt * 16 + lane_h * 8]);
+            gdn_half8 vd1 = *reinterpret_cast<const gdn_half8*>(&s_S[wave * 32 + 16 + lane_r][kt * 16 + lane_h * 8]);
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                gdn_half8 vk = *reinterpret_cast<const gdn_half8*>(&s_S[nt * 16 + lane_r][32 + kt * 16 + lane_h * 8]);
+                s_acc[0][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vd0, vk, s_acc[0][nt]);
+                s_acc[1][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vd1, vk, s_acc[1][nt]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write back persistent F32 state S[h][128][128]
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int row_base = wave * 32 + mt * 16 + lane_h * 8;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int col = nt * 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                S[((long long)h * 128 + (row_base + r)) * 128 + col] = s_acc[mt][nt][r];
+            }
+        }
+    }
+}
+#endif
 "#;
 
 #[cfg(test)]

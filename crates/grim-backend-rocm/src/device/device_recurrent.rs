@@ -584,13 +584,30 @@ impl RecurrentOps for RocmDevice {
         // serial 32-thread tail pass. Measured 681.8 -> see
         // tests/kda_scan_bench.rs. head_dim > 1024 cannot use v2 (shared
         // arrays are 1024) and falls back to v1.
+        let use_chunked_wy32 = head_dim == 128
+            && seq_len >= 128
+            && matches!(self.gpu_target.as_str(), "gfx1200" | "gfx1201")
+            && matches!(
+                std::env::var("GRIM_KDA_SCAN_CHUNKED").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+            && !matches!(
+                std::env::var("GRIM_KDA_SCAN_REG").as_deref(),
+                Ok("0" | "false" | "off")
+            );
         let use_reg128 = head_dim == 128
             && seq_len >= 16
             && !matches!(
                 std::env::var("GRIM_KDA_SCAN_REG").as_deref(),
                 Ok("0" | "false" | "off")
             );
-        let (grid, block, kernel) = if use_reg128 {
+        let (grid, block, kernel) = if use_chunked_wy32 {
+            (
+                num_value_heads as u32,
+                128u32,
+                "grim_kda_gated_delta_rule_scan_v4_wy32",
+            )
+        } else if use_reg128 {
             (
                 num_value_heads as u32,
                 128u32,

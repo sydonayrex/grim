@@ -679,3 +679,102 @@ fn eager_q81_matches_graph_decode() {
     println!("[0A perf @ 32k M=1] graph={g_ms:.3} ms, eager={e_ms:.3} ms (ratio={:.2}x)", e_ms / g_ms);
     assert!(e_ms <= 2.0 * g_ms, "eager Q8_1 too slow: {e_ms:.3} ms vs graph {g_ms:.3} ms");
 }
+
+#[test]
+#[ignore]
+fn test_gdn_v4_wy32_vs_v3_and_speed() {
+    use grim_backend_rocm::RecurrentOps;
+    let dev = RocmDevice::new(0);
+    let num_v = 48usize;
+    let num_k = 16usize;
+    let hd = 128usize;
+    let key_dim = num_k * hd;
+    let val_dim = num_v * hd;
+    let conv_dim = 2 * key_dim + val_dim;
+    let eps = 1e-6f32;
+
+    for &seq_len in &[2048usize, 4096] {
+        let mut rng = 0x1234_5678_9abc_def0u64 ^ (seq_len as u64);
+        let mut next_f = || -> f32 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let conv_h: Vec<f32> = (0..seq_len * conv_dim).map(|_| next_f() * 0.5).collect();
+        let alpha_h: Vec<f32> = (0..seq_len * num_v).map(|_| -2.0 + next_f() * 0.5).collect();
+        let beta_h: Vec<f32> = (0..seq_len * num_v).map(|_| next_f() * 0.5).collect();
+        let dt_b_h: Vec<f32> = (0..num_v).map(|_| -1.0).collect();
+        let ssm_a_h: Vec<f32> = (0..num_v).map(|_| -0.1).collect();
+        let nw_h: Vec<f32> = vec![1.0f32; hd];
+
+        let conv_d = dev.from_cpu(&conv_h, &Shape::new(vec![seq_len, conv_dim]), DType::F32).unwrap();
+        let alpha_d = dev.from_cpu(&alpha_h, &Shape::new(vec![seq_len, num_v]), DType::F32).unwrap();
+        let beta_d = dev.from_cpu(&beta_h, &Shape::new(vec![seq_len, num_v]), DType::F32).unwrap();
+        let dt_b_d = dev.from_cpu(&dt_b_h, &Shape::new(vec![num_v]), DType::F32).unwrap();
+        let ssm_a_d = dev.from_cpu(&ssm_a_h, &Shape::new(vec![num_v]), DType::F32).unwrap();
+        let nw_d = dev.from_cpu(&nw_h, &Shape::new(vec![hd]), DType::F32).unwrap();
+
+        let s_v3 = dev.zeros(&Shape::new(vec![num_v, hd, hd]), DType::F32).unwrap();
+        let s_v4 = dev.zeros(&Shape::new(vec![num_v, hd, hd]), DType::F32).unwrap();
+        let out_shape = Shape::new(vec![seq_len, val_dim]);
+
+        unsafe { std::env::set_var("GRIM_KDA_SCAN_CHUNKED", "0"); }
+        let (out_v3, _) = dev.kda_gated_delta_rule_scan(
+            conv_d.as_ref(), alpha_d.as_ref(), beta_d.as_ref(),
+            dt_b_d.as_ref(), ssm_a_d.as_ref(), nw_d.as_ref(), None,
+            s_v3.as_ref(), seq_len, num_v, num_k, hd, eps, &out_shape,
+        ).unwrap();
+        dev.synchronize();
+        let mut t3 = Vec::new();
+        for _ in 0..3 {
+            let s_tmp = dev.zeros(&Shape::new(vec![num_v, hd, hd]), DType::F32).unwrap();
+            let t0 = Instant::now();
+            let _ = dev.kda_gated_delta_rule_scan(
+                conv_d.as_ref(), alpha_d.as_ref(), beta_d.as_ref(),
+                dt_b_d.as_ref(), ssm_a_d.as_ref(), nw_d.as_ref(), None,
+                s_tmp.as_ref(), seq_len, num_v, num_k, hd, eps, &out_shape,
+            ).unwrap();
+            dev.synchronize();
+            t3.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+
+        unsafe { std::env::set_var("GRIM_KDA_SCAN_CHUNKED", "1"); }
+        let (out_v4, _) = dev.kda_gated_delta_rule_scan(
+            conv_d.as_ref(), alpha_d.as_ref(), beta_d.as_ref(),
+            dt_b_d.as_ref(), ssm_a_d.as_ref(), nw_d.as_ref(), None,
+            s_v4.as_ref(), seq_len, num_v, num_k, hd, eps, &out_shape,
+        ).unwrap();
+        dev.synchronize();
+        let mut t4 = Vec::new();
+        for _ in 0..3 {
+            let s_tmp = dev.zeros(&Shape::new(vec![num_v, hd, hd]), DType::F32).unwrap();
+            let t0 = Instant::now();
+            let _ = dev.kda_gated_delta_rule_scan(
+                conv_d.as_ref(), alpha_d.as_ref(), beta_d.as_ref(),
+                dt_b_d.as_ref(), ssm_a_d.as_ref(), nw_d.as_ref(), None,
+                s_tmp.as_ref(), seq_len, num_v, num_k, hd, eps, &out_shape,
+            ).unwrap();
+            dev.synchronize();
+            t4.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+
+        let o3 = out_v3.to_cpu_vec_f32().unwrap();
+        let o4 = out_v4.to_cpu_vec_f32().unwrap();
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in o3.iter().zip(o4.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            num += d * d;
+            den += (*a as f64) * (*a as f64);
+        }
+        let rel_l2 = (num / den.max(1e-30)).sqrt();
+        let v3_ms = median(t3);
+        let v4_ms = median(t4);
+        eprintln!(
+            "[gdn-v4-wy32 @ {seq_len}] v3={v3_ms:.2} ms (48L={:.1} ms), v4={v4_ms:.2} ms (48L={:.1} ms), speedup={:.2}x, rel_L2={rel_l2:.4e}",
+            v3_ms * 48.0,
+            v4_ms * 48.0,
+            v3_ms / v4_ms
+        );
+    }
+    unsafe { std::env::remove_var("GRIM_KDA_SCAN_CHUNKED"); }
+}
