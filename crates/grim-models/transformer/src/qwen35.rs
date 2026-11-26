@@ -1310,13 +1310,10 @@ impl Qwen35Block {
                         }
                     }
                 } else {
-                    // Arena full — grow geometrically and re-copy via D2D.
-                    // Phase 3: clamped to the eviction capacity (never resized
-                    // past it — the arena is reused instead).
-                    let new_rows = ((need_rows * 2) + 64)
-                        .next_power_of_two()
-                        .min(evict.cap_rows.unwrap_or(usize::MAX))
-                        .max(need_rows);
+                    // Arena full — pre-size directly to GRIM_KV_CACHE_LEN when configured
+                    // (eliminates power-of-2 overshoot and alloc-before-free transients),
+                    // otherwise grow geometrically clamped to eviction capacity.
+                    let new_rows = eager_kv_target_rows(need_rows, evict.cap_rows);
                     let fmt = kv_arena_format_qwen(&device);
                     let full_shape = Shape::new(vec![
                         new_rows,
@@ -6531,12 +6528,10 @@ fn attention_layer_d2d(
             )?;
         }
     } else {
-        // Growth is clamped to the eviction capacity: past it the arena is
-        // reused, never resized, so the KV footprint is a known quantity.
-        let new_rows = ((need_rows * 2) + 64)
-            .next_power_of_two()
-            .min(evict.cap_rows.unwrap_or(usize::MAX))
-            .max(need_rows);
+        // Pre-size directly to GRIM_KV_CACHE_LEN when configured (no mid-prefill
+        // power-of-2 overshoot or alloc-before-free transient), otherwise grow
+        // geometrically clamped to eviction capacity.
+        let new_rows = eager_kv_target_rows(need_rows, evict.cap_rows);
         // The arena is byte-addressed for the packed formats, so a row's extent
         // is its BYTE count there and `k_idx` (the KV element count) is wrong
         // for int4 by 2x — as an allocation size AND as the copy length below.
@@ -7820,6 +7815,25 @@ pub(crate) fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvAren
 /// Codes-element dtype for the dense ROCm KV arenas. F32/F16/U8 per
 /// [`kv_arena_format_qwen`]. ALL dense arena touchpoints key off the format
 /// so the representation can never disagree with itself.
+/// Target row count for eager KV arena allocation/growth.
+/// When `GRIM_KV_CACHE_LEN` is explicitly configured, pre-size directly to it
+/// on the first allocation so long-context prefill (200k/262k) never overshoots
+/// to the next power-of-two or triggers an alloc-before-free 2x transient OOM.
+pub(crate) fn eager_kv_target_rows(need_rows: usize, evict_cap: Option<usize>) -> usize {
+    let env_cap = std::env::var("GRIM_KV_CACHE_LEN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&c| c > 0);
+    if let Some(cap) = env_cap {
+        let clamped = cap.min(evict_cap.unwrap_or(usize::MAX));
+        return clamped.max(need_rows);
+    }
+    ((need_rows * 2) + 64)
+        .next_power_of_two()
+        .min(evict_cap.unwrap_or(usize::MAX))
+        .max(need_rows)
+}
+
 pub(crate) fn kv_arena_dtype(device: &Device) -> DType {
     kv_arena_dtype_for(kv_arena_format_qwen(device))
 }
@@ -8252,10 +8266,7 @@ fn hydrate_qwen35_kv_arena(
         .map(|s| s.shape().dims()[0])
         .unwrap_or(0);
     if k_cap < need_rows {
-        let new_rows = ((need_rows * 2) + 64)
-            .next_power_of_two()
-            .min(evict.cap_rows.unwrap_or(usize::MAX))
-            .max(need_rows);
+        let new_rows = eager_kv_target_rows(need_rows, evict.cap_rows);
         let fmt = kv_arena_format_qwen(device);
         let full_shape = Shape::new(vec![new_rows, nkv, kv_arena_head_extent(fmt, head_dim)]);
         let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(device))?;
