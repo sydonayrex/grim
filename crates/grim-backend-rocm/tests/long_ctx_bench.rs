@@ -778,3 +778,113 @@ fn test_gdn_v4_wy32_vs_v3_and_speed() {
     }
     unsafe { std::env::remove_var("GRIM_KDA_SCAN_CHUNKED"); }
 }
+
+#[test]
+#[ignore]
+fn test_wmma_i8_q80_q81_doublek_parity_and_speed() {
+    use grim_backend_rocm::BackendStorage;
+    let dev = RocmDevice::new(0);
+    // 1. Correctness + bitwise determinism at M=128, N=256, K=512
+    let (m, n, k) = (128usize, 256usize, 512usize);
+    let nb = k / 32;
+    let mut rng = 0xfeed_face_cafe_beefu64;
+    let mut next_f = || -> f32 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    let a_f32: Vec<f32> = (0..m * k).map(|_| next_f()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| next_f()).collect();
+
+    // Quantize A to Q8_1 (36 B/block) and B to Q8_0 (34 B/block) on CPU
+    let mut a_q81 = vec![0u8; m * nb * 36];
+    let mut a_deq = vec![0.0f32; m * k];
+    for r in 0..m {
+        for blk in 0..nb {
+            let base = r * k + blk * 32;
+            let amax = a_f32[base..base + 32].iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let dh = half::f16::from_f32(d);
+            let df = dh.to_f32();
+            let off = (r * nb + blk) * 36;
+            a_q81[off..off + 2].copy_from_slice(&dh.to_le_bytes());
+            let mut sum = 0.0f32;
+            for i in 0..32 {
+                let q = if df > 0.0 { (a_f32[base + i] / df).round().clamp(-127.0, 127.0) as i8 } else { 0i8 };
+                a_q81[off + 4 + i] = q as u8;
+                let v = (q as f32) * df;
+                a_deq[base + i] = v;
+                sum += v;
+            }
+            let sh = half::f16::from_f32(sum);
+            a_q81[off + 2..off + 4].copy_from_slice(&sh.to_le_bytes());
+        }
+    }
+
+    let mut b_q80 = vec![0u8; n * nb * 34];
+    let mut b_deq = vec![0.0f32; n * k];
+    for r in 0..n {
+        for blk in 0..nb {
+            let base = r * k + blk * 32;
+            let amax = b_f32[base..base + 32].iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let dh = half::f16::from_f32(d);
+            let df = dh.to_f32();
+            let off = (r * nb + blk) * 34;
+            b_q80[off..off + 2].copy_from_slice(&dh.to_le_bytes());
+            for i in 0..32 {
+                let q = if df > 0.0 { (b_f32[base + i] / df).round().clamp(-127.0, 127.0) as i8 } else { 0i8 };
+                b_q80[off + 2 + i] = q as u8;
+                b_deq[base + i] = (q as f32) * df;
+            }
+        }
+    }
+
+    // CPU exact oracle on dequantized Q8_1 x Q8_0
+    let mut c_ref = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f64;
+            for t in 0..k {
+                acc += (a_deq[i * k + t] as f64) * (b_deq[j * k + t] as f64);
+            }
+            c_ref[i * n + j] = acc as f32;
+        }
+    }
+
+    let a_dev = grim_backend_rocm::RocmStorage::copy_from_host_raw_bytes(&a_q81, &Shape::new(vec![m, nb * 36]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let b_dev = grim_backend_rocm::RocmStorage::copy_from_host_raw_bytes(&b_q80, &Shape::new(vec![n, nb * 34]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let c_dev1 = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+    let c_dev2 = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+
+    dev.launch_wmma_i8_q80_q81_doublek_gfx12(&a_dev, &b_dev, &c_dev1, m, n, k).unwrap();
+    dev.launch_wmma_i8_q80_q81_doublek_gfx12(&a_dev, &b_dev, &c_dev2, m, n, k).unwrap();
+    dev.synchronize();
+
+    let c1 = c_dev1.to_cpu_vec_f32().unwrap();
+    let c2 = c_dev2.to_cpu_vec_f32().unwrap();
+    let bit_eq = c1.iter().zip(c2.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+    let max_abs = c1.iter().zip(c_ref.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    eprintln!("[1C wmma-i8-doublek parity {m}x{n}x{k}] max_abs={max_abs:.4e}, bit_eq={bit_eq}");
+    assert!(bit_eq, "wmma_i8_doublek not bitwise deterministic!");
+    assert!(max_abs < 1e-3, "wmma_i8_doublek max_abs too high: {max_abs}");
+
+    // 2. Speed bench at Qwen3.8-27B prefill shape M=2048, N=5120, K=5120
+    let (bm, bn, bk) = (2048usize, 5120usize, 5120usize);
+    let bnb = bk / 32;
+    let ba = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![bm, bnb * 36]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let bb = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![bn, bnb * 34]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let bc = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![bm, bn]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+    dev.launch_wmma_i8_q80_q81_doublek_gfx12(&ba, &bb, &bc, bm, bn, bk).unwrap();
+    dev.synchronize();
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        dev.launch_wmma_i8_q80_q81_doublek_gfx12(&ba, &bb, &bc, bm, bn, bk).unwrap();
+        dev.synchronize();
+        times.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let ms = median(times);
+    let flops = 2.0 * (bm as f64) * (bn as f64) * (bk as f64);
+    let tops = flops / (ms * 1e-3) / 1e12;
+    eprintln!("[1C wmma-i8-doublek perf {bm}x{bn}x{bk}] {ms:.3} ms ({tops:.2} TOP/s)");
+}

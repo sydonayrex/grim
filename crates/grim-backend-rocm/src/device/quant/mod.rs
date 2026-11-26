@@ -1699,6 +1699,33 @@ impl QuantOps for RocmDevice {
                         // fp16_buf dropped after the GEMM launch is enqueued;
                         // single-stream ordering keeps it live long enough.
                         drop(fp16_buf);
+                    } else if m >= 64
+                        && k % 32 == 0
+                        && matches!(self.gpu_target.as_str(), "gfx1200" | "gfx1201")
+                        && !matches!(
+                            std::env::var("GRIM_WMMA_I8_DOUBLEK").as_deref(),
+                            Ok("0" | "false" | "off")
+                        )
+                    {
+                        // Phase 1C: INT8 WMMA Double-K (MMA_K=32) for Q8_1 x Q8_0.
+                        let q81_bytes = m * (k / 32) * 36;
+                        let act_q81 = RocmStorage::alloc_gpu_with_bytes(
+                            &Shape::new(vec![m, (k / 32) * 36]),
+                            DType::U8,
+                            q81_bytes,
+                            &self.allocator,
+                            self.ordinal,
+                        )?;
+                        let _ = self.launch_quantize_q8_1(a_storage, &act_q81, m, k)?;
+                        self.launch_wmma_i8_q80_q81_doublek_gfx12(
+                            &act_q81,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
+                        )?;
+                        drop(act_q81);
                     } else {
                         self.launch_wmma_fused_dequant_q8_0(
                             a_storage,

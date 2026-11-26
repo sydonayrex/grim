@@ -211,6 +211,136 @@ extern "C" __global__ __launch_bounds__(32) void grim_wmma_w4a8_iu8_gfx12(
         }
     }
 }
+
+// Phase 1C: INT8 WMMA Double-K (MMA_K=32) GEMM for Q8_1 activations x Q8_0 weights on RDNA4.
+// Each 64x64 CTA (4 waves = 2x2 warps, each warp 2x2 16x16 WMMA tiles) steps K by 32
+// (exact 1:1 match with Q8_1 and Q8_0 32-element blocks), runs 2x wmma_i32_16x16x16_iu8_w32_gfx12
+// per block with exact i32 inner-block accumulation, then scales by d_a * d_b into F32.
+extern "C" __global__ __launch_bounds__(128) void grim_wmma_i8_q80_q81_doublek_gfx12(
+    const unsigned char* __restrict__ A_q81, // [M, (K/32)*36] Q8_1 activations
+    const unsigned char* __restrict__ B_q80, // [N, (K/32)*34] Q8_0 weights (transposed: N rows of K)
+    float* __restrict__ C,                   // [M, N] row-major F32
+    int M, int N, int K)
+{
+    const int cta_m = blockIdx.y * 64;
+    const int cta_n = blockIdx.x * 64;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+    const int wm = (wave >> 1) * 32; // 0 or 32
+    const int wn = (wave & 1) * 32;  // 0 or 32
+
+    const int n_blocks = K >> 5; // K / 32
+    const long long a_row_bytes = (long long)n_blocks * 36;
+    const long long b_row_bytes = (long long)n_blocks * 34;
+
+    __shared__ signed char sA[64][32];
+    __shared__ signed char sB[64][32];
+    __shared__ float sDa[64];
+    __shared__ float sDb[64];
+
+    float f_acc[2][2][8];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (int e = 0; e < 8; ++e)
+                f_acc[mt][nt][e] = 0.0f;
+
+    for (int kb = 0; kb < n_blocks; ++kb) {
+        // Cooperative load of 64 rows x 32 bytes (128 threads -> 16 bytes = uint4 per thread!)
+        const int r_idx = tid >> 1;      // 0..63
+        const int half_idx = tid & 1;    // 0 or 1 (16 bytes each)
+        const int gm = cta_m + r_idx;
+        const int gn = cta_n + r_idx;
+
+        if (gm < M) {
+            const unsigned char* ap = A_q81 + (long long)gm * a_row_bytes + (long long)kb * 36;
+            if (half_idx == 0) {
+                sDa[r_idx] = __half2float(*reinterpret_cast<const __half*>(ap));
+            }
+            // Copy 16 bytes (unaligned-safe via 4x u32)
+            const unsigned char* qs = ap + 4 + half_idx * 16;
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                sA[r_idx][half_idx * 16 + b] = (signed char)qs[b];
+            }
+        } else {
+            if (half_idx == 0) sDa[r_idx] = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) sA[r_idx][half_idx * 16 + b] = 0;
+        }
+
+        if (gn < N) {
+            const unsigned char* bp = B_q80 + (long long)gn * b_row_bytes + (long long)kb * 34;
+            if (half_idx == 0) {
+                sDb[r_idx] = __half2float(*reinterpret_cast<const __half*>(bp));
+            }
+            const unsigned char* qs = bp + 2 + half_idx * 16;
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                sB[r_idx][half_idx * 16 + b] = (signed char)qs[b];
+            }
+        } else {
+            if (half_idx == 0) sDb[r_idx] = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) sB[r_idx][half_idx * 16 + b] = 0;
+        }
+        __syncthreads();
+
+        // Double-K (2 x 16 = 32) INT8 WMMA per 16x16 tile
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int m_off = wm + mt * 16 + lane_r;
+            const int* a0_p = reinterpret_cast<const int*>(&sA[m_off][lane_h * 8]);
+            const int* a1_p = reinterpret_cast<const int*>(&sA[m_off][16 + lane_h * 8]);
+            grim_v2i a0 = {a0_p[0], a0_p[1]};
+            grim_v2i a1 = {a1_p[0], a1_p[1]};
+
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int n_off = wn + nt * 16 + lane_r;
+                const int* b0_p = reinterpret_cast<const int*>(&sB[n_off][lane_h * 8]);
+                const int* b1_p = reinterpret_cast<const int*>(&sB[n_off][16 + lane_h * 8]);
+                grim_v2i b0 = {b0_p[0], b0_p[1]};
+                grim_v2i b1 = {b1_p[0], b1_p[1]};
+
+                grim_v8i i_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                i_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, true, b0, i_acc, false);
+                i_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, true, b1, i_acc, false);
+
+                const float db = sDb[wn + nt * 16 + lane_r];
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int local_r = wm + mt * 16 + lane_h * 8 + e;
+                    f_acc[mt][nt][e] += (float)i_acc[e] * (sDa[local_r] * db);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store C[M, N]
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int col = cta_n + wn + nt * 16 + lane_r;
+            if (col < N) {
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int row = cta_m + wm + mt * 16 + lane_h * 8 + e;
+                    if (row < M) {
+                        C[(long long)row * N + col] = f_acc[mt][nt][e];
+                    }
+                }
+            }
+        }
+    }
+}
 #endif
 "#;
 

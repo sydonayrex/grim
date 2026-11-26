@@ -842,6 +842,43 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// Phase 1C: Launch RDNA4 INT8 WMMA Double-K (`MMA_K=32`) GEMM for `Q8_1`
+    /// activations × `Q8_0` weights (`grim_wmma_i8_q80_q81_doublek_gfx12`).
+    pub fn launch_wmma_i8_q80_q81_doublek_gfx12(
+        &self,
+        a_q81: &RocmStorage,
+        b_q80: &RocmStorage,
+        out_f32: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let grid_dim = HipDim3::new(n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+
+        let mut aptr = crate::dev_ptr(a_q81)?;
+        let mut bptr = crate::dev_ptr(b_q80)?;
+        let mut optr = crate::dev_ptr(out_f32)?;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_i8_q80_q81_doublek_gfx12",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Public A/B wrapper around [`Self::launch_wmma_fused_dequant_q4k`].
     ///
     /// The kernel is a 16-row x 64-column tile with 128 threads per block
