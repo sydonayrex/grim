@@ -2700,7 +2700,198 @@ impl RecurrentStateSnapshot {
     }
 }
 
-/// M2: snapshot of a single Qwen35 layer cache for recurrent/speculative rollback.
+/// Phase B: Packed device-KV snapshot (`Q8_1` / `F16` / `U8` raw bytes for valid
+/// prefix rows `0..valid_rows`). Captures D2D when free VRAM >= 2048 MiB and
+/// spills automatically to host `Vec<u8>` when VRAM is tight (e.g. `200k` context).
+#[derive(Clone)]
+pub enum PackedKvSnapshot {
+    DeviceD2D {
+        storage: std::sync::Arc<grim_backend_rocm::RocmStorage>,
+        valid_bytes: usize,
+        full_shape: Vec<usize>,
+        dtype: DType,
+    },
+    HostBytes {
+        bytes: Vec<u8>,
+        full_shape: Vec<usize>,
+        dtype: DType,
+    },
+}
+
+impl PackedKvSnapshot {
+    fn capture(storage: &dyn grim_tensor::BackendStorage, valid_rows: usize) -> Result<Option<Self>> {
+        use grim_tensor::BackendStorage;
+        if valid_rows == 0 {
+            return Ok(None);
+        }
+        let Some(rocm_s) = storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        else {
+            return Ok(None);
+        };
+        let dims = rocm_s.shape().dims().to_vec();
+        let cap_rows = dims.first().copied().unwrap_or(0);
+        if cap_rows == 0 || valid_rows > cap_rows {
+            return Ok(None);
+        }
+        let total_bytes = rocm_s.bytes();
+        let row_bytes = total_bytes / cap_rows;
+        let valid_bytes = valid_rows * row_bytes;
+        if valid_bytes == 0 || valid_bytes > total_bytes {
+            return Ok(None);
+        }
+        let ord = rocm_s.device_ordinal();
+        let src_ptr = match rocm_s.device_ptr_u64() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let (free_bytes, _) = grim_backend_rocm::vram_info(ord);
+        let d2d_ok = !matches!(
+            std::env::var("GRIM_SNAPSHOT_D2D").as_deref(),
+            Ok("0" | "false" | "off")
+        ) && free_bytes >= (2048 * 1024 * 1024 + valid_bytes as u64);
+
+        let dev = grim_backend_rocm::RocmDevice::shared(ord);
+        let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+        if d2d_ok {
+            let dst = grim_backend_rocm::RocmStorage::alloc_gpu_with_bytes(
+                &Shape::new(vec![valid_bytes]),
+                DType::U8,
+                valid_bytes,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            if let Some(dst_ptr) = dst.device_ptr_u64() {
+                let rc = unsafe {
+                    grim_backend_rocm::hipMemcpyAsync(
+                        dst_ptr as *mut std::ffi::c_void,
+                        src_ptr as *const std::ffi::c_void,
+                        valid_bytes,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc == 0 {
+                    return Ok(Some(Self::DeviceD2D {
+                        storage: std::sync::Arc::new(dst),
+                        valid_bytes,
+                        full_shape: dims,
+                        dtype: rocm_s.dtype().clone(),
+                    }));
+                }
+            }
+        }
+        // Host spillover path (200k / tight VRAM): copy only `valid_bytes` D2H.
+        let mut host = vec![0u8; valid_bytes];
+        dev.synchronize();
+        let rc = unsafe {
+            grim_backend_rocm::hipMemcpyAsync(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                src_ptr as *const std::ffi::c_void,
+                valid_bytes,
+                grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(grim_core::error::Error::Backend(format!(
+                "PackedKvSnapshot::capture D2H failed: {rc}"
+            )));
+        }
+        dev.synchronize();
+        Ok(Some(Self::HostBytes {
+            bytes: host,
+            full_shape: dims,
+            dtype: rocm_s.dtype().clone(),
+        }))
+    }
+
+    fn restore_into_arena(
+        &self,
+        dev_type: &Device,
+    ) -> Result<Box<dyn grim_tensor::BackendStorage>> {
+        let ord = match *dev_type {
+            Device::Rocm(o) => o,
+            _ => {
+                return Err(grim_core::error::Error::Backend(
+                    "PackedKvSnapshot::restore_into_arena requires ROCm device".into(),
+                ))
+            }
+        };
+        let dev = grim_backend_rocm::RocmDevice::shared(ord);
+        let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+        match self {
+            Self::DeviceD2D {
+                storage,
+                valid_bytes,
+                full_shape,
+                dtype,
+            } => {
+                let dst = grim_backend_rocm::RocmStorage::alloc_gpu(
+                    &Shape::new(full_shape.clone()),
+                    dtype.clone(),
+                    &dev.allocator_handle(),
+                    ord,
+                )?;
+                let src_ptr = storage.device_ptr_u64().ok_or_else(|| {
+                    grim_core::error::Error::Backend("PackedKvSnapshot: null src ptr".into())
+                })?;
+                let dst_ptr = dst.device_ptr_u64().ok_or_else(|| {
+                    grim_core::error::Error::Backend("PackedKvSnapshot: null dst ptr".into())
+                })?;
+                let rc = unsafe {
+                    grim_backend_rocm::hipMemcpyAsync(
+                        dst_ptr as *mut std::ffi::c_void,
+                        src_ptr as *const std::ffi::c_void,
+                        *valid_bytes,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(grim_core::error::Error::Backend(format!(
+                        "PackedKvSnapshot::restore D2D failed: {rc}"
+                    )));
+                }
+                Ok(Box::new(dst))
+            }
+            Self::HostBytes {
+                bytes,
+                full_shape,
+                dtype,
+            } => {
+                let dst = grim_backend_rocm::RocmStorage::alloc_gpu(
+                    &Shape::new(full_shape.clone()),
+                    dtype.clone(),
+                    &dev.allocator_handle(),
+                    ord,
+                )?;
+                let dst_ptr = dst.device_ptr_u64().ok_or_else(|| {
+                    grim_core::error::Error::Backend("PackedKvSnapshot: null dst ptr".into())
+                })?;
+                let rc = unsafe {
+                    grim_backend_rocm::hipMemcpyAsync(
+                        dst_ptr as *mut std::ffi::c_void,
+                        bytes.as_ptr() as *const std::ffi::c_void,
+                        bytes.len(),
+                        grim_backend_rocm::HipMemcpyKind::HostToDevice,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(grim_core::error::Error::Backend(format!(
+                        "PackedKvSnapshot::restore H2D failed: {rc}"
+                    )));
+                }
+                dev.synchronize();
+                Ok(Box::new(dst))
+            }
+        }
+    }
+}
+
+/// M2 / Phase B: snapshot of a single Qwen35 layer cache for rollback or radix anchor.
 #[derive(Clone)]
 pub struct Qwen35LayerCacheSnapshot {
     pub k_cache: Vec<f32>,
@@ -2711,6 +2902,9 @@ pub struct Qwen35LayerCacheSnapshot {
     /// D2D or host copies of device-resident recurrent states (if present).
     pub conv_state_dev: Option<RecurrentStateSnapshot>,
     pub ssm_state_dev: Option<RecurrentStateSnapshot>,
+    /// Phase B: packed Q8_1 / F16 device KV rows (`0..current_pos`) for zero-requant radix restore.
+    pub k_device_packed: Option<PackedKvSnapshot>,
+    pub v_device_packed: Option<PackedKvSnapshot>,
 }
 
 /// M2: snapshot of all layer caches (opaque to session trait callers).
@@ -2721,8 +2915,9 @@ pub struct Qwen35RecurrentSnapshot {
 }
 
 impl Qwen35LayerCache {
-    /// M2 / Phase A: capture recurrent/KV-cache state for rollback or radix anchor.
+    /// M2 / Phase A+B: capture recurrent/KV-cache state for rollback or radix anchor.
     /// Uses async D2D copy when free VRAM >= 2048 MiB, spilling to host when tight.
+    /// When `GRIM_HYBRID_PREFIX=1`, also captures packed `Q8_1`/`F16` KV rows (`0..current_pos`).
     pub fn snapshot_for_rollback(&self) -> Result<Qwen35LayerCacheSnapshot> {
         let conv_state_dev = match self.conv_state_dev.as_ref() {
             Some(s) => Some(RecurrentStateSnapshot::capture(s.as_ref())?),
@@ -2732,6 +2927,24 @@ impl Qwen35LayerCache {
             Some(s) => Some(RecurrentStateSnapshot::capture(s.as_ref())?),
             None => None,
         };
+        let capture_kv = hybrid_kv_bridge_enabled()
+            && !matches!(
+                std::env::var("GRIM_SNAPSHOT_KV_PACKED").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+        let (k_device_packed, v_device_packed) = if capture_kv && self.current_pos > 0 {
+            let kp = match self.k_device.as_ref() {
+                Some(s) => PackedKvSnapshot::capture(s.as_ref(), self.current_pos)?,
+                None => None,
+            };
+            let vp = match self.v_device.as_ref() {
+                Some(s) => PackedKvSnapshot::capture(s.as_ref(), self.current_pos)?,
+                None => None,
+            };
+            (kp, vp)
+        } else {
+            (None, None)
+        };
         Ok(Qwen35LayerCacheSnapshot {
             k_cache: self.k_cache.clone(),
             v_cache: self.v_cache.clone(),
@@ -2740,6 +2953,8 @@ impl Qwen35LayerCache {
             current_pos: self.current_pos,
             conv_state_dev,
             ssm_state_dev,
+            k_device_packed,
+            v_device_packed,
         })
     }
 
@@ -2789,6 +3004,15 @@ impl Qwen35LayerCache {
         match &snap.ssm_state_dev {
             Some(s) => s.restore_into(&mut self.ssm_state_dev, &dev_type)?,
             None => self.ssm_state_dev = None,
+        }
+        // Phase B: on a fresh radix-hit session (`k_device.is_none()`), restore
+        // packed Q8_1/F16 KV rows directly onto the layer's owning ROCm device
+        // (zero F32 round-trip, zero re-quantization).
+        if self.k_device.is_none() {
+            if let (Some(kp), Some(vp)) = (&snap.k_device_packed, &snap.v_device_packed) {
+                self.k_device = Some(kp.restore_into_arena(&dev_type)?);
+                self.v_device = Some(vp.restore_into_arena(&dev_type)?);
+            }
         }
         Ok(())
     }
@@ -3964,12 +4188,12 @@ impl CausalLm for Qwen35 {
                     })
                     .unwrap_or_default();
                 if !gathered.is_empty() {
-                    let device = h.device().clone();
-                    let dev = pick_device_for_storage_device(&device);
                     if let Some(state) = session.model_state_mut() {
                         if let Some(caches) = state.downcast_mut::<Vec<Qwen35LayerCache>>() {
                             for (i, k_f32, v_f32) in gathered {
                                 let blk = &self.blocks[i];
+                                let device = blk.device.clone();
+                                let dev = pick_device_for_storage_device(&device);
                                 hydrate_qwen35_kv_arena(
                                     &dev,
                                     &device,
