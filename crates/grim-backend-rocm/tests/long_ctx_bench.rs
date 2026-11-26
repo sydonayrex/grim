@@ -402,3 +402,159 @@ fn bench_prefill_wmma_q81_parity_and_tflops() {
         }
     }
 }
+
+#[test]
+#[ignore]
+fn test_gdn_v3_reg128_vs_v2_vs_fp64() {
+    use grim_backend_rocm::RecurrentOps;
+    let dev = RocmDevice::shared(0);
+    let num_v = 4usize;
+    let num_k = 2usize;
+    let head_dim = 128usize;
+    let key_dim = num_k * head_dim;
+    let value_dim = num_v * head_dim;
+    let conv_dim = 2 * key_dim + value_dim;
+    let eps = 1e-6f32;
+    let eps64 = 1e-6f64;
+
+    println!("\n=== GDN v2 vs v3_reg128 vs FP64 CPU reference (high-memory decay ~0.99) ===");
+    println!("Pass criterion: v3_rel_L2 <= max(1e-6, 2.0 * v2_rel_L2) at EVERY length");
+    println!(
+        "{:<8} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "seq_len", "v2_out_L2", "v3_out_L2", "v2_st_L2", "v3_st_L2", "v2_vs_v3_max"
+    );
+
+    for &seq_len in &[2_048usize, 32_768, 131_072, 200_000] {
+        let mut rng = 0xdead_beef_cafe_1234_u64 ^ (seq_len as u64);
+        let mut next_f32 = || -> f32 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 40) as f32 / ((1u32 << 24) as f32)) - 0.5
+        };
+
+        let conv_h: Vec<f32> = (0..seq_len * conv_dim).map(|_| next_f32() * 0.5).collect();
+        // Realistic long-memory gates: alpha + dt_bias ~ -4.5, ssm_a ~ -1.0 -> softplus ~ 0.01 -> decay ~ 0.99
+        let alpha_h: Vec<f32> = (0..seq_len * num_v).map(|_| -4.5 + next_f32() * 0.5).collect();
+        let beta_h: Vec<f32> = (0..seq_len * num_v).map(|_| -1.0 + next_f32()).collect();
+        let dt_bias_h = vec![0.0f32; num_v];
+        let ssm_a_h = vec![-1.0f32; num_v];
+        let norm_w_h = vec![1.0f32; head_dim];
+
+        // FP64 CPU reference scan
+        let mut s64 = vec![0.0f64; num_v * head_dim * head_dim];
+        let mut out64 = vec![0.0f64; seq_len * value_dim];
+        let rstd64 = 1.0f64 / (head_dim as f64).sqrt();
+        let silu64 = |x: f64| x / (1.0 + (-x).exp());
+        let softplus64 = |x: f64| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+
+        for t in 0..seq_len {
+            let ct = &conv_h[t * conv_dim..(t + 1) * conv_dim];
+            for h in 0..num_v {
+                let kh = h % num_k;
+                let mut nk = [0.0f64; 128];
+                let mut nq = [0.0f64; 128];
+                let mut vv = [0.0f64; 128];
+                let mut k2 = 0.0f64;
+                let mut q2 = 0.0f64;
+                for j in 0..head_dim {
+                    let qq = silu64(ct[kh * head_dim + j] as f64);
+                    let kk = silu64(ct[key_dim + kh * head_dim + j] as f64);
+                    nq[j] = qq;
+                    nk[j] = kk;
+                    vv[j] = silu64(ct[2 * key_dim + h * head_dim + j] as f64);
+                    k2 += kk * kk;
+                    q2 += qq * qq;
+                }
+                let kden = (k2 + eps64).sqrt();
+                let qden = (q2 + eps64).sqrt();
+                for j in 0..head_dim {
+                    nk[j] /= kden;
+                    nq[j] /= qden;
+                }
+                let gate = softplus64(alpha_h[t * num_v + h] as f64 + dt_bias_h[h] as f64) * (ssm_a_h[h] as f64);
+                let beta = 1.0 / (1.0 + (-(beta_h[t * num_v + h] as f64)).exp());
+                let decay = gate.exp();
+
+                let mut a_vec = [0.0f64; 128];
+                let mut ss = 0.0f64;
+                for j in 0..head_dim {
+                    let row_off = (h * head_dim + j) * head_dim;
+                    let mut pred = 0.0f64;
+                    for i in 0..head_dim {
+                        pred += nk[i] * (decay * s64[row_off + i]);
+                    }
+                    let delta = beta * (vv[j] - pred);
+                    let mut a = 0.0f64;
+                    for i in 0..head_dim {
+                        let s2 = decay * s64[row_off + i] + nk[i] * delta;
+                        s64[row_off + i] = s2;
+                        a += nq[i] * s2;
+                    }
+                    let a_sc = a * rstd64;
+                    a_vec[j] = a_sc;
+                    ss += a_sc * a_sc;
+                }
+                let inv_rms = 1.0 / (ss * rstd64 * rstd64 + eps64).sqrt();
+                for j in 0..head_dim {
+                    out64[t * value_dim + h * head_dim + j] = a_vec[j] * inv_rms * (norm_w_h[j] as f64);
+                }
+            }
+        }
+
+        let conv_d = dev.from_cpu(&conv_h, &Shape::new(vec![seq_len, conv_dim]), DType::F32).unwrap();
+        let alpha_d = dev.from_cpu(&alpha_h, &Shape::new(vec![seq_len, num_v]), DType::F32).unwrap();
+        let beta_d = dev.from_cpu(&beta_h, &Shape::new(vec![seq_len, num_v]), DType::F32).unwrap();
+        let dt_d = dev.from_cpu(&dt_bias_h, &Shape::new(vec![num_v]), DType::F32).unwrap();
+        let a_d = dev.from_cpu(&ssm_a_h, &Shape::new(vec![num_v]), DType::F32).unwrap();
+        let nw_d = dev.from_cpu(&norm_w_h, &Shape::new(vec![head_dim]), DType::F32).unwrap();
+
+        let run_gpu = |flag: &str| -> (Vec<f32>, Vec<f32>) {
+            unsafe { std::env::set_var("GRIM_KDA_SCAN_REG", flag) };
+            let s_d = dev.zeros(&Shape::new(vec![num_v, head_dim, head_dim]), DType::F32).unwrap();
+            let (o_d, _) = dev
+                .kda_gated_delta_rule_scan(
+                    conv_d.as_ref(),
+                    alpha_d.as_ref(),
+                    beta_d.as_ref(),
+                    dt_d.as_ref(),
+                    a_d.as_ref(),
+                    nw_d.as_ref(),
+                    None,
+                    s_d.as_ref(),
+                    seq_len,
+                    num_v,
+                    num_k,
+                    head_dim,
+                    eps,
+                    &Shape::new(vec![seq_len, value_dim]),
+                )
+                .unwrap();
+            dev.synchronize();
+            (o_d.to_cpu_vec_f32().unwrap(), s_d.to_cpu_vec_f32().unwrap())
+        };
+
+        let (o2, s2) = run_gpu("0");
+        let (o3, s3) = run_gpu("1");
+
+        let rel_l2 = |got: &[f32], ref64: &[f64]| -> f64 {
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for (&g, &r) in got.iter().zip(ref64) {
+                let d = (g as f64) - r;
+                num += d * d;
+                den += r * r;
+            }
+            (num / den.max(1e-30)).sqrt()
+        };
+        let v2_o = rel_l2(&o2, &out64);
+        let v3_o = rel_l2(&o3, &out64);
+        let v2_s = rel_l2(&s2, &s64);
+        let v3_s = rel_l2(&s3, &s64);
+        let v2_vs_v3: f32 = o2.iter().zip(&o3).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!(
+            "{:<8} {:>12.4e} {:>12.4e} {:>12.4e} {:>12.4e} {:>12.4e}",
+            seq_len, v2_o, v3_o, v2_s, v3_s, v2_vs_v3
+        );
+        assert!(v3_o <= (2.0 * v2_o).max(1e-6), "v3 out L2 exceeded 2x v2 at {seq_len}");
+        assert!(v3_s <= (2.0 * v2_s).max(1e-6), "v3 state L2 exceeded 2x v2 at {seq_len}");
+    }
+}
