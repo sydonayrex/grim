@@ -178,7 +178,7 @@ impl QuantOps for RocmDevice {
                 } else if b_storage.is_released() {
                     self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if (is_rdna2 || is_rdna34)
-                    && m <= 32
+                    && m <= 63
                     && !dot_disabled
                     && !b_storage.is_released()
                     && k % 256 == 0
@@ -339,7 +339,7 @@ impl QuantOps for RocmDevice {
                 } else if b_storage.is_released() {
                     self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if (is_rdna2 || is_rdna34)
-                    && m <= 32
+                    && m <= 63
                     && !dot_disabled
                     && !b_storage.is_released()
                     && k % 256 == 0
@@ -801,7 +801,7 @@ impl QuantOps for RocmDevice {
                     Ok("0" | "false" | "off")
                 );
                 if (is_rdna2 || is_rdna34)
-                    && m <= 32
+                    && m <= 63
                     && !dot_disabled
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
@@ -1220,7 +1220,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_IQ3XXS_DOT4").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if self.is_dot4_arch && m <= 32 && !dot_disabled && k % 256 == 0 {
+                if self.is_dot4_arch && m <= 63 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -1328,7 +1328,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_IQ4NL_DOT4").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if self.is_dot4_arch && m <= 32 && !dot_disabled && k % 32 == 0 {
+                if self.is_dot4_arch && m <= 63 && !dot_disabled && k % 32 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -1412,7 +1412,7 @@ impl QuantOps for RocmDevice {
                 );
                 if iq4xs_dot4
                     && (is_rdna2 || self.is_rdna34)
-                    && m <= 32
+                    && m <= 63
                     && !dot_disabled
                     && k % 256 == 0
                     && !crate::device::quant::exact_decode_gemv()
