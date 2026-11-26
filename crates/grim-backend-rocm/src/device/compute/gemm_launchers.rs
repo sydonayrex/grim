@@ -376,9 +376,9 @@ impl RocmDevice {
         };
 
         // 4. Dispatch mixed-precision GEMM (A: F16, B: F16 -> C/D: F32).
-        // On gfx1200 (second GPU in a gfx1201+gfx1200 process), ROCm 10.1 rocBLAS/hipBLASLt
-        // falls back to scalar MT64x32x8 (~4.5 TFLOP/s); use our tiled RDNA4 WMMA kernel (~21-25 TFLOP/s).
-        if self.gpu_target == "gfx1200" && k % 16 == 0 && n % 16 == 0 {
+        // On RDNA4 (gfx1200/gfx1201), ROCm 10.1 rocBLAS/hipBLASLt with atomics_not_allowed
+        // falls back to scalar MT64x32x8 FMA (~4.5 TFLOP/s); use our tiled RDNA4 WMMA kernel.
+        if matches!(self.gpu_target.as_str(), "gfx1200" | "gfx1201") && k % 16 == 0 && n % 16 == 0 {
             self.launch_wmma_f16_tn_128x128x32(a_act, w_f16, out_storage, m, n, k)?;
         } else {
             self.launch_rocblas_gemm_f16_f32(a_act, w_f16, out_storage, m, n, k)?;
