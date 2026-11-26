@@ -3741,6 +3741,11 @@ pub trait BackendStorage: Send + Sync {
     /// type call this — see `CpuDevice::a_storage`.
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Owned downcast hook for zero-copy storage adoption (e.g. eager KV -> DecodeGraph).
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        panic!("BackendStorage::into_any not implemented for this backend")
+    }
+
     /// Device ordinal for this backend instance.
     /// Used by multi-GPU collective operations (RCCL all-reduce, CommFuse) to identify which GPU this backend owns.
     fn device_ordinal(&self) -> u32 {

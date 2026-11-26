@@ -41,6 +41,12 @@ fn dedup_ords(src: &[usize], extra: Option<usize>) -> Vec<usize> {
 // Per-process env latches: these flags were re-read via std::env::var on every
 // decode step (several sites on the per-token path). Env is not mutated at
 // runtime by the engine, so read once.
+std::thread_local! {
+    static QWEN35_PENDING_ADOPTED_KV: std::cell::RefCell<
+        Option<Vec<Option<(grim_backend_rocm::RocmStorage, grim_backend_rocm::RocmStorage)>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 fn decode_graph_m2_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -80,6 +86,35 @@ pub trait DecodeGraphModel: Send + Sync {
 
     /// Allocate or retrieve a fixed decode buffer pool for this model.
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph>;
+
+    /// Track 2: Prepare zero-copy adoption of pre-sized eager Q8_1 KV arenas
+    /// before `get_or_create_decode_graph` allocates buffers (returns per-layer
+    /// adopted mask). Default: no-op (copy-seed path).
+    fn prepare_zero_copy_kv_adopt(
+        &self,
+        _session: &mut dyn grim_core::session::SessionT,
+        _kv_cap: usize,
+    ) -> (Vec<bool>, usize) {
+        (Vec::new(), 0)
+    }
+
+    /// Snapshot row 0 (attention sink) of adopted KV arenas before warmup capture.
+    fn snapshot_adopted_kv_row0(
+        &self,
+        _g: &DecodeGraph,
+        _adopted_mask: &[bool],
+    ) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
+        Vec::new()
+    }
+
+    /// Restore row 0 (attention sink) of adopted KV arenas after capture.
+    fn restore_adopted_kv_row0(
+        &self,
+        _g: &mut DecodeGraph,
+        _saved: &[(usize, Vec<u8>, Vec<u8>)],
+        _valid_rows: u32,
+    ) {
+    }
 
     /// Populate the decode-only u4-lane weight memo for every K-quant linear
     /// in the model.
@@ -6453,6 +6488,133 @@ impl Qwen35 {
         freed
     }
 
+    /// Track 2: Zero-copy adoption of pre-sized eager Q8_1 `k_device`/`v_device`
+    /// arenas into `DecodeGraph` BEFORE graph buffer allocation, eliminating the
+    /// 2x transient KV VRAM peak at decode step 1 (enables `decode-graph: active`
+    /// at 200k/262k on dual 16 GB cards). Opt-out via `GRIM_KEEP_EAGER_KV=1`.
+    fn take_eager_kv_for_graph(
+        &self,
+        session: &mut dyn grim_core::session::SessionT,
+        kv_cap: usize,
+    ) -> (Vec<Option<(grim_backend_rocm::RocmStorage, grim_backend_rocm::RocmStorage)>>, usize) {
+        let mut out: Vec<Option<(grim_backend_rocm::RocmStorage, grim_backend_rocm::RocmStorage)>> =
+            (0..self.blocks.len()).map(|_| None).collect();
+        if matches!(
+            std::env::var("GRIM_KEEP_EAGER_KV").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return (out, 0);
+        }
+        if crate::qwen35::kv_arena_format_qwen(&self.device)
+            != grim_backend_rocm::KvArenaFormat::Q8_1
+        {
+            return (out, 0);
+        }
+        let Some(caches) = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<crate::qwen35::Qwen35LayerCache>>())
+        else {
+            return (out, 0);
+        };
+        let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+        let expected_bytes = kv_cap * row_bytes;
+        let mut adopted_bytes = 0usize;
+        for (l, c) in caches.iter_mut().enumerate() {
+            if !self.blocks.get(l).map_or(false, |b| b.is_full_attention) {
+                continue;
+            }
+            let can_adopt = match (&c.k_device, &c.v_device) {
+                (Some(k), Some(v)) => {
+                    let kr = k.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>();
+                    let vr = v.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>();
+                    match (kr, vr) {
+                        (Some(kr), Some(vr)) => {
+                            kr.bytes() >= expected_bytes
+                                && vr.bytes() >= expected_bytes
+                                && kr.shape().dims().first().copied().unwrap_or(0) >= kv_cap
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if can_adopt {
+                let kb = c.k_device.take().unwrap();
+                let vb = c.v_device.take().unwrap();
+                let kr = *kb.into_any().downcast::<grim_backend_rocm::RocmStorage>().unwrap();
+                let vr = *vb.into_any().downcast::<grim_backend_rocm::RocmStorage>().unwrap();
+                adopted_bytes += kr.bytes() + vr.bytes();
+                out[l] = Some((kr, vr));
+            }
+        }
+        (out, adopted_bytes)
+    }
+
+    /// Snapshot row 0 (attention sink) of adopted KV arenas before `forward_capture`
+    /// warmup runs with `total_tokens_dev == 0` (which overwrites row 0).
+    fn snapshot_adopted_row0(
+        g: &DecodeGraph,
+        adopted_mask: &[bool],
+        row_bytes: usize,
+    ) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
+        let mut saved = Vec::new();
+        for (l, &is_adopted) in adopted_mask.iter().enumerate() {
+            if !is_adopted {
+                continue;
+            }
+            let k_a = &g.buffers.k_arena[l];
+            let v_a = &g.buffers.v_arena[l];
+            let mut k_buf = vec![0u8; row_bytes];
+            let mut v_buf = vec![0u8; row_bytes];
+            let ord = k_a.device_ordinal();
+            let _dg = grim_backend_rocm::DeviceGuard::set(ord as i32);
+            if let (Some(kp), Some(vp)) = (k_a.device_ptr_u64(), v_a.device_ptr_u64()) {
+                unsafe {
+                    let _ = grim_backend_rocm::device::handles::hipMemcpy(
+                        k_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        kp as *const std::ffi::c_void,
+                        row_bytes,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    );
+                    let _ = grim_backend_rocm::device::handles::hipMemcpy(
+                        v_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        vp as *const std::ffi::c_void,
+                        row_bytes,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    );
+                }
+                saved.push((l, k_buf, v_buf));
+            }
+        }
+        saved
+    }
+
+    /// Restore row 0 (attention sink) of adopted KV arenas after `end_capture()`.
+    fn restore_adopted_row0(g: &DecodeGraph, saved: &[(usize, Vec<u8>, Vec<u8>)]) {
+        for (l, k_buf, v_buf) in saved {
+            let k_a = &g.buffers.k_arena[*l];
+            let v_a = &g.buffers.v_arena[*l];
+            let ord = k_a.device_ordinal();
+            let _dg = grim_backend_rocm::DeviceGuard::set(ord as i32);
+            if let (Some(kp), Some(vp)) = (k_a.device_ptr_u64(), v_a.device_ptr_u64()) {
+                unsafe {
+                    let _ = grim_backend_rocm::device::handles::hipMemcpy(
+                        kp as *mut std::ffi::c_void,
+                        k_buf.as_ptr() as *const std::ffi::c_void,
+                        k_buf.len(),
+                        grim_backend_rocm::HipMemcpyKind::HostToDevice,
+                    );
+                    let _ = grim_backend_rocm::device::handles::hipMemcpy(
+                        vp as *mut std::ffi::c_void,
+                        v_buf.as_ptr() as *const std::ffi::c_void,
+                        v_buf.len(),
+                        grim_backend_rocm::HipMemcpyKind::HostToDevice,
+                    );
+                }
+            }
+        }
+    }
+
     /// Publish row `row` (`0 <= row < batch`) of `g.buffers.head_input` (post-output_norm hidden
     /// state) into `_session.set_last_hidden_state(...)` so `predict_multi_after_forward` drafts
     /// from the exact accepted position without a redundant trunk replay.
@@ -6769,7 +6931,21 @@ impl Qwen35 {
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n >= 64)
                 .unwrap_or(4096);
-            let mut g = self.get_or_create_decode_graph(kv_cap, max_batch)?;
+            let (adopted_kv, adopted_bytes) = self.take_eager_kv_for_graph(_session, kv_cap);
+            let adopted_mask: Vec<bool> = adopted_kv.iter().map(|o| o.is_some()).collect();
+            let any_adopted = adopted_bytes > 0;
+            if any_adopted {
+                QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = Some(adopted_kv));
+            }
+            let g_res = self.get_or_create_decode_graph(kv_cap, max_batch);
+            QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = None);
+            let mut g = g_res?;
+            let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+            let saved_row0 = if any_adopted {
+                Self::snapshot_adopted_row0(&g, &adopted_mask, row_bytes)
+            } else {
+                Vec::new()
+            };
             g.buffers.set_active_batch(batch);
             if g.buffers.recurrent_ckpt.is_none() {
                 g.buffers.recurrent_ckpt = Some(g.buffers.alloc_recurrent_checkpoint()?);
@@ -6781,9 +6957,29 @@ impl Qwen35 {
                 let ok = self.forward_capture(&mut g, tokens[0]).is_ok();
                 let end_ok = g.end_capture().is_ok();
                 if ok && end_ok {
-                    // Seed KV, conv, and KDA state ONCE from eager session after warmup/capture.
-                    let srcs = self.eager_kv_seed_sources(_session, pos)?;
-                    g.buffers.seed_kv_arena_from_eager(&dev, &srcs)?;
+                    if any_adopted {
+                        Self::restore_adopted_row0(&g, &saved_row0);
+                        eprintln!(
+                            "[decode-graph] zero-copy adopted {:.1} MiB of eager Q8_1 KV arenas (1.0x peak)",
+                            adopted_bytes as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    // Seed non-adopted KV layers (if any), plus conv and KDA state.
+                    let srcs: Vec<_> = self
+                        .eager_kv_seed_sources(_session, pos)?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(l, s)| {
+                            if adopted_mask.get(l).copied().unwrap_or(false) {
+                                None
+                            } else {
+                                s
+                            }
+                        })
+                        .collect();
+                    if srcs.iter().any(|s| s.is_some()) {
+                        g.buffers.seed_kv_arena_from_eager(&dev, &srcs)?;
+                    }
                     let conv_dev = self.eager_conv_device_seed_sources(_session)?;
                     if conv_dev.iter().any(|s| s.is_some()) {
                         g.buffers.seed_conv_rings_from_device(&dev, &conv_dev)?;
@@ -6792,8 +6988,7 @@ impl Qwen35 {
                     if !kda_seeds.is_empty() {
                         g.buffers.seed_kda_state_from_eager(&dev, &kda_seeds)?;
                     }
-                    // Step 0A: release duplicate eager KV arenas once DecodeGraph owns
-                    // the seeded KV state (reclaims 516 MiB/card @ 28k, 4.50 GiB/card @ 262k).
+                    // Step 0A: release any remaining duplicate eager KV arenas.
                     let freed_bytes = self.release_eager_kv_arenas(_session);
                     if freed_bytes > 0 {
                         eprintln!(
@@ -6804,9 +6999,15 @@ impl Qwen35 {
                     *graph_slot = Some(Box::new(g));
                 } else {
                     let _ = g.abort_capture();
+                    if any_adopted {
+                        Self::restore_adopted_row0(&g, &saved_row0);
+                    }
                     return Ok(None);
                 }
             } else {
+                if any_adopted {
+                    Self::restore_adopted_row0(&g, &saved_row0);
+                }
                 return Ok(None);
             }
         }
@@ -7366,12 +7567,9 @@ impl DecodeGraphModel for Qwen35 {
                     grim_backend_rocm::KvArenaFormat::Q8_1 => 36.0 / 32.0,
                     _ => 1.0,
                 };
-                for (layer_idx, arena) in buffers
-                    .k_arena
-                    .iter_mut()
-                    .enumerate()
-                    .chain(buffers.v_arena.iter_mut().enumerate())
-                {
+                let mut pending_adopted =
+                    QWEN35_PENDING_ADOPTED_KV.with(|cell| cell.borrow_mut().take());
+                for layer_idx in 0..buffers.k_arena.len() {
                     // Skip GDN / linear-attention layers: they never read or write KV
                     // arenas. Resizing all 64 layers instead of the 16 full-attention
                     // layers wasted 1.62 GiB/card at 28k (and 11.5 GiB/card at 200k).
@@ -7382,7 +7580,7 @@ impl DecodeGraphModel for Qwen35 {
                     {
                         continue;
                     }
-                    let mut dims = arena.shape().dims().to_vec();
+                    let mut dims = buffers.k_arena[layer_idx].shape().dims().to_vec();
                     // C2: Qwen35 MTP verify is single-sequence (eff_batch = 1), so
                     // k_arena/v_arena only need `max_ctx` rows regardless of `batch`.
                     if let Some(first) = dims.first_mut() {
@@ -7392,22 +7590,36 @@ impl DecodeGraphModel for Qwen35 {
                         *last = ((*last as f64) * packed_factor) as usize;
                     }
                     let shape = grim_tensor::Shape::from_slice(&dims);
-                    let arena_ord = arena.device_ordinal();
-                    let arena_dev = grim_backend_rocm::RocmDevice::shared(arena_ord);
-                    let narrowed = RocmStorage::alloc_gpu(
-                        &shape,
-                        kv_dt.clone(),
-                        &arena_dev.allocator_handle(),
-                        arena_ord,
-                    )
-                    .map_err(|e| {
-                        grim_core::error::Error::Backend(format!(
-                            "graph KV arena alloc ({:?}): {e}",
-                            kv_dt.arith
-                        ))
-                    })?;
-                    let _ = arena_dev.launch_memset_u8(&narrowed, 0, narrowed.bytes());
-                    *arena = narrowed;
+                    if let Some(slot) = pending_adopted.as_mut().and_then(|v| v.get_mut(layer_idx)) {
+                        if let Some((mut k_adopted, mut v_adopted)) = slot.take() {
+                            k_adopted.set_shape(shape.clone());
+                            v_adopted.set_shape(shape);
+                            buffers.k_arena[layer_idx] = k_adopted;
+                            buffers.v_arena[layer_idx] = v_adopted;
+                            continue;
+                        }
+                    }
+                    for arena in [
+                        &mut buffers.k_arena[layer_idx],
+                        &mut buffers.v_arena[layer_idx],
+                    ] {
+                        let arena_ord = arena.device_ordinal();
+                        let arena_dev = grim_backend_rocm::RocmDevice::shared(arena_ord);
+                        let narrowed = RocmStorage::alloc_gpu(
+                            &shape,
+                            kv_dt.clone(),
+                            &arena_dev.allocator_handle(),
+                            arena_ord,
+                        )
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!(
+                                "graph KV arena alloc ({:?}): {e}",
+                                kv_dt.arith
+                            ))
+                        })?;
+                        let _ = arena_dev.launch_memset_u8(&narrowed, 0, narrowed.bytes());
+                        *arena = narrowed;
+                    }
                 }
             }
             // Packed codes need their f32 scale sidecars before capture. One f32
@@ -7672,6 +7884,40 @@ impl DecodeGraphModel for Qwen35 {
         }
 
         Ok(graph)
+    }
+
+    fn prepare_zero_copy_kv_adopt(
+        &self,
+        session: &mut dyn grim_core::session::SessionT,
+        kv_cap: usize,
+    ) -> (Vec<bool>, usize) {
+        let (adopted_kv, adopted_bytes) = self.take_eager_kv_for_graph(session, kv_cap);
+        let mask: Vec<bool> = adopted_kv.iter().map(|o| o.is_some()).collect();
+        if adopted_bytes > 0 {
+            QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = Some(adopted_kv));
+        }
+        (mask, adopted_bytes)
+    }
+
+    fn snapshot_adopted_kv_row0(
+        &self,
+        g: &DecodeGraph,
+        adopted_mask: &[bool],
+    ) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
+        let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+        Self::snapshot_adopted_row0(g, adopted_mask, row_bytes)
+    }
+
+    fn restore_adopted_kv_row0(
+        &self,
+        g: &mut DecodeGraph,
+        saved: &[(usize, Vec<u8>, Vec<u8>)],
+        valid_rows: u32,
+    ) {
+        Self::restore_adopted_row0(g, saved);
+        if !saved.is_empty() {
+            g.buffers.current_pos = valid_rows;
+        }
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {

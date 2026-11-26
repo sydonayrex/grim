@@ -566,7 +566,7 @@ fn try_graph_decode_step(
     allow_gpu_sample: bool,
     history: &[u32],
     // Session reference for generic KV arena seeding (`None` → fail closed to eager).
-    session: Option<&dyn grim_core::session::SessionT>,
+    mut session: Option<&mut dyn grim_core::session::SessionT>,
     // Rows valid in every dense arena (prompt_len + decode steps so far).
     valid_rows: u32,
     // GRAVE task 0.3 follow-up: set when decode has reached the graph's hard
@@ -608,8 +608,19 @@ fn try_graph_decode_step(
             );
             return None;
         }
+        let (adopted_mask, adopted_bytes) = if let Some(sess) = session.as_deref_mut() {
+            graph_model.prepare_zero_copy_kv_adopt(sess, graph_ctx)
+        } else {
+            (Vec::new(), 0)
+        };
+        let any_adopted = adopted_bytes > 0;
         match graph_model.get_or_create_decode_graph(graph_ctx, 1) {
             Ok(mut g) => {
+                let saved_row0 = if any_adopted {
+                    graph_model.snapshot_adopted_kv_row0(&g, &adopted_mask)
+                } else {
+                    Vec::new()
+                };
                 // Seed = copy prompt state (KV arenas + conv rings) from the
                 // eager session into the graph pool. Runs OUTSIDE any capture
                 // bracket (D2D + H2D + sync are capture-poison) and AFTER the
@@ -617,34 +628,46 @@ fn try_graph_decode_step(
                 macro_rules! seed_from_session {
                     ($g:expr) => {
                         (|| -> std::result::Result<(), String> {
-                            let sess = session.ok_or_else(|| "no session".to_string())?;
-                            let srcs = graph_model
-                                .eager_kv_seed_sources(sess, valid_rows)
-                                .map_err(|e| format!("export: {e}"))?;
-                            let kv_seeded = srcs.iter().filter(|s| s.is_some()).count();
-                            eprintln!("[seed-summary] found {kv_seeded} kv_seeds, valid_rows={valid_rows}");
-                            if valid_rows > 0 && kv_seeded == 0 {
-                                return Err(format!("expected attention KV seed sources for valid_rows={valid_rows}, found 0"));
+                            if any_adopted {
+                                graph_model.restore_adopted_kv_row0(&mut $g, &saved_row0, valid_rows);
+                                eprintln!(
+                                    "[decode-graph] zero-copy adopted {:.1} MiB of eager Q8_1 KV arenas (1.0x peak)",
+                                    adopted_bytes as f64 / (1024.0 * 1024.0)
+                                );
                             }
+                            let sess = session.as_deref().ok_or_else(|| "no session".to_string())?;
                             let Device::Rocm(ordinal) = *device else {
                                 return Err("non-ROCm device".to_string());
                             };
                             let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
-                            $g.buffers
-                                .seed_kv_arena_from_eager(&dev, &srcs)
-                                .map_err(|e| format!("seed: {e}"))?;
+                            let adopted_cnt = adopted_mask.iter().filter(|&&b| b).count();
+                            if adopted_cnt == 0 {
+                                let srcs = graph_model
+                                    .eager_kv_seed_sources(sess, valid_rows)
+                                    .map_err(|e| format!("export: {e}"))?;
+                                let kv_seeded = srcs.iter().filter(|s| s.is_some()).count();
+                                eprintln!("[seed-summary] found {kv_seeded} kv_seeds, valid_rows={valid_rows}");
+                                if valid_rows > 0 && kv_seeded == 0 {
+                                    return Err(format!("expected attention KV seed sources for valid_rows={valid_rows}, found 0"));
+                                }
+                                $g.buffers
+                                    .seed_kv_arena_from_eager(&dev, &srcs)
+                                    .map_err(|e| format!("seed: {e}"))?;
+                                // GDL layers: D2D copy eager recurrent state into the
+                                // graph's GDL state buffer so replay doesn't start
+                                // from zero after prefill.
+                                $g.buffers
+                                    .seed_gdl_state_from_eager(&dev, &srcs)
+                                    .map_err(|e| format!("gdl seed: {e}"))?;
+                            } else {
+                                eprintln!("[seed-summary] zero-copy adopted {adopted_cnt} full-attn KV layers, valid_rows={valid_rows}");
+                            }
                             if valid_rows > 0 && $g.buffers.current_pos != valid_rows {
                                 return Err(format!(
                                     "seed_kv_arena_from_eager left current_pos={} != valid_rows={valid_rows}",
                                     $g.buffers.current_pos
                                 ));
                             }
-                            // GDL layers: D2D copy eager recurrent state into the
-                            // graph's GDL state buffer so replay doesn't start
-                            // from zero after prefill.
-                            $g.buffers
-                                .seed_gdl_state_from_eager(&dev, &srcs)
-                                .map_err(|e| format!("gdl seed: {e}"))?;
                             // Recurrent (ShortConv) layers: seed the graph's conv
                             // rings from wherever the eager prefill left the live
                             // state. D2D prefill writes conv_state_dev and never
@@ -752,15 +775,20 @@ fn try_graph_decode_step(
                     );
                     return None;
                 }
-                // The capture bracket only RECORDS — it does not execute — so
-                // the capture-step token never entered graph state. The eager
-                // forward for this step runs in the caller after we return;
-                // `just_captured` makes the FIRST replay re-seed from the
-                // session (which then includes the capture-step token).
-                *just_captured = true;
                 *graph = Some(g);
                 graph_retry.note_success();
-                return None; // capture step ran eagerly path this token; replay from next.
+                if !any_adopted {
+                    // The capture bracket only RECORDS — it does not execute — so
+                    // the capture-step token never entered graph state. The eager
+                    // forward for this step runs in the caller after we return;
+                    // `just_captured` makes the FIRST replay re-seed from the
+                    // session (which then includes the capture-step token).
+                    *just_captured = true;
+                    return None; // capture step ran eagerly path this token; replay from next.
+                }
+                // Zero-copy adopted KV already owns rows 0..valid_rows (eager KV was
+                // moved into the graph), so fall straight through to replay step 1
+                // immediately without running an eager step or re-seeding.
             }
             Err(e) => {
                 graph_retry.note_fail(step);
@@ -2872,7 +2900,7 @@ pub async fn cmd_run(
                 generated,
                 allow_gpu_sample,
                 &history,
-                Some(&session as &dyn grim_core::session::SessionT),
+                Some(&mut session as &mut dyn grim_core::session::SessionT),
                 // Fix off-by-one: `tokens` contains the prompt plus the unscheduled token
                 // being decoded in this step. The eager cache only contains tokens forwarded
                 // so far (`tokens.len() - 1`). Passing `tokens.len()` read unwritten tail rows!

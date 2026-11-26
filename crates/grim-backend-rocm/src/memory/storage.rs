@@ -168,6 +168,12 @@ impl RocmStorage {
         self.bytes
     }
 
+    /// Update logical shape metadata without reallocating device memory
+    /// (used for zero-copy eager KV -> DecodeGraph arena adoption).
+    pub fn set_shape(&mut self, shape: Shape) {
+        self.shape = shape;
+    }
+
     /// Whether this storage uses HIP managed memory and may reside in host RAM.
     pub fn is_managed(&self) -> bool {
         self.managed
@@ -994,6 +1000,10 @@ impl BackendStorage for RocmStorage {
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
 
