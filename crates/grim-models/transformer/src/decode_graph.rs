@@ -6645,6 +6645,7 @@ impl Qwen35 {
     ) -> Result<Option<grim_tensor::Tensor>> {
         let batch = tokens.len();
         if batch < 1
+            || !decode_graph_enabled()
             || !decode_graph_m2_enabled()
         {
             return Ok(None);
@@ -7244,7 +7245,22 @@ impl DecodeGraphModel for Qwen35 {
                     grim_backend_rocm::KvArenaFormat::Q8_1 => 36.0 / 32.0,
                     _ => 1.0,
                 };
-                for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
+                for (layer_idx, arena) in buffers
+                    .k_arena
+                    .iter_mut()
+                    .enumerate()
+                    .chain(buffers.v_arena.iter_mut().enumerate())
+                {
+                    // Skip GDN / linear-attention layers: they never read or write KV
+                    // arenas. Resizing all 64 layers instead of the 16 full-attention
+                    // layers wasted 1.62 GiB/card at 28k (and 11.5 GiB/card at 200k).
+                    if !self
+                        .blocks
+                        .get(layer_idx)
+                        .map_or(false, |b| b.is_full_attention)
+                    {
+                        continue;
+                    }
                     let mut dims = arena.shape().dims().to_vec();
                     // C2: Qwen35 MTP verify is single-sequence (eff_batch = 1), so
                     // k_arena/v_arena only need `max_ctx` rows regardless of `batch`.

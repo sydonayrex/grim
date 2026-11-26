@@ -355,6 +355,53 @@ fn resolve_kv_cache_len() -> usize {
         .unwrap_or(4096)
 }
 
+/// Query minimum free VRAM (in MiB) across all active ROCm devices.
+#[cfg(feature = "rocm")]
+pub(crate) fn min_free_rocm_vram_mb() -> Option<u64> {
+    let mut min_free_mb: Option<u64> = None;
+    for ord in 0..8usize {
+        let (free_raw, _q, total_raw) =
+            grim_backend_rocm::device::capability_profiler::vram_info_detailed(ord);
+        if total_raw == 0 {
+            break;
+        }
+        let mb = free_raw / (1024 * 1024);
+        min_free_mb = Some(min_free_mb.map_or(mb, |cur| cur.min(mb)));
+    }
+    min_free_mb
+}
+
+/// Decide whether to pre-capture DecodeGraph(s) during load-time prewarm.
+/// For long contexts (`kv_cap > 4096`) or tight VRAM (`< 4096 MiB` free), defer
+/// capture to decode step 1 so `~2.75 GiB` of DecodeGraph arena/checkpoint
+/// scratch is not held simultaneously with multi-chunk prefill activations
+/// (prevents `rocm:1` OOM under `GRIM_MTP=on` at `28k`).
+pub(crate) fn should_prewarm_decode_graph(kv_cap: usize, min_free_mb: Option<u64>) -> bool {
+    if kv_cap > 4096 {
+        return false;
+    }
+    if let Some(mb) = min_free_mb {
+        if mb < 4096 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pure VRAM -> chunk_size mapping with an explicit `>= 512` floor so 200k KV
+/// shrinking free VRAM never collapses chunk size below 512.
+pub(crate) fn compute_auto_chunk_size_for_vram(min_free_mb: u64) -> usize {
+    if min_free_mb >= 2560 {
+        4096
+    } else if min_free_mb >= 1200 {
+        2048
+    } else if min_free_mb >= 640 {
+        1024
+    } else {
+        512
+    }
+}
+
 /// Compute auto chunk size from measured free VRAM (default 4096, clamped when
 /// free VRAM on any active ROCm device is tight so long prompts do not OOM on
 /// prefill intermediates, e.g. 3.9k at 40,24 with ~1.3-1.8 GiB free on dev0).
@@ -366,26 +413,8 @@ pub(crate) fn compute_auto_chunk_size(prompt_len: usize, _max_tokens: usize) -> 
     }
     #[cfg(feature = "rocm")]
     {
-        let mut min_free_mb: Option<u64> = None;
-        for ord in 0..8usize {
-            let (free_raw, _q, total_raw) =
-                grim_backend_rocm::device::capability_profiler::vram_info_detailed(ord);
-            if total_raw == 0 {
-                break;
-            }
-            let mb = free_raw / (1024 * 1024);
-            min_free_mb = Some(min_free_mb.map_or(mb, |cur| cur.min(mb)));
-        }
-        if let Some(mb) = min_free_mb {
-            let chunk = if mb >= 2560 {
-                4096
-            } else if mb >= 1200 {
-                2048
-            } else if mb >= 640 {
-                1024
-            } else {
-                512
-            };
+        if let Some(mb) = min_free_rocm_vram_mb() {
+            let chunk = compute_auto_chunk_size_for_vram(mb);
             if chunk < 4096 && prompt_len > chunk {
                 eprintln!(
                     "[prefill-chunk] clamped chunk_size 4096 -> {chunk} (min_free_vram={mb} MiB, prompt_len={prompt_len})"
@@ -2124,35 +2153,46 @@ pub async fn cmd_run(
         }
         #[cfg(feature = "rocm")]
         grim_backend_rocm::device::compute::kernel_infra::mark_prewarm_complete();
-        // Pre-capture M=2 DecodeGraph for NativeMtp during model-load prewarm so the
-        // first speculative verify step skips warmup + capture inside the decode timer.
-        if let Some(spec) = model
-            .as_any()
-            .downcast_ref::<grim_speculative::SpeculativeCausalLm>()
-        {
-            let _ = spec.prewarm_m2_graph();
-        }
-        // Pre-capture DecodeGraph during model-load prewarm so first-prompt
-        // TTFT skips the 2x warmup + capture passes.
-        if let Some(gm) = resolve_graph_model(&*model) {
-            let prewarm_ctx = resolve_kv_cache_len();
-            if let Ok(mut g) = gm.get_or_create_decode_graph(prewarm_ctx, 1) {
-                if !g.is_captured {
-                    let _ = gm.forward_capture(&mut g, 1);
-                    let _ = gm.forward_capture(&mut g, 1);
-                    if g.begin_capture().is_ok() {
-                        let ok = gm.forward_capture(&mut g, 1).is_ok();
-                        let _ = g.end_capture();
-                        if ok {
-                            g.buffers.current_pos = 0;
-                            graph_just_captured = true;
-                            decode_graph = Some(g);
-                        } else {
-                            g.is_captured = false;
+        // Pre-capture DecodeGraph(s) during load-time prewarm for short contexts with
+        // ample VRAM; for long contexts (> 4096) or tight VRAM (< 4096 MiB free), defer
+        // capture to decode step 1 so ~2.75 GiB of DecodeGraph arena/checkpoint scratch
+        // does not collide with multi-chunk prefill activations on rocm:1.
+        let prewarm_ctx = resolve_kv_cache_len();
+        #[cfg(feature = "rocm")]
+        let prewarm_min_free_mb = min_free_rocm_vram_mb();
+        #[cfg(not(feature = "rocm"))]
+        let prewarm_min_free_mb: Option<u64> = None;
+        if should_prewarm_decode_graph(prewarm_ctx, prewarm_min_free_mb) {
+            if let Some(spec) = model
+                .as_any()
+                .downcast_ref::<grim_speculative::SpeculativeCausalLm>()
+            {
+                let _ = spec.prewarm_m2_graph();
+            }
+            if let Some(gm) = resolve_graph_model(&*model) {
+                if let Ok(mut g) = gm.get_or_create_decode_graph(prewarm_ctx, 1) {
+                    if !g.is_captured {
+                        let _ = gm.forward_capture(&mut g, 1);
+                        let _ = gm.forward_capture(&mut g, 1);
+                        if g.begin_capture().is_ok() {
+                            let ok = gm.forward_capture(&mut g, 1).is_ok();
+                            let _ = g.end_capture();
+                            if ok {
+                                g.buffers.current_pos = 0;
+                                graph_just_captured = true;
+                                decode_graph = Some(g);
+                            } else {
+                                g.is_captured = false;
+                            }
                         }
                     }
                 }
             }
+        } else {
+            eprintln!(
+                "[prewarm] deferring DecodeGraph capture to decode step 1 (kv_cap={prewarm_ctx}, min_free_vram_mb={:?})",
+                prewarm_min_free_mb
+            );
         }
     }
 
@@ -4280,5 +4320,28 @@ mod tests {
             err.to_string().contains("UTF-8"),
             "error must name the cause: {err}"
         );
+    }
+
+    #[test]
+    fn decode_graph_prewarm_defers_for_long_context_or_tight_vram() {
+        // Short context with ample VRAM: prewarm enabled (zero 4k TTFT regression).
+        assert!(should_prewarm_decode_graph(4096, Some(5200)));
+        assert!(should_prewarm_decode_graph(2048, None));
+        // Long context (> 4096): defer capture to decode step 1 after prefill
+        // frees activation scratch, preventing rocm:1 OOM under GRIM_MTP=on.
+        assert!(!should_prewarm_decode_graph(29329, Some(5200)));
+        assert!(!should_prewarm_decode_graph(8192, Some(8192)));
+        // Tight VRAM (< 4096 MiB free): defer even at 4k.
+        assert!(!should_prewarm_decode_graph(4096, Some(3072)));
+    }
+
+    #[test]
+    fn auto_chunk_size_enforces_512_floor() {
+        assert_eq!(compute_auto_chunk_size_for_vram(4096), 4096);
+        assert_eq!(compute_auto_chunk_size_for_vram(2560), 4096);
+        assert_eq!(compute_auto_chunk_size_for_vram(2000), 2048);
+        assert_eq!(compute_auto_chunk_size_for_vram(1000), 1024);
+        assert_eq!(compute_auto_chunk_size_for_vram(500), 512);
+        assert_eq!(compute_auto_chunk_size_for_vram(0), 512);
     }
 }
