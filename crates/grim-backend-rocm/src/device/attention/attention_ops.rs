@@ -2218,6 +2218,39 @@ impl RocmDevice {
             return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
         }
 
+        let q81_gqa_splitk_ok = seq_len >= 1
+            && seq_len <= 2
+            && kv_seq_len >= 64
+            && head_dim == 256
+            && num_kv_heads > 0
+            && num_heads % num_kv_heads == 0
+            && (num_heads / num_kv_heads) <= 6
+            && window.is_none()
+            && !matches!(
+                std::env::var("GRIM_GQA_SPLITK").as_deref(),
+                Ok("0" | "false" | "off")
+            )
+            && !matches!(
+                std::env::var("GRIM_Q81_ATTN_SPLITK").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+        if q81_gqa_splitk_ok {
+            let stream = crate::kernels::qkv_attention::launch_qkv_attention_eager_q81_gqa_splitk(
+                self,
+                qptr,
+                kptr,
+                vptr,
+                optr,
+                nh,
+                nkv,
+                hd,
+                sl,
+                ksl,
+                isd,
+            )?;
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
+
         let grid = crate::HipDim3::new(seq_len as u32, num_heads as u32, 1);
         let block_dim_x = if matches!(
             self.props.wavefront_size,

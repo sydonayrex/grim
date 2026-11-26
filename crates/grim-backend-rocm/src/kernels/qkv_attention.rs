@@ -11932,6 +11932,108 @@ pub fn launch_qkv_attention_eager_f16_splitk(
     )
 }
 
+/// Phase 0A: Eager Q8_1 decode safety net routing `seq_len <= 2` through the exact same
+/// `grim_qkv_attention_dev_q81_gqa_splitk` + `grim_qkv_attention_splitk_combine` path as `DecodeGraph`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_eager_q81_gqa_splitk(
+    dev: &crate::RocmDevice,
+    q_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    o_ptr: u64,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    seq_len: i32,
+    kv_seq_len: i32,
+    inv_sqrt_d: f32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    const SPLIT_K: usize = 64;
+    let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) =
+        get_or_alloc_splitk_scratch(dev, num_heads as u32, head_dim as u32)?
+    else {
+        return Err(crate::Error::Backend(
+            "eager q81 splitk skipped during capture".into(),
+        ));
+    };
+    static Q81_TOT_DEV_POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, u64>>,
+    > = std::sync::OnceLock::new();
+    let mut tot_ptr = {
+        let map = Q81_TOT_DEV_POOL
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut guard = map.lock().unwrap();
+        let dev_idx = dev.ordinal();
+        if let Some(&p) = guard.get(&dev_idx) {
+            p
+        } else {
+            let _g = crate::device::util::DeviceGuard::set(dev_idx as i32);
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { crate::hipMalloc(&mut ptr, 4) };
+            if rc != 0 {
+                return Err(crate::Error::Backend(format!(
+                    "eager q81 splitk tot hipMalloc failed: {rc}"
+                )));
+            }
+            let p = ptr as u64;
+            guard.insert(dev_idx, p);
+            p
+        }
+    };
+    let tot_val: i32 = kv_seq_len;
+    let _g = crate::device::util::DeviceGuard::set(dev.ordinal() as i32);
+    let rc = unsafe {
+        crate::hipMemcpyAsync(
+            tot_ptr as *mut std::ffi::c_void,
+            &tot_val as *const i32 as *const std::ffi::c_void,
+            4,
+            crate::HipMemcpyKind::HostToDevice,
+            dev.active_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(crate::Error::Backend(format!(
+            "eager q81 splitk tot H2D failed: {rc}"
+        )));
+    }
+    let mut q_p = q_ptr;
+    let mut k_p = k_ptr;
+    let mut v_p = v_ptr;
+    let mut o_p = o_ptr;
+    let mut om_p: u64 = 0;
+    let mut os_p: u64 = 0;
+    let mut nh = num_heads;
+    let mut nkv = num_kv_heads;
+    let mut hd = head_dim;
+    let mut sl = seq_len;
+    let mut steps_i = 0i32;
+    let mut isd = inv_sqrt_d;
+    let mut split_k_i = SPLIT_K as i32;
+    let total_h = (seq_len as usize) * (num_heads as usize);
+    let mut total_h_i = total_h as i32;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_dev_q81_gqa_splitk",
+        crate::HipDim3::new(SPLIT_K as u32, nkv as u32, 1),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut q_p), arg(&mut k_p), arg(&mut v_p),
+            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+            arg(&mut nh), arg(&mut nkv), arg(&mut sl),
+            arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd), arg(&mut split_k_i),
+        ],
+    )?;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_splitk_combine",
+        crate::HipDim3::new(total_h as u32, 1, 1),
+        crate::HipDim3::new(hd as u32, 1, 1),
+        &mut [
+            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+            arg(&mut o_p), arg(&mut om_p), arg(&mut os_p),
+            arg(&mut total_h_i), arg(&mut hd), arg(&mut split_k_i),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod kv_arena_dtype_tests {
     use super::kv_arena_f16;

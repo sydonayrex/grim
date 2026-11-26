@@ -558,3 +558,124 @@ fn test_gdn_v3_reg128_vs_v2_vs_fp64() {
         assert!(v3_s <= (2.0 * v2_s).max(1e-6), "v3 state L2 exceeded 2x v2 at {seq_len}");
     }
 }
+
+/// Phase 0A TDD gate: eager `qkv_attention_q81` (seq_len <= 2) must match the shipped
+/// graph `launch_qkv_attention_dev_batch_q81` (GQA SPLIT_K=64) bitwise at 2k and stay
+/// within 2.0x of graph latency at 32k.
+#[test]
+#[ignore]
+fn eager_q81_matches_graph_decode() {
+    let dev = RocmDevice::shared(0);
+    let num_heads = 24usize;
+    let num_kv_heads = 4usize;
+    let head_dim = 256usize;
+    let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+    let q81_row_bytes = num_kv_heads * (head_dim / 32) * 36;
+    let dummy = dev.zeros(&Shape::new(vec![4]), DType::F32).unwrap();
+
+    // 1. Bitwise parity at 2k for seq_len = 1 and 2
+    let kv_len = 2_048usize;
+    let mut rng = 0x1122_3344_5566_7788_u64;
+    let mut next_f32 = || -> f32 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((rng >> 40) as f32 / ((1u32 << 24) as f32)) - 0.5
+    };
+    let pack_q81 = |src: &[f32]| -> Vec<u8> {
+        let mut out = Vec::with_capacity((src.len() / 32) * 36);
+        for chunk in src.chunks_exact(32) {
+            let amax = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let d_f16 = half::f16::from_f32(d);
+            let d_eff = d_f16.to_f32();
+            let inv_d = if d_eff > 0.0 { 1.0 / d_eff } else { 0.0 };
+            let mut qs = [0i8; 32];
+            let mut s = 0.0f32;
+            for i in 0..32 {
+                let q = (chunk[i] * inv_d).round().clamp(-127.0, 127.0) as i8;
+                qs[i] = q;
+                s += d_eff * (q as f32);
+            }
+            out.extend_from_slice(&d_f16.to_le_bytes());
+            out.extend_from_slice(&half::f16::from_f32(s).to_le_bytes());
+            for q in qs {
+                out.push(q as u8);
+            }
+        }
+        out
+    };
+    let k_h: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|_| next_f32()).collect();
+    let v_h: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|_| next_f32()).collect();
+    let k_d = dev.from_cpu_bytes(&pack_q81(&k_h), &Shape::new(vec![kv_len, q81_row_bytes]), DType::U8).unwrap();
+    let v_d = dev.from_cpu_bytes(&pack_q81(&v_h), &Shape::new(vec![kv_len, q81_row_bytes]), DType::U8).unwrap();
+    let tot_d = dev.from_cpu(&[f32::from_bits(kv_len as u32)], &Shape::new(vec![1]), DType::F32).unwrap();
+
+    for m in [1usize, 2usize] {
+        let q_h: Vec<f32> = (0..m * num_heads * head_dim).map(|_| next_f32() * 4.0).collect();
+        let q_d = dev.from_cpu(&q_h, &Shape::new(vec![m, num_heads, head_dim]), DType::F32).unwrap();
+        let out_shape = Shape::new(vec![m, num_heads, head_dim]);
+        let g_out = dev.zeros(&out_shape, DType::F32).unwrap();
+        let om = dev.zeros(&Shape::new(vec![m * num_heads]), DType::F32).unwrap();
+        let os = dev.zeros(&Shape::new(vec![m * num_heads]), DType::F32).unwrap();
+
+        launch_qkv_attention_dev_batch_q81(
+            &dev, q_d.as_ref(), k_d.as_ref(), v_d.as_ref(), g_out.as_ref(),
+            om.as_ref(), os.as_ref(), tot_d.as_ref(),
+            num_heads as u32, num_kv_heads as u32, head_dim as u32, m as u32, 0,
+            inv_sqrt_d, -1, 0.0, dummy.as_ref(), 0, 0, dummy.as_ref(), 0, 1, 0,
+            KvRingPolicy::new(0, 0),
+        ).unwrap();
+        dev.synchronize();
+        let graph_vec = g_out.to_cpu_vec_f32().unwrap();
+
+        let (e_out, _) = dev.qkv_attention_q81(
+            q_d.as_ref(), k_d.as_ref(), v_d.as_ref(),
+            num_kv_heads, kv_len, (kv_len - m) as u32, None, &out_shape, true,
+        ).unwrap();
+        dev.synchronize();
+        let eager_vec = e_out.to_cpu_vec_f32().unwrap();
+
+        let bit_eq = graph_vec.iter().zip(&eager_vec).all(|(a, b)| a.to_bits() == b.to_bits());
+        let max_abs: f32 = graph_vec.iter().zip(&eager_vec).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("[0A parity @ 2k M={m}] max_abs={max_abs:.6e}, bit_eq={bit_eq}");
+        assert!(bit_eq, "eager_q81_matches_graph_decode failed bitwise parity at M={m}: max_abs={max_abs}");
+    }
+
+    // 2. Perf gate at 32k M=1: eager must be within 2.0x of graph GQA split-K
+    let kv32 = 32_768usize;
+    let k32 = dev.zeros(&Shape::new(vec![kv32, q81_row_bytes]), DType::U8).unwrap();
+    let v32 = dev.zeros(&Shape::new(vec![kv32, q81_row_bytes]), DType::U8).unwrap();
+    let tot32 = dev.from_cpu(&[f32::from_bits(kv32 as u32)], &Shape::new(vec![1]), DType::F32).unwrap();
+    let q1 = dev.zeros(&Shape::new(vec![1, num_heads, head_dim]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![1, num_heads, head_dim]);
+    let g_out = dev.zeros(&out_shape, DType::F32).unwrap();
+    let om = dev.zeros(&Shape::new(vec![num_heads]), DType::F32).unwrap();
+    let os = dev.zeros(&Shape::new(vec![num_heads]), DType::F32).unwrap();
+
+    let mut gt = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        launch_qkv_attention_dev_batch_q81(
+            &dev, q1.as_ref(), k32.as_ref(), v32.as_ref(), g_out.as_ref(),
+            om.as_ref(), os.as_ref(), tot32.as_ref(),
+            num_heads as u32, num_kv_heads as u32, head_dim as u32, 1, 0,
+            inv_sqrt_d, -1, 0.0, dummy.as_ref(), 0, 0, dummy.as_ref(), 0, 1, 0,
+            KvRingPolicy::new(0, 0),
+        ).unwrap();
+        dev.synchronize();
+        gt.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let mut et = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        let _ = dev.qkv_attention_q81(
+            q1.as_ref(), k32.as_ref(), v32.as_ref(),
+            num_kv_heads, kv32, (kv32 - 1) as u32, None, &out_shape, true,
+        ).unwrap();
+        dev.synchronize();
+        et.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let g_ms = median(gt);
+    let e_ms = median(et);
+    println!("[0A perf @ 32k M=1] graph={g_ms:.3} ms, eager={e_ms:.3} ms (ratio={:.2}x)", e_ms / g_ms);
+    assert!(e_ms <= 2.0 * g_ms, "eager Q8_1 too slow: {e_ms:.3} ms vs graph {g_ms:.3} ms");
+}
