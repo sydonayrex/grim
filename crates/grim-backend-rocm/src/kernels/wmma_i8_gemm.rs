@@ -341,6 +341,185 @@ extern "C" __global__ __launch_bounds__(128) void grim_wmma_i8_q80_q81_doublek_g
         }
     }
 }
+
+// res12 Step 2 + HipKittens 8-wave ping-pong: Exact W4A8 (Q4_K weights x Q8_1 activations)
+// using RDNA4 native signed-i8 x unsigned-u8 WMMA (wmma_i32_16x16x16_iu8_w32_gfx12).
+// 8 waves (256 threads, 4x2 warp grid -> 128x64 CTA tile), double-buffered LDS (15 KB),
+// 1 barrier per K=32 sub-block, exact i32 inner-block accumulation + dmin*s_a term.
+__device__ __forceinline__ void q4k_get_scale_min(
+    int sb, const unsigned char* __restrict__ sc, unsigned char& d_sc, unsigned char& m_sc)
+{
+    if (sb < 4) {
+        d_sc = sc[sb] & 63u;
+        m_sc = sc[sb + 4] & 63u;
+    } else {
+        d_sc = (sc[sb + 4] & 0x0Fu) | ((sc[sb - 4] >> 6) << 4);
+        m_sc = (sc[sb + 4] >> 4)    | ((sc[sb]     >> 6) << 4);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256) void grim_wmma_w4a8_q4k_q81_pingpong_gfx12(
+    const unsigned char* __restrict__ A_q81, // [M, (K/32)*36] Q8_1 activations
+    const unsigned char* __restrict__ B_q4k, // [N, (K/256)*144] Q4_K weights (N rows of K)
+    float* __restrict__ C,                   // [M, N] row-major F32
+    int M, int N, int K)
+{
+    const int cta_m = blockIdx.y * 128;
+    const int cta_n = blockIdx.x * 64;
+    const int tid = threadIdx.x; // 0..255 (8 waves)
+    const int wave = tid >> 5;   // 0..7
+    const int lane = tid & 31;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+    const int wm = (wave >> 1) * 32; // 0, 32, 64, 96 (4 warp rows)
+    const int wn = (wave & 1) * 32;  // 0, 32 (2 warp cols)
+
+    const int n_blocks = K >> 5;      // K / 32
+    const int n_super = K >> 8;       // K / 256
+    const long long a_row_bytes = (long long)n_blocks * 36;
+    const long long b_row_bytes = (long long)n_super * 144;
+
+    // Double-buffered LDS: 15 KB total
+    __shared__ signed char   sA[2][128][32];
+    __shared__ float         sDa[2][128];
+    __shared__ float         sSa[2][128];
+    __shared__ unsigned char sB[2][64][32];
+    __shared__ float         sDb[2][64];
+    __shared__ float         sMb[2][64];
+
+    float f_acc[2][2][8];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (int e = 0; e < 8; ++e)
+                f_acc[mt][nt][e] = 0.0f;
+
+    auto load_tile = [&](int kb, int buf) {
+        // 1. Load 128 rows of Q8_1 (256 threads -> 2 threads per row, 16 bytes each)
+        const int a_row = tid >> 1;
+        const int a_half = tid & 1;
+        const int gm = cta_m + a_row;
+        if (gm < M) {
+            const unsigned char* ap = A_q81 + (long long)gm * a_row_bytes + (long long)kb * 36;
+            if (a_half == 0) {
+                sDa[buf][a_row] = __half2float(*reinterpret_cast<const __half*>(ap));
+                sSa[buf][a_row] = __half2float(*reinterpret_cast<const __half*>(ap + 2));
+            }
+            const unsigned char* qs = ap + 4 + a_half * 16;
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                sA[buf][a_row][a_half * 16 + b] = (signed char)qs[b];
+            }
+        } else {
+            if (a_half == 0) {
+                sDa[buf][a_row] = 0.0f;
+                sSa[buf][a_row] = 0.0f;
+            }
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) sA[buf][a_row][a_half * 16 + b] = 0;
+        }
+
+        // 2. Load & unpack 64 rows of Q4_K sub-block `sb = kb & 7` (256 threads -> 4 threads/row, 8 elems each)
+        const int b_row = tid >> 2;
+        const int b_qtr = tid & 3; // 0..3 -> 8 elements each
+        const int gn = cta_n + b_row;
+        const int super_idx = kb >> 3;
+        const int sb = kb & 7;
+        const int grp = sb >> 1;   // 0..3 (each group = 32 packed bytes = 64 nibbles)
+        const int is_hi = sb & 1;  // 0 = low nibble, 1 = high nibble
+        if (gn < N) {
+            const unsigned char* bp = B_q4k + (long long)gn * b_row_bytes + (long long)super_idx * 144;
+            if (b_qtr == 0) {
+                const float d = __half2float(*reinterpret_cast<const __half*>(bp));
+                const float dmin = __half2float(*reinterpret_cast<const __half*>(bp + 2));
+                unsigned char sc_u, m_u;
+                q4k_get_scale_min(sb, bp + 4, sc_u, m_u);
+                sDb[buf][b_row] = d * (float)sc_u;
+                sMb[buf][b_row] = dmin * (float)m_u;
+            }
+            const unsigned char* qs = bp + 16 + grp * 32 + b_qtr * 8;
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                unsigned char byte = qs[b];
+                sB[buf][b_row][b_qtr * 8 + b] = is_hi ? (byte >> 4) : (byte & 0x0Fu);
+            }
+        } else {
+            if (b_qtr == 0) {
+                sDb[buf][b_row] = 0.0f;
+                sMb[buf][b_row] = 0.0f;
+            }
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) sB[buf][b_row][b_qtr * 8 + b] = 0u;
+        }
+    };
+
+    if (n_blocks > 0) {
+        load_tile(0, 0);
+        __syncthreads();
+    }
+
+    for (int kb = 0; kb < n_blocks; ++kb) {
+        const int cur = kb & 1;
+        const int nxt = cur ^ 1;
+
+        // Compute current tile while prefetching next tile into ping-pong buffer
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int m_off = wm + mt * 16 + lane_r;
+            const int* a0_p = reinterpret_cast<const int*>(&sA[cur][m_off][lane_h * 8]);
+            const int* a1_p = reinterpret_cast<const int*>(&sA[cur][m_off][16 + lane_h * 8]);
+            grim_v2i a0 = {a0_p[0], a0_p[1]};
+            grim_v2i a1 = {a1_p[0], a1_p[1]};
+
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int n_off = wn + nt * 16 + lane_r;
+                const int* b0_p = reinterpret_cast<const int*>(&sB[cur][n_off][lane_h * 8]);
+                const int* b1_p = reinterpret_cast<const int*>(&sB[cur][n_off][16 + lane_h * 8]);
+                grim_v2i b0 = {b0_p[0], b0_p[1]};
+                grim_v2i b1 = {b1_p[0], b1_p[1]};
+
+                grim_v8i i_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                // Signed i8 A x Unsigned u8 (4-bit) B -> exact i32
+                i_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, false, b0, i_acc, false);
+                i_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, false, b1, i_acc, false);
+
+                const float db = sDb[cur][wn + nt * 16 + lane_r];
+                const float mb = sMb[cur][wn + nt * 16 + lane_r];
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int local_r = wm + mt * 16 + lane_h * 8 + e;
+                    f_acc[mt][nt][e] += (float)i_acc[e] * (sDa[cur][local_r] * db) - sSa[cur][local_r] * mb;
+                }
+            }
+        }
+
+        if (kb + 1 < n_blocks) {
+            load_tile(kb + 1, nxt);
+        }
+        __syncthreads();
+    }
+
+    // Store C[M, N]
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int col = cta_n + wn + nt * 16 + lane_r;
+            if (col < N) {
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int row = cta_m + wm + mt * 16 + lane_h * 8 + e;
+                    if (row < M) {
+                        C[(long long)row * N + col] = f_acc[mt][nt][e];
+                    }
+                }
+            }
+        }
+    }
+}
 #endif
 "#;
 

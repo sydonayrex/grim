@@ -992,3 +992,129 @@ fn test_int8_epilogue_conformance() {
     eprintln!("[Phase 4 int8-epilogue-conformance] max_abs={max_abs:.4e} (exact power-of-two scale)");
     assert_eq!(max_abs, 0.0, "INT8 epilogue conformance mismatch: {max_abs}");
 }
+
+/// res12 Step 2 + HipKittens 8-wave ping-pong spike: Exact W4A8 Q4_K x Q8_1 INT8 WMMA.
+#[test]
+#[ignore]
+fn test_wmma_w4a8_q4k_q81_pingpong_spike() {
+    use grim_backend_rocm::BackendStorage;
+    let dev = RocmDevice::new(0);
+    let (m, n, k) = (128usize, 128usize, 512usize);
+    let nb = k / 32;
+    let n_super = k / 256;
+    let mut rng = 0x4488_1234_5678_9abcu64;
+    let mut next_u32 = || -> u32 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (rng >> 32) as u32
+    };
+
+    // Build synthetic Q8_1 A [M, K] and dequantize exact A_deq
+    let mut a_q81 = vec![0u8; m * nb * 36];
+    let mut a_deq = vec![0.0f32; m * k];
+    for r in 0..m {
+        for blk in 0..nb {
+            let dh = half::f16::from_f32(0.03125); // 1/32
+            let df = dh.to_f32();
+            let off = (r * nb + blk) * 36;
+            a_q81[off..off + 2].copy_from_slice(&dh.to_le_bytes());
+            let mut sum = 0.0f32;
+            for i in 0..32 {
+                let q = ((next_u32() % 200) as i32 - 100) as i8;
+                a_q81[off + 4 + i] = q as u8;
+                let v = (q as f32) * df;
+                a_deq[r * k + blk * 32 + i] = v;
+                sum += v;
+            }
+            let sh = half::f16::from_f32(sum);
+            a_q81[off + 2..off + 4].copy_from_slice(&sh.to_le_bytes());
+        }
+    }
+
+    // Build synthetic Q4_K B [N, K] (144 B per 256 elems) and dequantize exact B_deq
+    let mut b_q4k = vec![0u8; n * n_super * 144];
+    let mut b_deq = vec![0.0f32; n * k];
+    for r in 0..n {
+        for sup in 0..n_super {
+            let off = (r * n_super + sup) * 144;
+            let dh = half::f16::from_f32(0.015625);
+            let dmh = half::f16::from_f32(0.0078125);
+            let df = dh.to_f32();
+            let dmf = dmh.to_f32();
+            b_q4k[off..off + 2].copy_from_slice(&dh.to_le_bytes());
+            b_q4k[off + 2..off + 4].copy_from_slice(&dmh.to_le_bytes());
+            for s in 0..12 {
+                b_q4k[off + 4 + s] = (next_u32() & 0x3F) as u8;
+            }
+            for q in 0..128 {
+                b_q4k[off + 16 + q] = (next_u32() & 0xFF) as u8;
+            }
+            // Dequantize using exact llama.cpp Q4_K formula
+            let sc = &b_q4k[off + 4..off + 16];
+            for sb in 0..8 {
+                let (sc_u, m_u) = if sb < 4 {
+                    (sc[sb] & 63, sc[sb + 4] & 63)
+                } else {
+                    (
+                        (sc[sb + 4] & 0x0F) | ((sc[sb - 4] >> 6) << 4),
+                        (sc[sb + 4] >> 4) | ((sc[sb] >> 6) << 4),
+                    )
+                };
+                let d_eff = df * (sc_u as f32);
+                let m_eff = dmf * (m_u as f32);
+                let grp = sb / 2;
+                let is_hi = sb & 1;
+                for i in 0..32 {
+                    let byte = b_q4k[off + 16 + grp * 32 + i];
+                    let q4 = if is_hi == 1 { byte >> 4 } else { byte & 0x0F };
+                    b_deq[r * k + sup * 256 + sb * 32 + i] = d_eff * (q4 as f32) - m_eff;
+                }
+            }
+        }
+    }
+
+    let mut c_ref = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f64;
+            for t in 0..k {
+                acc += (a_deq[i * k + t] as f64) * (b_deq[j * k + t] as f64);
+            }
+            c_ref[i * n + j] = acc as f32;
+        }
+    }
+
+    let a_dev = grim_backend_rocm::RocmStorage::copy_from_host_raw_bytes(&a_q81, &Shape::new(vec![m, nb * 36]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let b_dev = grim_backend_rocm::RocmStorage::copy_from_host_raw_bytes(&b_q4k, &Shape::new(vec![n, n_super * 144]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let c1_d = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+    let c2_d = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+
+    dev.launch_wmma_w4a8_q4k_q81_pingpong_gfx12(&a_dev, &b_dev, &c1_d, m, n, k).unwrap();
+    dev.launch_wmma_w4a8_q4k_q81_pingpong_gfx12(&a_dev, &b_dev, &c2_d, m, n, k).unwrap();
+    dev.synchronize();
+
+    let c1 = c1_d.to_cpu_vec_f32().unwrap();
+    let c2 = c2_d.to_cpu_vec_f32().unwrap();
+    let bit_eq = c1.iter().zip(c2.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+    let max_abs = c1.iter().zip(c_ref.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    eprintln!("[W4A8-Q4K-pingpong parity {m}x{n}x{k}] max_abs={max_abs:.4e}, bit_eq={bit_eq}");
+    assert!(bit_eq, "W4A8 Q4_K pingpong not bitwise deterministic");
+    assert!(max_abs < 1e-2, "W4A8 Q4_K pingpong max_abs too high: {max_abs}");
+
+    // Perf bench at Qwen3.8-27B prefill shape M=2048, N=5120, K=5120
+    let (bm, bn, bk) = (2048usize, 5120usize, 5120usize);
+    let ba = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![bm, (bk / 32) * 36]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let bb = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![bn, (bk / 256) * 144]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let bc = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![bm, bn]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+    dev.launch_wmma_w4a8_q4k_q81_pingpong_gfx12(&ba, &bb, &bc, bm, bn, bk).unwrap();
+    dev.synchronize();
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        dev.launch_wmma_w4a8_q4k_q81_pingpong_gfx12(&ba, &bb, &bc, bm, bn, bk).unwrap();
+        dev.synchronize();
+        times.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let ms = median(times);
+    let tops = (2.0 * (bm as f64) * (bn as f64) * (bk as f64)) / (ms * 1e-3) / 1e12;
+    eprintln!("[W4A8-Q4K-pingpong perf {bm}x{bn}x{bk}] {ms:.3} ms ({tops:.2} TOP/s)");
+}

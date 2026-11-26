@@ -879,6 +879,43 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// res12 Step 2 + HipKittens 8-wave ping-pong: Exact W4A8 (`Q4_K` weights x `Q8_1` activations)
+    /// via RDNA4 native `wmma_i32_16x16x16_iu8_w32_gfx12` (128x64 CTA, 8 waves, 15 KB double-buffered LDS).
+    pub fn launch_wmma_w4a8_q4k_q81_pingpong_gfx12(
+        &self,
+        a_q81: &RocmStorage,
+        b_q4k: &RocmStorage,
+        out_f32: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let grid_dim = HipDim3::new(n.div_ceil(64) as u32, m.div_ceil(128) as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+
+        let mut aptr = crate::dev_ptr(a_q81)?;
+        let mut bptr = crate::dev_ptr(b_q4k)?;
+        let mut optr = crate::dev_ptr(out_f32)?;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_w4a8_q4k_q81_pingpong_gfx12",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Public A/B wrapper around [`Self::launch_wmma_fused_dequant_q4k`].
     ///
     /// The kernel is a 16-row x 64-column tile with 128 threads per block
