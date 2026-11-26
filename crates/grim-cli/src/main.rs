@@ -173,6 +173,9 @@ enum Commands {
         lookahead: bool,
         /// Prompt string (runs one-shot mode instead of interactive chat).
         prompt: Option<String>,
+        /// Read one-shot prompt from a UTF-8 text file (routes through the same chunked prefill path as PROMPT).
+        #[arg(long)]
+        prompt_file: Option<std::path::PathBuf>,
         /// Start the HTTP server (Ollama-compatible) on the specified port.
         #[arg(long)]
         serve: bool,
@@ -1361,6 +1364,7 @@ async fn main() -> Result<()> {
             draft_model,
             lookahead,
             prompt,
+            prompt_file,
             serve,
             address,
             config,
@@ -1464,6 +1468,16 @@ async fn main() -> Result<()> {
                             ))
                         })?;
                     model_path.to_string_lossy().into_owned()
+                };
+                let prompt = match (prompt, prompt_file) {
+                    (Some(p), _) => Some(p),
+                    (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
+                        grim_core::error::Error::Config(format!(
+                            "failed to read --prompt-file {}: {e}",
+                            path.display()
+                        ))
+                    })?),
+                    (None, None) => None,
                 };
                 if prompt.is_some() || std::env::var("GRIM_SCORE_FILE").is_ok() {
                     println!("[grim run] Running prompt on: {}", resolved);
