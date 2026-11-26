@@ -6407,6 +6407,52 @@ impl Qwen35 {
         Ok(pos)
     }
 
+    /// Step 0A: Drop eager `k_device`/`v_device` arenas after `DecodeGraph` has
+    /// been seeded from them, and flush idle ROCm caching-allocator blocks so
+    /// duplicate KV VRAM (`516 MiB/card` @ `28k`, `4.50 GiB/card` @ `262,144`)
+    /// is returned immediately. Opt-out via `GRIM_KEEP_EAGER_KV=1`.
+    pub fn release_eager_kv_arenas(&self, session: &mut dyn grim_core::session::SessionT) -> usize {
+        if matches!(
+            std::env::var("GRIM_KEEP_EAGER_KV").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return 0;
+        }
+        let Some(caches) = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<crate::qwen35::Qwen35LayerCache>>())
+        else {
+            return 0;
+        };
+        let mut freed = 0usize;
+        let mut ords = Vec::new();
+        for c in caches.iter_mut() {
+            if let Some(k) = c.k_device.take() {
+                if let Some(r) = k.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                    freed += r.bytes();
+                    if !ords.contains(&r.device_ordinal()) {
+                        ords.push(r.device_ordinal());
+                    }
+                }
+            }
+            if let Some(v) = c.v_device.take() {
+                if let Some(r) = v.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                    freed += r.bytes();
+                    if !ords.contains(&r.device_ordinal()) {
+                        ords.push(r.device_ordinal());
+                    }
+                }
+            }
+        }
+        for ord in ords {
+            let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+            grim_backend_rocm::RocmDevice::shared(ord)
+                .allocator_handle()
+                .empty_cache();
+        }
+        freed
+    }
+
     /// Publish row `row` (`0 <= row < batch`) of `g.buffers.head_input` (post-output_norm hidden
     /// state) into `_session.set_last_hidden_state(...)` so `predict_multi_after_forward` drafts
     /// from the exact accepted position without a redundant trunk replay.
@@ -6745,6 +6791,15 @@ impl Qwen35 {
                     let kda_seeds = self.eager_kda_seed_sources(_session)?;
                     if !kda_seeds.is_empty() {
                         g.buffers.seed_kda_state_from_eager(&dev, &kda_seeds)?;
+                    }
+                    // Step 0A: release duplicate eager KV arenas once DecodeGraph owns
+                    // the seeded KV state (reclaims 516 MiB/card @ 28k, 4.50 GiB/card @ 262k).
+                    let freed_bytes = self.release_eager_kv_arenas(_session);
+                    if freed_bytes > 0 {
+                        eprintln!(
+                            "[decode-graph] released {:.1} MiB of duplicate eager KV arenas after graph seed",
+                            freed_bytes as f64 / (1024.0 * 1024.0)
+                        );
                     }
                     *graph_slot = Some(Box::new(g));
                 } else {
