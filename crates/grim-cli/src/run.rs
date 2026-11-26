@@ -402,9 +402,48 @@ pub(crate) fn compute_auto_chunk_size_for_vram(min_free_mb: u64) -> usize {
     }
 }
 
-/// Compute auto chunk size from measured free VRAM (default 4096, clamped when
-/// free VRAM on any active ROCm device is tight so long prompts do not OOM on
-/// prefill intermediates, e.g. 3.9k at 40,24 with ~1.3-1.8 GiB free on dev0).
+/// Pure VRAM + planned KV -> chunk_size mapping: subtracts planned per-card KV
+/// MiB from pre-KV free VRAM so long-context runs (200k/262k) clamp to 512
+/// before the KV arena lands.
+pub(crate) fn compute_auto_chunk_size_for_vram_after_kv(
+    min_free_mb: u64,
+    planned_kv_mb: u64,
+) -> usize {
+    compute_auto_chunk_size_for_vram(min_free_mb.saturating_sub(planned_kv_mb))
+}
+
+#[cfg(feature = "rocm")]
+fn planned_kv_arena_per_card_mb(prompt_len: usize) -> u64 {
+    let kv_fmt = match std::env::var("GRIM_KV_ARENA")
+        .unwrap_or_else(|_| "q8_1".into())
+        .to_lowercase()
+        .as_str()
+    {
+        "f16" => grim_backend_rocm::KvArenaFormat::F16,
+        "f32" => grim_backend_rocm::KvArenaFormat::F32,
+        _ => grim_backend_rocm::KvArenaFormat::Q8_1,
+    };
+    let kv_cap: usize = std::env::var("GRIM_KV_CACHE_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(prompt_len.max(4096));
+    let mut n_devs = 0usize;
+    for ord in 0..8usize {
+        if grim_backend_rocm::device::capability_profiler::vram_info_detailed(ord).2 == 0 {
+            break;
+        }
+        n_devs += 1;
+    }
+    let n_devs = n_devs.max(1);
+    let attn_layers_per_card = 16usize.div_ceil(n_devs);
+    let bytes =
+        (attn_layers_per_card * 4 * 256 * 2 * kv_cap) as f64 * kv_fmt.bytes_per_elem() as f64;
+    (bytes / (1024.0 * 1024.0)).ceil() as u64
+}
+
+/// Compute auto chunk size from measured free VRAM minus planned per-card KV
+/// arena bytes (default 4096, clamped when residual VRAM on any active ROCm
+/// device is tight so long prompts do not OOM on prefill intermediates).
 pub(crate) fn compute_auto_chunk_size(prompt_len: usize, _max_tokens: usize) -> usize {
     if let Ok(v) = std::env::var("GRIM_PREFILL_CHUNK_SIZE") {
         if let Ok(n) = v.parse::<usize>() {
@@ -414,10 +453,12 @@ pub(crate) fn compute_auto_chunk_size(prompt_len: usize, _max_tokens: usize) -> 
     #[cfg(feature = "rocm")]
     {
         if let Some(mb) = min_free_rocm_vram_mb() {
-            let chunk = compute_auto_chunk_size_for_vram(mb);
+            let kv_mb = planned_kv_arena_per_card_mb(prompt_len);
+            let residual_mb = mb.saturating_sub(kv_mb);
+            let chunk = compute_auto_chunk_size_for_vram_after_kv(mb, kv_mb);
             if chunk < 4096 && prompt_len > chunk {
                 eprintln!(
-                    "[prefill-chunk] clamped chunk_size 4096 -> {chunk} (min_free_vram={mb} MiB, prompt_len={prompt_len})"
+                    "[prefill-chunk] clamped chunk_size 4096 -> {chunk} (min_free_vram={mb} MiB, planned_kv={kv_mb} MiB, residual={residual_mb} MiB, prompt_len={prompt_len})"
                 );
             }
             return chunk;
@@ -4343,5 +4384,23 @@ mod tests {
         assert_eq!(compute_auto_chunk_size_for_vram(1000), 1024);
         assert_eq!(compute_auto_chunk_size_for_vram(500), 512);
         assert_eq!(compute_auto_chunk_size_for_vram(0), 512);
+    }
+
+    #[test]
+    fn auto_chunk_size_subtracts_planned_kv_vram() {
+        // 200k Q8_1: 4096 MiB pre-KV free - 3600 MiB KV = 496 MiB residual -> must clamp to 512
+        // (activation footprint 512 * 49152 = 24 MiB << 496 MiB residual).
+        let c200k = compute_auto_chunk_size_for_vram_after_kv(4096, 3600);
+        assert_eq!(c200k, 512);
+        assert!((c200k * 49_152) < (496 * 1024 * 1024));
+
+        // 262k Q8_1: 4096 MiB pre-KV free - 4608 MiB KV = 0 MiB residual -> 512 floor.
+        assert_eq!(compute_auto_chunk_size_for_vram_after_kv(4096, 4608), 512);
+
+        // 64k Q8_1: 4864 MiB pre-KV free - 1152 MiB KV = 3712 MiB residual -> 4096.
+        assert_eq!(compute_auto_chunk_size_for_vram_after_kv(4864, 1152), 4096);
+
+        // 128k Q8_1: 4096 MiB pre-KV free - 2304 MiB KV = 1792 MiB residual -> 2048.
+        assert_eq!(compute_auto_chunk_size_for_vram_after_kv(4096, 2304), 2048);
     }
 }
