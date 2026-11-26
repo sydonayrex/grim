@@ -116,7 +116,7 @@ fn kv_k_vs_v_attribution_and_needle_retrieval() {
         ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     };
 
-    for &kv_len in &[2048usize, 8192, 32_768] {
+    for &kv_len in &[2048usize, 8192, 32_768, 65_536, 131_072, 200_000, 262_144] {
         let mut q: Vec<f32> = (0..hd).map(|_| next_f() * 0.5).collect();
         let mut k: Vec<f32> = (0..kv_len * hd).map(|_| next_f() * 0.5).collect();
         let mut v: Vec<f32> = (0..kv_len * hd).map(|_| next_f() * 0.5).collect();

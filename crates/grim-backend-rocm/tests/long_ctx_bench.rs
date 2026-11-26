@@ -424,7 +424,7 @@ fn test_gdn_v3_reg128_vs_v2_vs_fp64() {
         "seq_len", "v2_out_L2", "v3_out_L2", "v2_st_L2", "v3_st_L2", "v2_vs_v3_max"
     );
 
-    for &seq_len in &[2_048usize, 32_768, 131_072, 200_000] {
+    for &seq_len in &[2_048usize, 32_768, 131_072, 200_000, 262_144] {
         let mut rng = 0xdead_beef_cafe_1234_u64 ^ (seq_len as u64);
         let mut next_f32 = || -> f32 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
