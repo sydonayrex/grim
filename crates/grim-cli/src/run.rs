@@ -346,6 +346,15 @@ pub(crate) fn emit_startup_config_banner(
     }
 }
 
+/// Single source of truth for DecodeGraph KV arena capacity (rows).
+#[cfg(feature = "rocm")]
+fn resolve_kv_cache_len() -> usize {
+    std::env::var("GRIM_KV_CACHE_LEN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096)
+}
+
 /// Compute auto chunk size from measured free VRAM (default 4096, clamped when
 /// free VRAM on any active ROCm device is tight so long prompts do not OOM on
 /// prefill intermediates, e.g. 3.9k at 40,24 with ~1.3-1.8 GiB free on dev0).
@@ -514,11 +523,8 @@ fn try_graph_decode_step(
 
     let graph_model: &dyn DecodeGraphModel = resolve_graph_model(model)?;
     // Lazily allocate once; stable addresses across steps.
+    let graph_ctx = resolve_kv_cache_len();
     if graph.is_none() {
-        let graph_ctx = std::env::var("GRIM_KV_CACHE_LEN")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4096);
         // GRAVE task 0.3 (revised after research review): capacity exhaustion
         // is a clean stop, NOT an eager fallback — the eager session is stale
         // by every row the graph appended since capture, so switching modes
@@ -2129,7 +2135,8 @@ pub async fn cmd_run(
         // Pre-capture DecodeGraph during model-load prewarm so first-prompt
         // TTFT skips the 2x warmup + capture passes.
         if let Some(gm) = resolve_graph_model(&*model) {
-            if let Ok(mut g) = gm.get_or_create_decode_graph(4096, 1) {
+            let prewarm_ctx = resolve_kv_cache_len();
+            if let Ok(mut g) = gm.get_or_create_decode_graph(prewarm_ctx, 1) {
                 if !g.is_captured {
                     let _ = gm.forward_capture(&mut g, 1);
                     let _ = gm.forward_capture(&mut g, 1);
