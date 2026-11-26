@@ -2213,7 +2213,7 @@ pub struct Qwen35Nextn {
     pub shared_head_norm: RmsNorm,
     /// Reusable KV cache and per-row position log so `predict_nextn_draft` persists
     /// full-attention context across decode steps and rolls back tentative rows in-place.
-    pub cache: std::sync::Mutex<(Option<Qwen35LayerCache>, Vec<u32>)>,
+    pub cache: std::sync::Arc<std::sync::Mutex<(Option<Qwen35LayerCache>, Vec<u32>)>>,
     /// Optional captured HIP graph for `forward_step` (Lever 3: eliminates eager launch overhead).
     pub(crate) graph: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
@@ -2247,7 +2247,7 @@ impl Qwen35Nextn {
             enorm,
             hnorm,
             shared_head_norm,
-            cache: std::sync::Mutex::new((None, Vec::new())),
+            cache: std::sync::Arc::new(std::sync::Mutex::new((None, Vec::new()))),
             graph: std::sync::Mutex::new(None),
         })
     }
@@ -2907,11 +2907,12 @@ pub struct Qwen35LayerCacheSnapshot {
     pub v_device_packed: Option<PackedKvSnapshot>,
 }
 
-/// M2: snapshot of all layer caches (opaque to session trait callers).
+/// M2 / Phase C: snapshot of all layer caches + optional nextn MTP cache/pos_log.
 #[derive(Clone)]
 pub struct Qwen35RecurrentSnapshot {
     pub layers: Vec<Qwen35LayerCacheSnapshot>,
     pub current_pos: usize,
+    pub nextn_snapshot: Option<(Qwen35LayerCacheSnapshot, Vec<u32>)>,
 }
 
 impl Qwen35LayerCache {
@@ -3024,6 +3025,12 @@ impl Qwen35LayerCache {
 /// `Inner`) can snapshot and restore without a Qwen35-specific session type.
 pub struct Qwen35RecurrentHooks {
     pub layer_devices: Vec<Device>,
+    /// Phase C: optional handle to `nextn.cache` + owning device so MTP KV &
+    /// `pos_log` are snapshotted/restored alongside the 48 GDN + 16 attn layers.
+    pub nextn_cache: Option<(
+        std::sync::Arc<std::sync::Mutex<(Option<Qwen35LayerCache>, Vec<u32>)>>,
+        Device,
+    )>,
 }
 
 impl grim_core::session::RecurrentHooks for Qwen35RecurrentHooks {
@@ -3035,7 +3042,13 @@ impl grim_core::session::RecurrentHooks for Qwen35RecurrentHooks {
         let Some(caches) = state.downcast_ref::<Vec<Qwen35LayerCache>>() else {
             return Ok(None);
         };
-        let snap = snapshot_qwen35_caches(caches, current_pos)?;
+        let mut snap = snapshot_qwen35_caches(caches, current_pos)?;
+        if let Some((ref arc, _)) = self.nextn_cache {
+            let guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let (Some(ref nextn_c), ref pos_log) = *guard {
+                snap.nextn_snapshot = Some((nextn_c.snapshot_for_rollback()?, pos_log.clone()));
+            }
+        }
         Ok(Some(Box::new(snap)))
     }
 
@@ -3055,6 +3068,15 @@ impl grim_core::session::RecurrentHooks for Qwen35RecurrentHooks {
             )
         })?;
         restore_qwen35_caches(caches, snap, &self.layer_devices)?;
+        if let (Some((arc, dev)), Some((nextn_snap, pos_log_snap))) =
+            (&self.nextn_cache, &snap.nextn_snapshot)
+        {
+            let mut guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref mut nextn_c) = guard.0 {
+                nextn_c.restore_from_snapshot(nextn_snap, std::slice::from_ref(dev), 0)?;
+            }
+            guard.1 = pos_log_snap.clone();
+        }
         Ok(snap.current_pos)
     }
 }
@@ -3070,6 +3092,7 @@ pub fn snapshot_qwen35_caches(
     Ok(Qwen35RecurrentSnapshot {
         layers,
         current_pos: session_pos,
+        nextn_snapshot: None,
     })
 }
 
@@ -4030,8 +4053,13 @@ impl CausalLm for Qwen35 {
         if session.recurrent_hooks().is_none() {
             let layer_devices: Vec<Device> =
                 self.blocks.iter().map(|b| b.device.clone()).collect();
+            let nextn_cache = self
+                .nextn
+                .as_ref()
+                .map(|n| (n.cache.clone(), n.block.device.clone()));
             session.set_recurrent_hooks(std::sync::Arc::new(Qwen35RecurrentHooks {
                 layer_devices,
+                nextn_cache,
             }));
         }
         if session.model_state().is_none() {
@@ -4137,8 +4165,13 @@ impl CausalLm for Qwen35 {
         if session.recurrent_hooks().is_none() {
             let layer_devices: Vec<Device> =
                 self.blocks.iter().map(|b| b.device.clone()).collect();
+            let nextn_cache = self
+                .nextn
+                .as_ref()
+                .map(|n| (n.cache.clone(), n.block.device.clone()));
             session.set_recurrent_hooks(std::sync::Arc::new(Qwen35RecurrentHooks {
                 layer_devices,
+                nextn_cache,
             }));
         }
 

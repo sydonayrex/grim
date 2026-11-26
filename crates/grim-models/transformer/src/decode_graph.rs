@@ -6341,6 +6341,72 @@ impl Qwen35 {
         Ok(())
     }
 
+    /// Phase C: D2D-sync live post-decode state (`kda_state`, `conv_state`,
+    /// `k_arena`/`v_arena`, and `current_pos`) from `DecodeGraphBuffers` back
+    /// into the session's eager `Vec<Qwen35LayerCache>` at turn end so
+    /// multi-turn decode outputs can be snapshotted into the radix prefix cache.
+    pub fn sync_eager_from_decode_graph(
+        &self,
+        graph: &DecodeGraph,
+        session: &mut dyn grim_core::session::SessionT,
+    ) -> Result<usize> {
+        let pos = graph.buffers.current_pos as usize;
+        let Some(caches) = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<crate::qwen35::Qwen35LayerCache>>())
+        else {
+            return Ok(pos);
+        };
+        let mut synced = Vec::new();
+        for &ord in &graph.buffers.layer_devices {
+            if !synced.contains(&ord) {
+                grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+                synced.push(ord);
+            }
+        }
+        for (i, c) in caches.iter_mut().enumerate() {
+            c.current_pos = pos;
+            let ord = graph.buffers.layer_devices.get(i).copied().unwrap_or(0);
+            let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+            if let (Some(kda_buf), Some(dst)) = (graph.buffers.kda.get(i).and_then(|o| o.as_ref()), c.ssm_state_dev.as_ref()) {
+                if let Some(dst_rocm) = dst.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                    if let (Some(sp), Some(dp)) = (kda_buf.state.device_ptr_u64(), dst_rocm.device_ptr_u64()) {
+                        let bytes = kda_buf.state.bytes().min(dst_rocm.bytes());
+                        unsafe {
+                            let _ = grim_backend_rocm::hipMemcpyAsync(
+                                dp as *mut std::ffi::c_void,
+                                sp as *const std::ffi::c_void,
+                                bytes,
+                                grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                                std::ptr::null_mut(),
+                            );
+                        }
+                    }
+                }
+            }
+            if let (Some(sc_buf), Some(dst)) = (graph.buffers.sc_state.get(i), c.conv_state_dev.as_ref()) {
+                if let Some(dst_rocm) = dst.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                    if let (Some(sp), Some(dp)) = (sc_buf.device_ptr_u64(), dst_rocm.device_ptr_u64()) {
+                        let bytes = sc_buf.bytes().min(dst_rocm.bytes());
+                        unsafe {
+                            let _ = grim_backend_rocm::hipMemcpyAsync(
+                                dp as *mut std::ffi::c_void,
+                                sp as *const std::ffi::c_void,
+                                bytes,
+                                grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                                std::ptr::null_mut(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for &ord in &synced {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+        }
+        Ok(pos)
+    }
+
     /// Publish row `row` (`0 <= row < batch`) of `g.buffers.head_input` (post-output_norm hidden
     /// state) into `_session.set_last_hidden_state(...)` so `predict_multi_after_forward` drafts
     /// from the exact accepted position without a redundant trunk replay.
