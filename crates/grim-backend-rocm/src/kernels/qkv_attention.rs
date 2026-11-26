@@ -3695,6 +3695,422 @@ extern "C" __global__ void grim_qkv_attention_wmma_f16(
         }
     }
 }
+
+// RDNA4 (gfx1200/gfx1201) FlashAttention-2 WMMA v2 prefill kernel for F16 KV.
+// Improvements over v1:
+// 1. Keeps Q in VGPRs (grim_attn_half8 q_reg[16] = 64 VGPRs), eliminating 33.8 KB sQ LDS -> 23 KB total LDS (>= 2 WG/CU).
+// 2. Coalesced 16-byte uint4 (8-half) HBM loads for both K and V (8 vector loads/thread instead of 64 scalar loads).
+extern "C" __global__ void grim_qkv_attention_wmma_f16_v2(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_tensor,
+    const unsigned short* __restrict__ v_tensor,
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_seq_len,
+    int cache_offset, float inv_sqrt_d
+) {
+    constexpr int BR = 64;
+    constexpr int BC = 32;
+    const int h = blockIdx.y;
+    const int i0 = blockIdx.x * BR;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int kv_stride = num_kv_heads * head_dim;
+    const int d_tiles = head_dim >> 4;
+
+    // LDS: sKV union (18.4 KB) + sP[64][36] (4.6 KB) = 23.0 KB -> >= 2 WGs/CU
+    __shared__ union {
+        _Float16 k[BC][264];
+        _Float16 vt[256][36];
+    } sKV;
+    __shared__ _Float16 sP[BR][36];
+
+    // 1. Load this wave's Q fragment directly into VGPRs once (64 VGPRs for head_dim=256)
+    grim_attn_half8 q_reg[16];
+    const int q_row_global = i0 + wave * 16 + lane_r;
+    const float* q_ptr = (q_row_global < seq_len)
+        ? (q + ((long long)q_row_global * num_heads + h) * head_dim)
+        : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        if (dt < d_tiles && q_ptr != nullptr) {
+            const int doff = dt * 16 + lane_h * 8;
+            float4 v0 = *reinterpret_cast<const float4*>(q_ptr + doff);
+            float4 v1 = *reinterpret_cast<const float4*>(q_ptr + doff + 4);
+            q_reg[dt] = {
+                (_Float16)v0.x, (_Float16)v0.y, (_Float16)v0.z, (_Float16)v0.w,
+                (_Float16)v1.x, (_Float16)v1.y, (_Float16)v1.z, (_Float16)v1.w
+            };
+        } else {
+            q_reg[dt] = {
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f,
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f
+            };
+        }
+    }
+
+    grim_attn_float8 o_acc[16];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        o_acc[dt] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    float rmax[8];
+    float rsum[8];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        rmax[r] = -1e30f;
+        rsum[r] = 0.0f;
+    }
+
+    const int last_q = (i0 + BR - 1 < seq_len) ? (i0 + BR - 1) : (seq_len - 1);
+    const int hi = (cache_offset + last_q + 1 < kv_seq_len) ? (cache_offset + last_q + 1) : kv_seq_len;
+    const _Float16* k16 = reinterpret_cast<const _Float16*>(k_tensor);
+    const _Float16* v16 = reinterpret_cast<const _Float16*>(v_tensor);
+
+    const int vec_per_row = head_dim >> 3; // head_dim / 8 (32 for hd=256)
+    const int total_vecs = BC * vec_per_row;
+    const int wave_q0 = i0 + wave * 16;
+    const int wave_max_abs_i = cache_offset + wave_q0 + 15;
+
+    for (int j0 = 0; j0 < hi; j0 += BC) {
+        // 2. Coalesced uint4 (8-half) load of K[j0..j0+BC, 0..head_dim] into sKV.k
+        for (int vidx = tid; vidx < total_vecs; vidx += 128) {
+            const int c = vidx / vec_per_row;
+            const int d = (vidx % vec_per_row) << 3;
+            const int kj = j0 + c;
+            if (kj < hi) {
+                *reinterpret_cast<uint4*>(&sKV.k[c][d]) =
+                    *reinterpret_cast<const uint4*>(&k16[(long long)kv_head * head_dim + (long long)kj * kv_stride + d]);
+            } else {
+                *reinterpret_cast<uint4*>(&sKV.k[c][d]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        // 3. QK^T via WMMA (Q in VGPRs, K in LDS) + online softmax -> sP
+        if (wave_q0 < seq_len && j0 <= wave_max_abs_i) {
+            grim_attn_float8 s0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            grim_attn_float8 s1 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int doff = dt * 16 + lane_h * 8;
+                grim_attn_half8 vb0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[lane_r][doff]);
+                grim_attn_half8 vb1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[16 + lane_r][doff]);
+                s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb0, s0);
+                s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb1, s1);
+            }
+
+            const int col0 = j0 + lane_r;
+            const int col1 = j0 + 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int local_row = lane_h * 8 + r;
+                const int qi = wave_q0 + local_row;
+                const int abs_i = cache_offset + qi;
+                const bool v0 = (qi < seq_len) && (col0 < hi) && (col0 <= abs_i);
+                const bool v1 = (qi < seq_len) && (col1 < hi) && (col1 <= abs_i);
+                const float sc0 = v0 ? (s0[r] * inv_sqrt_d) : -1e30f;
+                const float sc1 = v1 ? (s1[r] * inv_sqrt_d) : -1e30f;
+
+                float tmax = fmaxf(sc0, sc1);
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 8));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 4));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 2));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 1));
+
+                const float m_old = rmax[r];
+                const float m_new = fmaxf(m_old, tmax);
+                const float alpha = (m_old > -1e20f) ? expf(m_old - m_new) : 0.0f;
+                const float p0 = v0 ? expf(sc0 - m_new) : 0.0f;
+                const float p1 = v1 ? expf(sc1 - m_new) : 0.0f;
+
+                float tsum = p0 + p1;
+                tsum += __shfl_xor(tsum, 8);
+                tsum += __shfl_xor(tsum, 4);
+                tsum += __shfl_xor(tsum, 2);
+                tsum += __shfl_xor(tsum, 1);
+
+                rmax[r] = m_new;
+                rsum[r] = rsum[r] * alpha + tsum;
+
+                sP[wave * 16 + local_row][lane_r] = (_Float16)p0;
+                sP[wave * 16 + local_row][16 + lane_r] = (_Float16)p1;
+
+                if (alpha != 1.0f) {
+                    #pragma unroll
+                    for (int dt = 0; dt < 16; ++dt) {
+                        if (dt < d_tiles) o_acc[dt][r] *= alpha;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // 4. Coalesced uint4 load of V[j0..j0+BC, 0..head_dim] + register unpack transpose into sKV.vt
+        for (int vidx = tid; vidx < total_vecs; vidx += 128) {
+            const int c = vidx / vec_per_row;
+            const int d = (vidx % vec_per_row) << 3;
+            const int vj = j0 + c;
+            grim_attn_half8 hv;
+            if (vj < hi) {
+                hv = *reinterpret_cast<const grim_attn_half8*>(
+                    &v16[(long long)kv_head * head_dim + (long long)vj * kv_stride + d]);
+            } else {
+                hv = {
+                    (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f,
+                    (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f
+                };
+            }
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                sKV.vt[d + u][c] = hv[u];
+            }
+        }
+        __syncthreads();
+
+        // 5. PV via WMMA
+        if (wave_q0 < seq_len && j0 <= wave_max_abs_i) {
+            const int p_row = wave * 16 + lane_r;
+            grim_attn_half8 vp0 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][lane_h * 8]);
+            grim_attn_half8 vp1 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][16 + lane_h * 8]);
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int d_row = dt * 16 + lane_r;
+                grim_attn_half8 vv0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][lane_h * 8]);
+                grim_attn_half8 vv1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][16 + lane_h * 8]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp0, vv0, o_acc[dt]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp1, vv1, o_acc[dt]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 6. Normalize and store output
+    if (wave_q0 < seq_len) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int qi = wave_q0 + lane_h * 8 + r;
+            if (qi < seq_len) {
+                const float inv_s = (rsum[r] > 0.0f) ? (1.0f / rsum[r]) : 0.0f;
+                float* orow = out + ((long long)qi * num_heads + h) * head_dim;
+                #pragma unroll
+                for (int dt = 0; dt < 16; ++dt) {
+                    if (dt < d_tiles) orow[dt * 16 + lane_r] = o_acc[dt][r] * inv_s;
+                }
+            }
+        }
+    }
+}
+
+// RDNA4 (gfx1200/gfx1201) FlashAttention-2 WMMA prefill kernel for Q8_1 KV arenas.
+// Same v2 WMMA body (Q in VGPRs, 23.0 KB LDS -> >= 2 WGs/CU), decoding 36-byte Q8_1
+// blocks ([half d, half s, int8_t qs[32]]) directly into F16 LDS tiles sKV.k / sKV.vt.
+extern "C" __global__ void grim_qkv_attention_wmma_q81(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_seq_len,
+    int cache_offset, float inv_sqrt_d
+) {
+    constexpr int BR = 64;
+    constexpr int BC = 32;
+    const int h = blockIdx.y;
+    const int i0 = blockIdx.x * BR;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int n_q8_blocks = head_dim >> 5; // head_dim / 32 (8 for hd=256)
+    const int head_bytes = n_q8_blocks * 36;
+    const long long row_bytes = (long long)num_kv_heads * head_bytes;
+    const int d_tiles = head_dim >> 4;
+
+    __shared__ union {
+        _Float16 k[BC][264];
+        _Float16 vt[256][36];
+    } sKV;
+    __shared__ _Float16 sP[BR][36];
+
+    // 1. Load Q into VGPRs once
+    grim_attn_half8 q_reg[16];
+    const int q_row_global = i0 + wave * 16 + lane_r;
+    const float* q_ptr = (q_row_global < seq_len)
+        ? (q + ((long long)q_row_global * num_heads + h) * head_dim)
+        : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        if (dt < d_tiles && q_ptr != nullptr) {
+            const int doff = dt * 16 + lane_h * 8;
+            float4 v0 = *reinterpret_cast<const float4*>(q_ptr + doff);
+            float4 v1 = *reinterpret_cast<const float4*>(q_ptr + doff + 4);
+            q_reg[dt] = {
+                (_Float16)v0.x, (_Float16)v0.y, (_Float16)v0.z, (_Float16)v0.w,
+                (_Float16)v1.x, (_Float16)v1.y, (_Float16)v1.z, (_Float16)v1.w
+            };
+        } else {
+            q_reg[dt] = {
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f,
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f
+            };
+        }
+    }
+
+    grim_attn_float8 o_acc[16];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        o_acc[dt] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    float rmax[8];
+    float rsum[8];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        rmax[r] = -1e30f;
+        rsum[r] = 0.0f;
+    }
+
+    const int last_q = (i0 + BR - 1 < seq_len) ? (i0 + BR - 1) : (seq_len - 1);
+    const int hi = (cache_offset + last_q + 1 < kv_seq_len) ? (cache_offset + last_q + 1) : kv_seq_len;
+    const int total_blocks = BC * n_q8_blocks; // 32 * 8 = 256 blocks per tile
+    const int wave_q0 = i0 + wave * 16;
+    const int wave_max_abs_i = cache_offset + wave_q0 + 15;
+
+    for (int j0 = 0; j0 < hi; j0 += BC) {
+        // 2. Cooperative decode of Q8_1 K[j0..j0+BC] -> F16 sKV.k (4 waves x 32 lanes = 1 block per wave iter)
+        for (int bidx = wave; bidx < total_blocks; bidx += 4) {
+            const int c = bidx / n_q8_blocks;
+            const int blk = bidx % n_q8_blocks;
+            const int kj = j0 + c;
+            _Float16 val = (_Float16)0.0f;
+            if (kj < hi) {
+                const unsigned char* bp = k_arena + (long long)kj * row_bytes + (long long)kv_head * head_bytes + blk * 36;
+                const float d_scale = __half2float(*reinterpret_cast<const __half*>(bp));
+                const signed char qv = reinterpret_cast<const signed char*>(bp + 4)[lane];
+                val = (_Float16)(d_scale * (float)qv);
+            }
+            sKV.k[c][blk * 32 + lane] = val;
+        }
+        __syncthreads();
+
+        // 3. QK^T via WMMA + online softmax -> sP
+        if (wave_q0 < seq_len && j0 <= wave_max_abs_i) {
+            grim_attn_float8 s0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            grim_attn_float8 s1 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int doff = dt * 16 + lane_h * 8;
+                grim_attn_half8 vb0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[lane_r][doff]);
+                grim_attn_half8 vb1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[16 + lane_r][doff]);
+                s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb0, s0);
+                s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb1, s1);
+            }
+
+            const int col0 = j0 + lane_r;
+            const int col1 = j0 + 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int local_row = lane_h * 8 + r;
+                const int qi = wave_q0 + local_row;
+                const int abs_i = cache_offset + qi;
+                const bool v0 = (qi < seq_len) && (col0 < hi) && (col0 <= abs_i);
+                const bool v1 = (qi < seq_len) && (col1 < hi) && (col1 <= abs_i);
+                const float sc0 = v0 ? (s0[r] * inv_sqrt_d) : -1e30f;
+                const float sc1 = v1 ? (s1[r] * inv_sqrt_d) : -1e30f;
+
+                float tmax = fmaxf(sc0, sc1);
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 8));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 4));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 2));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 1));
+
+                const float m_old = rmax[r];
+                const float m_new = fmaxf(m_old, tmax);
+                const float alpha = (m_old > -1e20f) ? expf(m_old - m_new) : 0.0f;
+                const float p0 = v0 ? expf(sc0 - m_new) : 0.0f;
+                const float p1 = v1 ? expf(sc1 - m_new) : 0.0f;
+
+                float tsum = p0 + p1;
+                tsum += __shfl_xor(tsum, 8);
+                tsum += __shfl_xor(tsum, 4);
+                tsum += __shfl_xor(tsum, 2);
+                tsum += __shfl_xor(tsum, 1);
+
+                rmax[r] = m_new;
+                rsum[r] = rsum[r] * alpha + tsum;
+
+                sP[wave * 16 + local_row][lane_r] = (_Float16)p0;
+                sP[wave * 16 + local_row][16 + lane_r] = (_Float16)p1;
+
+                if (alpha != 1.0f) {
+                    #pragma unroll
+                    for (int dt = 0; dt < 16; ++dt) {
+                        if (dt < d_tiles) o_acc[dt][r] *= alpha;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // 4. Cooperative decode of Q8_1 V[j0..j0+BC] -> transposed F16 sKV.vt
+        for (int bidx = wave; bidx < total_blocks; bidx += 4) {
+            const int c = bidx / n_q8_blocks;
+            const int blk = bidx % n_q8_blocks;
+            const int vj = j0 + c;
+            _Float16 val = (_Float16)0.0f;
+            if (vj < hi) {
+                const unsigned char* bp = v_arena + (long long)vj * row_bytes + (long long)kv_head * head_bytes + blk * 36;
+                const float d_scale = __half2float(*reinterpret_cast<const __half*>(bp));
+                const signed char qv = reinterpret_cast<const signed char*>(bp + 4)[lane];
+                val = (_Float16)(d_scale * (float)qv);
+            }
+            sKV.vt[blk * 32 + lane][c] = val;
+        }
+        __syncthreads();
+
+        // 5. PV via WMMA
+        if (wave_q0 < seq_len && j0 <= wave_max_abs_i) {
+            const int p_row = wave * 16 + lane_r;
+            grim_attn_half8 vp0 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][lane_h * 8]);
+            grim_attn_half8 vp1 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][16 + lane_h * 8]);
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int d_row = dt * 16 + lane_r;
+                grim_attn_half8 vv0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][lane_h * 8]);
+                grim_attn_half8 vv1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][16 + lane_h * 8]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp0, vv0, o_acc[dt]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp1, vv1, o_acc[dt]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 6. Normalize and store output
+    if (wave_q0 < seq_len) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int qi = wave_q0 + lane_h * 8 + r;
+            if (qi < seq_len) {
+                const float inv_s = (rsum[r] > 0.0f) ? (1.0f / rsum[r]) : 0.0f;
+                float* orow = out + ((long long)qi * num_heads + h) * head_dim;
+                #pragma unroll
+                for (int dt = 0; dt < 16; ++dt) {
+                    if (dt < d_tiles) orow[dt * 16 + lane_r] = o_acc[dt][r] * inv_s;
+                }
+            }
+        }
+    }
+}
 #endif
 
 extern "C" __global__ void grim_qkv_attention_dev(

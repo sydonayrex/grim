@@ -689,8 +689,16 @@ impl AttentionOps for RocmDevice {
             let wmma_grid =
                 crate::HipDim3::new(seq_len.div_ceil(64) as u32, config.num_heads as u32, 1);
             let wmma_block = crate::HipDim3::new(128, 1, 1);
+            let kname = if matches!(
+                std::env::var("GRIM_PREFILL_WMMA_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            ) {
+                "grim_qkv_attention_wmma_f16"
+            } else {
+                "grim_qkv_attention_wmma_f16_v2"
+            };
             let stream = self.launch_compute_kernel(
-                "grim_qkv_attention_wmma_f16",
+                kname,
                 wmma_grid,
                 wmma_block,
                 &mut [
@@ -2171,6 +2179,44 @@ impl RocmDevice {
         let mut co = cache_offset as i32;
         let mut isd = 1.0 / (head_dim as f32).sqrt();
         let mut wlo = window_lo_i;
+
+        let q81_wmma_enabled = !matches!(
+            std::env::var("GRIM_Q81_PREFILL_WMMA").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if q81_wmma_enabled
+            && matches!(self.gpu_target.as_str(), "gfx1200" | "gfx1201")
+            && seq_len >= 64
+            && window.is_none()
+            && head_dim > 0
+            && head_dim <= 256
+            && head_dim % 32 == 0
+            && num_kv_heads > 0
+            && num_heads % num_kv_heads == 0
+        {
+            let wmma_grid =
+                crate::HipDim3::new(seq_len.div_ceil(64) as u32, num_heads as u32, 1);
+            let wmma_block = crate::HipDim3::new(128, 1, 1);
+            let stream = self.launch_compute_kernel(
+                "grim_qkv_attention_wmma_q81",
+                wmma_grid,
+                wmma_block,
+                &mut [
+                    arg(&mut qptr),
+                    arg(&mut kptr),
+                    arg(&mut vptr),
+                    arg(&mut optr),
+                    arg(&mut nh),
+                    arg(&mut nkv),
+                    arg(&mut hd),
+                    arg(&mut sl),
+                    arg(&mut ksl),
+                    arg(&mut co),
+                    arg(&mut isd),
+                ],
+            )?;
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
 
         let grid = crate::HipDim3::new(seq_len as u32, num_heads as u32, 1);
         let block_dim_x = if matches!(
