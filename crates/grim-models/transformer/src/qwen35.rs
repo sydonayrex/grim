@@ -2563,6 +2563,143 @@ pub struct Qwen35 {
     pub nextn: Option<Qwen35Nextn>,
 }
 
+/// Phase A: Immutable, refcounted storage for a single device-resident recurrent
+/// tensor (`conv_state_dev` or `ssm_state_dev`) in a radix/rollback snapshot.
+/// Prefers D2D on the owning ROCm device when free VRAM >= 2048 MiB (`~0.5 ms`
+/// for 48 GDN layers), spilling automatically to host memory when VRAM is tight.
+#[derive(Clone)]
+pub enum RecurrentStateSnapshot {
+    DeviceD2D(std::sync::Arc<grim_backend_rocm::RocmStorage>),
+    Host(Vec<f32>, Vec<usize>),
+}
+
+impl RecurrentStateSnapshot {
+    fn capture(storage: &dyn grim_tensor::BackendStorage) -> Result<Self> {
+        use grim_tensor::BackendStorage;
+        {
+            let d2d_enabled = !matches!(
+                std::env::var("GRIM_SNAPSHOT_D2D").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+            if d2d_enabled {
+                if let Some(rocm_s) = storage
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                {
+                    let ord = rocm_s.device_ordinal();
+                    let (free_bytes, _) = grim_backend_rocm::vram_info(ord);
+                    // Spill to host when free VRAM < 2048 MiB so 200k contexts never OOM.
+                    if free_bytes >= 2048 * 1024 * 1024 {
+                        if let Some(src_ptr) = rocm_s.device_ptr_u64() {
+                            let dev = grim_backend_rocm::RocmDevice::shared(ord);
+                            let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+                            let dst = grim_backend_rocm::RocmStorage::alloc_gpu(
+                                rocm_s.shape(),
+                                rocm_s.dtype().clone(),
+                                &dev.allocator_handle(),
+                                ord,
+                            )?;
+                            if let Some(dst_ptr) = dst.device_ptr_u64() {
+                                let rc = unsafe {
+                                    grim_backend_rocm::hipMemcpyAsync(
+                                        dst_ptr as *mut std::ffi::c_void,
+                                        src_ptr as *const std::ffi::c_void,
+                                        rocm_s.bytes(),
+                                        grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                if rc == 0 {
+                                    return Ok(Self::DeviceD2D(std::sync::Arc::new(dst)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self::Host(
+            storage.to_cpu_vec_f32()?,
+            storage.shape().dims().to_vec(),
+        ))
+    }
+
+    fn restore_into(
+        &self,
+        slot: &mut Option<Box<dyn grim_tensor::BackendStorage>>,
+        dev_type: &Device,
+    ) -> Result<()> {
+        use grim_tensor::BackendStorage;
+        match self {
+            Self::DeviceD2D(src) => {
+                let ord = src.device_ordinal();
+                let src_ptr = src.device_ptr_u64().ok_or_else(|| {
+                    grim_core::error::Error::Backend("RecurrentStateSnapshot: null src ptr".into())
+                })?;
+                let dev = grim_backend_rocm::RocmDevice::shared(ord);
+                let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+                // In-place D2D overwrite when existing buffer matches ordinal + byte size
+                // (zero hipMalloc/hipFree churn).
+                if let Some(existing) = slot.as_ref() {
+                    if let Some(dst_rocm) = existing
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    {
+                        if dst_rocm.device_ordinal() == ord && dst_rocm.bytes() == src.bytes() {
+                            if let Some(dst_ptr) = dst_rocm.device_ptr_u64() {
+                                let rc = unsafe {
+                                    grim_backend_rocm::hipMemcpyAsync(
+                                        dst_ptr as *mut std::ffi::c_void,
+                                        src_ptr as *const std::ffi::c_void,
+                                        src.bytes(),
+                                        grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                if rc == 0 {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+                let dst = grim_backend_rocm::RocmStorage::alloc_gpu(
+                    src.shape(),
+                    src.dtype().clone(),
+                    &dev.allocator_handle(),
+                    ord,
+                )?;
+                let dst_ptr = dst.device_ptr_u64().ok_or_else(|| {
+                    grim_core::error::Error::Backend("RecurrentStateSnapshot: null dst ptr".into())
+                })?;
+                let rc = unsafe {
+                    grim_backend_rocm::hipMemcpyAsync(
+                        dst_ptr as *mut std::ffi::c_void,
+                        src_ptr as *const std::ffi::c_void,
+                        src.bytes(),
+                        grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(grim_core::error::Error::Backend(format!(
+                        "RecurrentStateSnapshot::restore_into D2D hipMemcpyAsync failed: {rc}"
+                    )));
+                }
+                *slot = Some(Box::new(dst));
+                Ok(())
+            }
+            Self::Host(data, dims) => {
+                let backend = pick_device_for_storage_device(dev_type);
+                let shape = Shape::new(dims.clone());
+                let storage = backend.from_cpu(data, &shape, DType::F32)?;
+                *slot = Some(storage);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// M2: snapshot of a single Qwen35 layer cache for recurrent/speculative rollback.
 #[derive(Clone)]
 pub struct Qwen35LayerCacheSnapshot {
@@ -2571,9 +2708,9 @@ pub struct Qwen35LayerCacheSnapshot {
     pub conv_state: Vec<f32>,
     pub ssm_state: Vec<f32>,
     pub current_pos: usize,
-    /// Host copies of device-resident recurrent states (if present), with shapes.
-    pub conv_state_dev: Option<(Vec<f32>, Vec<usize>)>,
-    pub ssm_state_dev: Option<(Vec<f32>, Vec<usize>)>,
+    /// D2D or host copies of device-resident recurrent states (if present).
+    pub conv_state_dev: Option<RecurrentStateSnapshot>,
+    pub ssm_state_dev: Option<RecurrentStateSnapshot>,
 }
 
 /// M2: snapshot of all layer caches (opaque to session trait callers).
@@ -2584,19 +2721,16 @@ pub struct Qwen35RecurrentSnapshot {
 }
 
 impl Qwen35LayerCache {
-    /// M2: capture recurrent/KV-cache state for rollback.
-    /// Device storages are read back to host for correctness-first snapshotting.
-    /// TODO(gpu-verify): replace with D2D snapshot for performance on large contexts.
+    /// M2 / Phase A: capture recurrent/KV-cache state for rollback or radix anchor.
+    /// Uses async D2D copy when free VRAM >= 2048 MiB, spilling to host when tight.
     pub fn snapshot_for_rollback(&self) -> Result<Qwen35LayerCacheSnapshot> {
-        let conv_state_dev = if let Some(s) = self.conv_state_dev.as_ref() {
-            Some((s.to_cpu_vec_f32()?, s.shape().dims().to_vec()))
-        } else {
-            None
+        let conv_state_dev = match self.conv_state_dev.as_ref() {
+            Some(s) => Some(RecurrentStateSnapshot::capture(s.as_ref())?),
+            None => None,
         };
-        let ssm_state_dev = if let Some(s) = self.ssm_state_dev.as_ref() {
-            Some((s.to_cpu_vec_f32()?, s.shape().dims().to_vec()))
-        } else {
-            None
+        let ssm_state_dev = match self.ssm_state_dev.as_ref() {
+            Some(s) => Some(RecurrentStateSnapshot::capture(s.as_ref())?),
+            None => None,
         };
         Ok(Qwen35LayerCacheSnapshot {
             k_cache: self.k_cache.clone(),
@@ -2609,14 +2743,24 @@ impl Qwen35LayerCache {
         })
     }
 
-    /// M2: restore recurrent/KV-cache state from a rollback snapshot.
-    /// Device storages (if they existed) are restored by uploading host snapshot data
-    /// to freshly allocated device buffers on the cache's target devices.
+    /// M2 / Phase A: restore recurrent/KV-cache state from a snapshot.
+    /// When `sync_device` is false, the caller (`restore_qwen35_caches`) has already
+    /// synchronized each unique ROCm device once before the layer loop.
     pub fn restore_from_snapshot(
         &mut self,
         snap: &Qwen35LayerCacheSnapshot,
         devices: &[Device],
         layer_idx: usize,
+    ) -> Result<()> {
+        self.restore_from_snapshot_inner(snap, devices, layer_idx, true)
+    }
+
+    fn restore_from_snapshot_inner(
+        &mut self,
+        snap: &Qwen35LayerCacheSnapshot,
+        devices: &[Device],
+        layer_idx: usize,
+        sync_device: bool,
     ) -> Result<()> {
         self.k_cache = snap.k_cache.clone();
         self.v_cache = snap.v_cache.clone();
@@ -2624,56 +2768,27 @@ impl Qwen35LayerCache {
         self.ssm_state = snap.ssm_state.clone();
         self.current_pos = snap.current_pos;
 
-        // The replaces below DROP the previous device storages. The verify
-        // forward that preceded this restore queued kernels writing them; if
-        // the drop wins the race the stream faults on freed VRAM
-        // (intermittent dev1 page fault, MTP reject/replay only). Sync the
-        // layer's storage device first so nothing in flight references the
-        // buffers we are about to release.
         let dev_type = devices
             .get(layer_idx)
             .or_else(|| devices.last())
             .cloned()
             .unwrap_or(Device::Cpu);
-        if let Device::Rocm(ord) = &dev_type {
-            grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+        if sync_device {
+            if let Device::Rocm(ord) = &dev_type {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
         }
 
-        // Keep the device KV state (dense arenas + quant sidecars + paged
-        // handles). There is no rebuild path for these once dropped: the host
-        // `k_cache`/`v_cache` mirrors are never populated, so clearing
-        // `k_device` here made every post-restore forward attend over
-        // UNINITIALIZED arena rows (arena alloc only copies history from a
-        // pre-existing `old_k`, qwen35.rs grow arms) while `total_kv` still
-        // counted `current_pos` rows of history. Rollback only needs the
-        // logical position: appends write in place at `arena_row(current_pos)`
-        // and every forward appends BEFORE attention reads, so stale rows above
-        // the restored pos are overwritten before they can ever be read (same
-        // ring-wrap semantics as the accept path).
-        // A stashed prefill K/V belongs to the rolled-back pass; drop it so the
-        // replay does not append a second copy into the shared paged store.
+        // Keep device KV arenas; drop any stashed prefill bridge_kv.
         self.bridge_kv = None;
 
-        let dev_type = devices
-            .get(layer_idx)
-            .or_else(|| devices.last())
-            .cloned()
-            .unwrap_or(Device::Cpu);
-        let backend = pick_device_for_storage_device(&dev_type);
-
-        if let Some((data, dims)) = &snap.conv_state_dev {
-            let shape = Shape::new(dims.clone());
-            let storage = backend.from_cpu(data, &shape, DType::F32)?;
-            self.conv_state_dev = Some(storage);
-        } else {
-            self.conv_state_dev = None;
+        match &snap.conv_state_dev {
+            Some(s) => s.restore_into(&mut self.conv_state_dev, &dev_type)?,
+            None => self.conv_state_dev = None,
         }
-        if let Some((data, dims)) = &snap.ssm_state_dev {
-            let shape = Shape::new(dims.clone());
-            let storage = backend.from_cpu(data, &shape, DType::F32)?;
-            self.ssm_state_dev = Some(storage);
-        } else {
-            self.ssm_state_dev = None;
+        match &snap.ssm_state_dev {
+            Some(s) => s.restore_into(&mut self.ssm_state_dev, &dev_type)?,
+            None => self.ssm_state_dev = None,
         }
         Ok(())
     }
@@ -2746,8 +2861,19 @@ pub fn restore_qwen35_caches(
             snap.layers.len()
         )));
     }
+    {
+        let mut synced = Vec::new();
+        for d in devices {
+            if let Device::Rocm(ord) = *d {
+                if !synced.contains(&ord) {
+                    grim_backend_rocm::RocmDevice::shared(ord).synchronize();
+                    synced.push(ord);
+                }
+            }
+        }
+    }
     for (i, (c, s)) in caches.iter_mut().zip(snap.layers.iter()).enumerate() {
-        c.restore_from_snapshot(s, devices, i)?;
+        c.restore_from_snapshot_inner(s, devices, i, false)?;
     }
     Ok(())
 }

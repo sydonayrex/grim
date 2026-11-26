@@ -203,3 +203,70 @@ fn hybrid_model_does_not_seed_without_the_flag() {
         None => unsafe { std::env::remove_var("GRIM_HYBRID_PREFIX") },
     }
 }
+
+/// Phase A gate: 48-layer Qwen3.8-27B GDN+ShortConv D2D snapshot + in-place
+/// restore must complete in < 100 ms (target < 15 ms) with bit-exact 0.0000e0 state.
+#[test]
+fn d2d_snapshot_restore_48l_under_100ms() {
+    if std::env::var("GRIM_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run");
+        return;
+    }
+    use grim_backend_rocm::RocmDevice;
+    use grim_models_transformer::qwen35::{
+        restore_qwen35_caches, snapshot_qwen35_caches, Qwen35Config, Qwen35LayerCache,
+    };
+    use grim_tensor::{DType, Device, Shape};
+
+    let dev0 = RocmDevice::shared(0);
+    let cfg = Qwen35Config::default();
+    let ssm_shape = Shape::new(vec![48, 128, 128]); // 3 MiB per GDN layer (48L = 144 MiB)
+    let conv_shape = Shape::new(vec![4, 128]);
+    let ssm_seed: Vec<f32> = (0..48 * 128 * 128)
+        .map(|i| ((i % 97) as f32) * 0.01 - 0.5)
+        .collect();
+    let conv_seed: Vec<f32> = (0..4 * 128).map(|i| (i as f32) * 0.001).collect();
+
+    let mut caches = Vec::with_capacity(48);
+    let mut devices = Vec::with_capacity(48);
+    for _ in 0..48 {
+        let mut c = Qwen35LayerCache::new(&cfg);
+        c.ssm_state_dev = Some(dev0.from_cpu(&ssm_seed, &ssm_shape, DType::F32).unwrap());
+        c.conv_state_dev = Some(dev0.from_cpu(&conv_seed, &conv_shape, DType::F32).unwrap());
+        c.current_pos = 28_000;
+        caches.push(c);
+        devices.push(Device::Rocm(0));
+    }
+    dev0.synchronize();
+
+    // Warmup + measure snapshot + in-place restore
+    let _warm = snapshot_qwen35_caches(&caches, 28_000).unwrap();
+    dev0.synchronize();
+
+    let t0 = std::time::Instant::now();
+    let snap = snapshot_qwen35_caches(&caches, 28_000).unwrap();
+    dev0.synchronize();
+    let snap_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    // Clobber layer 0 ssm_state_dev to prove restore really overwrites it
+    caches[0].ssm_state_dev = Some(dev0.zeros(&ssm_shape, DType::F32).unwrap());
+    dev0.synchronize();
+
+    let t1 = std::time::Instant::now();
+    restore_qwen35_caches(&mut caches, &snap, &devices).unwrap();
+    dev0.synchronize();
+    let rest_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+    let restored = caches[0].ssm_state_dev.as_ref().unwrap().to_cpu_vec_f32().unwrap();
+    let max_err = restored
+        .iter()
+        .zip(ssm_seed.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let total_ms = snap_ms + rest_ms;
+    eprintln!(
+        "[Phase A 48L D2D] snapshot={snap_ms:.2} ms, restore={rest_ms:.2} ms, total={total_ms:.2} ms, max_err={max_err:.4e}"
+    );
+    assert_eq!(max_err, 0.0, "D2D snapshot/restore not bit-exact: {max_err}");
+    assert!(total_ms < 100.0, "48L D2D snapshot+restore exceeded 100 ms: {total_ms:.2} ms");
+}

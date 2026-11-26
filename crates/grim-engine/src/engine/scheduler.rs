@@ -427,10 +427,20 @@ impl Engine {
                             // Only a block-aligned depth is stored — the KV seed
                             // on admission is block-aligned, so a partial-block
                             // checkpoint could never be paired with it.
+                            let cadence_chunks: usize = std::env::var("GRIM_SNAPSHOT_CHUNK_CADENCE")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(4)
+                                .max(1);
+                            let at_end = target >= full_input.len();
+                            let on_cadence = at_end
+                                || full_input.len() <= 2048
+                                || (target % (cadence_chunks * 2048) == 0);
                             let snapshot = if self.hybrid_prefix_enabled
                                 && self.model_uses_hybrid_kv(id)
                                 && target > 0
                                 && target % grim_memory::BLOCK_SIZE == 0
+                                && on_cadence
                             {
                                 session.snapshot_recurrent_state().ok().flatten()
                             } else {
