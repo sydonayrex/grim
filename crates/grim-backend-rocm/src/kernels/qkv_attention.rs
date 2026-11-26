@@ -4770,6 +4770,283 @@ extern "C" __global__ void grim_qkv_attention_splitk_combine(
     }
 }
 
+// GQA-shared, many-split, uint4-vectorized F16 decode attention kernel (head_dim == 256).
+// 1 WG per (split_id, kv_head) = 128 threads (4 Wave32 waves).
+// Streams K and V ONCE from HBM into 4 KB LDS (4 tokens/tile via uint4 loads) and serves
+// all q_per_kv (<= 6) query heads x seq_len (<= 3) MTP rows simultaneously.
+extern "C" __global__ void grim_qkv_attention_dev_f16_gqa_splitk(
+    const float* __restrict__ q,
+    const __half* __restrict__ k_tensor,
+    const __half* __restrict__ v_tensor,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int split_k
+) {
+    constexpr int HD = 256;
+    constexpr int JT = 4;
+    constexpr int MAX_Q_PER_WAVE = 3; // exact for q_per_kv=6, seq_len<=2 (12/4=3) -> 48 VGPRs, zero spill
+
+    const int split_id = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int n_q = q_per_kv * seq_len;
+    const int total = *total_dev + steps;
+    const int kv_stride = num_kv_heads * HD;
+    const int total_h = seq_len * num_heads;
+
+    const int base = total / split_k;
+    const int rem = total % split_k;
+    const int j_start = split_id * base + (split_id < rem ? split_id : rem);
+    const int j_end = j_start + base + (split_id < rem ? 1 : 0);
+
+    // Load this wave's assigned query rows into registers (compile-time unrolled so LLVM keeps 100% in VGPRs)
+    float qreg[MAX_Q_PER_WAVE][8];
+    float acc[MAX_Q_PER_WAVE][8];
+    float rmax[MAX_Q_PER_WAVE];
+    float rsum[MAX_Q_PER_WAVE];
+    int q_hi[MAX_Q_PER_WAVE];
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        rmax[m] = -1e30f;
+        rsum[m] = 0.0f;
+        if (qi < n_q) {
+            const int qr = qi / q_per_kv;
+            const int h = kv_head * q_per_kv + (qi % q_per_kv);
+            q_hi[m] = total - (seq_len - 1 - qr);
+            const float* q_row = q + ((long long)qr * num_heads + h) * HD;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                qreg[m][c] = q_row[lane + c * 32];
+                acc[m][c] = 0.0f;
+            }
+        } else {
+            q_hi[m] = -1;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                qreg[m][c] = 0.0f;
+                acc[m][c] = 0.0f;
+            }
+        }
+    }
+
+    __shared__ __half sK[JT][HD];
+    __shared__ __half sV[JT][HD];
+    const int ld_t = tid >> 5;       // 0..3 token in tile
+    const int ld_v = (tid & 31) * 8; // 0..248 half offset (uint4 = 8 halfs = 16 B)
+
+    for (int j0 = j_start; j0 < j_end; j0 += JT) {
+        const int j = j0 + ld_t;
+        if (j < j_end) {
+            const long long off = (long long)j * kv_stride + (long long)kv_head * HD + ld_v;
+            *reinterpret_cast<uint4*>(&sK[ld_t][ld_v]) = *reinterpret_cast<const uint4*>(&k_tensor[off]);
+            *reinterpret_cast<uint4*>(&sV[ld_t][ld_v]) = *reinterpret_cast<const uint4*>(&v_tensor[off]);
+        }
+        __syncthreads();
+
+        const int jt_cnt = (j0 + JT <= j_end) ? JT : (j_end - j0);
+        for (int t = 0; t < jt_cnt; ++t) {
+            float kv_k[8], kv_v[8];
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                kv_k[c] = __half2float(sK[t][lane + c * 32]);
+                kv_v[c] = __half2float(sV[t][lane + c * 32]);
+            }
+            const int cur_j = j0 + t;
+            #pragma unroll
+            for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+                if (cur_j >= q_hi[m]) continue;
+                float score = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) score += qreg[m][c] * kv_k[c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) score += __shfl_xor(score, off);
+                score *= inv_sqrt_d;
+                const float m_new = fmaxf(rmax[m], score);
+                const float sa = expf(rmax[m] - m_new);
+                const float sb = expf(score - m_new);
+                rmax[m] = m_new;
+                rsum[m] = rsum[m] * sa + sb;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) acc[m][c] = acc[m][c] * sa + sb * kv_v[c];
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write partials in grim_qkv_attention_splitk_combine layout
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        if (qi >= n_q) continue;
+        const int qr = qi / q_per_kv;
+        const int h = kv_head * q_per_kv + (qi % q_per_kv);
+        const int out_h = qr * num_heads + h;
+        const int p_idx = split_id * total_h + out_h;
+        if (lane == 0) {
+            partial_max[p_idx] = rmax[m];
+            partial_sum[p_idx] = rsum[m];
+        }
+        float* po = partial_out + (long long)p_idx * HD;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            po[lane + c * 32] = acc[m][c];
+        }
+    }
+}
+
+// GQA-shared, many-split, uint4-vectorized Q8_1 decode attention kernel (head_dim == 256).
+// Each Q8_1 block = 36 bytes [half d, half s, int8_t qs[32]]; 8 blocks = 288 B per head.
+// 4 tokens = 1,152 B = 72 uint4 loads for K + 72 uint4 loads for V into 2.3 KB LDS.
+extern "C" __global__ void grim_qkv_attention_dev_q81_gqa_splitk(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int split_k
+) {
+    constexpr int HD = 256;
+    constexpr int HEAD_BYTES = 288; // (256 / 32) * 36
+    constexpr int JT = 4;
+    constexpr int MAX_Q_PER_WAVE = 3; // exact for q_per_kv=6, seq_len<=2 (12/4=3) -> 48 VGPRs, zero spill
+
+    const int split_id = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int n_q = q_per_kv * seq_len;
+    const int total = *total_dev + steps;
+    const long long row_bytes = (long long)num_kv_heads * HEAD_BYTES;
+    const int total_h = seq_len * num_heads;
+
+    const int base = total / split_k;
+    const int rem = total % split_k;
+    const int j_start = split_id * base + (split_id < rem ? split_id : rem);
+    const int j_end = j_start + base + (split_id < rem ? 1 : 0);
+
+    float qreg[MAX_Q_PER_WAVE][8];
+    float acc[MAX_Q_PER_WAVE][8];
+    float rmax[MAX_Q_PER_WAVE];
+    float rsum[MAX_Q_PER_WAVE];
+    int q_hi[MAX_Q_PER_WAVE];
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        rmax[m] = -1e30f;
+        rsum[m] = 0.0f;
+        if (qi < n_q) {
+            const int qr = qi / q_per_kv;
+            const int h = kv_head * q_per_kv + (qi % q_per_kv);
+            q_hi[m] = total - (seq_len - 1 - qr);
+            const float* q_row = q + ((long long)qr * num_heads + h) * HD;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                qreg[m][c] = q_row[c * 32 + lane];
+                acc[m][c] = 0.0f;
+            }
+        } else {
+            q_hi[m] = -1;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                qreg[m][c] = 0.0f;
+                acc[m][c] = 0.0f;
+            }
+        }
+    }
+
+    __shared__ alignas(16) unsigned char sK[JT][HEAD_BYTES];
+    __shared__ alignas(16) unsigned char sV[JT][HEAD_BYTES];
+    // 288 B = 18 uint4 per token; 4 tokens = 72 uint4 total
+    const int ld_t = tid / 18;
+    const int ld_b = (tid % 18) * 16;
+
+    for (int j0 = j_start; j0 < j_end; j0 += JT) {
+        if (tid < 72) {
+            const int j = j0 + ld_t;
+            if (j < j_end) {
+                const long long off = (long long)j * row_bytes + (long long)kv_head * HEAD_BYTES + ld_b;
+                *reinterpret_cast<uint4*>(&sK[ld_t][ld_b]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
+                *reinterpret_cast<uint4*>(&sV[ld_t][ld_b]) = *reinterpret_cast<const uint4*>(&v_arena[off]);
+            }
+        }
+        __syncthreads();
+
+        const int jt_cnt = (j0 + JT <= j_end) ? JT : (j_end - j0);
+        for (int t = 0; t < jt_cnt; ++t) {
+            float kv_k[8], kv_v[8];
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const unsigned char* kb = &sK[t][c * 36];
+                const unsigned char* vb = &sV[t][c * 36];
+                const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
+                const float dv = __half2float(*reinterpret_cast<const __half*>(vb));
+                kv_k[c] = dk * (float)(reinterpret_cast<const signed char*>(kb + 4)[lane]);
+                kv_v[c] = dv * (float)(reinterpret_cast<const signed char*>(vb + 4)[lane]);
+            }
+            const int cur_j = j0 + t;
+            #pragma unroll
+            for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+                if (cur_j >= q_hi[m]) continue;
+                float score = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) score += qreg[m][c] * kv_k[c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) score += __shfl_xor(score, off);
+                score *= inv_sqrt_d;
+                const float m_new = fmaxf(rmax[m], score);
+                const float sa = expf(rmax[m] - m_new);
+                const float sb = expf(score - m_new);
+                rmax[m] = m_new;
+                rsum[m] = rsum[m] * sa + sb;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) acc[m][c] = acc[m][c] * sa + sb * kv_v[c];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        if (qi >= n_q) continue;
+        const int qr = qi / q_per_kv;
+        const int h = kv_head * q_per_kv + (qi % q_per_kv);
+        const int out_h = qr * num_heads + h;
+        const int p_idx = split_id * total_h + out_h;
+        if (lane == 0) {
+            partial_max[p_idx] = rmax[m];
+            partial_sum[p_idx] = rsum[m];
+        }
+        float* po = partial_out + (long long)p_idx * HD;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            po[c * 32 + lane] = acc[m][c];
+        }
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_dev_f16_splitk(
     const float* __restrict__ q,
     const __half* __restrict__ k_tensor,
@@ -9245,12 +9522,64 @@ pub fn launch_qkv_attention_dev_batch_q81(
         )
     });
     if seq_len >= 1 && seq_len <= 3 && batch <= 1 && fuse_o == 0 && q81_splitk_enabled {
-        const SPLIT_K: usize = 8;
+        let gqa_ok = head_dim == 256
+            && num_kv_heads > 0
+            && num_heads % num_kv_heads == 0
+            && (num_heads / num_kv_heads) <= 6
+            && seq_len <= 2
+            && window_lo <= 0
+            && softcap <= 0.0
+            && has_alibi == 0
+            && cap_rows_i == 0
+            && !matches!(
+                std::env::var("GRIM_GQA_SPLITK").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+        let split_k: usize = if gqa_ok { 64 } else { 8 };
         let total_h = (seq_len as usize) * (num_heads as usize);
         let scratch_ptrs = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?;
         if let Some((mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr)) = scratch_ptrs {
-        let mut split_k_i = SPLIT_K as i32;
-        let split_grid = crate::HipDim3::new(SPLIT_K as u32, nh as u32, seq_len as u32);
+        let mut split_k_i = split_k as i32;
+        if gqa_ok {
+            dev.launch_compute_kernel(
+                "grim_qkv_attention_dev_q81_gqa_splitk",
+                crate::HipDim3::new(split_k as u32, nkv as u32, 1),
+                crate::HipDim3::new(128, 1, 1),
+                &mut [
+                    arg(&mut q_ptr),
+                    arg(&mut k_ptr),
+                    arg(&mut v_ptr),
+                    arg(&mut p_out_ptr),
+                    arg(&mut p_max_ptr),
+                    arg(&mut p_sum_ptr),
+                    arg(&mut nh),
+                    arg(&mut nkv),
+                    arg(&mut sl),
+                    arg(&mut tot_ptr),
+                    arg(&mut steps_i),
+                    arg(&mut isd),
+                    arg(&mut split_k_i),
+                ],
+            )?;
+            let mut total_h_i = total_h as i32;
+            return dev.launch_compute_kernel(
+                "grim_qkv_attention_splitk_combine",
+                crate::HipDim3::new(total_h as u32, 1, 1),
+                crate::HipDim3::new(head_dim, 1, 1),
+                &mut [
+                    arg(&mut p_out_ptr),
+                    arg(&mut p_max_ptr),
+                    arg(&mut p_sum_ptr),
+                    arg(&mut o_ptr),
+                    arg(&mut om_ptr),
+                    arg(&mut os_ptr),
+                    arg(&mut total_h_i),
+                    arg(&mut hd),
+                    arg(&mut split_k_i),
+                ],
+            );
+        }
+        let split_grid = crate::HipDim3::new(split_k as u32, nh as u32, seq_len as u32);
         let split_block = crate::HipDim3::new(128, 1, 1);
         dev.launch_compute_kernel(
             "grim_qkv_attention_dev_q81_splitk",
@@ -10948,7 +11277,7 @@ fn get_or_alloc_splitk_scratch(
     num_heads: u32,
     head_dim: u32,
 ) -> Result<Option<(u64, u64, u64)>, crate::Error> {
-    const SPLIT_K: usize = 8;
+    const SPLIT_K: usize = 64;
     let alloc_h = 3usize * (num_heads as usize);
     let need_out_bytes = SPLIT_K * alloc_h * (head_dim as usize) * std::mem::size_of::<f32>();
     let need_ms_bytes = SPLIT_K * alloc_h * std::mem::size_of::<f32>();
@@ -11107,9 +11436,61 @@ pub fn launch_qkv_attention_eager_f16_splitk(
     let mut asl = alibi_ptr;
     let mut ha = has_alibi;
     let mut cap_rows_i = 0i32;
-    let mut split_k_i = SPLIT_K as i32;
+    let gqa_ok = head_dim == 256
+        && num_kv_heads > 0
+        && num_heads % num_kv_heads == 0
+        && (num_heads / num_kv_heads) <= 6
+        && seq_len >= 1
+        && seq_len <= 2
+        && window_lo <= 0
+        && softcap <= 0.0
+        && has_alibi == 0
+        && !matches!(
+            std::env::var("GRIM_GQA_SPLITK").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+    let split_k: usize = if gqa_ok { 64 } else { SPLIT_K };
+    let mut split_k_i = split_k as i32;
     let total_h = (seq_len as usize) * (num_heads as usize);
     let mut total_h_i = total_h as i32;
+    if gqa_ok {
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_f16_gqa_splitk",
+            crate::HipDim3::new(split_k as u32, nkv as u32, 1),
+            crate::HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut q_p),
+                arg(&mut k_p),
+                arg(&mut v_p),
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut sl),
+                arg(&mut tot_ptr),
+                arg(&mut steps_i),
+                arg(&mut isd),
+                arg(&mut split_k_i),
+            ],
+        )?;
+        return dev.launch_compute_kernel(
+            "grim_qkv_attention_splitk_combine",
+            crate::HipDim3::new(total_h as u32, 1, 1),
+            crate::HipDim3::new(hd as u32, 1, 1),
+            &mut [
+                arg(&mut p_out_ptr),
+                arg(&mut p_max_ptr),
+                arg(&mut p_sum_ptr),
+                arg(&mut o_p),
+                arg(&mut om_p),
+                arg(&mut os_p),
+                arg(&mut total_h_i),
+                arg(&mut hd),
+                arg(&mut split_k_i),
+            ],
+        );
+    }
     dev.launch_compute_kernel(
         "grim_qkv_attention_dev_f16_splitk",
         crate::HipDim3::new(SPLIT_K as u32, nh as u32, sl as u32),
