@@ -888,3 +888,107 @@ fn test_wmma_i8_q80_q81_doublek_parity_and_speed() {
     let tops = flops / (ms * 1e-3) / 1e12;
     eprintln!("[1C wmma-i8-doublek perf {bm}x{bn}x{bk}] {ms:.3} ms ({tops:.2} TOP/s)");
 }
+
+/// Phase 2B: Verify F32 KV attention (prefill + decode flash_decode) is bitwise deterministic.
+#[test]
+#[ignore]
+fn test_f32_kv_attention_determinism() {
+    use grim_backend_rocm::AttentionOps;
+    let dev = RocmDevice::new(0);
+    let (nh, nkv, hd) = (24usize, 4usize, 256usize);
+    let kv_len = 2048usize;
+    let mut rng = 0xabcd_1234_ef56_7890u64;
+    let mut next_f = || -> f32 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((rng >> 40) as f32 / (1u64 << 24) as f32) * 0.5 - 0.25
+    };
+    let k_h: Vec<f32> = (0..kv_len * nkv * hd).map(|_| next_f()).collect();
+    let v_h: Vec<f32> = (0..kv_len * nkv * hd).map(|_| next_f()).collect();
+    let k_d = dev.from_cpu(&k_h, &Shape::new(vec![kv_len, nkv, hd]), DType::F32).unwrap();
+    let v_d = dev.from_cpu(&v_h, &Shape::new(vec![kv_len, nkv, hd]), DType::F32).unwrap();
+
+    for &sl in &[1usize, 128] {
+        let q_h: Vec<f32> = (0..sl * nh * hd).map(|_| next_f()).collect();
+        let q_d = dev.from_cpu(&q_h, &Shape::new(vec![sl, nh, hd]), DType::F32).unwrap();
+        let out_shape = Shape::new(vec![sl, nh, hd]);
+        let (o1, _) = dev.qkv_attention(q_d.as_ref(), k_d.as_ref(), v_d.as_ref(), nkv, kv_len, (kv_len - sl) as u32, None, &out_shape, None, None).unwrap();
+        let (o2, _) = dev.qkv_attention(q_d.as_ref(), k_d.as_ref(), v_d.as_ref(), nkv, kv_len, (kv_len - sl) as u32, None, &out_shape, None, None).unwrap();
+        dev.synchronize();
+        let v1 = o1.to_cpu_vec_f32().unwrap();
+        let v2 = o2.to_cpu_vec_f32().unwrap();
+        let bit_eq = v1.iter().zip(v2.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
+        let max_diff = v1.iter().zip(v2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("[2B f32-kv-det sl={sl} kv={kv_len}] bit_eq={bit_eq}, max_diff={max_diff:.4e}");
+        assert!(bit_eq, "F32 KV attention nondeterministic at sl={sl}: max_diff={max_diff}");
+    }
+}
+
+/// Phase 4: INT8 epilogue conformance check (res8/2609.00363).
+/// Verifies boundary int8 codes (-128, -127, 0, 127) accumulate in i32 without
+/// wraparound and match exact i64/f64 reference bitwise-deterministically.
+#[test]
+#[ignore]
+fn test_int8_epilogue_conformance() {
+    use grim_backend_rocm::BackendStorage;
+    let dev = RocmDevice::new(0);
+    let (m, n, k) = (64usize, 64usize, 128usize);
+    let nb = k / 32;
+    let boundary_vals: [i8; 4] = [-128, -127, 0, 127];
+
+    let mut a_q81 = vec![0u8; m * nb * 36];
+    let mut b_q80 = vec![0u8; n * nb * 34];
+    let mut a_i8 = vec![0i8; m * k];
+    let mut b_i8 = vec![0i8; n * k];
+    let scale_h = half::f16::from_f32(0.0625); // exact power-of-two scale (1/16)
+    let scale_f = scale_h.to_f32();
+
+    for r in 0..m {
+        for blk in 0..nb {
+            let off = (r * nb + blk) * 36;
+            a_q81[off..off + 2].copy_from_slice(&scale_h.to_le_bytes());
+            for i in 0..32 {
+                let v = boundary_vals[(r + blk + i) & 3];
+                a_q81[off + 4 + i] = v as u8;
+                a_i8[r * k + blk * 32 + i] = v;
+            }
+        }
+    }
+    for r in 0..n {
+        for blk in 0..nb {
+            let off = (r * nb + blk) * 34;
+            b_q80[off..off + 2].copy_from_slice(&scale_h.to_le_bytes());
+            for i in 0..32 {
+                let v = boundary_vals[(r * 3 + blk + i) & 3];
+                b_q80[off + 2 + i] = v as u8;
+                b_i8[r * k + blk * 32 + i] = v;
+            }
+        }
+    }
+
+    let a_dev = grim_backend_rocm::RocmStorage::copy_from_host_raw_bytes(&a_q81, &Shape::new(vec![m, nb * 36]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let b_dev = grim_backend_rocm::RocmStorage::copy_from_host_raw_bytes(&b_q80, &Shape::new(vec![n, nb * 34]), DType::U8, &dev.allocator_handle(), 0).unwrap();
+    let c_dev1 = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+    let c_dev2 = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &dev.allocator_handle(), 0).unwrap();
+
+    dev.launch_wmma_i8_q80_q81_doublek_gfx12(&a_dev, &b_dev, &c_dev1, m, n, k).unwrap();
+    dev.launch_wmma_i8_q80_q81_doublek_gfx12(&a_dev, &b_dev, &c_dev2, m, n, k).unwrap();
+    dev.synchronize();
+
+    let c1 = c_dev1.to_cpu_vec_f32().unwrap();
+    let c2 = c_dev2.to_cpu_vec_f32().unwrap();
+    assert!(c1.iter().zip(c2.iter()).all(|(x, y)| x.to_bits() == y.to_bits()), "INT8 epilogue not bitwise deterministic");
+
+    let mut max_abs = 0.0f32;
+    for i in 0..m {
+        for j in 0..n {
+            let mut dot: i64 = 0;
+            for t in 0..k {
+                dot += (a_i8[i * k + t] as i64) * (b_i8[j * k + t] as i64);
+            }
+            let expected = (dot as f32) * (scale_f * scale_f);
+            max_abs = max_abs.max((c1[i * n + j] - expected).abs());
+        }
+    }
+    eprintln!("[Phase 4 int8-epilogue-conformance] max_abs={max_abs:.4e} (exact power-of-two scale)");
+    assert_eq!(max_abs, 0.0, "INT8 epilogue conformance mismatch: {max_abs}");
+}
