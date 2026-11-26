@@ -43,6 +43,13 @@ pub mod kv_mirror;
 
 pub use kv_mirror::{KvDeviceMirror, KvDeviceMirrorConfig, MirrorSyncState};
 
+/// NVMe disk persistence for cross-process hybrid prefix checkpoints (Phase E).
+pub mod prefix_store;
+
+pub use prefix_store::{
+    hash_tokens_u64, DiskPrefixStore, PrefixCheckpoint, PrefixCheckpointMeta, PrefixKvDtype,
+};
+
 /// Chunk-aligned intermediate hidden-state cache on host pinned memory.
 pub mod hidden_state_store;
 
