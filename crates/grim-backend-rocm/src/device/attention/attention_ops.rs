@@ -686,16 +686,35 @@ impl AttentionOps for RocmDevice {
             && config.num_kv_heads > 0
             && config.num_heads % config.num_kv_heads == 0
         {
-            let wmma_grid =
-                crate::HipDim3::new(seq_len.div_ceil(64) as u32, config.num_heads as u32, 1);
-            let wmma_block = crate::HipDim3::new(128, 1, 1);
-            let kname = if matches!(
+            let q_per_kv = config.num_heads / config.num_kv_heads;
+            let use_v3 = !matches!(
+                std::env::var("GRIM_PREFILL_WMMA_V3").as_deref(),
+                Ok("0" | "false" | "off")
+            ) && !matches!(
+                std::env::var("GRIM_PREFILL_WMMA_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            ) && (2..=8).contains(&q_per_kv);
+            let (kname, wmma_grid, wmma_block) = if use_v3 {
+                (
+                    "grim_qkv_attention_wmma_f16_v3",
+                    crate::HipDim3::new(seq_len.div_ceil(16) as u32, config.num_kv_heads as u32, 1),
+                    crate::HipDim3::new((q_per_kv * 32) as u32, 1, 1),
+                )
+            } else if matches!(
                 std::env::var("GRIM_PREFILL_WMMA_V2").as_deref(),
                 Ok("0" | "false" | "off")
             ) {
-                "grim_qkv_attention_wmma_f16"
+                (
+                    "grim_qkv_attention_wmma_f16",
+                    crate::HipDim3::new(seq_len.div_ceil(64) as u32, config.num_heads as u32, 1),
+                    crate::HipDim3::new(128, 1, 1),
+                )
             } else {
-                "grim_qkv_attention_wmma_f16_v2"
+                (
+                    "grim_qkv_attention_wmma_f16_v2",
+                    crate::HipDim3::new(seq_len.div_ceil(64) as u32, config.num_heads as u32, 1),
+                    crate::HipDim3::new(128, 1, 1),
+                )
             };
             let stream = self.launch_compute_kernel(
                 kname,
@@ -2194,11 +2213,26 @@ impl RocmDevice {
             && num_kv_heads > 0
             && num_heads % num_kv_heads == 0
         {
-            let wmma_grid =
-                crate::HipDim3::new(seq_len.div_ceil(64) as u32, num_heads as u32, 1);
-            let wmma_block = crate::HipDim3::new(128, 1, 1);
+            let q_per_kv = num_heads / num_kv_heads;
+            let use_q81_v2 = !matches!(
+                std::env::var("GRIM_PREFILL_WMMA_Q81_V2").as_deref(),
+                Ok("0" | "false" | "off")
+            ) && (2..=8).contains(&q_per_kv);
+            let (kname, wmma_grid, wmma_block) = if use_q81_v2 {
+                (
+                    "grim_qkv_attention_wmma_q81_v2",
+                    crate::HipDim3::new(seq_len.div_ceil(16) as u32, num_kv_heads as u32, 1),
+                    crate::HipDim3::new((q_per_kv * 32) as u32, 1, 1),
+                )
+            } else {
+                (
+                    "grim_qkv_attention_wmma_q81",
+                    crate::HipDim3::new(seq_len.div_ceil(64) as u32, num_heads as u32, 1),
+                    crate::HipDim3::new(128, 1, 1),
+                )
+            };
             let stream = self.launch_compute_kernel(
-                "grim_qkv_attention_wmma_q81",
+                kname,
                 wmma_grid,
                 wmma_block,
                 &mut [
