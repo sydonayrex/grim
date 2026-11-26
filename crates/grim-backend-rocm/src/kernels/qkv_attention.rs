@@ -7532,6 +7532,232 @@ extern "C" __global__ void grim_qkv_attention_wmma_q81_v2(
         }
     }
 }
+
+// Phase 1A+res12: BC=64 GQA-shared WMMA prefill attention (F16 KV).
+// Halves workgroup barriers and online-softmax rescales vs BC=32 v3 (2x WMMA work per barrier).
+extern "C" __global__ void grim_qkv_attention_wmma_f16_v4_bc64(
+    const float* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_seq_len,
+    int cache_offset, float inv_sqrt_d
+) {
+    constexpr int BR = 16;
+    constexpr int BC = 64;
+    const int kv_head = blockIdx.y;
+    const int i0 = blockIdx.x * BR;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int h = kv_head * q_per_kv + wave;
+    const int n_threads = q_per_kv * 32;
+    const int d_tiles = head_dim >> 4;
+    const int vec8_per_row = head_dim >> 3;
+    const int total_vec8 = BC * vec8_per_row; // 2048 for BC=64, hd=256
+
+    __shared__ union {
+        _Float16 k[BC][264];
+        _Float16 vt[256][68];
+    } sKV;
+    __shared__ _Float16 sP[8 * BR][68];
+
+    // 1. Load Q into VGPRs once
+    grim_attn_half8 q_reg[16];
+    const int q_row_global = i0 + lane_r;
+    const float* q_ptr = (q_row_global < seq_len)
+        ? (q + ((long long)q_row_global * num_heads + h) * head_dim)
+        : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        if (dt < d_tiles && q_ptr != nullptr) {
+            const int doff = dt * 16 + lane_h * 8;
+            float4 v0 = *reinterpret_cast<const float4*>(q_ptr + doff);
+            float4 v1 = *reinterpret_cast<const float4*>(q_ptr + doff + 4);
+            q_reg[dt] = {
+                (_Float16)v0.x, (_Float16)v0.y, (_Float16)v0.z, (_Float16)v0.w,
+                (_Float16)v1.x, (_Float16)v1.y, (_Float16)v1.z, (_Float16)v1.w
+            };
+        } else {
+            q_reg[dt] = {
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f,
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f
+            };
+        }
+    }
+
+    grim_attn_float8 o_acc[16];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        o_acc[dt] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    float rmax[8];
+    float rsum[8];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        rmax[r] = -1e30f;
+        rsum[r] = 0.0f;
+    }
+
+    const int last_q = (i0 + BR - 1 < seq_len) ? (i0 + BR - 1) : (seq_len - 1);
+    const int hi = (cache_offset + last_q + 1 < kv_seq_len) ? (cache_offset + last_q + 1) : kv_seq_len;
+    const int wave_max_abs_i = cache_offset + i0 + 15;
+    const long long kv_row_stride = (long long)num_kv_heads * head_dim;
+
+    for (int j0 = 0; j0 < hi; j0 += BC) {
+        // 2. Cooperative uint4 load of 64 F16 K rows -> sKV.k
+        for (int idx = tid; idx < total_vec8; idx += n_threads) {
+            const int c = idx / vec8_per_row;
+            const int d8 = (idx % vec8_per_row) * 8;
+            const int kj = j0 + c;
+            uint4 v = {0u, 0u, 0u, 0u};
+            if (kj < hi) {
+                const __half* kp = k_cache + (long long)kj * kv_row_stride + (long long)kv_head * head_dim + d8;
+                v = *reinterpret_cast<const uint4*>(kp);
+            }
+            *reinterpret_cast<uint4*>(&sKV.k[c][d8]) = v;
+        }
+        __syncthreads();
+
+        // 3. QK^T (16x64 = 4 WMMA tiles) + online softmax -> sP
+        if (i0 < seq_len && j0 <= wave_max_abs_i) {
+            grim_attn_float8 s0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            grim_attn_float8 s1 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            grim_attn_float8 s2 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            grim_attn_float8 s3 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int doff = dt * 16 + lane_h * 8;
+                grim_attn_half8 vb0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[lane_r][doff]);
+                grim_attn_half8 vb1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[16 + lane_r][doff]);
+                grim_attn_half8 vb2 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[32 + lane_r][doff]);
+                grim_attn_half8 vb3 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[48 + lane_r][doff]);
+                s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb0, s0);
+                s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb1, s1);
+                s2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb2, s2);
+                s3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb3, s3);
+            }
+
+            const int col0 = j0 + lane_r;
+            const int col1 = j0 + 16 + lane_r;
+            const int col2 = j0 + 32 + lane_r;
+            const int col3 = j0 + 48 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int local_row = lane_h * 8 + r;
+                const int qi = i0 + local_row;
+                const int abs_i = cache_offset + qi;
+                const bool v0 = (qi < seq_len) && (col0 < hi) && (col0 <= abs_i);
+                const bool v1 = (qi < seq_len) && (col1 < hi) && (col1 <= abs_i);
+                const bool v2 = (qi < seq_len) && (col2 < hi) && (col2 <= abs_i);
+                const bool v3 = (qi < seq_len) && (col3 < hi) && (col3 <= abs_i);
+                const float sc0 = v0 ? (s0[r] * inv_sqrt_d) : -1e30f;
+                const float sc1 = v1 ? (s1[r] * inv_sqrt_d) : -1e30f;
+                const float sc2 = v2 ? (s2[r] * inv_sqrt_d) : -1e30f;
+                const float sc3 = v3 ? (s3[r] * inv_sqrt_d) : -1e30f;
+
+                float tmax = fmaxf(fmaxf(sc0, sc1), fmaxf(sc2, sc3));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 8));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 4));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 2));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 1));
+
+                const float m_old = rmax[r];
+                const float m_new = fmaxf(m_old, tmax);
+                const float alpha = (m_old > -1e20f) ? expf(m_old - m_new) : 0.0f;
+                const float p0 = v0 ? expf(sc0 - m_new) : 0.0f;
+                const float p1 = v1 ? expf(sc1 - m_new) : 0.0f;
+                const float p2 = v2 ? expf(sc2 - m_new) : 0.0f;
+                const float p3 = v3 ? expf(sc3 - m_new) : 0.0f;
+
+                float tsum = (p0 + p1) + (p2 + p3);
+                tsum += __shfl_xor(tsum, 8);
+                tsum += __shfl_xor(tsum, 4);
+                tsum += __shfl_xor(tsum, 2);
+                tsum += __shfl_xor(tsum, 1);
+
+                rmax[r] = m_new;
+                rsum[r] = rsum[r] * alpha + tsum;
+
+                sP[wave * BR + local_row][lane_r]      = (_Float16)p0;
+                sP[wave * BR + local_row][16 + lane_r] = (_Float16)p1;
+                sP[wave * BR + local_row][32 + lane_r] = (_Float16)p2;
+                sP[wave * BR + local_row][48 + lane_r] = (_Float16)p3;
+
+                if (alpha != 1.0f) {
+                    #pragma unroll
+                    for (int dt = 0; dt < 16; ++dt) {
+                        if (dt < d_tiles) o_acc[dt][r] *= alpha;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // 4. Cooperative uint4 load of 64 F16 V rows -> transposed sKV.vt
+        for (int idx = tid; idx < total_vec8; idx += n_threads) {
+            const int c = idx / vec8_per_row;
+            const int d8 = (idx % vec8_per_row) * 8;
+            const int vj = j0 + c;
+            grim_attn_half8 vv = {
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f,
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f
+            };
+            if (vj < hi) {
+                const __half* vp = v_cache + (long long)vj * kv_row_stride + (long long)kv_head * head_dim + d8;
+                vv = *reinterpret_cast<const grim_attn_half8*>(vp);
+            }
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                sKV.vt[d8 + k][c] = vv[k];
+            }
+        }
+        __syncthreads();
+
+        // 5. PV via WMMA (4 k-tiles of 16 = 64)
+        if (i0 < seq_len && j0 <= wave_max_abs_i) {
+            const int p_row = wave * BR + lane_r;
+            grim_attn_half8 vp0 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][lane_h * 8]);
+            grim_attn_half8 vp1 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][16 + lane_h * 8]);
+            grim_attn_half8 vp2 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][32 + lane_h * 8]);
+            grim_attn_half8 vp3 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][48 + lane_h * 8]);
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int d_row = dt * 16 + lane_r;
+                grim_attn_half8 vv0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][lane_h * 8]);
+                grim_attn_half8 vv1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][16 + lane_h * 8]);
+                grim_attn_half8 vv2 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][32 + lane_h * 8]);
+                grim_attn_half8 vv3 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][48 + lane_h * 8]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp0, vv0, o_acc[dt]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp1, vv1, o_acc[dt]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp2, vv2, o_acc[dt]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp3, vv3, o_acc[dt]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 6. Normalize and store output
+    if (i0 < seq_len) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int qi = i0 + lane_h * 8 + r;
+            if (qi < seq_len) {
+                const float inv_s = (rsum[r] > 0.0f) ? (1.0f / rsum[r]) : 0.0f;
+                float* orow = out + ((long long)qi * num_heads + h) * head_dim;
+                #pragma unroll
+                for (int dt = 0; dt < 16; ++dt) {
+                    if (dt < d_tiles) orow[dt * 16 + lane_r] = o_acc[dt][r] * inv_s;
+                }
+            }
+        }
+    }
+}
 #endif
 
 "#;

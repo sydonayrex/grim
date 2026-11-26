@@ -694,9 +694,17 @@ impl AttentionOps for RocmDevice {
                 std::env::var("GRIM_PREFILL_WMMA_V2").as_deref(),
                 Ok("0" | "false" | "off")
             ) && (2..=8).contains(&q_per_kv);
+            let use_v4_bc64 = !matches!(
+                std::env::var("GRIM_PREFILL_WMMA_V4").as_deref(),
+                Ok("0" | "false" | "off")
+            );
             let (kname, wmma_grid, wmma_block) = if use_v3 {
                 (
-                    "grim_qkv_attention_wmma_f16_v3",
+                    if use_v4_bc64 {
+                        "grim_qkv_attention_wmma_f16_v4_bc64"
+                    } else {
+                        "grim_qkv_attention_wmma_f16_v3"
+                    },
                     crate::HipDim3::new(seq_len.div_ceil(16) as u32, config.num_kv_heads as u32, 1),
                     crate::HipDim3::new((q_per_kv * 32) as u32, 1, 1),
                 )

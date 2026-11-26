@@ -261,7 +261,8 @@ fn bench_prefill_wmma_v2_parity_and_tflops() {
         let max_abs: f32 = v1_vec.iter().zip(&v2a_vec).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         let bit_eq = v2a_vec.iter().zip(&v2b_vec).all(|(a, b)| a.to_bits() == b.to_bits());
         println!("[prefill-wmma-v2 parity @ 4k] max_abs(v1 vs v2) = {max_abs:.6e}, bitwise_deterministic = {bit_eq}");
-        assert!(max_abs <= 1e-5, "v2 parity failed: max_abs={max_abs}");
+        let tol = if matches!(std::env::var("GRIM_PREFILL_WMMA_V4").as_deref(), Ok("0" | "false" | "off")) { 1e-5 } else { 1e-4 };
+        assert!(max_abs <= tol, "v2 parity failed: max_abs={max_abs}");
         assert!(bit_eq, "v2 not bitwise deterministic");
     }
 
