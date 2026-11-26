@@ -1831,14 +1831,16 @@ impl SpeculativeCausalLm {
             greedy,
         )?;
         let mut accepted_count = verification.accepted_count;
-        session.set_emitted_token_ids(verification.emitted_tokens);
-        tr_stage(&format!("accept-count done (accepted={accepted_count})"));
-        // Debug/measurement hooks for M2/M3 gate closure (TODO(gpu-verify): remove if undesired).
+        let mut emitted_tokens = verification.emitted_tokens;
+        // Debug/measurement hooks for M2/M3 gate closure.
         if std::env::var_os("GRIM_MTP_FORCE_REJECT").is_some() {
             accepted_count = 0;
+            emitted_tokens.truncate(1);
         } else if std::env::var_os("GRIM_MTP_FORCE_ACCEPT").is_some() {
             accepted_count = verify_len;
         }
+        session.set_emitted_token_ids(emitted_tokens);
+        tr_stage(&format!("accept-count done (accepted={accepted_count})"));
 
         if accepted_count > verify_len {
             if let Some(kv) = session.kv_mut() {
