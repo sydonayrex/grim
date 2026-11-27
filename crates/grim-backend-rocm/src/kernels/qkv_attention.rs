@@ -134,6 +134,9 @@ pub enum KvArenaFormat {
     /// Q8_1 Dot4 KV Format: 36 bytes per 32 values [d: fp16][sum: fp16][32 x int8 codes].
     /// Vectorized dot4 decode on RDNA3/4 via v_dot4_i32_iu8 (3.7x faster than F16, 2.4x faster than I8).
     Q8_1,
+    /// Asymmetric K8V4: Q8_1 Keys (36 B/32 elems) + Q4_1 Values (20 B/32 elems: [d: fp16][m: fp16][16 B u4 nibbles]).
+    /// Saves -1.00 GiB/card at 262,144 context while keeping K at full 8-bit precision.
+    K8V4,
     /// Asymmetric 2-bit keys / 4-bit values (WS-3A). The representation is
     /// declared here so the selector is first-class and cannot be mistaken for
     /// another format, but its DEVICE KERNELS DO NOT EXIST YET — every arena
@@ -164,6 +167,7 @@ impl KvArenaFormat {
             KvArenaFormat::F16 => 2.0,
             KvArenaFormat::Int8 => 1.0,
             KvArenaFormat::Q8_1 => 36.0 / 32.0,
+            KvArenaFormat::K8V4 => (36.0 + 20.0) / 64.0,
             KvArenaFormat::Int4 => 0.5,
             KvArenaFormat::Int2V4 => 0.375,
             KvArenaFormat::WhiteCrow => 67.0 / 128.0,
@@ -180,6 +184,7 @@ impl KvArenaFormat {
             | KvArenaFormat::F16
             | KvArenaFormat::Int8
             | KvArenaFormat::Q8_1
+            | KvArenaFormat::K8V4
             | KvArenaFormat::Int4
             | KvArenaFormat::Int2V4
             | KvArenaFormat::WhiteCrow => true,
@@ -214,6 +219,7 @@ pub fn parse_kv_arena_env(v: &str) -> Option<KvArenaFormat> {
         "f16" => Some(KvArenaFormat::F16),
         "int8" | "i8" | "q8" => Some(KvArenaFormat::Int8),
         "q8_1" | "q81" | "dot4_q81" => Some(KvArenaFormat::Q8_1),
+        "k8v4" | "q8v4" => Some(KvArenaFormat::K8V4),
         "int4" | "i4" | "q4" => Some(KvArenaFormat::Int4),
         // WS-3A: asymmetric bits. Resolves, then every graph entry point
         // refuses it (`graph_kernel_pair` == false) instead of mis-serving;
@@ -7956,6 +7962,386 @@ extern "C" __global__ void grim_q81_topk_blocks_bc32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// K8V4: Q4_1 Value append (20 bytes per 32 values: [d: fp16][m: fp16][16 B u4])
+// ---------------------------------------------------------------------------
+extern "C" __global__ void grim_kv_append_q41(
+    const float* __restrict__ v_in,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ dst,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,
+    int cap_rows,
+    int sink_rows
+) {
+    const int g = blockIdx.x;
+    const int num_blocks = head_dim / 32;
+    if (num_blocks <= 0) return;
+    const int per_slot = steps * nkv_heads * num_blocks;
+    const int total = batch * per_slot;
+    if (g >= total) return;
+    const int slot = g / per_slot;
+    const int r = g - slot * per_slot;
+    const int step = r / (nkv_heads * num_blocks);
+    const int rem = r - step * nkv_heads * num_blocks;
+    const int kh = rem / num_blocks;
+    const int blk = rem - kh * num_blocks;
+    const int past = past_dev[slot];
+
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
+    bool _keep = true;
+    for (int _j = step + 1; _j < steps; ++_j) {
+        if (grim_kv_ring_row(past + _j, cap_rows, sink_rows) == abs_row) { _keep = false; break; }
+    }
+    if (!_keep) return;
+
+    const long long src_base = ((long long)slot * steps + step) * kv_stride
+                             + (long long)kh * head_dim + (long long)blk * 32;
+    const long long row_bytes = (long long)nkv_heads * num_blocks * 20;
+    const long long dst_base = (long long)slot * arena_slot_stride
+                             + (long long)abs_row * row_bytes
+                             + (long long)kh * num_blocks * 20
+                             + (long long)blk * 20;
+    const int e = threadIdx.x; // 0..31
+
+    float val = v_in[src_base + e];
+    float vmin = val;
+    float vmax = val;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        vmin = fminf(vmin, __shfl_xor(vmin, off));
+        vmax = fmaxf(vmax, __shfl_xor(vmax, off));
+    }
+    float d = (vmax - vmin) / 15.0f;
+    float inv_d = (d > 1e-30f) ? (1.0f / d) : 0.0f;
+    int q = __float2int_rn((val - vmin) * inv_d);
+    if (q < 0) q = 0;
+    if (q > 15) q = 15;
+    int q_hi = __shfl_down(q, 16);
+
+    unsigned char* out_blk = dst + dst_base;
+    if (e == 0) {
+        __half dh = __float2half(d);
+        __half mh = __float2half(vmin);
+        __builtin_memcpy(out_blk, &dh, 2);
+        __builtin_memcpy(out_blk + 2, &mh, 2);
+    }
+    if (e < 16) {
+        out_blk[4 + e] = (unsigned char)((q & 0x0F) | ((q_hi & 0x0F) << 4));
+    }
+}
+
+// K8V4 sparse/dense prefill: identical to grim_qkv_attention_wmma_q81_v2_sparse
+// except V is decoded from Q4_1 (20 B/32 elems). When block_ids == nullptr, runs dense!
+extern "C" __global__ void grim_qkv_attention_wmma_k8v4_v2(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    const int* __restrict__ block_ids, // nullptr => dense, else [n_q_tiles, num_kv_heads, k_keep]
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_seq_len,
+    int cache_offset, float inv_sqrt_d, int k_keep
+) {
+    constexpr int BR = 16;
+    constexpr int BC = 32;
+    const int kv_head = blockIdx.y;
+    const int qt = blockIdx.x;
+    const int i0 = qt * BR;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int lane_r = lane & 15;
+    const int lane_h = lane >> 4;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int h = kv_head * q_per_kv + wave;
+    const int n_q8_blocks = head_dim >> 5;
+    const int k_head_bytes = n_q8_blocks * 36;
+    const int v_head_bytes = n_q8_blocks * 20;
+    const long long k_row_bytes = (long long)num_kv_heads * k_head_bytes;
+    const long long v_row_bytes = (long long)num_kv_heads * v_head_bytes;
+    const int d_tiles = head_dim >> 4;
+
+    __shared__ union {
+        _Float16 k[BC][264];
+        _Float16 vt[256][36];
+    } sKV;
+    __shared__ _Float16 sP[8 * BR][36];
+
+    grim_attn_half8 q_reg[16];
+    const int q_row_global = i0 + lane_r;
+    const float* q_ptr = (q_row_global < seq_len)
+        ? (q + ((long long)q_row_global * num_heads + h) * head_dim)
+        : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        if (dt < d_tiles && q_ptr != nullptr) {
+            const int doff = dt * 16 + lane_h * 8;
+            float4 v0 = *reinterpret_cast<const float4*>(q_ptr + doff);
+            float4 v1 = *reinterpret_cast<const float4*>(q_ptr + doff + 4);
+            q_reg[dt] = {
+                (_Float16)v0.x, (_Float16)v0.y, (_Float16)v0.z, (_Float16)v0.w,
+                (_Float16)v1.x, (_Float16)v1.y, (_Float16)v1.z, (_Float16)v1.w
+            };
+        } else {
+            q_reg[dt] = {
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f,
+                (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f, (_Float16)0.0f
+            };
+        }
+    }
+
+    grim_attn_float8 o_acc[16];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) o_acc[dt] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float rmax[8], rsum[8];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) { rmax[r] = -1e30f; rsum[r] = 0.0f; }
+
+    const int last_q = (i0 + BR - 1 < seq_len) ? (i0 + BR - 1) : (seq_len - 1);
+    const int hi = (cache_offset + last_q + 1 < kv_seq_len) ? (cache_offset + last_q + 1) : kv_seq_len;
+    const int total_blocks = BC * n_q8_blocks;
+    const int wave_max_abs_i = cache_offset + i0 + 15;
+    const int n_iters = (block_ids != nullptr) ? k_keep : ((hi + BC - 1) / BC);
+    const int* my_blks = (block_ids != nullptr) ? (block_ids + ((long long)qt * num_kv_heads + kv_head) * k_keep) : nullptr;
+
+    for (int bi = 0; bi < n_iters; ++bi) {
+        const int blk_id = (my_blks != nullptr) ? my_blks[bi] : bi;
+        if (blk_id < 0) continue;
+        const int j0 = blk_id * BC;
+        if (j0 >= hi) continue;
+
+        for (int bidx = wave; bidx < total_blocks; bidx += q_per_kv) {
+            const int c = bidx / n_q8_blocks;
+            const int blk = bidx % n_q8_blocks;
+            const int kj = j0 + c;
+            _Float16 val = (_Float16)0.0f;
+            if (kj < hi) {
+                const unsigned char* bp = k_arena + (long long)kj * k_row_bytes + (long long)kv_head * k_head_bytes + blk * 36;
+                const float d_scale = __half2float(*reinterpret_cast<const __half*>(bp));
+                const signed char qv = reinterpret_cast<const signed char*>(bp + 4)[lane];
+                val = (_Float16)(d_scale * (float)qv);
+            }
+            sKV.k[c][blk * 32 + lane] = val;
+        }
+        __syncthreads();
+
+        if (i0 < seq_len && j0 <= wave_max_abs_i) {
+            grim_attn_float8 s0 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            grim_attn_float8 s1 = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int doff = dt * 16 + lane_h * 8;
+                grim_attn_half8 vb0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[lane_r][doff]);
+                grim_attn_half8 vb1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.k[16 + lane_r][doff]);
+                s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb0, s0);
+                s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[dt], vb1, s1);
+            }
+            const int col0 = j0 + lane_r;
+            const int col1 = j0 + 16 + lane_r;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int local_row = lane_h * 8 + r;
+                const int qi = i0 + local_row;
+                const int abs_i = cache_offset + qi;
+                const bool v0 = (qi < seq_len) && (col0 < hi) && (col0 <= abs_i);
+                const bool v1 = (qi < seq_len) && (col1 < hi) && (col1 <= abs_i);
+                const float sc0 = v0 ? (s0[r] * inv_sqrt_d) : -1e30f;
+                const float sc1 = v1 ? (s1[r] * inv_sqrt_d) : -1e30f;
+                float tmax = fmaxf(sc0, sc1);
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 8));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 4));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 2));
+                tmax = fmaxf(tmax, __shfl_xor(tmax, 1));
+                const float m_old = rmax[r];
+                const float m_new = fmaxf(m_old, tmax);
+                const float alpha = (m_old > -1e20f) ? expf(m_old - m_new) : 0.0f;
+                const float p0 = v0 ? expf(sc0 - m_new) : 0.0f;
+                const float p1 = v1 ? expf(sc1 - m_new) : 0.0f;
+                float tsum = p0 + p1;
+                tsum += __shfl_xor(tsum, 8);
+                tsum += __shfl_xor(tsum, 4);
+                tsum += __shfl_xor(tsum, 2);
+                tsum += __shfl_xor(tsum, 1);
+                rmax[r] = m_new;
+                rsum[r] = rsum[r] * alpha + tsum;
+                sP[wave * BR + local_row][lane_r] = (_Float16)p0;
+                sP[wave * BR + local_row][16 + lane_r] = (_Float16)p1;
+                if (alpha != 1.0f) {
+                    #pragma unroll
+                    for (int dt = 0; dt < 16; ++dt) {
+                        if (dt < d_tiles) o_acc[dt][r] *= alpha;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // Decode Q4_1 V (20 B/32 elems: [d: fp16][m: fp16][16 B u4])
+        for (int bidx = wave; bidx < total_blocks; bidx += q_per_kv) {
+            const int c = bidx / n_q8_blocks;
+            const int blk = bidx % n_q8_blocks;
+            const int vj = j0 + c;
+            _Float16 val = (_Float16)0.0f;
+            if (vj < hi) {
+                const unsigned char* bp = v_arena + (long long)vj * v_row_bytes + (long long)kv_head * v_head_bytes + blk * 20;
+                const float d_scale = __half2float(*reinterpret_cast<const __half*>(bp));
+                const float m_off = __half2float(*reinterpret_cast<const __half*>(bp + 2));
+                const unsigned char packed = bp[4 + (lane & 15)];
+                const int nib = (lane < 16) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+                val = (_Float16)(d_scale * (float)nib + m_off);
+            }
+            sKV.vt[blk * 32 + lane][c] = val;
+        }
+        __syncthreads();
+
+        if (i0 < seq_len && j0 <= wave_max_abs_i) {
+            const int p_row = wave * BR + lane_r;
+            grim_attn_half8 vp0 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][lane_h * 8]);
+            grim_attn_half8 vp1 = *reinterpret_cast<const grim_attn_half8*>(&sP[p_row][16 + lane_h * 8]);
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                if (dt >= d_tiles) break;
+                const int d_row = dt * 16 + lane_r;
+                grim_attn_half8 vv0 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][lane_h * 8]);
+                grim_attn_half8 vv1 = *reinterpret_cast<const grim_attn_half8*>(&sKV.vt[d_row][16 + lane_h * 8]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp0, vv0, o_acc[dt]);
+                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vp1, vv1, o_acc[dt]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (i0 < seq_len) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int qi = i0 + lane_h * 8 + r;
+            if (qi < seq_len) {
+                const float inv_s = (rsum[r] > 0.0f) ? (1.0f / rsum[r]) : 0.0f;
+                float* orow = out + ((long long)qi * num_heads + h) * head_dim;
+                #pragma unroll
+                for (int dt = 0; dt < 16; ++dt) {
+                    if (dt < d_tiles) orow[dt * 16 + lane_r] = o_acc[dt][r] * inv_s;
+                }
+            }
+        }
+    }
+}
+
+// K8V4 eager decode (seq_len == 1..2): 1 WG (256 threads) per Q head, Q8_1 K + Q4_1 V
+extern "C" __global__ void grim_qkv_attention_k8v4_decode(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_seq_len,
+    int cache_offset, float inv_sqrt_d
+) {
+    const int qi = blockIdx.y;
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x; // 0..255 (head_dim)
+    if (qi >= seq_len || h >= num_heads || tid >= head_dim) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kvh = h / q_per_kv;
+    const int n_q8 = head_dim >> 5;
+    const int k_hb = n_q8 * 36;
+    const int v_hb = n_q8 * 20;
+    const long long k_rb = (long long)num_kv_heads * k_hb;
+    const long long v_rb = (long long)num_kv_heads * v_hb;
+    const int blk = tid >> 5;
+    const int lane = tid & 31;
+    const int hi = (cache_offset + qi + 1 < kv_seq_len) ? (cache_offset + qi + 1) : kv_seq_len;
+
+    const float qv = q[((long long)qi * num_heads + h) * head_dim + tid];
+    __shared__ float s_dot[256];
+    float rmax = -1e30f;
+    float rsum = 0.0f;
+    float acc = 0.0f;
+
+    for (int t = 0; t < hi; ++t) {
+        const unsigned char* kbp = k_arena + (long long)t * k_rb + (long long)kvh * k_hb + blk * 36;
+        const float kd = __half2float(*reinterpret_cast<const __half*>(kbp));
+        const float kv = kd * (float)reinterpret_cast<const signed char*>(kbp + 4)[lane];
+        s_dot[tid] = qv * kv;
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) s_dot[tid] += s_dot[tid + off];
+            __syncthreads();
+        }
+        const float sc = s_dot[0] * inv_sqrt_d;
+        const float m_new = fmaxf(rmax, sc);
+        const float alpha = (rmax > -1e20f) ? expf(rmax - m_new) : 0.0f;
+        const float p = expf(sc - m_new);
+        rmax = m_new;
+        rsum = rsum * alpha + p;
+
+        const unsigned char* vbp = v_arena + (long long)t * v_rb + (long long)kvh * v_hb + blk * 20;
+        const float vd = __half2float(*reinterpret_cast<const __half*>(vbp));
+        const float vm = __half2float(*reinterpret_cast<const __half*>(vbp + 2));
+        const unsigned char vp = vbp[4 + (lane & 15)];
+        const int nib = (lane < 16) ? (vp & 0x0F) : ((vp >> 4) & 0x0F);
+        const float vv = vd * (float)nib + vm;
+        acc = acc * alpha + p * vv;
+        __syncthreads();
+    }
+    const float inv_s = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+    out[((long long)qi * num_heads + h) * head_dim + tid] = acc * inv_s;
+}
+
+// K8V4 eager row quantizer for V: Q4_1 (20 bytes per 32 values: [d: fp16][m: fp16][16 B u4])
+extern "C" __global__ void grim_kv_quantize_rows_q41(
+    const float* __restrict__ src,
+    long long src_off,
+    unsigned char* __restrict__ dst,
+    long long dst_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim
+) {
+    const int g = blockIdx.x;
+    const int num_blocks = head_dim >> 5;
+    const int total = n_rows * nkv_heads * num_blocks;
+    if (g >= total) return;
+    const int row = g / (nkv_heads * num_blocks);
+    const int rem = g - row * (nkv_heads * num_blocks);
+    const int kh = rem / num_blocks;
+    const int blk = rem - kh * num_blocks;
+    const int e = threadIdx.x; // 0..31
+
+    const long long s_idx = src_off + (long long)row * kv_stride + (long long)kh * head_dim + (long long)blk * 32 + e;
+    const float val = src[s_idx];
+    float vmin = val;
+    float vmax = val;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        vmin = fminf(vmin, __shfl_xor(vmin, off));
+        vmax = fmaxf(vmax, __shfl_xor(vmax, off));
+    }
+    const float d = (vmax - vmin) / 15.0f;
+    const float inv_d = (d > 1e-30f) ? (1.0f / d) : 0.0f;
+    int q = __float2int_rn((val - vmin) * inv_d);
+    if (q < 0) q = 0;
+    if (q > 15) q = 15;
+    const int q_hi = __shfl_down(q, 16);
+
+    const long long row_bytes = (long long)nkv_heads * num_blocks * 20;
+    unsigned char* out_blk = dst + dst_off + (long long)row * row_bytes + ((long long)kh * num_blocks + blk) * 20;
+    if (e == 0) {
+        __half dh = __float2half(d);
+        __half mh = __float2half(vmin);
+        __builtin_memcpy(out_blk, &dh, 2);
+        __builtin_memcpy(out_blk + 2, &mh, 2);
+    }
+    if (e < 16) {
+        out_blk[4 + e] = (unsigned char)((q & 0x0F) | ((q_hi & 0x0F) << 4));
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_wmma_q81_v2_sparse(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_arena,
@@ -9129,6 +9515,57 @@ pub fn launch_kv_quantize_rows_i8(
 
 /// SPEED-DOT4: Q8_1 KV Row Quantizer Launcher.
 #[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_q41(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    dst: &dyn BackendStorage,
+    dst_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    let src_s = src
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_quantize_rows_q41: src must be RocmStorage".into()))?;
+    let dst_s = dst
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_quantize_rows_q41: dst must be RocmStorage".into()))?;
+    let mut sptr = src_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_quantize_rows_q41: src has no device ptr".into()))?;
+    let mut dptr = dst_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_quantize_rows_q41: dst has no device ptr".into()))?;
+    let mut soff = src_off as i64;
+    let mut doff = dst_off as i64;
+    let mut nr = n_rows as i32;
+    let mut st = kv_stride as i32;
+    let mut nkv = nkv_heads as i32;
+    let mut hd = head_dim as i32;
+    let total_blocks = (n_rows * nkv_heads * (head_dim / 32)) as u32;
+    let _dg = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_q41",
+        crate::HipDim3::new(total_blocks, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [
+            arg(&mut sptr),
+            arg(&mut soff),
+            arg(&mut dptr),
+            arg(&mut doff),
+            arg(&mut nr),
+            arg(&mut st),
+            arg(&mut nkv),
+            arg(&mut hd),
+        ],
+    )
+}
+
 pub fn launch_kv_quantize_rows_q81(
     dev: &crate::RocmDevice,
     src: &dyn BackendStorage,

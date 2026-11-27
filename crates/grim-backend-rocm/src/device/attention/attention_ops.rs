@@ -2449,4 +2449,106 @@ impl RocmDevice {
         )?;
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
+
+    /// K8V4 attention (Q8_1 K 36 B/32 elems + Q4_1 V 20 B/32 elems).
+    /// Supports both dense and `GRIM_SPARSE_PREFILL_PCT` GPU top-k prefill,
+    /// plus eager decode (`seq_len <= 2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_attention_k8v4(
+        &self,
+        q: &dyn BackendStorage,
+        k_q81: &dyn BackendStorage,
+        v_q41: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k_q81)?;
+        let v_s = as_rocm(v_q41)?;
+        let mut qptr = q_s.device_ptr.ok_or_else(|| Error::Backend("k8v4: q ptr".into()))?;
+        let mut kptr = k_s.device_ptr.ok_or_else(|| Error::Backend("k8v4: k ptr".into()))?;
+        let mut vptr = v_s.device_ptr.ok_or_else(|| Error::Backend("k8v4: v ptr".into()))?;
+        let dims = out_shape.dims();
+        let (seq_len, num_heads, head_dim) = (dims[0], dims[1], dims[2]);
+        let storage = RocmStorage::alloc_gpu(out_shape, grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+        let mut optr = storage.device_ptr.ok_or_else(|| Error::Backend("k8v4: out ptr".into()))?;
+        let _dg = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut nh = num_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut co = cache_offset as i32;
+        let mut isd = 1.0f32 / (head_dim as f32).sqrt();
+
+        if seq_len >= 16 && matches!(self.gpu_target.as_str(), "gfx1200" | "gfx1201") {
+            let q_per_kv = num_heads / num_kv_heads;
+            let n_q_tiles = seq_len.div_ceil(16);
+            let sparse_pct: Option<usize> = std::env::var("GRIM_SPARSE_PREFILL_PCT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&p| p > 0 && p < 100);
+            let (_keep_alive, mut bp_arg, mut kk_i) = if let (true, Some(pct)) = (kv_seq_len >= 1024, sparse_pct) {
+                let n_blocks = kv_seq_len.div_ceil(32);
+                let k_keep = ((n_blocks * pct) / 100).max(20).min(n_blocks);
+                let k_min = RocmStorage::alloc_gpu(&Shape::new(vec![n_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+                let k_max = RocmStorage::alloc_gpu(&Shape::new(vec![n_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+                let mut kmin_p = k_min.device_ptr.unwrap();
+                let mut kmax_p = k_max.device_ptr.unwrap();
+                self.launch_compute_kernel(
+                    "grim_q81_k_block_minmax_bc32",
+                    crate::HipDim3::new(n_blocks as u32, num_kv_heads as u32, 1),
+                    crate::HipDim3::new(head_dim as u32, 1, 1),
+                    &mut [arg(&mut kptr), arg(&mut kmin_p), arg(&mut kmax_p), arg(&mut ksl), arg(&mut nkv), arg(&mut hd)],
+                )?;
+                let scores_dev = RocmStorage::alloc_gpu(&Shape::new(vec![n_q_tiles, num_kv_heads, n_blocks]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+                let mut sc_p = scores_dev.device_ptr.unwrap();
+                let mut nb_i = n_blocks as i32;
+                self.launch_compute_kernel(
+                    "grim_q81_score_qtile_minmax_bc32",
+                    crate::HipDim3::new(n_blocks as u32, n_q_tiles as u32, num_kv_heads as u32),
+                    crate::HipDim3::new(head_dim as u32, 1, 1),
+                    &mut [arg(&mut qptr), arg(&mut kmin_p), arg(&mut kmax_p), arg(&mut sc_p), arg(&mut sl), arg(&mut nh), arg(&mut nkv), arg(&mut hd), arg(&mut nb_i)],
+                )?;
+                let blk_dev = RocmStorage::alloc_gpu(&Shape::new(vec![n_q_tiles * num_kv_heads * k_keep * 4]), grim_tensor::DType::U8, &self.allocator, self.ordinal)?;
+                let mut bp = blk_dev.device_ptr.unwrap();
+                let mut kk = k_keep as i32;
+                self.launch_compute_kernel(
+                    "grim_q81_topk_blocks_bc32",
+                    crate::HipDim3::new(n_q_tiles as u32, num_kv_heads as u32, 1),
+                    crate::HipDim3::new(256, 1, 1),
+                    &mut [arg(&mut sc_p), arg(&mut bp), arg(&mut nkv), arg(&mut nb_i), arg(&mut ksl), arg(&mut co), arg(&mut kk)],
+                )?;
+                (Some((k_min, k_max, scores_dev, blk_dev)), bp, kk)
+            } else {
+                (None, 0u64, 0i32)
+            };
+            let stream = self.launch_compute_kernel(
+                "grim_qkv_attention_wmma_k8v4_v2",
+                crate::HipDim3::new(n_q_tiles as u32, num_kv_heads as u32, 1),
+                crate::HipDim3::new((q_per_kv * 32) as u32, 1, 1),
+                &mut [
+                    arg(&mut qptr), arg(&mut kptr), arg(&mut vptr), arg(&mut bp_arg), arg(&mut optr),
+                    arg(&mut nh), arg(&mut nkv), arg(&mut hd), arg(&mut sl), arg(&mut ksl), arg(&mut co), arg(&mut isd), arg(&mut kk_i),
+                ],
+            )?;
+            if _keep_alive.is_some() {
+                self.synchronize();
+            }
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
+
+        let stream = self.launch_compute_kernel(
+            "grim_qkv_attention_k8v4_decode",
+            crate::HipDim3::new(num_heads as u32, seq_len as u32, 1),
+            crate::HipDim3::new(head_dim as u32, 1, 1),
+            &mut [
+                arg(&mut qptr), arg(&mut kptr), arg(&mut vptr), arg(&mut optr),
+                arg(&mut nh), arg(&mut nkv), arg(&mut hd), arg(&mut sl), arg(&mut ksl), arg(&mut co), arg(&mut isd),
+            ],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
 }

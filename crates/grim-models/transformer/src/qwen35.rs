@@ -1321,8 +1321,13 @@ impl Qwen35Block {
                         kv_arena_head_extent(fmt, self.head_dim),
                     ]);
                     let row_extent = kv_arena_row_extent(fmt, self.num_kv_heads, self.head_dim);
+                    let v_full_shape = if fmt == grim_backend_rocm::KvArenaFormat::K8V4 {
+                        Shape::new(vec![new_rows, self.num_kv_heads, (self.head_dim.div_ceil(32)) * 20])
+                    } else {
+                        full_shape.clone()
+                    };
                     let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
-                    let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
+                    let v_grown = dev.alloc_storage(&v_full_shape, kv_arena_dtype(&device))?;
                     if let Some(ref old_k) = cache.k_device {
                         dev.copy_slice_range(
                             k_grown.as_ref(),
@@ -1414,6 +1419,28 @@ impl Qwen35Block {
                     // intercept BEFORE the `_` f32 fallthrough — falling
                     // through would hand the byte-arena to the f32 reader
                     // and silently reinterpret quantized bytes as floats.
+                    _ if format == grim_backend_rocm::KvArenaFormat::K8V4 => {
+                        let ord = match device { Device::Rocm(o) => o, _ => 0 };
+                        let rdev = grim_backend_rocm::RocmDevice::shared(ord);
+                        let q_st = grim_backend_rocm::RocmStorage::copy_from_host(
+                            &q_all,
+                            &Shape::new(vec![seq_len, self.num_heads, self.head_dim]),
+                            DType::F32,
+                            &rdev.allocator_handle(),
+                            ord,
+                        )?;
+                        crate::shared_attention::fused_or_scalar_attention_k8v4_arena_device(
+                            &q_st,
+                            k_dev.as_ref(),
+                            v_dev.as_ref(),
+                            total_kv,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            seq_len,
+                            &device,
+                        )?
+                    }
                     _ if format == grim_backend_rocm::KvArenaFormat::Q8_1 => {
                         crate::shared_attention::fused_or_scalar_attention_q81_arena(
                             &q_all,
@@ -6542,8 +6569,13 @@ fn attention_layer_d2d(
             kv_arena_head_extent(fmt, blk.head_dim),
         ]);
         let row_extent = kv_arena_row_extent(fmt, blk.num_kv_heads, blk.head_dim);
+        let v_full_shape = if fmt == grim_backend_rocm::KvArenaFormat::K8V4 {
+            Shape::new(vec![new_rows, blk.num_kv_heads, (blk.head_dim.div_ceil(32)) * 20])
+        } else {
+            full_shape.clone()
+        };
         let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
-        let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
+        let v_grown = dev.alloc_storage(&v_full_shape, kv_arena_dtype(&device))?;
         if let Some(ref old_k) = cache.k_device {
             dev.copy_slice_range(
                 k_grown.as_ref(),
@@ -6554,12 +6586,17 @@ fn attention_layer_d2d(
             )?;
         }
         if let Some(ref old_v) = cache.v_device {
+            let v_row_extent = if fmt == grim_backend_rocm::KvArenaFormat::K8V4 {
+                blk.num_kv_heads * (blk.head_dim.div_ceil(32)) * 20
+            } else {
+                row_extent
+            };
             dev.copy_slice_range(
                 v_grown.as_ref(),
                 0,
                 old_v.as_ref(),
                 0,
-                cache.current_pos * row_extent,
+                cache.current_pos * v_row_extent,
             )?;
         }
         // Install the grown arena and its int8 sidecars BEFORE the append: the
@@ -6694,6 +6731,19 @@ fn attention_layer_d2d(
         // scale lives INSIDE each 67-byte block, so scales are None and this
         // arm must beat the `_` f32 fallthrough or the byte arena would be
         // read as raw floats.
+        _ if format == grim_backend_rocm::KvArenaFormat::K8V4 => {
+            crate::shared_attention::fused_or_scalar_attention_k8v4_arena_device(
+                q_rope.storage().as_ref(),
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                total_kv,
+                blk.num_heads,
+                blk.num_kv_heads,
+                blk.head_dim,
+                seq_len,
+                &device,
+            )?
+        }
         _ if format == grim_backend_rocm::KvArenaFormat::Q8_1 => {
             crate::shared_attention::fused_or_scalar_attention_q81_arena_device(
                 q_rope.storage().as_ref(),
@@ -7855,7 +7905,7 @@ pub(crate) fn kv_arena_dtype_for(format: grim_backend_rocm::KvArenaFormat) -> DT
         // WhiteCrow is also byte-addressed: its arena is a sequence of
         // interleaved 67-byte blocks (64 B u4 codes + 2 B bf16 scale + 1 B u8
         // zero per 128 values), so the storage element is a U8 byte.
-        F::Int8 | F::Int4 | F::Int2V4 | F::WhiteCrow | F::Q8_1 => DType {
+        F::Int8 | F::Int4 | F::Int2V4 | F::WhiteCrow | F::Q8_1 | F::K8V4 => DType {
             arith: ArithType::U8,
             storage: Storage::Native,
         },
@@ -7889,7 +7939,7 @@ pub(crate) fn kv_arena_head_extent(
     use grim_backend_rocm::KvArenaFormat as F;
     match format {
         F::F32 | F::F16 | F::Int8 => head_dim,
-        F::Q8_1 => (head_dim.div_ceil(32)) * 36,
+        F::Q8_1 | F::K8V4 => (head_dim.div_ceil(32)) * 36,
         F::Int4 => head_dim / 2,
         F::Int2V4 => head_dim / 2,
         // WhiteCrow: one 67-byte block per 128 values of the head vector, so a
@@ -7920,6 +7970,7 @@ pub(crate) fn kv_arena_bytes_per_kv_elem(format: grim_backend_rocm::KvArenaForma
         F::F16 => 2.0,
         F::Int8 => 1.0,
         F::Q8_1 => 36.0 / 32.0,
+        F::K8V4 => (36.0 + 20.0) / 64.0,
         // Key 0.25, value 0.5; the reservation takes the wider side.
         F::Int4 | F::Int2V4 => 0.5,
         // WhiteCrow: the amortized width of its interleaved blocks — 67 bytes
@@ -7940,7 +7991,7 @@ pub(crate) fn kv_arena_row_scale_bytes(
     use grim_backend_rocm::KvArenaFormat as F;
     match format {
         F::Int8 | F::Int4 | F::Int2V4 => nkv * 4 * 2,
-        F::F32 | F::F16 | F::WhiteCrow | F::Q8_1 => 0,
+        F::F32 | F::F16 | F::WhiteCrow | F::Q8_1 | F::K8V4 => 0,
     }
 }
 
@@ -7969,7 +8020,7 @@ fn kv_arena_scale_dtype(device: &Device) -> Option<DType> {
     use grim_backend_rocm::KvArenaFormat as F;
     match kv_arena_format_qwen(device) {
         F::Int8 | F::Int4 | F::Int2V4 => Some(DType::F32),
-        F::WhiteCrow | F::Q8_1 => None,
+        F::WhiteCrow | F::Q8_1 | F::K8V4 => None,
         _ => None,
     }
 }
@@ -8082,6 +8133,38 @@ fn arena_append_kv_rows<'a>(
             src_elem_off,
             v_dst,
             dst_off,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        return Ok(());
+    }
+    if matches!(format, F::K8V4) {
+        let ordinal = k_dst.device_ordinal() as usize;
+        let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let num_blocks = head_dim / 32;
+        let k_row_bytes = nkv * num_blocks * 36;
+        let v_row_bytes = nkv * num_blocks * 20;
+        grim_backend_rocm::launch_kv_quantize_rows_q81(
+            rocm.as_ref(),
+            k_src,
+            src_elem_off,
+            k_dst,
+            row_off * k_row_bytes,
+            n_tok_rows,
+            stride,
+            nkv,
+            head_dim,
+        )
+        .map(|_| ())?;
+        grim_backend_rocm::launch_kv_quantize_rows_q41(
+            rocm.as_ref(),
+            v_src,
+            src_elem_off,
+            v_dst,
+            row_off * v_row_bytes,
             n_tok_rows,
             stride,
             nkv,

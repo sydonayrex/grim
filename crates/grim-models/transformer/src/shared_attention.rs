@@ -748,6 +748,43 @@ pub fn fused_or_scalar_attention_q81_arena_device(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_k8v4_arena_device(
+    q_st: &dyn grim_tensor::BackendStorage,
+    k_arena: &dyn grim_tensor::BackendStorage,
+    v_arena: &dyn grim_tensor::BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let ordinal = match device {
+        Device::Rocm(ord) => *ord as usize,
+        _ => 0,
+    };
+    let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = rocm.qkv_attention_k8v4(
+        q_st,
+        k_arena,
+        v_arena,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn fused_or_scalar_attention_q81_arena(
     q: &[f32],
     k_arena: &dyn BackendStorage,

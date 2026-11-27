@@ -421,6 +421,7 @@ fn planned_kv_arena_per_card_mb(prompt_len: usize) -> u64 {
     {
         "f16" => grim_backend_rocm::KvArenaFormat::F16,
         "f32" => grim_backend_rocm::KvArenaFormat::F32,
+        "k8v4" | "q8v4" => grim_backend_rocm::KvArenaFormat::K8V4,
         _ => grim_backend_rocm::KvArenaFormat::Q8_1,
     };
     let kv_cap: usize = std::env::var("GRIM_KV_CACHE_LEN")
