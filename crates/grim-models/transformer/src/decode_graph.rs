@@ -7127,6 +7127,27 @@ impl Qwen35 {
                     if any_adopted {
                         Self::restore_adopted_row0(&g, &saved_row0);
                         g.buffers.current_pos = pos;
+                        if std::env::var("GRIM_SPARSE_DECODE_PCT")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0)
+                            > 0
+                        {
+                            for (l, &is_adopted) in adopted_mask.iter().enumerate() {
+                                if !is_adopted {
+                                    continue;
+                                }
+                                let ord = g.buffers.k_arena[l].device_ordinal();
+                                let layer_dev = grim_backend_rocm::RocmDevice::shared(ord);
+                                let _ = grim_backend_rocm::build_k8v4_quest_minmax(
+                                    &layer_dev,
+                                    &g.buffers.k_arena[l],
+                                    self.cfg.num_kv_heads as u32,
+                                    pos,
+                                    g.buffers.max_ctx as u32,
+                                );
+                            }
+                        }
                         eprintln!(
                             "[decode-graph] zero-copy adopted {:.1} MiB of eager Q8_1 KV arenas (1.0x peak)",
                             adopted_bytes as f64 / (1024.0 * 1024.0)

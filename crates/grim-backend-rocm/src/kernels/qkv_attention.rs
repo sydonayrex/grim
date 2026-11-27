@@ -8546,6 +8546,389 @@ extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
     }
 }
 
+// Phase 3: Build per-page (BC=32) FP16 K min/max metadata from Q8_1 k_arena once at adoption.
+// Grid: (n_blocks, num_kv_heads, 1), Block: (256, 1, 1).
+extern "C" __global__ void grim_q81_build_minmax_f16_bc32(
+    const unsigned char* __restrict__ k_arena,
+    __half* __restrict__ k_min_f16,
+    __half* __restrict__ k_max_f16,
+    int num_kv_heads,
+    int total_rows
+) {
+    const int b = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int d = threadIdx.x; // 0..255
+    const int j0 = b * 32;
+    if (j0 >= total_rows) return;
+    const int j1 = (j0 + 32 < total_rows) ? (j0 + 32) : total_rows;
+    const int blk = d >> 5;
+    const int elem = d & 31;
+    const long long row_bytes = (long long)num_kv_heads * 288;
+    float mn = 1e30f;
+    float mx = -1e30f;
+    for (int j = j0; j < j1; ++j) {
+        const unsigned char* kb = k_arena + (long long)j * row_bytes + (long long)kvh * 288 + blk * 36;
+        const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
+        const float v = dk * (float)(reinterpret_cast<const signed char*>(kb + 4)[elem]);
+        mn = fminf(mn, v);
+        mx = fmaxf(mx, v);
+    }
+    const long long out_off = ((long long)b * num_kv_heads + kvh) * 256 + d;
+    k_min_f16[out_off] = __float2half(mn);
+    k_max_f16[out_off] = __float2half(mx);
+}
+
+// Graph-capturable decode Quest page scorer (reads total_dev on-device).
+// Grid: (max_blocks, num_kv_heads, 1), Block: (256, 1, 1).
+extern "C" __global__ void grim_q81_decode_quest_score_bc32(
+    const float* __restrict__ q,
+    const __half* __restrict__ k_min_f16,
+    const __half* __restrict__ k_max_f16,
+    float* __restrict__ scores,
+    const int* __restrict__ total_dev,
+    int steps,
+    int num_heads,
+    int num_kv_heads,
+    int max_blocks
+) {
+    const int b = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x; // 0..255
+    const int total = *total_dev + steps;
+    const int n_blocks = (total + 31) >> 5;
+    if (b >= n_blocks || b >= max_blocks) return;
+
+    const long long km_off = ((long long)b * num_kv_heads + kvh) * 256 + tid;
+    const float km = __half2float(k_min_f16[km_off]);
+    const float kx = __half2float(k_max_f16[km_off]);
+    const int q_per_kv = num_heads / num_kv_heads;
+
+    float best = -1e30f;
+    __shared__ float s_red[256];
+    for (int g = 0; g < q_per_kv; ++g) {
+        const int h = kvh * q_per_kv + g;
+        const float qv = q[(long long)h * 256 + tid];
+        s_red[tid] = fmaxf(qv * km, qv * kx);
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) s_red[tid] += s_red[tid + off];
+            __syncthreads();
+        }
+        if (tid == 0) best = fmaxf(best, s_red[0]);
+        __syncthreads();
+    }
+    if (tid == 0) {
+        scores[(long long)kvh * max_blocks + b] = best;
+    }
+}
+
+// Graph-capturable decode Quest top-k selector (reads total_dev on-device).
+// Grid: (num_kv_heads, 1, 1), Block: (256, 1, 1).
+// Pins sink block 0 + last 16 blocks (recent 512 tokens, incl. newly decoded tokens).
+extern "C" __global__ void grim_q81_decode_quest_topk_bc32(
+    const float* __restrict__ scores,
+    int* __restrict__ block_ids,
+    int* __restrict__ k_keep_out,
+    const int* __restrict__ total_dev,
+    int steps,
+    int max_blocks,
+    int pct
+) {
+    const int kvh = blockIdx.x;
+    const int tid = threadIdx.x; // 0..255
+    const int total = *total_dev + steps;
+    int n_blocks = (total + 31) >> 5;
+    if (n_blocks > max_blocks) n_blocks = max_blocks;
+    int k_keep = (n_blocks * pct + 99) / 100;
+    if (k_keep < 64) k_keep = 64;
+    if (k_keep > n_blocks) k_keep = n_blocks;
+    if (kvh == 0 && tid == 0) k_keep_out[0] = k_keep;
+
+    const float* sc = scores + (long long)kvh * max_blocks;
+    int* out = block_ids + (long long)kvh * max_blocks;
+
+    if (n_blocks <= k_keep) {
+        for (int i = tid; i < k_keep; i += 256) out[i] = i;
+        return;
+    }
+
+    const int local_start = (n_blocks > 17) ? (n_blocks - 16) : 1;
+    const int n_pinned = 1 + (n_blocks - local_start);
+    const int need_mid = (k_keep > n_pinned) ? (k_keep - n_pinned) : 0;
+
+    __shared__ float s_min[256];
+    __shared__ float s_max[256];
+    __shared__ int s_cnt[256];
+    __shared__ int s_emit;
+
+    float lmin = 1e30f, lmax = -1e30f;
+    for (int b = 1 + tid; b < local_start; b += 256) {
+        float v = sc[b];
+        lmin = fminf(lmin, v);
+        lmax = fmaxf(lmax, v);
+    }
+    s_min[tid] = lmin;
+    s_max[tid] = lmax;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float lo = s_min[0], hi = s_max[0];
+    for (int it = 0; it < 16; ++it) {
+        float mid = 0.5f * (lo + hi);
+        int c = 0;
+        for (int b = 1 + tid; b < local_start; b += 256) {
+            if (sc[b] >= mid) ++c;
+        }
+        s_cnt[tid] = c;
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) s_cnt[tid] += s_cnt[tid + off];
+            __syncthreads();
+        }
+        if (s_cnt[0] >= need_mid) lo = mid; else hi = mid;
+        __syncthreads();
+    }
+    float thresh = lo;
+    if (tid == 0) {
+        out[0] = 0;
+        s_emit = 1;
+    }
+    __syncthreads();
+    for (int b = 1 + tid; b < local_start; b += 256) {
+        if (sc[b] > thresh) {
+            int pos = atomicAdd(&s_emit, 1);
+            if (pos < 1 + need_mid) out[pos] = b;
+        }
+    }
+    __syncthreads();
+    for (int b = 1 + tid; b < local_start; b += 256) {
+        if (sc[b] == thresh) {
+            int pos = atomicAdd(&s_emit, 1);
+            if (pos < 1 + need_mid) out[pos] = b;
+        }
+    }
+    __syncthreads();
+    const int n_local = n_blocks - local_start;
+    for (int i = tid; i < n_local; i += 256) {
+        out[1 + need_mid + i] = local_start + i;
+    }
+}
+
+// Sparse K8V4 GQA split-K decode attention (sudot4 + Lazy-V + JT=8 over Quest BC=32 pages).
+extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk_sparse(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    const int* __restrict__ block_ids,
+    const int* __restrict__ k_keep_dev,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int split_k,
+    int max_blocks
+) {
+    constexpr int HD = 256;
+    constexpr int K_HEAD_BYTES = 288;
+    constexpr int V_HEAD_BYTES = 160;
+    constexpr int JT = 8;
+    constexpr int MAX_Q_PER_WAVE = 3;
+
+    const int split_id = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int blk = lane >> 2;
+    const int sub = (lane & 3) * 8;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int n_q = q_per_kv * seq_len;
+    const int total = *total_dev + steps;
+    const int k_keep = k_keep_dev[0];
+    const long long k_row_bytes = (long long)num_kv_heads * K_HEAD_BYTES;
+    const long long v_row_bytes = (long long)num_kv_heads * V_HEAD_BYTES;
+    const int total_h = seq_len * num_heads;
+
+    const int p_base = k_keep / split_k;
+    const int p_rem = k_keep % split_k;
+    const int p_start = split_id * p_base + (split_id < p_rem ? split_id : p_rem);
+    const int p_end = p_start + p_base + (split_id < p_rem ? 1 : 0);
+
+    int qpack0[MAX_Q_PER_WAVE];
+    int qpack1[MAX_Q_PER_WAVE];
+    float qd[MAX_Q_PER_WAVE];
+    float acc[MAX_Q_PER_WAVE][8];
+    float rmax[MAX_Q_PER_WAVE];
+    float rsum[MAX_Q_PER_WAVE];
+    int q_hi[MAX_Q_PER_WAVE];
+
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        rmax[m] = -1e30f;
+        rsum[m] = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) acc[m][e] = 0.0f;
+        if (qi < n_q) {
+            const int qr = qi / q_per_kv;
+            const int h = kv_head * q_per_kv + (qi % q_per_kv);
+            q_hi[m] = total - (seq_len - 1 - qr);
+            const float* q_row = q + ((long long)qr * num_heads + h) * HD + blk * 32 + sub;
+            float qv[8];
+            float amax = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                qv[e] = q_row[e];
+                amax = fmaxf(amax, fabsf(qv[e]));
+            }
+            amax = fmaxf(amax, __shfl_xor(amax, 1));
+            amax = fmaxf(amax, __shfl_xor(amax, 2));
+            const float d = (amax > 0.0f) ? (amax / 127.0f) : 0.0f;
+            const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            qd[m] = d;
+            unsigned int p0 = 0u, p1 = 0u;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                int q0 = __float2int_rn(qv[e] * inv_d);
+                q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
+                p0 |= ((unsigned int)(q0 & 0xFF)) << (e * 8);
+                int q1 = __float2int_rn(qv[e + 4] * inv_d);
+                q1 = q1 < -127 ? -127 : (q1 > 127 ? 127 : q1);
+                p1 |= ((unsigned int)(q1 & 0xFF)) << (e * 8);
+            }
+            qpack0[m] = (int)p0;
+            qpack1[m] = (int)p1;
+        } else {
+            q_hi[m] = -1;
+            qpack0[m] = 0;
+            qpack1[m] = 0;
+            qd[m] = 0.0f;
+        }
+    }
+
+    __shared__ alignas(16) unsigned char sK[JT][K_HEAD_BYTES];
+    const int ld_kt0 = tid / 18;
+    const int ld_kb0 = (tid % 18) * 16;
+    const int tid1 = tid + 128;
+    const int ld_kt1 = tid1 / 18;
+    const int ld_kb1 = (tid1 % 18) * 16;
+    const int* my_blocks = block_ids + (long long)kv_head * max_blocks;
+
+    for (int p = p_start; p < p_end; ++p) {
+        const int bid = my_blocks[p];
+        if (bid < 0) continue;
+        const int j_blk_start = bid * 32;
+        const int j_blk_end = (j_blk_start + 32 < total) ? (j_blk_start + 32) : total;
+        for (int j0 = j_blk_start; j0 < j_blk_end; j0 += JT) {
+            {
+                const int j = j0 + ld_kt0;
+                if (j < j_blk_end) {
+                    const long long off = (long long)j * k_row_bytes + (long long)kv_head * K_HEAD_BYTES + ld_kb0;
+                    *reinterpret_cast<uint4*>(&sK[ld_kt0][ld_kb0]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
+                }
+            }
+            if (tid < 16) {
+                const int j = j0 + ld_kt1;
+                if (j < j_blk_end) {
+                    const long long off = (long long)j * k_row_bytes + (long long)kv_head * K_HEAD_BYTES + ld_kb1;
+                    *reinterpret_cast<uint4*>(&sK[ld_kt1][ld_kb1]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
+                }
+            }
+            __syncthreads();
+
+            const int jt_cnt = (j0 + JT <= j_blk_end) ? JT : (j_blk_end - j0);
+            for (int t = 0; t < jt_cnt; ++t) {
+                const int cur_j = j0 + t;
+                const unsigned char* kb = &sK[t][blk * 36];
+                const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
+                const int k0 = *reinterpret_cast<const int*>(kb + 4 + sub);
+                const int k1 = *reinterpret_cast<const int*>(kb + 8 + sub);
+
+                float scores_q[MAX_Q_PER_WAVE];
+                bool wave_need_v = false;
+                #pragma unroll
+                for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+                    if (cur_j >= q_hi[m]) {
+                        scores_q[m] = -1e30f;
+                        continue;
+                    }
+                    int idot = __builtin_amdgcn_sudot4(true, qpack0[m], true, k0, 0, false);
+                    idot = __builtin_amdgcn_sudot4(true, qpack1[m], true, k1, idot, false);
+                    float partial = (float)idot * (qd[m] * dk);
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor(partial, off);
+                    const float sc = partial * inv_sqrt_d;
+                    scores_q[m] = sc;
+                    if (sc - rmax[m] > -12.0f) wave_need_v = true;
+                }
+
+                if (wave_need_v) {
+                    const unsigned char* vb = v_arena + (long long)cur_j * v_row_bytes
+                                            + (long long)kv_head * V_HEAD_BYTES + blk * 20;
+                    const float dv = __half2float(*reinterpret_cast<const __half*>(vb));
+                    const float mv = __half2float(*reinterpret_cast<const __half*>(vb + 2));
+                    const int byte_off = sub & 15;
+                    const int sh = (sub >= 16) ? 4 : 0;
+                    const unsigned int w0 = *reinterpret_cast<const unsigned int*>(vb + 4 + byte_off);
+                    const unsigned int w1 = *reinterpret_cast<const unsigned int*>(vb + 8 + byte_off);
+                    float vv[8];
+                    vv[0] = dv * (float)((w0 >> (0 + sh)) & 0xFu) + mv;
+                    vv[1] = dv * (float)((w0 >> (8 + sh)) & 0xFu) + mv;
+                    vv[2] = dv * (float)((w0 >> (16 + sh)) & 0xFu) + mv;
+                    vv[3] = dv * (float)((w0 >> (24 + sh)) & 0xFu) + mv;
+                    vv[4] = dv * (float)((w1 >> (0 + sh)) & 0xFu) + mv;
+                    vv[5] = dv * (float)((w1 >> (8 + sh)) & 0xFu) + mv;
+                    vv[6] = dv * (float)((w1 >> (16 + sh)) & 0xFu) + mv;
+                    vv[7] = dv * (float)((w1 >> (24 + sh)) & 0xFu) + mv;
+
+                    #pragma unroll
+                    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+                        if (cur_j >= q_hi[m]) continue;
+                        const float sc = scores_q[m];
+                        if (sc - rmax[m] <= -12.0f) continue;
+                        const float m_new = fmaxf(rmax[m], sc);
+                        const float sa = expf(rmax[m] - m_new);
+                        const float sb = expf(sc - m_new);
+                        rmax[m] = m_new;
+                        rsum[m] = rsum[m] * sa + sb;
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[m][e] = acc[m][e] * sa + sb * vv[e];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        if (qi >= n_q) continue;
+        const int qr = qi / q_per_kv;
+        const int h = kv_head * q_per_kv + (qi % q_per_kv);
+        const int g_h = qr * num_heads + h;
+        const int slot_idx = split_id * total_h + g_h;
+        float* po = partial_out + (long long)slot_idx * HD + blk * 32 + sub;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) po[e] = acc[m][e];
+        if (lane == 0) {
+            partial_max[slot_idx] = rmax[m];
+            partial_sum[slot_idx] = rsum[m];
+        }
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_wmma_q81_v2_sparse(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_arena,
@@ -11526,9 +11909,146 @@ pub fn launch_qkv_attention_dev_batch_i4(
     )
 }
 
-/// Graph launcher for `grim_qkv_attention_dev_q81`.
-/// Same contract as [`launch_qkv_attention_dev_batch_whitecrow`]:
-/// scale lives inside each 36-byte Q8_1 block, no sidecar.
+struct K8v4QuestState {
+    k_min_f16: crate::memory::storage::RocmStorage,
+    k_max_f16: crate::memory::storage::RocmStorage,
+    scores: crate::memory::storage::RocmStorage,
+    block_ids: crate::memory::storage::RocmStorage,
+    k_keep_dev: crate::memory::storage::RocmStorage,
+    max_blocks: usize,
+}
+
+fn k8v4_quest_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, u64), K8v4QuestState>> {
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, u64), K8v4QuestState>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn sparse_decode_pct() -> usize {
+    std::env::var("GRIM_SPARSE_DECODE_PCT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&p| p > 0 && p < 100)
+        .unwrap_or(0)
+}
+
+fn get_or_alloc_k8v4_quest_ptrs(
+    dev: &crate::RocmDevice,
+    k_ptr: u64,
+    num_kv_heads: u32,
+    max_ctx: u32,
+) -> Result<(u64, u64, u64, u64, u64, usize), crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::{DType, Shape};
+    let ord = dev.ordinal();
+    let max_blocks = ((max_ctx as usize) + 31) / 32;
+    let mut map = k8v4_quest_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry((ord, k_ptr));
+    let st = match entry {
+        std::collections::hash_map::Entry::Occupied(o) if o.get().max_blocks >= max_blocks => {
+            o.into_mut()
+        }
+        other => {
+            let _dg = crate::DeviceGuard::set(ord as i32);
+            let nkv = num_kv_heads as usize;
+            let k_min_f16 = RocmStorage::alloc_gpu(
+                &Shape::new(vec![max_blocks * nkv * 256]),
+                DType::F16,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            let k_max_f16 = RocmStorage::alloc_gpu(
+                &Shape::new(vec![max_blocks * nkv * 256]),
+                DType::F16,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            let scores = RocmStorage::alloc_gpu(
+                &Shape::new(vec![nkv * max_blocks]),
+                DType::F32,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            let block_ids = RocmStorage::alloc_gpu(
+                &Shape::new(vec![nkv * max_blocks]),
+                DType::U32,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            let k_keep_dev = RocmStorage::alloc_gpu(
+                &Shape::new(vec![64]),
+                DType::U32,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            let state = K8v4QuestState {
+                k_min_f16,
+                k_max_f16,
+                scores,
+                block_ids,
+                k_keep_dev,
+                max_blocks,
+            };
+            match other {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    o.insert(state);
+                    o.into_mut()
+                }
+                std::collections::hash_map::Entry::Vacant(v) => v.insert(state),
+            }
+        }
+    };
+    Ok((
+        st.k_min_f16.device_ptr().unwrap_or(0) as u64,
+        st.k_max_f16.device_ptr().unwrap_or(0) as u64,
+        st.scores.device_ptr().unwrap_or(0) as u64,
+        st.block_ids.device_ptr().unwrap_or(0) as u64,
+        st.k_keep_dev.device_ptr().unwrap_or(0) as u64,
+        st.max_blocks,
+    ))
+}
+
+/// Build per-page (BC=32) FP16 K min/max metadata once after `DecodeGraph` adopts `k_arena`.
+pub fn build_k8v4_quest_minmax(
+    dev: &crate::RocmDevice,
+    k_arena: &dyn BackendStorage,
+    num_kv_heads: u32,
+    total_rows: u32,
+    max_ctx: u32,
+) -> Result<(), crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    if total_rows == 0 {
+        return Ok(());
+    }
+    let _dg = crate::DeviceGuard::set(dev.ordinal() as i32);
+    let mut k_ptr = k_arena
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("build_k8v4_quest_minmax: k ptr".into()))?;
+    let (mut kmin_ptr, mut kmax_ptr, _, _, _, _) =
+        get_or_alloc_k8v4_quest_ptrs(dev, k_ptr as u64, num_kv_heads, max_ctx)?;
+    let n_blocks = ((total_rows as usize) + 31) / 32;
+    let mut nkv = num_kv_heads as i32;
+    let mut tot = total_rows as i32;
+    dev.launch_compute_kernel(
+        "grim_q81_build_minmax_f16_bc32",
+        crate::HipDim3::new(n_blocks as u32, num_kv_heads, 1),
+        crate::HipDim3::new(256, 1, 1),
+        &mut [
+            arg(&mut k_ptr),
+            arg(&mut kmin_ptr),
+            arg(&mut kmax_ptr),
+            arg(&mut nkv),
+            arg(&mut tot),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Graph launcher for `grim_qkv_attention_dev_k8v4_gqa_splitk` (dense or Quest BC=32 sparse).
 #[allow(clippy::too_many_arguments)]
 pub fn launch_qkv_attention_dev_batch_k8v4(
     dev: &crate::RocmDevice,
@@ -11569,16 +12089,59 @@ pub fn launch_qkv_attention_dev_batch_k8v4(
     let mut total_h_i = total_h as i32;
     let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?
         .ok_or_else(|| crate::Error::Backend("k8v4_gqa_splitk: scratch alloc failed".into()))?;
-    dev.launch_compute_kernel(
-        "grim_qkv_attention_dev_k8v4_gqa_splitk",
-        crate::HipDim3::new(split_k as u32, num_kv_heads, 1),
-        crate::HipDim3::new(128, 1, 1),
-        &mut [
-            arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr),
-            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
-            arg(&mut nh), arg(&mut nkv), arg(&mut sl), arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd), arg(&mut split_k_i),
-        ],
-    )?;
+
+    let pct = sparse_decode_pct();
+    if pct > 0 && head_dim == 256 {
+        let max_ctx = std::env::var("GRIM_KV_CACHE_LEN")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 64)
+            .unwrap_or(4096);
+        let (mut kmin_ptr, mut kmax_ptr, mut scores_ptr, mut bids_ptr, mut kkeep_ptr, max_blocks) =
+            get_or_alloc_k8v4_quest_ptrs(dev, k_ptr as u64, num_kv_heads, max_ctx)?;
+        let mut max_b_i = max_blocks as i32;
+        let mut pct_i = pct as i32;
+        dev.launch_compute_kernel(
+            "grim_q81_decode_quest_score_bc32",
+            crate::HipDim3::new(max_blocks as u32, num_kv_heads, 1),
+            crate::HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut q_ptr), arg(&mut kmin_ptr), arg(&mut kmax_ptr), arg(&mut scores_ptr),
+                arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut nh), arg(&mut nkv), arg(&mut max_b_i),
+            ],
+        )?;
+        dev.launch_compute_kernel(
+            "grim_q81_decode_quest_topk_bc32",
+            crate::HipDim3::new(num_kv_heads, 1, 1),
+            crate::HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut scores_ptr), arg(&mut bids_ptr), arg(&mut kkeep_ptr),
+                arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut max_b_i), arg(&mut pct_i),
+            ],
+        )?;
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_k8v4_gqa_splitk_sparse",
+            crate::HipDim3::new(split_k as u32, num_kv_heads, 1),
+            crate::HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr), arg(&mut bids_ptr), arg(&mut kkeep_ptr),
+                arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+                arg(&mut nh), arg(&mut nkv), arg(&mut sl), arg(&mut tot_ptr), arg(&mut steps_i),
+                arg(&mut isd), arg(&mut split_k_i), arg(&mut max_b_i),
+            ],
+        )?;
+    } else {
+        dev.launch_compute_kernel(
+            "grim_qkv_attention_dev_k8v4_gqa_splitk",
+            crate::HipDim3::new(split_k as u32, num_kv_heads, 1),
+            crate::HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr),
+                arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+                arg(&mut nh), arg(&mut nkv), arg(&mut sl), arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd), arg(&mut split_k_i),
+            ],
+        )?;
+    }
     dev.launch_compute_kernel(
         "grim_qkv_attention_splitk_combine",
         crate::HipDim3::new(total_h as u32, 1, 1),
