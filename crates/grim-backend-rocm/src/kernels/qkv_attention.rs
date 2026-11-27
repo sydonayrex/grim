@@ -9178,6 +9178,76 @@ extern "C" __global__ void grim_qkv_attention_wmma_q81_v2_sparse(
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Phase 3b: Incremental per-page (BC=32) int8 K min/max + f16 scale refresh.
+// Covers ONLY the 1-2 blocks this decode step appends into (rows
+// [total, total+steps)); launched inside launch_qkv_attention_dev_batch_k8v4
+// immediately BEFORE the Quest score kernel, so it is graph-captured and
+// stream-ordered ahead of every score/top-k read of this metadata. Without
+// it, pages past the DecodeGraph adoption position are never re-indexed and
+// generations longer than the 512-token pinned tail lose retrieval.
+// MTP ROLLBACK PROPERTY (deliberate — do not "fix"): after a draft rollback a
+// recomputed block can briefly include rejected draft rows, which WIDENS the
+// min/max bound. Quest then OVERESTIMATES page scores and keeps blocks it
+// might otherwise drop — conservative-safe (never drops a needle), and it
+// self-corrects as the ring overwrites those rows. Replacing this with an
+// exact rebuild keyed on a built-position scalar could under-cover after a
+// rollback.
+// Grid: (2, num_kv_heads, 1), Block: (256, 1, 1). blockIdx.x = block offset
+// within the [b_first .. b_last] touched range (span <= 2 for steps <= 32).
+extern "C" __global__ void grim_q81_minmax_update_f16_bc32(
+    const unsigned char* __restrict__ k_arena,
+    signed char* __restrict__ k_min_i8,
+    signed char* __restrict__ k_max_i8,
+    __half* __restrict__ k_scale_f16,
+    int num_kv_heads,
+    const int* __restrict__ total_dev,
+    int steps
+) {
+    const int kvh = blockIdx.y;
+    const int d = threadIdx.x; // 0..255
+    const int prev_total = *total_dev;
+    const int total = prev_total + steps;
+    if (total <= 0) return;
+    const int b_first = (prev_total > 0) ? (prev_total >> 5) : 0;
+    const int b_last = (total - 1) >> 5;
+    const int b = b_first + (int)blockIdx.x;
+    if (b > b_last) return;
+    const int j0 = b * 32;
+    const int j1 = (j0 + 32 < total) ? (j0 + 32) : total;
+    const int blk = d >> 5;
+    const int elem = d & 31;
+    const long long row_bytes = (long long)num_kv_heads * 288;
+    float mn = 1e30f;
+    float mx = -1e30f;
+    for (int j = j0; j < j1; ++j) {
+        const unsigned char* kb = k_arena + (long long)j * row_bytes + (long long)kvh * 288 + blk * 36;
+        const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
+        const float v = dk * (float)(reinterpret_cast<const signed char*>(kb + 4)[elem]);
+        mn = fminf(mn, v);
+        mx = fmaxf(mx, v);
+    }
+    __shared__ float s_amax[256];
+    s_amax[d] = fmaxf(fabsf(mn), fabsf(mx));
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (d < off) s_amax[d] = fmaxf(s_amax[d], s_amax[d + off]);
+        __syncthreads();
+    }
+    const float sc = fmaxf(s_amax[0] / 127.0f, 1e-30f);
+    const float inv_sc = 1.0f / sc;
+    if (d == 0) {
+        k_scale_f16[(long long)b * num_kv_heads + kvh] = __float2half(sc);
+    }
+    int qmn = __float2int_rn(mn * inv_sc);
+    int qmx = __float2int_rn(mx * inv_sc);
+    qmn = qmn < -127 ? -127 : (qmn > 127 ? 127 : qmn);
+    qmx = qmx < -127 ? -127 : (qmx > 127 ? 127 : qmx);
+    const long long out_off = ((long long)b * num_kv_heads + kvh) * 256 + d;
+    k_min_i8[out_off] = (signed char)qmn;
+    k_max_i8[out_off] = (signed char)qmx;
+}
+
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12104,6 +12174,122 @@ pub fn build_k8v4_quest_minmax(
     Ok(())
 }
 
+/// Test/verification wrapper: launch `grim_q81_build_minmax_f16_bc32` into
+/// CALLER-OWNED metadata buffers (kernels write raw bytes; dtype is opaque).
+/// `total_rows` rows of `k_arena` are treated as valid.
+pub fn build_minmax_f16_bc32_into(
+    dev: &crate::RocmDevice,
+    k_arena: &dyn BackendStorage,
+    k_min: &dyn BackendStorage,
+    k_max: &dyn BackendStorage,
+    k_scale: &dyn BackendStorage,
+    num_kv_heads: u32,
+    total_rows: u32,
+) -> Result<(), crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    if total_rows == 0 {
+        return Ok(());
+    }
+    let _dg = crate::DeviceGuard::set(dev.ordinal() as i32);
+    let mut k_ptr = k_arena
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("build_minmax_into: k ptr".into()))?;
+    let mut kmin_ptr = k_min
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("build_minmax_into: kmin ptr".into()))?;
+    let mut kmax_ptr = k_max
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("build_minmax_into: kmax ptr".into()))?;
+    let mut kscale_ptr = k_scale
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("build_minmax_into: kscale ptr".into()))?;
+    let n_blocks = ((total_rows as usize) + 31) / 32;
+    let mut nkv = num_kv_heads as i32;
+    let mut tot = total_rows as i32;
+    dev.launch_compute_kernel(
+        "grim_q81_build_minmax_f16_bc32",
+        crate::HipDim3::new(n_blocks as u32, num_kv_heads, 1),
+        crate::HipDim3::new(256, 1, 1),
+        &mut [
+            arg(&mut k_ptr),
+            arg(&mut kmin_ptr),
+            arg(&mut kmax_ptr),
+            arg(&mut kscale_ptr),
+            arg(&mut nkv),
+            arg(&mut tot),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Test/verification wrapper: launch the incremental `grim_q81_minmax_update_f16_bc32`
+/// refresh into CALLER-OWNED metadata buffers. `total_dev` must hold the
+/// PRE-step row count as an i32 bit pattern; `steps` rows are treated as newly
+/// appended (span covers at most 2 BC=32 blocks for steps <= 32).
+pub fn update_minmax_f16_bc32_rows(
+    dev: &crate::RocmDevice,
+    k_arena: &dyn BackendStorage,
+    k_min: &dyn BackendStorage,
+    k_max: &dyn BackendStorage,
+    k_scale: &dyn BackendStorage,
+    num_kv_heads: u32,
+    total_dev: &dyn BackendStorage,
+    steps: u32,
+) -> Result<(), crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    let _dg = crate::DeviceGuard::set(dev.ordinal() as i32);
+    let mut k_ptr = k_arena
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("update_minmax_rows: k ptr".into()))?;
+    let mut kmin_ptr = k_min
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("update_minmax_rows: kmin ptr".into()))?;
+    let mut kmax_ptr = k_max
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("update_minmax_rows: kmax ptr".into()))?;
+    let mut kscale_ptr = k_scale
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("update_minmax_rows: kscale ptr".into()))?;
+    let mut tot_ptr = total_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| crate::Error::Backend("update_minmax_rows: tot ptr".into()))?;
+    let mut nkv = num_kv_heads as i32;
+    let mut steps_i = steps as i32;
+    dev.launch_compute_kernel(
+        "grim_q81_minmax_update_f16_bc32",
+        crate::HipDim3::new(2, num_kv_heads, 1),
+        crate::HipDim3::new(256, 1, 1),
+        &mut [
+            arg(&mut k_ptr),
+            arg(&mut kmin_ptr),
+            arg(&mut kmax_ptr),
+            arg(&mut kscale_ptr),
+            arg(&mut nkv),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Graph launcher for `grim_qkv_attention_dev_k8v4_gqa_splitk` (dense or Quest BC=32 sparse).
 #[allow(clippy::too_many_arguments)]
 pub fn launch_qkv_attention_dev_batch_k8v4(
@@ -12157,6 +12343,22 @@ pub fn launch_qkv_attention_dev_batch_k8v4(
             get_or_alloc_k8v4_quest_ptrs(dev, k_ptr as u64, num_kv_heads, max_ctx)?;
         let mut max_b_i = max_blocks as i32;
         let mut pct_i = pct as i32;
+        // 1b: refresh min/max for the 1-2 blocks this step appends into (rows
+        // [total, total+steps)) so pages past the DecodeGraph adoption position
+        // stay indexed for long generations. Launched on the capture stream =>
+        // graph-captured and stream-ordered before every score/top-k read.
+        // MTP rollback may briefly include rejected draft rows in a block's
+        // bound — that WIDENS it (Quest keeps extra blocks, never drops one)
+        // and self-corrects on overwrite. See the kernel's doc comment.
+        dev.launch_compute_kernel(
+            "grim_q81_minmax_update_f16_bc32",
+            crate::HipDim3::new(2, num_kv_heads, 1),
+            crate::HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut k_ptr), arg(&mut kmin_ptr), arg(&mut kmax_ptr), arg(&mut kscale_ptr),
+                arg(&mut nkv), arg(&mut tot_ptr), arg(&mut steps_i),
+            ],
+        )?;
         dev.launch_compute_kernel(
             "grim_q81_decode_quest_score_bc32",
             crate::HipDim3::new(max_blocks as u32, num_kv_heads, 1),

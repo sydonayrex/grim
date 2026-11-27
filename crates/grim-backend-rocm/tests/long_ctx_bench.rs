@@ -1119,3 +1119,87 @@ fn test_wmma_w4a8_q4k_q81_pingpong_spike() {
     let tops = (2.0 * (bm as f64) * (bn as f64) * (bk as f64)) / (ms * 1e-3) / 1e12;
     eprintln!("[W4A8-Q4K-pingpong perf {bm}x{bn}x{bk}] {ms:.3} ms ({tops:.2} TOP/s)");
 }
+
+/// Task 1b gate: the incremental 1-2-block minmax refresh must produce metadata
+/// BITWISE identical to a full rebuild over the same valid row range (untouched
+/// blocks retain adoption values; touched blocks recompute from the same arena
+/// bytes). Run: GRIM_GPU_TEST=1 cargo test --release -p grim-backend-rocm
+///   --test long_ctx_bench k8v4_minmax_incremental_matches_rebuild -- --ignored
+#[test]
+#[ignore]
+fn k8v4_minmax_incremental_matches_rebuild() {
+    use grim_backend_rocm::kernels::qkv_attention::{
+        build_minmax_f16_bc32_into, update_minmax_f16_bc32_rows,
+    };
+    let dev = RocmDevice::shared(0);
+    let nkv = 4usize;
+    let n_blocks0 = 10usize; // adoption builds rows [0, 320) -> blocks 0..9
+    let appends = 5usize;    // 5 decode steps of 32 rows each -> blocks 10..14
+    let total0 = n_blocks0 * 32;
+    let total1 = total0 + appends * 32;
+    let max_blocks = total1.div_ceil(32);
+
+    // Deterministic Q8_1 K arena bytes (row stride nkv*288).
+    let mut arena = vec![0u8; total1 * nkv * 288];
+    let mut s = 0x9e37_79b9u32;
+    for b in arena.iter_mut() {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (s >> 16) as u8;
+    }
+    // from_cpu is f32-only: pack the raw Q8_1 bytes 4-per-f32 (the kernel
+    // reads the allocation bytewise, so the payload is byte-identical).
+    assert_eq!(arena.len() % 4, 0);
+    let arena_f32: Vec<f32> = arena
+        .chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect();
+    let k_arena = dev
+        .from_cpu(&arena_f32, &Shape::new(vec![arena_f32.len()]), DType::F32)
+        .expect("arena");
+    // Metadata buffers are F32-typed; the kernels write raw bytes (dtype opaque).
+    let meta_elems = (max_blocks * nkv * 256).div_ceil(4);
+    let scale_elems = (max_blocks * nkv * 2).div_ceil(4);
+    let mk_meta = |n: usize| dev.zeros(&Shape::new(vec![n]), DType::F32).expect("meta");
+    let (kmin_inc, kmax_inc, kscale_inc) = (mk_meta(meta_elems), mk_meta(meta_elems), mk_meta(scale_elems));
+
+    // Adoption-time full build over rows [0, total0).
+    build_minmax_f16_bc32_into(&dev, k_arena.as_ref(), kmin_inc.as_ref(), kmax_inc.as_ref(), kscale_inc.as_ref(), nkv as u32, total0 as u32)
+        .expect("build");
+
+    // Incremental refresh: one 32-row step per iteration (matches decode usage;
+    // each step touches exactly 1 block here).
+    for i in 0..appends {
+        let total = total0 + 32 * i;
+        let tot_dev = dev
+            .from_cpu(&[f32::from_bits(total as u32)], &Shape::new(vec![1]), DType::F32)
+            .expect("tot");
+        update_minmax_f16_bc32_rows(&dev, k_arena.as_ref(), kmin_inc.as_ref(), kmax_inc.as_ref(), kscale_inc.as_ref(), nkv as u32, tot_dev.as_ref(), 32)
+            .expect("update");
+    }
+
+    // Full rebuild over rows [0, total1) into fresh buffers.
+    let (kmin_ref, kmax_ref, kscale_ref) = (mk_meta(meta_elems), mk_meta(meta_elems), mk_meta(scale_elems));
+    build_minmax_f16_bc32_into(&dev, k_arena.as_ref(), kmin_ref.as_ref(), kmax_ref.as_ref(), kscale_ref.as_ref(), nkv as u32, total1 as u32)
+        .expect("rebuild");
+
+    let a_min = kmin_inc.to_cpu_vec_f32().expect("rmin");
+    let b_min = kmin_ref.to_cpu_vec_f32().expect("rmin2");
+    let a_max = kmax_inc.to_cpu_vec_f32().expect("rmax");
+    let b_max = kmax_ref.to_cpu_vec_f32().expect("rmax2");
+    let a_sc = kscale_inc.to_cpu_vec_f32().expect("rsc");
+    let b_sc = kscale_ref.to_cpu_vec_f32().expect("rsc2");
+    assert_eq!(a_min.len(), b_min.len(), "min len");
+    let diffs: Vec<usize> = (0..a_min.len())
+        .filter(|&i| a_min[i].to_bits() != b_min[i].to_bits())
+        .collect();
+    assert!(diffs.is_empty(), "k_min_i8 mismatch at f32 slots {diffs:?}");
+    let diffs: Vec<usize> = (0..a_max.len())
+        .filter(|&i| a_max[i].to_bits() != b_max[i].to_bits())
+        .collect();
+    assert!(diffs.is_empty(), "k_max_i8 mismatch at f32 slots {diffs:?}");
+    let diffs: Vec<usize> = (0..a_sc.len())
+        .filter(|&i| a_sc[i].to_bits() != b_sc[i].to_bits())
+        .collect();
+    assert!(diffs.is_empty(), "k_scale_f16 mismatch at f32 slots {diffs:?}");
+    eprintln!("[k8v4-minmax] incremental == rebuild bitwise (blocks 0..{max_blocks}, {appends} refreshed steps) PASS");
+}
