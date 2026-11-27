@@ -2293,62 +2293,32 @@ impl RocmDevice {
                             arg(&mut nb_i),
                         ],
                     )?;
-                    self.synchronize();
-                    let scores_host = scores_dev.to_cpu_vec_f32()?;
-                    let mut blk_ids = vec![-1i32; n_q_tiles * num_kv_heads * k_keep];
-                    for qt in 0..n_q_tiles {
-                        let abs_end = (cache_offset as usize + qt * 16 + 16).min(kv_seq_len);
-                        let max_b = abs_end.div_ceil(32).min(n_blocks);
-                        let local_start = max_b.saturating_sub(16); // 512 local tokens
-                        for kvh in 0..num_kv_heads {
-                            let base_sc = (qt * num_kv_heads + kvh) * n_blocks;
-                            let base_out = (qt * num_kv_heads + kvh) * k_keep;
-                            if max_b <= k_keep {
-                                for b in 0..max_b {
-                                    blk_ids[base_out + b] = b as i32;
-                                }
-                            } else {
-                                let mut cands: Vec<(f32, i32)> = Vec::with_capacity(max_b);
-                                for b in 0..max_b {
-                                    let s = if b == 0 || b >= local_start {
-                                        f32::INFINITY
-                                    } else {
-                                        scores_host[base_sc + b]
-                                    };
-                                    cands.push((s, b as i32));
-                                }
-                                let nth = max_b - k_keep;
-                                cands.select_nth_unstable_by(nth, |a, b| {
-                                    a.0.total_cmp(&b.0)
-                                });
-                                let mut picked: Vec<i32> =
-                                    cands[nth..].iter().map(|x| x.1).collect();
-                                picked.sort_unstable();
-                                for (i, &bid) in picked.iter().enumerate() {
-                                    blk_ids[base_out + i] = bid;
-                                }
-                            }
-                        }
-                    }
-                    let blk_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            blk_ids.as_ptr() as *const u8,
-                            blk_ids.len() * std::mem::size_of::<i32>(),
-                        )
-                    };
-                    let blk_dev = RocmStorage::copy_from_host_raw_bytes(
-                        blk_bytes,
-                        &Shape::new(vec![blk_bytes.len()]),
+                    let blk_dev = RocmStorage::alloc_gpu(
+                        &Shape::new(vec![n_q_tiles * num_kv_heads * k_keep * 4]),
                         grim_tensor::DType::U8,
                         &self.allocator,
                         self.ordinal,
                     )?;
                     let mut bp_arg = blk_dev.device_ptr.unwrap();
+                    let mut off_i = cache_offset as i32;
+                    let mut kk_i = k_keep as i32;
+                    self.launch_compute_kernel(
+                        "grim_q81_topk_blocks_bc32",
+                        crate::HipDim3::new(n_q_tiles as u32, num_kv_heads as u32, 1),
+                        crate::HipDim3::new(256, 1, 1),
+                        &mut [
+                            arg(&mut sc_p),
+                            arg(&mut bp_arg),
+                            arg(&mut nkv_i),
+                            arg(&mut nb_i),
+                            arg(&mut kv_i),
+                            arg(&mut off_i),
+                            arg(&mut kk_i),
+                        ],
+                    )?;
                     let mut vp_arg = vptr;
                     let mut op_arg = optr;
-                    let mut off_i = cache_offset as i32;
                     let mut inv_f = isd;
-                    let mut kk_i = k_keep as i32;
                     let stream = self.launch_compute_kernel(
                         "grim_qkv_attention_wmma_q81_v2_sparse",
                         crate::HipDim3::new(n_q_tiles as u32, num_kv_heads as u32, 1),

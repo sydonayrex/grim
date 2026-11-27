@@ -7837,6 +7837,125 @@ extern "C" __global__ void grim_q81_score_qtile_minmax_bc32(
     }
 }
 
+// 100% device-resident top-k block selector (zero host sync / D2H / H2D).
+// Grid: (n_q_tiles, num_kv_heads, 1), Block: (256, 1, 1).
+// Pins sink block 0 and local window [max_b - 16 .. max_b), then uses 16-step
+// parallel binary search on threshold over [1 .. local_start) to emit k_keep IDs.
+extern "C" __global__ void grim_q81_topk_blocks_bc32(
+    const float* __restrict__ scores, // [n_q_tiles, num_kv_heads, n_blocks]
+    int* __restrict__ block_ids,      // [n_q_tiles, num_kv_heads, k_keep]
+    int num_kv_heads, int n_blocks, int kv_seq_len, int cache_offset, int k_keep
+) {
+    const int qt = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x; // 0..255
+    const int abs_end = (cache_offset + qt * 16 + 16 < kv_seq_len)
+        ? (cache_offset + qt * 16 + 16) : kv_seq_len;
+    int max_b = (abs_end + 31) >> 5;
+    if (max_b > n_blocks) max_b = n_blocks;
+
+    const float* sc = scores + ((long long)qt * num_kv_heads + kvh) * n_blocks;
+    int* out = block_ids + ((long long)qt * num_kv_heads + kvh) * k_keep;
+
+    if (max_b <= k_keep) {
+        for (int i = tid; i < k_keep; i += 256) {
+            out[i] = (i < max_b) ? i : -1;
+        }
+        return;
+    }
+
+    const int local_start = (max_b > 17) ? (max_b - 16) : 1;
+    const int n_pinned = 1 + (max_b - local_start);
+    const int need_mid = (k_keep > n_pinned) ? (k_keep - n_pinned) : 0;
+
+    __shared__ float s_min[256];
+    __shared__ float s_max[256];
+    __shared__ int   s_cnt[256];
+    __shared__ int   s_emit;
+
+    float lmin = 1e30f;
+    float lmax = -1e30f;
+    for (int b = 1 + tid; b < local_start; b += 256) {
+        float v = sc[b];
+        lmin = fminf(lmin, v);
+        lmax = fmaxf(lmax, v);
+    }
+    s_min[tid] = lmin;
+    s_max[tid] = lmax;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + off]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + off]);
+        }
+        __syncthreads();
+    }
+    float lo = s_min[0];
+    float hi = s_max[0];
+
+    // 16-step parallel binary search for threshold where count(v > thresh) <= need_mid
+    for (int it = 0; it < 16; ++it) {
+        float mid = 0.5f * (lo + hi);
+        int c = 0;
+        for (int b = 1 + tid; b < local_start; b += 256) {
+            if (sc[b] > mid) ++c;
+        }
+        s_cnt[tid] = c;
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) s_cnt[tid] += s_cnt[tid + off];
+            __syncthreads();
+        }
+        if (s_cnt[0] > need_mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        __syncthreads();
+    }
+    const float thresh = hi;
+
+    if (tid == 0) {
+        out[0] = 0; // sink block 0
+        s_emit = 1;
+    }
+    __syncthreads();
+
+    // Emit local window blocks [local_start .. max_b)
+    for (int b = local_start + tid; b < max_b; b += 256) {
+        int pos = atomicAdd(&s_emit, 1);
+        if (pos < k_keep) out[pos] = b;
+    }
+    __syncthreads();
+
+    // Pass 1: emit strictly > thresh
+    for (int b = 1 + tid; b < local_start; b += 256) {
+        if (sc[b] > thresh) {
+            int pos = atomicAdd(&s_emit, 1);
+            if (pos < k_keep) out[pos] = b;
+        }
+    }
+    __syncthreads();
+
+    // Pass 2: fill any remaining slots with == thresh (or >= lo)
+    if (s_emit < k_keep) {
+        for (int b = 1 + tid; b < local_start; b += 256) {
+            float v = sc[b];
+            if (v <= thresh && v >= lo) {
+                int pos = atomicAdd(&s_emit, 1);
+                if (pos < k_keep) out[pos] = b;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Pad any unfilled tail with -1
+    int final_n = s_emit;
+    for (int i = final_n + tid; i < k_keep; i += 256) {
+        out[i] = -1;
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_wmma_q81_v2_sparse(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_arena,
