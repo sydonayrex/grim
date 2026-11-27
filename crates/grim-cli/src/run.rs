@@ -419,13 +419,14 @@ pub(crate) fn compute_auto_chunk_size_for_vram_after_kv(
 /// set, a 134k-token prefill dies silently at prefill start (rc=1, zero
 /// prefill chunks; isolated by A/B against the identical 6-var config, which
 /// completes). Manual-only until that defect is root-caused.
-pub(crate) const LONGCTX_PROFILE_VARS: [&str; 6] = [
+pub(crate) const LONGCTX_PROFILE_VARS: [&str; 7] = [
     "GRIM_KV_ARENA",
     "GRIM_SPLIT_LAYERS",
     "GRIM_SPARSE_PREFILL_PCT",
     "GRIM_SPARSE_DECODE_PCT",
     "GRIM_MTP",
     "GRIM_MTP_NEXTN_BACKFILL",
+    "GRIM_PREFILL_CHUNK_SIZE",
 ];
 
 /// Pure selector for the measured 262k long-context configuration. Fires only
@@ -466,7 +467,11 @@ pub(crate) fn auto_longctx_profile(
         // Nextn backfill is disabled at 262k for VRAM; costs ~0.4 tok/step of
         // MTP acceptance (1.45 vs 1.89 with backfill) but fits the cards.
         // GRIM_MTP_DRAFT_CHAIN is excluded: see the LONGCTX_PROFILE_VARS doc.
+        // chunk=512 is part of the proven manual 200k/262k operating point —
+        // at these sizes auto-chunk's residual estimate leaves rocm:1's slab
+        // exhausted mid-prefill at 2048 (783 KB hipMalloc(slab) failure).
         ("GRIM_MTP_NEXTN_BACKFILL", "0"),
+        ("GRIM_PREFILL_CHUNK_SIZE", "512"),
     ])
 }
 
@@ -491,7 +496,14 @@ fn planned_kv_arena_per_card_mb(prompt_len: usize) -> u64 {
         if grim_backend_rocm::device::capability_profiler::vram_info_detailed(ord).2 == 0 {
             break;
         }
-        n_devs += 1;
+        // The HIP driver exposes phantom gfx900 devices past the real GPUs;
+        // counting them divided the attention layers by 8 and under-estimated
+        // planned KV ~3x (691 MB vs the real ~1.9 GiB/card at 200k K8V4),
+        // which kept chunk_size too large and exhausted rocm:1's slab.
+        let arch = grim_backend_rocm::device::util::detect_gpu_arch(ord as i32);
+        if arch == "gfx1200" || arch == "gfx1201" {
+            n_devs += 1;
+        }
     }
     let n_devs = n_devs.max(1);
     let attn_layers_per_card = 16usize.div_ceil(n_devs);

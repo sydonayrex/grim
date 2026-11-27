@@ -12350,15 +12350,23 @@ pub fn launch_qkv_attention_dev_batch_k8v4(
         // MTP rollback may briefly include rejected draft rows in a block's
         // bound — that WIDENS it (Quest keeps extra blocks, never drops one)
         // and self-corrects on overwrite. See the kernel's doc comment.
-        dev.launch_compute_kernel(
-            "grim_q81_minmax_update_f16_bc32",
-            crate::HipDim3::new(2, num_kv_heads, 1),
-            crate::HipDim3::new(256, 1, 1),
-            &mut [
-                arg(&mut k_ptr), arg(&mut kmin_ptr), arg(&mut kmax_ptr), arg(&mut kscale_ptr),
-                arg(&mut nkv), arg(&mut tot_ptr), arg(&mut steps_i),
-            ],
-        )?;
+        // GRIM_K8V4_MINMAX_UPDATE=0 disables the refresh (A/B parity harness;
+        // adoption-time minmax + pinned tail only — the pre-1b behavior).
+        let minmax_update_on = !matches!(
+            std::env::var("GRIM_K8V4_MINMAX_UPDATE").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        if minmax_update_on {
+            dev.launch_compute_kernel(
+                "grim_q81_minmax_update_f16_bc32",
+                crate::HipDim3::new(2, num_kv_heads, 1),
+                crate::HipDim3::new(256, 1, 1),
+                &mut [
+                    arg(&mut k_ptr), arg(&mut kmin_ptr), arg(&mut kmax_ptr), arg(&mut kscale_ptr),
+                    arg(&mut nkv), arg(&mut tot_ptr), arg(&mut steps_i),
+                ],
+            )?;
+        }
         dev.launch_compute_kernel(
             "grim_q81_decode_quest_score_bc32",
             crate::HipDim3::new(max_blocks as u32, num_kv_heads, 1),
