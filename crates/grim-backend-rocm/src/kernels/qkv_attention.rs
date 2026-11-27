@@ -8343,7 +8343,9 @@ extern "C" __global__ void grim_kv_quantize_rows_q41(
 }
 
 // K8V4 GQA split-K decode attention (device-total, graph-capturable):
-// Q8_1 K (288 B/head = 18 uint4) + Q4_1 V (160 B/head = 10 uint4), 6:1 GQA shared in LDS.
+// Q8_1 K (288 B/head = 18 uint4) + Q4_1 V (160 B/head), 6:1 GQA shared in LDS.
+// Uses Q8_1 Q quantization + __builtin_amdgcn_sdot4 for Q*K and Lazy-V (skips V
+// global load + Q4_1 unpack whenever max_m(score[m] - rmax[m]) <= -12.0f).
 extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_arena,
@@ -8362,7 +8364,7 @@ extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
     constexpr int HD = 256;
     constexpr int K_HEAD_BYTES = 288; // (256 / 32) * 36
     constexpr int V_HEAD_BYTES = 160; // (256 / 32) * 20
-    constexpr int JT = 4;
+    constexpr int JT = 8;
     constexpr int MAX_Q_PER_WAVE = 3;
 
     const int split_id = blockIdx.x;
@@ -8370,6 +8372,8 @@ extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
+    const int blk = lane >> 2;        // 0..7 (8 blocks of 32)
+    const int sub = (lane & 3) * 8;   // 0, 8, 16, 24 (8 elems per lane)
 
     const int q_per_kv = num_heads / num_kv_heads;
     const int n_q = q_per_kv * seq_len;
@@ -8383,93 +8387,142 @@ extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
     const int j_start = split_id * base + (split_id < rem ? split_id : rem);
     const int j_end = j_start + base + (split_id < rem ? 1 : 0);
 
-    float qreg[MAX_Q_PER_WAVE][8];
+    int qpack0[MAX_Q_PER_WAVE];
+    int qpack1[MAX_Q_PER_WAVE];
+    float qd[MAX_Q_PER_WAVE];
     float acc[MAX_Q_PER_WAVE][8];
     float rmax[MAX_Q_PER_WAVE];
     float rsum[MAX_Q_PER_WAVE];
     int q_hi[MAX_Q_PER_WAVE];
+
     #pragma unroll
     for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
         const int qi = wave + m * 4;
         rmax[m] = -1e30f;
         rsum[m] = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) acc[m][e] = 0.0f;
         if (qi < n_q) {
             const int qr = qi / q_per_kv;
             const int h = kv_head * q_per_kv + (qi % q_per_kv);
             q_hi[m] = total - (seq_len - 1 - qr);
-            const float* q_row = q + ((long long)qr * num_heads + h) * HD;
+            const float* q_row = q + ((long long)qr * num_heads + h) * HD + blk * 32 + sub;
+            float qv[8];
+            float amax = 0.0f;
             #pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                qreg[m][c] = q_row[c * 32 + lane];
-                acc[m][c] = 0.0f;
+            for (int e = 0; e < 8; ++e) {
+                qv[e] = q_row[e];
+                amax = fmaxf(amax, fabsf(qv[e]));
             }
+            // Reduce amax across the 4 lanes owning this 32-element block.
+            amax = fmaxf(amax, __shfl_xor(amax, 1));
+            amax = fmaxf(amax, __shfl_xor(amax, 2));
+            const float d = (amax > 0.0f) ? (amax / 127.0f) : 0.0f;
+            const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            qd[m] = d;
+            unsigned int p0 = 0u, p1 = 0u;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                int q0 = __float2int_rn(qv[e] * inv_d);
+                q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
+                p0 |= ((unsigned int)(q0 & 0xFF)) << (e * 8);
+                int q1 = __float2int_rn(qv[e + 4] * inv_d);
+                q1 = q1 < -127 ? -127 : (q1 > 127 ? 127 : q1);
+                p1 |= ((unsigned int)(q1 & 0xFF)) << (e * 8);
+            }
+            qpack0[m] = (int)p0;
+            qpack1[m] = (int)p1;
         } else {
             q_hi[m] = -1;
-            #pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                qreg[m][c] = 0.0f;
-                acc[m][c] = 0.0f;
-            }
+            qpack0[m] = 0;
+            qpack1[m] = 0;
+            qd[m] = 0.0f;
         }
     }
 
     __shared__ alignas(16) unsigned char sK[JT][K_HEAD_BYTES];
-    __shared__ alignas(16) unsigned char sV[JT][V_HEAD_BYTES];
-    const int ld_kt = tid / 18;
-    const int ld_kb = (tid % 18) * 16;
-    const int ld_vt = tid / 10;
-    const int ld_vb = (tid % 10) * 16;
+    // JT=8 * 18 uint4 = 144 uint4 loads across 128 threads (pass 0: 0..127, pass 1: 128..143).
+    const int ld_kt0 = tid / 18;
+    const int ld_kb0 = (tid % 18) * 16;
+    const int tid1 = tid + 128;
+    const int ld_kt1 = tid1 / 18;
+    const int ld_kb1 = (tid1 % 18) * 16;
 
     for (int j0 = j_start; j0 < j_end; j0 += JT) {
-        if (tid < 72) {
-            const int j = j0 + ld_kt;
+        {
+            const int j = j0 + ld_kt0;
             if (j < j_end) {
-                const long long off = (long long)j * k_row_bytes + (long long)kv_head * K_HEAD_BYTES + ld_kb;
-                *reinterpret_cast<uint4*>(&sK[ld_kt][ld_kb]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
+                const long long off = (long long)j * k_row_bytes + (long long)kv_head * K_HEAD_BYTES + ld_kb0;
+                *reinterpret_cast<uint4*>(&sK[ld_kt0][ld_kb0]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
             }
         }
-        if (tid < 40) {
-            const int j = j0 + ld_vt;
+        if (tid < 16) {
+            const int j = j0 + ld_kt1;
             if (j < j_end) {
-                const long long off = (long long)j * v_row_bytes + (long long)kv_head * V_HEAD_BYTES + ld_vb;
-                *reinterpret_cast<uint4*>(&sV[ld_vt][ld_vb]) = *reinterpret_cast<const uint4*>(&v_arena[off]);
+                const long long off = (long long)j * k_row_bytes + (long long)kv_head * K_HEAD_BYTES + ld_kb1;
+                *reinterpret_cast<uint4*>(&sK[ld_kt1][ld_kb1]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
             }
         }
         __syncthreads();
 
         const int jt_cnt = (j0 + JT <= j_end) ? JT : (j_end - j0);
         for (int t = 0; t < jt_cnt; ++t) {
-            float kv_k[8], kv_v[8];
-            #pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                const unsigned char* kb = &sK[t][c * 36];
-                const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
-                kv_k[c] = dk * (float)(reinterpret_cast<const signed char*>(kb + 4)[lane]);
-
-                const unsigned char* vb = &sV[t][c * 20];
-                const float dv = __half2float(*reinterpret_cast<const __half*>(vb));
-                const float mv = __half2float(*reinterpret_cast<const __half*>(vb + 2));
-                const unsigned char vp = vb[4 + (lane & 15)];
-                const int nib = (lane < 16) ? (vp & 0x0F) : ((vp >> 4) & 0x0F);
-                kv_v[c] = dv * (float)nib + mv;
-            }
             const int cur_j = j0 + t;
+            const unsigned char* kb = &sK[t][blk * 36];
+            const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
+            const int k0 = *reinterpret_cast<const int*>(kb + 4 + sub);
+            const int k1 = *reinterpret_cast<const int*>(kb + 8 + sub);
+
+            float scores[MAX_Q_PER_WAVE];
+            bool wave_need_v = false;
             #pragma unroll
             for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
-                if (cur_j >= q_hi[m]) continue;
-                float score = 0.0f;
+                if (cur_j >= q_hi[m]) {
+                    scores[m] = -1e30f;
+                    continue;
+                }
+                int idot = __builtin_amdgcn_sudot4(true, qpack0[m], true, k0, 0, false);
+                idot = __builtin_amdgcn_sudot4(true, qpack1[m], true, k1, idot, false);
+                float partial = (float)idot * (qd[m] * dk);
                 #pragma unroll
-                for (int c = 0; c < 8; ++c) score += qreg[m][c] * kv_k[c];
+                for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor(partial, off);
+                const float sc = partial * inv_sqrt_d;
+                scores[m] = sc;
+                if (sc - rmax[m] > -12.0f) wave_need_v = true;
+            }
+
+            if (wave_need_v) {
+                const unsigned char* vb = v_arena + (long long)cur_j * v_row_bytes
+                                        + (long long)kv_head * V_HEAD_BYTES + blk * 20;
+                const float dv = __half2float(*reinterpret_cast<const __half*>(vb));
+                const float mv = __half2float(*reinterpret_cast<const __half*>(vb + 2));
+                const int byte_off = sub & 15;
+                const int sh = (sub >= 16) ? 4 : 0;
+                const unsigned int w0 = *reinterpret_cast<const unsigned int*>(vb + 4 + byte_off);
+                const unsigned int w1 = *reinterpret_cast<const unsigned int*>(vb + 8 + byte_off);
+                float vv[8];
+                vv[0] = dv * (float)((w0 >> (0 + sh)) & 0xFu) + mv;
+                vv[1] = dv * (float)((w0 >> (8 + sh)) & 0xFu) + mv;
+                vv[2] = dv * (float)((w0 >> (16 + sh)) & 0xFu) + mv;
+                vv[3] = dv * (float)((w0 >> (24 + sh)) & 0xFu) + mv;
+                vv[4] = dv * (float)((w1 >> (0 + sh)) & 0xFu) + mv;
+                vv[5] = dv * (float)((w1 >> (8 + sh)) & 0xFu) + mv;
+                vv[6] = dv * (float)((w1 >> (16 + sh)) & 0xFu) + mv;
+                vv[7] = dv * (float)((w1 >> (24 + sh)) & 0xFu) + mv;
+
                 #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) score += __shfl_xor(score, off);
-                score *= inv_sqrt_d;
-                const float m_new = fmaxf(rmax[m], score);
-                const float sa = expf(rmax[m] - m_new);
-                const float sb = expf(score - m_new);
-                rmax[m] = m_new;
-                rsum[m] = rsum[m] * sa + sb;
-                #pragma unroll
-                for (int c = 0; c < 8; ++c) acc[m][c] = acc[m][c] * sa + sb * kv_v[c];
+                for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+                    if (cur_j >= q_hi[m]) continue;
+                    const float sc = scores[m];
+                    if (sc - rmax[m] <= -12.0f) continue;
+                    const float m_new = fmaxf(rmax[m], sc);
+                    const float sa = expf(rmax[m] - m_new);
+                    const float sb = expf(sc - m_new);
+                    rmax[m] = m_new;
+                    rsum[m] = rsum[m] * sa + sb;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[m][e] = acc[m][e] * sa + sb * vv[e];
+                }
             }
         }
         __syncthreads();
@@ -8483,9 +8536,9 @@ extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
         const int h = kv_head * q_per_kv + (qi % q_per_kv);
         const int g_h = qr * num_heads + h;
         const int slot_idx = split_id * total_h + g_h;
-        float* po = partial_out + (long long)slot_idx * HD;
+        float* po = partial_out + (long long)slot_idx * HD + blk * 32 + sub;
         #pragma unroll
-        for (int c = 0; c < 8; ++c) po[c * 32 + lane] = acc[m][c];
+        for (int e = 0; e < 8; ++e) po[e] = acc[m][e];
         if (lane == 0) {
             partial_max[slot_idx] = rmax[m];
             partial_sum[slot_idx] = rsum[m];
