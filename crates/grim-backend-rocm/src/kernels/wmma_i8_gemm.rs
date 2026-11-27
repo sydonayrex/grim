@@ -397,31 +397,29 @@ extern "C" __global__ __launch_bounds__(256) void grim_wmma_w4a8_q4k_q81_pingpon
                 f_acc[mt][nt][e] = 0.0f;
 
     auto load_tile = [&](int kb, int buf) {
-        // 1. Load 128 rows of Q8_1 (256 threads -> 2 threads per row, 16 bytes each)
+        // 1. Load 128 rows of Q8_1 (256 threads -> 2 threads/row, 16 bytes via 4x u32 + uint4 LDS store)
         const int a_row = tid >> 1;
         const int a_half = tid & 1;
         const int gm = cta_m + a_row;
         if (gm < M) {
             const unsigned char* ap = A_q81 + (long long)gm * a_row_bytes + (long long)kb * 36;
             if (a_half == 0) {
-                sDa[buf][a_row] = __half2float(*reinterpret_cast<const __half*>(ap));
-                sSa[buf][a_row] = __half2float(*reinterpret_cast<const __half*>(ap + 2));
+                const unsigned int ds = *reinterpret_cast<const unsigned int*>(ap);
+                sDa[buf][a_row] = __half2float(*reinterpret_cast<const __half*>(&ds));
+                sSa[buf][a_row] = __half2float(*(reinterpret_cast<const __half*>(&ds) + 1));
             }
-            const unsigned char* qs = ap + 4 + a_half * 16;
-            #pragma unroll
-            for (int b = 0; b < 16; ++b) {
-                sA[buf][a_row][a_half * 16 + b] = (signed char)qs[b];
-            }
+            const unsigned int* qsp = reinterpret_cast<const unsigned int*>(ap + 4 + a_half * 16);
+            uint4 qv = make_uint4(qsp[0], qsp[1], qsp[2], qsp[3]);
+            *reinterpret_cast<uint4*>(&sA[buf][a_row][a_half * 16]) = qv;
         } else {
             if (a_half == 0) {
                 sDa[buf][a_row] = 0.0f;
                 sSa[buf][a_row] = 0.0f;
             }
-            #pragma unroll
-            for (int b = 0; b < 16; ++b) sA[buf][a_row][a_half * 16 + b] = 0;
+            *reinterpret_cast<uint4*>(&sA[buf][a_row][a_half * 16]) = make_uint4(0u, 0u, 0u, 0u);
         }
 
-        // 2. Load & unpack 64 rows of Q4_K sub-block `sb = kb & 7` (256 threads -> 4 threads/row, 8 elems each)
+        // 2. Load & unpack 64 rows of Q4_K sub-block `sb = kb & 7` (256 threads -> 4 threads/row, uint2 load + SWAR nibble unpack)
         const int b_row = tid >> 2;
         const int b_qtr = tid & 3; // 0..3 -> 8 elements each
         const int gn = cta_n + b_row;
@@ -432,26 +430,24 @@ extern "C" __global__ __launch_bounds__(256) void grim_wmma_w4a8_q4k_q81_pingpon
         if (gn < N) {
             const unsigned char* bp = B_q4k + (long long)gn * b_row_bytes + (long long)super_idx * 144;
             if (b_qtr == 0) {
-                const float d = __half2float(*reinterpret_cast<const __half*>(bp));
-                const float dmin = __half2float(*reinterpret_cast<const __half*>(bp + 2));
+                const unsigned int dd = *reinterpret_cast<const unsigned int*>(bp);
+                const float d = __half2float(*reinterpret_cast<const __half*>(&dd));
+                const float dmin = __half2float(*(reinterpret_cast<const __half*>(&dd) + 1));
                 unsigned char sc_u, m_u;
                 q4k_get_scale_min(sb, bp + 4, sc_u, m_u);
                 sDb[buf][b_row] = d * (float)sc_u;
                 sMb[buf][b_row] = dmin * (float)m_u;
             }
-            const unsigned char* qs = bp + 16 + grp * 32 + b_qtr * 8;
-            #pragma unroll
-            for (int b = 0; b < 8; ++b) {
-                unsigned char byte = qs[b];
-                sB[buf][b_row][b_qtr * 8 + b] = is_hi ? (byte >> 4) : (byte & 0x0Fu);
-            }
+            const uint2 packed = *reinterpret_cast<const uint2*>(bp + 16 + grp * 32 + b_qtr * 8);
+            const unsigned int u0 = is_hi ? ((packed.x >> 4) & 0x0F0F0F0Fu) : (packed.x & 0x0F0F0F0Fu);
+            const unsigned int u1 = is_hi ? ((packed.y >> 4) & 0x0F0F0F0Fu) : (packed.y & 0x0F0F0F0Fu);
+            *reinterpret_cast<uint2*>(&sB[buf][b_row][b_qtr * 8]) = make_uint2(u0, u1);
         } else {
             if (b_qtr == 0) {
                 sDb[buf][b_row] = 0.0f;
                 sMb[buf][b_row] = 0.0f;
             }
-            #pragma unroll
-            for (int b = 0; b < 8; ++b) sB[buf][b_row][b_qtr * 8 + b] = 0u;
+            *reinterpret_cast<uint2*>(&sB[buf][b_row][b_qtr * 8]) = make_uint2(0u, 0u);
         }
     };
 
@@ -464,7 +460,12 @@ extern "C" __global__ __launch_bounds__(256) void grim_wmma_w4a8_q4k_q81_pingpon
         const int cur = kb & 1;
         const int nxt = cur ^ 1;
 
-        // Compute current tile while prefetching next tile into ping-pong buffer
+        // Prefetch next tile into ping-pong buffer BEFORE WMMA so global loads overlap compute
+        if (kb + 1 < n_blocks) {
+            load_tile(kb + 1, nxt);
+        }
+
+        // Compute current tile from sA[cur] / sB[cur]
         #pragma unroll
         for (int mt = 0; mt < 2; ++mt) {
             const int m_off = wm + mt * 16 + lane_r;
@@ -472,6 +473,14 @@ extern "C" __global__ __launch_bounds__(256) void grim_wmma_w4a8_q4k_q81_pingpon
             const int* a1_p = reinterpret_cast<const int*>(&sA[cur][m_off][16 + lane_h * 8]);
             grim_v2i a0 = {a0_p[0], a0_p[1]};
             grim_v2i a1 = {a1_p[0], a1_p[1]};
+
+            float da_r[8], sa_r[8];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int local_r = wm + mt * 16 + lane_h * 8 + e;
+                da_r[e] = sDa[cur][local_r];
+                sa_r[e] = sSa[cur][local_r];
+            }
 
             #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
@@ -486,19 +495,15 @@ extern "C" __global__ __launch_bounds__(256) void grim_wmma_w4a8_q4k_q81_pingpon
                 i_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, false, b0, i_acc, false);
                 i_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, false, b1, i_acc, false);
 
-                const float db = sDb[cur][wn + nt * 16 + lane_r];
-                const float mb = sMb[cur][wn + nt * 16 + lane_r];
+                const float db = sDb[cur][n_off];
+                const float mb = sMb[cur][n_off];
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    const int local_r = wm + mt * 16 + lane_h * 8 + e;
-                    f_acc[mt][nt][e] += (float)i_acc[e] * (sDa[cur][local_r] * db) - sSa[cur][local_r] * mb;
+                    f_acc[mt][nt][e] += (float)i_acc[e] * (da_r[e] * db) - sa_r[e] * mb;
                 }
             }
         }
 
-        if (kb + 1 < n_blocks) {
-            load_tile(kb + 1, nxt);
-        }
         __syncthreads();
     }
 
