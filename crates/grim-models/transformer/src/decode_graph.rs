@@ -116,6 +116,18 @@ pub trait DecodeGraphModel: Send + Sync {
     ) {
     }
 
+    /// Lossless fallback: if graph capture/seeding fails after zero-copy KV adoption,
+    /// restore row 0 and move the adopted KV arenas back into `session` so eager
+    /// decode continues with intact prompt KV.
+    fn return_adopted_kv_to_session(
+        &self,
+        _g: DecodeGraph,
+        _session: &mut dyn grim_core::session::SessionT,
+        _adopted_mask: &[bool],
+        _saved_row0: &[(usize, Vec<u8>, Vec<u8>)],
+    ) {
+    }
+
     /// Populate the decode-only u4-lane weight memo for every K-quant linear
     /// in the model.
     ///
@@ -6615,6 +6627,41 @@ impl Qwen35 {
         }
     }
 
+    /// Lossless fallback: restore row 0 and move adopted KV arenas back into `session`.
+    fn return_adopted_kv_to_session_impl(
+        &self,
+        mut g: DecodeGraph,
+        session: &mut dyn grim_core::session::SessionT,
+        adopted_mask: &[bool],
+        saved_row0: &[(usize, Vec<u8>, Vec<u8>)],
+    ) {
+        Self::restore_adopted_row0(&g, saved_row0);
+        let Some(caches) = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<crate::qwen35::Qwen35LayerCache>>())
+        else {
+            return;
+        };
+        let fmt = crate::qwen35::kv_arena_format_qwen(&self.device);
+        let head_ext = crate::qwen35::kv_arena_head_extent(fmt, self.cfg.head_dim);
+        let k_arenas = std::mem::take(&mut g.buffers.k_arena);
+        let v_arenas = std::mem::take(&mut g.buffers.v_arena);
+        for (l, (mut k_a, mut v_a)) in k_arenas.into_iter().zip(v_arenas.into_iter()).enumerate() {
+            if !adopted_mask.get(l).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(c) = caches.get_mut(l) {
+                let rows = k_a.shape().dims().first().copied().unwrap_or(0);
+                let eager_shape =
+                    grim_tensor::Shape::new(vec![rows, self.cfg.num_kv_heads, head_ext]);
+                k_a.set_shape(eager_shape.clone());
+                v_a.set_shape(eager_shape);
+                c.k_device = Some(Box::new(k_a));
+                c.v_device = Some(Box::new(v_a));
+            }
+        }
+    }
+
     /// Publish row `row` (`0 <= row < batch`) of `g.buffers.head_input` (post-output_norm hidden
     /// state) into `_session.set_last_hidden_state(...)` so `predict_multi_after_forward` drafts
     /// from the exact accepted position without a redundant trunk replay.
@@ -6959,26 +7006,17 @@ impl Qwen35 {
                 if ok && end_ok {
                     if any_adopted {
                         Self::restore_adopted_row0(&g, &saved_row0);
+                        g.buffers.current_pos = pos;
                         eprintln!(
                             "[decode-graph] zero-copy adopted {:.1} MiB of eager Q8_1 KV arenas (1.0x peak)",
                             adopted_bytes as f64 / (1024.0 * 1024.0)
                         );
-                    }
-                    // Seed non-adopted KV layers (if any), plus conv and KDA state.
-                    let srcs: Vec<_> = self
-                        .eager_kv_seed_sources(_session, pos)?
-                        .into_iter()
-                        .enumerate()
-                        .map(|(l, s)| {
-                            if adopted_mask.get(l).copied().unwrap_or(false) {
-                                None
-                            } else {
-                                s
-                            }
-                        })
-                        .collect();
-                    if srcs.iter().any(|s| s.is_some()) {
-                        g.buffers.seed_kv_arena_from_eager(&dev, &srcs)?;
+                    } else {
+                        // Seed KV from eager session when not zero-copy adopted.
+                        let srcs = self.eager_kv_seed_sources(_session, pos)?;
+                        if srcs.iter().any(|s| s.is_some()) {
+                            g.buffers.seed_kv_arena_from_eager(&dev, &srcs)?;
+                        }
                     }
                     let conv_dev = self.eager_conv_device_seed_sources(_session)?;
                     if conv_dev.iter().any(|s| s.is_some()) {
@@ -7000,13 +7038,13 @@ impl Qwen35 {
                 } else {
                     let _ = g.abort_capture();
                     if any_adopted {
-                        Self::restore_adopted_row0(&g, &saved_row0);
+                        self.return_adopted_kv_to_session_impl(g, _session, &adopted_mask, &saved_row0);
                     }
                     return Ok(None);
                 }
             } else {
                 if any_adopted {
-                    Self::restore_adopted_row0(&g, &saved_row0);
+                    self.return_adopted_kv_to_session_impl(g, _session, &adopted_mask, &saved_row0);
                 }
                 return Ok(None);
             }
@@ -7918,6 +7956,16 @@ impl DecodeGraphModel for Qwen35 {
         if !saved.is_empty() {
             g.buffers.current_pos = valid_rows;
         }
+    }
+
+    fn return_adopted_kv_to_session(
+        &self,
+        g: DecodeGraph,
+        session: &mut dyn grim_core::session::SessionT,
+        adopted_mask: &[bool],
+        saved_row0: &[(usize, Vec<u8>, Vec<u8>)],
+    ) {
+        self.return_adopted_kv_to_session_impl(g, session, adopted_mask, saved_row0);
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {

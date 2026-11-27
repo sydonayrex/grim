@@ -731,6 +731,11 @@ fn try_graph_decode_step(
                         "[grim] decode-graph: KV seed failed at step {step} ({e}); eager fallback (retry {})",
                         graph_retry.failures()
                     );
+                    if any_adopted {
+                        if let Some(sess) = session.as_deref_mut() {
+                            graph_model.return_adopted_kv_to_session(g, sess, &adopted_mask, &saved_row0);
+                        }
+                    }
                     return None;
                 }
 
@@ -746,6 +751,11 @@ fn try_graph_decode_step(
                         "[grim] decode-graph: begin_capture failed at step {step} ({e}); eager fallback (retry {})",
                         graph_retry.failures()
                     );
+                    if any_adopted {
+                        if let Some(sess) = session.as_deref_mut() {
+                            graph_model.return_adopted_kv_to_session(g, sess, &adopted_mask, &saved_row0);
+                        }
+                    }
                     return None;
                 }
                 let bt = std::time::Instant::now();
@@ -773,6 +783,11 @@ fn try_graph_decode_step(
                             .unwrap_or_else(|| "ok".into()),
                         graph_retry.failures()
                     );
+                    if any_adopted {
+                        if let Some(sess) = session.as_deref_mut() {
+                            graph_model.return_adopted_kv_to_session(g, sess, &adopted_mask, &saved_row0);
+                        }
+                    }
                     return None;
                 }
                 *graph = Some(g);
