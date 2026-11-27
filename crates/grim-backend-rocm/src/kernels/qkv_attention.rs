@@ -7845,8 +7845,16 @@ extern "C" __global__ void grim_q81_score_qtile_minmax_bc32(
 
 // 100% device-resident top-k block selector (zero host sync / D2H / H2D).
 // Grid: (n_q_tiles, num_kv_heads, 1), Block: (256, 1, 1).
-// Pins sink block 0 and local window [max_b - 16 .. max_b), then uses 16-step
-// parallel binary search on threshold over [1 .. local_start) to emit k_keep IDs.
+// Pins sink block 0 and a 64-block (2048-token) recent tail, clamped to the
+// k_keep budget most-recent-first, then uses 16-step parallel binary search on
+// threshold over [1 .. tail_emit_start) to fill the remaining budget.
+// Boundary halo: every threshold-selected block b also emits its successor
+// b+1 when sc[b+1] <= thresh (b+1 straddles the selected-region boundary and
+// would otherwise be dropped — the needle-tail clipping failure mode); the
+// == thresh fill pass skips b when sc[b-1] > thresh because b is already that
+// block's halo. Halos are emitted lazily and every write is capped by
+// pos < k_keep, so emissions can never exceed the cap_keep-sized block_ids
+// pool (see attention_ops.rs) — a halo under budget pressure is skipped.
 extern "C" __global__ void grim_q81_topk_blocks_bc32(
     const float* __restrict__ scores, // [n_q_tiles, num_kv_heads, n_blocks]
     int* __restrict__ block_ids,      // [n_q_tiles, num_kv_heads, k_keep]
@@ -7870,9 +7878,19 @@ extern "C" __global__ void grim_q81_topk_blocks_bc32(
         return;
     }
 
-    const int local_start = (max_b > 17) ? (max_b - 16) : 1;
-    const int n_pinned = 1 + (max_b - local_start);
-    const int need_mid = (k_keep > n_pinned) ? (k_keep - n_pinned) : 0;
+    const int tail_start = (max_b - 64 > 1) ? (max_b - 64) : 1;
+    // Clamp the pinned tail to the budget, keeping the MOST RECENT blocks
+    // (dropping the newest tail blocks would be the worst possible loss).
+    const int tail_emit_start = (max_b - tail_start > k_keep - 1)
+        ? (max_b - (k_keep - 1)) : tail_start;
+    const int n_pinned = 1 + (max_b - tail_emit_start);
+    // Boundary halos are emitted LAZILY: they only take leftover budget slots
+    // (each write is capped by pos < k_keep), so the full mid budget stays
+    // available for scored selection — scored blocks are never sacrificed for
+    // halos. Overflow-safe invariant: the block_ids pool is cap_keep-sized and
+    // every atomicAdd write is guarded by pos < k_keep; a halo whose slot is
+    // exhausted is simply skipped (graceful degradation to the dense tail).
+    const int need_sel = (k_keep > n_pinned) ? (k_keep - n_pinned) : 0;
 
     __shared__ float s_min[256];
     __shared__ float s_max[256];
@@ -7881,7 +7899,7 @@ extern "C" __global__ void grim_q81_topk_blocks_bc32(
 
     float lmin = 1e30f;
     float lmax = -1e30f;
-    for (int b = 1 + tid; b < local_start; b += 256) {
+    for (int b = 1 + tid; b < tail_emit_start; b += 256) {
         float v = sc[b];
         lmin = fminf(lmin, v);
         lmax = fmaxf(lmax, v);
@@ -7899,11 +7917,11 @@ extern "C" __global__ void grim_q81_topk_blocks_bc32(
     float lo = s_min[0];
     float hi = s_max[0];
 
-    // 16-step parallel binary search for threshold where count(v > thresh) <= need_mid
+    // 16-step parallel binary search for threshold where count(v > thresh) <= need_sel
     for (int it = 0; it < 16; ++it) {
         float mid = 0.5f * (lo + hi);
         int c = 0;
-        for (int b = 1 + tid; b < local_start; b += 256) {
+        for (int b = 1 + tid; b < tail_emit_start; b += 256) {
             if (sc[b] > mid) ++c;
         }
         s_cnt[tid] = c;
@@ -7912,7 +7930,7 @@ extern "C" __global__ void grim_q81_topk_blocks_bc32(
             if (tid < off) s_cnt[tid] += s_cnt[tid + off];
             __syncthreads();
         }
-        if (s_cnt[0] > need_mid) {
+        if (s_cnt[0] > need_sel) {
             lo = mid;
         } else {
             hi = mid;
@@ -7927,27 +7945,35 @@ extern "C" __global__ void grim_q81_topk_blocks_bc32(
     }
     __syncthreads();
 
-    // Emit local window blocks [local_start .. max_b)
-    for (int b = local_start + tid; b < max_b; b += 256) {
+    // Emit pinned recent tail [tail_emit_start .. max_b)
+    for (int b = tail_emit_start + tid; b < max_b; b += 256) {
         int pos = atomicAdd(&s_emit, 1);
         if (pos < k_keep) out[pos] = b;
     }
     __syncthreads();
 
-    // Pass 1: emit strictly > thresh
-    for (int b = 1 + tid; b < local_start; b += 256) {
+    // Pass 1: emit strictly > thresh, plus the boundary-halo successor.
+    // b+1 is emitted ONLY when it was not itself selected (sc[b+1] <= thresh);
+    // combined with the pass-2 skip rule below this yields zero duplicates.
+    for (int b = 1 + tid; b < tail_emit_start; b += 256) {
         if (sc[b] > thresh) {
             int pos = atomicAdd(&s_emit, 1);
             if (pos < k_keep) out[pos] = b;
+            if (b + 1 < tail_emit_start && sc[b + 1] <= thresh) {
+                int hpos = atomicAdd(&s_emit, 1);
+                if (hpos < k_keep) out[hpos] = b + 1;
+            }
         }
     }
     __syncthreads();
 
-    // Pass 2: fill any remaining slots with == thresh (or >= lo)
+    // Pass 2: fill any remaining slots with == thresh (or >= lo), skipping
+    // blocks that are already the halo successor of a pass-1 selection
+    // (sc[b-1] > thresh) so no block is ever written twice.
     if (s_emit < k_keep) {
-        for (int b = 1 + tid; b < local_start; b += 256) {
+        for (int b = 1 + tid; b < tail_emit_start; b += 256) {
             float v = sc[b];
-            if (v <= thresh && v >= lo) {
+            if (v <= thresh && v >= lo && !(b > 1 && sc[b - 1] > thresh)) {
                 int pos = atomicAdd(&s_emit, 1);
                 if (pos < k_keep) out[pos] = b;
             }

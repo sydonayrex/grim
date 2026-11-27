@@ -2234,7 +2234,11 @@ impl RocmDevice {
                 if let Some(pct) = sparse_pct {
                     let n_blocks = kv_seq_len.div_ceil(32);
                     let n_q_tiles = seq_len.div_ceil(16);
-                    let k_keep = ((n_blocks * pct) / 100).max(20).min(n_blocks);
+                    // +64 = the pinned 2048-token recent tail is EXTRA budget
+                    // (not traded against scored top-k slots — see the
+                    // grim_q81_topk_blocks_bc32 halo/tail contract).
+                    let k_keep = ((((n_blocks * pct) / 100).max(20).min(n_blocks)) + 64)
+                        .min(n_blocks);
                     let k_min = RocmStorage::alloc_gpu(
                         &Shape::new(vec![n_blocks, num_kv_heads, head_dim]),
                         grim_tensor::DType::F32,
@@ -2492,7 +2496,9 @@ impl RocmDevice {
                 .filter(|&p| p > 0 && p < 100);
             let (_keep_alive, mut bp_arg, mut kk_i) = if let (true, Some(pct)) = (kv_seq_len >= 1024, sparse_pct) {
                 let n_blocks = kv_seq_len.div_ceil(32);
-                let k_keep = ((n_blocks * pct) / 100).max(20).min(n_blocks);
+                // +64 = pinned recent tail is EXTRA budget (see topk kernel contract).
+                let k_keep = ((((n_blocks * pct) / 100).max(20).min(n_blocks)) + 64)
+                    .min(n_blocks);
                 // Fixed-capacity pool sizing across prefill chunks prevents monotonic
                 // size-bucket fragmentation (~1.7 GiB saved at 262k).
                 let cap_kv = std::env::var("GRIM_KV_CACHE_LEN")
@@ -2501,7 +2507,8 @@ impl RocmDevice {
                     .unwrap_or(kv_seq_len)
                     .max(kv_seq_len);
                 let cap_blocks = cap_kv.div_ceil(32);
-                let cap_keep = ((cap_blocks * pct) / 100).max(20).min(cap_blocks);
+                let cap_keep = ((((cap_blocks * pct) / 100).max(20).min(cap_blocks)) + 64)
+                    .min(cap_blocks);
                 let k_min = RocmStorage::alloc_gpu(&Shape::new(vec![cap_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
                 let k_max = RocmStorage::alloc_gpu(&Shape::new(vec![cap_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
                 let mut kmin_p = k_min.device_ptr.unwrap();
