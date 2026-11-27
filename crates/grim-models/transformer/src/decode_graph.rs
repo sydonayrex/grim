@@ -5953,7 +5953,7 @@ impl Qwen35 {
             Device::Rocm(o) => o,
             _ => return Ok(None),
         };
-        let ctx = std::env::var("GRIM_KV_CACHE_LEN")
+        let ctx = std::env::var("GRIM_MTP_NEXTN_CTX")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n >= 64)
