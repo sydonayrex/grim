@@ -412,6 +412,64 @@ pub(crate) fn compute_auto_chunk_size_for_vram_after_kv(
     compute_auto_chunk_size_for_vram(min_free_mb.saturating_sub(planned_kv_mb))
 }
 
+/// Env vars the >=128k long-context auto-profile would set. Any of these being
+/// already present in the environment disables the profile (least-surprise:
+/// explicit user configuration always wins — see the GRIM_KV_ARENA rule).
+/// NOTE: `GRIM_MTP_DRAFT_CHAIN` is deliberately NOT in the profile — with it
+/// set, a 134k-token prefill dies silently at prefill start (rc=1, zero
+/// prefill chunks; isolated by A/B against the identical 6-var config, which
+/// completes). Manual-only until that defect is root-caused.
+pub(crate) const LONGCTX_PROFILE_VARS: [&str; 6] = [
+    "GRIM_KV_ARENA",
+    "GRIM_SPLIT_LAYERS",
+    "GRIM_SPARSE_PREFILL_PCT",
+    "GRIM_SPARSE_DECODE_PCT",
+    "GRIM_MTP",
+    "GRIM_MTP_NEXTN_BACKFILL",
+];
+
+/// Pure selector for the measured 262k long-context configuration. Fires only
+/// when the request needs >= 131072 context on EXACTLY two RDNA4 (gfx1200/
+/// gfx1201) cards and none of [`LONGCTX_PROFILE_VARS`] is already set.
+/// `env_set` = profile var names already present in the environment.
+pub(crate) fn auto_longctx_profile(
+    ctx_tokens: usize,
+    device_count: usize,
+    gpu_targets: &[&str],
+    env_set: &[&str],
+) -> Option<Vec<(&'static str, &'static str)>> {
+    const LONGCTX_MIN: usize = 131_072;
+    if ctx_tokens < LONGCTX_MIN {
+        return None;
+    }
+    if device_count != 2 {
+        return None;
+    }
+    if gpu_targets.len() != 2
+        || !gpu_targets
+            .iter()
+            .all(|t| matches!(*t, "gfx1200" | "gfx1201"))
+    {
+        return None;
+    }
+    if LONGCTX_PROFILE_VARS.iter().any(|v| env_set.contains(v)) {
+        return None;
+    }
+    Some(vec![
+        ("GRIM_KV_ARENA", "k8v4"),
+        ("GRIM_SPLIT_LAYERS", "33,31"),
+        // 25% is the proven 3/3-needle budget (12% clips needle tails without
+        // the halo fix; the tail-protection kernel landed alongside).
+        ("GRIM_SPARSE_PREFILL_PCT", "25"),
+        ("GRIM_SPARSE_DECODE_PCT", "25"),
+        ("GRIM_MTP", "on"),
+        // Nextn backfill is disabled at 262k for VRAM; costs ~0.4 tok/step of
+        // MTP acceptance (1.45 vs 1.89 with backfill) but fits the cards.
+        // GRIM_MTP_DRAFT_CHAIN is excluded: see the LONGCTX_PROFILE_VARS doc.
+        ("GRIM_MTP_NEXTN_BACKFILL", "0"),
+    ])
+}
+
 #[cfg(feature = "rocm")]
 fn planned_kv_arena_per_card_mb(prompt_len: usize) -> u64 {
     let kv_fmt = match std::env::var("GRIM_KV_ARENA")
@@ -1870,6 +1928,44 @@ pub async fn cmd_run(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048);
     let total_budget_needed = tokens.len() + max_tokens + max_thinking;
+
+    // Task 2: >=128k long-context auto-profile. When the request needs
+    // >= 131072 context on exactly two RDNA4 cards and the user has not set
+    // ANY of the profile's env vars, apply the measured 262k configuration
+    // out-of-the-box. Runs BEFORE the dynamic-kv policy below so the profiled
+    // values are respected as explicit, and before the startup banner so it
+    // reflects the selection. Opt out by setting any profile var explicitly.
+    if matches!(device, Device::Rocm(_)) {
+        // The HIP driver can expose phantom gfx900 devices past the real GPUs,
+        // so the profile counts REAL RDNA4 devices by arch, not raw enumerations.
+        let rdna4: Vec<String> = (0..8usize)
+            .take_while(|&ord| grim_backend_rocm::vram_info_detailed(ord).2 != 0)
+            .map(|ord| grim_backend_rocm::device::util::detect_gpu_arch(ord as i32))
+            .filter(|a| a == "gfx1200" || a == "gfx1201")
+            .collect();
+        let archs: Vec<&str> = rdna4.iter().map(|s| s.as_str()).collect();
+        let env_set: Vec<&str> = LONGCTX_PROFILE_VARS
+            .iter()
+            .filter(|v| std::env::var(*v).is_ok())
+            .copied()
+            .collect();
+        if let Some(profile) =
+            auto_longctx_profile(total_budget_needed, archs.len(), &archs, &env_set)
+        {
+            for (k, v) in &profile {
+                unsafe { std::env::set_var(k, v) };
+            }
+            let names: Vec<&str> = profile.iter().map(|(k, _)| *k).collect();
+            eprintln!(
+                "[longctx-profile] ctx={} >= 131072 on {}x {:?}: auto-selected {} \
+                 (opt out by setting any of these env vars explicitly)",
+                total_budget_needed,
+                archs.len(),
+                archs,
+                names.join(", ")
+            );
+        }
+    }
 
     if matches!(device, Device::Rocm(_)) {
         let (d0_free_raw, _, _) = grim_backend_rocm::vram_info_detailed(0);
@@ -4270,6 +4366,58 @@ pub async fn cmd_run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// >=128k auto-profile: fires on 2x RDNA4 with clean env, correct contents.
+    #[test]
+    fn longctx_profile_fires_on_two_rdna4() {
+        let p = auto_longctx_profile(200_000, 2, &["gfx1200", "gfx1201"], &[])
+            .expect("profile should fire");
+        let get = |k: &str| {
+            p.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| *v)
+                .expect(k)
+        };
+        assert_eq!(get("GRIM_KV_ARENA"), "k8v4");
+        assert_eq!(get("GRIM_SPLIT_LAYERS"), "33,31");
+        assert_eq!(get("GRIM_SPARSE_PREFILL_PCT"), "25");
+        assert_eq!(get("GRIM_SPARSE_DECODE_PCT"), "25");
+        assert_eq!(get("GRIM_MTP"), "on");
+        assert_eq!(get("GRIM_MTP_NEXTN_BACKFILL"), "0");
+        // GRIM_MTP_DRAFT_CHAIN must NOT be set: it crashes >=128k prefill
+        // (silent death, isolated by A/B) — manual-only until root-caused.
+        assert!(p.iter().all(|(k, _)| *k != "GRIM_MTP_DRAFT_CHAIN"));
+    }
+
+    #[test]
+    fn longctx_profile_suppressed_below_131072() {
+        assert!(auto_longctx_profile(131_071, 2, &["gfx1200", "gfx1201"], &[]).is_none());
+        assert!(auto_longctx_profile(131_072, 2, &["gfx1200", "gfx1201"], &[]).is_some());
+    }
+
+    /// Least-surprise: single-GPU runs never receive a 33,31 split.
+    #[test]
+    fn longctx_profile_suppressed_on_one_gpu() {
+        assert!(auto_longctx_profile(200_000, 1, &["gfx1201"], &[]).is_none());
+        assert!(auto_longctx_profile(200_000, 3, &["gfx1200", "gfx1201", "gfx1200"], &[]).is_none());
+    }
+
+    #[test]
+    fn longctx_profile_suppressed_on_non_rdna4() {
+        assert!(auto_longctx_profile(200_000, 2, &["gfx1100", "gfx1100"], &[]).is_none());
+        assert!(auto_longctx_profile(200_000, 2, &["gfx90a", "gfx90a"], &[]).is_none());
+    }
+
+    /// Least-surprise: ANY explicit profile var disables the whole profile.
+    #[test]
+    fn longctx_profile_suppressed_when_any_var_set() {
+        for var in LONGCTX_PROFILE_VARS {
+            assert!(
+                auto_longctx_profile(200_000, 2, &["gfx1200", "gfx1201"], &[var]).is_none(),
+                "profile must not fire when {var} is explicitly set"
+            );
+        }
+    }
 
     /// Qwen3.8's own contract: `add_bos_token = false`, `bos_token_id = 248044`.
     /// No BOS may be prepended, and certainly not a token the file never named.
