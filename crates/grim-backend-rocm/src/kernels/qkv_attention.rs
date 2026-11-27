@@ -8546,12 +8546,14 @@ extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
     }
 }
 
-// Phase 3: Build per-page (BC=32) FP16 K min/max metadata from Q8_1 k_arena once at adoption.
+// Phase 3: Build per-page (BC=32) int8 K min/max + f16 page scale from Q8_1 k_arena once at adoption.
+// Halves Quest decode metadata VRAM (16 MiB/layer vs 32 MiB/layer, -128 MiB/card at 262k).
 // Grid: (n_blocks, num_kv_heads, 1), Block: (256, 1, 1).
 extern "C" __global__ void grim_q81_build_minmax_f16_bc32(
     const unsigned char* __restrict__ k_arena,
-    __half* __restrict__ k_min_f16,
-    __half* __restrict__ k_max_f16,
+    signed char* __restrict__ k_min_i8,
+    signed char* __restrict__ k_max_i8,
+    __half* __restrict__ k_scale_f16,
     int num_kv_heads,
     int total_rows
 ) {
@@ -8573,17 +8575,34 @@ extern "C" __global__ void grim_q81_build_minmax_f16_bc32(
         mn = fminf(mn, v);
         mx = fmaxf(mx, v);
     }
+    __shared__ float s_amax[256];
+    s_amax[d] = fmaxf(fabsf(mn), fabsf(mx));
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (d < off) s_amax[d] = fmaxf(s_amax[d], s_amax[d + off]);
+        __syncthreads();
+    }
+    const float sc = fmaxf(s_amax[0] / 127.0f, 1e-30f);
+    const float inv_sc = 1.0f / sc;
+    if (d == 0) {
+        k_scale_f16[(long long)b * num_kv_heads + kvh] = __float2half(sc);
+    }
+    int qmn = __float2int_rn(mn * inv_sc);
+    int qmx = __float2int_rn(mx * inv_sc);
+    qmn = qmn < -127 ? -127 : (qmn > 127 ? 127 : qmn);
+    qmx = qmx < -127 ? -127 : (qmx > 127 ? 127 : qmx);
     const long long out_off = ((long long)b * num_kv_heads + kvh) * 256 + d;
-    k_min_f16[out_off] = __float2half(mn);
-    k_max_f16[out_off] = __float2half(mx);
+    k_min_i8[out_off] = (signed char)qmn;
+    k_max_i8[out_off] = (signed char)qmx;
 }
 
-// Graph-capturable decode Quest page scorer (reads total_dev on-device).
+// Graph-capturable decode Quest page scorer (reads total_dev on-device, int8 min/max + f16 scale).
 // Grid: (max_blocks, num_kv_heads, 1), Block: (256, 1, 1).
 extern "C" __global__ void grim_q81_decode_quest_score_bc32(
     const float* __restrict__ q,
-    const __half* __restrict__ k_min_f16,
-    const __half* __restrict__ k_max_f16,
+    const signed char* __restrict__ k_min_i8,
+    const signed char* __restrict__ k_max_i8,
+    const __half* __restrict__ k_scale_f16,
     float* __restrict__ scores,
     const int* __restrict__ total_dev,
     int steps,
@@ -8598,9 +8617,10 @@ extern "C" __global__ void grim_q81_decode_quest_score_bc32(
     const int n_blocks = (total + 31) >> 5;
     if (b >= n_blocks || b >= max_blocks) return;
 
+    const float sc_page = __half2float(k_scale_f16[(long long)b * num_kv_heads + kvh]);
     const long long km_off = ((long long)b * num_kv_heads + kvh) * 256 + tid;
-    const float km = __half2float(k_min_f16[km_off]);
-    const float kx = __half2float(k_max_f16[km_off]);
+    const float km = sc_page * (float)k_min_i8[km_off];
+    const float kx = sc_page * (float)k_max_i8[km_off];
     const int q_per_kv = num_heads / num_kv_heads;
 
     float best = -1e30f;
@@ -11910,8 +11930,9 @@ pub fn launch_qkv_attention_dev_batch_i4(
 }
 
 struct K8v4QuestState {
-    k_min_f16: crate::memory::storage::RocmStorage,
-    k_max_f16: crate::memory::storage::RocmStorage,
+    k_min_i8: crate::memory::storage::RocmStorage,
+    k_max_i8: crate::memory::storage::RocmStorage,
+    k_scale_f16: crate::memory::storage::RocmStorage,
     scores: crate::memory::storage::RocmStorage,
     block_ids: crate::memory::storage::RocmStorage,
     k_keep_dev: crate::memory::storage::RocmStorage,
@@ -11939,7 +11960,7 @@ fn get_or_alloc_k8v4_quest_ptrs(
     k_ptr: u64,
     num_kv_heads: u32,
     max_ctx: u32,
-) -> Result<(u64, u64, u64, u64, u64, usize), crate::Error> {
+) -> Result<(u64, u64, u64, u64, u64, u64, usize), crate::Error> {
     use crate::memory::storage::RocmStorage;
     use grim_tensor::{DType, Shape};
     let ord = dev.ordinal();
@@ -11953,14 +11974,20 @@ fn get_or_alloc_k8v4_quest_ptrs(
         other => {
             let _dg = crate::DeviceGuard::set(ord as i32);
             let nkv = num_kv_heads as usize;
-            let k_min_f16 = RocmStorage::alloc_gpu(
+            let k_min_i8 = RocmStorage::alloc_gpu(
                 &Shape::new(vec![max_blocks * nkv * 256]),
-                DType::F16,
+                DType::U8,
                 &dev.allocator_handle(),
                 ord,
             )?;
-            let k_max_f16 = RocmStorage::alloc_gpu(
+            let k_max_i8 = RocmStorage::alloc_gpu(
                 &Shape::new(vec![max_blocks * nkv * 256]),
+                DType::U8,
+                &dev.allocator_handle(),
+                ord,
+            )?;
+            let k_scale_f16 = RocmStorage::alloc_gpu(
+                &Shape::new(vec![max_blocks * nkv]),
                 DType::F16,
                 &dev.allocator_handle(),
                 ord,
@@ -11984,8 +12011,9 @@ fn get_or_alloc_k8v4_quest_ptrs(
                 ord,
             )?;
             let state = K8v4QuestState {
-                k_min_f16,
-                k_max_f16,
+                k_min_i8,
+                k_max_i8,
+                k_scale_f16,
                 scores,
                 block_ids,
                 k_keep_dev,
@@ -12001,8 +12029,9 @@ fn get_or_alloc_k8v4_quest_ptrs(
         }
     };
     Ok((
-        st.k_min_f16.device_ptr().unwrap_or(0) as u64,
-        st.k_max_f16.device_ptr().unwrap_or(0) as u64,
+        st.k_min_i8.device_ptr().unwrap_or(0) as u64,
+        st.k_max_i8.device_ptr().unwrap_or(0) as u64,
+        st.k_scale_f16.device_ptr().unwrap_or(0) as u64,
         st.scores.device_ptr().unwrap_or(0) as u64,
         st.block_ids.device_ptr().unwrap_or(0) as u64,
         st.k_keep_dev.device_ptr().unwrap_or(0) as u64,
@@ -12010,7 +12039,7 @@ fn get_or_alloc_k8v4_quest_ptrs(
     ))
 }
 
-/// Build per-page (BC=32) FP16 K min/max metadata once after `DecodeGraph` adopts `k_arena`.
+/// Build per-page (BC=32) int8 K min/max + f16 scale metadata once after `DecodeGraph` adopts `k_arena`.
 pub fn build_k8v4_quest_minmax(
     dev: &crate::RocmDevice,
     k_arena: &dyn BackendStorage,
@@ -12028,7 +12057,7 @@ pub fn build_k8v4_quest_minmax(
         .downcast_ref::<RocmStorage>()
         .and_then(|s| s.device_ptr)
         .ok_or_else(|| crate::Error::Backend("build_k8v4_quest_minmax: k ptr".into()))?;
-    let (mut kmin_ptr, mut kmax_ptr, _, _, _, _) =
+    let (mut kmin_ptr, mut kmax_ptr, mut kscale_ptr, _, _, _, _) =
         get_or_alloc_k8v4_quest_ptrs(dev, k_ptr as u64, num_kv_heads, max_ctx)?;
     let n_blocks = ((total_rows as usize) + 31) / 32;
     let mut nkv = num_kv_heads as i32;
@@ -12041,6 +12070,7 @@ pub fn build_k8v4_quest_minmax(
             arg(&mut k_ptr),
             arg(&mut kmin_ptr),
             arg(&mut kmax_ptr),
+            arg(&mut kscale_ptr),
             arg(&mut nkv),
             arg(&mut tot),
         ],
@@ -12097,7 +12127,7 @@ pub fn launch_qkv_attention_dev_batch_k8v4(
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&n| n >= 64)
             .unwrap_or(4096);
-        let (mut kmin_ptr, mut kmax_ptr, mut scores_ptr, mut bids_ptr, mut kkeep_ptr, max_blocks) =
+        let (mut kmin_ptr, mut kmax_ptr, mut kscale_ptr, mut scores_ptr, mut bids_ptr, mut kkeep_ptr, max_blocks) =
             get_or_alloc_k8v4_quest_ptrs(dev, k_ptr as u64, num_kv_heads, max_ctx)?;
         let mut max_b_i = max_blocks as i32;
         let mut pct_i = pct as i32;
@@ -12106,7 +12136,7 @@ pub fn launch_qkv_attention_dev_batch_k8v4(
             crate::HipDim3::new(max_blocks as u32, num_kv_heads, 1),
             crate::HipDim3::new(256, 1, 1),
             &mut [
-                arg(&mut q_ptr), arg(&mut kmin_ptr), arg(&mut kmax_ptr), arg(&mut scores_ptr),
+                arg(&mut q_ptr), arg(&mut kmin_ptr), arg(&mut kmax_ptr), arg(&mut kscale_ptr), arg(&mut scores_ptr),
                 arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut nh), arg(&mut nkv), arg(&mut max_b_i),
             ],
         )?;

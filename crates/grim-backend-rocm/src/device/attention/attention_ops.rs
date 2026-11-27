@@ -2493,8 +2493,17 @@ impl RocmDevice {
             let (_keep_alive, mut bp_arg, mut kk_i) = if let (true, Some(pct)) = (kv_seq_len >= 1024, sparse_pct) {
                 let n_blocks = kv_seq_len.div_ceil(32);
                 let k_keep = ((n_blocks * pct) / 100).max(20).min(n_blocks);
-                let k_min = RocmStorage::alloc_gpu(&Shape::new(vec![n_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
-                let k_max = RocmStorage::alloc_gpu(&Shape::new(vec![n_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+                // Fixed-capacity pool sizing across prefill chunks prevents monotonic
+                // size-bucket fragmentation (~1.7 GiB saved at 262k).
+                let cap_kv = std::env::var("GRIM_KV_CACHE_LEN")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(kv_seq_len)
+                    .max(kv_seq_len);
+                let cap_blocks = cap_kv.div_ceil(32);
+                let cap_keep = ((cap_blocks * pct) / 100).max(20).min(cap_blocks);
+                let k_min = RocmStorage::alloc_gpu(&Shape::new(vec![cap_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+                let k_max = RocmStorage::alloc_gpu(&Shape::new(vec![cap_blocks, num_kv_heads, head_dim]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
                 let mut kmin_p = k_min.device_ptr.unwrap();
                 let mut kmax_p = k_max.device_ptr.unwrap();
                 self.launch_compute_kernel(
@@ -2503,7 +2512,7 @@ impl RocmDevice {
                     crate::HipDim3::new(head_dim as u32, 1, 1),
                     &mut [arg(&mut kptr), arg(&mut kmin_p), arg(&mut kmax_p), arg(&mut ksl), arg(&mut nkv), arg(&mut hd)],
                 )?;
-                let scores_dev = RocmStorage::alloc_gpu(&Shape::new(vec![n_q_tiles, num_kv_heads, n_blocks]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
+                let scores_dev = RocmStorage::alloc_gpu(&Shape::new(vec![n_q_tiles, num_kv_heads, cap_blocks]), grim_tensor::DType::F32, &self.allocator, self.ordinal)?;
                 let mut sc_p = scores_dev.device_ptr.unwrap();
                 let mut nb_i = n_blocks as i32;
                 self.launch_compute_kernel(
@@ -2512,7 +2521,7 @@ impl RocmDevice {
                     crate::HipDim3::new(head_dim as u32, 1, 1),
                     &mut [arg(&mut qptr), arg(&mut kmin_p), arg(&mut kmax_p), arg(&mut sc_p), arg(&mut sl), arg(&mut nh), arg(&mut nkv), arg(&mut hd), arg(&mut nb_i)],
                 )?;
-                let blk_dev = RocmStorage::alloc_gpu(&Shape::new(vec![n_q_tiles * num_kv_heads * k_keep * 4]), grim_tensor::DType::U8, &self.allocator, self.ordinal)?;
+                let blk_dev = RocmStorage::alloc_gpu(&Shape::new(vec![n_q_tiles * num_kv_heads * cap_keep * 4]), grim_tensor::DType::U8, &self.allocator, self.ordinal)?;
                 let mut bp = blk_dev.device_ptr.unwrap();
                 let mut kk = k_keep as i32;
                 self.launch_compute_kernel(
