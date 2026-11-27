@@ -3946,8 +3946,9 @@ impl Qwen35Block {
                 Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW) => {
                     buffers.max_ctx * nkv * hd.div_ceil(128) * 67
                 }
-                // Q8_1 Dot4: 36 bytes per 32 elements.
-                Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1) => {
+                // Q8_1 Dot4: 36 bytes per 32 elements (K8V4 also uses 36 B/32 for K).
+                Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1)
+                | Some(grim_backend_rocm::KV_ARENA_BITS_K8V4) => {
                     buffers.max_ctx * nkv * (hd / 32) * 36
                 }
                 _ => buffers.max_ctx * kv_stride,
@@ -3983,7 +3984,8 @@ impl Qwen35Block {
                 | Some(8)
                 | Some(4)
                 | Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW)
-                | Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1) => {}
+                | Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1)
+                | Some(grim_backend_rocm::KV_ARENA_BITS_K8V4) => {}
                 Some(bits) => {
                     return Err(grim_core::error::Error::Backend(format!(
                         "graph KV append: no device-total kernel pair for {bits}-bit KV codes (eager fallback)"
@@ -3994,6 +3996,7 @@ impl Qwen35Block {
             let arena_i4 = packed_bits == Some(4);
             let arena_whitecrow = packed_bits == Some(grim_backend_rocm::KV_ARENA_BITS_WHITECROW);
             let arena_q81 = packed_bits == Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1);
+            let arena_k8v4 = packed_bits == Some(grim_backend_rocm::KV_ARENA_BITS_K8V4);
             // The i4 kernels' per-row and per-head code terms are PACKED BYTES
             // (`kv_stride/2`, `head_dim/2`), so the slot stride they receive
             // must be the arena's BYTE extent. `arena_slot_stride` is ALREADY
@@ -4160,6 +4163,36 @@ impl Qwen35Block {
                         })?;
                     }
                 }
+            } else if arena_k8v4 {
+                grim_backend_rocm::launch_kv_append_q81(
+                    dev,
+                    &buffers.k_buf[layer_idx],
+                    &buffers.layer_totals[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    kv_stride,
+                    nkv,
+                    hd,
+                    steps,
+                    eff_batch,
+                    arena_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_q81 k: {e}")))?;
+                let v_slot_stride = buffers.max_ctx * nkv * (hd / 32) * 20;
+                grim_backend_rocm::launch_kv_append_q41(
+                    dev,
+                    &buffers.v_buf[layer_idx],
+                    &buffers.layer_totals[layer_idx],
+                    &buffers.v_arena[layer_idx],
+                    kv_stride,
+                    nkv,
+                    hd,
+                    steps,
+                    eff_batch,
+                    v_slot_stride,
+                    buffers.kv_ring,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_q41 v: {e}")))?;
             } else if arena_q81 {
                 for (src, dst, tag) in [
                     (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], "k"),
@@ -4386,6 +4419,26 @@ impl Qwen35Block {
                         ))
                     })?;
                 }
+            } else if arena_k8v4 {
+                grim_backend_rocm::launch_qkv_attention_dev_batch_k8v4(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    &buffers.v_arena[layer_idx],
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.layer_totals[layer_idx],
+                    nh as u32,
+                    nkv as u32,
+                    hd as u32,
+                    steps as u32,
+                    steps as u32,
+                    1.0 / (hd as f32).sqrt(),
+                )
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("qkv_attention_dev_k8v4: {e}"))
+                })?;
             } else if arena_q81 {
                 grim_backend_rocm::launch_qkv_attention_dev_batch_q81(
                     dev,
@@ -6525,9 +6578,11 @@ impl Qwen35 {
         ) {
             return (out, 0);
         }
-        if crate::qwen35::kv_arena_format_qwen(&self.device)
-            != grim_backend_rocm::KvArenaFormat::Q8_1
-        {
+        let fmt = crate::qwen35::kv_arena_format_qwen(&self.device);
+        if !matches!(
+            fmt,
+            grim_backend_rocm::KvArenaFormat::Q8_1 | grim_backend_rocm::KvArenaFormat::K8V4
+        ) {
             return (out, 0);
         }
         let Some(caches) = session
@@ -6536,8 +6591,14 @@ impl Qwen35 {
         else {
             return (out, 0);
         };
-        let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
-        let expected_bytes = kv_cap * row_bytes;
+        let k_row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+        let v_row_bytes = if fmt == grim_backend_rocm::KvArenaFormat::K8V4 {
+            self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 20
+        } else {
+            k_row_bytes
+        };
+        let k_expected = kv_cap * k_row_bytes;
+        let v_expected = kv_cap * v_row_bytes;
         let mut adopted_bytes = 0usize;
         for (l, c) in caches.iter_mut().enumerate() {
             if !self.blocks.get(l).map_or(false, |b| b.is_full_attention) {
@@ -6549,8 +6610,8 @@ impl Qwen35 {
                     let vr = v.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>();
                     match (kr, vr) {
                         (Some(kr), Some(vr)) => {
-                            kr.bytes() >= expected_bytes
-                                && vr.bytes() >= expected_bytes
+                            kr.bytes() >= k_expected
+                                && vr.bytes() >= v_expected
                                 && kr.shape().dims().first().copied().unwrap_or(0) >= kv_cap
                         }
                         _ => false,
@@ -6613,7 +6674,8 @@ impl Qwen35 {
     fn snapshot_adopted_row0(
         g: &DecodeGraph,
         adopted_mask: &[bool],
-        row_bytes: usize,
+        k_row_bytes: usize,
+        v_row_bytes: usize,
     ) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
         let mut saved = Vec::new();
         for (l, &is_adopted) in adopted_mask.iter().enumerate() {
@@ -6622,8 +6684,8 @@ impl Qwen35 {
             }
             let k_a = &g.buffers.k_arena[l];
             let v_a = &g.buffers.v_arena[l];
-            let mut k_buf = vec![0u8; row_bytes];
-            let mut v_buf = vec![0u8; row_bytes];
+            let mut k_buf = vec![0u8; k_row_bytes];
+            let mut v_buf = vec![0u8; v_row_bytes];
             let ord = k_a.device_ordinal();
             let _dg = grim_backend_rocm::DeviceGuard::set(ord as i32);
             if let (Some(kp), Some(vp)) = (k_a.device_ptr_u64(), v_a.device_ptr_u64()) {
@@ -6631,13 +6693,13 @@ impl Qwen35 {
                     let _ = grim_backend_rocm::device::handles::hipMemcpy(
                         k_buf.as_mut_ptr() as *mut std::ffi::c_void,
                         kp as *const std::ffi::c_void,
-                        row_bytes,
+                        k_row_bytes,
                         grim_backend_rocm::HipMemcpyKind::DeviceToHost,
                     );
                     let _ = grim_backend_rocm::device::handles::hipMemcpy(
                         v_buf.as_mut_ptr() as *mut std::ffi::c_void,
                         vp as *const std::ffi::c_void,
-                        row_bytes,
+                        v_row_bytes,
                         grim_backend_rocm::HipMemcpyKind::DeviceToHost,
                     );
                 }
@@ -7036,9 +7098,14 @@ impl Qwen35 {
             }
             QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = None);
             let mut g = g_res?;
-            let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+            let k_row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+            let v_row_bytes = if g.buffers.kv_arena_bits == Some(grim_backend_rocm::KV_ARENA_BITS_K8V4) {
+                self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 20
+            } else {
+                k_row_bytes
+            };
             let saved_row0 = if any_adopted {
-                Self::snapshot_adopted_row0(&g, &adopted_mask, row_bytes)
+                Self::snapshot_adopted_row0(&g, &adopted_mask, k_row_bytes, v_row_bytes)
             } else {
                 Vec::new()
             };
@@ -7636,6 +7703,9 @@ impl DecodeGraphModel for Qwen35 {
                 grim_backend_rocm::KvArenaFormat::Q8_1 => {
                     Some(grim_backend_rocm::KV_ARENA_BITS_Q8_1)
                 }
+                grim_backend_rocm::KvArenaFormat::K8V4 => {
+                    Some(grim_backend_rocm::KV_ARENA_BITS_K8V4)
+                }
                 _ => None,
             };
             if kv_dt.arith != grim_tensor::ArithType::F32 {
@@ -7651,7 +7721,8 @@ impl DecodeGraphModel for Qwen35 {
                     grim_backend_rocm::KvArenaFormat::Int4
                     | grim_backend_rocm::KvArenaFormat::Int2V4 => 0.5,
                     grim_backend_rocm::KvArenaFormat::WhiteCrow => 67.0 / 128.0,
-                    grim_backend_rocm::KvArenaFormat::Q8_1 => 36.0 / 32.0,
+                    grim_backend_rocm::KvArenaFormat::Q8_1
+                    | grim_backend_rocm::KvArenaFormat::K8V4 => 36.0 / 32.0,
                     _ => 1.0,
                 };
                 let mut pending_adopted =
@@ -7677,23 +7748,35 @@ impl DecodeGraphModel for Qwen35 {
                         *last = ((*last as f64) * packed_factor) as usize;
                     }
                     let shape = grim_tensor::Shape::from_slice(&dims);
+                    let v_shape = if fmt == grim_backend_rocm::KvArenaFormat::K8V4 {
+                        let mut vdims = buffers.v_arena[layer_idx].shape().dims().to_vec();
+                        if let Some(first) = vdims.first_mut() {
+                            *first = max_ctx;
+                        }
+                        if let Some(last) = vdims.last_mut() {
+                            *last = ((*last as f64) * (20.0 / 32.0)) as usize;
+                        }
+                        grim_tensor::Shape::from_slice(&vdims)
+                    } else {
+                        shape.clone()
+                    };
                     if let Some(slot) = pending_adopted.as_mut().and_then(|v| v.get_mut(layer_idx)) {
                         if let Some((mut k_adopted, mut v_adopted)) = slot.take() {
                             k_adopted.set_shape(shape.clone());
-                            v_adopted.set_shape(shape);
+                            v_adopted.set_shape(v_shape);
                             buffers.k_arena[layer_idx] = k_adopted;
                             buffers.v_arena[layer_idx] = v_adopted;
                             continue;
                         }
                     }
-                    for arena in [
-                        &mut buffers.k_arena[layer_idx],
-                        &mut buffers.v_arena[layer_idx],
+                    for (arena, a_shape) in [
+                        (&mut buffers.k_arena[layer_idx], &shape),
+                        (&mut buffers.v_arena[layer_idx], &v_shape),
                     ] {
                         let arena_ord = arena.device_ordinal();
                         let arena_dev = grim_backend_rocm::RocmDevice::shared(arena_ord);
                         let narrowed = RocmStorage::alloc_gpu(
-                            &shape,
+                            a_shape,
                             kv_dt.clone(),
                             &arena_dev.allocator_handle(),
                             arena_ord,
@@ -7991,8 +8074,13 @@ impl DecodeGraphModel for Qwen35 {
         g: &DecodeGraph,
         adopted_mask: &[bool],
     ) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
-        let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
-        Self::snapshot_adopted_row0(g, adopted_mask, row_bytes)
+        let k_row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
+        let v_row_bytes = if g.buffers.kv_arena_bits == Some(grim_backend_rocm::KV_ARENA_BITS_K8V4) {
+            self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 20
+        } else {
+            k_row_bytes
+        };
+        Self::snapshot_adopted_row0(g, adopted_mask, k_row_bytes, v_row_bytes)
     }
 
     fn restore_adopted_kv_row0(

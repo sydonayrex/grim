@@ -100,6 +100,7 @@ pub fn capture_fp8_pad_scratch() -> Option<&'static RocmStorage> {
 /// a slot's byte extent is `max_ctx * nkv * (head_dim/128) * 67`.
 pub const KV_ARENA_BITS_WHITECROW: u32 = 67;
 pub const KV_ARENA_BITS_Q8_1: u32 = 36;
+pub const KV_ARENA_BITS_K8V4: u32 = 84;
 
 /// Spec §Phase 1: owns all decode intermediates at fixed addresses.
 /// Allocated once at model load, never freed until unload.
@@ -2246,6 +2247,7 @@ impl DecodeGraphBuffers {
             if arena_elem_bytes == 1
                 && self.kv_arena_bits != Some(KV_ARENA_BITS_WHITECROW)
                 && self.kv_arena_bits != Some(KV_ARENA_BITS_Q8_1)
+                && self.kv_arena_bits != Some(KV_ARENA_BITS_K8V4)
             {
                 if src.src_elem_bytes != 1 {
                     return Err(Error::Backend(format!(

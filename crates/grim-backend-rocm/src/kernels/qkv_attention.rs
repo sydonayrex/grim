@@ -203,7 +203,7 @@ impl KvArenaFormat {
     pub fn graph_kernel_pair(self) -> bool {
         matches!(
             self,
-            KvArenaFormat::Q8_1 | KvArenaFormat::Int8 | KvArenaFormat::Int4 | KvArenaFormat::WhiteCrow
+            KvArenaFormat::Q8_1 | KvArenaFormat::K8V4 | KvArenaFormat::Int8 | KvArenaFormat::Int4 | KvArenaFormat::WhiteCrow
         )
     }
 }
@@ -8342,6 +8342,157 @@ extern "C" __global__ void grim_kv_quantize_rows_q41(
     }
 }
 
+// K8V4 GQA split-K decode attention (device-total, graph-capturable):
+// Q8_1 K (288 B/head = 18 uint4) + Q4_1 V (160 B/head = 10 uint4), 6:1 GQA shared in LDS.
+extern "C" __global__ void grim_qkv_attention_dev_k8v4_gqa_splitk(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_arena,
+    const unsigned char* __restrict__ v_arena,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int split_k
+) {
+    constexpr int HD = 256;
+    constexpr int K_HEAD_BYTES = 288; // (256 / 32) * 36
+    constexpr int V_HEAD_BYTES = 160; // (256 / 32) * 20
+    constexpr int JT = 4;
+    constexpr int MAX_Q_PER_WAVE = 3;
+
+    const int split_id = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int n_q = q_per_kv * seq_len;
+    const int total = *total_dev + steps;
+    const long long k_row_bytes = (long long)num_kv_heads * K_HEAD_BYTES;
+    const long long v_row_bytes = (long long)num_kv_heads * V_HEAD_BYTES;
+    const int total_h = seq_len * num_heads;
+
+    const int base = total / split_k;
+    const int rem = total % split_k;
+    const int j_start = split_id * base + (split_id < rem ? split_id : rem);
+    const int j_end = j_start + base + (split_id < rem ? 1 : 0);
+
+    float qreg[MAX_Q_PER_WAVE][8];
+    float acc[MAX_Q_PER_WAVE][8];
+    float rmax[MAX_Q_PER_WAVE];
+    float rsum[MAX_Q_PER_WAVE];
+    int q_hi[MAX_Q_PER_WAVE];
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        rmax[m] = -1e30f;
+        rsum[m] = 0.0f;
+        if (qi < n_q) {
+            const int qr = qi / q_per_kv;
+            const int h = kv_head * q_per_kv + (qi % q_per_kv);
+            q_hi[m] = total - (seq_len - 1 - qr);
+            const float* q_row = q + ((long long)qr * num_heads + h) * HD;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                qreg[m][c] = q_row[c * 32 + lane];
+                acc[m][c] = 0.0f;
+            }
+        } else {
+            q_hi[m] = -1;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                qreg[m][c] = 0.0f;
+                acc[m][c] = 0.0f;
+            }
+        }
+    }
+
+    __shared__ alignas(16) unsigned char sK[JT][K_HEAD_BYTES];
+    __shared__ alignas(16) unsigned char sV[JT][V_HEAD_BYTES];
+    const int ld_kt = tid / 18;
+    const int ld_kb = (tid % 18) * 16;
+    const int ld_vt = tid / 10;
+    const int ld_vb = (tid % 10) * 16;
+
+    for (int j0 = j_start; j0 < j_end; j0 += JT) {
+        if (tid < 72) {
+            const int j = j0 + ld_kt;
+            if (j < j_end) {
+                const long long off = (long long)j * k_row_bytes + (long long)kv_head * K_HEAD_BYTES + ld_kb;
+                *reinterpret_cast<uint4*>(&sK[ld_kt][ld_kb]) = *reinterpret_cast<const uint4*>(&k_arena[off]);
+            }
+        }
+        if (tid < 40) {
+            const int j = j0 + ld_vt;
+            if (j < j_end) {
+                const long long off = (long long)j * v_row_bytes + (long long)kv_head * V_HEAD_BYTES + ld_vb;
+                *reinterpret_cast<uint4*>(&sV[ld_vt][ld_vb]) = *reinterpret_cast<const uint4*>(&v_arena[off]);
+            }
+        }
+        __syncthreads();
+
+        const int jt_cnt = (j0 + JT <= j_end) ? JT : (j_end - j0);
+        for (int t = 0; t < jt_cnt; ++t) {
+            float kv_k[8], kv_v[8];
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const unsigned char* kb = &sK[t][c * 36];
+                const float dk = __half2float(*reinterpret_cast<const __half*>(kb));
+                kv_k[c] = dk * (float)(reinterpret_cast<const signed char*>(kb + 4)[lane]);
+
+                const unsigned char* vb = &sV[t][c * 20];
+                const float dv = __half2float(*reinterpret_cast<const __half*>(vb));
+                const float mv = __half2float(*reinterpret_cast<const __half*>(vb + 2));
+                const unsigned char vp = vb[4 + (lane & 15)];
+                const int nib = (lane < 16) ? (vp & 0x0F) : ((vp >> 4) & 0x0F);
+                kv_v[c] = dv * (float)nib + mv;
+            }
+            const int cur_j = j0 + t;
+            #pragma unroll
+            for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+                if (cur_j >= q_hi[m]) continue;
+                float score = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) score += qreg[m][c] * kv_k[c];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) score += __shfl_xor(score, off);
+                score *= inv_sqrt_d;
+                const float m_new = fmaxf(rmax[m], score);
+                const float sa = expf(rmax[m] - m_new);
+                const float sb = expf(score - m_new);
+                rmax[m] = m_new;
+                rsum[m] = rsum[m] * sa + sb;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) acc[m][c] = acc[m][c] * sa + sb * kv_v[c];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int m = 0; m < MAX_Q_PER_WAVE; ++m) {
+        const int qi = wave + m * 4;
+        if (qi >= n_q) continue;
+        const int qr = qi / q_per_kv;
+        const int h = kv_head * q_per_kv + (qi % q_per_kv);
+        const int g_h = qr * num_heads + h;
+        const int slot_idx = split_id * total_h + g_h;
+        float* po = partial_out + (long long)slot_idx * HD;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) po[c * 32 + lane] = acc[m][c];
+        if (lane == 0) {
+            partial_max[slot_idx] = rmax[m];
+            partial_sum[slot_idx] = rsum[m];
+        }
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_wmma_q81_v2_sparse(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_arena,
@@ -10358,6 +10509,48 @@ pub fn launch_kv_gather_q81(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_q41(
+    dev: &crate::RocmDevice,
+    v_in: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    dst: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    ring: KvRingPolicy,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let _dg = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+    use crate::memory::storage::RocmStorage;
+    let vs = v_in.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| crate::Error::Backend("kv_append_q41: v_in".into()))?;
+    let ps = past_dev.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| crate::Error::Backend("kv_append_q41: past".into()))?;
+    let ds = dst.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| crate::Error::Backend("kv_append_q41: dst".into()))?;
+    let mut vp = vs.device_ptr.ok_or_else(|| crate::Error::Backend("kv_append_q41: v ptr".into()))?;
+    let mut pp = ps.device_ptr.ok_or_else(|| crate::Error::Backend("kv_append_q41: past ptr".into()))?;
+    let mut dp = ds.device_ptr.ok_or_else(|| crate::Error::Backend("kv_append_q41: dst ptr".into()))?;
+    let mut st = kv_stride as i32;
+    let mut nkv = nkv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut stp = steps as i32;
+    let mut b = batch.max(1) as i32;
+    let mut ss = arena_slot_stride as i32;
+    let mut cr = ring.cap_rows;
+    let mut sr = ring.sink_rows;
+    let total = (batch.max(1) * steps * nkv_heads * (head_dim / 32)) as u32;
+    dev.launch_compute_kernel(
+        "grim_kv_append_q41",
+        crate::HipDim3::new(total, 1, 1),
+        crate::HipDim3::new(32, 1, 1),
+        &mut [
+            arg(&mut vp), arg(&mut pp), arg(&mut dp),
+            arg(&mut st), arg(&mut nkv), arg(&mut hd), arg(&mut stp), arg(&mut b), arg(&mut ss), arg(&mut cr), arg(&mut sr),
+        ],
+    )
+}
+
 pub fn launch_kv_append_q81(
     dev: &crate::RocmDevice,
     k_rot: &dyn BackendStorage,
@@ -11283,6 +11476,68 @@ pub fn launch_qkv_attention_dev_batch_i4(
 /// Graph launcher for `grim_qkv_attention_dev_q81`.
 /// Same contract as [`launch_qkv_attention_dev_batch_whitecrow`]:
 /// scale lives inside each 36-byte Q8_1 block, no sidecar.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_dev_batch_k8v4(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_arena: &dyn BackendStorage,
+    v_arena: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    fn dc<'a>(b: &'a dyn BackendStorage, w: &'static str) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| crate::Error::Backend(format!("k8v4_gqa_splitk: {w}")))
+    }
+    let mut q_ptr = dc(q, "q")?.device_ptr.ok_or_else(|| crate::Error::Backend("q ptr".into()))?;
+    let mut k_ptr = dc(k_arena, "k")?.device_ptr.ok_or_else(|| crate::Error::Backend("k ptr".into()))?;
+    let mut v_ptr = dc(v_arena, "v")?.device_ptr.ok_or_else(|| crate::Error::Backend("v ptr".into()))?;
+    let mut o_ptr = dc(out, "o")?.device_ptr.ok_or_else(|| crate::Error::Backend("o ptr".into()))?;
+    let mut om_ptr = dc(out_max, "om")?.device_ptr.ok_or_else(|| crate::Error::Backend("om ptr".into()))?;
+    let mut os_ptr = dc(out_sum, "os")?.device_ptr.ok_or_else(|| crate::Error::Backend("os ptr".into()))?;
+    let mut tot_ptr = dc(total_dev, "tot")?.device_ptr.ok_or_else(|| crate::Error::Backend("tot ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let split_k: usize = 64;
+    let mut split_k_i = split_k as i32;
+    let total_h = (seq_len as usize) * (num_heads as usize);
+    let mut total_h_i = total_h as i32;
+    let (mut p_out_ptr, mut p_max_ptr, mut p_sum_ptr) = get_or_alloc_splitk_scratch(dev, num_heads, head_dim)?
+        .ok_or_else(|| crate::Error::Backend("k8v4_gqa_splitk: scratch alloc failed".into()))?;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_dev_k8v4_gqa_splitk",
+        crate::HipDim3::new(split_k as u32, num_kv_heads, 1),
+        crate::HipDim3::new(128, 1, 1),
+        &mut [
+            arg(&mut q_ptr), arg(&mut k_ptr), arg(&mut v_ptr),
+            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+            arg(&mut nh), arg(&mut nkv), arg(&mut sl), arg(&mut tot_ptr), arg(&mut steps_i), arg(&mut isd), arg(&mut split_k_i),
+        ],
+    )?;
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_splitk_combine",
+        crate::HipDim3::new(total_h as u32, 1, 1),
+        crate::HipDim3::new(head_dim, 1, 1),
+        &mut [
+            arg(&mut p_out_ptr), arg(&mut p_max_ptr), arg(&mut p_sum_ptr),
+            arg(&mut o_ptr), arg(&mut om_ptr), arg(&mut os_ptr),
+            arg(&mut total_h_i), arg(&mut hd), arg(&mut split_k_i),
+        ],
+    )
+}
+
 pub fn launch_qkv_attention_dev_batch_q81(
     dev: &crate::RocmDevice,
     q: &dyn BackendStorage,
