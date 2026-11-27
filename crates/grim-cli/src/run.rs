@@ -806,6 +806,11 @@ fn try_graph_decode_step(
                 // immediately without running an eager step or re-seeding.
             }
             Err(e) => {
+                if any_adopted {
+                    if let Some(sess) = session.as_deref_mut() {
+                        graph_model.return_pending_adopted_kv_to_session(sess);
+                    }
+                }
                 graph_retry.note_fail(step);
                 *graph_fallback_step = Some(step);
                 eprintln!(

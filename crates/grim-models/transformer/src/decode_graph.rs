@@ -128,6 +128,14 @@ pub trait DecodeGraphModel: Send + Sync {
     ) {
     }
 
+    /// Lossless fallback: if `get_or_create_decode_graph` itself returns `Err`,
+    /// return any unconsumed pending adopted KV arenas back into `session`.
+    fn return_pending_adopted_kv_to_session(
+        &self,
+        _session: &mut dyn grim_core::session::SessionT,
+    ) {
+    }
+
     /// Populate the decode-only u4-lane weight memo for every K-quant linear
     /// in the model.
     ///
@@ -6559,7 +6567,45 @@ impl Qwen35 {
                 out[l] = Some((kr, vr));
             }
         }
+        // Flush cached prefill scratch slabs back to HIP before DecodeGraph's
+        // free-VRAM check so long-context (200k) capture does not see stale 0.00 GB free.
+        if adopted_bytes > 0 {
+            let mut ords = Vec::new();
+            for b in &self.blocks {
+                if let grim_tensor::Device::Rocm(ord) = b.device {
+                    if !ords.contains(&ord) {
+                        ords.push(ord);
+                    }
+                }
+            }
+            for ord in ords {
+                let _g = grim_backend_rocm::DeviceGuard::set(ord as i32);
+                grim_backend_rocm::RocmDevice::shared(ord)
+                    .allocator_handle()
+                    .empty_cache();
+            }
+        }
         (out, adopted_bytes)
+    }
+
+    fn return_pending_adopted_kv_impl(&self, session: &mut dyn grim_core::session::SessionT) {
+        let Some(pending) = QWEN35_PENDING_ADOPTED_KV.with(|cell| cell.borrow_mut().take()) else {
+            return;
+        };
+        let Some(caches) = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<crate::qwen35::Qwen35LayerCache>>())
+        else {
+            return;
+        };
+        for (l, pair) in pending.into_iter().enumerate() {
+            if let Some((k_a, v_a)) = pair {
+                if let Some(c) = caches.get_mut(l) {
+                    c.k_device = Some(Box::new(k_a));
+                    c.v_device = Some(Box::new(v_a));
+                }
+            }
+        }
     }
 
     /// Snapshot row 0 (attention sink) of adopted KV arenas before `forward_capture`
@@ -6985,6 +7031,9 @@ impl Qwen35 {
                 QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = Some(adopted_kv));
             }
             let g_res = self.get_or_create_decode_graph(kv_cap, max_batch);
+            if g_res.is_err() && any_adopted {
+                self.return_pending_adopted_kv_impl(_session);
+            }
             QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = None);
             let mut g = g_res?;
             let row_bytes = self.cfg.num_kv_heads * (self.cfg.head_dim / 32) * 36;
@@ -7966,6 +8015,13 @@ impl DecodeGraphModel for Qwen35 {
         saved_row0: &[(usize, Vec<u8>, Vec<u8>)],
     ) {
         self.return_adopted_kv_to_session_impl(g, session, adopted_mask, saved_row0);
+    }
+
+    fn return_pending_adopted_kv_to_session(
+        &self,
+        session: &mut dyn grim_core::session::SessionT,
+    ) {
+        self.return_pending_adopted_kv_impl(session);
     }
 
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
