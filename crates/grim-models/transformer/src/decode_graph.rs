@@ -5953,7 +5953,11 @@ impl Qwen35 {
             Device::Rocm(o) => o,
             _ => return Ok(None),
         };
-        let ctx = 4096usize;
+        let ctx = std::env::var("GRIM_KV_CACHE_LEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 64)
+            .unwrap_or(4096);
         if nextn_cache.current_pos + 1 >= ctx {
             return Ok(None);
         }
