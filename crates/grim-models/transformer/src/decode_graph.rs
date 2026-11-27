@@ -7095,10 +7095,12 @@ impl Qwen35 {
             let any_adopted = adopted_bytes > 0;
             if any_adopted {
                 QWEN35_PENDING_ADOPTED_KV.with(|cell| *cell.borrow_mut() = Some(adopted_kv));
-                for &ord in &self.layer_devices {
-                    grim_backend_rocm::RocmDevice::shared(ord)
-                        .allocator_handle()
-                        .empty_cache();
+                for d in &self.cfg.devices {
+                    if let grim_tensor::Device::Rocm(ord) = *d {
+                        grim_backend_rocm::RocmDevice::shared(ord)
+                            .allocator_handle()
+                            .empty_cache();
+                    }
                 }
             }
             let g_res = self.get_or_create_decode_graph(kv_cap, max_batch);
